@@ -21,6 +21,8 @@ dist/
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
 
 # Studio frontend build workspace
 node_modules/
@@ -35,6 +37,8 @@ env/
 # Run artifacts / outputs
 runs/
 runs-*/
+# Workspace-local release scratch; already excluded from sdists (see CHANGELOG v0.18.0)
+.tmp/
 studio-workspace/
 proposal.tar
 .codex-studio/

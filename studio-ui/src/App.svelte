@@ -1040,7 +1040,7 @@
         </div>
         <div class="inspector-content" id="inspector-panel" role="tabpanel" aria-labelledby={`inspector-tab-${inspector}`}>
           {#if inspector === "workspace"}
-            <WorkspaceInspector {workspaceName} {files} {jobs} plan={run.plan} onRefresh={refreshFiles} />
+            <WorkspaceInspector {workspaceName} {files} {jobs} plan={run.plan} planTruncatedItems={run.planTruncatedItems} onRefresh={refreshFiles} />
           {:else if inspector === "config"}
             {#key `${settings.model}:${settings.effort}:${settings.capabilities.join(',')}:${settings.otel}`}
               <LiveConfig {settings} onApply={updateSettings} />

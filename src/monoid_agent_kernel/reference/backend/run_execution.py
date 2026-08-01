@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -10,6 +11,10 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.reference.backend.content_hydration import (
+    hydrate_settled_text,
+    needs_settled_text,
+)
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
     LoopBuildPort,
@@ -71,6 +76,9 @@ class RunExecutionService:
 
     async def run_prepared(self, prepared: PreparedRunPort, request: RunRequestPort) -> None:
         await self._context.acquire_run_slot()
+        loop: RunExecutionLoopPort | None = None
+        released = False
+        discarded = False
         try:
             try:
                 loop_build = self._context.build_loop(
@@ -83,10 +91,26 @@ class RunExecutionService:
                 loop = loop_build.loop
                 self._context.attach_loop(prepared.record, loop_build)
                 result = await self.drive_session(prepared.run_id, request, loop)
+                released = True
                 self._context.record_run_result(prepared.run_id, result)
             except Exception as exc:
+                if loop is not None and not released:
+                    try:
+                        await asyncio.to_thread(loop.discard_uncommitted)
+                        discarded = True
+                    except BaseException:
+                        # The original execution failure remains the actionable cause. AgentLoop
+                        # already attempts every owned resource before surfacing cleanup failure.
+                        pass
                 self._context.record_run_failure(prepared.run_id, exc)
         finally:
+            # Cancellation derives from BaseException, so it bypasses the failure-recording branch.
+            # It still owns every resource materialized before the cancellation point.
+            if loop is not None and not released and not discarded:
+                try:
+                    await asyncio.to_thread(loop.discard_uncommitted)
+                except BaseException:
+                    pass
             self._context.release_run_slot()
 
     async def drive_session(
@@ -133,8 +157,41 @@ class RunExecutionService:
             suspension: Suspension | None = None
             first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
             async with loop.astream(first_input) as stream:
+                stream_run_dir = loop.spec.run_root / loop.spec.run_id
                 async for item in stream:
-                    yield stream_item_frame(item)
+                    frame = stream_item_frame(item)
+                    # ``kind:event`` frames carry the settle events, and the settled-text record is
+                    # written *before* its emit, so it is already on disk by the time the frame is
+                    # built. Without this the live stream degrades asymmetrically — orchestration
+                    # frames lose the text while ``kind:delta`` and ``kind:result`` keep it, which
+                    # no consumer expects. Delta frames are deliberately untouched: they carry live
+                    # token text that no turn-end record can supply.
+                    if frame.get("kind") == "event":
+                        # ``AgentEvent.to_json()`` hands back the live ``data`` dict *by
+                        # reference*, so hydrating the frame in place would write the text into
+                        # the event the bus still owns and every registered sink shares —
+                        # including embedder-supplied ones. A sink that buffers events and
+                        # serializes them later would then export exactly the content this change
+                        # moves off that stream. Copy before filling.
+                        data = frame.get("data")
+                        if isinstance(data, dict):
+                            frame["data"] = dict(data)
+                        # Off-thread ONLY when there is a digest to resolve. Resolving one scans
+                        # the transcript, which has no positional bound (any window drops text a
+                        # reader legitimately asked for); inline that blocked the shared run loop
+                        # for the whole read — ~0.15s on a 21MB transcript — and runs share that
+                        # loop behind ``acquire_run_slot``.
+                        #
+                        # But the hop is not free either: the default executor is shared and
+                        # bounded (32 workers), and parked runs hold workers for up to
+                        # ``task_wait_poll_s`` each, so an unconditional hop would queue every
+                        # frame's delivery behind them. Until the emit change lands, no event
+                        # carries a digest and the resolver opens no file at all — so the
+                        # emptiness check stays on the loop and only real work crosses the
+                        # boundary.
+                        if needs_settled_text([frame]):
+                            await asyncio.to_thread(hydrate_settled_text, [frame], stream_run_dir)
+                    yield frame
                 suspension = stream.suspension
             result = await loop.aclose()
             closed = True
@@ -144,9 +201,15 @@ class RunExecutionService:
             if loop is not None and not closed:
                 try:
                     await loop.aclose()
+                    closed = True
                 except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
                     pass
             self._context.record_run_failure(prepared.run_id, exc)
             yield failure_frame(exc)
         finally:
+            if loop is not None and not closed:
+                try:
+                    await asyncio.to_thread(loop.discard_uncommitted)
+                except BaseException:
+                    pass
             self._context.release_run_slot()

@@ -29,6 +29,21 @@ class ValidationOutcome:
     value: Any = None
     feedback: str = ""
 
+    def __post_init__(self) -> None:
+        validate_validation_outcome(self)
+
+
+def validate_validation_outcome(value: Any) -> ValidationOutcome:
+    """Validate a developer-supplied validator result without truthiness coercion."""
+
+    if not isinstance(value, ValidationOutcome):
+        raise TypeError(f"validate() must return a ValidationOutcome, got {type(value).__name__}")
+    if type(value.ok) is not bool:
+        raise TypeError("ValidationOutcome.ok must be a boolean")
+    if type(value.feedback) is not str:
+        raise TypeError("ValidationOutcome.feedback must be a string")
+    return value
+
 
 def ok(value: Any = None) -> ValidationOutcome:
     """Accept the final response, optionally carrying a validated/parsed ``value``."""
@@ -75,11 +90,9 @@ class OutputValidator(Protocol):
         ...
 
     @property
-    def schema(self) -> dict | None:
-        ...
+    def schema(self) -> dict | None: ...
 
-    def validate(self, view: FinalOutputView) -> ValidationOutcome:
-        ...
+    def validate(self, view: FinalOutputView) -> ValidationOutcome: ...
 
 
 class OutputRetry(Exception):

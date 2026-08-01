@@ -20,6 +20,7 @@ Security invariants the core enforces (see ``CapabilityVault.admit``):
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +33,11 @@ from monoid_agent_kernel.core.capability_revocation import (
     import_revocation_state,
     is_capability_revoked,
     is_lease_revoked,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.lease_admission import validate_lease_admission
 from monoid_agent_kernel.core.scope import scope_within
@@ -61,7 +67,11 @@ class CapabilityRequest:
     reason: str = ""
     request_id: str = field(default_factory=lambda: f"cap_req_{uuid.uuid4().hex[:12]}")
 
+    def __post_init__(self) -> None:
+        _normalize_request_fields(self)
+
     def to_json(self) -> dict[str, Any]:
+        _normalize_request_fields(self)
         return {
             "protocol": CAPABILITY_REQUEST_VERSION,
             "request_id": self.request_id,
@@ -99,6 +109,9 @@ class CapabilityLease:
     # no ceiling (the default for ephemeral sync grants); a policy/approval broker sets it.
     max_expires_at: float | None = None
 
+    def __post_init__(self) -> None:
+        _validate_lease_fields(self)
+
     def is_valid(self, now: float) -> bool:
         return now < self.expires_at
 
@@ -111,6 +124,7 @@ class CapabilityLease:
         return self.max_expires_at is None or now < self.max_expires_at
 
     def to_json(self) -> dict[str, Any]:
+        _validate_lease_fields(self)
         return {
             "protocol": CAPABILITY_LEASE_VERSION,
             "lease_id": self.lease_id,
@@ -129,12 +143,16 @@ class CapabilityLease:
         protocol = parse_str(payload, "protocol")
         if protocol and protocol not in ACCEPTED_CAPABILITY_LEASE_VERSIONS:
             raise ValueError("unsupported capability lease protocol")
-        max_expires_at = parse_float(
-            payload,
-            "max_expires_at",
-            default=0.0,
-            allow_none=True,
-        ) if "max_expires_at" in payload else None
+        max_expires_at = (
+            parse_float(
+                payload,
+                "max_expires_at",
+                default=0.0,
+                allow_none=True,
+            )
+            if "max_expires_at" in payload
+            else None
+        )
         scope = require_object(payload["scope"], "scope") if "scope" in payload else {}
         kwargs: dict[str, Any] = {
             "capability": parse_str(payload, "capability"),
@@ -151,6 +169,96 @@ class CapabilityLease:
         return cls(**kwargs)
 
 
+def _finite_epoch(value: Any, field_name: str) -> float:
+    if not is_finite_json_number(value):
+        raise ValueError(f"{field_name} must be a finite number")
+    return float(value)
+
+
+def _normalize_scope(scope: Any, field_name: str) -> dict[str, Any]:
+    # Validate the exact control shape before normalization so tuples and coercible scalar
+    # subclasses do not become newly accepted inputs.
+    _validate_json_scope(scope, field_name)
+    normalized = normalize_json_ingress(scope, substitute_nonfinite=False)
+    if not isinstance(normalized, dict):  # guarded above; keeps the helper total for future callers
+        raise ValueError(f"{field_name} must be an object")
+    return normalized
+
+
+def _normalize_request_fields(request: CapabilityRequest) -> None:
+    if not isinstance(request, CapabilityRequest):
+        raise ValueError("capability request must be a CapabilityRequest")
+    for field_name in ("capability", "run_id", "binding_id", "reason", "request_id"):
+        value = getattr(request, field_name)
+        if type(value) is not str:
+            raise ValueError(f"capability request {field_name} must be a string")
+        object.__setattr__(request, field_name, normalize_unicode_scalars(value))
+    if not request.capability or not request.request_id:
+        raise ValueError("capability request identities must be non-empty strings")
+    if (
+        type(request.ttl_seconds) is not int
+        or request.ttl_seconds <= 0
+        or not is_finite_json_number(request.ttl_seconds)
+    ):
+        raise ValueError("capability request ttl_seconds must be a positive integer")
+    object.__setattr__(
+        request,
+        "scope",
+        _normalize_scope(request.scope, "capability request scope"),
+    )
+
+
+def _validate_json_scope(scope: Any, field_name: str = "capability lease scope") -> None:
+    if not isinstance(scope, dict):
+        raise ValueError(f"{field_name} must be an object")
+    pending: list[tuple[Any, bool]] = [(scope, True)]
+    active: set[int] = set()
+    while pending:
+        value, entering = pending.pop()
+        if isinstance(value, (dict, list)) and not entering:
+            active.remove(id(value))
+            continue
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in active:
+                raise ValueError(f"{field_name} must not contain cycles")
+            active.add(identity)
+            pending.append((value, False))
+            for key, child in value.items():
+                if type(key) is not str:
+                    raise ValueError(f"{field_name} keys must be strings")
+                pending.append((child, True))
+            continue
+        if isinstance(value, list):
+            identity = id(value)
+            if identity in active:
+                raise ValueError(f"{field_name} must not contain cycles")
+            active.add(identity)
+            pending.append((value, False))
+            pending.extend((child, True) for child in value)
+            continue
+        if value is None or type(value) in {str, bool, int}:
+            continue
+        if type(value) is float and math.isfinite(value):
+            continue
+        raise ValueError(f"{field_name} must contain portable JSON values")
+
+
+def _validate_lease_fields(lease: CapabilityLease) -> None:
+    for field_name in ("capability", "token_ref", "lease_id"):
+        value = getattr(lease, field_name)
+        if type(value) is not str or not value:
+            raise ValueError(f"capability lease {field_name} must be a non-empty string")
+        object.__setattr__(lease, field_name, normalize_unicode_scalars(value))
+    _finite_epoch(lease.expires_at, "capability lease expires_at")
+    _finite_epoch(lease.issued_at, "capability lease issued_at")
+    if type(lease.durable) is not bool:
+        raise ValueError("capability lease durable must be a boolean")
+    object.__setattr__(lease, "scope", _normalize_scope(lease.scope, "capability lease scope"))
+    if lease.max_expires_at is not None:
+        _finite_epoch(lease.max_expires_at, "capability lease max_expires_at")
+
+
 @dataclass(frozen=True)
 class CapabilityDenial:
     """A broker's refusal to grant. ``retryable`` hints whether a later attempt might succeed
@@ -159,6 +267,15 @@ class CapabilityDenial:
     capability: str
     reason: str = ""
     retryable: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("capability", "reason"):
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise ValueError(f"capability denial {field_name} must be a string")
+            object.__setattr__(self, field_name, normalize_unicode_scalars(value))
+        if type(self.retryable) is not bool:
+            raise ValueError("capability denial retryable must be a boolean")
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -178,10 +295,19 @@ class CapabilityPending:
     request: CapabilityRequest
     prompt: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, CapabilityRequest):
+            raise ValueError("capability pending request must be a CapabilityRequest")
+        _normalize_request_fields(self.request)
+        if type(self.prompt) is not str:
+            raise ValueError("capability pending prompt must be a string")
+        object.__setattr__(self, "prompt", normalize_unicode_scalars(self.prompt))
+
     def to_json(self) -> dict[str, Any]:
+        request = self.request.to_json()
         return {
-            "capability": self.request.capability,
-            "request_id": self.request.request_id,
+            "capability": request["capability"],
+            "request_id": request["request_id"],
             "prompt": self.prompt,
         }
 
@@ -251,7 +377,9 @@ class CapabilityVault:
     def _is_revoked(self, lease: CapabilityLease) -> bool:
         return is_lease_revoked(self._revocations, lease)
 
-    def get_valid(self, capability: str, scope: dict[str, Any], *, now: float) -> CapabilityLease | None:
+    def get_valid(
+        self, capability: str, scope: dict[str, Any], *, now: float
+    ) -> CapabilityLease | None:
         """Return a cached, non-expired, non-revoked lease that COVERS ``scope`` (the requested
         constraints are within the lease's scope), else ``None``."""
         lease = self._leases.get(capability)
@@ -275,6 +403,8 @@ class CapabilityVault:
     def admit(self, request: CapabilityRequest, lease: CapabilityLease) -> CapabilityLease:
         """Store a granted lease after enforcing least-privilege (grant scope ⊆ request scope).
         Raises ``ValueError`` if the broker tried to widen scope or grant another capability."""
+        _normalize_request_fields(request)
+        _validate_lease_fields(lease)
         validate_lease_admission(request.capability, request.scope, lease.capability, lease.scope)
         self._leases[lease.capability] = lease
         return lease
@@ -351,6 +481,7 @@ class CapabilityVault:
     def install(self, lease: CapabilityLease) -> None:
         """Directly install a lease (no scope re-check) — used on restore to rehydrate durable
         leases from a trusted checkpoint. The lease was already scope-checked at grant time."""
+        _validate_lease_fields(lease)
         self._leases[lease.capability] = lease
 
 

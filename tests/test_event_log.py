@@ -127,8 +127,13 @@ def test_no_newline_fragment_is_uncommitted(tmp_path, fragment: bytes) -> None:
         (b'{"seq": 0}\n', "invalid sequence"),
         (b'{"seq": "secret-marker"}\n', "invalid sequence"),
         (b'{"secret-marker"\n', "valid JSON"),
+        (b'{"seq": 1, "seq": 2}\n', "valid JSON"),
+        (b'{"seq": 1, "data": {"approved": false, "approved": true}}\n', "valid JSON"),
         (b"\xffsecret-marker\n", "valid UTF-8"),
         (b'["secret-marker"]\n', "JSON object"),
+        (b'{"seq": 1, "value": NaN}\n', "valid JSON"),
+        (b'{"seq": 1, "value": Infinity}\n', "valid JSON"),
+        (b'{"seq": 1, "value": -Infinity}\n', "valid JSON"),
     ],
 )
 def test_committed_corruption_is_sanitized(

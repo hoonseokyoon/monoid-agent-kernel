@@ -18,7 +18,7 @@ def str_tuple(
     normalize: bool = False,
     error: Callable[[str], Exception] = ValueError,
 ) -> tuple[str, ...]:
-    """Coerce a JSON array into a tuple of strings.
+    """Validate a JSON string array and return it as a tuple.
 
     A bare string (or any non-array) is rejected with ``type_error``. With
     ``normalize=True`` each item is stripped, lowercased, and empties are
@@ -27,7 +27,9 @@ def str_tuple(
     """
     if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise error(type_error)
-    items = tuple(str(item) for item in value)
+    if not all(isinstance(item, str) for item in value):
+        raise error(type_error)
+    items = tuple(value)
     if normalize:
         return tuple(item.strip().lower() for item in items if item.strip())
     if empty_error is not None and any(not item.strip() for item in items):

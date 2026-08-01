@@ -11,6 +11,7 @@ from support.backend_harness import (
     PermissionDenied,
     PermissionPolicy,
     RunnerBackend,
+    SqliteCheckpointStore,
     TokenError,
     TokenManager,
     ToolScope,
@@ -32,6 +33,7 @@ from support.backend_harness import (
     tool_binding,
 )
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.reference.backend.run_types import normalize_backend_run_request
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
 pytestmark = pytest.mark.integration
@@ -64,6 +66,109 @@ def test_run_preparation_writes_initial_metadata_once(tmp_path: Path, monkeypatc
     assert calls == [submission.run_id]
 
 
+def test_direct_run_request_is_normalized_before_sqlite_admission(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    checkpoint_store = SqliteCheckpointStore(tmp_path / "shared.db")
+    captured_specs: list[Any] = []
+    adapters: list[FakeModelAdapter] = []
+
+    def factory(spec: Any, token: str) -> FakeModelAdapter:
+        del token
+        captured_specs.append(spec)
+        adapter = FakeModelAdapter(turns=[ModelTurn(response_id="turn_1", final_text="done")])
+        adapters.append(adapter)
+        return adapter
+
+    backend = backend_factory.create(
+        run_root=run_root,
+        workspace=workspace,
+        token_manager=_token_manager(),
+        checkpoint_store=checkpoint_store,
+        model_adapter_factory=factory,
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello\ud800world",
+            runtime_config=_default_config(),
+            multi_turn=True,
+            metadata={"score": float("nan"), "label": "bad\ud800label"},
+        )
+    )
+
+    assert eventually(
+        lambda: backend._record(submission.run_id).state is SessionState.AWAITING_INPUT
+    )
+    local_metadata = json.loads((submission.run_dir / "run.json").read_text(encoding="utf-8"))
+    shared_metadata = checkpoint_store.run_metadata(submission.run_id)
+    assert shared_metadata == local_metadata
+    assert local_metadata["title"] == "hello\ufffdworld"
+    assert captured_specs[0].metadata["score"] is None
+    assert captured_specs[0].metadata["label"] == "bad\ufffdlabel"
+    assert adapters[0].requests[0].instruction == "hello\ufffdworld"
+    json.dumps(
+        {"local": local_metadata, "spec": captured_specs[0].metadata},
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    backend.cancel_run(submission.run_id, submission.run_token)
+    backend.wait_for_run(submission.run_id, timeout_s=20)
+
+    existing_run_dirs = set(run_root.iterdir())
+    with pytest.raises(ValueError, match="max_duration_s"):
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="invalid controls",
+                runtime_config=_default_config(),
+                max_duration_s=float("nan"),  # type: ignore[arg-type]
+            )
+        )
+    assert set(run_root.iterdir()) == existing_run_dirs
+
+    with pytest.raises(ValueError, match="metadata.subagent_depth"):
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="invalid reserved metadata control",
+                runtime_config=_default_config(),
+                metadata={"subagent_depth": -100},
+            )
+        )
+    assert set(run_root.iterdir()) == existing_run_dirs
+
+
+@pytest.mark.parametrize("field_name", ["max_steps", "max_tool_calls", "max_bytes_read"])
+def test_backend_run_request_preserves_zero_budget_semantics(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    request = BackendRunRequest(
+        tenant_id="tenant_a",
+        user_id="user_a",
+        workspace_root=workspace,
+        instruction="zero budget",
+        runtime_config=_default_config(),
+        **{field_name: 0},
+    )
+
+    normalized = normalize_backend_run_request(request)
+
+    assert getattr(normalized, field_name) == 0
+
+
 def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapters: list = []
@@ -71,7 +176,12 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
         tmp_path,
         workspace,
         adapters,
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),))],
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),),
+            )
+        ],
     )
     submission = backend.submit_run(
         BackendRunRequest(
@@ -90,7 +200,9 @@ def test_backend_report_task_result_completes_parked_hitl_run(tmp_path: Path) ->
                 return
             for task in _running_hitl_tasks(backend, run_id):
                 try:
-                    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "Ada"})
+                    backend.report_task_result(
+                        run_id, token, task_id=task.job_id, result={"answer": "Ada"}
+                    )
                 except Exception:
                     pass
             time.sleep(0.01)
@@ -142,7 +254,9 @@ def test_backend_task_result_checkpoint_preserves_queued_messages(tmp_path: Path
     assert eventually(lambda: bool(_running_hitl_tasks(backend, run_id)))
     task = _running_hitl_tasks(backend, run_id)[0]
 
-    queued = backend.send_message(run_id, token, "queued while approval is pending", message_id="queued-1")
+    queued = backend.send_message(
+        run_id, token, "queued while approval is pending", message_id="queued-1"
+    )
     assert queued["status"] == "queued"
     assert eventually(lambda: backend._record(run_id).message_queue.qsize() == 1)
 
@@ -242,7 +356,9 @@ def test_backend_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_p
 
     assert eventually(lambda: bool(pending_approval_tasks()))
     task_id = pending_approval_tasks()[0]["task_id"]
-    queued = backend.send_message(run_id, token, "queued while approval replays", message_id="queued-approval")
+    queued = backend.send_message(
+        run_id, token, "queued while approval replays", message_id="queued-approval"
+    )
     assert queued["status"] == "queued"
     backend.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
 
@@ -254,7 +370,9 @@ def test_backend_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_p
     backend.wait_for_run(run_id, timeout_s=20)
 
 
-def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_path: Path) -> None:
+def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_messages(
+    tmp_path: Path,
+) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"
     token_manager = _token_manager()
@@ -301,7 +419,9 @@ def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_mess
         allowed_workspace_roots=(workspace,),
         llm_gateway_url="http://llm-gateway.internal/v1/turns",
         model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
-            turns=[ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),))]
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),))
+            ]
         ),
         tool_providers=(provider,),
     )
@@ -341,7 +461,9 @@ def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_mess
         token_manager=token_manager,
         allowed_workspace_roots=(workspace,),
         llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(final_text="done")]
+        ),
         tool_providers=(provider,),
     )
     backend2.max_recover_attempts = 10_000
@@ -349,7 +471,9 @@ def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_mess
     assert eventually(lambda: bool(pending_approval_tasks(backend2)))
     holder["backend"] = backend2
 
-    queued = backend2.send_message(run_id, token, "queued while recovered approval replays", message_id="queued-recovered")
+    queued = backend2.send_message(
+        run_id, token, "queued while recovered approval replays", message_id="queued-recovered"
+    )
     assert queued["status"] == "queued"
     task_id = pending_approval_tasks(backend2)[0]["task_id"]
     backend2.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
@@ -370,7 +494,12 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
         tmp_path,
         workspace,
         adapters,
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),))],
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick a name"}, "c1"),),
+            )
+        ],
     )
     submission = backend.submit_run(
         BackendRunRequest(
@@ -392,12 +521,18 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
             # Once the model's task is parked, inject a backend-initiated task too.
             if running and "task_id" not in created:
                 try:
-                    created.update(backend.create_task(run_id, token, kind="hitl", request={"prompt": "backend asks"}))
+                    created.update(
+                        backend.create_task(
+                            run_id, token, kind="hitl", request={"prompt": "backend asks"}
+                        )
+                    )
                 except Exception:
                     pass
             for task in _running_hitl_tasks(backend, run_id):
                 try:
-                    backend.report_task_result(run_id, token, task_id=task.job_id, result={"answer": "X"})
+                    backend.report_task_result(
+                        run_id, token, task_id=task.job_id, result={"answer": "X"}
+                    )
                 except Exception:
                     pass
             time.sleep(0.01)
@@ -423,7 +558,9 @@ def test_backend_create_task_injects_into_running_run(tmp_path: Path) -> None:
 def test_backend_multi_turn_session_threads_two_user_messages(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     adapters: list = []
-    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend = _hitl_backend(
+        tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
     backend.idle_timeout_s = 10.0
     submission = backend.submit_run(
         BackendRunRequest(
@@ -462,7 +599,9 @@ def test_backend_single_turn_run_closes_after_first_settle(tmp_path: Path) -> No
     # Without multi_turn the run closes after the first settle (no awaiting_input hang).
     workspace = _workspace(tmp_path)
     adapters: list = []
-    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="done")])
+    backend = _hitl_backend(
+        tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="done")]
+    )
     submission = backend.submit_run(
         BackendRunRequest(
             tenant_id="tenant_a",
@@ -486,7 +625,12 @@ def test_backend_proposal_diff_returns_unified_diff(tmp_path: Path) -> None:
         workspace,
         adapters,
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_write", {"path": "NEW.md", "content": "hi\n"}, "c1"),)),
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "NEW.md", "content": "hi\n"}, "c1"),
+                ),
+            ),
             ModelTurn(response_id="r2", final_text="wrote NEW.md"),
         ],
     )
@@ -511,7 +655,9 @@ def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     # reaches a terminal state (no dangling coroutine on the shared loop).
     workspace = _workspace(tmp_path)
     adapters: list = []
-    backend = _hitl_backend(tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")])
+    backend = _hitl_backend(
+        tmp_path, workspace, adapters, turns=[ModelTurn(response_id="r1", final_text="first")]
+    )
     backend.idle_timeout_s = 30.0
     submission = backend.submit_run(
         BackendRunRequest(
@@ -638,7 +784,11 @@ def test_backend_submits_run_issues_tokens_and_returns_usage(tmp_path: Path) -> 
     usage = backend.tenant_usage("tenant_a")
     assert usage["runs"] == 1
     assert usage["total_tokens"] == 10
-    run_files = "\n".join(path.read_text(encoding="utf-8") for path in submission.run_dir.glob("*.json*") if path.is_file())
+    run_files = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in submission.run_dir.glob("*.json*")
+        if path.is_file()
+    )
     assert captured_gateway_tokens
     assert captured_gateway_tokens[0] not in run_files
 
@@ -650,7 +800,10 @@ def test_backend_permission_policy_reaches_manifest_and_execution(tmp_path: Path
     def factory(_spec, _llm_gateway_token):
         return FakeModelAdapter(
             turns=[
-                ModelTurn(response_id="turn_1", tool_calls=(fake_tool_call("fs_read", {"path": ".env"}, "call_env"),)),
+                ModelTurn(
+                    response_id="turn_1",
+                    tool_calls=(fake_tool_call("fs_read", {"path": ".env"}, "call_env"),),
+                ),
                 ModelTurn(final_text="done"),
             ]
         )
@@ -677,7 +830,10 @@ def test_backend_permission_policy_reaches_manifest_and_execution(tmp_path: Path
     manifest = json.loads(submission.run_dir.joinpath("manifest.json").read_text(encoding="utf-8"))
     assert manifest["permission_policy"] == {"deny_patterns": [".env"], "redact_patterns": [".env"]}
     events = backend.events(submission.run_id, submission.run_token)["events"]
-    assert any(event["type"] == "tool.call.failed" and event["data"]["call_id"] == "call_env" for event in events)
+    assert any(
+        event["type"] == "tool.call.failed" and event["data"]["call_id"] == "call_env"
+        for event in events
+    )
 
 
 def test_backend_web_binding_requires_gateway_url(tmp_path: Path) -> None:
@@ -687,7 +843,9 @@ def test_backend_web_binding_requires_gateway_url(tmp_path: Path) -> None:
         token_manager=_token_manager(),
         allowed_workspace_roots=(workspace,),
         llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(final_text="done")]
+        ),
     )
 
     with pytest.raises(ValueError, match="web_gateway_url"):
@@ -759,8 +917,13 @@ def test_backend_shell_binding_auto_approves_without_provider_env_leak(
     )
 
     assert backend.wait_for_run(submission.run_id, timeout_s=5) is SessionState.COMPLETED
-    assert submission.run_dir.joinpath("proposal", "files", "BACKEND.md").read_text(encoding="utf-8") == "None"
-    run_text = "\n".join(path.read_text(encoding="utf-8") for path in submission.run_dir.rglob("*.json*"))
+    assert (
+        submission.run_dir.joinpath("proposal", "files", "BACKEND.md").read_text(encoding="utf-8")
+        == "None"
+    )
+    run_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in submission.run_dir.rglob("*.json*")
+    )
     assert "provider-secret" not in run_text
 
 

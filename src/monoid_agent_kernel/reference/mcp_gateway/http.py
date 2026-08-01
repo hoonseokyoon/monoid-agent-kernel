@@ -100,7 +100,9 @@ def make_mcp_handler(
             if method == "prompts/get":
                 params = message.get("params") or {}
                 try:
-                    result = server.get_prompt(str(params.get("name") or ""), params.get("arguments"))
+                    result = server.get_prompt(
+                        str(params.get("name") or ""), params.get("arguments")
+                    )
                 except FakeMcpError as exc:
                     self._write_jsonrpc_error(rid, exc.code, exc.message)
                     return
@@ -114,7 +116,7 @@ def make_mcp_handler(
                 return
             header = self.headers.get("Authorization") or ""
             prefix = "Bearer "
-            token = header[len(prefix):].strip() if header.startswith(prefix) else ""
+            token = header[len(prefix) :].strip() if header.startswith(prefix) else ""
             if token != admin_token:
                 raise PermissionDenied("invalid or missing MCP gateway token")
 
@@ -125,19 +127,25 @@ def make_mcp_handler(
             return None
 
         # -- response writers -----------------------------------------------------------
-        def _write_result(self, rid: Any, result: dict[str, Any], *, session_id: str | None = None) -> None:
+        def _write_result(
+            self, rid: Any, result: dict[str, Any], *, session_id: str | None = None
+        ) -> None:
             self._write_json({"jsonrpc": "2.0", "id": rid, "result": result}, session_id=session_id)
 
         def _write_jsonrpc_error(self, rid: Any, code: int, message: str) -> None:
             # A JSON-RPC error rides a 200 HTTP response (the error lives in the body); the
             # client raises McpError off the "error" field.
-            self._write_json({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
+            self._write_json(
+                {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+            )
 
         def _write_exception(self, exc: Exception) -> None:
             if isinstance(exc, PermissionDenied):
                 self._write_error(HTTPStatus.UNAUTHORIZED, str(exc), error_code="mcp_auth_error")
             elif isinstance(exc, HttpRequestTooLarge):
-                self._write_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), error_code="mcp_bad_request")
+                self._write_error(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), error_code="mcp_bad_request"
+                )
             elif isinstance(exc, ValueError):
                 self._write_error(HTTPStatus.BAD_REQUEST, str(exc), error_code="mcp_bad_request")
             else:
@@ -147,7 +155,9 @@ def make_mcp_handler(
                     error_code="mcp_server_error",
                 )
 
-        def _write_error(self, status: HTTPStatus, message: str, *, error_code: str = "mcp_gateway_error") -> None:
+        def _write_error(
+            self, status: HTTPStatus, message: str, *, error_code: str = "mcp_gateway_error"
+        ) -> None:
             self._write_json(
                 {"error": message, "error_code": error_code, "http_status": int(status)},
                 status=status,
@@ -165,7 +175,7 @@ def make_mcp_handler(
             status: HTTPStatus = HTTPStatus.OK,
             session_id: str | None = None,
         ) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             if session_id:
@@ -184,4 +194,6 @@ def create_mcp_server(
     port: int,
     admin_token: str | None = None,
 ) -> HardenedThreadingHTTPServer:
-    return HardenedThreadingHTTPServer((host, port), make_mcp_handler(server, admin_token=admin_token))
+    return HardenedThreadingHTTPServer(
+        (host, port), make_mcp_handler(server, admin_token=admin_token)
+    )

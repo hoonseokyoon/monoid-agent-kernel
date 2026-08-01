@@ -42,6 +42,8 @@ from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
     PACKAGE_SCHEMA,
+    PUBLIC_JOB_SCHEMA,
+    PUBLIC_JOB_SCHEMA_VERSION,
     PROPOSAL_SCHEMA,
     WORKSPACE_BASE_SCHEMA,
     WORKSPACE_INDEX_SCHEMA,
@@ -57,8 +59,10 @@ from monoid_agent_kernel.reference._shared.tokens import (
     TOKEN_HEADER_TYPE,
 )
 from monoid_agent_kernel.reference.studio.chat_projection import (
+    CHAT_SCHEMA_V1,
     CHAT_MESSAGE_SCHEMA_VERSION,
     CHAT_SCHEMA_VERSION,
+    SUPPORTED_CHAT_SCHEMA_VERSIONS,
 )
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
@@ -78,7 +82,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 34
+    assert len(artifacts) == 36
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -116,6 +120,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "manifest": MANIFEST_SCHEMA_VERSION,
         "workspace-base": WORKSPACE_BASE_SCHEMA_VERSION,
         "workspace-index": WORKSPACE_INDEX_SCHEMA_VERSION,
+        "public-background-job": PUBLIC_JOB_SCHEMA_VERSION,
         "proposal-package": PACKAGE_SCHEMA_VERSION,
         "approval": APPROVAL_SCHEMA_VERSION,
         "apply-result": APPLY_RESULT_SCHEMA_VERSION,
@@ -129,6 +134,11 @@ def test_registry_matches_source_owned_version_constants() -> None:
     }
 
     assert {key: compatibility_artifact(key).current_writer for key in expected} == expected
+
+    studio_chat = compatibility_artifact("studio-chat")
+    assert studio_chat.current_writer == CHAT_SCHEMA_VERSION
+    assert studio_chat.supported_readers == SUPPORTED_CHAT_SCHEMA_VERSIONS
+    assert studio_chat.supported_readers[0] == CHAT_SCHEMA_V1
 
 
 def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
@@ -161,6 +171,7 @@ def test_json_schema_reader_versions_match_registry() -> None:
         "workspace-index": WORKSPACE_INDEX_SCHEMA,
         "proposal": PROPOSAL_SCHEMA,
         "background-job": JOB_SCHEMA,
+        "public-background-job": PUBLIC_JOB_SCHEMA,
         "proposal-package": PACKAGE_SCHEMA,
         "approval": APPROVAL_SCHEMA,
         "apply-result": APPLY_RESULT_SCHEMA,
@@ -206,10 +217,19 @@ def test_documented_ledger_rows_match_registry_in_order() -> None:
         if not line.startswith("| `"):
             continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        documented.append((cells[0].strip("`"), cells[2].strip("`")))
+        documented.append((cells[0].strip("`"), cells[2].strip("`"), cells[3].strip()))
 
+    # The reader-policy cell is checked too. Reading only the key and the writer left the column
+    # that actually drifted unchecked, in a table whose own preamble says CI checks it: the
+    # `transcript` row said `json-schema` while the registry set `accepts_missing_version=True`,
+    # and every other such row renders the suffix.
     assert documented == [
-        (artifact.key, artifact.current_writer) for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
+        (
+            artifact.key,
+            artifact.current_writer,
+            artifact.reader_policy + ("; missing id accepted" if artifact.accepts_missing_version else ""),
+        )
+        for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
     ]
     alias_table = text.split("<!-- compatibility-aliases:start -->", 1)[1].split(
         "<!-- compatibility-aliases:end -->", 1

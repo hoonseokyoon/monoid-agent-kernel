@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel._runtime_config_ingress import normalize_runtime_config
 from monoid_agent_kernel.core.agents import AgentDefinition, AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.content import ContentPart
+from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.lifecycle import SessionState, session_state_value
 from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.result import AgentRunResult
@@ -39,6 +42,112 @@ class BackendRunRequest:
     # When True the session stays open awaiting follow-up messages (multi-turn).
     multi_turn: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _nonnegative_integer(value: Any, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _normalize_permission_policy(policy: Any) -> PermissionPolicy:
+    if not isinstance(policy, PermissionPolicy):
+        raise ValueError("permission_policy must be a PermissionPolicy")
+    return PermissionPolicy(
+        deny_patterns=tuple(
+            _required_text(pattern, "permission_policy deny pattern")
+            for pattern in policy.deny_patterns
+        ),
+        redact_patterns=tuple(
+            _required_text(pattern, "permission_policy redact pattern")
+            for pattern in policy.redact_patterns
+        ),
+    )
+
+
+def _normalize_agent_definition(definition: Any) -> AgentDefinition | None:
+    if definition is None:
+        return None
+    if not isinstance(definition, AgentDefinition):
+        raise ValueError("agent_definition must be an AgentDefinition or null")
+    normalized_config = normalize_runtime_config(AgentRuntimeConfig.from_definition(definition))
+    normalized_metadata = normalize_json_ingress(definition.metadata)
+    if not isinstance(normalized_metadata, dict):
+        raise ValueError("agent_definition.metadata must be an object")
+    normalized = copy(definition)
+    for name, value in {
+        "id": normalized_config.definition_id,
+        "version": _required_text(definition.version, "agent_definition.version"),
+        "description": _required_text(
+            definition.description,
+            "agent_definition.description",
+        ),
+        "model": normalized_config.model,
+        "prompt": normalized_config.prompt,
+        "tools": normalized_config.tools,
+        "tool_search": normalized_config.tool_search,
+        "metadata": normalized_metadata,
+    }.items():
+        object.__setattr__(normalized, name, value)
+    return normalized
+
+
+def normalize_backend_run_request(request: BackendRunRequest) -> BackendRunRequest:
+    """Copy a direct Python run request into its portable typed domain before any side effect."""
+
+    if not isinstance(request, BackendRunRequest):
+        raise ValueError("request must be a BackendRunRequest")
+    if not isinstance(request.workspace_root, Path):
+        raise ValueError("workspace_root must be a Path")
+    if not isinstance(request.input_parts, (list, tuple)):
+        raise ValueError("input_parts must be an array of content parts")
+    if type(request.multi_turn) is not bool:
+        raise ValueError("multi_turn must be a boolean")
+    if request.max_duration_s is not None and (
+        type(request.max_duration_s) is not int or request.max_duration_s < 0
+    ):
+        raise ValueError("max_duration_s must be a non-negative integer or null")
+    if not isinstance(request.metadata, dict):
+        raise ValueError("metadata must be an object")
+
+    normalized_metadata = normalize_json_ingress(request.metadata)
+    assert isinstance(normalized_metadata, dict)
+    subagent_depth = normalized_metadata.get("subagent_depth", 0)
+    if type(subagent_depth) is not int or subagent_depth < 0:
+        raise ValueError("metadata.subagent_depth must be a non-negative integer")
+    normalized_definition = _normalize_agent_definition(request.agent_definition)
+    normalized_config = (
+        normalize_runtime_config(request.runtime_config)
+        if request.runtime_config is not None
+        else None
+    )
+    return BackendRunRequest(
+        tenant_id=_required_text(request.tenant_id, "tenant_id"),
+        user_id=_required_text(request.user_id, "user_id"),
+        workspace_root=Path(normalize_unicode_scalars(str(request.workspace_root))),
+        instruction=_required_text(request.instruction, "instruction"),
+        input_parts=tuple(normalize_content_part(part) for part in request.input_parts),
+        mode=_required_text(request.mode, "mode"),  # type: ignore[arg-type]
+        workspace_backend=_required_text(  # type: ignore[arg-type]
+            request.workspace_backend,
+            "workspace_backend",
+        ),
+        max_steps=_nonnegative_integer(request.max_steps, "max_steps"),
+        max_tool_calls=_nonnegative_integer(request.max_tool_calls, "max_tool_calls"),
+        max_bytes_read=_nonnegative_integer(request.max_bytes_read, "max_bytes_read"),
+        max_duration_s=request.max_duration_s,
+        permission_policy=_normalize_permission_policy(request.permission_policy),
+        agent_definition=normalized_definition,
+        runtime_config=normalized_config,
+        multi_turn=request.multi_turn,
+        metadata=normalized_metadata,
+    )
 
 
 @dataclass(frozen=True)

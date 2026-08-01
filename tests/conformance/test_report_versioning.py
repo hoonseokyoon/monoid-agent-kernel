@@ -116,6 +116,15 @@ def test_default_v1_writer_keeps_the_deployed_v2_reader_path() -> None:
     )
 
 
+def test_report_rejects_float_overflowing_control_numbers() -> None:
+    with pytest.raises(ValueError, match="started_at must be a finite non-negative number"):
+        replace(_v2_report(), started_at=10**400)
+
+    payload = _v2_report().to_json()
+    payload["duration_s"] = 10**400
+    assert decode_conformance_report(payload).status == "corrupt"
+
+
 def test_v2_report_round_trips_through_checked_reader() -> None:
     report = _v2_report()
     payload = report.to_json()

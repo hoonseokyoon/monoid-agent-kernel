@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from monoid_agent_kernel.env import _FALSE_VALUES, _TRUE_VALUES
 from monoid_agent_kernel.reference.studio.cli import studio
 
 
@@ -33,6 +34,76 @@ def test_doctor_offline_all_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result.exit_code == 0, result.output
     assert "[PASS]" in result.output
     assert "All hard checks passed" in result.output
+
+
+def test_doctor_fails_on_a_typo_in_the_delta_kill_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed switch value is a startup error by design, so preflight has to catch it.
+
+    Without this the doctor reported every hard check passing and `serve` then died in
+    `AgentLoop.__post_init__` on the next command — the exact class of late, cryptic failure this
+    command exists to convert into an upfront checklist. The doctor loads the same `.env` the loop
+    reads, which is where the typo lives.
+
+    The remedy line matters as much as the failure: `of` is a plausible spelling of `off`, so the
+    output has to say what *is* accepted rather than only that this is not.
+    """
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "of")
+    result = _invoke(tmp_path, "--no-env-file")
+    assert result.exit_code == 1, result.output
+    assert "MONOID_OUTPUT_DELTAS" in result.output
+    assert "[FAIL]" in result.output
+    # Driven off the constants, not a substring: `"off" in output` was satisfied by the doctor's
+    # own earlier `[PASS] provider 'offline'` line, so this assertion held even when the remedy
+    # named nothing at all.
+    for accepted in sorted(_TRUE_VALUES | _FALSE_VALUES):
+        assert repr(accepted) in result.output, f"the remedy never names {accepted!r}"
+
+
+@pytest.mark.parametrize(
+    ("env_value", "extra", "transport", "expected"),
+    [
+        (None, (), True, "will be published"),
+        ("0", (), True, "disabled by MONOID_OUTPUT_DELTAS"),
+        (None, ("--no-output-deltas",), True, "disabled by --no-output-deltas"),
+        (None, (), False, "async transport is not installed"),
+    ],
+)
+def test_doctor_reports_the_effective_delta_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    extra: tuple[str, ...],
+    transport: bool,
+    expected: str,
+) -> None:
+    """Reporting the resolved state, not just the absence of an error.
+
+    This switch fails silently in the direction that matters: an operator who believes they turned
+    off a channel publishing raw model text, and did not, is told nothing by a bare `[PASS]`.
+
+    Every input `StudioServer.start` ANDs together gets a case, and each asserts on the *named
+    cause* rather than on "off", because naming the wrong one sends someone to edit the wrong
+    place. The transport case is the one a first version missed: without `httpx` — the base
+    package's own default — the server uses one-shot turns and publishes no deltas at all, while
+    the doctor announced raw model text was about to be published.
+
+    `transport` is patched rather than inferred so the expected line does not depend on whether the
+    machine running the suite happens to have the optional extra installed.
+    """
+    monkeypatch.setattr(
+        "monoid_agent_kernel.reference.studio.cli._gateway_streaming_available", lambda: transport
+    )
+    if env_value is None:
+        monkeypatch.delenv("MONOID_OUTPUT_DELTAS", raising=False)
+    else:
+        monkeypatch.setenv("MONOID_OUTPUT_DELTAS", env_value)
+
+    result = _invoke(tmp_path, "--no-env-file", *extra)
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.output
 
 
 def test_doctor_openai_without_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

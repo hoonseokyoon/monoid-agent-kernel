@@ -42,7 +42,11 @@ def make_llm_gateway_handler(
                     self._write_json({"ok": True})
                     return
                 parts = [part for part in parsed.path.split("/") if part]
-                if len(parts) == 5 and parts[:3] == ["internal", "llm", "tenants"] and parts[4] == "usage":
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["internal", "llm", "tenants"]
+                    and parts[4] == "usage"
+                ):
                     self._require_admin()
                     self._write_json(gateway.tenant_usage(parts[3]))
                     return
@@ -103,6 +107,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
+                    provider_retried=exc.provider_retried,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -140,19 +145,23 @@ def make_llm_gateway_handler(
             *,
             error_code: str = GATEWAY_BAD_RESPONSE,
             retryable: bool = False,
+            provider_retried: bool = False,
         ) -> None:
             self._write_json(
-                {
-                    "error": message,
-                    "error_code": error_code,
-                    "retryable": retryable,
-                    "http_status": int(status),
-                },
+                _error_body(
+                    status,
+                    message,
+                    error_code=error_code,
+                    retryable=retryable,
+                    provider_retried=provider_retried,
+                ),
                 status=status,
             )
 
-        def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def _write_json(
+            self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -180,29 +189,68 @@ def make_llm_gateway_handler(
 
         def _write_sse_frame(self, frame: dict[str, Any]) -> None:
             # Single-line JSON (no indent), flushed per frame so the stream is live.
-            self.wfile.write(b"data: " + json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            self.wfile.write(
+                b"data: "
+                + json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                + b"\n\n"
+            )
             self.wfile.flush()
 
     return LlmGatewayHttpHandler
 
 
+def _error_body(
+    status: HTTPStatus,
+    message: str,
+    *,
+    error_code: str = GATEWAY_BAD_RESPONSE,
+    retryable: bool = False,
+    provider_retried: bool = False,
+) -> dict[str, Any]:
+    """The fields every gateway error carries, whatever transport reports it.
+
+    One definition rather than one per writer. The non-200 body and the SSE error frame are read
+    back by the same client code but were written separately, so every field added to one had to be
+    remembered for the other -- ``provider_retried`` was added to both in the same commit only
+    because they were reviewed together. One definition removes the chance to forget.
+
+    ``provider_retried`` is a retry the gateway's *backend* made before failing. The client can only
+    see its own attempts, so without it a call the provider retried and then failed was recorded as
+    a clean single attempt -- and a failure is where that record matters most. It defaults False,
+    which is what an error the gateway raised on its own, before reaching a provider, means.
+    """
+
+    return {
+        "error": message,
+        "error_code": error_code,
+        "retryable": retryable,
+        "http_status": int(status),
+        "provider_retried": provider_retried,
+    }
+
+
 def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict[str, Any]:
-    """Mid-stream error as an SSE frame, mirroring ``_write_error``'s fields so the client maps
-    it back to a ModelAdapterError identically to a non-200 response."""
+    """Mid-stream error as an SSE frame, carrying ``_error_body``'s fields so the client maps it
+    back to a ModelAdapterError identically to a non-200 response."""
     if isinstance(exc, ModelAdapterError):
         return {
             "type": "error",
-            "error": str(exc),
-            "error_code": exc.provider_error_code or GATEWAY_BAD_RESPONSE,
-            "retryable": exc.retryable,
-            "http_status": int(_model_error_status(exc)),
+            **_error_body(
+                _model_error_status(exc),
+                str(exc),
+                error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
+                retryable=exc.retryable,
+                provider_retried=exc.provider_retried,
+            ),
         }
     return {
         "type": "error",
-        "error": redact_internal_error(_LOGGER, handler, exc),
-        "error_code": GATEWAY_SERVER_ERROR,
-        "retryable": True,
-        "http_status": int(HTTPStatus.INTERNAL_SERVER_ERROR),
+        **_error_body(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            redact_internal_error(_LOGGER, handler, exc),
+            error_code=GATEWAY_SERVER_ERROR,
+            retryable=True,
+        ),
     }
 
 
@@ -222,4 +270,6 @@ def create_llm_gateway_server(
     port: int,
     admin_token: str,
 ) -> HardenedThreadingHTTPServer:
-    return HardenedThreadingHTTPServer((host, port), make_llm_gateway_handler(gateway, admin_token=admin_token))
+    return HardenedThreadingHTTPServer(
+        (host, port), make_llm_gateway_handler(gateway, admin_token=admin_token)
+    )

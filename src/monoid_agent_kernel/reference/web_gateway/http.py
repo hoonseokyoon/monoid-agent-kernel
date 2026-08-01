@@ -36,7 +36,11 @@ def make_web_gateway_handler(
                     self._write_json({"ok": True})
                     return
                 parts = [part for part in parsed.path.split("/") if part]
-                if len(parts) == 5 and parts[:3] == ["internal", "web", "tenants"] and parts[4] == "usage":
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["internal", "web", "tenants"]
+                    and parts[4] == "usage"
+                ):
                     self._require_admin()
                     self._write_json(gateway.tenant_usage(parts[3]))
                     return
@@ -54,7 +58,9 @@ def make_web_gateway_handler(
                     self._write_json(gateway.handle_fetch(self._bearer_token(), self._read_json()))
                     return
                 if parsed.path == "/internal/web/context":
-                    self._write_json(gateway.handle_context(self._bearer_token(), self._read_json()))
+                    self._write_json(
+                        gateway.handle_context(self._bearer_token(), self._read_json())
+                    )
                     return
                 self._write_error(HTTPStatus.NOT_FOUND, "not found")
             except Exception as exc:
@@ -92,7 +98,9 @@ def make_web_gateway_handler(
                     error_code=exc.error_code,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
-                self._write_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), error_code="web_bad_request")
+                self._write_error(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), error_code="web_bad_request"
+                )
             elif isinstance(exc, ValueError):
                 self._write_error(HTTPStatus.BAD_REQUEST, str(exc), error_code="web_bad_request")
             elif isinstance(exc, NativeAgentError):
@@ -124,8 +132,10 @@ def make_web_gateway_handler(
                 status=status,
             )
 
-        def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def _write_json(
+            self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
+        ) -> None:
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -152,4 +162,6 @@ def create_web_gateway_server(
     port: int,
     admin_token: str,
 ) -> HardenedThreadingHTTPServer:
-    return HardenedThreadingHTTPServer((host, port), make_web_gateway_handler(gateway, admin_token=admin_token))
+    return HardenedThreadingHTTPServer(
+        (host, port), make_web_gateway_handler(gateway, admin_token=admin_token)
+    )

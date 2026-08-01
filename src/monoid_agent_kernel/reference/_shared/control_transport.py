@@ -12,6 +12,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -104,6 +108,35 @@ def sanitize_command_data(value: Any, *, key: str = "") -> Any:
     return repr(value)
 
 
+def sanitize_command_args(command_type: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize durable args while retaining validated tool authorization policy values."""
+
+    sanitized = sanitize_command_data(args)
+    assert isinstance(sanitized, dict)
+    if command_type != "replace_runtime_config":
+        return sanitized
+
+    source_config = args.get("config")
+    target_config = sanitized.get("config")
+    if not isinstance(source_config, dict) or not isinstance(target_config, dict):
+        return sanitized
+    source_tools = source_config.get("tools")
+    target_tools = target_config.get("tools")
+    if not isinstance(source_tools, list) or not isinstance(target_tools, list):
+        return sanitized
+
+    for source_tool, target_tool in zip(source_tools, target_tools, strict=True):
+        if not isinstance(source_tool, dict) or not isinstance(target_tool, dict):
+            continue
+        authorization = source_tool.get("authorization")
+        if isinstance(authorization, str) and authorization in {"allow", "ask", "deny"}:
+            # ``ToolBinding.authorization`` is a policy enum, not an HTTP credential. Keep the
+            # exception at this exact validated runtime-config path; every other key named
+            # ``authorization`` remains redacted by ``sanitize_command_data``.
+            target_tool["authorization"] = authorization
+    return sanitized
+
+
 def redact_command_credential(value: Any, credential: str) -> Any:
     """Remove the authenticated bearer value if a caller repeated it in payload text."""
 
@@ -132,11 +165,34 @@ def command_identity_sha256(
 ) -> str:
     """Canonical semantic identity used to reject conflicting command-ID reuse."""
 
+    if not isinstance(command_type, str):
+        raise ValueError("command type must be a string")
+    if not isinstance(args, dict):
+        raise ValueError("command args must be an object")
+    if not isinstance(principal, CommandPrincipal):
+        raise ValueError("command principal must be a CommandPrincipal")
+    if not all(
+        isinstance(value, str)
+        for value in (principal.tenant_id, principal.user_id, principal.issuer, reason)
+    ):
+        raise ValueError("command principal and reason fields must be strings")
+    normalized_args = normalize_json_ingress(sanitize_command_args(command_type, args))
+    assert isinstance(normalized_args, dict)
     payload = {
-        "type": command_type,
-        "args": sanitize_command_data(args),
-        "principal": principal.to_json(),
-        "reason": reason,
+        "type": normalize_unicode_scalars(command_type),
+        "args": normalized_args,
+        "principal": {
+            "tenant_id": normalize_unicode_scalars(principal.tenant_id),
+            "user_id": normalize_unicode_scalars(principal.user_id),
+            "issuer": normalize_unicode_scalars(principal.issuer),
+        },
+        "reason": normalize_unicode_scalars(reason),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

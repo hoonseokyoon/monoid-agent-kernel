@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urljoin
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from monoid_agent_kernel._version import user_agent
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, normalize_json_ingress
 from monoid_agent_kernel.web import WebGatewayError, domain_allowed, domain_from_url
 
 DEFAULT_BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -21,8 +22,7 @@ DEFAULT_HTTP_USER_AGENT = user_agent("monoid-agent-kernel-webgateway")
 class SearchProvider(Protocol):
     provider_name: str
 
-    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
-        ...
+    def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]: ...
 
 
 class FetchProvider(Protocol):
@@ -37,8 +37,7 @@ class FetchProvider(Protocol):
         blocked_domains: tuple[str, ...] = (),
         timeout_s: int | None = None,
         max_bytes: int | None = None,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
 
 class ContextProvider(Protocol):
@@ -55,8 +54,7 @@ class ContextProvider(Protocol):
         freshness: str | None,
         allowed_domains: tuple[str, ...],
         blocked_domains: tuple[str, ...],
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -100,7 +98,9 @@ class CompositeWebProvider:
         blocked_domains: tuple[str, ...],
     ) -> dict[str, Any]:
         if self.context_provider is None:
-            raise WebGatewayError("web context provider is not configured", error_code="web_disabled")
+            raise WebGatewayError(
+                "web context provider is not configured", error_code="web_disabled"
+            )
         provider = self.context_provider
         return provider.context(
             query,
@@ -250,7 +250,9 @@ class HttpFetchProvider:
         timeout_s: int | None = None,
         max_bytes: int | None = None,
     ) -> dict[str, Any]:
-        _ensure_fetch_url_allowed(url, allowed_domains=allowed_domains, blocked_domains=blocked_domains)
+        _ensure_fetch_url_allowed(
+            url, allowed_domains=allowed_domains, blocked_domains=blocked_domains
+        )
         effective_timeout_s = max(1, int(timeout_s if timeout_s is not None else self.timeout_s))
         effective_max_raw_bytes = min(
             self.max_raw_bytes,
@@ -283,7 +285,9 @@ class HttpFetchProvider:
                     time.sleep(0.05 * (attempt + 1))
                     continue
                 if isinstance(exc, TimeoutError):
-                    raise WebGatewayError("fetch timed out", error_code="web_fetch_timeout") from exc
+                    raise WebGatewayError(
+                        "fetch timed out", error_code="web_fetch_timeout"
+                    ) from exc
                 reason = getattr(exc, "reason", exc)
                 raise WebGatewayError(
                     f"fetch failed: {reason}", error_code="web_fetch_network_error"
@@ -327,7 +331,9 @@ class HttpFetchProvider:
         current_url = url
         for _redirect_count in range(10):
             try:
-                with _NO_REDIRECT_OPENER.open(self._request(current_url), timeout=timeout_s) as response:
+                with _NO_REDIRECT_OPENER.open(
+                    self._request(current_url), timeout=timeout_s
+                ) as response:
                     return (
                         response.geturl(),
                         response.headers.get("Content-Type", ""),
@@ -346,7 +352,9 @@ class HttpFetchProvider:
                     blocked_domains=blocked_domains,
                 )
                 current_url = next_url
-        raise WebGatewayError("fetch redirect limit exceeded", error_code="web_fetch_redirect_limit")
+        raise WebGatewayError(
+            "fetch redirect limit exceeded", error_code="web_fetch_redirect_limit"
+        )
 
 
 @dataclass(frozen=True)
@@ -434,7 +442,11 @@ class SearchFetchContextProvider:
         filtered_results = [
             result
             for result in results
-            if _domain_allowed_by_filters(str(result.get("domain") or domain_from_url(str(result.get("url") or ""))), allowed_domains, blocked_domains)
+            if _domain_allowed_by_filters(
+                str(result.get("domain") or domain_from_url(str(result.get("url") or ""))),
+                allowed_domains,
+                blocked_domains,
+            )
         ][:max_urls]
         pages: list[dict[str, Any]] = []
         for result in filtered_results:
@@ -508,7 +520,13 @@ def _request_json(
     error_prefix: str = "search provider",
     error_code_prefix: str = "web_search",
 ) -> dict[str, Any]:
-    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    data = (
+        None
+        if body is None
+        else json.dumps(normalize_json_ingress(body), ensure_ascii=False, allow_nan=False).encode(
+            "utf-8"
+        )
+    )
     body = _urlopen_read_with_retry(
         Request(url, data=data, headers=headers, method=method),
         timeout_s=timeout_s,
@@ -516,11 +534,17 @@ def _request_json(
         error_code_prefix=error_code_prefix,
     )
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise WebGatewayError(f"{error_prefix} returned invalid JSON", error_code=f"{error_code_prefix}_bad_response") from exc
+        payload = loads_json_ingress(body.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise WebGatewayError(
+            f"{error_prefix} returned invalid JSON",
+            error_code=f"{error_code_prefix}_bad_response",
+        ) from exc
     if not isinstance(payload, dict):
-        raise WebGatewayError(f"{error_prefix} response must be an object", error_code=f"{error_code_prefix}_bad_response")
+        raise WebGatewayError(
+            f"{error_prefix} response must be an object",
+            error_code=f"{error_code_prefix}_bad_response",
+        )
     return payload
 
 
@@ -552,7 +576,9 @@ def _ensure_fetch_url_allowed(
         )
 
 
-def _normalize_brave_results(payload: dict[str, Any], *, max_results: int, source: str) -> list[dict[str, Any]]:
+def _normalize_brave_results(
+    payload: dict[str, Any], *, max_results: int, source: str
+) -> list[dict[str, Any]]:
     raw_results = []
     web = payload.get("web")
     if isinstance(web, dict) and isinstance(web.get("results"), list):
@@ -574,9 +600,15 @@ def _normalize_brave_results(payload: dict[str, Any], *, max_results: int, sourc
     return results
 
 
-def _normalize_context_payload(payload: dict[str, Any], *, query: str, source: str) -> dict[str, Any]:
-    sources = _normalize_sources(payload.get("sources") or payload.get("results") or payload.get("web", {}).get("results"))
-    chunks = _normalize_chunks(payload.get("chunks") or payload.get("snippets") or payload.get("context_chunks"))
+def _normalize_context_payload(
+    payload: dict[str, Any], *, query: str, source: str
+) -> dict[str, Any]:
+    sources = _normalize_sources(
+        payload.get("sources") or payload.get("results") or payload.get("web", {}).get("results")
+    )
+    chunks = _normalize_chunks(
+        payload.get("chunks") or payload.get("snippets") or payload.get("context_chunks")
+    )
     if not chunks:
         chunks = _chunks_from_grounding(payload.get("grounding"))
     context = str(
@@ -611,7 +643,9 @@ def _normalize_sources(value: Any) -> list[dict[str, Any]]:
                 {
                     "url": url_text,
                     "title": str(item.get("title") or item.get("name") or ""),
-                    "domain": str(item.get("domain") or item.get("hostname") or domain_from_url(url_text)),
+                    "domain": str(
+                        item.get("domain") or item.get("hostname") or domain_from_url(url_text)
+                    ),
                     "snippet": str(item.get("snippet") or item.get("description") or "")[:500],
                     "source": str(item.get("source") or ""),
                 }
@@ -726,13 +760,17 @@ def _format_context(query: str, chunks: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
-def _domain_allowed_by_filters(domain: str, allowed_domains: tuple[str, ...], blocked_domains: tuple[str, ...]) -> bool:
+def _domain_allowed_by_filters(
+    domain: str, allowed_domains: tuple[str, ...], blocked_domains: tuple[str, ...]
+) -> bool:
     normalized = domain.lower().strip(".")
     if not normalized:
         return False
     if any(_domain_matches(normalized, pattern) for pattern in blocked_domains):
         return False
-    if allowed_domains and not any(_domain_matches(normalized, pattern) for pattern in allowed_domains):
+    if allowed_domains and not any(
+        _domain_matches(normalized, pattern) for pattern in allowed_domains
+    ):
         return False
     return True
 
@@ -771,7 +809,9 @@ def _extract_title(html: str) -> str:
 def _html_to_text(html: str) -> str:
     parser = _TextHtmlParser()
     parser.feed(html)
-    return "\n".join(line for line in (" ".join(chunk.split()) for chunk in parser.text_chunks) if line)
+    return "\n".join(
+        line for line in (" ".join(chunk.split()) for chunk in parser.text_chunks) if line
+    )
 
 
 class _TextHtmlParser(HTMLParser):

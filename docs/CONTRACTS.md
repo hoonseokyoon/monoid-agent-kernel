@@ -205,6 +205,13 @@ makes a backend a drop-in.
 - `metadata`
 - `config_hash`
 
+`config_hash` identifies the parsed runtime configuration rather than every JSON representation
+detail. It hashes every policy value, including the raw `allowed_paths` and `denied_paths` arrays,
+while omitting only `tools[*].scope.path_pattern_encoding`. That additive field disambiguates a
+literal leading `!` for fresh JSON readers and does not change the in-memory `ToolScope` meaning.
+This normalization lets pre-v0.20 readers ignore the field and recompute the same hash during a
+rolling deployment.
+
 `ToolBinding` is the public tool unit:
 
 ```json
@@ -265,14 +272,110 @@ one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
 stream when `emit_output_deltas=True`.
 
+Four further opt-in protocols declare optional capability members:
+
+- `MultimodalModelAdapter.supports_multimodal: bool` — the loop resolves by-reference media in the
+  by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
+  `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
+  parameterizes the capability rather than declaring it.
+- `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
+  provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
+  Omitting it means "do not tag".
+- `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
+  `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
+  actually ran under rather than a default the call never used.
+- `AddressedModelAdapter.resolve_destination(config) -> str` — where a call under `config` would
+  actually be sent. Two adapters holding identical configs can address different hosts, so the
+  destination is folded into the receipt's replay key; it is hashed and never recorded, so an
+  internal hostname stays internal. Raising is permitted and read as "unknown".
+
+Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
+default, and behaves identically whether an adapter declares it or omits it, so the attributes are
+deliberately **not** members of `ModelAdapter` / `AsyncModelAdapter`: a protocol member is required
+for structural typing even when the protocol body assigns it a default, which would reject an
+adapter that implements only `next_turn`. Each member that is a *value* is declared as a read-only
+property so a `ClassVar`, an instance attribute, and a property all satisfy it;
+`resolve_destination` is a method because it answers for a given `ModelConfig`.
+
+An adapter with its own retry loop should call `report_provider_retried()` when it decides to make
+another attempt. The kernel counts one adapter call per turn however many attempts happen inside it,
+so without this a call that failed twice and succeeded on the third try is recorded as a clean
+single attempt. Report on the *decision*, before waiting or reconnecting: a call the run cancels or
+times out mid-retry never returns an outcome to carry the fact, and for a blocking `next_turn` the
+worker's eventual result is discarded entirely. Calling it is optional and inert outside a run.
+
+`ModelCallReceipt.attempts` may be **0**. A run whose cancellation or deadline was already past when
+the call was requested is refused before the adapter is reached, and a receipt is still written
+because a refused call belongs in the audit trail — so a consumer summing `attempts` must treat 0 as
+"no adapter call was made" rather than as a missing value. A failure *while* reaching into the
+adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
+as 1, which is what older records mean.
+
+#### AgentLoop model-I/O subscriptions
+
+`AgentLoop.model_io_subscriptions` is the opt-in bridge from agent turns to
+`ModelIOObserver`. Every adapter shape reaches the same `ModelCallRunner`, so observers receive one
+settled capture for success, provider failure, cancellation, deadline, or streamed interruption.
+Observer failure remains contained and never changes the run outcome.
+
+`AgentLoop.invocation_context` is a base context supplied by the caller. For each call, the loop:
+
+- sets `run_id` to `AgentRunSpec.run_id`;
+- appends the durable `turn_NNNN` id to a non-empty caller `step_id`, or uses it directly;
+- preserves the caller's `attempt`, Skill/batch/case fields, trace context, and attributes.
+
+Caller provenance is observational. If a caller force-mutates an `InvocationContext` into an
+invalid state after construction, AgentLoop drops those caller-supplied fields and still records its
+authoritative run and turn identity; malformed metadata cannot prevent the adapter call.
+
+The receipt is delivered through subscriptions only. AgentLoop continues to use the provider turn
+for usage/budget accounting and does not add receipt data to `events.jsonl`, `transcript.jsonl`, the
+run result, or checkpoints. A subscription's `CapturePolicy` governs only that model-I/O delivery;
+it does not rewrite the private transcript or the separate event-sink channel.
+
+Subscriptions passed to AgentLoop are owned by that run activation, like `event_sinks`. The loop
+identity-de-duplicates and closes observers at normal close, successful durable release, discard,
+and bootstrap/restore failure. A loop whose subscriptions have closed rejects reactivation; build a
+fresh AgentLoop with fresh observers. `RunnerBackend.model_io_subscription_factories` is the
+Reference composition seam and each factory must return an ownership-unique subscription on every
+call. Partial construction is cleaned before the build error propagates.
+
+In-process subagents do not inherit a parent's observer instances: simultaneous parent/child calls
+would share callbacks and a child close could terminate the parent's exporter. Their
+`InvocationContext` does preserve the caller unit and attempt while appending a subagent task segment
+and child turn id, and adds root/parent/task/definition/depth attributes. Current in-process child
+calls are therefore not delivered to model-I/O observers. A child-scoped observer composition seam
+is deferred to a later change.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
 cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
 so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
-step-boundary signals for non-streamed model calls. A synchronous adapter runs through
-`asyncio.to_thread`; Python cannot force-stop that worker thread, so cancellation and the run
-deadline take effect after `next_turn` returns. Sync adapters should enforce their own provider I/O
-timeout and idempotency policy.
+step-boundary signals for non-streamed model calls. A synchronous `next_turn` observes the same two
+run boundaries: Python cannot force-stop its worker thread, so exceeding a boundary *abandons* the
+call rather than stopping it. The grace interval applies to the worker itself — a call that returns
+inside `async_model_cancel_grace_s` settles normally and is not abandoned, so the boundary is
+reported once the worker has stopped rather than while it races run finalization. Only a call still
+running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
+worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
+the grace is not an extension of the deadline. Sync adapters should still enforce their own provider
+I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
+
+Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can
+reclaim the thread of a call that never returns, and the run no longer blocks to throttle the next
+attempt, so an implementation that wedges *permanently* accumulates one thread per abandoned call
+across runs. Each abandonment is logged as a warning on the `monoid_agent_kernel.core.sync_bridge`
+logger — both the synchronous and the asynchronous half — so the growth is visible; there is
+currently no cap on outstanding abandoned calls. A streamed call whose `aclose()` outruns the same
+grace is abandoned too, and warns on `monoid_agent_kernel.model_call`.
+
+Nor is there a bound on *healthy* concurrent sync calls. A dedicated daemon thread per call is what
+makes abandonment possible, but it gives up the thread-pool bound a shared executor provided: within
+one run sync calls are sequential, so this is a per-process concern for a host driving many runs at
+once, where a burst can reach the process thread limit and fail calls that would otherwise succeed.
+Hosts that run many concurrent sessions with synchronous adapters or tools should bound admission
+themselves until the kernel does. Both bounds belong with per-call resource policy rather than with
+the dispatch helper, and are tracked for a later release.
 
 `ModelRequest` carries:
 
@@ -324,9 +427,33 @@ external boundary.
 Run cancellation and the run deadline cancel an in-flight native async handler and preserve the
 run-level `cancelled` or `run_timeout` result. Cleanup has a bounded
 `AgentLoop.async_tool_cancel_grace_s` window; a handler that suppresses cancellation is detached
-after that window so it cannot block the run result. A synchronous Python call cannot be
-force-stopped safely; its worker completes before the next run-boundary check. Sync tools that
-perform external I/O should apply their own operation timeout and idempotency policy.
+after that window so it cannot block the run result. A synchronous handler observes the same two
+boundaries and the same window, but cannot be force-stopped, so it is detached without ever
+receiving a cancellation to clean up after — the position a cancellation-suppressing async handler
+already ends in. The window applies to the worker thread: a handler that returns inside it settles
+normally and is never detached, which is what keeps its workspace writes ahead of run finalization
+instead of racing it. A handler still running when the window expires is detached and may still be
+writing to the workspace after the run stopped waiting for it. An awaitable it returns too late is
+disposed rather than left dangling — a coroutine is closed, and a future or task is cancelled and
+its outcome consumed. Sync tools that perform external I/O should apply their own operation timeout
+and idempotency policy, because the kernel can stop waiting for a handler it cannot stop.
+
+A handler's call authorization follows the handler, including into threads it starts itself: a
+`ToolContext` operation delegated to a joined child thread is checked against the same binding scope
+as the parent. It also stays valid for a handler the run has abandoned, so a detached handler keeps
+its own scope rather than picking up whichever call the run moved on to.
+
+Outside a tool call there is no binding whose scope could authorize anything, so scoped `ToolContext`
+operations — path checks, shell execution, web access — **refuse** rather than fall back to the
+run-level permission policy. Every scope check narrows only under a non-empty allow/deny list, so
+treating "no call" as an empty scope would grant the widest authorization in the run at the moment it
+is least warranted. This is what bounds a thread descended from an *abandoned* handler: once the run
+gives up on the parent, the thread is refused. One narrower case remains: while some *other* call is
+live, such a thread reads that call's authorization instead of its own, because nothing links a
+thread to its creator — Python exposes no parent edges — so it cannot be told apart from the live
+call's own child thread. It borrows a scope rather than escaping scoping. Handlers that outlive their
+run and fan out to further threads should re-check their own authorization rather than relying on
+`ToolContext` to narrow for them.
 
 `ToolExecutionError`, `PermissionDenied`, validation failures, and other controlled contract
 errors become failed tool observations. A handler-local `CancelledError` maps to
@@ -1245,8 +1372,12 @@ durable storage — a mounted volume needs no code change.
 **Limitations (v2):** a mid-run `commit_checkpoint` re-baseline combined with delta-
 restore is a documented follow-up (the common no-re-baseline case is covered).
 Multimodal message parts (image/document) round-trip through the checkpoint, so a
-resumed run re-forwards the media. `transcript.jsonl` is a debug artifact (the
-by-value `messages` in the checkpoint are the load-bearing conversation record).
+resumed run re-forwards the media. The by-value `messages` in the checkpoint remain
+the load-bearing record for *resuming* a run — but `transcript.jsonl` is no longer
+only a debug artifact: since v0.20 the settle events carry a digest instead of the
+model's text, and `transcript.jsonl`'s `settled_text` record is what an entitled
+reader joins back to display it. Deleting it now costs displayed answers, not just
+debuggability.
 
 ## Legacy Reference Production Hardening
 

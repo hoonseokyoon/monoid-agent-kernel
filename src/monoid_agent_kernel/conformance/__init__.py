@@ -18,8 +18,12 @@ from .harness import (
 from .contracts import (
     CapabilityBrokerFactory,
     CheckpointStoreFactory,
+    ModelIOObserverFactory,
+    RedactorFactory,
     run_capability_broker_contract,
     run_checkpoint_store_contract,
+    run_model_io_observer_contract,
+    run_redactor_contract,
 )
 from .fixtures import CompatibilityFixture, load_compatibility_fixtures
 from .provenance import (
@@ -90,8 +94,12 @@ __all__ = [
     "read_conformance_report",
     "CapabilityBrokerFactory",
     "CheckpointStoreFactory",
+    "ModelIOObserverFactory",
+    "RedactorFactory",
     "run_capability_broker_contract",
     "run_checkpoint_store_contract",
+    "run_model_io_observer_contract",
+    "run_redactor_contract",
     "CompatibilityFixture",
     "load_compatibility_fixtures",
     "CONFORMANCE_EVIDENCE_KIND",

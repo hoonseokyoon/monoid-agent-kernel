@@ -11,6 +11,10 @@ from monoid_agent_kernel.core.capability import CapabilityBroker
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.context import ContextProvider
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.model_io import (
+    ModelIOSubscription,
+    close_model_io_subscriptions,
+)
 from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
@@ -48,16 +52,25 @@ class BackendLoopFactoryContext:
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     emit_output_deltas_provider: Callable[[], bool]
     extra_event_sink_factories_provider: Callable[[], tuple[Callable[[], EventSink], ...]]
+    model_io_subscription_factories_provider: Callable[
+        [], tuple[Callable[[], ModelIOSubscription], ...]
+    ]
     subagent_definitions_provider: Callable[[], Mapping[str, Any] | None]
     tool_providers_provider: Callable[[], tuple[ToolProvider, ...]]
     context_providers_provider: Callable[[], tuple[ContextProvider, ...]]
     output_validators_provider: Callable[[], tuple[OutputValidator, ...]]
-    capability_broker_factory_provider: Callable[[], Callable[[RunRequestPort], CapabilityBroker | None] | None]
-    outbox_sender_factory_provider: Callable[[], Callable[[RunRequestPort], OutboxSender | None] | None]
+    capability_broker_factory_provider: Callable[
+        [], Callable[[RunRequestPort], CapabilityBroker | None] | None
+    ]
+    outbox_sender_factory_provider: Callable[
+        [], Callable[[RunRequestPort], OutboxSender | None] | None
+    ]
     current_runtime_config: Callable[[str], AgentRuntimeConfig | None]
     record: Callable[[str], MutableRunRecordPort]
     record_event: Callable[[str, AgentEvent], None]
-    persist_checkpoint_payload: Callable[[MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None]
+    persist_checkpoint_payload: Callable[
+        [MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None
+    ]
 
 
 class BackendRuntimeConfigProvider(RuntimeConfigProvider):
@@ -139,31 +152,46 @@ class BackendLoopFactory:
         capability_broker = self.capability_broker_for(request)
         outbox_sender = self.outbox_sender_for(request) if include_outbox_sender else None
         record = self._context.record(run_id)
-        loop = AgentLoop(
-            spec=spec,
-            model_adapter=model_adapter,
-            event_sinks=(
-                BackendRunStateSink(self._context.record_event, run_id),
-                *(make() for make in self._context.extra_event_sink_factories_provider()),
-            ),
-            permission_policy=request.permission_policy,
-            cancellation_token=record.cancellation_token,
-            shell_approval_provider=None,
-            web_gateway_client=web_gateway_client,
-            runtime_config_provider=runtime_config_provider,
-            checkpoint_store=self._context.checkpoint_store_provider(),
-            emit_output_deltas=self._context.emit_output_deltas_provider(),
-            subagent_definitions=self._context.subagent_definitions_provider(),
-            tool_providers=self._context.tool_providers_provider(),
-            context_providers=self._context.context_providers_provider(),
-            output_validators=self._context.output_validators_provider(),
-            capability_broker=capability_broker,
-            checkpoint_persist_callback=lambda checkpoint, blobs: self._context.persist_checkpoint_payload(
-                self._context.record(run_id),
-                checkpoint,
-                blobs,
-            ),
-        )
+        model_io_subscriptions: list[ModelIOSubscription] = []
+        try:
+            for make in self._context.model_io_subscription_factories_provider():
+                subscription = make()
+                if not isinstance(subscription, ModelIOSubscription):
+                    raise TypeError(
+                        "model-I/O subscription factory must return ModelIOSubscription"
+                    )
+                model_io_subscriptions.append(subscription)
+            loop = AgentLoop(
+                spec=spec,
+                model_adapter=model_adapter,
+                event_sinks=(
+                    BackendRunStateSink(self._context.record_event, run_id),
+                    *(make() for make in self._context.extra_event_sink_factories_provider()),
+                ),
+                model_io_subscriptions=tuple(model_io_subscriptions),
+                permission_policy=request.permission_policy,
+                cancellation_token=record.cancellation_token,
+                shell_approval_provider=None,
+                web_gateway_client=web_gateway_client,
+                runtime_config_provider=runtime_config_provider,
+                checkpoint_store=self._context.checkpoint_store_provider(),
+                emit_output_deltas=self._context.emit_output_deltas_provider(),
+                subagent_definitions=self._context.subagent_definitions_provider(),
+                tool_providers=self._context.tool_providers_provider(),
+                context_providers=self._context.context_providers_provider(),
+                output_validators=self._context.output_validators_provider(),
+                capability_broker=capability_broker,
+                checkpoint_persist_callback=lambda checkpoint, blobs: (
+                    self._context.persist_checkpoint_payload(
+                        self._context.record(run_id),
+                        checkpoint,
+                        blobs,
+                    )
+                ),
+            )
+        except BaseException:
+            close_model_io_subscriptions(tuple(model_io_subscriptions))
+            raise
         return BackendLoopBuild(
             spec=spec,
             model_adapter=model_adapter,
@@ -226,7 +254,9 @@ class BackendLoopFactory:
             tenant_id=request.tenant_id,
             user_id=request.user_id,
             ttl_s=self._context.llm_gateway_token_ttl_s_provider(),
-            metadata={"agent_config_hash": runtime_config.config_hash} if runtime_config is not None else {},
+            metadata={"agent_config_hash": runtime_config.config_hash}
+            if runtime_config is not None
+            else {},
         )
 
     def build_model_adapter(

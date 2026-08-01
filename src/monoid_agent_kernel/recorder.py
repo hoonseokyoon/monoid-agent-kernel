@@ -24,8 +24,17 @@ from monoid_agent_kernel.core._util import (
     write_json_atomic,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
-from monoid_agent_kernel.core.lifecycle import SessionState, session_state_from_run_status, session_state_value
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+)
+from monoid_agent_kernel.core.lifecycle import (
+    SessionState,
+    session_state_from_run_status,
+    session_state_value,
+)
 from monoid_agent_kernel.core.manifest import RunManifest
+from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.result import AgentArtifact
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -109,12 +118,20 @@ class StatusJsonSink:
                 error_code=str(data.get("error_code") or ""),
                 terminal=True,
             )
+            # No ``final_text``. This sink is a *fan-out* sink — it fires as the event is emitted,
+            # before the log is on disk — so no hydration seam can reach it, and model-authored text
+            # now leaves ``run.finished`` as a digest. Carrying ``data.get("final_text", "")`` would
+            # therefore write ``""`` on every model-answered run: no schema failure (``STATUS_SCHEMA``
+            # never declares the field and allows additional properties), no error, just a silently
+            # empty answer. Removing it is the honest shape, and it is also a leak fix —
+            # ``RunProjectionService.status()`` returns this file wholesale to any run-token bearer.
+            # Verified to have no reader in ``src/``, ``tests/``, ``docs/``, ``studio-ui/`` or
+            # ``scripts/``, and subagent runs never had one (``status_file=False``).
             self.state.update(
                 {
                     "state": session_state_value(state),
                     "terminal": True,
                     "finished_at": event.timestamp,
-                    "final_text": data.get("final_text", ""),
                     "error": data.get("error", ""),
                     "error_code": data.get("error_code", ""),
                 }
@@ -168,6 +185,16 @@ class StatusJsonSink:
             self.state.pop("current_tool_call_id", None)
         elif event.type == "plan.updated":
             self.state["plan"] = data.get("items", [])
+            # Carry the drop count across with the list it belongs to. The event moved it out of
+            # the array so a typed renderer would stop drawing a blank row for it, and copying only
+            # ``items`` here would have turned that into a *silent* cap on this surface: a reader
+            # would see 20 steps with nothing saying there had been 25. Reassigned rather than
+            # merged, because a later shorter plan has to clear a stale count.
+            truncated = data.get("truncated_items")
+            if isinstance(truncated, int) and truncated > 0:
+                self.state["plan_truncated_items"] = truncated
+            else:
+                self.state.pop("plan_truncated_items", None)
         elif event.type == "metrics.updated":
             self.state["metrics"] = data
         elif event.type == "workspace.proposal.updated":
@@ -225,6 +252,10 @@ class AgentRecorder:
     _transcript_file: TextIO = field(init=False, repr=False)
     started_at: float = field(default_factory=time.time)
     artifacts: list[AgentArtifact] = field(default_factory=list)
+    # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
+    # record whose digest is already in the file; that duplicates identical content, which the
+    # content-addressed join resolves the same either way.
+    _settled_text_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
@@ -238,6 +269,7 @@ class AgentRecorder:
         )
         initial_seq = _verified_event_sequence_seed(events_path, tail)
         self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
+        self._terminate_torn_transcript_tail()
         sinks: list[EventSink] = [JsonlEventSink(events_path)]
         if self.status_file:
             sinks.append(StatusJsonSink(self.run_dir / "status.json"))
@@ -261,8 +293,87 @@ class AgentRecorder:
             parent_id=parent_id,
         )
 
+    def _terminate_torn_transcript_tail(self) -> None:
+        """Close off a torn last line so the next append is not glued onto it.
+
+        ``transcript.jsonl`` gets no ``repair_event_log_tail_for_append`` the way ``events.jsonl``
+        does. Appending after a line that lacks its trailing newline concatenates the remnant and
+        the new record into one unparseable line, losing **both** — so a crash costs the next run's
+        first record as well as its own. On the recovery path that first record can be the
+        settled-text one, which a committed ``run.finished`` then names: exactly the
+        "event names text that is not on disk" failure the write-before-emit ordering exists to
+        prevent, with no crash during the recovered run.
+
+        Writing the missing newline costs one byte and confines a torn write to the record it tore.
+        Best-effort by design: if the file cannot be inspected, appending as before is no worse.
+        """
+        path = self.run_dir / "transcript.jsonl"
+        try:
+            size = path.stat().st_size
+            if size == 0:
+                return
+            with path.open("rb") as handle:
+                handle.seek(size - 1)
+                if handle.read(1) == b"\n":
+                    return
+            self._transcript_file.write("\n")
+            self._transcript_file.flush()
+        except OSError:
+            return
+
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
+
+    def settled_text(self, text: str) -> str:
+        """Record model-authored settled text and return its content digest.
+
+        The digest is the join key: a settle event carries ``final_text_digest`` and a reader
+        resolves the text by matching it here. Keying on *content* rather than on the emitting
+        event's identity is what lets this be written **before** the emit — the event's id and seq
+        do not exist until ``emit`` returns, and writing afterwards would open a window in which a
+        committed event names text that is not yet on disk.
+
+        Identical text yields one record. ``turn.settled`` and ``run.finished`` normally carry the
+        same value, so a content-addressed key makes the second write redundant by construction
+        rather than by a caller remembering not to repeat itself.
+
+        This lives on the recorder rather than beside the emit sites because it owns the transcript
+        handle. ``transcript.jsonl`` is the private debug/replay artifact
+        (``docs/OBSERVABILITY.md``) and already holds model text per turn, so settled text belongs
+        with it rather than in a new run-dir file.
+
+        This docstring used to add "which is also why no compatibility-ledger entry is involved".
+        That was true when the transcript was only a debug aid, and adding this record is what made
+        it false: the settle events now publish a digest, so an entitled reader joins *here* for the
+        text a UI displays. It is registered as ``monoid.transcript.v1`` — a private artifact with a
+        public join contract, which is exactly the case a ledger exists to pin.
+
+        Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
+        and the transcript's only repair is ``_terminate_torn_transcript_tail``, which stops a torn
+        line eating the *next* record but does not recover the torn one. A crash can leave a
+        committed event whose
+        digest resolves to nothing, so **content-missing is a tolerated read outcome** — hydration
+        fills absent fields and never fails a read.
+        """
+        # ``content_digest``, never a bare sha256 of the text: it hashes canonical JSON under a
+        # shape key so a text field cannot collide with a structured value's serialization. Once a
+        # record persists one it is frozen (see the function's own docstring).
+        digest = content_digest(text)
+        if digest not in self._settled_text_digests:
+            _write_jsonl(
+                self._transcript_file,
+                {
+                    "kind": "settled_text",
+                    "final_text": text,
+                    "final_text_digest": digest,
+                    "final_text_len": content_length(text),
+                },
+            )
+            # Marked written only once it is. Adding before the write meant a raising write (a
+            # full disk mid-flush) recorded the digest as present with nothing on disk, so a later
+            # call for the same text short-circuited and returned a digest resolving to nothing.
+            self._settled_text_digests.add(digest)
+        return digest
 
     def emit_artifact_bytes(
         self,
@@ -350,7 +461,7 @@ class AgentRecorder:
             "finished_at": time.time(),
             **metrics,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(path, payload)
         return path
 
     def write_failure(self, payload: dict[str, Any]) -> Path:
@@ -362,8 +473,12 @@ class AgentRecorder:
         return path
 
     def close(self) -> None:
-        self.event_bus.close()
-        self._transcript_file.close()
+        try:
+            self.event_bus.close()
+        finally:
+            # Event-sink failure must not retain the private transcript handle. TextIO close is
+            # idempotent, while EventBus separately guarantees each configured sink is called once.
+            self._transcript_file.close()
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -386,7 +501,15 @@ class AgentRecorder:
 
 
 def _write_jsonl(handle: TextIO, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        # Manually constructed events can bypass semantic ingress. Repair them to valid Unicode so
+        # the persisted record remains encodable after it is read and projected onto a later wire.
+        normalized = normalize_json_ingress(payload)
+        line = json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    handle.write(line + "\n")
     handle.flush()
 
 
@@ -424,7 +547,7 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
     status_path = run_dir / "status.json"
     if status_path.exists():
         try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status = loads_json_ingress(status_path.read_text(encoding="utf-8"))
             if isinstance(status, dict) and isinstance(status.get("run_id"), str):
                 return status["run_id"]
         except (OSError, ValueError):
@@ -432,7 +555,7 @@ def _run_id_from_run_dir(run_dir: Path) -> str:
     proposal_path = run_dir / "proposal.json"
     if proposal_path.exists():
         try:
-            proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+            proposal = loads_json_ingress(proposal_path.read_text(encoding="utf-8"))
             if isinstance(proposal, dict) and isinstance(proposal.get("run_id"), str):
                 return proposal["run_id"]
         except (OSError, ValueError):
@@ -448,7 +571,7 @@ def _read_status_last_event_seq(run_dir: Path) -> int | None:
     except (OSError, UnicodeError) as exc:
         raise EventLogCorruption("status event watermark cannot be verified") from exc
     try:
-        status = json.loads(raw_status)
+        status = loads_json_ingress(raw_status)
     except ValueError as exc:
         raise EventLogCorruption("status event watermark cannot be verified") from exc
     if not isinstance(status, dict):
@@ -478,7 +601,7 @@ def _update_status_last_event(run_dir: Path, event: AgentEvent) -> None:
     if not status_path.exists():
         return
     try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status = loads_json_ingress(status_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return
     if not isinstance(status, dict):

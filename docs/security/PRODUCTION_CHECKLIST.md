@@ -27,11 +27,25 @@ default must be changed for production.
 - [ ] Hosted runs use `mode="propose"` with an isolated `overlay` or `staging` workspace backend;
       `mode="apply"` is reserved for explicitly privileged paths.
 - [ ] A deny/redact policy is set per run — there is no secure default. At
-      minimum deny `.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh/**`, `.git/**`.
+      minimum deny `.env`, `*.key`, `*.pem`, `**/id_rsa`, `.ssh`, `.git`.
+      The bare directory names cover each node and its full subtree, including nested copies.
+      Patterns use gitignore-style wildcard syntax — see [CLI.md](../CLI.md#path-permissions).
+      **On < v0.20 the previous `.ssh/**` / `.git/**` list left holes**: `**` behaved as a
+      single `*`, missing deep entries, and those spellings did not protect the directory node from
+      recursive move/delete. `**/id_rsa` also missed a bare `id_rsa` at the workspace root.
+      Re-check any policy written against an earlier version.
 - [ ] The workspace root is per-tenant isolated; no host-sensitive directory is
       mounted as a workspace.
-- [ ] The `Workspace` backend passes `tests/test_workspace_contract.py`, and its
-      symlink behavior is documented/tested.
+- [ ] The `Workspace` backend passes `tests/test_workspace_contract.py`. Its case and Unicode
+      normalization aliases, symlink behavior, and hardlink behavior are documented and tested
+      against every supported volume, including case-sensitive directories and custom/network
+      filesystems. The path-pattern matcher is lexical; the backend, including the built-in local
+      backend on case- or normalization-insensitive volumes, must canonicalize or reject any other
+      spelling that resolves to the same filesystem object before policy evaluation.
+- [ ] Recursive copy, move, delete, archive, and similar tree operations preflight every descendant
+      against deny rules, or are disabled for trees that can mix allowed and denied paths. The
+      built-in recursive file tools currently present only the operation root to the policy, so an
+      allowed ancestor does not protect a denied descendant by itself.
 
 ## Tool surface
 

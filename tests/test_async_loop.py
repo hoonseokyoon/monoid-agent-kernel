@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
+from contextvars import ContextVar
 from pathlib import Path
+
+import pytest
 
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, runtime_provider, tool_binding
@@ -165,6 +170,192 @@ def test_never_returning_coroutine_next_turn_observes_run_cancellation(tmp_path:
     assert result.status == "limited"
     assert result.error_code == "cancelled"
     assert cleaned_up is True
+
+
+_TENANT: ContextVar[str] = ContextVar("test_tenant", default="unset")
+
+
+def test_sync_next_turn_sees_caller_context_variables(tmp_path: Path) -> None:
+    """A sync adapter runs in a copy of the caller's context, as ``asyncio.to_thread`` did.
+
+    This is the call site where host-supplied ``ContextVar`` state matters most -- provider
+    credentials and tracing context -- and a worker on an empty context would read defaults.
+    """
+    seen: list[str] = []
+
+    class ContextReadingSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            seen.append(_TENANT.get())
+            return ModelTurn(response_id="r1", final_text="ok")
+
+    async def run() -> object:
+        _TENANT.set("acme")
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=ContextReadingSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        )
+        return await loop.arun_once("go")
+
+    result = asyncio.run(run())
+
+    assert result.status == "completed"
+    assert seen == ["acme"]
+
+
+def _block_like_a_stuck_provider() -> None:
+    """Block the way a wedged sync provider does: with no way for the run to release it.
+
+    Deliberately not an event the test can set -- releasing the worker would hide whether the
+    caller was freed on its own. The bound only keeps a regression to a failure instead of a
+    hung session; it is far above the ~1.5s a correct abandon takes, so it never fires in a
+    passing run and the daemon worker simply outlives the test.
+    """
+
+    threading.Event().wait(timeout=20)
+
+
+def test_never_returning_sync_next_turn_observes_run_deadline(tmp_path: Path) -> None:
+    """A blocking sync ``next_turn`` observes the run deadline like an async adapter.
+
+    The offloaded thread cannot be interrupted, so the run abandons it after the cancel grace
+    interval instead of waiting for the provider to return. The abandonment has to survive
+    ``asyncio.run`` returning: it shuts down the loop's default executor and joins its workers,
+    which would make the deadline internally enforced but externally unobservable. Hence the
+    worker is asserted to be still *alive* once the result is in hand.
+    """
+    started = threading.Event()
+    workers: list[threading.Thread] = []
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            workers.append(threading.current_thread())
+            started.set()
+            _block_like_a_stuck_provider()
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            async_model_cancel_grace_s=0.2,
+        )
+        return await asyncio.wait_for(loop.arun_once("go"), timeout=10)
+
+    result = asyncio.run(run())
+
+    assert started.is_set() is True
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert workers[0].is_alive() is True
+
+
+def test_abandoning_a_sync_next_turn_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Abandonment is logged, because nothing can reclaim the thread of a call that never returns.
+
+    A permanently wedged adapter leaks one thread per abandoned call, and the run no longer blocks
+    to throttle the next attempt, so the growth has to be visible rather than silent.
+    """
+    workers: list[threading.Thread] = []
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            workers.append(threading.current_thread())
+            _block_like_a_stuck_provider()
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path, limits=RunLimits(max_duration_s=1)),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            async_model_cancel_grace_s=0.2,
+        )
+        result = await loop.arun_once("go")
+        await asyncio.sleep(0)  # let the future's done callback run
+        return result
+
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
+        result = asyncio.run(run())
+
+    assert result.error_code == "run_timeout"
+    assert workers[0].is_alive() is True
+    warnings = [r.getMessage() for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"]
+    assert len(warnings) == 1
+    assert "abandoned a synchronous call" in warnings[0]
+
+
+def test_completed_sync_next_turn_does_not_warn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning is specific to abandonment: a call that returns in time is silent."""
+
+    class PromptSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(response_id="r1", final_text="ok")
+
+    with caplog.at_level(logging.WARNING, logger="monoid_agent_kernel.core.sync_bridge"):
+        result = asyncio.run(
+            AgentLoop(
+                spec=_spec(tmp_path),
+                model_adapter=PromptSyncAdapter(),  # type: ignore[arg-type]
+                runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            ).arun_once("go")
+        )
+
+    assert result.status == "completed"
+    assert [r for r in caplog.records if r.name == "monoid_agent_kernel.core.sync_bridge"] == []
+
+
+def test_never_returning_sync_next_turn_observes_run_cancellation(tmp_path: Path) -> None:
+    token = CancellationToken()
+    started = threading.Event()
+    workers: list[threading.Thread] = []
+
+    class NeverReturningSyncAdapter:
+        supports_multimodal = False
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            workers.append(threading.current_thread())
+            started.set()
+            _block_like_a_stuck_provider()
+            return ModelTurn(response_id="late", final_text="late")
+
+    async def run() -> object:
+        loop = AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=NeverReturningSyncAdapter(),  # type: ignore[arg-type]
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            cancellation_token=token,
+            async_model_cancel_grace_s=0.2,
+        )
+        pending = asyncio.create_task(loop.arun_once("go"))
+        await asyncio.to_thread(started.wait, 5)
+        token.cancel()
+        return await asyncio.wait_for(pending, timeout=10)
+
+    result = asyncio.run(run())
+
+    assert started.is_set() is True
+    assert result.status == "limited"
+    assert result.error_code == "cancelled"
+    assert workers[0].is_alive() is True
 
 
 def test_blocked_async_stream_cleanup_cannot_block_run_cancellation(tmp_path: Path) -> None:
@@ -478,3 +669,69 @@ def test_astream_parks_on_external_task(tmp_path: Path) -> None:
     assert suspension.has_external is True
     assert len(suspension.awaiting_task_ids) == 1
     assert "run.awaiting_input" in _event_types(items)
+
+
+class _MarkedAdapter:
+    """Names itself in its answer, so the receipt and the response can be checked against each
+    other rather than only against a literal."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.provider_name = tag
+        self.requests = 0
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.requests += 1
+        return ModelTurn(final_text=f"FROM-{self.tag}")
+
+
+def test_a_model_adapter_swapped_after_open_answers_the_next_turn(tmp_path: Path) -> None:
+    """`model_adapter` is a public mutable field, and the loop reads it live *everywhere else*.
+
+    Extracting the call into `ModelCallRunner` captured it once at bootstrap. That is not merely
+    stale: `supports_multimodal` and `wire_image_encoding` shape the request from the live field, and
+    the `provider_name` recorded on the assistant message comes from it too -- so a swapped adapter
+    got a request shaped for it, and an answer attributed to it, that a different adapter produced.
+    """
+
+    first, second = _MarkedAdapter("FIRST"), _MarkedAdapter("SECOND")
+
+    async def run() -> object:
+        loop = _loop(tmp_path, first)
+        await loop.aopen()
+        loop.model_adapter = second
+        try:
+            return await loop.asubmit("go")
+        finally:
+            await loop.aclose()
+
+    result = asyncio.run(run())
+    assert getattr(result, "final_text", None) == "FROM-SECOND"
+    assert (first.requests, second.requests) == (0, 1)
+
+
+def test_the_two_halves_of_the_cancel_grace_knob_agree(tmp_path: Path) -> None:
+    """`async_model_cancel_grace_s` and its tool-side twin are both public mutable fields.
+
+    The tool half is read at every use; the model half was captured at bootstrap, so raising the
+    grace after `open()` abandoned a model worker on the old value -- ~150x early in the case that
+    found it -- while an identically-timed tool call honoured the new one. A knob whose two halves
+    disagree is worse than one that is simply wrong.
+    """
+
+    async def observed_grace(where: str, mutate_to: float | None) -> float:
+        loop = _loop(tmp_path / where, FakeModelAdapter(), "fs.write")
+        loop.async_model_cancel_grace_s = 0.02
+        await loop.aopen()
+        if mutate_to is not None:
+            loop.async_model_cancel_grace_s = mutate_to
+        try:
+            return loop._bootstrap_resources.model_runner._grace_s()
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(observed_grace("unchanged", None)) == pytest.approx(0.02)
+    assert asyncio.run(observed_grace("raised", 3.0)) == pytest.approx(3.0), (
+        "the model half of the grace must follow the field the tool half already follows"
+    )

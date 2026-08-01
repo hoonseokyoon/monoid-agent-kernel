@@ -22,6 +22,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
+from monoid_agent_kernel.core.runtime_controls import exact_runtime_bool, exact_runtime_string
 from monoid_agent_kernel.core.wire_validation import (
     parse_bool,
     parse_float,
@@ -74,7 +79,11 @@ class OutboxRequest:
     reference: str = ""  # external id returned by the sender on success
     error: str = ""
 
+    def __post_init__(self) -> None:
+        normalize_outbox_request(self)
+
     def to_json(self) -> dict[str, Any]:
+        normalize_outbox_request(self)
         return {
             "protocol": OUTBOX_REQUEST_VERSION,
             "id": self.id,
@@ -105,7 +114,9 @@ class OutboxRequest:
         protocol = parse_str(payload, "protocol")
         if protocol and protocol not in ACCEPTED_OUTBOX_REQUEST_VERSIONS:
             raise ValueError("unsupported outbox request protocol")
-        request_payload = require_object(payload["payload"], "payload") if "payload" in payload else {}
+        request_payload = (
+            require_object(payload["payload"], "payload") if "payload" in payload else {}
+        )
         kwargs: dict[str, Any] = {
             "destination": parse_str(payload, "destination"),
             "payload": dict(request_payload),
@@ -120,7 +131,9 @@ class OutboxRequest:
             "traceparent": parse_str(payload, "traceparent"),
             "tracestate": parse_str(payload, "tracestate"),
             "created_at": parse_float(payload, "created_at", default=0.0) or 0.0,
-            "status": parse_literal(payload, "status", ("pending", "dispatched", "failed"), default="pending"),
+            "status": parse_literal(
+                payload, "status", ("pending", "dispatched", "failed"), default="pending"
+            ),
             "attempts": parse_int(payload, "attempts", default=0),
             "next_attempt_at": parse_float(payload, "next_attempt_at", default=0.0) or 0.0,
             "reference": parse_str(payload, "reference"),
@@ -132,6 +145,56 @@ class OutboxRequest:
         return cls(**kwargs)
 
 
+_OUTBOX_REQUEST_STRING_FIELDS = (
+    "destination",
+    "capability",
+    "token_ref",
+    "run_id",
+    "id",
+    "idempotency_key",
+    "correlation_id",
+    "causation_id",
+    "reply_to",
+    "traceparent",
+    "tracestate",
+    "status",
+    "reference",
+    "error",
+)
+
+
+def normalize_outbox_request(value: Any) -> OutboxRequest:
+    """Normalize one directly constructed request into the durable JSON domain."""
+
+    if not isinstance(value, OutboxRequest):
+        raise ValueError("outbox request must be an OutboxRequest")
+    normalized_payload = normalize_json_ingress(value.payload)
+    if not isinstance(normalized_payload, dict):
+        raise ValueError("outbox request payload must be an object")
+    value.payload = normalized_payload
+    for field_name in _OUTBOX_REQUEST_STRING_FIELDS:
+        field_value = exact_runtime_string(
+            getattr(value, field_name),
+            field_name=f"outbox request {field_name}",
+        )
+        setattr(value, field_name, normalize_unicode_scalars(field_value))
+    value.expect_ack = exact_runtime_bool(
+        value.expect_ack,
+        field_name="outbox request expect_ack",
+    )
+    if value.status not in {"pending", "dispatched", "failed"}:
+        raise ValueError("outbox request status must be one of: pending, dispatched, failed")
+
+    # These are durable scheduler fields rather than arbitrary model data. Reject non-finite or
+    # coercible controls instead of substituting a value that would alter dispatch timing.
+    value.created_at = parse_float({"created_at": value.created_at}, "created_at") or 0.0
+    value.attempts = parse_int({"attempts": value.attempts}, "attempts")
+    value.next_attempt_at = (
+        parse_float({"next_attempt_at": value.next_attempt_at}, "next_attempt_at") or 0.0
+    )
+    return value
+
+
 @dataclass(frozen=True)
 class OutboxReceipt:
     """A sender's outcome for one request. ``retryable`` distinguishes a transient failure (leave the
@@ -141,6 +204,33 @@ class OutboxReceipt:
     reference: str = ""
     error: str = ""
     retryable: bool = False
+
+    def __post_init__(self) -> None:
+        normalize_outbox_receipt(self)
+
+
+def normalize_outbox_receipt(value: Any) -> OutboxReceipt:
+    """Validate and normalize an edge sender result before it changes durable state."""
+
+    if not isinstance(value, OutboxReceipt):
+        raise ValueError("outbox sender must return OutboxReceipt")
+    object.__setattr__(
+        value,
+        "ok",
+        exact_runtime_bool(value.ok, field_name="outbox receipt ok"),
+    )
+    for field_name in ("reference", "error"):
+        field_value = exact_runtime_string(
+            getattr(value, field_name),
+            field_name=f"outbox receipt {field_name}",
+        )
+        object.__setattr__(value, field_name, normalize_unicode_scalars(field_value))
+    object.__setattr__(
+        value,
+        "retryable",
+        exact_runtime_bool(value.retryable, field_name="outbox receipt retryable"),
+    )
+    return value
 
 
 @runtime_checkable
@@ -176,7 +266,9 @@ class Outbox:
     def due(self, now: float) -> list[OutboxRequest]:
         """Pending requests whose ``next_attempt_at`` has arrived — the drain's dispatch predicate.
         A freshly staged request (``next_attempt_at == 0.0``) is always due."""
-        return [r for r in self._requests.values() if r.status == "pending" and r.next_attempt_at <= now]
+        return [
+            r for r in self._requests.values() if r.status == "pending" and r.next_attempt_at <= now
+        ]
 
     def mark(
         self,

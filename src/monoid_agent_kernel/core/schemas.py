@@ -10,13 +10,23 @@ from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
-from monoid_agent_kernel.identifiers import schema_version_property
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
 EVENT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["schema_version", "event_id", "seq", "run_id", "timestamp", "type", "level", "data"],
+    "required": [
+        "schema_version",
+        "event_id",
+        "seq",
+        "run_id",
+        "timestamp",
+        "type",
+        "level",
+        "data",
+    ],
     "properties": {
         "schema_version": schema_version_property("event.v1"),
         "event_id": {"type": "string", "minLength": 1},
@@ -89,7 +99,16 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "status": _STR,
             "error": _STR,
             "error_code": _STR,
+            # ``final_text`` stays accepted after v0.20 stops emitting model-authored text here.
+            # ``validate_run_dir`` replays committed logs against these schemas, so removing the
+            # property would fail every run directory written before the change — and kernel
+            # strings ("Stopped after reaching max steps.") keep travelling inline regardless.
             "final_text": _STR,
+            # Set instead of ``final_text`` when the text is the model's. The digest is
+            # ``core.model_io.content_digest`` — canonical JSON, NOT a bare sha256 of the text —
+            # and the text itself is resolved from the run-dir settled-text record.
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "duration_s": _NUM,
             "diff_path": _STR,
             "proposal_path": _STR,
@@ -124,7 +143,10 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     "turn.settled": _data_schema(
         {
             "status": _STR,
+            # Retained for the same reasons as on ``run.finished`` above.
             "final_text": _STR,
+            "final_text_digest": _STR,
+            "final_text_len": _INT,
             "error_code": _STR,
             "changed_paths": _STR_ARRAY,
             "output_validators": _INT,
@@ -294,7 +316,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("capability",),
     ),
     "capability.granted": _data_schema(
-        {"capability": _STR, "binding_id": _STR, "lease_id": _STR, "expires_at": _NUM, "scope": _OBJ},
+        {
+            "capability": _STR,
+            "binding_id": _STR,
+            "lease_id": _STR,
+            "expires_at": _NUM,
+            "scope": _OBJ,
+        },
         required=("capability",),
     ),
     "capability.denied": _data_schema(
@@ -335,7 +363,14 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "state": _STR_NULL,
             "duration_ms": _NUM,
         },
-        required=("command_id", "command", "target_run_id", "idempotency_key", "status", "result_code"),
+        required=(
+            "command_id",
+            "command",
+            "target_run_id",
+            "idempotency_key",
+            "status",
+            "result_code",
+        ),
     ),
     "control.command.failed": _data_schema(
         {
@@ -351,18 +386,38 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "failure_code": _STR,
             "duration_ms": _NUM,
         },
-        required=("command_id", "command", "target_run_id", "idempotency_key", "status", "error_code", "failure_code"),
+        required=(
+            "command_id",
+            "command",
+            "target_run_id",
+            "idempotency_key",
+            "status",
+            "error_code",
+            "failure_code",
+        ),
     ),
     "outbox.requested": _data_schema(
         {"request_id": _STR, "destination": _STR, "capability": _STR, "traceparent": _STR},
         required=("request_id",),
     ),
     "outbox.dispatched": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reference": _STR, "attempts": _NUM, "traceparent": _STR},
+        {
+            "request_id": _STR,
+            "destination": _STR,
+            "reference": _STR,
+            "attempts": _NUM,
+            "traceparent": _STR,
+        },
         required=("request_id",),
     ),
     "outbox.failed": _data_schema(
-        {"request_id": _STR, "destination": _STR, "reason": _STR, "attempts": _NUM, "traceparent": _STR},
+        {
+            "request_id": _STR,
+            "destination": _STR,
+            "reason": _STR,
+            "attempts": _NUM,
+            "traceparent": _STR,
+        },
         required=("request_id",),
     ),
     "workspace.file.read": _data_schema(
@@ -432,7 +487,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         required=("artifact_id",),
     ),
     "plan.updated": _data_schema(
-        {"items": _OBJ_ARRAY},
+        {"items": _OBJ_ARRAY, "truncated_items": _INT},
         required=("items",),
     ),
     "output.validator.satisfied": _data_schema(
@@ -699,6 +754,24 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        {
+            # Model-authored text a run settled on, keyed by its content digest so a settle event
+            # carrying ``final_text_digest`` can resolve back to it. Distinct from ``model_turn``
+            # above: that records one model response per step, while ``state.final_text`` is
+            # frequently not the last of those (a ``run.finish`` summary, a validator repair), and
+            # is what the settle events actually publish.
+            "type": "object",
+            "required": ["kind", "final_text", "final_text_digest", "final_text_len"],
+            "properties": {
+                "kind": {"const": "settled_text"},
+                "final_text": {"type": "string"},
+                # ``core.model_io.content_digest`` — canonical JSON under a shape key, NOT a bare
+                # sha256 of the text. Recompute with that function or the join silently misses.
+                "final_text_digest": {"type": "string"},
+                "final_text_len": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        },
     ]
 }
 
@@ -802,10 +875,19 @@ JOB_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("background-job.v1"),
         "job_id": {"type": "string", "minLength": 1},
+        # `BackgroundJob.to_json` has written `kind` since the tool bundle was widened, and this
+        # schema is `additionalProperties: false` -- so `monoid validate` reported
+        # "Additional properties are not allowed ('kind' was unexpected)" on every run that started
+        # a background job, and no test noticed because none validated a run directory that had
+        # one. Declared optional rather than required: a `background-job.v1` artifact written
+        # before that change has no `kind`, and this schema still has to read it.
+        "kind": {"type": "string"},
         "command": {"type": "string"},
         "command_preview": {"type": "string"},
         "cwd": {"type": "string"},
-        "status": {"enum": ["running", "exited", "timed_out", "cancelled", "output_limited", "failed"]},
+        "status": {
+            "enum": ["running", "exited", "timed_out", "cancelled", "output_limited", "failed"]
+        },
         "started_at": {"type": "number"},
         "finished_at": {"type": ["number", "null"]},
         "duration_s": {"type": "number", "minimum": 0},
@@ -826,6 +908,90 @@ JOB_SCHEMA: dict[str, Any] = {
         "effective_startup_wait_s": {"type": "integer", "minimum": 0},
         "execution_workspace": {"enum": ["isolated-copy", "direct"]},
         "resume_on_exit": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+
+PUBLIC_JOB_SCHEMA_VERSION = namespaced_id("public-background-job.v1")
+_PUBLIC_PATH_PREVIEW_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "required": ["redacted", "type", "bytes"],
+            "properties": {
+                "redacted": {"const": True},
+                "type": {"const": "str"},
+                "bytes": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": ["type", "preview", "bytes", "truncated"],
+            "properties": {
+                "type": {"const": "str"},
+                "preview": {"type": "string"},
+                "bytes": {"type": "integer", "minimum": 0},
+                "truncated": {"const": True},
+            },
+            "additionalProperties": False,
+        },
+    ]
+}
+
+# The public projection is a different wire shape from the durable artifact: it drops `command`,
+# transforms paths, and identifies the input version separately. Giving the transformed object the
+# durable `background-job.v1` discriminator made every response invalid against its own schema.
+PUBLIC_JOB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "schema_version",
+        "artifact_schema_version",
+        "job_id",
+        "command_preview",
+        "cwd",
+        "status",
+        "started_at",
+        "duration_s",
+        "stdout_path",
+        "stderr_path",
+        "stdout_bytes",
+        "stderr_bytes",
+        "effective_timeout_s",
+        "effective_max_output_bytes",
+        "effective_startup_wait_s",
+        "execution_workspace",
+        "resume_on_exit",
+    ],
+    "properties": {
+        "schema_version": {"enum": [PUBLIC_JOB_SCHEMA_VERSION]},
+        "artifact_schema_version": schema_version_property("background-job.v1"),
+        "job_id": JOB_SCHEMA["properties"]["job_id"],
+        "kind": JOB_SCHEMA["properties"]["kind"],
+        "command_preview": {"type": "string"},
+        "cwd": _PUBLIC_PATH_PREVIEW_SCHEMA,
+        "status": JOB_SCHEMA["properties"]["status"],
+        "started_at": JOB_SCHEMA["properties"]["started_at"],
+        "finished_at": JOB_SCHEMA["properties"]["finished_at"],
+        "duration_s": JOB_SCHEMA["properties"]["duration_s"],
+        "exit_code": JOB_SCHEMA["properties"]["exit_code"],
+        "timed_out": JOB_SCHEMA["properties"]["timed_out"],
+        "output_truncated": JOB_SCHEMA["properties"]["output_truncated"],
+        "error": {"type": "string"},
+        "changed_paths": JOB_SCHEMA["properties"]["changed_paths"],
+        "stdout_path": {"type": "string"},
+        "stderr_path": {"type": "string"},
+        "stdout_bytes": JOB_SCHEMA["properties"]["stdout_bytes"],
+        "stderr_bytes": JOB_SCHEMA["properties"]["stderr_bytes"],
+        "requested_timeout_s": JOB_SCHEMA["properties"]["requested_timeout_s"],
+        "effective_timeout_s": JOB_SCHEMA["properties"]["effective_timeout_s"],
+        "requested_max_output_bytes": JOB_SCHEMA["properties"]["requested_max_output_bytes"],
+        "effective_max_output_bytes": JOB_SCHEMA["properties"]["effective_max_output_bytes"],
+        "requested_startup_wait_s": JOB_SCHEMA["properties"]["requested_startup_wait_s"],
+        "effective_startup_wait_s": JOB_SCHEMA["properties"]["effective_startup_wait_s"],
+        "execution_workspace": JOB_SCHEMA["properties"]["execution_workspace"],
+        "resume_on_exit": JOB_SCHEMA["properties"]["resume_on_exit"],
     },
     "additionalProperties": False,
 }
@@ -974,6 +1140,7 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     transcript_path = run_dir / "transcript.jsonl"
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
+        _validate_settled_text_digests(transcript_path, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
@@ -981,18 +1148,95 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     return issues
 
 
+def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) -> None:
+    """Recompute each ``settled_text`` record's digest and length.
+
+    The schema can only say ``final_text_digest`` is *a string*, but the reader
+    (``reference.backend.content_hydration``) rejects any record whose text does not hash to the
+    digest it claims. Without this check the two disagree in the worst direction: a record whose
+    text was altered while its digest was left alone stays schema-valid, so ``monoid validate``
+    reports the run clean while an entitled reader silently resolves nothing and the final answer
+    is gone. Validation must not certify a record the reader will refuse.
+
+    Uses ``content_digest``/``content_length`` — the same functions the writer and the reader use —
+    rather than reimplementing the hash, so the three cannot drift apart.
+    """
+    from monoid_agent_kernel.core.model_io import content_digest, content_length
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return  # already reported by the schema pass
+    for index, raw_line in enumerate(raw.split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # already reported by the schema pass
+        if not line.strip():
+            continue
+        try:
+            record = loads_json_ingress(line)
+        except (ValueError, RecursionError):
+            continue  # already reported by the schema pass
+        if not isinstance(record, dict) or record.get("kind") != "settled_text":
+            continue
+        text = record.get("final_text")
+        if not isinstance(text, str):
+            continue  # shape is the schema's job
+        label = f"{path.name}:{index}"
+        claimed = record.get("final_text_digest")
+        if claimed != content_digest(text):
+            issues.append(ValidationIssue(label, "settled_text digest does not match final_text"))
+        claimed_len = record.get("final_text_len")
+        if claimed_len != content_length(text):
+            issues.append(ValidationIssue(label, "settled_text length does not match final_text"))
+
+
+def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
+    """Decode and parse one JSON artifact, returning the problem instead of raising it.
+
+    The single loader for every JSON artifact read in this module — schema validation *and* the
+    relationship/hash checks that re-read the same files afterwards. Hardening one reader and
+    leaving its siblings is precisely how this file kept crashing ``monoid validate`` on the
+    corruption it exists to report: the schema pass recorded the issue and returned, and a
+    downstream check then re-read the same bytes with a bare ``read_text()``.
+
+    Decoding is explicit rather than left to ``read_text`` because a torn multi-byte sequence
+    raises out of the *read*, not out of ``json.loads`` — and ``RecursionError`` is not a
+    ``ValueError``, so a deeply nested document escapes a ``ValueError``-only handler.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return None, ValidationIssue(path.name, f"unreadable: {exc}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, ValidationIssue(path.name, "invalid UTF-8")
+    try:
+        return loads_json_ingress(text), None
+    except json.JSONDecodeError as exc:
+        return None, ValidationIssue(path.name, f"invalid JSON: {exc.msg}")
+    except (ValueError, RecursionError):
+        # Same catch-set and label as both JSONL halves: a deeply nested document exceeds the C
+        # scanner's stack, and ``json.loads`` raises other ValueErrors (the digit-conversion cap)
+        # that are decoder limits too.
+        return None, ValidationIssue(path.name, "invalid JSON: decoder limit exceeded")
+
+
 def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
     if not path.exists():
         return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        issues.append(ValidationIssue(path.name, f"invalid JSON: {exc.msg}"))
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
+        issues.append(issue)
         return
     _validate_object(payload, schema, issues, path.name)
 
 
-def _validate_object(payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str) -> None:
+def _validate_object(
+    payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str
+) -> None:
     validator = Draft202012Validator(schema)
     for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
         suffix = ".".join(str(part) for part in error.path)
@@ -1001,13 +1245,34 @@ def _validate_object(payload: Any, schema: dict[str, Any], issues: list[Validati
 
 
 def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    # Decode per line and REPORT undecodable bytes, matching the twin ``_validate_event_file``.
+    #
+    # Strict whole-file decoding raised ``UnicodeDecodeError`` out of ``monoid validate`` — the
+    # ``try`` below covers only ``json.loads`` — so a torn transcript crashed the validator. But
+    # ``errors="replace"`` is the wrong repair: a *complete* record whose string value holds an
+    # undecodable byte then parses, validates, and the file is reported clean. A validator that
+    # turns detected corruption into silence is worse than one that crashes, because the crash at
+    # least stops the caller. The twin detects and reports; do the same.
+    for index, raw_line in enumerate(path.read_bytes().split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
+            continue
         if not line.strip():
             continue
         try:
-            payload = json.loads(line)
+            payload = loads_json_ingress(line)
         except json.JSONDecodeError as exc:
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {exc.msg}"))
+            continue
+        except (ValueError, RecursionError) as exc:
+            # Wider than JSONDecodeError: a deeply nested line exceeds the C scanner's stack, and
+            # `json.loads` raises other ValueErrors too. A validator whose job is to report
+            # corruption must not be stopped by it. Same catch-set and same message shape as
+            # ``_validate_event_file`` — identical corruption should not be labelled two ways.
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
+            issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
         _validate_object(payload, schema, issues, f"{path.name}:{index}")
 
@@ -1017,11 +1282,15 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         if not record.raw_bytes.strip():
             continue
         try:
-            event = json.loads(record.raw_bytes.decode("utf-8"))
+            event = loads_json_ingress(record.raw_bytes.decode("utf-8"))
         except UnicodeDecodeError:
             issues.append(ValidationIssue(f"{path.name}:{index}", "invalid UTF-8"))
             continue
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # ``RecursionError`` is NOT a ``ValueError``: a deeply nested line exceeds the C
+            # scanner's stack and escaped this clause entirely, crashing ``monoid validate`` on the
+            # very corruption it exists to report. ``events.jsonl`` is validated before
+            # ``transcript.jsonl``, so hardening only the transcript half left this reachable first.
             message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
@@ -1032,19 +1301,27 @@ def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
         schema = EVENT_DATA_SCHEMAS.get(event_type) if isinstance(event_type, str) else None
         if schema is None:
             issues.append(
-                ValidationIssue(f"{path.name}:{index}", f"no data schema for event type: {event_type!r}")
+                ValidationIssue(
+                    f"{path.name}:{index}", f"no data schema for event type: {event_type!r}"
+                )
             )
             continue
         data = event.get("data")
-        _validate_object(data if isinstance(data, dict) else {}, schema, issues, f"{path.name}:{index}.data")
+        _validate_object(
+            data if isinstance(data, dict) else {}, schema, issues, f"{path.name}:{index}.data"
+        )
 
 
 def _validate_manifest_workspace_index(run_dir: Path, issues: list[ValidationIssue]) -> None:
-    _validate_manifest_relative_file(run_dir, issues, "workspace_index_path", "workspace index file missing")
+    _validate_manifest_relative_file(
+        run_dir, issues, "workspace_index_path", "workspace index file missing"
+    )
 
 
 def _validate_manifest_workspace_base(run_dir: Path, issues: list[ValidationIssue]) -> None:
-    _validate_manifest_relative_file(run_dir, issues, "workspace_base_path", "workspace base file missing")
+    _validate_manifest_relative_file(
+        run_dir, issues, "workspace_base_path", "workspace base file missing"
+    )
 
 
 def _validate_manifest_relative_file(
@@ -1056,10 +1333,9 @@ def _validate_manifest_relative_file(
     manifest_path = run_dir / "manifest.json"
     if not manifest_path.exists():
         return
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return
+    manifest, issue = _read_json_artifact(manifest_path)
+    if issue is not None:
+        return  # already recorded by the schema pass; do not double-report
     if not isinstance(manifest, dict):
         return
     rel = manifest.get(key)
@@ -1081,9 +1357,8 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
     proposal_path = run_dir / "proposal.json"
     if not proposal_path.exists():
         return
-    try:
-        proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    proposal, issue = _read_json_artifact(proposal_path)
+    if issue is not None:
         return
     if not isinstance(proposal, dict):
         return
@@ -1108,23 +1383,32 @@ def _validate_proposal_hashes(run_dir: Path, issues: list[ValidationIssue]) -> N
                 continue
             path = run_dir / snapshot_path
             if not path.exists():
-                issues.append(ValidationIssue(f"proposal.json.files.{index}.snapshot_path", "snapshot missing"))
+                issues.append(
+                    ValidationIssue(
+                        f"proposal.json.files.{index}.snapshot_path", "snapshot missing"
+                    )
+                )
                 continue
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if file_info.get("snapshot_sha256") != actual:
-                issues.append(ValidationIssue(f"proposal.json.files.{index}.snapshot_sha256", "snapshot hash mismatch"))
+                issues.append(
+                    ValidationIssue(
+                        f"proposal.json.files.{index}.snapshot_sha256", "snapshot hash mismatch"
+                    )
+                )
 
 
 def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> None:
     package_path = run_dir / "proposal.package.json"
-    try:
-        package = json.loads(package_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    package, issue = _read_json_artifact(package_path)
+    if issue is not None:
         return
     if not isinstance(package, dict):
         return
     if package.get("package_hash") != canonical_sha256(package, drop=("package_hash",)):
-        issues.append(ValidationIssue("proposal.package.json.package_hash", "package hash mismatch"))
+        issues.append(
+            ValidationIssue("proposal.package.json.package_hash", "package hash mismatch")
+        )
     seen: set[str] = set()
     for index, file_info in enumerate(package.get("files") or []):
         if not isinstance(file_info, dict):
@@ -1133,21 +1417,30 @@ def _validate_package_hashes(run_dir: Path, issues: list[ValidationIssue]) -> No
         if not isinstance(rel, str):
             continue
         if rel in seen:
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.path", "duplicate package path"))
+            issues.append(
+                ValidationIssue(
+                    f"proposal.package.json.files.{index}.path", "duplicate package path"
+                )
+            )
         seen.add(rel)
         path = run_dir / rel
         if not path.exists() or not path.is_file():
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.path", "package file missing"))
+            issues.append(
+                ValidationIssue(f"proposal.package.json.files.{index}.path", "package file missing")
+            )
             continue
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if file_info.get("sha256") != actual:
-            issues.append(ValidationIssue(f"proposal.package.json.files.{index}.sha256", "package file hash mismatch"))
+            issues.append(
+                ValidationIssue(
+                    f"proposal.package.json.files.{index}.sha256", "package file hash mismatch"
+                )
+            )
 
 
 def _validate_canonical_hash(path: Path, hash_key: str, issues: list[ValidationIssue]) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    payload, issue = _read_json_artifact(path)
+    if issue is not None:
         return
     if not isinstance(payload, dict):
         return

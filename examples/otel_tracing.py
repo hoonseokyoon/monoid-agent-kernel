@@ -27,6 +27,7 @@ from monoid_agent_kernel import (  # noqa: E402
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
+    CapturePolicy,
     RegistryToolRef,
     ToolBinding,
 )
@@ -68,7 +69,9 @@ def main() -> None:
                     response_id="t1",
                     tool_calls=(
                         fake_tool_call(
-                            "fs_write", {"path": "SUMMARY.md", "content": "# Summary\n3 words.\n"}, "c1"
+                            "fs_write",
+                            {"path": "SUMMARY.md", "content": "# Summary\n3 words.\n"},
+                            "c1",
                         ),
                     ),
                 ),
@@ -76,10 +79,19 @@ def main() -> None:
             ]
         )
 
-        # Pass the local provider to the sink; an app with a global OTLP provider just uses
-        # OtelEventSink() with no argument.
+        # The event and model-I/O facets share one preset: events own span timing/topology and the
+        # policy-gated observer adds only digests to the already-open chat span. An app with a
+        # global OTLP provider omits tracer_provider.
+        otel = OtelEventSink(
+            tracer_provider=provider,
+            capture_policy=CapturePolicy(mode="digest"),
+        )
         result = AgentLoop.from_config(
-            spec, adapter, config, event_sinks=(OtelEventSink(tracer_provider=provider),)
+            spec,
+            adapter,
+            config,
+            event_sinks=(otel,),
+            model_io_subscriptions=(otel.model_io_subscription(),),
         ).run_once("Summarize notes.md")
 
     provider.force_flush()  # ensure the spans above are flushed to the console

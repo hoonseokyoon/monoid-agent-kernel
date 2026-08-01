@@ -53,11 +53,13 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
+| `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
 | `proposal` | durable | `monoid.proposal.v2` | json-schema | `monoid.proposal.v2`<br>`native-agent-runner.proposal.v2` |
 | `background-job` | durable | `monoid.background-job.v1` | json-schema | `monoid.background-job.v1`<br>`native-agent-runner.background-job.v1` |
+| `public-background-job` | wire | `monoid.public-background-job.v1` | json-schema | `monoid.public-background-job.v1` |
 | `task` | durable | `monoid.task.v1` | writer-only | None (writer-only) |
 | `proposal-package` | durable | `monoid.proposal-package.v1` | json-schema | `monoid.proposal-package.v1`<br>`native-agent-runner.proposal-package.v1` |
 | `approval` | durable | `monoid.approval.v1` | json-schema | `monoid.approval.v1`<br>`native-agent-runner.approval.v1` |
@@ -68,7 +70,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `conformance-report` | reference | `monoid.conformance-report.v1` | checked | `monoid.conformance-report.v1`<br>`monoid.conformance-report.v2` |
 | `conformance-evidence` | reference | `monoid.conformance-evidence.v1` | strict | `monoid.conformance-evidence.v1` |
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
-| `studio-chat` | reference | `studio.chat.v1` | strict | `studio.chat.v1` |
+| `studio-chat` | reference | `studio.chat.v2` | strict | `studio.chat.v1`<br>`studio.chat.v2` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
 <!-- compatibility-registry:end -->
 
@@ -193,6 +195,19 @@ identifier. New descriptors start at generation one and increment on every commi
 Recovery compares the local and shared copies, selects and repairs from the higher generation,
 and reports equal-generation divergence as `corrupt`. When both historical copies omit the field,
 the local descriptor retains authority. Older readers ignore this additive field.
+
+The v0.20 path-pattern writer keeps a literal leading `!` unchanged and adds
+`"path_pattern_encoding": "monoid.literal-bang.v1"` to the containing policy or tool scope.
+Pre-v0.20 writers stored the literal without that marker in the same v1 artifact identifiers.
+Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `backend-run.v1`,
+`checkpoint.v1`, and retained `command-inbox.v1` runtime-config payloads. Fresh operator
+configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
+`\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
+The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
+grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
+`path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other
+scope field remain hash-authoritative. A pre-v0.20 reader can ignore the additive marker and
+recompute the same semantic hash, while retained legacy spellings keep distinct hashes.
 
 The v0.18 writer adds four optional recovery fields to `monoid.checkpoint.v1`:
 

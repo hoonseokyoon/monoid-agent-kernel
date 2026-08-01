@@ -5,13 +5,23 @@ import base64
 import fnmatch
 import inspect
 import json
+import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any
 
+from monoid_agent_kernel.core._sync_bridge import (
+    AbandonableSyncCall,
+    CalleeCancelled,
+    await_abandonable_call,
+    is_async_callable,
+    start_abandonable_sync_call,
+)
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
+from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
@@ -19,6 +29,11 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.model_io import (
+    ModelIOSubscription,
+    close_model_io_subscriptions,
+)
 from monoid_agent_kernel.core.content import (
     ContentPart,
     content_part_from_json,
@@ -38,6 +53,11 @@ from monoid_agent_kernel.core.media import (
     normalize_inline_media_dicts,
     normalize_inline_media_part,
     resolve_wire_messages,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.context import (
     ContextProvider,
@@ -61,6 +81,10 @@ from monoid_agent_kernel.core.agents import (
     validate_runtime_config,
 )
 from monoid_agent_kernel.core.prompt import BASE_SYSTEM_PROMPT, compose_system_prompt
+from monoid_agent_kernel._runtime_config_ingress import (
+    normalize_runtime_config,
+    preflight_runtime_config,
+)
 from monoid_agent_kernel.core.result import (
     AgentRunResult,
     AgentTurnResult,
@@ -88,6 +112,7 @@ from monoid_agent_kernel.core.tool_surface import (
     ToolSurfaceSnapshot,
     allowed_immediate_registry_tool_ids,
     immediate_registry_tool_ids,
+    validate_tool_surface_snapshot,
 )
 from monoid_agent_kernel.core.tool_approval import (
     TOOL_APPROVAL_RESULT_TYPE,
@@ -104,8 +129,10 @@ from monoid_agent_kernel.core.side_effect_policy import (
     side_effect_policy_from_config,
     verify_outbox_side_effect,
 )
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.errors import (
     ModelAdapterError,
+    ModelCallAborted,
     AgentConfigError,
     NativeAgentError,
     PermissionDenied,
@@ -133,8 +160,14 @@ from monoid_agent_kernel.core.capability import (
     CapabilityRequest,
     CapabilityVault,
 )
-from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
-from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.core.outbox import (
+    Outbox,
+    OutboxReceipt,
+    OutboxRequest,
+    normalize_outbox_receipt,
+)
+from monoid_agent_kernel.core.runtime_controls import exact_runtime_bool, exact_runtime_string
+from monoid_agent_kernel.core.trace_context import child_traceparent, new_traceparent
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.tasks import (
     HostedResultInjector,
@@ -152,12 +185,15 @@ from monoid_agent_kernel.providers.base import (
     ReasoningDelta,
     TextDelta,
     ToolObservation,
-    assemble_streamed_turn,
     format_async_result_text,
 )
 from monoid_agent_kernel.public_view import (
     args_preview,
+    finish_args_preview,
+    preview_value,
     public_error_message,
+    public_inline_path,
+    public_identifier,
     public_path,
     public_proposal_payload,
     public_result_content,
@@ -174,6 +210,8 @@ from monoid_agent_kernel.tools.base import (
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    normalize_tool_result,
+    normalize_tool_spec,
 )
 from monoid_agent_kernel.tool_loader import FunctionToolProvider
 from monoid_agent_kernel.tools.builtin import agent_spawn_tool, builtin_tools
@@ -186,13 +224,7 @@ class _CheckpointPersistError(RuntimeError):
     """Infrastructure failure that must escape the agent-failure recording boundary."""
 
 
-def _consume_task_outcome(task: asyncio.Future[Any]) -> None:
-    """Retrieve a detached task outcome so late cleanup cannot emit an unhandled warning."""
-
-    try:
-        task.result()
-    except BaseException:
-        pass
+_LOGGER = logging.getLogger("monoid_agent_kernel.loop")
 
 
 def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
@@ -200,7 +232,9 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     tool id, binding id, and model name, so subagent allow/deny lists accept ids
     (``fs.read``), patterns (``mcp.*``, ``mcp.github.*``), or ``*`` for all."""
     candidates = (binding.ref.tool_id, binding.binding_id, binding.model_name or "")
-    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name)
+    return any(
+        fnmatch.fnmatch(name, pattern) for pattern in patterns for name in candidates if name
+    )
 
 
 def _recoverable_turn_error(exc: BaseException) -> bool:
@@ -265,6 +299,9 @@ class AgentToolContext(ToolContext):
     shell_service: ShellService
     web_service: WebService
     jobs_service: JobsService
+    # Trace parent of the enclosing AgentLoop invocation. Subagent spawn derives a child span from
+    # this value so parent receipts, delegation events, and child receipts remain in one trace.
+    invocation_traceparent: str = ""
     # The final answer, set by ``run.finish`` (None until then). Cleared (back to None) when a
     # finish is REJECTED by an output validator. The four former fields (final_text/final_outputs/
     # final_notes/finished) collapsed into this one value so the clear is all-or-nothing.
@@ -294,11 +331,86 @@ class AgentToolContext(ToolContext):
     skill_activation_count: int = 0
     skills_activated: list[str] = field(default_factory=list)
     _requested_tool_loads: list[str] = field(default_factory=list)
-    _current_call: CallContext = field(default_factory=lambda: CallContext("", None, None))
+    # The authorization of the tool call currently executing, resolved from two tiers because
+    # neither alone is safe. A ``ContextVar`` is authoritative: a shared attribute was only correct
+    # while exactly one call could be in flight, since the ``finally`` that clears it would strip the
+    # scope of a *still running* handler the run had abandoned, and ``path_allowed`` treats an empty
+    # scope as "no narrowing" -- so the abandoned worker would silently widen to the run-level
+    # permission policy. A copied context per handler (``asyncio`` does this per task,
+    # ``start_abandonable_sync_call`` per worker thread) keeps each call's authorization valid for
+    # that call's whole lifetime. ``ContextVar`` values do not reach a thread the handler starts
+    # itself, though, which is what ``_call_fallback`` covers.
+    #
+    # Residual, and narrower than fail-open: a thread descended from an *abandoned* handler whose run
+    # has already moved on to another call reads that other call's authorization from the fallback.
+    # It borrows a scope it was not granted rather than widening to the run policy. Closing even that
+    # needs a thread-to-creator link, which Python does not expose -- ``threading.enumerate()`` has no
+    # parent edges -- so a descendant thread is indistinguishable from the live call's own child.
+    _call_var: ContextVar[CallContext | None] = field(
+        default_factory=lambda: ContextVar("monoid_current_tool_call", default=None),
+        repr=False,
+        compare=False,
+    )
+    # Fallback for threads a handler starts itself. A new ``threading.Thread`` begins with an empty
+    # context, so ``_call_var`` reads unset there -- and a handler that delegates a ``ToolContext``
+    # operation to a joined child thread is a normal shape, not an abuse. Without this the child
+    # would see no call at all and ``path_allowed`` would apply no binding-level narrowing, widening
+    # to the run-level permission policy while the parent handler is still under a restricted
+    # authorization. This attribute is deliberately *not* authoritative: the ContextVar wins wherever
+    # it is set, which is what keeps an abandoned worker on its own authorization after the run has
+    # moved on to another call. ``None`` means no call is in flight *on this thread's tier*, which is
+    # a refusal for authorization-bearing operations rather than an unrestricted scope.
+    _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
+
+    def _live_call(self) -> CallContext | None:
+        call = self._call_var.get()
+        return self._call_fallback if call is None else call
+
+    def _enter_call(self, call: CallContext) -> None:
+        self._call_var.set(call)
+        self._call_fallback = call
+
+    def _exit_call(self) -> None:
+        self._call_var.set(None)
+        self._call_fallback = None
+
+    @property
+    def _current_call(self) -> CallContext:
+        """The call an operation is *correlated* with, or an empty context outside any call.
+
+        Read only by operations that want the call's identifiers -- turn id, tool event id -- to
+        parent an event or tag a job. Authorization-bearing operations must read
+        ``_authorized_call`` instead: every scope check in this codebase narrows only under a
+        non-empty tuple (``path_allowed`` below, ``shell.py:232`` on command prefixes, ``web.py:102``
+        on domains), so handing them an empty ``CallContext`` widens authorization to the run-level
+        permission policy instead of denying.
+        """
+        call = self._live_call()
+        return CallContext("", None, None) if call is None else call
+
+    @property
+    def _authorized_call(self) -> CallContext:
+        """The call an authorization-bearing operation is acting for; refuses when there is none.
+
+        Outside a live tool call there is no binding whose scope could authorize the operation, so
+        the only safe answer is to refuse. Returning an empty ``CallContext`` here would read as
+        "this call narrows nothing" and grant the full run-level policy.
+        """
+        call = self._live_call()
+        if call is None:
+            raise ToolExecutionError(
+                "no tool call is in flight; scoped operations are refused",
+                error_code="tool_call_not_in_flight",
+            )
+        return call
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
+        path = normalize_unicode_scalars(path)
+        kind = normalize_unicode_scalars(kind)
+        label = None if label is None else normalize_unicode_scalars(label)
+        metadata = normalize_json_ingress(metadata)
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
@@ -311,9 +423,31 @@ class AgentToolContext(ToolContext):
             "artifact.emitted",
             data={
                 "artifact_id": artifact.artifact_id,
+                # Deliberately raw, and not the twin it looks like. `emit_artifact_bytes` rewrites
+                # this to `artifacts/<artifact_id>/<basename>` (recorder.py), so it is a run-dir
+                # pointer to a real file, never the model's own argument: `redact_patterns` cannot
+                # match it and the filesystem already bounds the basename. Bounding it here would
+                # break the readers that resolve it, for no egress -- the same reason
+                # `snapshot_path` keeps bare `public_path`.
                 "path": artifact.path,
-                "kind": kind,
-                "metadata": dict(artifact.metadata),
+                # `kind` is declared `{"type": "string"}` with no enum, so it is free model text
+                # sitting beside two bounded neighbours -- `metadata` is previewed and `path` is a
+                # run-dir pointer. It reads like an enum and is not one. (An earlier version of this
+                # comment cited `label` as a third precedent; `label` is not on this event at all,
+                # and is not bounded anywhere.)
+                #
+                # Bounded as a *string*, not previewed: `artifact.emitted`'s own data schema declares
+                # `{"kind": _STR}` with `additionalProperties: false`, so returning the preview
+                # envelope made every run carrying a long `kind` fail `validate_run_dir` -- the fix
+                # broke the contract it was protecting. Same reason `_INLINE_TEXT_KEYS` exists.
+                "kind": public_identifier(kind),
+                # Model-authored and republished on the fan-out stream. The same mapping is already
+                # capped when it reaches ``tool.call.started`` through ``args_preview``, so leaving
+                # it raw here made the second emit the wider door -- the twin-miss shape again. The
+                # tool's *return* value below stays raw: that goes back to the model, which wrote it.
+                "metadata": preview_value(
+                    "metadata", dict(artifact.metadata), self.permission_policy
+                ),
             },
         )
         return {
@@ -339,26 +473,54 @@ class AgentToolContext(ToolContext):
     def path_allowed(self, path: str, operation: str = "read") -> bool:
         try:
             rel = self.workspace.normalize(path)
-            permission_operation = operation if operation in {"read", "write", "artifact", "run"} else "read"
+            permission_operation = (
+                operation if operation in {"read", "write", "artifact", "run"} else "read"
+            )
             self.permission_policy.check_paths(permission_operation, (rel,))  # type: ignore[arg-type]
-            scope = self._current_call.scope
+            scope = self._authorized_call.scope
             if scope.allowed_paths and not matches_path_patterns(rel, scope.allowed_paths):
                 return False
             if scope.denied_paths and matches_path_patterns(rel, scope.denied_paths):
                 return False
             return True
-        except (PermissionDenied, WorkspaceError, ValueError):
+        except (PermissionDenied, WorkspaceError, ValueError, ToolExecutionError):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
+        # ``self.plan`` keeps the model's own steps verbatim; only the published copy is capped.
+        # Each step is truncated as a *string* inside its item: ``plan.updated.items`` is declared
+        # ``_OBJ_ARRAY``, so an item that stops being an object fails ``validate_run_dir``, and
+        # ``WorkspaceInspector`` renders ``items[].step`` directly -- a preview dict there would
+        # show up as a blank row rather than a truncated one.
+        #
+        # This also bounds ``status.json["plan"]``, which ``StatusJsonSink`` copies straight out of
+        # this event and ``RunProjectionService.status()`` serves wholesale. Capping here rather
+        # than there keeps one copy of the rule instead of two that can drift apart.
+        #
+        # ``items`` is a *typed* array, not a JSON blob: the reducer casts it to ``PlanItem[]`` and
+        # the renderer reads ``.step``/``.status`` off every element. So the list cap reports its
+        # drop through a sibling key instead of appending a marker element -- as an element it drew
+        # a blank row and counted toward the ``completed/total`` denominator, making a capped plan
+        # look permanently one step short of done. The count comes from the previewed length rather
+        # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
+        items = normalize_json_ingress(items)
         self.plan = items
-        self.recorder.emit("plan.updated", data={"items": items})
+        published = preview_value("items", items, self.permission_policy, list_marker=False)
+        data: dict[str, Any] = {"items": published}
+        dropped = len(items) - len(published)
+        if dropped > 0:
+            data["truncated_items"] = dropped
+        self.recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        self.pending_finish = FinishResult(summary, tuple(outputs), notes)
+        self.pending_finish = FinishResult(
+            normalize_unicode_scalars(summary),
+            tuple(normalize_unicode_scalars(output) for output in outputs),
+            None if notes is None else normalize_unicode_scalars(notes),
+        )
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.shell_service.execute(args, self._current_call)
+        return self.shell_service.execute(args, self._authorized_call)
 
     def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run a pre-resolved ``argv`` (skill.run_script) through the shell machinery —
@@ -367,7 +529,7 @@ class AgentToolContext(ToolContext):
         carries ``argv`` (the real command) plus a ``command`` label for the preview."""
         argv = [str(part) for part in args.get("argv") or ()]
         rest = {key: value for key, value in args.items() if key != "argv"}
-        return self.shell_service.execute(rest, self._current_call, argv_override=argv)
+        return self.shell_service.execute(rest, self._authorized_call, argv_override=argv)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self.jobs_service.list_jobs()
@@ -414,7 +576,7 @@ class AgentToolContext(ToolContext):
                 # Correlation so subagent.* events nest under this spawn tool call.
                 "parent_event_id": call.tool_event_id,
                 "turn_id": call.turn_id,
-                "traceparent": new_traceparent(),
+                "traceparent": child_traceparent(self.invocation_traceparent),
             },
         )
         if background:
@@ -439,13 +601,19 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(args, self._current_call, capability_token=self.capability_token("web.search"))
+        return self.web_service.search(
+            args, self._authorized_call, capability_token=self.capability_token("web.search")
+        )
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(args, self._current_call, capability_token=self.capability_token("web.fetch"))
+        return self.web_service.fetch(
+            args, self._authorized_call, capability_token=self.capability_token("web.fetch")
+        )
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(args, self._current_call, capability_token=self.capability_token("web.context"))
+        return self.web_service.context(
+            args, self._authorized_call, capability_token=self.capability_token("web.context")
+        )
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
         self.tool_search_entries = entries
@@ -493,10 +661,26 @@ class AgentToolContext(ToolContext):
         ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
         if self.outbox is None:
             raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
+        normalized_payload = normalize_json_ingress(payload)
+        if not isinstance(normalized_payload, dict):
+            raise ValueError("outbox payload must be an object")
+        destination = normalize_unicode_scalars(
+            exact_runtime_string(destination, field_name="outbox destination")
+        )
+        capability = normalize_unicode_scalars(
+            exact_runtime_string(capability, field_name="outbox capability")
+        )
+        idempotency_key = normalize_unicode_scalars(
+            exact_runtime_string(idempotency_key, field_name="outbox idempotency_key")
+        )
+        expect_ack = exact_runtime_bool(expect_ack, field_name="outbox expect_ack")
+        reply_to = normalize_unicode_scalars(
+            exact_runtime_string(reply_to, field_name="outbox reply_to")
+        )
         call = self._current_call
         request = OutboxRequest(
             destination=destination,
-            payload=dict(payload),
+            payload=normalized_payload,
             capability=capability,
             token_ref=self.capability_token(capability) or "" if capability else "",
             run_id=self.run_id,
@@ -514,31 +698,37 @@ class AgentToolContext(ToolContext):
             parent_id=call.tool_event_id,
             data={
                 "request_id": request.id,
-                "destination": destination,
-                "capability": capability,
+                "destination": request.destination,
+                "capability": request.capability,
                 "traceparent": request.traceparent,
             },
         )
         return {"status": "staged", "request_id": request.id}
 
 
-def _observation_message(observation: ToolObservation, media_store: dict[str, bytes]) -> dict[str, Any]:
+def _observation_message(
+    observation: ToolObservation, media_store: dict[str, bytes]
+) -> dict[str, Any]:
     """Provider-neutral by-value message for a tool/async observation. Preserves the
     ``is_background`` → role semantics the adapters use: a background/hosted result is a
     new user message; a tool result is a ``tool`` message keyed by ``call_id``."""
+    output = normalize_json_ingress(observation.output)
     if observation.is_background:
-        return {"role": "user", "content": format_async_result_text(observation.output)}
+        return {
+            "role": "user",
+            "content": format_async_result_text(output),
+        }
     message: dict[str, Any] = {
         "role": "tool",
-        "call_id": observation.call_id,
-        "content": observation.output,
+        "call_id": normalize_unicode_scalars(observation.call_id),
+        "content": output,
     }
     if observation.media:
         # By reference; resolved to wire blocks at send time and delivered per provider (a follow-up
         # user message for OpenAI/gateway). Inline (data:) media a tool returned is normalized to a
         # durable blob here, symmetric with user-input media — so tool media survives restart too.
         message["media"] = normalize_inline_media_dicts(list(observation.media), media_store)
-    return message
+    return normalize_json_ingress(message)
 
 
 def _as_blob_reader(
@@ -548,6 +738,7 @@ def _as_blob_reader(
     ``None`` source has no content — used when restoring a checkpoint with no workspace
     delta; reading any sha then raises (a delta entry without its blob is a bug)."""
     if blobs is None:
+
         def _empty(sha256: str) -> bytes:
             raise KeyError(sha256)
 
@@ -583,6 +774,17 @@ class RunState:
     provider_error_code: str = ""
     provider_http_status: int | None = None
     final_text: str = ""
+    # Whether ``final_text`` came from the model — its response text, or the ``summary`` argument of
+    # a ``run.finish`` tool call — rather than being authored by the kernel. Only model-authored text
+    # is content the fan-out event stream must not carry; a kernel string like "Stopped after
+    # reaching max steps." is ours to publish, and digesting it would cost the operator the one
+    # sentence explaining why the run stopped. Every write to ``final_text`` sets this in the same
+    # breath (pinned by ``tests/test_final_text_provenance.py``), because a site that forgets one
+    # direction leaks model output and the other hides a limit message.
+    #
+    # Deliberately NOT checkpointed: that would widen ``RunCheckpoint``, a compatibility-ledger
+    # artifact. Restore therefore fails closed — see ``_rehydrate``.
+    final_text_is_model_output: bool = False
     # Validated value from a successful output validator (process-local; surfaced as
     # AgentRunResult.final_output, never checkpointed). Only set on a successful settle.
     final_output: Any = None
@@ -663,11 +865,20 @@ class AgentLoop:
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
+    # Base provenance for model calls made by this run. AgentLoop supplies the authoritative
+    # run/turn identity per call while preserving caller-owned Skill, batch, trace, and attributes.
+    invocation_context: InvocationContext | None = None
+    # Run-owned observers of settled model calls. They receive an activation snapshot and are
+    # closed with the loop, like event sinks. Use fresh instances for every loop/restore activation.
+    model_io_subscriptions: tuple[ModelIOSubscription, ...] = ()
     status_file: bool = True
     # Opt-in token streaming for the autonomous (non-RunStream) drive: when set and the model
     # adapter supports ``astream_turn``, each text fragment is emitted as a ``model.output.delta``
     # event so an event-stream consumer (e.g. the studio app over SSE) can render tokens live.
-    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default.
+    # Falls back to a one-shot ``next_turn`` for adapters that can't stream. Off by default here,
+    # but the shipped Studio turns it on whenever ``httpx`` is importable — so for the product most
+    # people run, this is on. ``MONOID_OUTPUT_DELTAS=0`` forces it off for a whole deployment;
+    # see ``__post_init__``.
     emit_output_deltas: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
@@ -718,6 +929,7 @@ class AgentLoop:
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
+    _model_io_subscriptions_closed: bool = field(default=False, init=False, repr=False)
     # Core-owned per-run event loop for sync callers. Runs continuously on a dedicated
     # daemon thread for the whole run (not just during a call), so background asyncio tasks
     # (subprocess monitors) keep progressing between turns even when a turn-by-turn driver
@@ -742,7 +954,9 @@ class AgentLoop:
     _pause_requested: bool = field(default=False, init=False, repr=False)
     # Per-run cache of granted capability leases (handles only, never secrets). Deliberately not
     # checkpointed — on restore leases are re-brokered, so a stale handle never survives on disk.
-    _capability_vault: CapabilityVault = field(default_factory=CapabilityVault, init=False, repr=False)
+    _capability_vault: CapabilityVault = field(
+        default_factory=CapabilityVault, init=False, repr=False
+    )
     _outbox: Outbox = field(default_factory=Outbox, init=False, repr=False)
     _bootstrapper: LoopBootstrapper = field(init=False, repr=False)
     _settle_coordinator: LoopSettleCoordinator = field(init=False, repr=False)
@@ -752,6 +966,23 @@ class AgentLoop:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        # Operator kill switch for the delta channel. Resolved here, into the field itself, rather
+        # than at the emit site: gating the emit would leave `emit_output_deltas` reporting True
+        # while nothing streamed, which is the "one half bound, its twin reporting otherwise" shape
+        # this release exists to remove. It can only turn the channel OFF -- an operator disabling
+        # content egress must not be able to enable it by accident, and a deployment that never
+        # opted in has nothing to switch on.
+        #
+        # Subagents are deliberately NOT special-cased: each child re-runs this on its own
+        # construction, so one variable covers a run and every run it spawns.
+        # Read unconditionally, and only then combine. Guarding the read behind
+        # `self.emit_output_deltas and ...` short-circuited it away in exactly the configurations
+        # where the operator most needs the feedback -- the kernel default, and Studio without
+        # `httpx` -- so a typo'd value was never validated for them at all. `getenv_bool`'s promise
+        # that a malformed value is an error rather than a silent no-op has to hold for everyone.
+        deltas_permitted = getenv_bool(OUTPUT_DELTAS_ENV, default=True)
+        if self.emit_output_deltas and not deltas_permitted:
+            self.emit_output_deltas = False
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
@@ -800,7 +1031,7 @@ class AgentLoop:
 
             AgentLoop.from_tools(spec, adapter, [word_count]).run_once("count the words")
         """
-        specs = tuple(tools)
+        specs = tuple(normalize_tool_spec(tool) for tool in tools)
         provider = FunctionToolProvider(lambda _ctx: specs)
         config = AgentRuntimeConfig(
             definition_id=definition_id,
@@ -828,7 +1059,10 @@ class AgentLoop:
 
         Validates against the builtin tools plus any ``tools`` you'll bind (or an explicit
         ``registry``). The run ``spec`` is not needed — tool validation doesn't depend on it."""
-        issues: list[str] = []
+        normalized_config, issues = preflight_runtime_config(config)
+        if normalized_config is None:
+            return issues
+        config = normalized_config
         if registry is None:
             registry = ToolRegistry()
             registry.register_many(builtin_tools(None))  # type: ignore[arg-type]
@@ -864,14 +1098,29 @@ class AgentLoop:
         session so close() still returns a failed result rather than raising."""
         if self._session is not None:
             raise NativeAgentError("run is already open", error_code="run_already_open")
+        if self.model_io_subscriptions and self._model_io_subscriptions_closed:
+            raise NativeAgentError(
+                "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
+                error_code="model_io_subscriptions_closed",
+            )
         try:
             res = self._bootstrap()
         except Exception as exc:  # controlled recording boundary for standalone CLI
             res = self._bootstrap_resources
             if res is None:
+                self._close_model_io_subscriptions()
                 raise
             state = RunState()
-            self._record_failure(state, res, exc)
+            try:
+                self._record_failure(state, res, exc)
+            except BaseException:
+                # A failure recorder is an owned sink too. If it fails, no terminal session can be
+                # returned, so discard every partially published bootstrap resource before raising.
+                try:
+                    self.discard_uncommitted()
+                except BaseException:
+                    pass
+                raise
             self._session = _Session(state=state, res=res, terminal=True)
             return
         self._session = _Session(state=RunState(), res=res)
@@ -1047,9 +1296,13 @@ class AgentLoop:
         ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable failure fails
         immediately. The loop never computes the schedule — it records what the edge decided. The
         ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        request_id = normalize_unicode_scalars(
+            exact_runtime_string(request_id, field_name="outbox request_id")
+        )
         request = self._outbox.get(request_id)
         if request is None:
             return ""
+        receipt = normalize_outbox_receipt(receipt)
         attempts = request.attempts + 1
         recorder = self._session.res.recorder if self._session is not None else None
         if receipt.ok:
@@ -1114,6 +1367,7 @@ class AgentLoop:
             state.provider_error_code = ""
             state.provider_http_status = None
             state.final_text = ""
+            state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
             state.output_retries = 0
             state.final_output = None
@@ -1144,6 +1398,7 @@ class AgentLoop:
                 if state.error_code == "cancelled"
                 else "Stopped after reaching max duration."
             )
+            state.final_text_is_model_output = False
             session.terminal = True
             result = replace(
                 Suspension(reason="terminal", status="limited"),
@@ -1307,17 +1562,34 @@ class AgentLoop:
         """Finalize the run: cancel jobs, write the terminal proposal, emit
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
-        result = self._finalize(session.state, session.res)
-        # A successfully completed run has nothing to recover: drop its checkpoints. A
-        # failed/limited run KEEPS its checkpoints so the last-good one (named in
-        # failure.json) is available for an operator-driven restore.
-        if session.state.status == "completed":
-            self._checkpoint_store().delete(self.spec.run_id)
-        self._session = None
-        # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
-        # owned loop is torn down now. The run_once path calls close() from within the loop;
-        # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
-        self._maybe_close_loop()
+        try:
+            result = self._finalize(session.state, session.res)
+        except BaseException:
+            # A failed terminal transition cannot remain submit-capable with already-closed
+            # observers. Finish best-effort activation cleanup while preserving the original
+            # finalization/checkpoint error for the caller.
+            try:
+                self.discard_uncommitted()
+            except BaseException:
+                pass
+            raise
+        self._close_model_io_subscriptions(session.res)
+        try:
+            # A successfully completed run has nothing to recover: drop its checkpoints. A
+            # failed/limited run KEEPS its checkpoints so the last-good one (named in
+            # failure.json) is available for an operator-driven restore.
+            if session.state.status == "completed":
+                self._checkpoint_store().delete(self.spec.run_id)
+        finally:
+            # Finalization already closed the recorder. A checkpoint-delete failure must end this
+            # activation without asking recorder/event sinks to close a second time.
+            self._session = None
+            self._bootstrap_resources = None
+            self._stream_sink = None
+            # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
+            # owned loop is torn down now. The run_once path calls close() from within the loop;
+            # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
+            self._maybe_close_loop()
         return result
 
     def release_parked(self) -> None:
@@ -1341,7 +1613,17 @@ class AgentLoop:
                 "run has no current committed suspension boundary",
                 error_code="run_not_durably_parked",
             )
-        session.res.recorder.close()
+        try:
+            self._close_model_io_subscriptions(session.res)
+            session.res.recorder.close()
+        except BaseException:
+            # The committed boundary remains recoverable, but this process-local activation is no
+            # longer usable after its observers close. Discard it while preserving the close error.
+            try:
+                self.discard_uncommitted()
+            except BaseException:
+                pass
+            raise
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1350,7 +1632,14 @@ class AgentLoop:
     async def arelease_parked(self) -> None:
         """Async facade for :meth:`release_parked`."""
 
-        await asyncio.to_thread(self.release_parked)
+        try:
+            await self._await_lifecycle_thread(self.release_parked)
+        except asyncio.CancelledError:
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
 
     def discard_uncommitted(self) -> None:
         """Discard process-local activation state and keep the last durable checkpoint.
@@ -1376,6 +1665,7 @@ class AgentLoop:
                 resources.recorder.close()
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
+        self._close_model_io_subscriptions(resources)
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1389,7 +1679,7 @@ class AgentLoop:
     async def adiscard_uncommitted(self) -> None:
         """Async facade for :meth:`discard_uncommitted`."""
 
-        await asyncio.to_thread(self.discard_uncommitted)
+        await self._await_lifecycle_thread(self.discard_uncommitted)
 
     def run_once(self, user_input: str | tuple[ContentPart, ...]) -> AgentRunResult:
         """One-shot convenience: open() + submit(user_input) + close().
@@ -1418,7 +1708,8 @@ class AgentLoop:
             session = self._require_open()
             if not session.terminal:
                 if seed_messages:
-                    session.state.messages = [dict(message) for message in seed_messages]
+                    normalized_messages = normalize_json_ingress(seed_messages)
+                    session.state.messages = [dict(message) for message in normalized_messages]
                 if seed_media_blobs:
                     session.state.media_blobs = dict(seed_media_blobs)
                 await self.asubmit(user_input)
@@ -1429,11 +1720,51 @@ class AgentLoop:
     async def aopen(self) -> None:
         """Async form of :meth:`open` — offloads the (sync) bootstrap I/O to a thread so
         an event loop is not blocked during workspace/manifest setup."""
-        await asyncio.to_thread(self.open)
+        try:
+            await self._await_lifecycle_thread(self.open)
+        except asyncio.CancelledError:
+            # ``to_thread`` work cannot be force-cancelled. Wait until bootstrap stops publishing
+            # resources, then discard them before the cancellation reaches the backend driver.
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
 
     async def aclose(self) -> AgentRunResult:
         """Async form of :meth:`close` — offloads the (sync) finalize I/O to a thread."""
-        return await asyncio.to_thread(self.close)
+        try:
+            return await self._await_lifecycle_thread(self.close)
+        except asyncio.CancelledError:
+            try:
+                await self._await_lifecycle_thread(self.discard_uncommitted)
+            except BaseException:
+                pass
+            raise
+
+    @staticmethod
+    async def _await_lifecycle_thread(operation: Callable[[], Any]) -> Any:
+        """Wait for non-cancellable thread I/O to settle before propagating task cancellation."""
+
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A second cancellation request must not reopen the race. Retrieve the worker outcome
+            # after it settles, then propagate cancellation from the original await.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if task.done() and not task.cancelled():
+                try:
+                    task.result()
+                except BaseException:
+                    pass
+            raise
 
     def _run_sync(self, coro: Any) -> Any:
         """Drive an async core method to completion from a synchronous caller.
@@ -1489,169 +1820,116 @@ class AgentLoop:
         loop.call_soon_threadsafe(loop.stop)
         if self._owned_loop_thread is not None:
             self._owned_loop_thread.join(timeout=5)
+        # An abandoned sync worker can deliver into the window between ``stop`` and ``close``.
+        # ``call_soon_threadsafe`` accepts a callback there -- the loop is stopped, not closed -- but
+        # a stopped loop never runs it and closing drops it, so a late awaitable would go undisposed
+        # and warn at collection. The loop thread has exited by now, so this thread is free to drive
+        # one more iteration and flush what is already queued. ``running is None`` because an async
+        # caller closing from its own loop cannot drive a second loop here; that path keeps the plain
+        # stop-and-close, and a worker arriving after the close still self-disposes on the
+        # ``RuntimeError`` from ``call_soon_threadsafe``.
+        if running is None and not loop.is_closed():
+            loop.run_until_complete(asyncio.sleep(0))
         loop.close()
         self._owned_loop = None
         self._owned_loop_thread = None
 
-    async def _acall_model(self, request: ModelRequest, deadline: float | None) -> ModelTurn:
-        """Invoke the model adapter, awaiting an async adapter natively or offloading a
-        sync ``next_turn`` to a thread so the event loop is never blocked on the LLM call.
-
-        Backward compatible: an adapter exposing ``async def anext_turn`` is awaited; a
-        coroutine ``next_turn`` is awaited; a plain sync ``next_turn`` runs in a thread.
-
-        While a stream is active and the adapter supports ``astream_turn``, the streaming
-        path is preferred: token chunks are relayed to the stream queue and folded into a
-        ``ModelTurn`` so the rest of the turn is identical to the non-streamed path."""
-        adapter = self.model_adapter
-        sink = self._stream_sink
-        if sink is not None and sink.active:
-            astream_turn = getattr(adapter, "astream_turn", None)
-            if astream_turn is not None:
-                return await self._acall_model_streaming(astream_turn, request, sink, deadline)
-        if self.emit_output_deltas:
-            astream_turn = getattr(adapter, "astream_turn", None)
-            if astream_turn is not None:
-                return await self._acall_model_emitting_deltas(astream_turn, request, deadline)
-        anext = getattr(adapter, "anext_turn", None)
-        if anext is not None:
-            return await self._await_native_model_call(anext(request), deadline)
-        next_turn = adapter.next_turn
-        if inspect.iscoroutinefunction(next_turn):
-            return await self._await_native_model_call(next_turn(request), deadline)
-        return await asyncio.to_thread(next_turn, request)
-
-    async def _await_native_model_call(
+    async def _acall_model(
         self,
-        pending: Awaitable[ModelTurn],
+        request: ModelRequest,
         deadline: float | None,
+        runner: ModelCallRunner,
+        *,
+        invocation_context: InvocationContext,
     ) -> ModelTurn:
-        """Await native model I/O while propagating run cancellation and the run deadline.
+        """Run one model call through the runner, choosing what this run wants to see of it.
 
-        Interrupt and pause remain step-boundary signals for one-shot model calls. They are
-        intentionally absent from this race and are checked by ``_apump_turn`` after the model
-        returns. Cancellation and deadlines are run boundaries, so they cancel the provider task
-        immediately and wait only a bounded interval for cooperative cleanup.
+        The dispatch, the cancel/deadline race and the receipt live in ``ModelCallRunner``. What
+        stays here is the part that is genuinely about *this* run: which consumer the chunks go to,
+        and whether a cooperative stop applies.
+
+        Three cases, and they are not symmetric. A live ``RunStream`` relays every chunk to its
+        queue and does **not** honour the turn interrupt -- that has always been a step-boundary
+        signal on this path, and making the stream stop early here would be a behaviour change
+        wearing a refactor's clothes. An autonomous run emitting deltas turns text and reasoning
+        into events and *does* stop immediately, which is what ``interrupt_turn`` means to a caller
+        with no queue to close. Everything else takes the one-shot path.
+
+        ``ModelCallAborted`` is translated here because the runner knows nothing about turns. Left
+        untranslated it would reach the loop's generic failure handler and terminalize a session
+        that is supposed to park and stay alive.
         """
 
-        task = asyncio.ensure_future(pending)
-        loop = asyncio.get_running_loop()
-        cancelled: asyncio.Future[None] = loop.create_future()
-        outcome_consumed = False
+        delta_consumer: Callable[[ModelStreamChunk], None] | None = None
+        should_abort: Callable[[], bool] | None = None
+        sink = self._stream_sink
+        if sink is not None and sink.active:
+            delta_consumer = sink.push_delta
+        elif self.emit_output_deltas:
+            assert self._session is not None
+            recorder = self._session.res.recorder
 
-        def signal_cancelled() -> None:
-            def resolve() -> None:
-                if not cancelled.done():
-                    cancelled.set_result(None)
+            def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
+                if isinstance(chunk, TextDelta) and chunk.text:
+                    recorder.emit("model.output.delta", data={"text": chunk.text}, level="debug")
+                elif isinstance(chunk, ReasoningDelta) and chunk.text:
+                    # Display-only reasoning summary (DX-13b): a separate event so a consumer
+                    # renders it in a "thinking" view, distinct from the answer text.
+                    recorder.emit("model.reasoning.delta", data={"text": chunk.text}, level="debug")
 
-            loop.call_soon_threadsafe(resolve)
+            should_abort = lambda: self._interrupt_requested  # noqa: E731
 
-        remove_callback = (
-            self.cancellation_token.add_cancel_callback(signal_cancelled)
-            if self.cancellation_token is not None
-            else lambda: None
-        )
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
         try:
-            await asyncio.wait(
-                {task, cancelled},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            turn, _receipt = await runner.acall(
+                request,
+                context=invocation_context,
+                deadline=deadline,
+                delta_consumer=delta_consumer,
+                should_abort=should_abort,
             )
-            self._check_model_cancel_or_deadline(deadline)
-            if task.done():
-                outcome_consumed = True
-                return task.result()
-            if cancelled.done():
-                raise RunCancelled("run cancelled")
-            raise RunTimeout("run exceeded max duration")
-        finally:
-            remove_callback()
-            if not cancelled.done():
-                cancelled.cancel()
-            if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_model_cancel_grace_s)
-                )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
-            elif not outcome_consumed:
-                _consume_task_outcome(task)
+        except ModelCallAborted as exc:
+            raise TurnInterrupted("turn interrupted") from exc
+        return turn
 
-    async def _acall_model_streaming(
-        self,
-        astream_turn: Callable[[ModelRequest], Any],
-        request: ModelRequest,
-        sink: QueueEventSink,
-        deadline: float | None,
-    ) -> ModelTurn:
-        """Drive an adapter's ``astream_turn``: relay each chunk to the live stream and
-        accumulate them into the turn's ``ModelTurn`` (see ``assemble_streamed_turn``)."""
-        agen = astream_turn(request)
+    def _model_invocation_context(self, turn_id: str) -> InvocationContext:
+        """Bind caller provenance to this loop's durable, monotonic model-call address."""
 
-        async def consume() -> ModelTurn:
-            chunks: list[ModelStreamChunk] = []
-            try:
-                async for chunk in agen:
-                    sink.push_delta(chunk)
-                    chunks.append(chunk)
-            finally:
-                # Provider async iterators own network resources. Cooperative cancellation enters
-                # their ``finally`` and then explicitly closes the iterator; stubborn cleanup is
-                # detached by ``_await_native_model_call`` after its bounded grace interval.
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-            return assemble_streamed_turn(chunks)
+        base = self._safe_invocation_context()
+        step_id = f"{base.step_id}/{turn_id}" if base.step_id else turn_id
+        return replace(
+            base,
+            run_id=self.spec.run_id,
+            step_id=step_id,
+            # The caller's attempt identifies the enclosing Skill/pipeline unit. AgentLoop does
+            # not alter it; provider retries live in the receipt and later loop calls get new turns.
+            attempt=base.attempt,
+        )
 
-        return await self._await_native_model_call(consume(), deadline)
+    def _safe_invocation_context(self) -> InvocationContext:
+        """Snapshot valid caller provenance without letting observability metadata fail the run."""
 
-    async def _acall_model_emitting_deltas(
-        self,
-        astream_turn: Callable[[ModelRequest], Any],
-        request: ModelRequest,
-        deadline: float | None,
-    ) -> ModelTurn:
-        """Autonomous-drive streaming (no RunStream queue): drive ``astream_turn`` and emit each
-        text fragment as a ``model.output.delta`` event, so an event-stream consumer renders
-        tokens live. Tool-call/usage chunks are folded only — the assembled ``ModelTurn`` is
-        identical to the one-shot path, so the rest of the turn is unchanged."""
-        assert self._session is not None
-        recorder = self._session.res.recorder
-        agen = astream_turn(request)
+        if self.invocation_context is None:
+            return InvocationContext()
+        try:
+            # ``InvocationContext`` is frozen but callers can still force-mutate fields and its
+            # copied attributes map remains mutable. The wire round-trip validates every scalar as
+            # well as the attributes before AgentLoop derives per-turn or child provenance.
+            return InvocationContext.from_json(self.invocation_context.to_json())
+        except Exception:
+            return InvocationContext()
 
-        async def consume() -> ModelTurn:
-            chunks: list[ModelStreamChunk] = []
-            try:
-                async for chunk in agen:
-                    chunks.append(chunk)
-                    if isinstance(chunk, TextDelta) and chunk.text:
-                        recorder.emit(
-                            "model.output.delta", data={"text": chunk.text}, level="debug"
-                        )
-                    elif isinstance(chunk, ReasoningDelta) and chunk.text:
-                        # Display-only reasoning summary (DX-13b): a separate event so a consumer
-                        # renders it in a "thinking" view, distinct from the answer text.
-                        recorder.emit(
-                            "model.reasoning.delta", data={"text": chunk.text}, level="debug"
-                        )
-                    # Immediate stop: when a turn interrupt arrives mid-stream, abort the in-flight
-                    # generation now (don't wait for the next step boundary). The text already
-                    # streamed stays; the except in arun_until_suspended parks the live session.
-                    if self._interrupt_requested:
-                        raise TurnInterrupted("turn interrupted")
-            finally:
-                # Close the generator so the provider's stream/connection is released promptly
-                # (on a normal drain this is a no-op; on a bounded abort it cancels the wire).
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-            return assemble_streamed_turn(chunks)
+    def _close_model_io_subscriptions(self, resources: _RunResources | None = None) -> None:
+        """Close this activation's observer snapshot once, tolerating observer failures."""
 
-        return await self._await_native_model_call(consume(), deadline)
+        if self._model_io_subscriptions_closed:
+            return
+        self._model_io_subscriptions_closed = True
+        subscriptions = (
+            tuple(resources.model_runner.subscriptions)
+            if resources is not None
+            else self.model_io_subscriptions
+        )
+        close_model_io_subscriptions(subscriptions)
 
     def _record_failure(
         self,
@@ -1681,6 +1959,7 @@ class AgentLoop:
                 state.provider_error_code = ""
                 state.provider_http_status = None
         state.final_text = ""
+        state.final_text_is_model_output = False
         res.recorder.emit(
             "run.failed",
             data={
@@ -1744,7 +2023,11 @@ class AgentLoop:
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
-        reported = session.res.context.job_manager.report_result(task_id, result, status=status)
+        reported = session.res.context.job_manager.report_result(
+            normalize_unicode_scalars(task_id),
+            normalize_json_ingress(result),
+            status=normalize_unicode_scalars(status),
+        )
         if persist_checkpoint:
             self._persist_checkpoint(session)
         return reported
@@ -1825,7 +2108,9 @@ class AgentLoop:
             # Durable (approved) capability leases — handles only — so a restart does not re-prompt.
             capability_leases=self._capability_vault.export_durable(),
             outbox_requests=self._outbox.export(),
-            pending_capability_replays=[dict(replay) for replay in state.pending_capability_replays],
+            pending_capability_replays=[
+                dict(replay) for replay in state.pending_capability_replays
+            ],
             pending_tool_approval_replays=[
                 dict(replay) for replay in state.pending_tool_approval_replays
             ],
@@ -1947,6 +2232,11 @@ class AgentLoop:
         the agent's delta on top."""
         if self._session is not None:
             raise NativeAgentError("run is already open", error_code="run_already_open")
+        if self.model_io_subscriptions and self._model_io_subscriptions_closed:
+            raise NativeAgentError(
+                "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
+                error_code="model_io_subscriptions_closed",
+            )
         self._restoring = True
         try:
             res = self._bootstrap()
@@ -1962,7 +2252,9 @@ class AgentLoop:
         finally:
             self._restoring = False
 
-    def _rehydrate(self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]) -> None:
+    def _rehydrate(
+        self, cp: RunCheckpoint, res: _RunResources, blob_reader: Callable[[str], bytes]
+    ) -> None:
         # Deadline carry-over: downtime while parked does not count against
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
@@ -1975,6 +2267,14 @@ class AgentLoop:
                 else res.started
             )
             res = replace(res, deadline=now + cp.remaining_duration_s, started=started)
+        previous_runtime_config = None
+        if cp.previous_runtime_config is not None:
+            try:
+                previous_runtime_config = normalize_runtime_config(
+                    AgentRuntimeConfig.from_durable_json(cp.previous_runtime_config)
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise AgentConfigError(f"invalid restored runtime config: {exc}") from exc
         state = RunState(
             status=cp.status,
             error=cp.error,
@@ -1982,26 +2282,31 @@ class AgentLoop:
             provider_error_code=cp.provider_error_code,
             provider_http_status=cp.provider_http_status,
             final_text=cp.final_text,
+            # Fail closed. Provenance is not in the checkpoint, so a restored non-empty final_text is
+            # assumed to be the model's: over-digesting a resumed kernel message costs a sentence in
+            # the transcript, while the other default would publish model output on the very stream
+            # the run had already moved it off.
+            final_text_is_model_output=bool(cp.final_text),
             previous_turn_handle=cp.previous_turn_handle,
             pending_user_input=(
                 tuple(content_part_from_json(part) for part in cp.pending_user_input)
                 if cp.pending_user_input is not None
                 else None
             ),
-            pending_observations=tuple(ToolObservation.from_json(obs) for obs in cp.pending_observations),
+            pending_observations=tuple(
+                ToolObservation.from_json(obs) for obs in cp.pending_observations
+            ),
             pending_binding_loads=tuple(cp.pending_binding_loads),
             tool_call_counts=dict(cp.tool_call_counts),
-            previous_runtime_config=(
-                AgentRuntimeConfig.from_json(cp.previous_runtime_config)
-                if cp.previous_runtime_config is not None
-                else None
-            ),
+            previous_runtime_config=previous_runtime_config,
             total_tool_calls=cp.total_tool_calls,
             output_retries=cp.output_retries,
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
-            pending_capability_replays=tuple(dict(replay) for replay in cp.pending_capability_replays),
+            pending_capability_replays=tuple(
+                dict(replay) for replay in cp.pending_capability_replays
+            ),
             pending_tool_approval_replays=tuple(
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
@@ -2034,7 +2339,9 @@ class AgentLoop:
         # Re-apply the agent's workspace delta on top of the (backend-re-provisioned)
         # base, so the restored workspace matches the checkpoint instant and
         # changed_entries() reports the same delta again.
-        self._apply_workspace_delta(res.workspace, cp.workspace_delta, blob_reader, self.spec.limits)
+        self._apply_workspace_delta(
+            res.workspace, cp.workspace_delta, blob_reader, self.spec.limits
+        )
         manager = res.context.job_manager
         # Publish the restored durable baseline before registering hosted tasks. If any later
         # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
@@ -2046,9 +2353,7 @@ class AgentLoop:
             terminal=cp.terminal,
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
-            last_suspension=(
-                dict(cp.last_suspension) if cp.last_suspension is not None else None
-            ),
+            last_suspension=(dict(cp.last_suspension) if cp.last_suspension is not None else None),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={
@@ -2062,7 +2367,10 @@ class AgentLoop:
             },
         )
         manager.restore_state(
-            [HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir) for payload in cp.hosted_tasks],
+            [
+                HostedTask.from_checkpoint(payload, res.recorder.artifacts_dir)
+                for payload in cp.hosted_tasks
+            ],
             reentry_queue=cp.reentry_queue,
             delivered_reentry_jobs=cp.delivered_reentry_jobs,
         )
@@ -2123,8 +2431,10 @@ class AgentLoop:
         observations: list[ToolObservation] = []
         for job_file in sorted(jobs_dir.glob("*/job.json")):
             try:
-                payload = json.loads(job_file.read_text(encoding="utf-8"))
+                payload = loads_json_ingress(job_file.read_text(encoding="utf-8"))
             except (ValueError, OSError):
+                continue
+            if not isinstance(payload, dict):
                 continue
             if payload.get("status") != "running":
                 continue
@@ -2198,7 +2508,12 @@ class AgentLoop:
         parent_event_id = task.request.get("parent_event_id")
         turn_id = task.request.get("turn_id")
         definition = self.subagent_definitions[definition_id]
-        parent_config = self.runtime_config_provider.current_config(self.spec.run_id)
+        try:
+            parent_config = normalize_runtime_config(
+                self.runtime_config_provider.current_config(self.spec.run_id)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AgentConfigError(f"invalid runtime config: {exc}") from exc
         is_fork = definition.context == "fork"
         subagent = SubagentRuntimeContext.create(
             parent_run_id=self.spec.run_id,
@@ -2250,10 +2565,29 @@ class AgentLoop:
                 **subagent.child_metadata(),
             },
         )
+        parent_invocation = self._safe_invocation_context()
+        child_step = f"subagent:{subagent.task_id}"
+        if parent_invocation.step_id:
+            child_step = f"{parent_invocation.step_id}/{child_step}"
         child = AgentLoop(
             spec=child_spec,
             model_adapter=self.model_adapter,
             runtime_config_provider=child_config,
+            invocation_context=replace(
+                parent_invocation,
+                run_id=subagent.child_run_id,
+                step_id=child_step,
+                attempt=parent_invocation.attempt,
+                traceparent=subagent.traceparent,
+                attributes={
+                    **parent_invocation.attributes,
+                    "root_run_id": subagent.root_run_id,
+                    "parent_run_id": subagent.parent_run_id,
+                    "parent_task_id": subagent.task_id,
+                    "subagent_definition_id": subagent.definition_id,
+                    "subagent_depth": str(subagent.depth),
+                },
+            ),
             # Inherit the parent's tool providers so MCP/custom tools are in the child's
             # registry (the inherited bindings reference them).
             tool_providers=self.tool_providers,
@@ -2287,7 +2621,9 @@ class AgentLoop:
             for key, value in usage.items():
                 amount = int(value)
                 parent_ctx.subagent_usage[key] = parent_ctx.subagent_usage.get(key, 0) + amount
-                self._session.state.total_usage[key] = self._session.state.total_usage.get(key, 0) + amount
+                self._session.state.total_usage[key] = (
+                    self._session.state.total_usage.get(key, 0) + amount
+                )
         task.result = subagent.result_payload(
             status=result.status,
             final_text=result.final_text,
@@ -2504,15 +2840,19 @@ class AgentLoop:
                 providers.append(provider)  # type: ignore[arg-type]
         return tuple(providers)
 
-    def _current_runtime_config(self, registry: ToolRegistry, *, validate: bool = True) -> AgentRuntimeConfig:
-        config = (
-            self.runtime_config_provider.current_config(self.spec.run_id)
-        )
+    def _current_runtime_config(
+        self, registry: ToolRegistry, *, validate: bool = True
+    ) -> AgentRuntimeConfig:
+        config = self.runtime_config_provider.current_config(self.spec.run_id)
         if config is None:
             raise AgentConfigError(
                 "runtime config provider returned no config",
                 error_code="agent_config_missing",
             )
+        try:
+            config = normalize_runtime_config(config)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise AgentConfigError(f"invalid runtime config: {exc}") from exc
         if validate:
             validate_runtime_config(config, registry)
         return config
@@ -2557,7 +2897,9 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
-    async def _apump_turn(self, state: RunState, res: _RunResources, session: _Session) -> Suspension:
+    async def _apump_turn(
+        self, state: RunState, res: _RunResources, session: _Session
+    ) -> Suspension:
         context = res.context
         recorder = res.recorder
         deadline = res.deadline
@@ -2580,14 +2922,24 @@ class AgentLoop:
             local_step = session.submit_local_step
             session.session_step += 1
             step = session.session_step
-            background_observations = self._pop_background_observations(context, recorder, step, state)
+            background_observations = self._pop_background_observations(
+                context, recorder, step, state
+            )
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
             turn_started = recorder.emit(
                 "model.turn.started",
                 turn_id=turn_id,
-                data={"step": step, "previous_turn_handle": state.previous_turn_handle},
+                data={
+                    "step": step,
+                    # Same provenance as `response_id`: this *is* a previous one, echoed back.
+                    "previous_turn_handle": (
+                        public_identifier(state.previous_turn_handle)
+                        if state.previous_turn_handle
+                        else state.previous_turn_handle
+                    ),
+                },
             )
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
@@ -2598,7 +2950,8 @@ class AgentLoop:
             # authorization, exposure, and quota filtering, this is replaced with the visible
             # surface's registry tool ids before context providers see the turn.
             turn_context = replace(
-                turn_context, bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools)
+                turn_context,
+                bound_tools=frozenset(tool.base_spec.id for tool in bound_catalog.tools),
             )
             self._emit_runtime_config_if_changed(
                 recorder=recorder,
@@ -2609,12 +2962,14 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
             )
             pending_binding_loads = state.pending_binding_loads
-            surface_snapshot = self.tool_surface_resolver.resolve(
-                bound_catalog=bound_catalog,
-                turn=turn_context,
-                pending_binding_loads=pending_binding_loads,
-                previous_snapshot=state.previous_surface_snapshot,
-                call_counts=state.tool_call_counts,
+            surface_snapshot = validate_tool_surface_snapshot(
+                self.tool_surface_resolver.resolve(
+                    bound_catalog=bound_catalog,
+                    turn=turn_context,
+                    pending_binding_loads=pending_binding_loads,
+                    previous_snapshot=state.previous_surface_snapshot,
+                    call_counts=state.tool_call_counts,
+                )
             )
             if not surface_snapshot.turn_id:
                 surface_snapshot = replace(surface_snapshot, turn_id=turn_id)
@@ -2634,7 +2989,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     data=surface_snapshot.to_public_json(),
-            )
+                )
             state.previous_surface_snapshot = surface_snapshot
             state.pending_binding_loads = ()
             call_counts_before_replays = dict(state.tool_call_counts)
@@ -2697,15 +3052,19 @@ class AgentLoop:
             # Replays run before the model request. If they consumed quota, rebuild the
             # model-facing surface so context providers and tools see the post-replay limits.
             if state.tool_call_counts != call_counts_before_replays:
-                refreshed_surface_snapshot = self.tool_surface_resolver.resolve(
-                    bound_catalog=bound_catalog,
-                    turn=turn_context,
-                    pending_binding_loads=pending_binding_loads,
-                    previous_snapshot=surface_snapshot,
-                    call_counts=state.tool_call_counts,
+                refreshed_surface_snapshot = validate_tool_surface_snapshot(
+                    self.tool_surface_resolver.resolve(
+                        bound_catalog=bound_catalog,
+                        turn=turn_context,
+                        pending_binding_loads=pending_binding_loads,
+                        previous_snapshot=surface_snapshot,
+                        call_counts=state.tool_call_counts,
+                    )
                 )
                 if not refreshed_surface_snapshot.turn_id:
-                    refreshed_surface_snapshot = replace(refreshed_surface_snapshot, turn_id=turn_id)
+                    refreshed_surface_snapshot = replace(
+                        refreshed_surface_snapshot, turn_id=turn_id
+                    )
                 context.configure_tool_search(
                     refreshed_surface_snapshot.search_entries,
                     runtime_config.tool_search.top_k,
@@ -2734,7 +3093,9 @@ class AgentLoop:
                     if not dynamic_segment
                     else f"{dynamic_segment}\n\n{surface_snapshot.delta_notice}"
                 )
-            static_system_prompt = self._system_prompt_for_config(runtime_config, res.static_segments)
+            static_system_prompt = self._system_prompt_for_config(
+                runtime_config, res.static_segments
+            )
             turn_system_prompt = (
                 static_system_prompt
                 if not dynamic_segment
@@ -2767,7 +3128,7 @@ class AgentLoop:
             # assistant reply is appended after the call. The system prompt is NOT logged
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
-                state.messages.append(user_message)
+                state.messages.append(normalize_json_ingress(user_message))
             for observation in state.pending_observations:
                 state.messages.append(_observation_message(observation, state.media_blobs))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
@@ -2778,6 +3139,7 @@ class AgentLoop:
             if log_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the conversation size limit."
+                state.final_text_is_model_output = False
                 state.error_code = log_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2793,6 +3155,7 @@ class AgentLoop:
             if token_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the token budget."
+                state.final_text_is_model_output = False
                 state.error_code = token_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2805,6 +3168,7 @@ class AgentLoop:
             if delta_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the workspace change size limit."
+                state.final_text_is_model_output = False
                 state.error_code = delta_limit_code
                 state.pending_observations = ()
                 return Suspension(
@@ -2829,7 +3193,9 @@ class AgentLoop:
                 wire_messages = resolve_wire_messages(
                     wire_messages,
                     WorkspaceMediaResolver(
-                        res.workspace, blobs=state.media_blobs, blob_reader=self._media_blob_reader()
+                        res.workspace,
+                        blobs=state.media_blobs,
+                        blob_reader=self._media_blob_reader(),
                     ),
                     encoding=getattr(self.model_adapter, "wire_image_encoding", "base64"),
                 )
@@ -2846,6 +3212,7 @@ class AgentLoop:
                 if wire_limit_code is not None:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching the model request size limit."
+                    state.final_text_is_model_output = False
                     state.error_code = wire_limit_code
                     state.pending_observations = ()
                     return Suspension(
@@ -2873,7 +3240,12 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(request, deadline)
+                turn = await self._acall_model(
+                    request,
+                    deadline,
+                    res.model_runner,
+                    invocation_context=self._model_invocation_context(turn_id),
+                )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -2917,11 +3289,16 @@ class AgentLoop:
                         "model": (runtime_config.model or ModelConfig()).model,
                         "items": [dict(item) for item in turn.reasoning],
                     }
-            state.messages.append(assistant_message)
+            state.messages.append(normalize_json_ingress(assistant_message))
             recorder.transcript(
                 {
                     "kind": "model_turn",
                     "step": step,
+                    # Raw. This is `transcript.jsonl`, the private full-payload replay artifact --
+                    # its neighbour `final_text` on the next line is the whole model answer. The
+                    # bound belongs on the *event* copy below, and putting it here also left
+                    # `model_request`'s `previous_turn_handle` unbounded sixty lines up, so the
+                    # private artifact was half-bounded and inconsistent with itself.
                     "response_id": turn.response_id,
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
@@ -2934,7 +3311,13 @@ class AgentLoop:
                 parent_id=turn_started.event_id,
                 data={
                     "step": step,
-                    "response_id": turn.response_id,
+                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
+                    # trust boundary, and real ids are short. A compromised or buggy proxy
+                    # echoing an unbounded string onto the public stream is a channel no
+                    # review of *tool* arguments would ever look at.
+                    "response_id": public_identifier(turn.response_id)
+                    if turn.response_id
+                    else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
                     "usage": turn.usage,
@@ -2982,6 +3365,10 @@ class AgentLoop:
                 # "neither text nor tool calls" error below.
                 if turn.final_text or turn.stop_reason in ("refusal", "length"):
                     state.final_text = turn.final_text or ""
+                    # The model wrote this (or refused/was truncated, which is still its turn
+                    # speaking). Flagged even when the text is empty: provenance describes who
+                    # produced the value, not whether the value has anything in it.
+                    state.final_text_is_model_output = True
                     # The model has consumed the pending observations and settled;
                     # the next submit must not resend them alongside a new message.
                     state.pending_observations = ()
@@ -2999,6 +3386,10 @@ class AgentLoop:
                 if state.total_tool_calls > self.spec.limits.max_tool_calls:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching max tool calls."
+                    # Overwrites whatever a prior settle in this run left here, so the flag has to
+                    # come down with it — otherwise a limit message inherits an earlier turn's
+                    # model provenance and gets digested off the stream.
+                    state.final_text_is_model_output = False
                     state.error_code = "max_tool_calls_exceeded"
                     break
                 # Each call completes before the next starts. Native async handlers stay on
@@ -3027,7 +3418,11 @@ class AgentLoop:
             state.pending_observations = tuple(observations)
 
             if context.pending_finish is not None:
+                # ``summary`` is an argument the model passed to the ``run.finish`` tool, so this is
+                # model-authored prose even though the kernel is the one storing it. Classifying it
+                # as ours would publish model output on the fan-out stream.
                 state.final_text = context.pending_finish.summary
+                state.final_text_is_model_output = True
                 decision = await self._decide_settle(state, res, context, turn, runtime_config)
                 settled = self._apply_settle(decision, state, res, context, from_finish=True)
                 if settled is None:
@@ -3042,6 +3437,7 @@ class AgentLoop:
                 )
         state.status = "limited"
         state.final_text = "Stopped after reaching max steps."
+        state.final_text_is_model_output = False
         state.error_code = "max_steps_exceeded"
         return Suspension(
             reason="limited",
@@ -3056,7 +3452,10 @@ class AgentLoop:
         limits = self.spec.limits
         if len(state.messages) > limits.max_messages:
             return "message_count_exceeded"
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in state.messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in state.messages
+        )
         if size > limits.max_message_log_bytes:
             return "message_log_bytes_exceeded"
         return None
@@ -3067,11 +3466,20 @@ class AgentLoop:
         the authoritative provider actuals summed across turns, not an estimate."""
         limits = self.spec.limits
         usage = state.total_usage
-        if limits.max_input_tokens is not None and usage.get("input_tokens", 0) > limits.max_input_tokens:
+        if (
+            limits.max_input_tokens is not None
+            and usage.get("input_tokens", 0) > limits.max_input_tokens
+        ):
             return "input_tokens_exceeded"
-        if limits.max_output_tokens is not None and usage.get("output_tokens", 0) > limits.max_output_tokens:
+        if (
+            limits.max_output_tokens is not None
+            and usage.get("output_tokens", 0) > limits.max_output_tokens
+        ):
             return "output_tokens_exceeded"
-        if limits.max_total_tokens is not None and usage.get("total_tokens", 0) > limits.max_total_tokens:
+        if (
+            limits.max_total_tokens is not None
+            and usage.get("total_tokens", 0) > limits.max_total_tokens
+        ):
             return "total_tokens_exceeded"
         return None
 
@@ -3079,7 +3487,10 @@ class AgentLoop:
         """Return ``"wire_bytes_exceeded"`` if the resolved per-turn wire payload (inline
         base64 media included) outgrows ``max_message_log_bytes``, else ``None``. Distinct
         from the durable by-reference log cap, which never carries bytes."""
-        size = sum(len(json.dumps(message, ensure_ascii=False)) for message in wire_messages)
+        size = sum(
+            len(json.dumps(message, ensure_ascii=False, allow_nan=False))
+            for message in wire_messages
+        )
         if size > self.spec.limits.max_message_log_bytes:
             return "wire_bytes_exceeded"
         return None
@@ -3180,7 +3591,9 @@ class AgentLoop:
         delivered: list[ToolObservation] = []
         for observation in observations:
             if observation.output.get("type") == TOOL_APPROVAL_RESULT_TYPE:
-                observation = self._handle_tool_approval_result(observation, context, recorder, state)
+                observation = self._handle_tool_approval_result(
+                    observation, context, recorder, state
+                )
             recorder.transcript(
                 {
                     "kind": "tool_observation",
@@ -3463,8 +3876,14 @@ class AgentLoop:
         context: AgentToolContext,
         recorder: AgentRecorder,
     ) -> None:
+        # `public_inline_path`, matching the foreground branch. Despite the local name these are
+        # emitted as `data["paths"]` below -- the same field `_public_paths_from_args` bounds for a
+        # foreground `shell.exec` and the same `narration._target` reads. `shell.exec` declares
+        # `skip_emit_if_background=True`, so which branch runs is decided by `background=True` in a
+        # model-authored argument: the twin was one flag away, and a scripted edit that matched on
+        # indentation converted the foreground copy and silently missed this one.
         changed_paths = [
-            public_path(str(path), self.permission_policy)
+            public_inline_path(str(path), self.permission_policy)
             for path in payload.get("changed_paths", [])
         ]
         if not changed_paths:
@@ -3633,90 +4052,81 @@ class AgentLoop:
         deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
-        context._current_call = CallContext(
-            tool_call_id=call_id,
-            turn_id=turn_id,
-            tool_event_id=started_event.event_id,
-            binding_id=bound_tool.binding_id,
-            tool_id=bound_tool.base_spec.id,
-            model_name=bound_tool.model_name,
-            authorization=authorization,
-            scope=authorization.scope,
-            runtime=bound_tool.runtime,
+        context._enter_call(
+            CallContext(
+                tool_call_id=call_id,
+                turn_id=turn_id,
+                tool_event_id=started_event.event_id,
+                binding_id=bound_tool.binding_id,
+                tool_id=bound_tool.base_spec.id,
+                model_name=bound_tool.model_name,
+                authorization=authorization,
+                scope=authorization.scope,
+                runtime=bound_tool.runtime,
+            )
         )
         try:
             handler = spec.handler
-            async_call = inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
-                getattr(handler, "__call__", None)
-            )
+            async_call = is_async_callable(handler)
             if async_call:
                 pending = handler(context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)
             else:
-                result = await asyncio.to_thread(handler, context, arguments)
+                result = await self._await_native_tool_handler(
+                    start_abandonable_sync_call(
+                        lambda: handler(context, arguments),
+                        thread_name=f"nar-tool-{self.spec.run_id}",
+                    ),
+                    deadline,
+                )
                 if inspect.isawaitable(result):
                     result = await self._await_native_tool_handler(result, deadline)
             if not isinstance(result, ToolResult):
                 raise TypeError("tool handler must return ToolResult")
         finally:
-            context._current_call = CallContext("", None, None)
+            context._exit_call()
         return result
 
     async def _await_native_tool_handler(
         self,
-        pending: Awaitable[ToolResult],
+        pending: Awaitable[ToolResult] | AbandonableSyncCall[ToolResult],
         deadline: float | None,
     ) -> ToolResult:
-        """Await a native handler with run cancellation and deadline propagation."""
+        """Await a handler with run cancellation and deadline propagation.
 
-        task = asyncio.ensure_future(pending)
-        loop = asyncio.get_running_loop()
-        cancelled: asyncio.Future[None] = loop.create_future()
+        Both handler shapes come through here: a native async handler, and a sync handler wrapped
+        by ``start_abandonable_sync_call``. A sync handler cannot be interrupted, so exceeding a
+        run boundary *abandons* it -- the same outcome an async handler that suppresses
+        cancellation already gets once ``async_tool_cancel_grace_s`` expires. It is the run
+        boundary that is reported (``cancelled`` / ``run_timeout``), not a tool failure: a
+        handler-local ``CancelledError`` keeps its distinct ``tool_handler_cancelled`` meaning.
 
-        def signal_cancelled() -> None:
-            def resolve() -> None:
-                if not cancelled.done():
-                    cancelled.set_result(None)
+        An abandoned handler may still be writing to the workspace after the run has stopped
+        waiting for it. That is why abandonment is bounded by a grace interval rather than
+        immediate, and why blocking integrations should still enforce a timeout at their own I/O
+        edge -- the kernel can stop *waiting* for a handler, but it cannot stop the handler.
+        """
 
-            loop.call_soon_threadsafe(resolve)
-
-        remove_callback = (
-            self.cancellation_token.add_cancel_callback(signal_cancelled)
-            if self.cancellation_token is not None
-            else lambda: None
-        )
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
         try:
-            done, _pending = await asyncio.wait(
-                {task, cancelled},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            return await await_abandonable_call(
+                pending,
+                deadline=deadline,
+                token=self.cancellation_token,
+                grace_s=self.async_tool_cancel_grace_s,
+                check_boundary=self._check_run_boundary,
             )
-            self._check_run_boundary(deadline)
-            if task in done:
-                try:
-                    return task.result()
-                except asyncio.CancelledError as exc:
-                    raise ToolExecutionError(
-                        "async tool handler was cancelled",
-                        error_code="tool_handler_cancelled",
-                    ) from exc
-            if cancelled in done:
-                raise RunCancelled("run cancelled")
-            raise RunTimeout("run exceeded max duration")
-        finally:
-            remove_callback()
-            if not cancelled.done():
-                cancelled.cancel()
-            if not task.done():
-                task.cancel()
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=max(0.0, self.async_tool_cancel_grace_s)
-                )
-                if task not in done:
-                    task.add_done_callback(_consume_task_outcome)
-                else:
-                    _consume_task_outcome(task)
+        except CalleeCancelled as exc:
+            # Distinct from the run boundaries the shared race raises: a handler cancelled from
+            # inside keeps its own ``tool_handler_cancelled`` meaning rather than being reported as
+            # the run stopping.
+            #
+            # Only the *handler's* cancellation, never a plain ``CancelledError``. Cancellation
+            # delivered to this task is the host stopping the run, and catching it here reported
+            # one failed tool call and carried on with the next step.
+            raise ToolExecutionError(
+                "async tool handler was cancelled",
+                error_code="tool_handler_cancelled",
+            ) from exc
 
     def _finalize_tool_call(
         self,
@@ -3742,6 +4152,12 @@ class AgentLoop:
                 "kind": "tool_observation",
                 "step": step,
                 "call_id": call_id,
+                # Raw, like every other value in `transcript.jsonl`. Bounding it here made the
+                # observation record disagree with the `model_turn.tool_calls` entry above it and
+                # with `ToolObservation.tool_name`, so a replay reader could not reconstruct the
+                # call that actually ran. The `response_id` bound was reverted out of the transcript
+                # for exactly this reason one commit earlier -- and this twin, in the same file,
+                # was missed. The event copy below keeps the bound.
                 "tool": call_name,
                 "tool_id": spec.id if spec is not None else None,
                 "output": observation.output,
@@ -3754,7 +4170,7 @@ class AgentLoop:
             parent_id=started_event.event_id if started_event else parent_id,
             data={
                 "call_id": call_id,
-                "tool": call_name,
+                "tool": public_identifier(call_name),
                 "ok": result.ok,
                 "error": public_error_message(result.error),
                 "error_code": result.error_code,
@@ -3786,7 +4202,26 @@ class AgentLoop:
             reason=authorization.reason,
             turn_id=turn_id,
             tool_event_id=started_event.event_id if started_event is not None else None,
+            # The run's real policy, not a default one: without it the preview keeps every cap and
+            # silently drops `redact_patterns`, which is the half an operator configured.
+            policy=context.permission_policy,
         )
+        # No separate content-addressed copy of the raw arguments is written here, and an earlier
+        # revision of this branch did write one (`arguments_digest` + `put_blob`). Removed, because
+        # every reason for it turned out to be wrong:
+        #
+        #   * It had no reader. Nothing in `studio-ui/`, the backend, or the CLI consumed the
+        #     digest, so the "entitled fetch" it was supposed to buy did not exist; the approver
+        #     simply lost information.
+        #   * It was redundant. `HostedTask.checkpoint_json` already stores `request` verbatim,
+        #     raw `arguments` included, and the checkpoint *is* deleted when a run completes.
+        #   * On the store this repo ships it was permanent. `SqliteCheckpointStore.put_blob`
+        #     discards `run_id` (blobs are global and content-addressed) and `delete(run_id)`
+        #     deliberately leaves blobs behind, so raw secrets and file bodies stayed in the
+        #     database forever, contradicting the run-lifetime retention the code claimed.
+        #
+        # What the approver actually needed was to see the arguments on the card, which
+        # `redact_tool_arguments` now does directly. See `core.tool_approval`.
         task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
             "tool.approval.requested",
@@ -3851,6 +4286,11 @@ class AgentLoop:
         deadline: float | None,
         approved_tool_approval: Mapping[str, Any] | None = None,
     ) -> ToolObservation:
+        call_name = normalize_unicode_scalars(call_name)
+        call_id = normalize_unicode_scalars(call_id)
+        arguments = normalize_json_ingress(arguments)
+        if not isinstance(arguments, dict):
+            raise TypeError("tool call arguments must be an object")
         spec: ToolSpec | None = None
         bound_tool: BoundTool | None = None
         result: ToolResult
@@ -3894,7 +4334,14 @@ class AgentLoop:
             else:
                 bound_tool = bound_catalog.resolve_model_call(call_name)
                 if bound_tool is None:
-                    raise ToolExecutionError(f"unknown tool: {call_name}", error_code="tool_unknown")
+                    raise ToolExecutionError(
+                        # Bounded, like the `tool` field on the same event. Interpolating the
+                        # raw name republished the whole 36 KB of it through `error` on the
+                        # very event whose `tool` field had just been capped -- two of three
+                        # fields bound and the third a laundering channel for the same string.
+                        f"unknown tool: {public_identifier(call_name)}",
+                        error_code="tool_unknown",
+                    )
                 spec = bound_tool.model_spec
                 started_event = self._emit_tool_started(
                     recorder,
@@ -3960,20 +4407,26 @@ class AgentLoop:
                         # once the lease is granted. Not counted against the binding's call quota.
                         result = pending
                     else:
-                        call_counts[bound_tool.binding_id] = call_counts.get(bound_tool.binding_id, 0) + 1
-                        outbox_count = (
-                            len(self._outbox.export()) if side_effect_admission.requires_outbox else 0
+                        call_counts[bound_tool.binding_id] = (
+                            call_counts.get(bound_tool.binding_id, 0) + 1
                         )
-                        result = await self._ainvoke_handler(
-                            bound_tool,
-                            context,
-                            arguments,
-                            call_id=call_id,
-                            turn_id=turn_id,
-                            recorder=recorder,
-                            started_event=started_event,
-                            authorization=authorization,
-                            deadline=deadline,
+                        outbox_count = (
+                            len(self._outbox.export())
+                            if side_effect_admission.requires_outbox
+                            else 0
+                        )
+                        result = normalize_tool_result(
+                            await self._ainvoke_handler(
+                                bound_tool,
+                                context,
+                                arguments,
+                                call_id=call_id,
+                                turn_id=turn_id,
+                                recorder=recorder,
+                                started_event=started_event,
+                                authorization=authorization,
+                                deadline=deadline,
+                            )
                         )
                         if result.ok:
                             if side_effect_admission.requires_outbox:
@@ -4018,8 +4471,8 @@ class AgentLoop:
                 parent_id=started_event.event_id if started_event else parent_id,
                 data={
                     "call_id": call_id,
-                    "tool": spec.id if spec is not None else call_name,
-                    "requested_tool": call_name,
+                    "tool": spec.id if spec is not None else public_identifier(call_name),
+                    "requested_tool": public_identifier(call_name),
                     "error": public_error_message(str(exc)),
                     "error_code": result.error_code,
                     "surface_decision": surface_decision or None,
@@ -4040,6 +4493,10 @@ class AgentLoop:
                     parent_id=parent_id,
                 )
 
+        try:
+            result = normalize_tool_result(result)
+        except Exception as exc:
+            result = normalize_tool_result(_failure_result(exc))
         return self._finalize_tool_call(
             recorder,
             spec=spec,
@@ -4258,31 +4715,73 @@ class AgentLoop:
                 "max_snippets": 256,
             },
         }[feature]
-        max_calls = web_runtime.get("max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"]))
+        max_calls = web_runtime.get(
+            "max_calls", web_runtime.get(f"max_{feature}_calls", defaults["max_calls"])
+        )
         scope.setdefault("max_calls", max(0, int(max_calls)))
         if feature == "search":
-            scope.setdefault("max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"]))))
+            scope.setdefault(
+                "max_results", max(1, int(web_runtime.get("max_results", defaults["max_results"])))
+            )
         elif feature == "fetch":
             scope.setdefault(
                 "max_bytes",
-                max(1, int(web_runtime.get("max_response_bytes", web_runtime.get("max_bytes", defaults["max_bytes"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_response_bytes",
+                            web_runtime.get("max_bytes", defaults["max_bytes"]),
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "timeout_s",
-                max(1, int(web_runtime.get("max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_timeout_s", web_runtime.get("timeout_s", defaults["timeout_s"])
+                        )
+                    ),
+                ),
             )
         else:
             scope.setdefault(
                 "max_tokens",
-                max(1, int(web_runtime.get("max_context_tokens", web_runtime.get("max_tokens", defaults["max_tokens"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_tokens",
+                            web_runtime.get("max_tokens", defaults["max_tokens"]),
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "max_urls",
-                max(1, int(web_runtime.get("max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_urls", web_runtime.get("max_urls", defaults["max_urls"])
+                        )
+                    ),
+                ),
             )
             scope.setdefault(
                 "max_snippets",
-                max(1, int(web_runtime.get("max_context_snippets", web_runtime.get("max_snippets", defaults["max_snippets"])))),
+                max(
+                    1,
+                    int(
+                        web_runtime.get(
+                            "max_context_snippets",
+                            web_runtime.get("max_snippets", defaults["max_snippets"]),
+                        )
+                    ),
+                ),
             )
         return scope
 
@@ -4342,18 +4841,6 @@ class AgentLoop:
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
 
-    def _check_model_cancel_or_deadline(self, deadline: float | None) -> None:
-        """Check only terminal run boundaries while native model I/O is in flight.
-
-        Turn interrupt and pause keep their existing step-boundary behavior for non-streamed
-        adapters and are handled by ``_check_run_boundary`` after the model returns.
-        """
-
-        if self.cancellation_token is not None and self.cancellation_token.requested:
-            raise RunCancelled("run cancelled")
-        if deadline is not None and time.time() >= deadline:
-            raise RunTimeout("run exceeded max duration")
-
     def _emit_side_effect_event(
         self,
         spec: ToolSpec,
@@ -4369,7 +4856,10 @@ class AgentLoop:
                 "workspace.file.read",
                 turn_id=turn_id,
                 parent_id=parent_id,
-                data={"tool": spec.id, "paths": _public_paths_from_args(spec, arguments, self.permission_policy)},
+                data={
+                    "tool": spec.id,
+                    "paths": _public_paths_from_args(spec, arguments, self.permission_policy),
+                },
             )
         elif spec.emits_workspace_diff:
             if (
@@ -4380,7 +4870,7 @@ class AgentLoop:
                 return
             if spec.changed_paths_source == "result_content":
                 paths = [
-                    public_path(str(path), self.permission_policy)
+                    public_inline_path(str(path), self.permission_policy)
                     for path in result.content.get("changed_paths", [])
                 ]
             else:
@@ -4436,8 +4926,12 @@ def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
     priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
     adapter reports them, so they reach metrics and the token-budget check."""
     for key, value in turn.usage.items():
-        if isinstance(value, bool) or not isinstance(value, int):
-            continue
+        if type(value) is not int or value < 0:
+            raise ModelAdapterError(
+                f"model usage {key} must be a non-negative integer",
+                provider_error_code="model_bad_response",
+                retryable=False,
+            )
         total_usage[key] = total_usage.get(key, 0) + value
 
 
@@ -4477,7 +4971,11 @@ def _rank_tool_search_entries(
         return sum(1 for term in terms if term in haystack)
 
     scored = [(score(entry), index, entry) for index, entry in enumerate(entries)]
-    return [entry for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1])) if value > 0]
+    return [
+        entry
+        for value, _index, entry in sorted(scored, key=lambda item: (-item[0], item[1]))
+        if value > 0
+    ]
 
 
 def _filter_tool_search_entries(
@@ -4559,14 +5057,18 @@ def _tool_start_data(
         preview = shell_args_preview(arguments, permission_policy)
     elif preview_kind == "web":
         preview = web_args_preview(arguments, permission_policy)
+    elif preview_kind == "finish":
+        preview = finish_args_preview(arguments, permission_policy)
     else:
         preview = args_preview(arguments, permission_policy)
     return {
         "call_id": call_id,
-        "tool": call_name,
+        "tool": public_identifier(call_name),
         "capability": spec.capability if spec is not None else None,
         "side_effect": spec.side_effect if spec is not None else None,
-        "paths": _public_paths_from_args(spec, arguments, permission_policy) if spec is not None else [],
+        "paths": _public_paths_from_args(spec, arguments, permission_policy)
+        if spec is not None
+        else [],
         "args_preview": preview,
     }
 
@@ -4576,8 +5078,20 @@ def _public_paths_from_args(
     arguments: dict[str, Any],
     permission_policy: PermissionPolicy,
 ) -> list[str]:
+    """Public `paths` for an event, bounded like every other published copy of the same value.
+
+    `paths` and `args_preview.path` are the *same argument* on the *same event*, and only the second
+    was capped: a 5000-character path arrived truncated in one field and whole in the field beside
+    it. `public_path` redacts by pattern, which is a different question from length.
+
+    Stays a list of plain strings — `narration._target` falls back to `paths` and joins them, and a
+    preview dict there would render as its repr. That fallback is also why the cut has to be
+    *marked*: an unmarked prefix is presented to an operator as the exact target, and two different
+    long paths sharing a prefix become one indistinguishable string. `truncate_inline_text` is
+    shared with the plan-step branch so the two cannot answer that differently again.
+    """
     return [
-        public_path(str(arguments[name]), permission_policy)
+        public_inline_path(str(arguments[name]), permission_policy)
         for name in spec.path_args
         if name in arguments and arguments[name] is not None
     ]

@@ -222,6 +222,19 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         legacy_reader=True,
     ),
     _monoid_artifact(
+        "transcript.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=("core/schemas.py:TRANSCRIPT_RECORD_SCHEMA",),
+        legacy_reader=False,
+        accepts_missing_version=True,
+        notes=(
+            "Private run-dir artifact, listed next to event.v1 because the two are now a pair: a "
+            "settle event carries final_text_digest and resolves here. Records are typed by 'kind' "
+            "rather than a schema_version field, hence accepts_missing_version."
+        ),
+    ),
+    _monoid_artifact(
         "manifest.v1",
         kind="durable",
         reader_policy="json-schema",
@@ -255,6 +268,14 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         reader_policy="json-schema",
         source=("core/schemas.py:JOB_SCHEMA",),
         legacy_reader=True,
+    ),
+    _monoid_artifact(
+        "public-background-job.v1",
+        kind="wire",
+        reader_policy="json-schema",
+        source=("core/schemas.py:PUBLIC_JOB_SCHEMA",),
+        legacy_reader=False,
+        notes="Public projection; artifact_schema_version identifies the durable source shape.",
     ),
     _monoid_artifact(
         "task.v1",
@@ -355,11 +376,15 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
     CompatibilityArtifact(
         key="studio-chat",
         kind="reference",
-        current_writer="studio.chat.v1",
-        supported_readers=("studio.chat.v1",),
+        current_writer="studio.chat.v2",
+        supported_readers=("studio.chat.v1", "studio.chat.v2"),
         namespace_aliases=(),
         reader_policy="strict",
-        source=("reference/studio/chat_projection.py:ChatProjection.response",),
+        source=(
+            "reference/studio/chat_projection.py:is_supported_chat_response",
+            "reference/studio/chat_projection.py:ChatProjection.response",
+        ),
+        notes="v2 adds the required event_log_error member for degraded event-log reads.",
     ),
     CompatibilityArtifact(
         key="studio-chat-message",
@@ -368,9 +393,15 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         supported_readers=("studio.chat.message.v1",),
         namespace_aliases=(),
         reader_policy="permissive",
-        source=("reference/studio/chat_projection.py:ChatProjection.read",),
+        source=(
+            "reference/studio/chat_projection.py:ChatProjection.read",
+            "reference/studio/chat_projection.py:is_supported_chat_response",
+        ),
         accepts_missing_version=True,
-        notes="JSONL projection reader skips malformed records and does not gate by version.",
+        notes=(
+            "The JSONL reader skips invalid JSON and non-object records without gating by version; "
+            "strict transcript readers require the renderable core fields and allow extensions."
+        ),
     ),
 )
 

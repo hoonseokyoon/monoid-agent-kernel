@@ -14,6 +14,7 @@ from monoid_agent_kernel.core.capability import (
     CapabilityDenial,
     CapabilityGrant,
     CapabilityLease,
+    CapabilityPending,
     CapabilityRequest,
     CapabilityVault,
     scope_within,
@@ -21,6 +22,10 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.permissions import (
+    PATH_PATTERN_ENCODING_FIELD,
+    PATH_PATTERN_ENCODING_LITERAL_BANG,
+)
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -63,14 +68,98 @@ def test_vault_caches_valid_lease_and_expires() -> None:
     vault = CapabilityVault()
     request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
     lease = CapabilityLease(
-        capability="web.search", token_ref="t", expires_at=2000.0, scope={"allowed_domains": ["a.edu"]}
+        capability="web.search",
+        token_ref="t",
+        expires_at=2000.0,
+        scope={"allowed_domains": ["a.edu"]},
     )
     vault.admit(request, lease)
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=1999.0) is lease
     # Expired -> miss.
     assert vault.get_valid("web.search", {"allowed_domains": ["a.edu"]}, now=2001.0) is None
     # A need broader than the cached lease -> miss (must re-request).
-    assert vault.get_valid("web.search", {"allowed_domains": ["a.edu", "b.edu"]}, now=1999.0) is None
+    assert (
+        vault.get_valid("web.search", {"allowed_domains": ["a.edu", "b.edu"]}, now=1999.0) is None
+    )
+
+
+def _current_literal_bang_scope() -> dict[str, object]:
+    scope = {
+        key: value for key, value in ToolScope(allowed_paths=("!odd",)).to_json().items() if value
+    }
+    assert scope[PATH_PATTERN_ENCODING_FIELD] == PATH_PATTERN_ENCODING_LITERAL_BANG
+    return scope
+
+
+def test_pre_v020_literal_bang_lease_satisfies_current_marked_scope() -> None:
+    current_scope = _current_literal_bang_scope()
+    legacy_lease = CapabilityLease.from_json(
+        {
+            "protocol": "monoid.capability-lease.v1",
+            "lease_id": "lease_pre_v020_raw_bang",
+            "capability": "filesystem.read",
+            "token_ref": "legacy:raw-bang",
+            "expires_at": 2000.0,
+            "scope": {"allowed_paths": ["!odd"]},
+        }
+    )
+
+    restored_vault = CapabilityVault()
+    restored_vault.install(legacy_lease)
+    assert restored_vault.get_valid("filesystem.read", current_scope, now=1999.0) is legacy_lease
+
+    current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
+    assert CapabilityVault().admit(current_request, legacy_lease) is legacy_lease
+
+
+def test_pre_v020_backslash_bang_lease_does_not_widen_to_current_literal_bang() -> None:
+    current_scope = _current_literal_bang_scope()
+    legacy_lease = CapabilityLease.from_json(
+        {
+            "protocol": "monoid.capability-lease.v1",
+            "lease_id": "lease_pre_v020_backslash_bang",
+            "capability": "filesystem.read",
+            "token_ref": "legacy:backslash-bang",
+            "expires_at": 2000.0,
+            "scope": {"allowed_paths": [r"\!odd"]},
+        }
+    )
+
+    restored_vault = CapabilityVault()
+    restored_vault.install(legacy_lease)
+    assert restored_vault.get_valid("filesystem.read", current_scope, now=1999.0) is None
+
+    current_request = CapabilityRequest(capability="filesystem.read", scope=current_scope)
+    with pytest.raises(ValueError, match="wider scope"):
+        CapabilityVault().admit(current_request, legacy_lease)
+
+
+@pytest.mark.parametrize(
+    ("stored_pattern", "accepted"),
+    [("!odd", True), (r"\!odd", False)],
+)
+def test_pre_v020_hosted_capability_request_preserves_literal_bang_boundary(
+    stored_pattern: str,
+    accepted: bool,
+) -> None:
+    # Hosted capability tasks retain the original request scope as an untyped JSON object.
+    restored_request = CapabilityRequest(
+        capability="filesystem.read",
+        scope={"allowed_paths": [stored_pattern]},
+    )
+    current_lease = CapabilityLease(
+        capability="filesystem.read",
+        token_ref="current:literal-bang",
+        expires_at=2000.0,
+        scope=_current_literal_bang_scope(),
+    )
+    vault = CapabilityVault()
+
+    if accepted:
+        assert vault.admit(restored_request, current_lease) is current_lease
+    else:
+        with pytest.raises(ValueError, match="wider scope"):
+            vault.admit(restored_request, current_lease)
 
 
 def test_vault_admit_rejects_scope_widening() -> None:
@@ -119,7 +208,9 @@ def test_vault_admit_accepts_narrower_numeric_web_caps() -> None:
 
 
 def test_request_and_lease_round_trip_json() -> None:
-    req = CapabilityRequest(capability="email.send", scope={"to": ["x@example.edu"]}, reason="reply")
+    req = CapabilityRequest(
+        capability="email.send", scope={"to": ["x@example.edu"]}, reason="reply"
+    )
     assert req.to_json()["protocol"] == "monoid.capability-request.v1"
     lease = CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=1.0)
     assert lease.to_json()["protocol"] == "monoid.capability-lease.v1"
@@ -215,7 +306,8 @@ def test_loop_grants_lease_then_runs_tool(tmp_path: Path) -> None:
     assert provider.seen_tokens == ["auto:web.search"]  # the handle reached the handler
     events = _events(result.run_dir)
     assert any(
-        e["type"] == "capability.granted" and e["data"]["capability"] == "web.search" for e in events
+        e["type"] == "capability.granted" and e["data"]["capability"] == "web.search"
+        for e in events
     )
 
 
@@ -228,7 +320,9 @@ def test_loop_denied_capability_blocks_tool(tmp_path: Path) -> None:
     assert result.status == "completed"
     assert provider.calls == 0  # the tool never executed
     events = _events(result.run_dir)
-    assert any(e["type"] == "capability.denied" and e["data"]["capability"] == "web.search" for e in events)
+    assert any(
+        e["type"] == "capability.denied" and e["data"]["capability"] == "web.search" for e in events
+    )
 
 
 def test_loop_requires_lease_without_broker_fails_closed(tmp_path: Path) -> None:
@@ -247,8 +341,7 @@ def test_loop_requires_lease_without_broker_fails_closed(tmp_path: Path) -> None
         for e in events
     )
     assert any(
-        e["type"] == "tool.call.failed"
-        and e["data"]["error_code"] == "capability_broker_required"
+        e["type"] == "tool.call.failed" and e["data"]["error_code"] == "capability_broker_required"
         for e in events
     )
 
@@ -281,7 +374,10 @@ def test_gateway_broker_mints_verifiable_token() -> None:
     # the web gateway — see test_gateway_broker_mints_web_gateway_token_for_web_capabilities.)
     lease = broker.request(
         CapabilityRequest(
-            capability="email.send", scope={"to": ["x@example.edu"]}, run_id="run_1", ttl_seconds=300
+            capability="email.send",
+            scope={"to": ["x@example.edu"]},
+            run_id="run_1",
+            ttl_seconds=300,
         )
     )
     assert isinstance(lease, CapabilityLease)
@@ -333,7 +429,9 @@ def test_loop_escalates_capability_then_resumes_after_grant(tmp_path: Path) -> N
     loop.close()
 
 
-def _redispatch_loop(tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn]) -> AgentLoop:
+def _redispatch_loop(
+    tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn]
+) -> AgentLoop:
     binding = tool_binding(
         "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
     )
@@ -364,7 +462,11 @@ def test_auto_redispatch_runs_gated_tool_without_model_retry(tmp_path: Path) -> 
     loop = _redispatch_loop(
         tmp_path,
         provider,
-        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+        turns=[
+            _FETCH,
+            ModelTurn(response_id="rw", final_text="waiting"),
+            ModelTurn(response_id="rd", final_text="done"),
+        ],
     )
     loop.open()
     parked = loop.run_until_suspended("go")
@@ -435,7 +537,11 @@ def test_approved_capability_preserves_lease_policy_fields(tmp_path: Path) -> No
     loop = _redispatch_loop(
         tmp_path,
         provider,
-        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+        turns=[
+            _FETCH,
+            ModelTurn(response_id="rw", final_text="waiting"),
+            ModelTurn(response_id="rd", final_text="done"),
+        ],
     )
     loop.open()
     parked = loop.run_until_suspended("go")
@@ -470,7 +576,11 @@ def test_denied_capability_skips_replay(tmp_path: Path) -> None:
     loop = _redispatch_loop(
         tmp_path,
         provider,
-        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), ModelTurn(response_id="rd", final_text="done")],
+        turns=[
+            _FETCH,
+            ModelTurn(response_id="rw", final_text="waiting"),
+            ModelTurn(response_id="rd", final_text="done"),
+        ],
     )
     loop.open()
     parked = loop.run_until_suspended("go")
@@ -488,7 +598,9 @@ def test_human_escalation_broker_returns_pending() -> None:
     from monoid_agent_kernel.core.capability import CapabilityPending
 
     broker = HumanEscalationBroker()
-    grant = broker.request(CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]}))
+    grant = broker.request(
+        CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
+    )
     assert isinstance(grant, CapabilityPending)
     assert "web.search" in grant.prompt
 
@@ -500,11 +612,21 @@ def test_vault_export_durable_and_install_roundtrip() -> None:
     vault = CapabilityVault()
     request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
     # An ephemeral (sync) lease is NOT exported; a durable (approved) one is.
-    vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
+    vault.admit(
+        request,
+        CapabilityLease(
+            capability="web.search",
+            token_ref="t",
+            expires_at=9e9,
+            scope={"allowed_domains": ["a.edu"]},
+        ),
+    )
     assert vault.export_durable() == []
     vault.admit(
         CapabilityRequest(capability="email.send", scope={}),
-        CapabilityLease(capability="email.send", token_ref="secret-ref://l", expires_at=9e9, durable=True),
+        CapabilityLease(
+            capability="email.send", token_ref="secret-ref://l", expires_at=9e9, durable=True
+        ),
     )
     exported = vault.export_durable()
     assert [e["capability"] for e in exported] == ["email.send"]
@@ -515,14 +637,20 @@ def test_vault_export_durable_and_install_roundtrip() -> None:
     assert fresh.token_for("email.send", now=0.0) == "secret-ref://l"
 
 
-def _escalation_loop(tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn], run_id: str | None = None) -> AgentLoop:
+def _escalation_loop(
+    tmp_path: Path, provider: _CapToolProvider, turns: list[ModelTurn], run_id: str | None = None
+) -> AgentLoop:
     binding = tool_binding(
         "ext.fetch", runtime={"requires_lease": True}, scope=ToolScope(allowed_domains=("a.edu",))
     )
     workspace = tmp_path / "ws"
     if not workspace.exists():
         workspace.mkdir()
-    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", run_id=run_id) if run_id else AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    spec = (
+        AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs", run_id=run_id)
+        if run_id
+        else AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    )
     return AgentLoop(
         spec=spec,
         model_adapter=FakeModelAdapter(turns=turns),
@@ -552,7 +680,12 @@ def test_approved_lease_survives_restart_no_reprompt(tmp_path: Path) -> None:
     loop1 = _escalation_loop(
         tmp_path,
         provider1,
-        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), _FETCH2, ModelTurn(response_id="rd", final_text="done")],
+        turns=[
+            _FETCH,
+            ModelTurn(response_id="rw", final_text="waiting"),
+            _FETCH2,
+            ModelTurn(response_id="rd", final_text="done"),
+        ],
     )
     loop1.open()
     parked = loop1.run_until_suspended("go")
@@ -564,7 +697,9 @@ def test_approved_lease_survives_restart_no_reprompt(tmp_path: Path) -> None:
 
     cp = loop1.snapshot()
     assert cp is not None
-    assert [lease["capability"] for lease in cp.capability_leases] == ["web.search"]  # durable, persisted
+    assert [lease["capability"] for lease in cp.capability_leases] == [
+        "web.search"
+    ]  # durable, persisted
     blobs = loop1.collect_checkpoint_blobs()
     run_id = loop1.spec.run_id
 
@@ -573,7 +708,10 @@ def test_approved_lease_survives_restart_no_reprompt(tmp_path: Path) -> None:
     loop2 = _escalation_loop(
         tmp_path,
         provider2,
-        turns=[ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)), ModelTurn(response_id="r2b", final_text="done2")],
+        turns=[
+            ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)),
+            ModelTurn(response_id="r2b", final_text="done2"),
+        ],
         run_id=run_id,
     )
     loop2.restore(cp, blobs=blobs)
@@ -587,7 +725,9 @@ def test_approved_lease_survives_restart_no_reprompt(tmp_path: Path) -> None:
 # --- backend injection (A-2): RunnerBackend provisions a per-run broker -------------------
 
 
-def _cap_backend(tmp_path: Path, provider: _CapToolProvider, broker_factory: object) -> tuple[RunnerBackend, Path]:
+def _cap_backend(
+    tmp_path: Path, provider: _CapToolProvider, broker_factory: object
+) -> tuple[RunnerBackend, Path]:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     workspace.joinpath("notes.md").write_text("n\n", encoding="utf-8")
@@ -629,7 +769,9 @@ def test_backend_grants_capability_via_factory(tmp_path: Path) -> None:
     backend, workspace = _cap_backend(tmp_path, provider, lambda req: AutoGrantBroker())
     assert _run_cap_backend(backend, workspace) == "completed"
     assert provider.calls == 1
-    assert provider.seen_tokens == ["auto:web.search"]  # broker reached the tool through the backend
+    assert provider.seen_tokens == [
+        "auto:web.search"
+    ]  # broker reached the tool through the backend
 
 
 def test_backend_denies_capability_via_factory(tmp_path: Path) -> None:
@@ -650,8 +792,7 @@ def test_backend_no_factory_fails_requires_lease_closed(tmp_path: Path) -> None:
     run_id = next(iter(backend._records))
     events = _events(backend._record(run_id).run_dir)
     assert any(
-        e["type"] == "tool.call.failed"
-        and e["data"]["error_code"] == "capability_broker_required"
+        e["type"] == "tool.call.failed" and e["data"]["error_code"] == "capability_broker_required"
         for e in events
     )
 
@@ -662,7 +803,15 @@ def test_backend_no_factory_fails_requires_lease_closed(tmp_path: Path) -> None:
 def test_vault_revoke_per_capability_blocks_reads() -> None:
     vault = CapabilityVault()
     request = CapabilityRequest(capability="web.search", scope={"allowed_domains": ["a.edu"]})
-    vault.admit(request, CapabilityLease(capability="web.search", token_ref="t", expires_at=9e9, scope={"allowed_domains": ["a.edu"]}))
+    vault.admit(
+        request,
+        CapabilityLease(
+            capability="web.search",
+            token_ref="t",
+            expires_at=9e9,
+            scope={"allowed_domains": ["a.edu"]},
+        ),
+    )
     assert vault.token_for("web.search", now=0.0) == "t"
     vault.revoke(capability="web.search")
     assert vault.is_capability_revoked("web.search")
@@ -698,12 +847,14 @@ def test_vault_export_import_revocations_roundtrip() -> None:
         "revoked_all": False,
     }
     fresh = CapabilityVault()
-    fresh.import_revocations(**{
-        "lease_ids": exported["revoked_lease_ids"],
-        "capabilities": exported["revoked_capabilities"],
-        "before": exported["revoked_before"],
-        "all_revoked": exported["revoked_all"],
-    })
+    fresh.import_revocations(
+        **{
+            "lease_ids": exported["revoked_lease_ids"],
+            "capabilities": exported["revoked_capabilities"],
+            "before": exported["revoked_before"],
+            "all_revoked": exported["revoked_all"],
+        }
+    )
     assert fresh.is_capability_revoked("web.search")
     assert "lease_x" in fresh._revoked_lease_ids
     assert fresh._revoked_before == 42.0
@@ -792,7 +943,10 @@ def test_loop_revoke_blocks_next_call_without_rebrokering(tmp_path: Path) -> Non
     assert broker.requests == 1  # no re-broker after revocation
     run_dir = loop._session.res.recorder.run_dir  # type: ignore[union-attr]
     events = _events(run_dir)
-    assert any(e["type"] == "capability.revoked" and e["data"]["capability"] == "web.search" for e in events)
+    assert any(
+        e["type"] == "capability.revoked" and e["data"]["capability"] == "web.search"
+        for e in events
+    )
     loop.close()
 
 
@@ -803,7 +957,12 @@ def test_revocation_survives_restart(tmp_path: Path) -> None:
     loop1 = _escalation_loop(
         tmp_path,
         provider1,
-        turns=[_FETCH, ModelTurn(response_id="rw", final_text="waiting"), _FETCH2, ModelTurn(response_id="rd", final_text="done")],
+        turns=[
+            _FETCH,
+            ModelTurn(response_id="rw", final_text="waiting"),
+            _FETCH2,
+            ModelTurn(response_id="rd", final_text="done"),
+        ],
     )
     loop1.open()
     parked = loop1.run_until_suspended("go")
@@ -824,7 +983,10 @@ def test_revocation_survives_restart(tmp_path: Path) -> None:
     loop2 = _escalation_loop(
         tmp_path,
         provider2,
-        turns=[ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)), ModelTurn(response_id="r2b", final_text="done2")],
+        turns=[
+            ModelTurn(response_id="r1b", tool_calls=(fake_tool_call("ext_fetch", {}, "cb"),)),
+            ModelTurn(response_id="r2b", final_text="done2"),
+        ],
         run_id=run_id,
     )
     loop2.restore(cp, blobs=blobs)
@@ -842,13 +1004,17 @@ def test_lease_can_rotate_respects_skew_and_ceiling() -> None:
     assert not lease.can_rotate(now=100.0, skew=50.0)  # far from expiry -> no
     assert lease.can_rotate(now=970.0, skew=50.0)  # within skew of expiry -> yes
     assert not lease.can_rotate(now=1001.0, skew=50.0)  # already expired -> no
-    capped = CapabilityLease(capability="web.search", token_ref="t", expires_at=1000.0, max_expires_at=980.0)
+    capped = CapabilityLease(
+        capability="web.search", token_ref="t", expires_at=1000.0, max_expires_at=980.0
+    )
     assert capped.can_rotate(now=970.0, skew=50.0)  # within skew, before the ceiling -> yes
     assert not capped.can_rotate(now=985.0, skew=50.0)  # past the absolute ceiling -> no
 
 
 def test_lease_max_expires_at_round_trips() -> None:
-    lease = CapabilityLease(capability="c", token_ref="t", expires_at=10.0, max_expires_at=20.0, durable=True)
+    lease = CapabilityLease(
+        capability="c", token_ref="t", expires_at=10.0, max_expires_at=20.0, durable=True
+    )
     assert CapabilityLease.from_json(lease.to_json()).max_expires_at == 20.0
     # Absent ceiling stays None across the round-trip (the ephemeral-grant default).
     plain = CapabilityLease(capability="c", token_ref="t", expires_at=1.0)
@@ -877,6 +1043,70 @@ def test_lease_from_json_rejects_present_wrong_type_fields(field: str, value: ob
 
     with pytest.raises(ValueError):
         CapabilityLease.from_json(payload)
+
+
+def test_lease_rejects_float_overflowing_epoch_integer() -> None:
+    with pytest.raises(ValueError, match="expires_at must be a finite number"):
+        CapabilityLease(capability="c", token_ref="t", expires_at=10**400)
+
+
+def test_capability_request_rejects_float_overflowing_ttl_integer() -> None:
+    with pytest.raises(ValueError, match="ttl_seconds must be a positive integer"):
+        CapabilityRequest(capability="web.search", ttl_seconds=10**400)
+
+
+def test_capability_semantic_ingress_normalizes_unicode_before_use_or_serialization() -> None:
+    request = CapabilityRequest(
+        capability="web.\ud800",
+        scope={"domain\ud800": ["docs\ud800"]},
+        run_id="run\ud800",
+        binding_id="binding\ud800",
+        reason="reason\ud800",
+        request_id="request\ud800",
+    )
+    lease = CapabilityLease(
+        capability="web.\ud800",
+        token_ref="token\ud800",
+        expires_at=10.0,
+        scope={"domain\ud800": ["docs\ud800"]},
+        lease_id="lease\ud800",
+    )
+    denial = CapabilityDenial(capability="web.\ud800", reason="reason\ud800")
+    pending = CapabilityPending(request=request, prompt="prompt\ud800")
+
+    assert request.capability == "web.�"
+    assert request.scope == {"domain�": ["docs�"]}
+    assert lease.token_ref == "token�"
+    assert lease.scope == {"domain�": ["docs�"]}
+    assert denial.to_json() == {"capability": "web.�", "reason": "reason�", "retryable": False}
+    assert pending.to_json()["prompt"] == "prompt�"
+    CapabilityVault().admit(request, lease)
+
+    for payload in (request.to_json(), lease.to_json(), denial.to_json(), pending.to_json()):
+        json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+@pytest.mark.parametrize("factory", [CapabilityRequest, CapabilityLease])
+def test_capability_scope_rejects_keys_that_collide_after_unicode_repair(factory) -> None:
+    lone_surrogate = "\ud800"
+    replacement_character = "�"
+    scope = {lone_surrogate: 1, replacement_character: 2}
+
+    with pytest.raises(ValueError, match="keys collide"):
+        if factory is CapabilityRequest:
+            factory(capability="web.search", scope=scope)
+        else:
+            factory(capability="web.search", token_ref="token", expires_at=10.0, scope=scope)
+
+
+def test_capability_vault_revalidates_mutable_scope_before_install() -> None:
+    lease = CapabilityLease(capability="web.search", token_ref="token", expires_at=10.0)
+    lease.scope["domain"] = "docs\ud800"
+
+    vault = CapabilityVault()
+    vault.install(lease)
+
+    assert lease.scope == {"domain": "docs�"}
 
 
 def test_loop_rotates_near_expiry_lease_on_use(tmp_path: Path) -> None:
@@ -933,9 +1163,13 @@ def _web_loop(
     workspace = tmp_path / "ws"
     workspace.mkdir()
     runtime = {"requires_lease": True} if requires_lease else {}
-    binding = tool_binding("web.search", runtime=runtime, scope=ToolScope(allowed_domains=("a.edu",)))
+    binding = tool_binding(
+        "web.search", runtime=runtime, scope=ToolScope(allowed_domains=("a.edu",))
+    )
     turns = turns or [
-        ModelTurn(response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "hi"}, "c1"),)),
+        ModelTurn(
+            response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "hi"}, "c1"),)
+        ),
         ModelTurn(response_id="rN", final_text="done"),
     ]
     return AgentLoop(
@@ -994,7 +1228,9 @@ def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
     )
     assert isinstance(web, CapabilityLease)
     # The web lease's token_ref IS a web-gateway token the existing web gateway already accepts.
-    claims = manager.verify(web.token_ref, kind="web_gateway", audience="csp.web-gateway", run_id="run_1")
+    claims = manager.verify(
+        web.token_ref, kind="web_gateway", audience="csp.web-gateway", run_id="run_1"
+    )
     assert claims.metadata["capability"] == "web.search"
     assert claims.metadata["scope"] == {
         "allowed_domains": ["a.edu"],
@@ -1004,7 +1240,9 @@ def test_gateway_broker_mints_web_gateway_token_for_web_capabilities() -> None:
     # A non-web capability still mints the generic capability-kind token.
     other = broker.request(CapabilityRequest(capability="email.send", run_id="run_1"))
     assert isinstance(other, CapabilityLease)
-    manager.verify(other.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1")
+    manager.verify(
+        other.token_ref, kind="capability", audience="csp.capability-gateway", run_id="run_1"
+    )
 
 
 def test_web_access_can_be_revoked_mid_run(tmp_path: Path) -> None:
@@ -1017,9 +1255,13 @@ def test_web_access_can_be_revoked_mid_run(tmp_path: Path) -> None:
         AutoGrantBroker(),
         requires_lease=True,
         turns=[
-            ModelTurn(response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "a"}, "c1"),)),
+            ModelTurn(
+                response_id="r1", tool_calls=(fake_tool_call("web_search", {"query": "a"}, "c1"),)
+            ),
             ModelTurn(response_id="rw", final_text="first"),
-            ModelTurn(response_id="r2", tool_calls=(fake_tool_call("web_search", {"query": "b"}, "c2"),)),
+            ModelTurn(
+                response_id="r2", tool_calls=(fake_tool_call("web_search", {"query": "b"}, "c2"),)
+            ),
             ModelTurn(response_id="rd", final_text="second"),
         ],
     )
@@ -1032,5 +1274,7 @@ def test_web_access_can_be_revoked_mid_run(tmp_path: Path) -> None:
 
     second = loop.run_until_suspended("again")
     assert second.reason == "settled"
-    assert client.tokens == ["auto:web.search"]  # the 2nd web call was refused at the gate (no new call)
+    assert client.tokens == [
+        "auto:web.search"
+    ]  # the 2nd web call was refused at the gate (no new call)
     loop.close()

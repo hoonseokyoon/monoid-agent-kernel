@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 from support.process import python_command as _python_command
-from support.runtime import runtime_config, runtime_provider
+from support.runtime import runtime_config, runtime_provider, tool_binding
 
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
@@ -25,6 +26,7 @@ from monoid_agent_kernel.core.result import (
     suspension_from_checkpoint_payload,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn, ToolObservation
@@ -45,7 +47,12 @@ def _hitl_parked_loop(spec: AgentRunSpec) -> tuple[AgentLoop, str, Path, Path]:
     artifacts dir — the setup shared by the restore tests."""
     provider = runtime_provider(runtime_config("hitl.request"))
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),),
+            )
+        ]
     )
     loop = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=provider)
     loop.open()
@@ -63,6 +70,18 @@ def test_tool_observation_round_trip() -> None:
         is_background=True,
     )
     assert ToolObservation.from_json(obs.to_json()) == obs
+
+
+def test_tool_observation_rejects_coercible_background_flag() -> None:
+    with pytest.raises(ValueError, match="is_background must be a boolean"):
+        ToolObservation.from_json(
+            {
+                "call_id": "call_1",
+                "tool_name": "fs.read",
+                "output": {},
+                "is_background": "false",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -90,7 +109,9 @@ def test_tool_observation_round_trip() -> None:
     ),
 )
 def test_durable_suspension_observation_round_trip(suspension: Suspension) -> None:
-    assert suspension_from_checkpoint_payload(suspension_checkpoint_payload(suspension)) == suspension
+    assert (
+        suspension_from_checkpoint_payload(suspension_checkpoint_payload(suspension)) == suspension
+    )
 
 
 def test_release_parked_closes_process_resources_without_finalizing_or_deleting(
@@ -461,7 +482,9 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
         run_id="run_1",
         status="running",
         previous_turn_handle="turn_xyz",
-        pending_observations=[{"call_id": "c1", "tool_name": "t", "output": {}, "is_background": False}],
+        pending_observations=[
+            {"call_id": "c1", "tool_name": "t", "output": {}, "is_background": False}
+        ],
         tool_call_counts={"fs.write": 2},
         total_tool_calls=2,
         total_usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
@@ -483,6 +506,17 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored.schema_version == SCHEMA_VERSION
 
 
+@pytest.mark.parametrize("field", ("revoked_before", "remaining_duration_s"))
+def test_checkpoint_writer_rejects_overflowing_float_fields(tmp_path: Path, field: str) -> None:
+    checkpoint = RunCheckpoint(run_id="run_1")
+    setattr(checkpoint, field, 10**400)
+
+    with pytest.raises(ValueError, match=rf"checkpoint {field} must be a finite"):
+        write_checkpoint(tmp_path, checkpoint)
+
+    assert not (tmp_path / "checkpoint.json").exists()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -497,6 +531,7 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
         ("queued_messages", [1]),
         ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
         ("applied_input_receipts", {"input": {"terminal": "false"}}),
+        ("remaining_duration_s", 10**400),
     ),
 )
 def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value: object) -> None:
@@ -549,7 +584,9 @@ def test_read_checkpoint_schema_mismatch_returns_none(tmp_path: Path) -> None:
     write_checkpoint(tmp_path, cp)
     # Corrupt the schema version on disk -> treated as no checkpoint, never raises.
     path = tmp_path / "checkpoint.json"
-    path.write_text(path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "bogus.v0"), encoding="utf-8"
+    )
     assert read_checkpoint(tmp_path) is None
     checked = read_checkpoint_checked(tmp_path)
     assert checked.status == "corrupt"
@@ -591,7 +628,9 @@ def test_read_checkpoint_accepts_legacy_schema_version(tmp_path: Path) -> None:
     write_checkpoint(tmp_path, cp)
     path = tmp_path / "checkpoint.json"
     path.write_text(
-        path.read_text(encoding="utf-8").replace(SCHEMA_VERSION, "native-agent-runner.checkpoint.v1"),
+        path.read_text(encoding="utf-8").replace(
+            SCHEMA_VERSION, "native-agent-runner.checkpoint.v1"
+        ),
         encoding="utf-8",
     )
 
@@ -630,7 +669,9 @@ def test_local_fs_store_put_gcs_orphan_blob_tmp(tmp_path: Path) -> None:
     assert (blobs_dir / ("b" * 64)).read_bytes() == b"data"
 
 
-def test_local_fs_checked_latest_treats_metadata_and_blob_only_runs_as_missing(tmp_path: Path) -> None:
+def test_local_fs_checked_latest_treats_metadata_and_blob_only_runs_as_missing(
+    tmp_path: Path,
+) -> None:
     store = LocalFsCheckpointStore(tmp_path)
     store.put_run_metadata("metadata_only", {"run_id": "metadata_only"})
     store.put_blob("blob_only", b"artifact")
@@ -652,6 +693,7 @@ def test_snapshot_writes_checkpoint_at_hosted_park(tmp_path: Path) -> None:
     assert cp.terminal is False
     assert cp.previous_turn_handle == "r1"
     assert len(cp.hosted_tasks) == 1
+
     # snapshot() is a pure read: calling it again yields an equal payload, save the
     # wall-clock fields (remaining_duration_s countdown, workspace_base.created_at).
     def _strip(payload: dict) -> dict:
@@ -685,7 +727,10 @@ def test_restore_resumes_parked_hitl_in_fresh_loop(tmp_path: Path) -> None:
     # The hitl answer reached the model, and the conversation continued by reference
     # from the pre-restart turn handle (no transcript replay).
     hitl_obs = [
-        obs for req in adapter2.requests for obs in req.observations if obs.tool_name == "human_input"
+        obs
+        for req in adapter2.requests
+        for obs in req.observations
+        if obs.tool_name == "human_input"
     ]
     assert hitl_obs and hitl_obs[0].output["answer"] == "Ada"
     assert adapter2.requests[0].previous_turn_handle == "r1"
@@ -875,7 +920,9 @@ def test_openai_reasoning_block_attached_and_survives_restore(tmp_path: Path) ->
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
     provider = runtime_provider(runtime_config("fs.write"))
     items = ({"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},)
-    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done", reasoning=items)])
+    adapter = FakeModelAdapter(
+        turns=[ModelTurn(response_id="r1", final_text="done", reasoning=items)]
+    )
     adapter.provider_name = "openai"  # tag this fake like the real OpenAI adapter
     loop = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=provider)
     loop.open()
@@ -974,11 +1021,18 @@ def test_time_machine_restores_workspace_conversation_and_task_together(tmp_path
     spec = AgentRunSpec(workspace_root=base, run_root=tmp_path / "runs")
     provider = runtime_provider(runtime_config("hitl.request"))
     adapter1 = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("hitl_request", {"prompt": "ok?"}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "ok?"}, "c1"),),
+            )
+        ]
     )
     loop1 = AgentLoop(spec=spec, model_adapter=adapter1, runtime_config_provider=provider)
     loop1.open()
-    loop1._session.res.workspace.write_bytes("draft.md", b"v1\n", create_dirs=True)  # agent's file edit
+    loop1._session.res.workspace.write_bytes(
+        "draft.md", b"v1\n", create_dirs=True
+    )  # agent's file edit
     suspension = loop1.run_until_suspended("write a draft")
     assert suspension.reason == "awaiting_tasks"
     task_id = suspension.awaiting_task_ids[0]
@@ -996,13 +1050,20 @@ def test_time_machine_restores_workspace_conversation_and_task_together(tmp_path
 
     # Workspace + conversation are both back at the checkpoint instant.
     assert loop2._session.res.workspace.read_bytes("draft.md")[0] == b"v1\n"
-    assert any(m["role"] == "user" and m.get("content") == "write a draft" for m in loop2._session.state.messages)
+    assert any(
+        m["role"] == "user" and m.get("content") == "write a draft"
+        for m in loop2._session.state.messages
+    )
 
     # The parked task resumes and the run settles, sending full by-value history.
     loop2.report_task_result(task_id, {"answer": "yes"})
     resumed = loop2.run_until_suspended(None)
     loop2.close()
-    assert resumed.reason == "settled" and resumed.turn is not None and resumed.turn.final_text == "done"
+    assert (
+        resumed.reason == "settled"
+        and resumed.turn is not None
+        and resumed.turn.final_text == "done"
+    )
     assert adapter2.requests[-1].messages is not None
 
 
@@ -1023,6 +1084,47 @@ def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
     # Downtime does not count against max_duration_s: the resumed deadline is ~now+remaining,
     # so the run is not immediately limited even though it was parked for a long time.
     assert 290.0 < (res.deadline - time.time()) < 300.5
+    loop.close()
+
+
+def test_restore_reads_pre_v020_runtime_config_scope_from_checkpoint(tmp_path: Path) -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                scope=ToolScope(allowed_paths=("!odd",), denied_paths=("./!private",)),
+            ),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["!odd"]
+    legacy_payload["tools"][0]["scope"]["denied_paths"] = ["./!private"]
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    legacy_payload["config_hash"] = canonical_sha256(hash_payload)
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.read")),
+    )
+
+    loop.restore(
+        RunCheckpoint(
+            run_id=spec.run_id,
+            status="completed",
+            previous_runtime_config=legacy_payload,
+        )
+    )
+
+    restored = loop._session.state.previous_runtime_config  # type: ignore[union-attr]
+    assert restored is not None
+    assert restored.tools[0].scope == config.tools[0].scope
+    assert restored.to_json()["tools"][0]["scope"]["allowed_paths"] == ["!odd"]
+    assert restored.to_json()["tools"][0]["scope"]["path_pattern_encoding"] == (
+        "monoid.literal-bang.v1"
+    )
     loop.close()
 
 

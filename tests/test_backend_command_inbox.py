@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -10,17 +11,156 @@ from typing import Any
 import pytest
 
 from support.http import http_json, serving
-from support.runtime import runtime_config
+from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
 from monoid_agent_kernel.reference.backend.http import create_backend_server
-from monoid_agent_kernel.reference.backend.service import BackendRunRequest
+from monoid_agent_kernel.reference.backend.service import (
+    BackendRunRequest,
+    _normalize_control_command_ingress,
+)
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
-from monoid_agent_kernel.reference.command_inbox import InMemoryCommandStore, SqliteCommandStore
+from monoid_agent_kernel.reference.command_inbox import (
+    CommandPrincipal,
+    InMemoryCommandStore,
+    SqliteCommandStore,
+    StoredCommand,
+)
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.identifiers import BACKEND_AUDIENCE, TASK_CALLBACK_AUDIENCE
 from monoid_agent_kernel.core.control import ControlCommand
+from monoid_agent_kernel.core.tool_surface import ToolScope
+from monoid_agent_kernel.permissions import matches_path_patterns
+
+
+def test_direct_control_rejects_float_overflowing_revocation_watermark() -> None:
+    with pytest.raises(ValueError, match="before must be a finite number"):
+        _normalize_control_command_ingress(
+            ControlCommand(
+                type="revoke_capability",
+                run_id="run_1",
+                args={"before": 10**400},
+            )
+        )
+
+
+def test_fresh_queued_runtime_config_rejects_a_bare_negation(
+    backend_factory: Any,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+    config = runtime_config(
+        bindings=(tool_binding("fs.read", scope=ToolScope(allowed_paths=("!literal",))),),
+        version=2,
+    ).to_json()
+    config["tools"][0]["scope"].pop("path_pattern_encoding")
+    config["tools"][0]["scope"]["allowed_paths"] = ["!ambiguous"]
+
+    with pytest.raises(ValueError, match="negated path patterns"):
+        backend.enqueue_control(
+            ControlCommand(
+                type="replace_runtime_config",
+                run_id=submission.run_id,
+                command_id="cmd_ambiguous_scope",
+                args={
+                    "token": submission.run_token,
+                    "expected_version": 1,
+                    "config": config,
+                },
+            )
+        )
+
+    assert backend.command_store is not None
+    assert backend.command_store.read_command(submission.run_id, "cmd_ambiguous_scope") is None
+    backend.cancel_run(submission.run_id, submission.run_token)
+    backend.wait_for_run(submission.run_id, timeout_s=20)
+
+
+def test_retained_backslash_bang_scope_stays_inert_through_inbox_dispatch(
+    backend_factory: Any,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="wait",
+            runtime_config=runtime_config("run.finish"),
+            multi_turn=True,
+        )
+    )
+    assert eventually(
+        lambda: backend._record(submission.run_id).state.value == "awaiting_input",
+        timeout_s=10,
+    )
+
+    legacy_config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                scope=ToolScope(allowed_paths=("placeholder",)),
+            ),
+        ),
+        version=2,
+    ).to_json()
+    legacy_scope = legacy_config["tools"][0]["scope"]
+    legacy_scope["allowed_paths"] = [r"\!inert", "secret//file"]
+    legacy_scope.pop("path_pattern_encoding", None)
+    stored = StoredCommand(
+        run_id=submission.run_id,
+        command_id="cmd_legacy_backslash_scope",
+        type="replace_runtime_config",
+        args={
+            "expected_version": 1,
+            "config": legacy_config,
+        },
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+    assert backend.command_store is not None
+    backend.command_store.append(stored, max_pending=10)
+
+    completed = backend._drain_command_inbox(submission.run_id)
+
+    assert completed[stored.command_id].status == "ok", completed[stored.command_id].error
+    effective = backend.current_runtime_config(submission.run_id)
+    assert effective is not None
+    restored_scope = effective.tools[0].scope
+    assert restored_scope.allowed_paths == (r"\!inert", "secret//file")
+    assert matches_path_patterns("!inert", restored_scope.allowed_paths) is False
+    assert matches_path_patterns("secret/file", restored_scope.allowed_paths) is True
+
+    events = backend.events(submission.run_id, submission.run_token)["events"]
+    received = next(
+        event["data"]
+        for event in events
+        if event["type"] == "control.command.received"
+        and event["data"]["command_id"] == stored.command_id
+    )
+    assert received["args_keys"] == ["config", "expected_version"]
+    assert all("durable_runtime_config" not in key for key in received["args_keys"])
+    persisted = backend.command_store.read_command(submission.run_id, stored.command_id)
+    assert persisted is not None
+    assert "_monoid_durable_runtime_config" not in json.dumps(persisted.to_json())
+
+    backend.cancel_run(submission.run_id, submission.run_token)
+    backend.wait_for_run(submission.run_id, timeout_s=20)
 
 
 def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
@@ -205,13 +345,13 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
 
             duplicate = http_json(
                 f"{base_url}/v1/runs/{submission.run_id}/control",
-                    {
-                        "type": "status",
-                        "command_id": "cmd_cross_worker",
-                        "issuer": "operator-name",
-                        "reason": f"requested with {submission.run_token}",
-                        "args": {"access_token": "must-not-persist"},
-                    },
+                {
+                    "type": "status",
+                    "command_id": "cmd_cross_worker",
+                    "issuer": "operator-name",
+                    "reason": f"requested with {submission.run_token}",
+                    "args": {"access_token": "must-not-persist"},
+                },
                 token=submission.run_token,
             )
             assert duplicate["status"] == "ok"
@@ -242,9 +382,7 @@ def test_cross_worker_http_command_is_drained_by_owner_with_durable_receipt(
     ]
     assert len(received) == 1
     assert received[0]["data"]["actor"] == "tenant_a/user_a (operator-name)"
-    assert received[0]["data"]["token_sha256"] == TokenManager.token_sha256(
-        submission.run_token
-    )
+    assert received[0]["data"]["token_sha256"] == TokenManager.token_sha256(submission.run_token)
 
     with sqlite3.connect(db) as conn:
         row = conn.execute(
@@ -299,9 +437,7 @@ def test_local_command_returns_transient_callback_and_callback_token_can_enqueue
     def append_with_watchdog_race(
         command: Any, *, max_pending: int, require_empty: bool = False
     ) -> Any:
-        receipt = original_append(
-            command, max_pending=max_pending, require_empty=require_empty
-        )
+        receipt = original_append(command, max_pending=max_pending, require_empty=require_empty)
         if command.type == "create_task":
             immediate_requirements.append(require_empty)
             started = threading.Event()
@@ -396,9 +532,7 @@ def test_enqueue_control_redacts_bearer_reintroduced_by_json_coercion(
 ) -> None:
     workspace = backend_factory.workspace(f"workspace-{store_kind}")
     db = tmp_path / "commands.db"
-    command_store = (
-        InMemoryCommandStore() if store_kind == "memory" else SqliteCommandStore(db)
-    )
+    command_store = InMemoryCommandStore() if store_kind == "memory" else SqliteCommandStore(db)
     token_manager = backend_factory.token_manager()
     backend = backend_factory.create(
         workspace=workspace,

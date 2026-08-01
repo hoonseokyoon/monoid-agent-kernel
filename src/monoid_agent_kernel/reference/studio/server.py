@@ -51,6 +51,7 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
 from monoid_agent_kernel.core.prompt import compose_system_prompt
@@ -72,7 +73,10 @@ from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_se
 from monoid_agent_kernel.reference.web_gateway.service import FakeWebProvider, WebGatewayBackend
 from monoid_agent_kernel.reference.studio.activity import describe_event
 from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
-from monoid_agent_kernel.reference._shared.http_util import HardenedThreadingHTTPServer, wait_http_ready
+from monoid_agent_kernel.reference._shared.http_util import (
+    HardenedThreadingHTTPServer,
+    wait_http_ready,
+)
 from monoid_agent_kernel.reference.mcp_gateway import FakeMcpServer, create_mcp_server
 from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider
 from monoid_agent_kernel.mcp import McpError, McpToolProvider
@@ -103,14 +107,28 @@ def _gateway_streaming_available() -> bool:
 
 
 # Directories never shown in the file tree (and not worth walking).
-_TREE_SKIP = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".ruff_cache", ".pytest_cache"}
+_TREE_SKIP = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "node_modules",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+}
 _TREE_MAX_ENTRIES = 2000
 _VIEW_MAX_BYTES = 256 * 1024  # file-viewer read cap — keep a huge file from stalling the UI
 # File-viewer image preview: these extensions are served as raw bytes via /api/file-raw and
 # rendered with an <img>, instead of being refused as binary by the text viewer.
 _IMAGE_EXTS = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
-    ".webp": "image/webp", ".bmp": "image/bmp", ".ico": "image/x-icon", ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
 }
 _IMAGE_VIEW_MAX_BYTES = 8 * 1024 * 1024  # raw-image preview cap
 
@@ -146,7 +164,16 @@ _APP_CONTENT_TYPES = {
 # Obvious destructive command prefixes the shell binding refuses outright (a binding-level
 # safety gate, enforced regardless of approval mode). Matched as command.strip().startswith.
 _SHELL_DENY_PREFIXES = (
-    "rm ", "rmdir", "del ", "rd ", "format", "mkfs", "dd ", "sudo ", "shutdown", "reboot",
+    "rm ",
+    "rmdir",
+    "del ",
+    "rd ",
+    "format",
+    "mkfs",
+    "dd ",
+    "sudo ",
+    "shutdown",
+    "reboot",
 )
 
 
@@ -192,7 +219,14 @@ _SUBAGENT_DEFINITIONS = {
                 "your final message. You cannot edit files or run commands."
             )
         ),
-        tools=("fs.read", "text.search", "web.search", "web.fetch", "web.context", "run.update_plan"),
+        tools=(
+            "fs.read",
+            "text.search",
+            "web.search",
+            "web.fetch",
+            "web.context",
+            "run.update_plan",
+        ),
         context="fresh",
     ),
 }
@@ -208,7 +242,7 @@ def load_env_file(path: Path | None) -> dict[str, str]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
-            line = line[len("export "):].strip()
+            line = line[len("export ") :].strip()
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -307,7 +341,9 @@ _SYSTEM_PROMPT = (
 )
 # Always available (observability, not a gated capability): the plan tool the Plan panel renders.
 _PLAN_BINDING = ToolBinding(
-    binding_id="run.update_plan", model_name="run_update_plan", ref=RegistryToolRef("run.update_plan")
+    binding_id="run.update_plan",
+    model_name="run_update_plan",
+    ref=RegistryToolRef("run.update_plan"),
 )
 
 _DEFAULT_PROFILES = (
@@ -438,6 +474,16 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
+    # Publish `model.output.delta` / `model.reasoning.delta` to the run's event log. On by default
+    # because live token rendering is what the UI is for, but it is the widest content route out of
+    # a run: the events are durable, and `EventBus` fans them to every sink with no level filter, so
+    # the assembled answer sits in `events.jsonl`. Turning this off leaves the run result,
+    # `transcript.jsonl` and the settle events untouched, but it costs two things: live rendering,
+    # and mid-turn interruption. The kernel only streams when something consumes deltas, so with
+    # none consumed, Stop lands on the next step boundary instead of aborting inside the call.
+    # Pre-existing coupling -- `emit_output_deltas` is `False` by default in the kernel and this is
+    # what turns it on -- but it is invisible from here, hence the note.
+    stream_output_deltas: bool = True
 
 
 class StudioServer:
@@ -515,7 +561,7 @@ class StudioServer:
 
     def _load_profile_store(self) -> dict[str, Any]:
         try:
-            payload = json.loads(self._profile_store_path().read_text(encoding="utf-8"))
+            payload = loads_json_ingress(self._profile_store_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {"profiles": {}, "runs": {}}
         if not isinstance(payload, dict):
@@ -528,10 +574,15 @@ class StudioServer:
         path = self._profile_store_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         normalized = {
-            "profiles": payload.get("profiles") if isinstance(payload.get("profiles"), dict) else {},
+            "profiles": payload.get("profiles")
+            if isinstance(payload.get("profiles"), dict)
+            else {},
             "runs": payload.get("runs") if isinstance(payload.get("runs"), dict) else {},
         }
-        path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+        path.write_text(
+            json.dumps(normalized, indent=2, sort_keys=True, allow_nan=False),
+            encoding="utf-8",
+        )
 
     def _profile_system_prompt(self, profile: dict[str, Any]) -> str:
         instructions = str(profile.get("instructions") or "").strip()
@@ -747,10 +798,22 @@ class StudioServer:
 
     def _draft_profile_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         raw_id = str(payload.get("id") or "").strip()
-        profile_id = _normalize_profile_id(raw_id) if raw_id else _normalize_profile_id(str(payload.get("name") or "preview"))
+        profile_id = (
+            _normalize_profile_id(raw_id)
+            if raw_id
+            else _normalize_profile_id(str(payload.get("name") or "preview"))
+        )
         existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
         raw = dict(existing)
-        for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+        for key in (
+            "name",
+            "description",
+            "instructions",
+            "capabilities",
+            "model",
+            "effort",
+            "summary",
+        ):
             if key in payload:
                 raw[key] = payload[key]
         return self._normalize_profile_payload(
@@ -770,9 +833,7 @@ class StudioServer:
             p
             for p in (self._skill_provider, self._mcp_provider, self._memory_provider)
             if p is not None
-        ) + (
-            OutboxToolProvider(),
-        )
+        ) + (OutboxToolProvider(),)
 
     def _context_providers(self) -> tuple[Any, ...]:
         return tuple(
@@ -788,7 +849,11 @@ class StudioServer:
             registry.register_many(provider.get_tools(None))
         subagents = self._subagent_definitions_for_runtime()
         if subagents:
-            registry.register(agent_spawn_tool({name: definition.description for name, definition in subagents.items()}))
+            registry.register(
+                agent_spawn_tool(
+                    {name: definition.description for name, definition in subagents.items()}
+                )
+            )
         return registry
 
     def _profile_index_path(self) -> Path:
@@ -830,9 +895,19 @@ class StudioServer:
                 else self._new_profile_id(str(payload.get("name") or "agent"))
             )
             defaults = self._profile_defaults()
-            existing = self._profiles_by_id().get(profile_id, {"id": profile_id, "name": profile_id})
+            existing = self._profiles_by_id().get(
+                profile_id, {"id": profile_id, "name": profile_id}
+            )
             raw = dict(existing)
-            for key in ("name", "description", "instructions", "capabilities", "model", "effort", "summary"):
+            for key in (
+                "name",
+                "description",
+                "instructions",
+                "capabilities",
+                "model",
+                "effort",
+                "summary",
+            ):
                 if key in payload:
                     raw[key] = (
                         self._preserve_unavailable_capabilities(
@@ -904,7 +979,9 @@ class StudioServer:
             # Preserve the old Live Config behavior for the untouched default profile: settings
             # changes apply to new chats. Once a profile is edited, its saved preset owns the new
             # chat config.
-            if known_profile_id != _DEFAULT_PROFILE_ID or self._profile_has_saved_override(known_profile_id):
+            if known_profile_id != _DEFAULT_PROFILE_ID or self._profile_has_saved_override(
+                known_profile_id
+            ):
                 profile = self._profile_for_config(known_profile_id)
                 return _runtime_config_for(
                     list(profile["capabilities"]),
@@ -959,7 +1036,9 @@ class StudioServer:
             FakeMcpServer(), host="127.0.0.1", port=0, admin_token=self._admin_token
         )
         port = server.server_address[1]
-        thread = threading.Thread(target=server.serve_forever, name="studio-mcp-gateway", daemon=True)
+        thread = threading.Thread(
+            target=server.serve_forever, name="studio-mcp-gateway", daemon=True
+        )
         thread.start()
         base_url = f"http://127.0.0.1:{port}"
         provider: McpToolProvider | None = None
@@ -1005,7 +1084,9 @@ class StudioServer:
         self._gateway_thread.start()
 
         # Web gateway (R5): the fake corpus provider, so web tools work with no egress/keys.
-        web_gateway = WebGatewayBackend(token_manager=self._token_manager, provider=FakeWebProvider())
+        web_gateway = WebGatewayBackend(
+            token_manager=self._token_manager, provider=FakeWebProvider()
+        )
         self._web_gateway_server = create_web_gateway_server(
             web_gateway, host="127.0.0.1", port=0, admin_token=self._admin_token
         )
@@ -1037,8 +1118,20 @@ class StudioServer:
         # validation through the same provider seam as Skills/MCP.
         provider_instances = self._tool_providers_for_runtime()
 
-        stream_gateway_output = _gateway_streaming_available()
-        if not stream_gateway_output:
+        # Two independent conditions: whether live streaming is *possible* (the optional transport)
+        # and whether the operator *wants* the durable delta events it produces. They were one
+        # value, so the only way to stop publishing model text to `events.jsonl` was to uninstall
+        # httpx. `AgentLoop.__post_init__` still applies `MONOID_OUTPUT_DELTAS` on top of this.
+        stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas
+        if not self.config.stream_output_deltas:
+            # Said separately from the httpx case: reporting "httpx is unavailable" to an operator
+            # who just passed --no-output-deltas sends them to install a package that would not
+            # change anything.
+            _LOGGER.info(
+                "output deltas are disabled; model text will not be published to events.jsonl "
+                "(the run result and transcript.jsonl are unaffected)"
+            )
+        elif not stream_gateway_output:
             _LOGGER.info(
                 "httpx is unavailable; Studio will use one-shot gateway turns "
                 "(install monoid-agent-kernel[http-async] for live token deltas)"
@@ -1099,7 +1192,12 @@ class StudioServer:
                 self._mcp_provider.close()
             except Exception:  # pragma: no cover - best-effort teardown
                 _LOGGER.debug("error closing MCP provider", exc_info=True)
-        for server in (self._ui_server, self._gateway_server, self._web_gateway_server, self._mcp_server):
+        for server in (
+            self._ui_server,
+            self._gateway_server,
+            self._web_gateway_server,
+            self._mcp_server,
+        ):
             if server is not None:
                 try:
                     server.shutdown()
@@ -1152,7 +1250,9 @@ class StudioServer:
             if not raw:
                 raise NativeAgentError(f"attachment {name!r} is empty")
             if len(raw) > _MAX_ATTACH_BYTES:
-                raise NativeAgentError(f"attachment {name!r} exceeds the {_MAX_ATTACH_BYTES}-byte limit")
+                raise NativeAgentError(
+                    f"attachment {name!r} exceeds the {_MAX_ATTACH_BYTES}-byte limit"
+                )
             source_ref = f"data:{mime};base64,{data_b64}"
             if mime.startswith("image/"):
                 parts.append(ImagePart(source_ref=source_ref, mime_type=mime))
@@ -1207,7 +1307,11 @@ class StudioServer:
                 client_message_id=client_message_id,
                 created_at=user_created_at,
             )
-        return {"run_id": submission.run_id, "state": submission.state.value, "terminal": submission.terminal}
+        return {
+            "run_id": submission.run_id,
+            "state": submission.state.value,
+            "terminal": submission.terminal,
+        }
 
     # --- A2A demo (agent-to-agent durable messaging) ------------------------------------
 
@@ -1390,10 +1494,14 @@ class StudioServer:
         payload: str | tuple[ContentPart, ...] = parts if parts else message
         user_created_at = time.time()
         try:
-            result = self._backend.send_message(run_id, token, payload, message_id=client_message_id)
+            result = self._backend.send_message(
+                run_id, token, payload, message_id=client_message_id
+            )
         except KeyError:
             self._backend.resume_run(run_id, token)
-            result = self._backend.send_message(run_id, token, payload, message_id=client_message_id)
+            result = self._backend.send_message(
+                run_id, token, payload, message_id=client_message_id
+            )
         with self._lock:
             ChatProjection(self._run_dir_for(run_id)).append_user(
                 content=message,
@@ -1637,9 +1745,7 @@ class StudioServer:
             proposal_hash = str(payload.get("proposal_hash") or "")
             diff_payload = self._backend.proposal_diff(run_id, token)
             diff = diff_payload.get("diff", "")
-            if str(diff_payload.get("diff_sha256") or "") != str(
-                payload.get("diff_sha256") or ""
-            ):
+            if str(diff_payload.get("diff_sha256") or "") != str(payload.get("diff_sha256") or ""):
                 raise NativeAgentError(
                     "proposal diff does not match its snapshot; refresh and review again",
                     error_code="proposal_diff_mismatch",
@@ -1748,7 +1854,11 @@ class StudioServer:
             self._assert_proposal_hash(run_id, token, expected_proposal_hash)
             payload = self._backend.proposal_file(run_id, token, path)
         content = str(payload.get("content") or "")
-        data = base64.b64decode(content) if payload.get("encoding") == "base64" else content.encode("utf-8")
+        data = (
+            base64.b64decode(content)
+            if payload.get("encoding") == "base64"
+            else content.encode("utf-8")
+        )
         if len(data) > _IMAGE_VIEW_MAX_BYTES:
             raise NativeAgentError(f"image exceeds the {_IMAGE_VIEW_MAX_BYTES}-byte preview limit")
         return data, mime
@@ -1761,7 +1871,9 @@ class StudioServer:
     def job_logs(self, run_id: str, job_id: str, *, stream: str = "stdout") -> dict[str, Any]:
         """Tail of a background job's stdout/stderr log."""
         assert self._backend is not None
-        return self._backend.job_logs(run_id, self._token_for(run_id), job_id, stream=stream, tail_bytes=20_000)
+        return self._backend.job_logs(
+            run_id, self._token_for(run_id), job_id, stream=stream, tail_bytes=20_000
+        )
 
     def answer_hitl(self, run_id: str, task_id: str, answer: str) -> dict[str, Any]:
         """Deliver the human's decision for a parked ``hitl.request`` (the approval gate). The
@@ -1779,7 +1891,9 @@ class StudioServer:
             "provider": self.config.provider,
             "offline": self.offline,
             "capabilities": list(self._capabilities),
-            "available": [{"key": cap, "label": labels[cap]} for cap in self._available_capabilities()],
+            "available": [
+                {"key": cap, "label": labels[cap]} for cap in self._available_capabilities()
+            ],
             "model": self._model,
             "effort": self._effort,
             "efforts": list(_EFFORT_CHOICES),
@@ -1924,13 +2038,25 @@ class StudioServer:
         candidate = self._resolve_workspace_file(rel_path)
         mime = _IMAGE_EXTS.get(candidate.suffix.lower())
         if mime is not None:
-            return {"path": rel_path, "image": True, "mime": mime, "binary": False,
-                    "truncated": False, "content": ""}
+            return {
+                "path": rel_path,
+                "image": True,
+                "mime": mime,
+                "binary": False,
+                "truncated": False,
+                "content": "",
+            }
         raw = candidate.read_bytes()
         truncated = len(raw) > _VIEW_MAX_BYTES
         raw = raw[:_VIEW_MAX_BYTES]
         if b"\x00" in raw:
-            return {"path": rel_path, "binary": True, "image": False, "truncated": False, "content": ""}
+            return {
+                "path": rel_path,
+                "binary": True,
+                "image": False,
+                "truncated": False,
+                "content": "",
+            }
         return {
             "path": rel_path,
             "binary": False,
@@ -1979,6 +2105,24 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
 
         # --- GET ---------------------------------------------------------------------
         def do_GET(self) -> None:  # noqa: N802
+            """Route a GET, and never let an exception out.
+
+            ``do_POST`` has had this handler all along and ``do_GET`` had none, so anything the
+            routes below did not anticipate reached ``BaseHTTPRequestHandler`` -- which logs the
+            traceback and drops the connection, with no status line the browser can act on. The
+            route that made it reachable was ``/api/chat-transcript``: it catches ``NativeAgentError``
+            only, and a corrupt ``events.jsonl`` raises ``EventLogCorruption`` (a ``ValueError``).
+            """
+            try:
+                self._route_get()
+            except Exception:  # pragma: no cover - defensive
+                _LOGGER.exception("studio GET failed")
+                try:
+                    self._write_json({"error": "internal error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                except Exception:  # noqa: BLE001 - the response is already on the wire (SSE)
+                    _LOGGER.debug("studio GET error response could not be written", exc_info=True)
+
+        def _route_get(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
                 self._serve_app_index()
@@ -2040,8 +2184,13 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 else:
                     # Content-addressed → immutable + cacheable (ETag = the digest).
                     self._serve_bytes(
-                        data, "application/x-tar", download_name=name,
-                        headers={"ETag": f'"{digest}"', "Cache-Control": "immutable, max-age=31536000"},
+                        data,
+                        "application/x-tar",
+                        download_name=name,
+                        headers={
+                            "ETag": f'"{digest}"',
+                            "Cache-Control": "immutable, max-age=31536000",
+                        },
                     )
                 return
             if parsed.path == "/api/sessions":
@@ -2115,7 +2264,7 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 self._write_json(studio.subagent_events(child_run_id, from_seq))
                 return
             if parsed.path.startswith("/vendor/"):
-                self._serve_vendor(parsed.path[len("/vendor/"):])
+                self._serve_vendor(parsed.path[len("/vendor/") :])
                 return
             if parsed.path.startswith("/assets/"):
                 self._serve_app_asset(parsed.path.removeprefix("/"))
@@ -2136,7 +2285,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         else []
                     )
                     if not message and not attachments:
-                        self._write_json({"error": "message or attachment is required"}, HTTPStatus.BAD_REQUEST)
+                        self._write_json(
+                            {"error": "message or attachment is required"}, HTTPStatus.BAD_REQUEST
+                        )
                         return
                     run_id = body.get("run_id")
                     client_message_id = str(body.get("client_message_id") or "").strip()
@@ -2234,7 +2385,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                     if "capabilities" in body:
                         caps = body.get("capabilities")
                         if not isinstance(caps, list):
-                            self._write_json({"error": "capabilities must be a list"}, HTTPStatus.BAD_REQUEST)
+                            self._write_json(
+                                {"error": "capabilities must be a list"}, HTTPStatus.BAD_REQUEST
+                            )
                             return
                         kwargs["capabilities"] = [str(c) for c in caps]
                     if "model" in body:
@@ -2258,7 +2411,10 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
             except NativeAgentError as exc:
                 self._write_json(
-                    {"error": str(exc), "error_code": str(getattr(exc, "error_code", "internal_error"))},
+                    {
+                        "error": str(exc),
+                        "error_code": str(getattr(exc, "error_code", "internal_error")),
+                    },
                     HTTPStatus.BAD_REQUEST,
                 )
             except ValueError as exc:
@@ -2320,7 +2476,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if summary:
                 event = {**event, "studio_activity": summary}
             prefix = f"id: {event_id}\n" if event_id else ""
-            self.wfile.write(f"{prefix}data: {json.dumps(event)}\n\n".encode("utf-8"))
+            self.wfile.write(
+                f"{prefix}data: {json.dumps(event, allow_nan=False)}\n\n".encode("utf-8")
+            )
             self.wfile.flush()
 
         def _sse_comment(self, text: str) -> None:
@@ -2329,16 +2487,27 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
 
         # --- helpers -----------------------------------------------------------------
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError) as exc:
+                self.close_connection = True
+                raise ValueError("invalid Content-Length") from exc
+            if length < 0:
+                self.close_connection = True
+                raise ValueError("Content-Length must be non-negative")
             if length > _MAX_BODY_BYTES:
+                self.close_connection = True
                 raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             if not raw:
                 return {}
-            return json.loads(raw.decode("utf-8"))
+            payload = loads_json_ingress(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON request body must be an object")
+            return payload
 
         def _write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
-            body = json.dumps(payload).encode("utf-8")
+            body = json.dumps(payload, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -2357,7 +2526,9 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if not target.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 return
-            content_type = _VENDOR_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            content_type = _VENDOR_CONTENT_TYPES.get(
+                target.suffix.lower(), "application/octet-stream"
+            )
             self._serve_file(target, content_type)
 
         def _serve_app_index(self) -> None:
@@ -2384,9 +2555,7 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if not target.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 return
-            content_type = _APP_CONTENT_TYPES.get(
-                target.suffix.lower(), "application/octet-stream"
-            )
+            content_type = _APP_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
             self._serve_file(
                 target,
                 content_type,

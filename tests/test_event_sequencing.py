@@ -75,9 +75,7 @@ def test_page_reader_hides_uncommitted_tail_until_newline(tmp_path) -> None:
 
 def test_event_log_tail_scan_uses_binary_offsets_for_crlf_and_utf8(tmp_path) -> None:
     events_path = tmp_path / "events.jsonl"
-    events_path.write_bytes(
-        '{"seq":1,"data":{"text":"한글"}}\r\n{"seq":2,"data":{}}\r\n'.encode()
-    )
+    events_path.write_bytes('{"seq":1,"data":{"text":"한글"}}\r\n{"seq":2,"data":{}}\r\n'.encode())
 
     tail = inspect_event_log_tail(events_path)
 
@@ -88,9 +86,7 @@ def test_event_log_tail_scan_uses_binary_offsets_for_crlf_and_utf8(tmp_path) -> 
 
 def test_event_log_tail_scan_is_bounded_by_tail_record_not_history(tmp_path) -> None:
     events_path = tmp_path / "events.jsonl"
-    events_path.write_bytes(
-        b"".join(f'{{"seq":{seq}}}\n'.encode() for seq in range(1, 100_001))
-    )
+    events_path.write_bytes(b"".join(f'{{"seq":{seq}}}\n'.encode() for seq in range(1, 100_001)))
 
     tail = inspect_event_log_tail(events_path)
 
@@ -188,9 +184,7 @@ def test_complete_tail_fails_closed_when_status_watermark_is_ahead(tmp_path) -> 
     original = b'{"seq":1}\n'
     events_path.write_bytes(original)
     status_path = run_dir / "status.json"
-    original_status = json.dumps(
-        {"run_id": "run_missing_acknowledged_event", "last_event_seq": 2}
-    )
+    original_status = json.dumps({"run_id": "run_missing_acknowledged_event", "last_event_seq": 2})
     status_path.write_text(original_status, encoding="utf-8")
 
     with pytest.raises(EventLogCorruption, match="acknowledged status watermark"):
@@ -262,7 +256,7 @@ def test_incomplete_tail_fails_closed_when_status_watermark_is_unreadable(
         (b'{"seq":\n', "valid JSON"),
         (b"\xff\n", "valid UTF-8"),
         (b'[{"seq":1}]\n', "JSON object"),
-        (b'{}\n', "invalid sequence"),
+        (b"{}\n", "invalid sequence"),
         (b'{"seq":null}\n', "invalid sequence"),
         (b'{"seq":true}\n', "invalid sequence"),
         (b'{"seq":-1}\n', "invalid sequence"),
@@ -363,6 +357,17 @@ def test_recordless_nonterminal_run_skips_direct_append(tmp_path) -> None:
     run_dir.mkdir(parents=True)
     (run_dir / "status.json").write_text(
         json.dumps({"run_id": "run_live", "status": "running", "last_event_seq": 1}),
+        encoding="utf-8",
+    )
+
+    assert RunEventSequencer().run_dir_allows_direct_append(run_dir) is False
+
+
+def test_nonfinite_terminal_flag_cannot_authorize_direct_append(tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "run_corrupt"
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text(
+        '{"run_id":"run_corrupt","state":"running","terminal":NaN}',
         encoding="utf-8",
     )
 

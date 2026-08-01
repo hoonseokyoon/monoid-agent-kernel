@@ -136,6 +136,50 @@ monoid run \
 `deny_patterns` blocks tool and shell access. `redact_patterns` masks paths in the public
 event/status stream only; private run artifacts keep real paths and contents.
 
+Both use **gitignore-style wildcard syntax**, with each normalized workspace-relative path matched
+independently. This table is the exact contract:
+
+| pattern | covers | does not cover |
+| --- | --- | --- |
+| `.env`, `*.key` | that name at **any** depth (`a/b/.env`) | `.envx` |
+| `internal/**` | everything under `internal/`, any depth | `internal` itself; `vendor/internal/x` |
+| `internal` | the directory and its contents, at any depth | `internals` |
+| `internal/` | canonicalized to `internal`; the node and its contents | `internals` |
+| `internal/*` | direct children only | `internal/deep/x` |
+| `**/id_rsa` | that name anywhere, root included | `id_rsa_backup` |
+| `**/secrets` | a `secrets` directory and its contents, wherever it appears | `secret` |
+
+A leading `!` (negation) is **rejected**: it would make the result depend on pattern order, and
+merging two policies treats their patterns as a set.
+A literal leading `!` is written as `\!` in operator configuration. Serialized JSON keeps the
+literal `!` and adds `"path_pattern_encoding": "monoid.literal-bang.v1"`, so current readers can
+distinguish it from negation without changing how pre-v0.20 readers match the pattern.
+A leading `#` stays literal; it does not turn the rest of the pattern into a gitignore comment.
+Leading `./` is normalized. Backslash is a workspace path separator rather than a pattern escape;
+the leading `\!` configuration spelling is its only accepted source-level use. Root-only (`/`, `.`,
+`./`), malformed, and control-character patterns are rejected during configuration load. The
+synthetic workspace root (`.` or an empty path) is not a workspace entry and matches no pattern;
+scopes grant paths below it explicitly.
+
+Workspace paths containing C0/DEL controls are rejected. Windows additionally rejects ambiguous
+Win32 aliases (trailing dot/space, alternate data streams, reserved devices, and 8.3 alias-shaped
+segments). Case and Unicode-normalization aliases, plus symlink and hardlink identity, belong to the
+workspace backend because this matcher compares normalized lexical paths and has no workspace root
+or volume metadata. This includes the built-in local backend when it runs on a case-insensitive or
+normalization-insensitive volume. Hosted deployments should test, canonicalize or reject aliases,
+and document those relations as required by the production checklist.
+
+Path rules evaluate the path arguments presented to the policy. The built-in recursive
+`fs.copy`/`fs.move`/`fs.delete` flow currently checks its root argument, not every descendant. An
+allowed ancestor can therefore contain a denied descendant. Deployments that expose recursive
+operations must add backend/tool tree preflight or disallow those operations across mixed-policy
+trees.
+
+> **Changed in v0.20.** These were previously matched with `PurePath.match`, where `**` behaved as
+> a single `*`. `internal/**` covered one level and missed `internal/deep/x`, while also matching
+> `vendor/internal/x`, and `**/id_rsa` never matched a bare `id_rsa` at the root. If you relied on
+> a `dir/**` pattern matching that directory at *any* depth, write `**/dir/**`.
+
 Public events keep file content out of the stream and mask `redact_patterns` paths.
 Your backend owns any extra redaction for secret-bearing tool arguments or shell commands
 (see [OBSERVABILITY.md](OBSERVABILITY.md#event-sinks)).
@@ -185,6 +229,13 @@ monoid watch <run_id> --run-root ./runs --follow
 `--json` prints raw JSONL events. The default watch output is a compact human
 view.
 
+`watch` reads `events.jsonl` directly and does **not** join settled text back in. Since v0.20 a
+settle event carries `final_text_digest` instead of model-authored `final_text`, so `--json` shows
+the digest where the backend and Studio show the text — they read through a hydrating projection
+and `watch` deliberately does not, because "raw JSONL events" is what this flag is for. Kernel
+messages such as `Stopped after reaching max steps.` are still inline. To resolve a digest, match it
+against the `settled_text` records in the run's `transcript.jsonl`.
+
 Inspect the current proposed output snapshot:
 
 ```bash
@@ -200,6 +251,19 @@ monoid job status <job_id> --run <run_id> --run-root ./runs --json
 monoid job logs <job_id> --run <run_id> --stream stdout --tail-bytes 4096
 monoid job cancel <job_id> --run <run_id>
 ```
+
+`jobs` and `job status` print the **public projection** of `artifacts/jobs/<id>/job.json` rather
+than the artifact: `command` is dropped and `command_preview` carries the bounded rendering, and
+`cwd` and `changed_paths` are redacted against the run's `permission_policy.redact_patterns`. Read
+the artifact off disk if you are inside the trust boundary and need the exact command. The response
+uses `monoid.public-background-job.v1`; `artifact_schema_version` records the validated durable
+input version. A missing manifest redacts every path, and malformed policy metadata is an error.
+
+`monoid status` exits non-zero when the run's `events.jsonl` is corrupt, after printing what it
+could project. The projection carries the reason in `event_log_error`. Its other fields combine
+the latest readable run artifacts with the valid event prefix and may therefore describe different
+points in time. Treat the entire degraded projection as diagnostic; do not poll `state` without
+checking the error field.
 
 For the full run-directory artifact set (`events.jsonl`, `transcript.jsonl`,
 `diff.patch`, `proposal.json`, …), see [OBSERVABILITY.md](OBSERVABILITY.md#outputs).

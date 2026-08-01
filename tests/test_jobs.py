@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import monoid_agent_kernel.tasks as tasks_module
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.tasks import BackgroundJob, SubagentTaskExecutor, TaskManager
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -43,7 +44,9 @@ def _manager(tmp_path: Path) -> tuple[TaskManager, AgentRecorder, _CaptureSink]:
     workspace_root.mkdir()
     workspace = LocalWorkspaceBackend(workspace_root, mode="propose", backend_kind="staging")
     sink = _CaptureSink()
-    recorder = AgentRecorder(tmp_path / "runs", "run_jobs", extra_event_sinks=(sink,), status_file=False)
+    recorder = AgentRecorder(
+        tmp_path / "runs", "run_jobs", extra_event_sinks=(sink,), status_file=False
+    )
     manager = TaskManager(
         run_id="run_jobs",
         workspace=workspace,
@@ -153,6 +156,98 @@ def test_reentry_is_idempotent_and_clears_has_resume(tmp_path: Path) -> None:
     assert manager.has_resume_jobs() is False
 
 
+def test_clock_rollback_cannot_block_job_reentry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, recorder, sink = _manager(tmp_path)
+    job_id = "job_clock_rollback"
+    job_dir = recorder.artifacts_dir / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    stdout_path = job_dir / "stdout.log"
+    stderr_path = job_dir / "stderr.log"
+    stdout_path.write_bytes(b"")
+    stderr_path.write_bytes(b"")
+    job = BackgroundJob(
+        job_id=job_id,
+        kind="shell",
+        command="python -c pass",
+        command_preview="python -c pass",
+        cwd=".",
+        status="running",
+        started_at=200.0,
+        timeout_s=10,
+        max_output_bytes=100_000,
+        startup_wait_s=0,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        job_path=job_dir / "job.json",
+        cancel_path=job_dir / "cancel.requested",
+        execution_workspace="direct",
+        resume_on_exit=True,
+    )
+
+    # A rollback can happen while the job is live, so started/output/status projections must
+    # remain valid before there is a terminal timestamp as well as after one is recorded.
+    monkeypatch.setattr(tasks_module.time, "time", lambda: 100.0)
+    assert manager._public_job_payload(job)["duration_s"] == 0.0
+    job.status = "exited"
+    job.finished_at = 100.0
+    job.exit_code = 0
+    manager.jobs[job_id] = job
+
+    waiter_entered = threading.Event()
+    wait_result: list[bool] = []
+    condition_wait = manager._condition.wait
+
+    def observed_wait(timeout: float | None = None) -> bool:
+        waiter_entered.set()
+        return condition_wait(timeout)
+
+    monkeypatch.setattr(manager._condition, "wait", observed_wait)
+    waiter = threading.Thread(
+        target=lambda: wait_result.append(manager.wait_for_reentry(5.0)),
+        daemon=True,
+    )
+    waiter.start()
+    assert waiter_entered.wait(1.0) is True
+
+    manager.mark_ready(job)
+
+    waiter.join(timeout=1.0)
+    woke_promptly = not waiter.is_alive()
+    if not woke_promptly:
+        # Keep a failing mutation from leaking the waiter into later tests.
+        with manager._condition:
+            manager._condition.notify_all()
+        waiter.join(timeout=1.0)
+    assert woke_promptly is True
+    assert wait_result == [True]
+    persisted = json.loads(job.job_path.read_text(encoding="utf-8"))
+    assert persisted["duration_s"] == 0.0
+    assert job.ready_for_reentry is True
+    assert [obs.output["job_id"] for obs in manager.pop_reentry_observations()] == [job_id]
+    terminal = [event for event in sink.events if event.type == "job.finished"]
+    assert len(terminal) == 1
+    assert terminal[0].data["duration_s"] == 0.0
+
+
+def test_hosted_task_duration_is_nonnegative_after_clock_rollback(tmp_path: Path) -> None:
+    manager, _recorder, sink = _manager(tmp_path)
+    task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})
+    task.started_at = 200.0
+    task.finished_at = 100.0
+    task.status = "answered"
+    task.result = {"status": "answered"}
+
+    manager.mark_ready(task)
+
+    persisted = json.loads(task.job_path.read_text(encoding="utf-8"))
+    assert persisted["duration_s"] == 0.0
+    terminal = [event for event in sink.events if event.type == "task.finished"]
+    assert len(terminal) == 1
+    assert terminal[0].data["duration_s"] == 0.0
+
+
 def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
     manager, _recorder, sink = _manager(tmp_path)
     task = manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": True})
@@ -165,7 +260,10 @@ def test_hosted_task_cancel_marks_ready_for_reentry(tmp_path: Path) -> None:
     observations = manager.pop_reentry_observations()
     assert observations
     assert observations[0].output["status"] == "cancelled"
-    assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
+    assert any(
+        event.type == "task.cancelled" and event.data["task_id"] == task.job_id
+        for event in sink.events
+    )
 
 
 def test_mark_ready_is_idempotent_for_cancelled_task(tmp_path: Path) -> None:
@@ -227,9 +325,25 @@ def test_subagent_cancel_waits_for_child_coroutine_to_stop_before_reentry(tmp_pa
         observations = manager.pop_reentry_observations()
         assert observations
         assert observations[0].output["status"] == "cancelled"
-        assert any(event.type == "task.cancelled" and event.data["task_id"] == task.job_id for event in sink.events)
+        assert any(
+            event.type == "task.cancelled" and event.data["task_id"] == task.job_id
+            for event in sink.events
+        )
     finally:
         manager._shutdown_task_loop()
+
+
+@pytest.mark.parametrize("invalid", ["false", 0, None, float("nan")])
+def test_hosted_task_rejects_coercible_resume_control(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    manager, _recorder, _sink = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="resume_on_exit must be a boolean"):
+        manager.start_task("hitl", {"prompt": "Approve?", "resume_on_exit": invalid})
+
+    assert manager.jobs == {}
 
 
 def test_non_resume_job_is_not_offered_for_reentry(tmp_path: Path) -> None:

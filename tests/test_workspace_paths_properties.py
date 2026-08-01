@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from string import ascii_lowercase, digits
 
 import pytest
@@ -9,8 +10,26 @@ from monoid_agent_kernel.errors import WorkspaceError
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
 
+_WINDOWS_RESERVED = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+
+def _safe_segment(value: str) -> bool:
+    if value in {".", ".."}:
+        return False
+    if os.name == "nt" and (value.endswith(".") or value.split(".", 1)[0] in _WINDOWS_RESERVED):
+        return False
+    return True
+
+
 SEGMENT = st.text(alphabet=ascii_lowercase + digits + "_.-", min_size=1, max_size=8).filter(
-    lambda value: value not in {".", ".."}
+    _safe_segment
 )
 SEPARATOR = st.sampled_from(("/", "\\"))
 PROPERTY_SETTINGS = settings(max_examples=40, deadline=None)

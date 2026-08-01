@@ -7,11 +7,24 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args
 
-from monoid_agent_kernel.core.control import ControlCommand, ControlResult
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.control import (
+    ACCEPTED_CONTROL_PROTOCOL_VERSIONS,
+    ControlCommand,
+    ControlCommandType,
+    ControlResult,
+    ControlResultStatus,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    loads_json_ingress,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference._shared.control_transport import (
     COMMAND_RECEIPT_VERSION as COMMAND_RECEIPT_VERSION,
@@ -21,10 +34,16 @@ from monoid_agent_kernel.reference._shared.control_transport import (
     CommandReceipt,
     CommandStatus,
     redact_command_credential as redact_command_credential,
+    sanitize_command_args,
     sanitize_command_data,
 )
 
 COMMAND_ENVELOPE_VERSION = namespaced_id("command-inbox.v1")
+_DURABLE_RUNTIME_CONFIG_KEY = "_monoid_durable_runtime_config"
+_DURABLE_RUNTIME_CONFIG_MARKER = object()
+_COMMAND_STATUSES = frozenset({"pending", "claimed", "completed", "failed"})
+_COMMAND_TYPES = frozenset(get_args(ControlCommandType))
+_RESULT_STATUSES = frozenset(get_args(ControlResultStatus))
 
 
 @dataclass(frozen=True)
@@ -47,7 +66,7 @@ class StoredCommand:
             "run_id": self.run_id,
             "command_id": self.command_id,
             "type": self.type,
-            "args": sanitize_command_data(self.args),
+            "args": sanitize_command_args(self.type, self.args),
             "principal": self.principal.to_json(),
             "token_sha256": self.token_sha256,
             "reason": self.reason,
@@ -60,10 +79,19 @@ class StoredCommand:
     def control_command(
         self, *, token: str, transient_args: dict[str, Any] | None = None
     ) -> ControlCommand:
+        args = dict(self.args if transient_args is None else transient_args)
+        if transient_args is None and self.type == "replace_runtime_config":
+            config_payload = args.get("config")
+            if isinstance(config_payload, dict):
+                # A v0.19 worker could have queued this v1 command with literal leading bangs in
+                # tool scopes. Fresh commands are parsed strictly before enqueue; only the retained
+                # copy crosses the compatibility decoder here.
+                args["config"] = AgentRuntimeConfig.from_durable_json(config_payload).to_json()
+                args[_DURABLE_RUNTIME_CONFIG_KEY] = _DURABLE_RUNTIME_CONFIG_MARKER
         return ControlCommand(
             type=self.type,  # type: ignore[arg-type]
             run_id=self.run_id,
-            args={**(self.args if transient_args is None else transient_args), "token": token},
+            args={**args, "token": token},
             issuer=self.principal.actor,
             reason=self.reason,
             command_id=self.command_id,
@@ -86,10 +114,126 @@ class CommandStore(Protocol):
     def receipt(self, run_id: str, command_id: str) -> CommandReceipt | None: ...
 
 
+def _required_text(value: Any, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _required_object(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    return value
+
+
+def _finite_number(value: Any, field_name: str) -> float:
+    if not is_finite_json_number(value):
+        raise ValueError(f"{field_name} must be a finite number")
+    return float(value)
+
+
+def _positive_integer(value: Any, field_name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _exact_bool(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _normalize_stored_command(command: StoredCommand) -> StoredCommand:
+    """Canonicalize a submitted command before lookup or persistence."""
+
+    if not isinstance(command, StoredCommand):
+        raise ValueError("command must be a StoredCommand")
+    if not isinstance(command.args, dict):
+        raise ValueError("command args must be an object")
+    if not isinstance(command.principal, CommandPrincipal):
+        raise ValueError("command principal must be a CommandPrincipal")
+
+    command_type = _required_text(command.type, "command type")
+    if command_type not in _COMMAND_TYPES:
+        raise ValueError("command type is invalid")
+    status = _required_text(command.status, "command status")
+    if status not in _COMMAND_STATUSES:
+        raise ValueError("command status is invalid")
+    args = normalize_json_ingress(sanitize_command_args(command_type, command.args))
+    if not isinstance(args, dict):  # sanitize_command_args guarantees this today
+        raise ValueError("command args must be an object")
+    return replace(
+        command,
+        run_id=_required_text(command.run_id, "command run_id"),
+        command_id=_required_text(command.command_id, "command command_id"),
+        type=command_type,
+        args=args,
+        principal=CommandPrincipal(
+            tenant_id=_required_text(command.principal.tenant_id, "command principal tenant_id"),
+            user_id=_required_text(command.principal.user_id, "command principal user_id"),
+            issuer=_required_text(command.principal.issuer, "command principal issuer"),
+        ),
+        token_sha256=_required_text(command.token_sha256, "command token_sha256"),
+        reason=_required_text(command.reason, "command reason"),
+        created_at=_finite_number(command.created_at, "command created_at"),
+        status=status,  # type: ignore[arg-type]
+        claimed_by=_required_text(command.claimed_by, "command claimed_by"),
+        claimed_at=_finite_number(command.claimed_at, "command claimed_at"),
+    )
+
+
+def _normalize_result_payload(result: ControlResult) -> dict[str, Any]:
+    if not isinstance(result, ControlResult):
+        raise ValueError("command result must be a ControlResult")
+    result_type = _required_text(result.type, "command result type")
+    if result_type not in _COMMAND_TYPES:
+        raise ValueError("command result type is invalid")
+    result_status = _required_text(result.status, "command result status")
+    if result_status not in _RESULT_STATUSES:
+        raise ValueError("command result status is invalid")
+    if result.state is not None:
+        _required_text(result.state, "command result state")
+    if not isinstance(result.data, dict):
+        raise ValueError("command result data must be an object")
+    _required_text(result.run_id, "command result run_id")
+    _required_text(result.error, "command result error")
+    _required_text(result.error_code, "command result error_code")
+    payload = normalize_json_ingress(sanitize_command_data(result.to_json()))
+    if not isinstance(payload, dict):  # ControlResult.to_json guarantees this today
+        raise ValueError("command result must be an object")
+    return payload
+
+
+def _normalize_retained_result_payload(value: Any) -> dict[str, Any]:
+    """Validate a decoded durable result with the same rules as a fresh acknowledgement."""
+
+    payload = _required_object(value, "command result")
+    protocol = _required_text(payload.get("protocol", ""), "command result protocol")
+    if protocol and protocol not in ACCEPTED_CONTROL_PROTOCOL_VERSIONS:
+        raise ValueError("command result protocol is invalid")
+    state = payload.get("state")
+    if state is not None:
+        state = _required_text(state, "command result state")
+    return _normalize_result_payload(
+        ControlResult(
+            run_id=_required_text(payload.get("run_id"), "command result run_id"),
+            type=_required_text(payload.get("type"), "command result type"),  # type: ignore[arg-type]
+            status=_required_text(  # type: ignore[arg-type]
+                payload.get("status"), "command result status"
+            ),
+            state=state,
+            data=_required_object(payload.get("data", {}), "command result data"),
+            error=_required_text(payload.get("error", ""), "command result error"),
+            error_code=_required_text(payload.get("error_code", ""), "command result error_code"),
+        )
+    )
+
+
 def _same_command_identity(existing: StoredCommand, submitted: StoredCommand) -> bool:
     return (
         existing.type == submitted.type
-        and existing.args == sanitize_command_data(submitted.args)
+        and existing.args == submitted.args
         and existing.principal == submitted.principal
         and existing.reason == submitted.reason
     )
@@ -108,6 +252,9 @@ class InMemoryCommandStore:
     def append(
         self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
     ) -> CommandReceipt:
+        command = _normalize_stored_command(command)
+        max_pending = _positive_integer(max_pending, "max_pending")
+        require_empty = _exact_bool(require_empty, "require_empty")
         key = (command.run_id, command.command_id)
         with self._lock:
             existing = self._commands.get(key)
@@ -125,17 +272,20 @@ class InMemoryCommandStore:
                 )
             if pending >= max_pending:
                 raise CommandQueueFull(f"command queue is full for run {command.run_id}")
-            persisted = StoredCommand(
-                **{**command.__dict__, "args": dict(sanitize_command_data(command.args))}
-            )
+            persisted = command
             self._commands[key] = persisted
             return self._receipt(persisted)
 
     def read_command(self, run_id: str, command_id: str) -> StoredCommand | None:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
         with self._lock:
             return self._commands.get((run_id, command_id))
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
+        run_id = _required_text(run_id, "run_id")
+        worker_id = _required_text(worker_id, "worker_id")
+        claim_ttl_s = _finite_number(claim_ttl_s, "claim_ttl_s")
         now = time.time()
         with self._lock:
             selected = next(
@@ -149,8 +299,7 @@ class InMemoryCommandStore:
             if selected is None:
                 return None
             if selected.status == "claimed" and (
-                selected.claimed_by == worker_id
-                or now - selected.claimed_at <= claim_ttl_s
+                selected.claimed_by == worker_id or now - selected.claimed_at <= claim_ttl_s
             ):
                 return None
             claimed = StoredCommand(
@@ -167,6 +316,10 @@ class InMemoryCommandStore:
     def acknowledge(
         self, run_id: str, command_id: str, worker_id: str, result: ControlResult
     ) -> CommandReceipt:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
+        worker_id = _required_text(worker_id, "worker_id")
+        result_payload = _normalize_result_payload(result)
         key = (run_id, command_id)
         with self._lock:
             command = self._commands[key]
@@ -175,10 +328,12 @@ class InMemoryCommandStore:
             status: CommandStatus = "completed" if result.status == "ok" else "failed"
             acknowledged = StoredCommand(**{**command.__dict__, "status": status})
             self._commands[key] = acknowledged
-            self._results[key] = sanitize_command_data(result.to_json())
+            self._results[key] = result_payload
             return self._receipt(acknowledged)
 
     def receipt(self, run_id: str, command_id: str) -> CommandReceipt | None:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
         with self._lock:
             command = self._commands.get((run_id, command_id))
             return self._receipt(command) if command is not None else None
@@ -239,6 +394,9 @@ class SqliteCommandStore:
     def append(
         self, command: StoredCommand, *, max_pending: int, require_empty: bool = False
     ) -> CommandReceipt:
+        command = _normalize_stored_command(command)
+        max_pending = _positive_integer(max_pending, "max_pending")
+        require_empty = _exact_bool(require_empty, "require_empty")
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, command.run_id, command.command_id)
@@ -268,8 +426,12 @@ class SqliteCommandStore:
                     command.run_id,
                     command.command_id,
                     command.type,
-                    json.dumps(sanitize_command_data(command.args), sort_keys=True),
-                    json.dumps(command.principal.to_json(), sort_keys=True),
+                    json.dumps(
+                        command.args,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
+                    json.dumps(command.principal.to_json(), sort_keys=True, allow_nan=False),
                     command.reason,
                     command.created_at,
                     command.created_at,
@@ -283,11 +445,16 @@ class SqliteCommandStore:
             return self._receipt_from_row(row)
 
     def read_command(self, run_id: str, command_id: str) -> StoredCommand | None:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
         with closing(self._connect()) as conn:
             row = self._row(conn, run_id, command_id)
         return self._command_from_row(row) if row is not None else None
 
     def claim(self, run_id: str, worker_id: str, *, claim_ttl_s: float) -> StoredCommand | None:
+        run_id = _required_text(run_id, "run_id")
+        worker_id = _required_text(worker_id, "worker_id")
+        claim_ttl_s = _finite_number(claim_ttl_s, "claim_ttl_s")
         now = time.time()
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -300,8 +467,7 @@ class SqliteCommandStore:
                 conn.commit()
                 return None
             if row["status"] == "claimed" and (
-                row["claimed_by"] == worker_id
-                or now - float(row["claimed_at"]) <= claim_ttl_s
+                row["claimed_by"] == worker_id or now - float(row["claimed_at"]) <= claim_ttl_s
             ):
                 conn.commit()
                 return None
@@ -320,6 +486,10 @@ class SqliteCommandStore:
     def acknowledge(
         self, run_id: str, command_id: str, worker_id: str, result: ControlResult
     ) -> CommandReceipt:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
+        worker_id = _required_text(worker_id, "worker_id")
+        result_payload = _normalize_result_payload(result)
         status = "completed" if result.status == "ok" else "failed"
         now = time.time()
         with self._lock, closing(self._connect()) as conn:
@@ -329,7 +499,11 @@ class SqliteCommandStore:
                 "WHERE run_id=? AND command_id=? AND status='claimed' AND claimed_by=?",
                 (
                     status,
-                    json.dumps(sanitize_command_data(result.to_json()), sort_keys=True),
+                    json.dumps(
+                        result_payload,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
                     now,
                     run_id,
                     command_id,
@@ -345,6 +519,8 @@ class SqliteCommandStore:
             return self._receipt_from_row(row)
 
     def receipt(self, run_id: str, command_id: str) -> CommandReceipt | None:
+        run_id = _required_text(run_id, "run_id")
+        command_id = _required_text(command_id, "command_id")
         with closing(self._connect()) as conn:
             row = self._row(conn, run_id, command_id)
         return self._receipt_from_row(row) if row is not None else None
@@ -365,34 +541,48 @@ class SqliteCommandStore:
 
     @staticmethod
     def _command_from_row(row: sqlite3.Row) -> StoredCommand:
-        if str(row["schema_version"]) != COMMAND_ENVELOPE_VERSION:
+        schema_version = _required_text(row["schema_version"], "command schema_version")
+        if schema_version != COMMAND_ENVELOPE_VERSION:
             raise ValueError(f"unsupported command inbox schema: {row['schema_version']}")
-        principal = json.loads(row["principal"])
-        return StoredCommand(
-            run_id=str(row["run_id"]),
-            command_id=str(row["command_id"]),
-            type=str(row["command_type"]),
-            args=dict(json.loads(row["args"])),
-            principal=CommandPrincipal(
-                tenant_id=str(principal["tenant_id"]),
-                user_id=str(principal["user_id"]),
-                issuer=str(principal.get("issuer") or ""),
-            ),
-            token_sha256=str(row["token_sha256"]),
-            reason=str(row["reason"]),
-            created_at=float(row["created_at"]),
-            status=str(row["status"]),  # type: ignore[arg-type]
-            claimed_by=str(row["claimed_by"]),
-            claimed_at=float(row["claimed_at"]),
+        args = _required_object(loads_json_ingress(row["args"]), "command args")
+        principal = _required_object(loads_json_ingress(row["principal"]), "command principal")
+        return _normalize_stored_command(
+            StoredCommand(
+                run_id=row["run_id"],
+                command_id=row["command_id"],
+                type=row["command_type"],
+                args=args,
+                principal=CommandPrincipal(
+                    tenant_id=_required_text(
+                        principal.get("tenant_id"), "command principal tenant_id"
+                    ),
+                    user_id=_required_text(principal.get("user_id"), "command principal user_id"),
+                    issuer=_required_text(principal.get("issuer", ""), "command principal issuer"),
+                ),
+                token_sha256=row["token_sha256"],
+                reason=row["reason"],
+                created_at=row["created_at"],
+                status=row["status"],
+                claimed_by=row["claimed_by"],
+                claimed_at=row["claimed_at"],
+            )
         )
 
     @staticmethod
     def _receipt_from_row(row: sqlite3.Row) -> CommandReceipt:
+        status = _required_text(row["status"], "command status")
+        if status not in _COMMAND_STATUSES:
+            raise ValueError("command status is invalid")
+        result_value = row["result"]
         return CommandReceipt(
-            run_id=str(row[1]),
-            command_id=str(row[2]),
-            status=str(row[8]),  # type: ignore[arg-type]
-            result=dict(json.loads(row[11])) if row[11] else None,
-            created_at=float(row[7]),
-            updated_at=float(row[12]),
+            run_id=_required_text(row["run_id"], "command run_id"),
+            command_id=_required_text(row["command_id"], "command command_id"),
+            status=status,  # type: ignore[arg-type]
+            result=(
+                _normalize_retained_result_payload(loads_json_ingress(result_value))
+                if result_value is not None
+                else None
+            ),
+            created_at=_finite_number(row["created_at"], "command created_at"),
+            updated_at=_finite_number(row["updated_at"], "command updated_at"),
         )

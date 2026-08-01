@@ -14,11 +14,11 @@ stdio transport, OAuth flows, sampling, subscriptions/SSE listeners, and automat
 from __future__ import annotations
 
 import itertools
-import json
 import threading
 from typing import Any
 
 from monoid_agent_kernel._version import package_version
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -61,7 +61,10 @@ class McpHttpClient:
             headers["Authorization"] = f"Bearer {token}"
         self._url = url
         self._http = httpx.Client(headers=headers, timeout=timeout_s)
-        self._client_name, self._client_version = client_info or ("monoid-agent-kernel", package_version())
+        self._client_name, self._client_version = client_info or (
+            "monoid-agent-kernel",
+            package_version(),
+        )
         self._ids = itertools.count(1)
         self._session_id: str | None = None
         self._initialized = False
@@ -83,7 +86,9 @@ class McpHttpClient:
                     "clientInfo": {"name": self._client_name, "version": self._client_version},
                 },
             )
-            session_id = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
+            session_id = response.headers.get("Mcp-Session-Id") or response.headers.get(
+                "mcp-session-id"
+            )
             if session_id:
                 self._session_id = session_id
             self._post("notifications/initialized", None, notify=True)
@@ -155,7 +160,12 @@ class McpHttpClient:
     # -- transport ---------------------------------------------------------------------
 
     def _post(
-        self, method: str, params: Any = None, *, notify: bool = False, _allow_reconnect: bool = True
+        self,
+        method: str,
+        params: Any = None,
+        *,
+        notify: bool = False,
+        _allow_reconnect: bool = True,
     ) -> tuple[dict[str, Any], Any]:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if not notify:
@@ -194,8 +204,8 @@ class McpHttpClient:
             data = _read_sse_until(response, request_id)
         else:
             try:
-                data = response.json()
-            except json.JSONDecodeError as exc:
+                data = loads_json_ingress(response.text)
+            except ValueError as exc:
                 raise McpError("MCP returned invalid JSON") from exc
         if isinstance(data, dict) and "error" in data:
             error = data["error"] or {}
@@ -213,7 +223,7 @@ def _read_sse_until(response: Any, request_id: int) -> dict[str, Any]:
         line = raw if isinstance(raw, str) else raw.decode("utf-8")
         if line == "":
             if data_lines:
-                message = json.loads("\n".join(data_lines))
+                message = loads_json_ingress("\n".join(data_lines))
                 data_lines = []
                 if isinstance(message, dict) and message.get("id") == request_id:
                     return message
@@ -221,9 +231,9 @@ def _read_sse_until(response: Any, request_id: int) -> dict[str, Any]:
         if line.startswith(":"):
             continue
         if line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip(" "))
+            data_lines.append(line[len("data:") :].lstrip(" "))
     if data_lines:
-        message = json.loads("\n".join(data_lines))
+        message = loads_json_ingress("\n".join(data_lines))
         if isinstance(message, dict):
             return message
     raise McpError("MCP stream ended without a matching response")

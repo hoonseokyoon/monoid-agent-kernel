@@ -64,6 +64,31 @@ def test_read_run_meta_accepts_legacy_schema_version(tmp_path: Path) -> None:
     }
 
 
+def test_recovery_request_reads_pre_v020_permission_policy_literal_bangs(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    meta = {
+        **_recovery_metadata("run_legacy", workspace),
+        "permission_policy": {
+            "deny_patterns": ["!odd"],
+            "redact_patterns": ["./!private"],
+        },
+    }
+
+    request = RunnerBackend._recovery_request(  # type: ignore[arg-type]
+        None, meta, _default_config()
+    )
+
+    assert request.permission_policy.deny_patterns == ("!odd",)
+    assert request.permission_policy.redact_patterns == ("./!private",)
+    assert request.permission_policy.to_json() == {
+        "deny_patterns": ["!odd"],
+        "redact_patterns": ["./!private"],
+        "path_pattern_encoding": "monoid.literal-bang.v1",
+    }
+
+
 def test_backend_accepts_checkpoint_store_without_metadata_methods(tmp_path: Path) -> None:
     class LegacyCheckpointStore:
         def put(self, checkpoint: RunCheckpoint, blobs: dict[str, bytes] | None = None) -> None:

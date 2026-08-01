@@ -15,7 +15,19 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_value,
 )
 from monoid_agent_kernel.core.result import AgentRunResult
-from monoid_agent_kernel.reference.backend.ports import LoopPort, MutableRunRecordPort, RunRecordPort
+from monoid_agent_kernel.public_view import public_error_message
+from monoid_agent_kernel.reference.backend.ports import (
+    LoopPort,
+    MutableRunRecordPort,
+    RunRecordPort,
+)
+
+
+def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
+    value = metrics.get(key, 0)
+    if type(value) is not int or value < 0:
+        raise ValueError(f"run metric {key} must be a non-negative integer")
+    return value
 
 
 def set_record_state(
@@ -58,17 +70,19 @@ class TenantUsage:
 
     def add_metrics(self, metrics: dict[str, Any]) -> None:
         self.runs += 1
-        self.input_tokens += int(metrics.get("input_tokens") or 0)
-        self.output_tokens += int(metrics.get("output_tokens") or 0)
-        self.total_tokens += int(metrics.get("total_tokens") or 0)
-        self.web_search_calls += int(metrics.get("web_search_calls") or 0)
-        self.web_fetch_calls += int(metrics.get("web_fetch_calls") or 0)
-        self.web_context_calls += int(metrics.get("web_context_calls") or 0)
-        self.web_failed_calls += int(metrics.get("web_failed_calls") or 0)
-        self.web_result_count += int(metrics.get("web_result_count") or 0)
-        self.web_bytes_returned += int(metrics.get("web_bytes_returned") or 0)
-        self.web_context_source_count += int(metrics.get("web_context_source_count") or 0)
-        self.web_context_bytes_returned += int(metrics.get("web_context_bytes_returned") or 0)
+        self.input_tokens += _nonnegative_metric(metrics, "input_tokens")
+        self.output_tokens += _nonnegative_metric(metrics, "output_tokens")
+        self.total_tokens += _nonnegative_metric(metrics, "total_tokens")
+        self.web_search_calls += _nonnegative_metric(metrics, "web_search_calls")
+        self.web_fetch_calls += _nonnegative_metric(metrics, "web_fetch_calls")
+        self.web_context_calls += _nonnegative_metric(metrics, "web_context_calls")
+        self.web_failed_calls += _nonnegative_metric(metrics, "web_failed_calls")
+        self.web_result_count += _nonnegative_metric(metrics, "web_result_count")
+        self.web_bytes_returned += _nonnegative_metric(metrics, "web_bytes_returned")
+        self.web_context_source_count += _nonnegative_metric(metrics, "web_context_source_count")
+        self.web_context_bytes_returned += _nonnegative_metric(
+            metrics, "web_context_bytes_returned"
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -172,7 +186,9 @@ class RunStateMutationService:
         def _snapshot() -> tuple[MutableRunRecordPort | None, LoopPort | None, Path, bool, bool]:
             record = self._context.active_record(run_id)
             loop = record.loop if record is not None else None
-            run_dir = record.run_dir if record is not None else self._context.run_root_provider() / run_id
+            run_dir = (
+                record.run_dir if record is not None else self._context.run_root_provider() / run_id
+            )
             queued_direct = (
                 self._context.event_sequencer.is_queued_before_recorder(record.state)
                 if record is not None
@@ -192,13 +208,18 @@ class RunStateMutationService:
             self._context.with_record_lock(_snapshot)
         )
         if record is not None:
-            if loop is not None and loop.emit_external_event(event_type, data=dict(data), level=level):
+            if loop is not None and loop.emit_external_event(
+                event_type, data=dict(data), level=level
+            ):
                 return
             if not direct_append_allowed and requires_live_owner:
                 return
         if not run_dir.exists():
             return
-        if not direct_append_allowed and not self._context.event_sequencer.run_dir_allows_direct_append(run_dir):
+        if (
+            not direct_append_allowed
+            and not self._context.event_sequencer.run_dir_allows_direct_append(run_dir)
+        ):
             return
         try:
             self._context.append_event(run_dir, event_type, data=dict(data), level=level)
@@ -211,10 +232,17 @@ class RunStateMutationService:
             record.result = result
             set_record_state(
                 record,
-                session_state_from_run_status(result.status, error_code=result.error_code, terminal=True),
+                session_state_from_run_status(
+                    result.status, error_code=result.error_code, terminal=True
+                ),
                 terminal=True,
             )
-            record.error = result.error
+            # Through the kernel's own error filter before it becomes an HTTP projection.
+            # `AgentRunResult.error` is deliberately raw -- the embedding application is inside
+            # the trust boundary and needs the whole message to debug -- but `record.error` is
+            # served by `status`, `result` and `diagnostics`, and a gateway 400 embeds the entire
+            # provider response body in it, which is not the run's own data to hand back.
+            record.error = public_error_message(result.error)
             record.error_code = result.error_code
             record.finished_at = self._context.now()
             self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
@@ -227,7 +255,10 @@ class RunStateMutationService:
         self._context.write_failure_bundle(
             run_id,
             self._context.run_root_provider() / run_id,
-            error=str(exc),
+            # Filtered, like `record.error` below. `diagnostics()` returns the whole `failure.json`,
+            # so writing it raw put the message back on the same response the filter two lines
+            # down was added to clean. The kernel's own writer (`loop.py`) already filters here.
+            error=public_error_message(str(exc)),
             error_code=getattr(exc, "error_code", "internal_error"),
             exc_type=type(exc).__name__,
             overwrite=False,
@@ -236,7 +267,7 @@ class RunStateMutationService:
         def _mutate() -> None:
             record = self._context.record(run_id)
             set_record_state(record, SessionState.FAILED, terminal=True)
-            record.error = str(exc)
+            record.error = public_error_message(str(exc))
             record.error_code = getattr(exc, "error_code", "internal_error")
             record.finished_at = self._context.now()
 

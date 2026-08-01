@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_from_checkpoint_payload,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
@@ -59,7 +60,8 @@ class RecoveryContext:
     issue_llm_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
     issue_web_gateway_token: Callable[[str, RunRequestPort, AgentRuntimeConfig], str]
     build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopBuildPort]
-    register_record: Callable[[MutableRunRecordPort], None]
+    register_record: Callable[[MutableRunRecordPort], bool]
+    unregister_record: Callable[[MutableRunRecordPort], None]
     attach_loop: Callable[[MutableRunRecordPort, LoopBuildPort], None]
     call_soon: Callable[..., None]
     spawn: Callable[[Awaitable[Any]], object]
@@ -111,7 +113,10 @@ class RecoveryService:
             if self.attempt_resume(run_dir, run_id):
                 _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
                 reclaimed.append(run_id)
-            elif not (run_dir / "failure.json").exists():
+            elif (
+                not self._context.is_record_tracked(run_id)
+                and not (run_dir / "failure.json").exists()
+            ):
                 lease_store.release(run_id)
         return reclaimed
 
@@ -160,7 +165,7 @@ class RecoveryService:
             )
             return False
         try:
-            self.resume_from_checkpoint(stored, meta)
+            resumed = self.resume_from_checkpoint(stored, meta)
         except Exception as exc:
             attempts = self.bump_recover_attempts(run_dir)
             max_recover_attempts = self._context.max_recover_attempts_provider()
@@ -182,10 +187,13 @@ class RecoveryService:
                 )
                 _LOGGER.error("run %s marked unrecoverable", run_id)
             return False
+        if resumed is False:
+            # A concurrent recovery path won the atomic record claim. It owns the activation.
+            return False
         self.clear_recover_attempts(run_dir)
         return True
 
-    def resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
+    def resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> bool:
         checkpoint = stored.checkpoint
         run_id = checkpoint.run_id
         if checkpoint.seq != stored.seq:
@@ -205,20 +213,43 @@ class RecoveryService:
             runtime_config,
             meta,
         )
-        self._context.register_record(record)
-        loop_build = self._context.build_loop(run_id, request, workspace_root, llm_gateway_token, web_gateway_token)
-        loop = loop_build.loop
-        loop.restore(checkpoint, blobs=stored.blob)
-        self._context.attach_loop(record, loop_build)
-        record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
-        for message in checkpoint.queued_messages:
-            self._context.call_soon(record.message_queue.put_nowait, message)
-        restored_suspension = (
-            suspension_from_checkpoint_payload(checkpoint.last_suspension)
-            if checkpoint.last_suspension is not None
-            else Suspension(reason="settled", status="completed")
-        )
-        self._context.spawn(self.run_recovered(run_id, request, loop, restored_suspension))
+        if not self._context.register_record(record):
+            return False
+        loop: LoopPort | None = None
+        try:
+            loop_build = self._context.build_loop(
+                run_id, request, workspace_root, llm_gateway_token, web_gateway_token
+            )
+            loop = loop_build.loop
+            loop.restore(checkpoint, blobs=stored.blob)
+            self._context.attach_loop(record, loop_build)
+            record.seen_inbox_ids = set(checkpoint.inbox_seen_ids)
+            for message in checkpoint.queued_messages:
+                self._context.call_soon(record.message_queue.put_nowait, message)
+            restored_suspension = (
+                suspension_from_checkpoint_payload(checkpoint.last_suspension)
+                if checkpoint.last_suspension is not None
+                else Suspension(reason="settled", status="completed")
+            )
+            recovered = self.run_recovered(run_id, request, loop, restored_suspension)
+            try:
+                self._context.spawn(recovered)
+            except BaseException:
+                recovered.close()
+                raise
+            return True
+        except BaseException:
+            if loop is not None:
+                try:
+                    loop.discard_uncommitted()
+                except BaseException:
+                    # Preserve the recovery/build failure. AgentLoop cleanup is best-effort and
+                    # already attempts each owned activation resource before raising its first one.
+                    pass
+            # A failed build is not a live run. Leaving this provisional record registered makes
+            # every later recovery pass skip it forever, bypassing the retry/unrecoverable policy.
+            self._context.unregister_record(record)
+            raise
 
     async def run_recovered(
         self,
@@ -227,10 +258,16 @@ class RecoveryService:
         loop: LoopPort,
         suspension: Suspension,
     ) -> None:
-        await self._context.acquire_run_slot()
+        acquired = False
+        released = False
+        discarded = False
         try:
+            await self._context.acquire_run_slot()
+            acquired = True
             if loop.has_pending_tasks():
-                suspension = Suspension(reason="awaiting_tasks", status="running", has_external=True)
+                suspension = Suspension(
+                    reason="awaiting_tasks", status="running", has_external=True
+                )
             record = self._context.record(run_id)
             result = await self._context.drive_open_session(
                 record,
@@ -240,11 +277,26 @@ class RecoveryService:
                 started=time.time(),
                 turns=1,
             )
+            released = True
             self._context.record_run_result(run_id, result)
         except Exception as exc:
+            try:
+                await asyncio.to_thread(loop.discard_uncommitted)
+                discarded = True
+            except BaseException:
+                # Preserve the recovered execution failure. AgentLoop has already attempted every
+                # owned activation resource before surfacing a cleanup error.
+                pass
             self._context.record_run_failure(run_id, exc)
         finally:
-            self._context.release_run_slot()
+            # Task cancellation bypasses ``except Exception`` but still owns the recovered loop.
+            if not released and not discarded:
+                try:
+                    await asyncio.to_thread(loop.discard_uncommitted)
+                except BaseException:
+                    pass
+            if acquired:
+                self._context.release_run_slot()
 
     def read_recovery_meta(self, run_dir: Path, run_id: str) -> dict[str, Any] | None:
         return self.read_recovery_meta_checked(run_dir, run_id).value
@@ -276,7 +328,9 @@ class RecoveryService:
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:
-            payload = json.loads(self._recover_attempts_path(run_dir).read_text(encoding="utf-8"))
+            payload = loads_json_ingress(
+                self._recover_attempts_path(run_dir).read_text(encoding="utf-8")
+            )
             return int(payload["count"])
         except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
             return 0

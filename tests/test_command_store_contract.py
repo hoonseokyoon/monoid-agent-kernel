@@ -7,7 +7,11 @@ from threading import Barrier
 
 import pytest
 
+from support.runtime import runtime_config, tool_binding
+
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.control import ControlResult
+from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.reference.command_inbox import (
     CommandConflict,
     CommandPrincipal,
@@ -63,6 +67,104 @@ def test_bearer_redaction_covers_nested_keys_and_values() -> None:
         "nested": {"prefix-[redacted]": "[redacted]"},
         "tuple": ["safe", "[redacted]"],
     }
+
+
+def test_store_rejects_float_overflowing_control_numbers(store: CommandStore) -> None:
+    with pytest.raises(ValueError, match="command created_at must be a finite number"):
+        store.append(_command("cmd_huge", created_at=10**400), max_pending=10)
+
+    store.append(_command("cmd_claim"), max_pending=10)
+    with pytest.raises(ValueError, match="claim_ttl_s must be a finite number"):
+        store.claim("run_1", "worker", claim_ttl_s=10**400)
+
+
+def test_store_rejects_string_subclasses_before_command_type_membership(
+    store: CommandStore,
+) -> None:
+    class SpoofedCommandType(str):
+        def __new__(cls):
+            return super().__new__(cls, "evil")
+
+        def __hash__(self) -> int:
+            return hash("status")
+
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+    command = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_spoofed_type",
+        type=SpoofedCommandType(),
+        args={},
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+
+    with pytest.raises(ValueError, match="command type must be a string"):
+        store.append(command, max_pending=10)
+
+
+def test_retained_replace_config_command_migrates_pre_v020_literal_bangs() -> None:
+    config = runtime_config(
+        bindings=(
+            tool_binding(
+                "fs.read",
+                scope=ToolScope(allowed_paths=("!odd",), denied_paths=("./!private",)),
+            ),
+        )
+    )
+    legacy_payload = config.to_json()
+    legacy_payload["tools"][0]["scope"].pop("path_pattern_encoding")
+    legacy_payload["tools"][0]["scope"]["allowed_paths"] = ["!odd"]
+    legacy_payload["tools"][0]["scope"]["denied_paths"] = ["./!private"]
+    hash_payload = dict(legacy_payload)
+    hash_payload.pop("config_hash")
+    legacy_payload["config_hash"] = canonical_sha256(hash_payload)
+    stored = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_legacy_config",
+        type="replace_runtime_config",
+        args={"expected_version": 1, "config": legacy_payload},
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+
+    command = stored.control_command(token="signed-run-token")
+
+    assert command.args["token"] == "signed-run-token"
+    scope = command.args["config"]["tools"][0]["scope"]
+    assert scope["allowed_paths"] == ["!odd"]
+    assert scope["denied_paths"] == ["./!private"]
+    assert scope["path_pattern_encoding"] == "monoid.literal-bang.v1"
+    assert command.args["config"]["config_hash"] == config.config_hash
+
+
+def test_transient_replace_config_command_keeps_strict_operator_spelling() -> None:
+    stored = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_current_config",
+        type="replace_runtime_config",
+        args={},
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+    transient = {
+        "expected_version": 1,
+        "config": {
+            **runtime_config("fs.read").to_json(),
+            "tools": [
+                {
+                    **runtime_config("fs.read").to_json()["tools"][0],
+                    "scope": {"allowed_paths": ["!ambiguous"]},
+                }
+            ],
+        },
+    }
+
+    command = stored.control_command(token="signed-run-token", transient_args=transient)
+
+    with pytest.raises(ValueError, match="negated path patterns"):
+        # The fresh dispatch path still uses the strict parser.
+        from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+
+        AgentRuntimeConfig.from_json(command.args["config"])
 
 
 def test_append_is_idempotent_and_claims_in_order(store: CommandStore) -> None:
@@ -208,6 +310,46 @@ def test_persisted_command_redacts_credential_shaped_fields(store: CommandStore)
         "refreshToken": "[redacted]",
         "api_secret": "[redacted]",
         "safe": "visible",
+    }
+
+
+def test_replace_config_only_preserves_tool_authorization_policy(store: CommandStore) -> None:
+    command = StoredCommand(
+        run_id="run_1",
+        command_id="cmd_runtime_config",
+        type="replace_runtime_config",
+        args={
+            "authorization": "allow",
+            "config": {
+                "authorization": "ask",
+                "tools": [
+                    {
+                        "authorization": "allow",
+                        "headers": {"authorization": "Bearer credential"},
+                    },
+                    {"authorization": "owner-token"},
+                ],
+            },
+        },
+        principal=CommandPrincipal("tenant", "user", "operator"),
+    )
+
+    store.append(command, max_pending=10)
+    persisted = store.read_command("run_1", "cmd_runtime_config")
+
+    assert persisted is not None
+    assert persisted.args == {
+        "authorization": "[redacted]",
+        "config": {
+            "authorization": "[redacted]",
+            "tools": [
+                {
+                    "authorization": "allow",
+                    "headers": {"authorization": "[redacted]"},
+                },
+                {"authorization": "[redacted]"},
+            ],
+        },
     }
 
 

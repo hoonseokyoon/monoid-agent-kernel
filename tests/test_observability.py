@@ -11,7 +11,7 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.cli import _read_watch_batch, main
 from monoid_agent_kernel.core._event_log import EventLogChanged, inspect_event_log_tail
-from monoid_agent_kernel.core.events import EventBus
+from monoid_agent_kernel.core.events import AgentEvent, EventBus
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
@@ -37,7 +37,9 @@ def _provider(*tool_ids: str):
 
 def _runtime_config_file(tmp_path: Path, *tool_ids: str) -> Path:
     path = tmp_path / "runtime-config.json"
-    path.write_text(json.dumps(runtime_config(*(tool_ids or ("run.finish",))).to_json()), encoding="utf-8")
+    path.write_text(
+        json.dumps(runtime_config(*(tool_ids or ("run.finish",))).to_json()), encoding="utf-8"
+    )
     return path
 
 
@@ -72,6 +74,42 @@ def test_event_bus_schema_sequence_and_memory_sink() -> None:
     assert payload["schema_version"] == "monoid.event.v1"
     assert payload["type"] == "run.started"
     assert "kind" not in payload
+
+
+def test_event_bus_normalizes_python_values_before_any_sink_sees_them() -> None:
+    memory = MemoryEventSink()
+    bus = EventBus("run_\ud800", (memory,))
+
+    event = bus.emit(
+        "metrics.updated",
+        data={"\ud800": [float("nan"), float("inf"), -float("inf")]},
+    )
+
+    assert event.run_id == "run_�"
+    assert event.data == {"�": [None, None, None]}
+    assert memory.events == [event]
+
+
+def test_jsonl_sink_rejects_non_finite_values_if_an_ingress_is_bypassed(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    sink = JsonlEventSink(path)
+    event = AgentEvent(
+        schema_version="monoid.event.v1",
+        event_id="evt_1",
+        seq=1,
+        run_id="run_1",
+        timestamp="2026-07-30T00:00:00Z",
+        type="metrics.updated",
+        data={"value": float("nan")},
+    )
+
+    try:
+        with pytest.raises(ValueError, match="Out of range float values"):
+            sink.emit(event)
+    finally:
+        sink.close()
+
+    assert path.read_bytes() == b""
 
 
 def test_jsonl_and_status_sinks_flush_and_update(tmp_path: Path) -> None:
@@ -133,6 +171,30 @@ def test_emit_after_close_is_a_noop(tmp_path: Path) -> None:
     assert events_path.read_bytes() == bytes_before  # the closed sink is not written
 
 
+def test_event_bus_closes_each_sink_once_even_when_one_close_fails() -> None:
+    class ClosingSink:
+        def __init__(self, *, fail: bool = False) -> None:
+            self.fail = fail
+            self.close_count = 0
+
+        def emit(self, event: AgentEvent) -> None:
+            del event
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.fail:
+                raise RuntimeError("sink close failed")
+
+    sinks = (ClosingSink(), ClosingSink(fail=True), ClosingSink())
+    bus = EventBus("run-close-once", sinks)
+
+    with pytest.raises(RuntimeError, match="sink close failed"):
+        bus.close()
+    bus.close()
+
+    assert [sink.close_count for sink in sinks] == [1, 1, 1]
+
+
 def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -155,9 +217,9 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
 
-    result = AgentLoop(spec=spec, model_adapter=adapter, runtime_config_provider=_provider()).run_once(
-        "Clean notes."
-    )
+    result = AgentLoop(
+        spec=spec, model_adapter=adapter, runtime_config_provider=_provider()
+    ).run_once("Clean notes.")
 
     types = [event["type"] for event in _events(result.run_dir)]
     assert types[0] == "run.started"
@@ -177,7 +239,9 @@ def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     assert proposal["files"][0]["snapshot_path"] == "proposal/files/SUMMARY.md"
     assert proposal["proposal_hash"]
     assert status["manifest_path"] == "manifest.json"
-    workspace_index = json.loads(result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8"))
+    workspace_index = json.loads(
+        result.run_dir.joinpath("workspace.index.json").read_text(encoding="utf-8")
+    )
     assert workspace_index["schema_version"] == "monoid.workspace-index.v1"
     assert any(entry["path"] == "notes.md" for entry in workspace_index["entries"])
     projection = project_run_status(result.run_dir)
@@ -207,7 +271,9 @@ def test_otel_event_sink_emits_genai_span_tree(tmp_path: Path) -> None:
         turns=[
             ModelTurn(
                 response_id="r1",
-                tool_calls=(fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),),
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "OUT.md", "content": "hi\n"}, "c1"),
+                ),
             ),
             ModelTurn(final_text="done"),
         ]
@@ -357,6 +423,50 @@ def test_status_projection_redacts_paths_from_manifest_policy(tmp_path: Path) ->
     assert projection["changed_paths"] == ["[redacted-path]"]
 
 
+@pytest.mark.parametrize(
+    ("stored_pattern", "encoding", "changed_path", "expected_path"),
+    [
+        ("!private", None, "!private", "[redacted-path]"),
+        (r"\!private", None, "!private", "!private"),
+        ("!private", "monoid.literal-bang.v1", "!private", "[redacted-path]"),
+        ("secret//file", None, "secret/file", "[redacted-path]"),
+        ("secret/./file", None, "secret/file", "[redacted-path]"),
+        ("[", None, "[", "[redacted-path]"),
+        ("public\u00a0", None, "public\u00a0", "[redacted-path]"),
+    ],
+)
+def test_status_projection_reads_legacy_and_current_literal_bang_patterns(
+    tmp_path: Path,
+    stored_pattern: str,
+    encoding: str | None,
+    changed_path: str,
+    expected_path: str,
+) -> None:
+    run_dir = tmp_path / "runs" / "run_legacy"
+    run_dir.mkdir(parents=True)
+    policy = {"deny_patterns": [], "redact_patterns": [stored_pattern]}
+    if encoding is not None:
+        policy["path_pattern_encoding"] = encoding
+    run_dir.joinpath("manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "monoid.manifest.v1",
+                "permission_policy": policy,
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir.joinpath("proposal.json").write_text(
+        json.dumps({"run_id": "run_legacy", "changed_paths": [changed_path]}),
+        encoding="utf-8",
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["run_id"] == "run_legacy"
+    assert projection["changed_paths"] == [expected_path]
+
+
 def test_loop_records_unknown_malformed_and_permission_failures_as_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -404,7 +514,11 @@ def test_loop_limited_status_is_public_event(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     adapter = FakeModelAdapter(
-        turns=[ModelTurn(response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),))]
+        turns=[
+            ModelTurn(
+                response_id="r1", tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),)
+            )
+        ]
     )
     spec = AgentRunSpec(
         workspace_root=workspace,
@@ -489,9 +603,7 @@ def make_sink():
     stdout_text = result.stdout if has_separate_stderr else result.output
     assert result.exit_code == 0, stderr_text
     stdout_events = [
-        json.loads(line)
-        for line in stdout_text.splitlines()
-        if line.strip().startswith("{")
+        json.loads(line) for line in stdout_text.splitlines() if line.strip().startswith("{")
     ]
     assert stdout_events[0]["type"] == "run.started"
     assert stdout_events[-1]["type"] == "run.finished"
@@ -713,13 +825,291 @@ def test_cli_proposal_command_reads_snapshot_file(tmp_path: Path) -> None:
     )
     spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
     result = AgentLoop(
-        spec=spec, model_adapter=adapter, runtime_config_provider=_provider("fs.write", "run.finish")
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.write", "run.finish"),
     ).run_once("Write summary.")
 
     runner = CliRunner()
-    summary = runner.invoke(main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"])
+    summary = runner.invoke(
+        main, ["proposal", str(result.run_dir), "--file", "SUMMARY.md", "--json"]
+    )
 
     assert summary.exit_code == 0
     payload = json.loads(summary.stdout)
     assert payload["encoding"] == "utf-8"
     assert payload["content"] == "Clean summary\n"
+
+
+# --- corrupt event log ---------------------------------------------------------------------
+#
+# `monoid watch` catches `EventLogCorruption` and prints one line. The two *projection* readers
+# did not, so `monoid status --json` printed a 4.8 KB traceback and Studio's chat catch-up died
+# inside `do_GET`, which has no handler, taking the connection with it. Both now read leniently
+# and publish the reason; these pin that the reason is published rather than swallowed, which is
+# the half that matters -- a projection that stops at the damage without saying so reads as a
+# complete, shorter run.
+
+
+def _corrupt_event_log(run_dir: Path) -> Path:
+    """A log whose *interior* is damaged: valid, garbage, valid.
+
+    Interior rather than trailing on purpose. A truncated tail is the ordinary case -- a crash
+    mid-append -- and the reader already withholds an uncommitted final record. What escaped was a
+    committed record that does not decode, with good records after it.
+    """
+    events_path = run_dir / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}})
+        + "\n"
+        + "{not json at all\n"
+        + json.dumps({"seq": 3, "type": "run.finished", "data": {"status": "completed"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    return events_path
+
+
+def test_status_projection_degrades_on_a_corrupt_event_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_corrupt"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    projection = project_run_status(run_dir)
+
+    assert "not valid JSON" in projection["event_log_error"]
+    # Everything before the damage survives...
+    assert projection["last_event_seq"] == 1
+    # ...and nothing after it does. This is exactly why the flag has to be published: the file
+    # says the run completed and the projection cannot see it, so a poller reading `state` alone
+    # waits forever on a run that already finished.
+    assert projection["state"] == "running"
+    assert projection["terminal"] is False
+
+
+def test_status_projection_reports_no_error_on_a_clean_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["event_log_error"] == ""
+    assert projection["state"] == "running"
+
+
+def test_status_projection_reports_no_error_when_there_is_no_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_empty"
+    run_dir.mkdir()
+
+    assert project_run_status(run_dir)["event_log_error"] == ""
+
+
+def test_cli_status_json_prints_the_projection_then_fails(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cli_corrupt"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    runner, split_stderr = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir), "--json"])
+
+    # Non-zero, because `state` is not trustworthy and a script must not read it as current.
+    assert result.exit_code != 0
+    # The partial answer is still printed: the caller asked for it and it is all there is.
+    payload = json.loads(result.stdout.splitlines()[0])
+    assert payload["state"] == "running"
+    assert "not valid JSON" in payload["event_log_error"]
+    # One clean line, not a traceback.
+    stderr = result.stderr if split_stderr else result.output
+    assert "Traceback" not in stderr
+    assert "not valid JSON" in stderr
+
+
+def test_cli_status_human_output_also_fails_on_a_corrupt_log(tmp_path: Path) -> None:
+    """The `--json` branch returns early, so the human branch is a separate exit path -- the
+    shape that shipped a rule bound to one of two siblings all through this release."""
+    run_dir = tmp_path / "run_cli_corrupt_human"
+    run_dir.mkdir()
+    _corrupt_event_log(run_dir)
+
+    runner, split_stderr = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir)])
+
+    assert result.exit_code != 0
+    assert "run_id:" in result.stdout
+    stderr = result.stderr if split_stderr else result.output
+    assert "Traceback" not in stderr
+    assert "not valid JSON" in stderr
+
+
+def test_cli_status_succeeds_on_a_clean_log(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cli_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    runner, _ = _isolated_cli_runner()
+    result = runner.invoke(main, ["status", str(run_dir), "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["event_log_error"] == ""
+
+
+def test_studio_chat_catch_up_degrades_on_a_corrupt_event_log(tmp_path: Path) -> None:
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_studio_corrupt"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "before the damage"}})
+        + "\n"
+        + "{not json at all\n"
+        + json.dumps({"seq": 3, "type": "run.failed", "data": {"error": "after the damage"}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    body = ChatProjection(run_dir).catch_up("run-corrupt")
+
+    contents = [message["content"] for message in body["messages"]]
+    assert "before the damage" in contents
+    assert "after the damage" not in contents
+    assert "not valid JSON" in body["event_log_error"]
+
+
+def test_studio_chat_catch_up_reports_no_error_on_a_clean_log(tmp_path: Path) -> None:
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_studio_clean"
+    run_dir.mkdir()
+    run_dir.joinpath("events.jsonl").write_text(
+        json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "only message"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    body = ChatProjection(run_dir).catch_up("run-clean")
+
+    assert [message["content"] for message in body["messages"]] == ["only message"]
+    assert body["event_log_error"] == ""
+
+
+def test_an_uncommitted_tail_is_not_reported_as_corruption(tmp_path: Path) -> None:
+    """The distinction the flag lives or dies on.
+
+    A run that crashed mid-append leaves a final record with no newline. That is the *ordinary*
+    case, the reader already withholds it, and reporting it as damage would put a scary field on
+    a large fraction of interrupted runs -- which is how a warning stops being read.
+    """
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"seq": 1, "type": "run.started", "data": {}}) + "\n" + '{"seq": 2, "type": "ru',
+        encoding="utf-8",
+    )
+
+    read = read_committed_event_payloads(events_path)
+
+    assert [payload["seq"] for payload in read.payloads] == [1]
+    assert read.corruption == ""
+
+
+def test_a_missing_or_empty_event_log_is_not_corruption(tmp_path: Path) -> None:
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    absent = read_committed_event_payloads(tmp_path / "nope.jsonl")
+    assert absent.payloads == [] and absent.corruption == ""
+
+    empty_path = tmp_path / "empty.jsonl"
+    empty_path.write_text("", encoding="utf-8")
+    empty = read_committed_event_payloads(empty_path)
+    assert empty.payloads == [] and empty.corruption == ""
+
+
+@pytest.mark.parametrize("sequence", [(1, 1), (2, 1)])
+def test_lenient_event_read_stops_at_a_non_increasing_sequence(
+    tmp_path: Path, sequence: tuple[int, int]
+) -> None:
+    from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        "".join(
+            json.dumps({"seq": seq, "type": "run.started", "data": {}}) + "\n" for seq in sequence
+        ),
+        encoding="utf-8",
+    )
+
+    read = read_committed_event_payloads(events_path)
+
+    assert [payload["seq"] for payload in read.payloads] == [sequence[0]]
+    assert "sequence is not increasing" in read.corruption
+
+
+def test_status_and_studio_degrade_when_json_decoder_hits_recursion_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.core import _event_log
+    from monoid_agent_kernel.reference.studio.chat_projection import ChatProjection
+
+    run_dir = tmp_path / "run_deep_event"
+    run_dir.mkdir()
+    prefix = json.dumps({"seq": 1, "type": "run.failed", "data": {"error": "safe prefix"}})
+    deeply_nested = '{"seq":2,"type":"run.failed","data":{"nested":' + "[[0]]" + "}}"
+    run_dir.joinpath("events.jsonl").write_text(
+        prefix + "\n" + deeply_nested + "\n", encoding="utf-8"
+    )
+
+    real_loads = json.loads
+
+    def recursion_error_for_nested_event(
+        payload: str | bytes | bytearray,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if '"nested"' in str(payload):
+            raise RecursionError("simulated JSON decoder recursion limit")
+        return real_loads(payload, *args, **kwargs)
+
+    monkeypatch.setattr(_event_log, "loads_json_ingress", recursion_error_for_nested_event)
+
+    status = project_run_status(run_dir)
+    transcript = ChatProjection(run_dir).catch_up("run-deep-event")
+
+    assert "not valid JSON" in status["event_log_error"]
+    assert status["state"] == "failed"
+    assert [message["content"] for message in transcript["messages"]] == ["safe prefix"]
+    assert "not valid JSON" in transcript["event_log_error"]
+
+
+def test_degraded_status_can_mix_snapshot_and_event_prefix_fields(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_mixed_projection"
+    run_dir.mkdir()
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-mixed",
+                "state": "completed",
+                "terminal": True,
+                "last_event_seq": 3,
+                "last_event_type": "run.finished",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _corrupt_event_log(run_dir)
+
+    projection = project_run_status(run_dir)
+
+    assert "not valid JSON" in projection["event_log_error"]
+    # Snapshot metadata can be newer than the valid event prefix. The error flag marks the whole
+    # mixed projection as diagnostic instead of promising one coherent point in time.
+    assert projection["last_event_seq"] == 3
+    assert projection["last_event_type"] == "run.finished"
+    assert projection["state"] == "running"

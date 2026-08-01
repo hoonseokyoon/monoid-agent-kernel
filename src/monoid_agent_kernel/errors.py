@@ -32,11 +32,18 @@ class ModelAdapterError(NativeAgentError):
         provider_error_code: str | None = None,
         retryable: bool = False,
         http_status: int | None = None,
+        provider_retried: bool = False,
     ) -> None:
         super().__init__(message, error_code=error_code)
         self.provider_error_code = provider_error_code or ""
         self.retryable = retryable
         self.http_status = http_status
+        # Whether the adapter's own retry loop ran before giving up. ``retryable`` is a forecast
+        # about a *future* attempt; this is a fact about attempts already made, and the two are
+        # independent -- an exhausted retry budget leaves a retryable error that will not be
+        # retried again. Without it a failed audit record denies retries in exactly the case where
+        # they happened most.
+        self.provider_retried = provider_retried
 
 
 class PermissionDenied(NativeAgentError):
@@ -98,6 +105,19 @@ class TurnPaused(NativeAgentError):
     where it left off. Pause lands only at the start of the next step, never mid-step."""
 
     error_code = "paused"
+
+
+class ModelCallAborted(NativeAgentError):
+    """Raised when a caller's ``should_abort`` predicate stops an in-flight model call.
+
+    Distinct from :class:`TurnInterrupted` because the model-call runner is reusable and knows
+    nothing about turns: a gateway or a batch driver aborting a stream is not interrupting a
+    conversational turn. :class:`~monoid_agent_kernel.loop.AgentLoop` translates this into
+    ``TurnInterrupted`` at its own boundary, which is what keeps the session non-terminal — left
+    untranslated it would reach the loop's generic failure handler and terminalize the run.
+    """
+
+    error_code = "model_call_aborted"
 
 
 def error_code_for_exception(exc: Exception) -> str:

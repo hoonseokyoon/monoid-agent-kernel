@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-from monoid_agent_kernel.core._event_log import iter_committed_event_records
+from monoid_agent_kernel.core._event_log import read_committed_event_payloads
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
     session_state_value,
 )
-from monoid_agent_kernel.tasks import list_job_artifacts
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import public_path
+from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
 
 
 def project_run_status(run_dir: Path) -> dict[str, Any]:
@@ -24,8 +24,11 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
     package = _read_json_if_exists(run_dir / "proposal.package.json")
     approval = _read_json_if_exists(run_dir / "approval.json")
     apply_result = _read_json_if_exists(run_dir / "apply-result.json")
-    permission_policy = PermissionPolicy.from_json(manifest.get("permission_policy"))
-    jobs = _public_jobs(list_job_artifacts(run_dir), permission_policy)
+    permission_policy = run_permission_policy(run_dir)
+    # Already projected by the reader. There used to be a `_public_jobs` here that applied its own
+    # partial version of the same rules -- it dropped `command` and redacted `changed_paths` but
+    # left `cwd` exact -- and a second pass now would double-truncate what the reader already cut.
+    jobs = public_job_artifacts(run_dir)
     state = _payload_state(status_payload, metrics)
     terminal = _payload_terminal(status_payload, state)
 
@@ -46,7 +49,11 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
             or manifest.get("workspace_backend")
             or ""
         ),
-        "waiting_for_background_jobs": bool(status_payload.get("waiting_for_background_jobs", False)),
+        "waiting_for_background_jobs": _payload_bool(
+            status_payload,
+            "waiting_for_background_jobs",
+            default=False,
+        ),
         "jobs": jobs,
         "running_jobs": [job for job in jobs if job.get("status") == "running"],
         "completed_jobs": [job for job in jobs if job.get("status") != "running"],
@@ -61,8 +68,16 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "approval_hash": approval.get("approval_hash"),
         "apply_status": apply_result.get("status") or "",
         "apply_hash": apply_result.get("apply_hash"),
-        "last_event_seq": int(status_payload.get("last_event_seq") or 0),
+        "last_event_seq": _payload_nonnegative_int(
+            status_payload,
+            "last_event_seq",
+            default=0,
+        ),
         "last_event_type": status_payload.get("last_event_type") or "",
+        # Empty on a clean read. A degraded result combines the run's durable snapshots with the
+        # valid event prefix, so none of its state fields can be trusted as current without first
+        # checking this member.
+        "event_log_error": "",
     }
     _apply_event_projection(run_dir / "events.jsonl", projection, permission_policy)
     return projection
@@ -75,22 +90,31 @@ def _apply_event_projection(
 ) -> None:
     if not events_path.exists():
         return
-    for event in _iter_events(events_path):
-        event_type = str(event.get("type") or "")
+    read = read_committed_event_payloads(events_path)
+    projection["event_log_error"] = read.corruption
+    for event in read.payloads:
+        event_type = _optional_text(event.get("type"), "event type") or ""
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
-        seq = int(event.get("seq") or 0)
-        if seq >= int(projection.get("last_event_seq") or 0):
+        seq = _payload_nonnegative_int(event, "seq", default=0)
+        if seq >= projection["last_event_seq"]:
             projection["last_event_seq"] = seq
             projection["last_event_type"] = event_type
         if event_type == "run.started":
             projection["state"] = session_state_value(SessionState.RUNNING)
             projection["terminal"] = False
-            projection["workspace_backend"] = data.get("workspace_backend") or projection.get("workspace_backend", "")
+            projection["workspace_backend"] = data.get("workspace_backend") or projection.get(
+                "workspace_backend", ""
+            )
         elif event_type == "run.finished":
             projection["state"] = session_state_value(
                 session_state_from_run_status(
-                    str(data.get("status") or projection["state"]),
-                    error_code=str(data.get("error_code") or projection["error_code"] or ""),
+                    _optional_text(data.get("status"), "run.finished status")
+                    or projection["state"],
+                    error_code=(
+                        _optional_text(data.get("error_code"), "run.finished error_code")
+                        or projection["error_code"]
+                        or ""
+                    ),
                     terminal=True,
                 )
             )
@@ -141,37 +165,54 @@ def _apply_event_projection(
             )
 
 
-def _iter_events(path: Path) -> list[dict[str, Any]]:
-    return [record.payload for record in iter_committed_event_records(path)]
-
-
 def _read_json_if_exists(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        payload = loads_json_ingress(path.read_text(encoding="utf-8"))
+    except ValueError:
         return {}
     return payload if isinstance(payload, dict) else {}
 
 
 def _payload_state(status_payload: dict[str, Any], metrics: dict[str, Any]) -> str:
-    raw = status_payload.get("state") or status_payload.get("status") or metrics.get("state") or metrics.get("status")
+    raw = _first_present_text(
+        (status_payload, "state"),
+        (status_payload, "status"),
+        (metrics, "state"),
+        (metrics, "status"),
+        field_name="run state",
+    )
     if not raw:
         return session_state_value(SessionState.CREATED)
+    error_code = (
+        _first_present_text(
+            (status_payload, "error_code"),
+            (metrics, "error_code"),
+            field_name="run error_code",
+        )
+        or ""
+    )
     state = session_state_from_run_status(
-        str(raw),
-        error_code=str(status_payload.get("error_code") or metrics.get("error_code") or ""),
-        terminal=bool(status_payload.get("terminal")),
+        raw,
+        error_code=error_code,
+        terminal=_payload_bool(status_payload, "terminal", default=False),
     )
     return session_state_value(state)
 
 
 def _payload_terminal(status_payload: dict[str, Any], state: str) -> bool:
     if "terminal" in status_payload:
-        return bool(status_payload.get("terminal"))
-    raw = status_payload.get("state") or status_payload.get("status")
-    return str(raw or state) in {"completed", "failed", "limited", "cancelled"} or state in {
+        return _payload_bool(status_payload, "terminal", default=False)
+    raw_state = (
+        _first_present_text(
+            (status_payload, "state"),
+            (status_payload, "status"),
+            field_name="run state",
+        )
+        or state
+    )
+    return raw_state in {"completed", "failed", "limited", "cancelled"} or state in {
         SessionState.CANCELLED.value,
         SessionState.FAILED.value,
         SessionState.COMPLETED.value,
@@ -184,21 +225,47 @@ def _public_paths(paths: object, permission_policy: PermissionPolicy) -> list[st
     return [public_path(str(path), permission_policy) for path in paths]
 
 
-def _public_jobs(jobs: list[dict[str, Any]], permission_policy: PermissionPolicy) -> list[dict[str, Any]]:
-    public: list[dict[str, Any]] = []
-    for job in jobs:
-        payload = {
-            key: value
-            for key, value in job.items()
-            if key not in {"command"}
-        }
-        payload["changed_paths"] = _public_paths(payload.get("changed_paths") or [], permission_policy)
-        public.append(payload)
-    return public
-
-
 def _first_string(*values: object) -> str:
     for value in values:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+def _optional_text(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a string")
+    return value
+
+
+def _first_present_text(
+    *candidates: tuple[dict[str, Any], str],
+    field_name: str,
+) -> str | None:
+    for payload, key in candidates:
+        if key not in payload or payload[key] is None:
+            continue
+        value = _optional_text(payload[key], field_name)
+        if value:
+            return value
+    return None
+
+
+def _payload_bool(payload: dict[str, Any], key: str, *, default: bool) -> bool:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _payload_nonnegative_int(payload: dict[str, Any], key: str, *, default: int) -> int:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return value

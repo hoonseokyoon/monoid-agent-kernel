@@ -94,6 +94,27 @@ from monoid_agent_kernel.core.capability import (
 # Context providers (pluggable static + per-turn system context)
 from monoid_agent_kernel.core.context import ContextProvider, TurnContext
 
+# Invocation identity (who is asking for a model call; usable without an agent run)
+from monoid_agent_kernel.core.invocation import InvocationContext
+
+# Model I/O capture (per-consumer policy for prompt/output disclosure)
+from monoid_agent_kernel.core.model_io import (
+    DEFAULT_SECRET_KEY_PARTS,
+    CapturePolicy,
+    ClosableModelIOObserver,
+    DefaultRedactor,
+    ModelCallCapture,
+    ModelCallReceipt,
+    ModelIOObserver,
+    ModelIOSubscription,
+    RedactionPolicy,
+    Redactor,
+)
+
+# Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
+# it names the provider vocabulary it drives; see the module docstring.
+from monoid_agent_kernel.model_call import ModelCallRunner
+
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -138,11 +159,17 @@ from monoid_agent_kernel.core.content import (
 
 # Model adapter contract
 from monoid_agent_kernel.providers.base import (
+    AddressedModelAdapter,
     AsyncModelAdapter,
+    ConfiguredModelAdapter,
+    mark_provider_retried,
+    report_provider_retried,
     ModelAdapter,
     ModelRequest,
     ModelStreamChunk,
     ModelTurn,
+    MultimodalModelAdapter,
+    ProviderNamedModelAdapter,
     StreamingModelAdapter,
     TextDelta,
     ToolCall,
@@ -291,6 +318,19 @@ __all__ = [
     "ToolSearchConfig",
     "ContextProvider",
     "TurnContext",
+    # Model call kernel
+    "InvocationContext",
+    "CapturePolicy",
+    "RedactionPolicy",
+    "Redactor",
+    "DefaultRedactor",
+    "DEFAULT_SECRET_KEY_PARTS",
+    "ModelCallReceipt",
+    "ModelCallCapture",
+    "ModelIOObserver",
+    "ClosableModelIOObserver",
+    "ModelIOSubscription",
+    "ModelCallRunner",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
@@ -315,6 +355,15 @@ __all__ = [
     "ModelAdapter",
     "AsyncModelAdapter",
     "StreamingModelAdapter",
+    "MultimodalModelAdapter",
+    "ProviderNamedModelAdapter",
+    "ConfiguredModelAdapter",
+    "AddressedModelAdapter",
+    # Adapter-facing seams. An adapter with its own retry loop reports through these; nothing else
+    # can observe a retry that happened inside one adapter call, and a call the run abandons never
+    # returns an outcome to carry it.
+    "report_provider_retried",
+    "mark_provider_retried",
     "ModelRequest",
     "ModelTurn",
     "ToolCall",

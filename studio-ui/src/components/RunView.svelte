@@ -57,6 +57,22 @@
   <div class="sr-only" role="status" aria-live="polite">{runAnnouncement}</div>
   <div class="chat-scroll" data-testid="chat-log" aria-label="Session transcript" aria-busy={state.status === "running" || state.status === "queued"}>
     <div class="conversation">
+      {#if state.eventLogError}
+        <article class="error-panel" role="alert" data-testid="transcript-event-log-error">
+          <span class="error-mark"><Icon name="alert" size={18} /></span>
+          <div class="min-w-0 flex-1">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <div class="eyebrow">Transcript degraded</div>
+                <h3>Transcript is incomplete</h3>
+              </div>
+              <span class="error-code">EVENT LOG</span>
+            </div>
+            <p>{state.eventLogError}</p>
+          </div>
+        </article>
+      {/if}
+
       {#each state.messages as message (message.id)}
         <article class:from-user={message.role === "user"} class:error-message={message.role === "error"} class="message-row">
           <span class="message-avatar">{#if message.role === "user"}<Icon name="profile" size={14} />{:else if message.role === "error"}<Icon name="alert" size={14} />{:else}<Icon name="spark" size={14} />{/if}</span>

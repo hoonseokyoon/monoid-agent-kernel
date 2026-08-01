@@ -14,6 +14,10 @@ from monoid_agent_kernel.core.lease_admission import sanitize_denied_capability_
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError, TokenManager
 from monoid_agent_kernel.reference.backend.ports import LoopPort, TokenClaimsPort
+from monoid_agent_kernel.reference.command_inbox import (
+    _DURABLE_RUNTIME_CONFIG_KEY,
+    _DURABLE_RUNTIME_CONFIG_MARKER,
+)
 
 _CONTROL_AUDIT_POLICY = ControlAuditPolicy()
 
@@ -136,6 +140,11 @@ class BackendCommandService:
     ) -> ControlResult:
         args = dict(command.args)
         token = str(args.pop("token", "") or "")
+        durable_runtime_config = (
+            args.pop(_DURABLE_RUNTIME_CONFIG_KEY, None) is _DURABLE_RUNTIME_CONFIG_MARKER
+        )
+        audit_args = dict(command.args)
+        audit_args.pop(_DURABLE_RUNTIME_CONFIG_KEY, None)
         run_id = command.run_id
         ctype = command.type
         command_id = command.command_id or f"control_{uuid.uuid4().hex[:12]}"
@@ -158,7 +167,7 @@ class BackendCommandService:
                     reason=command.reason,
                     token_sha256=token_sha256,
                     idempotency_key=idempotency_key,
-                    args=command.args,
+                    args=audit_args,
                 ),
             )
             result = self.dispatch_control_command(
@@ -166,6 +175,7 @@ class BackendCommandService:
                 args=args,
                 token=token,
                 command_id=command_id,
+                durable_runtime_config=durable_runtime_config,
             )
         except PermissionDenied as exc:
             if audit_authorized:
@@ -245,6 +255,7 @@ class BackendCommandService:
         args: dict[str, Any],
         token: str,
         command_id: str,
+        durable_runtime_config: bool = False,
     ) -> ControlResult:
         run_id = command.run_id
         ctype = command.type
@@ -298,6 +309,11 @@ class BackendCommandService:
         if ctype == "runtime_config":
             return ok(self._context.runtime_config.runtime_config(run_id, token))
         if ctype == "replace_runtime_config":
+            config_parser = (
+                AgentRuntimeConfig.from_durable_json
+                if durable_runtime_config
+                else AgentRuntimeConfig.from_json
+            )
             return ok(
                 self._context.runtime_config.replace_runtime_config(
                     run_id,
@@ -305,7 +321,7 @@ class BackendCommandService:
                     expected_version=int(args.get("expected_version", 0)),
                     issuer=command.issuer,
                     reason=command.reason,
-                    config=AgentRuntimeConfig.from_json(args["config"]),
+                    config=config_parser(args["config"]),
                 )
             )
         if ctype == "send_message":

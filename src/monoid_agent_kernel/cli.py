@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import replace
@@ -21,6 +22,7 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     StaticRuntimeConfigProvider,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -45,8 +47,8 @@ from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.proposal_file import ProposalFileError, read_proposal_file_payload
 from monoid_agent_kernel.event_loader import load_event_sinks
 from monoid_agent_kernel.tasks import (
-    get_job_artifact,
-    list_job_artifacts,
+    public_job_artifact_for,
+    public_job_artifacts,
     read_job_log_text,
     request_job_cancel,
 )
@@ -139,7 +141,9 @@ main.add_command(builder_group)
     default="overlay",
     show_default=True,
 )
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--run-id", type=str, default=None, help="Use a specific run id.")
 @click.option("--max-steps", type=int, default=30, show_default=True)
 @click.option("--max-tool-calls", type=int, default=100, show_default=True)
@@ -169,8 +173,12 @@ main.add_command(builder_group)
     is_flag=True,
     help="Use the built-in AutoGrantBroker (local dev): grant any requires_lease tool, scoped to its binding.",
 )
-@click.option("--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob.")
-@click.option("--redact-path", multiple=True, help="Redact matching paths from public events and projections.")
+@click.option(
+    "--deny-path", multiple=True, help="Deny workspace paths matching a backend-provided glob."
+)
+@click.option(
+    "--redact-path", multiple=True, help="Redact matching paths from public events and projections."
+)
 @click.option("--permission-policy-file", type=click.Path(path_type=Path), default=None)
 @click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
@@ -186,7 +194,9 @@ main.add_command(builder_group)
     default=None,
     help="File containing a short-lived WebGateway token.",
 )
-@click.option("--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function.")
+@click.option(
+    "--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function."
+)
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
 @click.pass_context
@@ -237,9 +247,11 @@ def run(
         raise click.ClickException("--instruction or --instruction-file is required")
     if spec_file is not None:
         if workspace is not None:
-            raise click.ClickException("--spec cannot be combined with --workspace; the spec file is authoritative")
+            raise click.ClickException(
+                "--spec cannot be combined with --workspace; the spec file is authoritative"
+            )
         try:
-            spec = AgentRunSpec.from_json(json.loads(spec_file.read_text(encoding="utf-8")))
+            spec = AgentRunSpec.from_json(loads_json_ingress(spec_file.read_text(encoding="utf-8")))
         except Exception as exc:
             raise click.ClickException(f"failed to load --spec: {exc}") from exc
         if run_id is not None:
@@ -278,9 +290,7 @@ def run(
         )
 
     if _runtime_config_uses_web(runtime_config) and not web_gateway_url:
-        raise click.ClickException(
-            "runtime config binds web tools; --web-gateway-url is required"
-        )
+        raise click.ClickException("runtime config binds web tools; --web-gateway-url is required")
     _human_echo(f"run_id: {spec.run_id}", stream_json=stream_json)
     _human_echo(f"run_dir: {spec.run_root / spec.run_id}", stream_json=stream_json)
 
@@ -301,14 +311,19 @@ def run(
                 )
                 # Fork skills (context: fork) run as subagents; register their synthesized
                 # definitions (namespaced ids, so no collision with --agents-directory).
-                subagent_definitions = {**subagent_definitions, **skill_provider.subagent_definitions()}
+                subagent_definitions = {
+                    **subagent_definitions,
+                    **skill_provider.subagent_definitions(),
+                }
         extra_sinks = []
         if stream_json:
             extra_sinks.append(StdoutJsonlSink())
         for item in event_sink_module:
             extra_sinks.extend(load_event_sinks(item))
         if capability_broker and auto_grant_capabilities:
-            raise ValueError("use either --capability-broker or --auto-grant-capabilities, not both")
+            raise ValueError(
+                "use either --capability-broker or --auto-grant-capabilities, not both"
+            )
         broker = (
             load_capability_broker(capability_broker)
             if capability_broker
@@ -319,47 +334,92 @@ def run(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
-    result = AgentLoop(
-        spec=spec,
-        subagent_definitions=subagent_definitions,
-        model_adapter=_model_adapter(
-            runtime_config.model or ModelConfig(),
-            llm_gateway_url=llm_gateway_url or (runtime_config.model.gateway_url if runtime_config.model else None),
-            llm_gateway_token_env=llm_gateway_token_env,
-            llm_gateway_token_file=llm_gateway_token_file,
-            allow_direct_provider_api=allow_direct_provider_api,
-        ),
-        tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
-        context_providers=(skill_provider,) if skill_provider is not None else (),
-        capability_broker=broker,
-        event_sinks=tuple(extra_sinks),
-        status_file=not no_status_file,
-        permission_policy=spec.permission_policy,
-        runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
-        web_gateway_client=(
-            WebGatewayClient(
-                web_gateway_url,
-                token_env=web_gateway_token_env,
-                token_file=web_gateway_token_file,
-            )
-            if _runtime_config_uses_web(runtime_config) and web_gateway_url
-            else None
-        ),
-    ).run_once(instruction)
-    _human_echo(f"status: {result.status}", stream_json=stream_json)
-    if result.final_text:
-        _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
-    if result.error:
-        raise click.ClickException(result.error)
+    model_adapter = _model_adapter(
+        runtime_config.model or ModelConfig(),
+        llm_gateway_url=llm_gateway_url
+        or (runtime_config.model.gateway_url if runtime_config.model else None),
+        llm_gateway_token_env=llm_gateway_token_env,
+        llm_gateway_token_file=llm_gateway_token_file,
+        allow_direct_provider_api=allow_direct_provider_api,
+    )
+    # One adapter serves every turn of this run, so an adapter that can hold its provider client
+    # open across turns should: the direct-OpenAI one builds a client per call otherwise, which
+    # costs far more than the request it carries. Duck-typed because only some adapters have a
+    # client to hold -- the gateway adapter owns its httpx client per call by design.
+    #
+    # Driven through the pair that is probed. ``enter_context`` needed ``__enter__``/``__exit__``
+    # instead, so the ``open``/``close`` adapter this probe invites -- the lifecycle pair the rest
+    # of the kernel uses, on ``AgentLoop`` and ``LoopSession`` -- raised ``TypeError`` before the
+    # first turn, outside the handler above, killing the run with a bare traceback.
+    #
+    # Both halves are resolved *before* either is called. Registering the bound ``close`` after
+    # ``open()`` looked like it failed early enough, and did not: ``open()`` had already allocated
+    # whatever it allocates -- a connection pool, for the adapter this exists for -- and the
+    # ``AttributeError`` from resolving the missing ``close`` then escaped past the handler above
+    # with nothing left able to release it. An adapter that offers one half of the pair is
+    # misconfigured, so it is reported as such, before it holds anything.
+    with contextlib.ExitStack() as adapter_scope:
+        opener = getattr(model_adapter, "open", None)
+        if callable(opener):
+            closer = getattr(model_adapter, "close", None)
+            if not callable(closer):
+                raise click.ClickException(
+                    f"model adapter {type(model_adapter).__name__} exposes open() without a "
+                    "callable close(); nothing would release what open() allocates"
+                )
+            # Reported the way every other startup failure is. These two calls sit below the
+            # `except Exception` that normalizes the setup above, so an adapter whose pool
+            # construction or teardown raised ended the command in a bare traceback.
+            try:
+                opener()
+            except Exception as exc:
+                raise click.ClickException(f"model adapter open() failed: {exc}") from exc
+            adapter_scope.push(_adapter_teardown(closer))
+        result = AgentLoop(
+            spec=spec,
+            subagent_definitions=subagent_definitions,
+            model_adapter=model_adapter,
+            tool_providers=providers + ((skill_provider,) if skill_provider is not None else ()),
+            context_providers=(skill_provider,) if skill_provider is not None else (),
+            capability_broker=broker,
+            event_sinks=tuple(extra_sinks),
+            status_file=not no_status_file,
+            permission_policy=spec.permission_policy,
+            runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
+            web_gateway_client=(
+                WebGatewayClient(
+                    web_gateway_url,
+                    token_env=web_gateway_token_env,
+                    token_file=web_gateway_token_file,
+                )
+                if _runtime_config_uses_web(runtime_config) and web_gateway_url
+                else None
+            ),
+        ).run_once(instruction)
+        # All inside the scope, because an exception from a cleanup callback replaces whatever is
+        # leaving the block. With the echoes outside, a teardown that raised swallowed the result of a
+        # run that had completed. With the failure raised outside, it was never reached at all: the
+        # teardown error left the block first and `result.error` -- the provider failure an operator
+        # needs -- was simply never reported. Raised in here, it is the exception already on its way
+        # out, and the teardown demotes itself to a warning beside it.
+        _human_echo(f"status: {result.status}", stream_json=stream_json)
+        if result.final_text:
+            _human_echo(f"summary: {result.final_text}", stream_json=stream_json)
+        if result.error:
+            raise click.ClickException(result.error)
 
 
 @main.command()
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--from-start", is_flag=True, help="Read events from the beginning of the file.")
 @click.option("--follow", is_flag=True, help="Keep waiting for new events.")
 @click.option("--json", "json_output", is_flag=True, help="Print raw JSONL events.")
-def watch(run_dir_or_id: str, run_root: Path, from_start: bool, follow: bool, json_output: bool) -> None:
+def watch(
+    run_dir_or_id: str, run_root: Path, from_start: bool, follow: bool, json_output: bool
+) -> None:
     """Watch a run's public events."""
     events_path = _resolve_events_path(run_dir_or_id, run_root)
     if not events_path.exists():
@@ -423,14 +483,23 @@ def _read_watch_batch(
 
 @main.command("status")
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """Project a run directory into compact status state."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = project_run_status(run_dir)
+    # The projection degrades rather than raising, so this surface decides what that means. It
+    # prints the partial snapshot-and-prefix answer first -- a caller asked for it and it is the
+    # only answer available -- and then fails, because `state` may name a run that has since
+    # finished and a script polling this must not read that as still running.
+    event_log_error = str(payload.get("event_log_error") or "")
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
+        if event_log_error:
+            raise click.ClickException(event_log_error)
         return
     click.echo(f"run_id: {payload.get('run_id', '')}")
     click.echo(f"state: {payload.get('state', '')}")
@@ -449,18 +518,22 @@ def status_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> Non
         click.echo(f"proposal_hash: {payload['proposal_hash']}")
     if payload.get("changed_paths"):
         click.echo(f"changed_paths: {', '.join(map(str, payload['changed_paths']))}")
+    if event_log_error:
+        raise click.ClickException(event_log_error)
 
 
 @main.command("jobs")
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def jobs_command(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """List background shell jobs for a run."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
-    payload = {"run_dir": str(run_dir), "jobs": list_job_artifacts(run_dir)}
+    payload = {"run_dir": str(run_dir), "jobs": public_job_artifacts(run_dir)}
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     for job in payload["jobs"]:
         click.echo(
@@ -477,14 +550,16 @@ def job_group() -> None:
 @job_group.command("status")
 @click.argument("job_id", type=str)
 @click.option("--run", "run_dir_or_id", type=str, required=True)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def job_status_command(job_id: str, run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """Show one background job status."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
-    payload = get_job_artifact(run_dir, job_id)
+    payload = public_job_artifact_for(run_dir, job_id)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"job_id: {payload.get('job_id', '')}")
     click.echo(f"status: {payload.get('status', '')}")
@@ -497,8 +572,16 @@ def job_status_command(job_id: str, run_dir_or_id: str, run_root: Path, json_out
 @job_group.command("logs")
 @click.argument("job_id", type=str)
 @click.option("--run", "run_dir_or_id", type=str, required=True)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
-@click.option("--stream", "stream_name", type=click.Choice(["stdout", "stderr"]), default="stdout", show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
+@click.option(
+    "--stream",
+    "stream_name",
+    type=click.Choice(["stdout", "stderr"]),
+    default="stdout",
+    show_default=True,
+)
 @click.option("--tail-bytes", type=int, default=None)
 @click.option("--offset", type=int, default=None)
 @click.option("--follow", is_flag=True)
@@ -525,7 +608,7 @@ def job_logs_command(
             offset=next_offset,
         )
         if json_output:
-            click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         elif payload.get("content"):
             click.echo(payload["content"], nl=False)
         next_offset = int(payload.get("next_offset") or 0)
@@ -537,22 +620,28 @@ def job_logs_command(
 @job_group.command("cancel")
 @click.argument("job_id", type=str)
 @click.option("--run", "run_dir_or_id", type=str, required=True)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def job_cancel_command(job_id: str, run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """Request cancellation for one background job."""
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     payload = request_job_cancel(run_dir, job_id)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"cancel_requested: {payload['job_id']}")
 
 
 @main.command()
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
-@click.option("--file", "file_path", type=str, default=None, help="Show one proposed file's snapshot content.")
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
+@click.option(
+    "--file", "file_path", type=str, default=None, help="Show one proposed file's snapshot content."
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def proposal(run_dir_or_id: str, run_root: Path, file_path: str | None, json_output: bool) -> None:
     """Inspect a run's proposal snapshot."""
@@ -560,18 +649,20 @@ def proposal(run_dir_or_id: str, run_root: Path, file_path: str | None, json_out
     proposal_path = run_dir / "proposal.json"
     if not proposal_path.exists():
         raise click.ClickException(f"proposal.json not found: {proposal_path}")
-    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    payload = loads_json_ingress(proposal_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise click.ClickException("proposal.json must contain an object")
     if file_path is not None:
         file_payload = _proposal_file_payload(run_dir, payload, file_path)
         if json_output:
-            click.echo(json.dumps(file_payload, ensure_ascii=False, sort_keys=True))
+            click.echo(
+                json.dumps(file_payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            )
         else:
             click.echo(file_payload["content"])
         return
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"run_id: {payload.get('run_id', '')}")
     click.echo(f"mode: {payload.get('mode', '')}")
@@ -587,7 +678,9 @@ def proposal(run_dir_or_id: str, run_root: Path, file_path: str | None, json_out
 
 @main.command("validate")
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
     """Validate a run directory's public contract artifacts."""
@@ -599,7 +692,7 @@ def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
         "issues": [issue.__dict__ for issue in issues],
     }
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     elif issues:
         for issue in issues:
             click.echo(f"{issue.path}: {issue.message}")
@@ -616,7 +709,9 @@ def package_group() -> None:
 
 @package_group.command("export")
 @click.argument("run_dir_or_id", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--output", type=click.Path(path_type=Path), required=True)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def package_export(run_dir_or_id: str, run_root: Path, output: Path, json_output: bool) -> None:
@@ -632,7 +727,7 @@ def package_export(run_dir_or_id: str, run_root: Path, output: Path, json_output
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"package: {output}")
         click.echo(f"package_hash: {payload['package_hash']}")
@@ -640,7 +735,9 @@ def package_export(run_dir_or_id: str, run_root: Path, output: Path, json_output
 
 @package_group.command("verify")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def package_verify(package_or_run_dir: str, run_root: Path, json_output: bool) -> None:
     """Verify proposal package hashes and required files."""
@@ -653,7 +750,7 @@ def package_verify(package_or_run_dir: str, run_root: Path, json_output: bool) -
         "package": result.package,
     }
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     elif result.ok:
         click.echo("ok")
         click.echo(f"package_hash: {result.package.get('package_hash', '')}")
@@ -666,26 +763,34 @@ def package_verify(package_or_run_dir: str, run_root: Path, json_output: bool) -
 
 @package_group.command("inspect")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
 def package_inspect(package_or_run_dir: str, run_root: Path, json_output: bool) -> None:
     """Inspect a proposal package summary."""
     source = _resolve_package_source(package_or_run_dir, run_root)
     payload = inspect_package(source)
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
         return
     click.echo(f"ok: {payload['ok']}")
     click.echo(f"package_hash: {payload.get('package', {}).get('package_hash', '')}")
-    click.echo(f"changed_paths: {', '.join(map(str, payload.get('proposal', {}).get('changed_paths', [])))}")
+    click.echo(
+        f"changed_paths: {', '.join(map(str, payload.get('proposal', {}).get('changed_paths', [])))}"
+    )
 
 
 @package_group.command("import")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--output", type=click.Path(path_type=Path), required=True)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
-def package_import(package_or_run_dir: str, run_root: Path, output: Path, json_output: bool) -> None:
+def package_import(
+    package_or_run_dir: str, run_root: Path, output: Path, json_output: bool
+) -> None:
     """Import a proposal package into a verified staging directory."""
     source = _resolve_package_source(package_or_run_dir, run_root)
     try:
@@ -693,7 +798,7 @@ def package_import(package_or_run_dir: str, run_root: Path, output: Path, json_o
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"imported: {payload['output']}")
         click.echo(f"package_hash: {payload['package_hash']}")
@@ -701,9 +806,13 @@ def package_import(package_or_run_dir: str, run_root: Path, output: Path, json_o
 
 @package_group.command("approve")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--approver", type=str, required=True)
-@click.option("--path", "approved_path", multiple=True, help="Approve one changed workspace path. Repeatable.")
+@click.option(
+    "--path", "approved_path", multiple=True, help="Approve one changed workspace path. Repeatable."
+)
 @click.option("--note", type=str, default="")
 @click.option("--output", type=click.Path(path_type=Path), default=None)
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
@@ -725,7 +834,9 @@ def package_approve(
             approved_paths=approved_path or None,
             note=note,
         )
-        output_path = output or (_source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json"))
+        output_path = output or (
+            _source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json")
+        )
         write_approval(output_path, approval)
         _append_package_event_if_run_dir(
             source,
@@ -735,7 +846,7 @@ def package_approve(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"approval: {output_path}")
         click.echo(f"approval_hash: {approval['approval_hash']}")
@@ -743,7 +854,9 @@ def package_approve(
 
 @package_group.command("reject")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--approver", type=str, required=True)
 @click.option("--reason", type=str, required=True)
 @click.option("--output", type=click.Path(path_type=Path), default=None)
@@ -760,7 +873,9 @@ def package_reject(
     source = _resolve_package_source(package_or_run_dir, run_root)
     try:
         approval = create_approval(source, approver_id=approver, decision="rejected", note=reason)
-        output_path = output or (_source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json"))
+        output_path = output or (
+            _source_run_dir(source) / "approval.json" if source.is_dir() else Path("approval.json")
+        )
         write_approval(output_path, approval)
         _append_package_event_if_run_dir(
             source,
@@ -770,7 +885,7 @@ def package_reject(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     if json_output:
-        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(approval, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"approval: {output_path}")
         click.echo(f"approval_hash: {approval['approval_hash']}")
@@ -778,7 +893,9 @@ def package_reject(
 
 @package_group.command("apply")
 @click.argument("package_or_run_dir", type=str)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option("--approval", "approval_path", type=click.Path(path_type=Path), required=True)
 @click.option("--target", type=click.Path(path_type=Path), required=True)
 @click.option("--dry-run", is_flag=True)
@@ -797,7 +914,11 @@ def package_apply(
     source = _resolve_package_source(package_or_run_dir, run_root)
     try:
         result = apply_package(source, approval=approval_path, target=target, dry_run=dry_run)
-        output_path = output or (_source_run_dir(source) / "apply-result.json" if source.is_dir() else Path("apply-result.json"))
+        output_path = output or (
+            _source_run_dir(source) / "apply-result.json"
+            if source.is_dir()
+            else Path("apply-result.json")
+        )
         write_apply_result(output_path, result)
         event_type = "proposal.conflict" if result.status == "conflict" else "proposal.applied"
         _append_package_event_if_run_dir(
@@ -816,7 +937,7 @@ def package_apply(
         raise click.ClickException(str(exc)) from exc
     payload = result.to_json()
     if json_output:
-        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
     else:
         click.echo(f"status: {payload['status']}")
         click.echo(f"apply_result: {output_path}")
@@ -830,7 +951,9 @@ def backend() -> None:
 @backend.command("serve")
 @click.option("--host", type=str, default="127.0.0.1", show_default=True)
 @click.option("--port", type=int, default=8765, show_default=True)
-@click.option("--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
 @click.option(
     "--workspace-root",
     type=click.Path(path_type=Path),
@@ -902,7 +1025,9 @@ def backend_serve(
     )
     server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
     click.echo(f"Monoid backend listening on http://{host}:{port}")
-    click.echo(f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}")
+    click.echo(
+        f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}"
+    )
     if apply_root:
         click.echo(f"allowed apply roots: {', '.join(str(path.resolve()) for path in apply_root)}")
     try:
@@ -973,7 +1098,9 @@ def llm_gateway_serve(
         token_manager = TokenManager.from_secret(signing_secret)
 
     provider_factory = offline_provider_factory if provider == "fake" else None
-    gateway = LlmGatewayBackend(token_manager=token_manager, provider_adapter_factory=provider_factory)
+    gateway = LlmGatewayBackend(
+        token_manager=token_manager, provider_adapter_factory=provider_factory
+    )
     server = create_llm_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
     click.echo(f"LLM gateway listening on http://{host}:{port}")
     click.echo("turn endpoint: /internal/llm/turns")
@@ -1109,6 +1236,35 @@ def web_gateway_serve(
         server.server_close()
 
 
+def _adapter_teardown(closer: Any) -> Any:
+    """Release the adapter, reporting a teardown failure without ever replacing a real one.
+
+    Registered with ``ExitStack.push`` rather than ``callback`` so it can see whether an exception is
+    already leaving the block. Raising from a cleanup callback *replaces* that exception: a failing
+    ``close()`` superseded the run's own failure, and the provider error an operator actually needs
+    disappeared behind "close() failed". Measured -- a run failed by a dead provider, reported only as
+    a teardown error.
+
+    With nothing else on its way out, the failure is still the command's error, because then it is the
+    only signal there is. Alongside a real failure it is a footnote, on stderr so it neither
+    supersedes the error nor lands in ``--stream-json`` output.
+    """
+
+    def _exit(exc_type: Any, exc: Any, tb: Any) -> bool:
+        del exc, tb
+        try:
+            closer()
+        except Exception as close_exc:
+            message = f"model adapter close() failed: {close_exc}"
+            if exc_type is not None:
+                click.echo(f"warning: {message}", err=True)
+                return False
+            raise click.ClickException(message) from close_exc
+        return False
+
+    return _exit
+
+
 def _human_echo(message: str, *, stream_json: bool) -> None:
     click.echo(message, err=stream_json)
 
@@ -1192,13 +1348,15 @@ def _load_agent_runtime_config(
     agent_definition_file: Path | None,
 ) -> AgentRuntimeConfig:
     if runtime_config_file is not None and agent_definition_file is not None:
-        raise click.ClickException("--runtime-config-file and --agent-definition-file are mutually exclusive")
+        raise click.ClickException(
+            "--runtime-config-file and --agent-definition-file are mutually exclusive"
+        )
     if runtime_config_file is None and agent_definition_file is None:
         raise click.ClickException("--runtime-config-file or --agent-definition-file is required")
     config_file = runtime_config_file or agent_definition_file
     assert config_file is not None
     try:
-        payload = json.loads(config_file.read_text(encoding="utf-8"))
+        payload = loads_json_ingress(config_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"invalid agent config JSON: {exc.msg}") from exc
     try:
@@ -1222,7 +1380,7 @@ def _load_permission_policy(
     policy = PermissionPolicy()
     if policy_file is not None:
         try:
-            payload = json.loads(policy_file.read_text(encoding="utf-8"))
+            payload = loads_json_ingress(policy_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid permission policy JSON: {exc.msg}") from exc
         policy = PermissionPolicy.from_json(payload)
@@ -1258,7 +1416,9 @@ def _append_package_event_if_run_dir(
         append_event_to_run(source.resolve(), event_type, data=data, level=level)
 
 
-def _proposal_file_payload(run_dir: Path, proposal: dict[str, Any], file_path: str) -> dict[str, Any]:
+def _proposal_file_payload(
+    run_dir: Path, proposal: dict[str, Any], file_path: str
+) -> dict[str, Any]:
     try:
         return read_proposal_file_payload(run_dir, proposal, file_path)
     except ProposalFileError as exc:
@@ -1267,7 +1427,7 @@ def _proposal_file_payload(run_dir: Path, proposal: dict[str, Any], file_path: s
 
 def _compact_event_line(line: str) -> str:
     try:
-        event = json.loads(line)
+        event = loads_json_ingress(line)
     except json.JSONDecodeError:
         return line.rstrip("\n")
     # Tool activity goes through the shared narration projection (the same one the Studio feed

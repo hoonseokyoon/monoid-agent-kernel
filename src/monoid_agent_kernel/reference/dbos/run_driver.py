@@ -24,6 +24,7 @@ from monoid_agent_kernel.core.checkpoint import (
     RunCheckpoint,
     load_latest_checked,
 )
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number
 from monoid_agent_kernel.core.lifecycle import state_from_suspension
 from monoid_agent_kernel.core.result import (
     Suspension,
@@ -153,6 +154,9 @@ class DbosResumeCommand:
             or self.checkpoint_seq < 1
         ):
             raise ValueError("checkpoint_seq must be a positive integer")
+        if not is_finite_json_number(self.created_at):
+            raise ValueError("created_at must be a finite number")
+        object.__setattr__(self, "created_at", float(self.created_at))
 
     @property
     def identity_sha256(self) -> str:
@@ -189,7 +193,7 @@ class DbosResumeCommand:
             run_id=str(payload.get("run_id") or ""),
             command_id=str(payload.get("command_id") or ""),
             checkpoint_seq=checkpoint_seq,
-            created_at=float(payload.get("created_at") or 0.0),
+            created_at=payload.get("created_at", 0.0),  # type: ignore[arg-type]
         )
         recorded_identity = str(payload.get("identity_sha256") or "")
         if recorded_identity and recorded_identity != command.identity_sha256:
@@ -431,9 +435,7 @@ class DbosRunDriver:
     def _preflight_queue_configuration(self) -> None:
         from sqlalchemy.exc import DBAPIError
 
-        client = self._dbos_module.DBOSClient(
-            system_database_url=self.config.system_database_url
-        )
+        client = self._dbos_module.DBOSClient(system_database_url=self.config.system_database_url)
         try:
             try:
                 queue = self._register_run_queue(client)
@@ -463,9 +465,10 @@ class DbosRunDriver:
             if not self._accepting:
                 raise RuntimeError("DBOS run driver is not accepting commands")
             workflow_id = self.workflow_id(command.run_id, command.command_id)
-            with self._dbos_module.SetWorkflowID(
-                workflow_id
-            ), self._dbos_module.SetEnqueueOptions(queue_partition_key=command.run_id):
+            with (
+                self._dbos_module.SetWorkflowID(workflow_id),
+                self._dbos_module.SetEnqueueOptions(queue_partition_key=command.run_id),
+            ):
                 handle = self._runtime.enqueue_workflow(
                     self._queue_name,
                     self._workflow,
@@ -726,10 +729,7 @@ class DbosRunDriver:
         observed = loaded.value.checkpoint
         if observed.seq < outgoing.seq:
             return None
-        if (
-            observed.seq == outgoing.seq
-            and canonical_sha256(observed.to_json()) == expected_sha256
-        ):
+        if observed.seq == outgoing.seq and canonical_sha256(observed.to_json()) == expected_sha256:
             return observed
         raise NativeAgentError(
             "resume checkpoint lost ownership before commit verification",

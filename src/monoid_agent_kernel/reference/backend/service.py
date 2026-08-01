@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
+from monoid_agent_kernel._runtime_config_ingress import normalize_runtime_config
 from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     SubagentDefinition,
@@ -29,6 +30,7 @@ from monoid_agent_kernel.core.durable_metadata import (
 from monoid_agent_kernel.core.capability import CapabilityBroker
 from monoid_agent_kernel.core.context import ContextProvider
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
+from monoid_agent_kernel.core.model_io import ModelIOSubscription
 from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
@@ -37,6 +39,11 @@ from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointRecord,
@@ -71,9 +78,12 @@ from monoid_agent_kernel.reference.command_inbox import (
     InMemoryCommandStore,
     StoredCommand,
     redact_command_credential,
-    sanitize_command_data,
+    sanitize_command_args,
 )
-from monoid_agent_kernel.reference.backend.commands import BackendCommandContext, BackendCommandService
+from monoid_agent_kernel.reference.backend.commands import (
+    BackendCommandContext,
+    BackendCommandService,
+)
 from monoid_agent_kernel.reference.backend.jobs import JobService, JobServiceContext
 from monoid_agent_kernel.reference.backend.loop_factory import (
     BackendLoopBuild,
@@ -95,7 +105,10 @@ from monoid_agent_kernel.reference.backend.projection import (
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
 from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
-from monoid_agent_kernel.reference.backend.runtime_config import RuntimeConfigContext, RuntimeConfigService
+from monoid_agent_kernel.reference.backend.runtime_config import (
+    RuntimeConfigContext,
+    RuntimeConfigService,
+)
 from monoid_agent_kernel.reference.backend.run_execution import (
     RunExecutionContext,
     RunExecutionService,
@@ -116,6 +129,7 @@ from monoid_agent_kernel.reference.backend.run_types import (
     BackendRunRequest,
     BackendRunSubmission,
     _PreparedRun,
+    normalize_backend_run_request,
 )
 from monoid_agent_kernel.reference.backend.session import (
     BackendSessionContext,
@@ -145,6 +159,7 @@ _ACCEPTED_RUN_META_SCHEMA_VERSIONS = ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS
 _RUN_EVENT_SEQUENCER = RunEventSequencer()
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
+_CONTROL_CONFIG_SENTINEL = object()
 
 
 def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
@@ -154,6 +169,82 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any] | None:
 
 def _validate_run_meta(payload: Any) -> dict[str, Any] | None:
     return validate_run_metadata(payload)
+
+
+def _control_text(value: Any, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a string")
+    return normalize_unicode_scalars(value)
+
+
+def _validate_control_operational_args(command_type: str, args: dict[str, Any]) -> None:
+    token = args.get("token", "")
+    if type(token) is not str:
+        raise ValueError("control command token must be a string")
+
+    text_fields: tuple[str, ...] = ()
+    object_fields: tuple[str, ...] = ()
+    if command_type in {"approve", "deny"}:
+        text_fields = ("task_id", "answer", "reason", "status")
+        object_fields = ("result",)
+    elif command_type == "create_task":
+        text_fields = ("kind",)
+        object_fields = ("request",)
+    elif command_type == "report_task_result":
+        text_fields = ("task_id", "status")
+        object_fields = ("result",)
+
+    for field_name in text_fields:
+        if field_name in args and type(args[field_name]) is not str:
+            raise ValueError(f"control command {field_name} must be a string")
+    for field_name in object_fields:
+        if field_name in args and not isinstance(args[field_name], dict):
+            raise ValueError(f"control command {field_name} must be an object")
+
+    if command_type == "replace_runtime_config" and "expected_version" in args:
+        if type(args["expected_version"]) is not int:
+            raise ValueError("control command expected_version must be an integer")
+    if command_type == "revoke_capability":
+        for field_name in ("capability", "lease_id"):
+            value = args.get(field_name)
+            if value is not None and type(value) is not str:
+                raise ValueError(f"control command {field_name} must be a string or null")
+        if args.get("before") is not None:
+            before = args["before"]
+            if not is_finite_json_number(before):
+                raise ValueError("control command before must be a finite number or null")
+
+
+def _normalize_control_command_ingress(command: ControlCommand) -> ControlCommand:
+    """Canonicalize a direct control command before authorization and durable identity."""
+
+    if not isinstance(command, ControlCommand):
+        raise ValueError("command must be a ControlCommand")
+    command_type = _control_text(command.type, "control command type")
+    if not isinstance(command.args, dict):
+        raise ValueError("control command args must be an object")
+
+    raw_args = dict(command.args)
+    _validate_control_operational_args(command_type, raw_args)
+    raw_config = (
+        raw_args.pop("config", _CONTROL_CONFIG_SENTINEL)
+        if command_type == "replace_runtime_config"
+        else _CONTROL_CONFIG_SENTINEL
+    )
+    args = normalize_json_ingress(raw_args)
+    if not isinstance(args, dict):
+        raise ValueError("control command args must be an object")
+    if raw_config is not _CONTROL_CONFIG_SENTINEL:
+        args["config"] = raw_config
+    return replace(
+        command,
+        type=command_type,  # type: ignore[arg-type]
+        run_id=_control_text(command.run_id, "control command run_id"),
+        args=args,
+        issuer=_control_text(command.issuer, "control command issuer"),
+        reason=_control_text(command.reason, "control command reason"),
+        command_id=_control_text(command.command_id, "control command command_id"),
+    )
 
 
 def _backend_builtin_tool_specs(
@@ -211,6 +302,7 @@ def _teardown_loop(
     if loop.is_closed():
         return
     if loop.is_running():
+
         async def _cancel_pending_tasks() -> None:
             pending = [
                 task
@@ -300,6 +392,9 @@ class RunnerBackend:
     # uses to attach observability without a core dep — e.g. studio sets ``(OtelEventSink,)`` when
     # OTel is toggled on. Read at loop-build time so it can change at runtime. Empty → no deps.
     extra_event_sink_factories: tuple[Callable[[], EventSink], ...] = ()
+    # Per-run model-I/O subscriptions. Factories must return ownership-unique observers because
+    # AgentLoop closes each activation's instances at its terminal/release/discard boundary.
+    model_io_subscription_factories: tuple[Callable[[], ModelIOSubscription], ...] = ()
     # Tool/context providers attached to every run the backend builds (Skills, MCP, custom).
     # The embedder-facing seam for the loop's tool_providers/context_providers (the CLI passes
     # these to AgentLoop directly; without these fields an out-of-process embedder could not
@@ -486,6 +581,9 @@ class RunnerBackend:
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 emit_output_deltas_provider=lambda: self.emit_output_deltas,
                 extra_event_sink_factories_provider=lambda: self.extra_event_sink_factories,
+                model_io_subscription_factories_provider=lambda: (
+                    self.model_io_subscription_factories
+                ),
                 subagent_definitions_provider=lambda: self.subagent_definitions,
                 tool_providers_provider=lambda: self.tool_providers,
                 context_providers_provider=lambda: self.context_providers,
@@ -574,6 +672,7 @@ class RunnerBackend:
                 issue_web_gateway_token=self._issue_recovery_web_gateway_token,
                 build_loop=self._build_loop_build,
                 register_record=self._register_recovered_record,
+                unregister_record=self._unregister_recovered_record,
                 attach_loop=self._attach_loop_build,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 spawn=self._spawn,
@@ -713,7 +812,9 @@ class RunnerBackend:
         with self._lock:
             self._records[record.run_id] = record
 
-    def _recovery_request(self, meta: Mapping[str, Any], runtime_config: AgentRuntimeConfig) -> BackendRunRequest:
+    def _recovery_request(
+        self, meta: Mapping[str, Any], runtime_config: AgentRuntimeConfig
+    ) -> BackendRunRequest:
         limits = meta.get("limits") or {}
         return BackendRunRequest(
             tenant_id=str(meta["tenant_id"]),
@@ -726,7 +827,7 @@ class RunnerBackend:
             max_tool_calls=int(limits.get("max_tool_calls", 100)),
             max_bytes_read=int(limits.get("max_bytes_read", 1_000_000)),
             max_duration_s=limits.get("max_duration_s", 900),
-            permission_policy=PermissionPolicy.from_json(meta.get("permission_policy")),
+            permission_policy=PermissionPolicy.from_durable_json(meta.get("permission_policy")),
             runtime_config=runtime_config,
             multi_turn=bool(meta.get("multi_turn", False)),
         )
@@ -752,11 +853,17 @@ class RunnerBackend:
             created_at=time.time(),
             run_token_sha256="",
             llm_gateway_token_sha256=TokenManager.token_sha256(llm_gateway_token),
-            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token) if web_gateway_token else "",
+            web_gateway_token_sha256=TokenManager.token_sha256(web_gateway_token)
+            if web_gateway_token
+            else "",
             runtime_config=runtime_config,
             runtime_config_issuer=str(meta.get("runtime_config_issuer") or "recover_runs"),
-            runtime_config_reason=str(meta.get("runtime_config_reason") or "resumed from checkpoint"),
-            runtime_config_committed_at=float(meta.get("runtime_config_committed_at") or time.time()),
+            runtime_config_reason=str(
+                meta.get("runtime_config_reason") or "resumed from checkpoint"
+            ),
+            runtime_config_committed_at=float(
+                meta.get("runtime_config_committed_at") or time.time()
+            ),
         )
 
     def _issue_recovery_llm_gateway_token(
@@ -793,8 +900,19 @@ class RunnerBackend:
             metadata={"agent_config_hash": runtime_config.config_hash},
         )
 
-    def _register_recovered_record(self, record: BackendRunRecord) -> None:
-        self._register_record(record)
+    def _register_recovered_record(self, record: BackendRunRecord) -> bool:
+        """Atomically claim one in-process activation for a recovered run id."""
+
+        with self._lock:
+            if record.run_id in self._records:
+                return False
+            self._records[record.run_id] = record
+            return True
+
+    def _unregister_recovered_record(self, record: BackendRunRecord) -> None:
+        with self._lock:
+            if self._records.get(record.run_id) is record:
+                self._records.pop(record.run_id, None)
 
     def _attach_loop_build(
         self,
@@ -859,7 +977,9 @@ class RunnerBackend:
             if record.message_queue.qsize() >= self.max_message_queue_depth:
                 raise ValueError("message queue is full; retry once the run drains it")
 
-    def _issue_task_callback_token(self, run_id: str, tenant_id: str, user_id: str, task_id: str) -> str:
+    def _issue_task_callback_token(
+        self, run_id: str, tenant_id: str, user_id: str, task_id: str
+    ) -> str:
         return self.token_manager.issue(
             kind="task_callback",
             audience=TASK_CALLBACK_AUDIENCE,
@@ -877,7 +997,9 @@ class RunnerBackend:
         if str(claims.metadata.get("task_id") or "") != task_id:
             raise PermissionDenied("callback token does not match this task")
         record = self._active_record(run_id)
-        if record is not None and (claims.tenant_id != record.tenant_id or claims.user_id != record.user_id):
+        if record is not None and (
+            claims.tenant_id != record.tenant_id or claims.user_id != record.user_id
+        ):
             raise PermissionDenied("token subject mismatch")
 
     # --- Shared event loop (coroutine-per-run) ------------------------------------------
@@ -977,6 +1099,7 @@ class RunnerBackend:
         return pending
 
     def submit_run(self, request: BackendRunRequest) -> BackendRunSubmission:
+        request = normalize_backend_run_request(request)
         prepared = self._prepare_run_record(request)
         # Run executes as a coroutine on the shared loop (coroutine-per-run), not a thread.
         self._spawn(
@@ -1051,14 +1174,23 @@ class RunnerBackend:
         )
 
     def dispatch(self, command: ControlCommand) -> ControlResult:
-        return self._commands.dispatch(command)
+        return self._commands.dispatch(_normalize_control_command_ingress(command))
 
     def enqueue_control(self, command: ControlCommand) -> CommandReceipt:
         """Authenticate, sanitize, and durably enqueue one idempotent command."""
 
+        command = _normalize_control_command_ingress(command)
         args = dict(command.args)
-        token = str(args.pop("token", "") or "")
+        token = args.pop("token", "")
+        assert isinstance(token, str)
         principal = self._authorize_command_principal(command, args=args, token=token)
+        if command.type == "replace_runtime_config":
+            # This is the fresh operator boundary. Stored v1 commands have a separate compatibility
+            # decoder when claimed, so a new ambiguous bare ``!`` never acquires legacy meaning.
+            parsed_config = normalize_runtime_config(
+                AgentRuntimeConfig.from_json(args.get("config"))
+            )
+            args["config"] = parsed_config.to_json()
         with self._lock:
             locally_owned = command.run_id in self._records
         if command.type == "create_task" and not locally_owned:
@@ -1089,7 +1221,7 @@ class RunnerBackend:
         # storage gets a second bearer pass after JSON coercion because bytes/custom objects become
         # repr strings and can reintroduce the authenticated credential.
         stored_args = dict(
-            redact_command_credential(sanitize_command_data(execution_args), token)
+            redact_command_credential(sanitize_command_args(command.type, execution_args), token)
         )
         stored_command = StoredCommand(
             run_id=command.run_id,
@@ -1154,9 +1286,7 @@ class RunnerBackend:
                 record = self._records.get(command.run_id)
             if record is not None:
                 return CommandPrincipal(record.tenant_id, record.user_id, command.issuer)
-            metadata = self._read_recovery_meta(
-                self.run_root / command.run_id, command.run_id
-            )
+            metadata = self._read_recovery_meta(self.run_root / command.run_id, command.run_id)
             if metadata is None:
                 raise KeyError(command.run_id)
             try:
@@ -1173,10 +1303,9 @@ class RunnerBackend:
                     )
                 except TokenError as exc:
                     raise PermissionDenied(str(exc)) from exc
-            if (
-                authenticated_claims.tenant_id != str(metadata.get("tenant_id") or "")
-                or authenticated_claims.user_id != str(metadata.get("user_id") or "")
-            ):
+            if authenticated_claims.tenant_id != str(
+                metadata.get("tenant_id") or ""
+            ) or authenticated_claims.user_id != str(metadata.get("user_id") or ""):
                 raise PermissionDenied("token subject mismatch")
             return CommandPrincipal(
                 str(metadata.get("tenant_id") or ""),
@@ -1276,9 +1405,7 @@ class RunnerBackend:
                         error=str(exc),
                         error_code=getattr(exc, "error_code", "command_execution_error"),
                     )
-                self.command_store.acknowledge(
-                    run_id, stored.command_id, self._worker_id, result
-                )
+                self.command_store.acknowledge(run_id, stored.command_id, self._worker_id, result)
                 completed[stored.command_id] = result
 
     def _command_drain_lock(self, run_id: str) -> threading.RLock:
@@ -1517,9 +1644,7 @@ class RunnerBackend:
 
         cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
         return EventSubscription(
-            lambda next_seq, limit: self.events(
-                run_id, token, from_seq=next_seq, limit=limit
-            ),
+            lambda next_seq, limit: self.events(run_id, token, from_seq=next_seq, limit=limit),
             cursor=cursor,
             read_lifecycle=lambda: self.status(run_id, token),
         )
@@ -1544,9 +1669,7 @@ class RunnerBackend:
             limit=limit,
         )
 
-    def descendant_status(
-        self, run_id: str, token: str, descendant_run_id: str
-    ) -> dict[str, Any]:
+    def descendant_status(self, run_id: str, token: str, descendant_run_id: str) -> dict[str, Any]:
         return self._projection.descendant_status(run_id, token, descendant_run_id)
 
     def subscribe_descendant_events(
@@ -1570,9 +1693,7 @@ class RunnerBackend:
                 limit=limit,
             ),
             cursor=cursor,
-            read_lifecycle=lambda: self.descendant_status(
-                run_id, token, descendant_run_id
-            ),
+            read_lifecycle=lambda: self.descendant_status(run_id, token, descendant_run_id),
         )
 
     def jobs(self, run_id: str, token: str) -> dict[str, Any]:
@@ -1618,7 +1739,9 @@ class RunnerBackend:
             time.sleep(0.05)
         raise TimeoutError(f"run did not finish before timeout: {run_id}")
 
-    async def _drive_session(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> AgentRunResult:
+    async def _drive_session(
+        self, run_id: str, request: BackendRunRequest, loop: AgentLoop
+    ) -> AgentRunResult:
         return await self._run_execution.drive_session(run_id, request, loop)
 
     async def _drive_open_session(
@@ -1757,6 +1880,7 @@ class RunnerBackend:
         hosted-task park is surfaced in the result frame and then closed (HITL-over-stream is
         deferred), so this never leaves a resumable run dangling.
         """
+        request = normalize_backend_run_request(request)
         prepared = self._prepare_run_record(request)
         async for frame in self._run_execution.stream_prepared(prepared, request):
             yield frame
@@ -1926,7 +2050,9 @@ class RunnerBackend:
     def _resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> None:
         self._recovery.resume_from_checkpoint(stored, meta)
 
-    async def _run_recovered(self, run_id: str, request: BackendRunRequest, loop: AgentLoop) -> None:
+    async def _run_recovered(
+        self, run_id: str, request: BackendRunRequest, loop: AgentLoop
+    ) -> None:
         await self._recovery.run_recovered(run_id, request, loop)
 
     def _llm_token_source(

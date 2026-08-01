@@ -34,6 +34,25 @@ def test_echo_adapter_replies_with_latest_user_text() -> None:
     assert turn.usage["total_tokens"] > 0
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_studio_rejects_non_finite_json_constants(studio: StudioServer, constant: str) -> None:
+    import urllib.error
+    import urllib.request
+
+    body = f'{{"message":"hello","value":{constant}}}'.encode()
+    request = urllib.request.Request(
+        f"{studio.base_url}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(request)
+
+    assert caught.value.code == 400
+
+
 def test_vendor_route_serves_katex_offline(studio: StudioServer) -> None:
     import urllib.error
     import urllib.request
@@ -91,6 +110,8 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "profile-switcher",
         "profile-editor-popup",
         "chat-log",
+        "transcript-event-log-error",
+        "Studio returned an unsupported or malformed chat transcript response.",
         "composer",
         "right-panel-tabs",
         "settings-config-popup",
@@ -99,6 +120,7 @@ def test_index_serves_compiled_svelte_shell_and_assets(studio: StudioServer) -> 
         "/api/proposal-file-raw",
         "Starting delegated work",
         "Previewed from the proposal snapshot",
+        "command_preview",
     ):
         assert hook in javascript
 
@@ -132,7 +154,9 @@ def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     run_root = tmp_path / "runs"
-    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root)
+    )
 
     saved = server.save_profile(
         {
@@ -150,7 +174,9 @@ def test_studio_profiles_can_be_saved_and_reloaded(tmp_path: Path) -> None:
     assert saved["capabilities"] == ["read", "web"]
     assert saved["built_in"] is False
 
-    reloaded = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root))
+    reloaded = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=run_root)
+    )
     profiles = {profile["id"]: profile for profile in reloaded.profiles()["profiles"]}
     assert profiles["release-reviewer"]["instructions"] == "Always call out release blockers."
     assert profiles["release-reviewer"]["model"] == "gpt-profile"
@@ -196,7 +222,9 @@ def test_studio_start_chat_uses_selected_profile_runtime_config(tmp_path: Path) 
 def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    server = StudioServer(StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs"))
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
     server.start()
     try:
         profile = server.save_profile(
@@ -232,7 +260,9 @@ def test_studio_settings_hot_swap_preserves_run_profiles(tmp_path: Path) -> None
         server._backend.replace_runtime_config = replace_runtime_config  # type: ignore[method-assign]
 
         all_caps = [item["key"] for item in server.settings()["available"]]
-        server.update_settings(capabilities=all_caps, model="gpt-global", effort="low", summary="auto")
+        server.update_settings(
+            capabilities=all_caps, model="gpt-global", effort="low", summary="auto"
+        )
 
         profile_config = replaced["profile-run"]
         default_config = replaced["default-run"]
@@ -305,9 +335,7 @@ def test_subagent_events_uses_root_ancestor_token_for_nested_child(tmp_path: Pat
             from_seq: int = 0,
             last_event_id: str | None = None,
         ) -> EventSubscription:
-            cursor = SequenceCursor.resolve(
-                from_seq=from_seq, last_event_id=last_event_id
-            )
+            cursor = SequenceCursor.resolve(from_seq=from_seq, last_event_id=last_event_id)
             return EventSubscription(
                 lambda next_seq, limit: self.descendant_events(
                     parent_run_id,
@@ -352,7 +380,9 @@ def test_runtime_config_binds_read_write_hitl_shell_and_web() -> None:
     } <= refs
     # The plan tool is always bound (observability) and the prompt nudges its use.
     assert "run.update_plan" in refs
-    assert config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base
+    assert (
+        config.prompt.system_prompt_base and "run_update_plan" in config.prompt.system_prompt_base
+    )
     # The shell binding refuses obviously destructive commands and auto-approves the rest.
     shell = next(b for b in config.tools if b.ref.tool_id == "shell.exec")
     assert any(p.startswith("rm") for p in shell.scope.command_deny_prefixes)
@@ -369,7 +399,10 @@ def test_describe_event_maps_tool_activity_to_human_text() -> None:
     }
     assert describe_event(started) == "Reading notes.md"
     # A successful finish is implied by the next step — not shown.
-    assert describe_event({"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": True}}) is None
+    assert (
+        describe_event({"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": True}})
+        is None
+    )
     # A failure surfaces with its error.
     failed = describe_event(
         {"type": "tool.call.finished", "data": {"tool": "fs_read", "ok": False, "error": "boom"}}
@@ -387,6 +420,61 @@ def test_list_files_returns_workspace_tree(studio: StudioServer) -> None:
     paths = {entry["path"] for entry in studio.list_files()}
     assert "notes.md" in paths
     assert "sub/inner.txt" in paths
+
+
+def test_the_ui_still_gets_a_final_answer_with_the_delta_channel_switched_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill switch does not cost the answer.
+
+    Not "and nothing else" — that phrasing was corrected in four other places and survived here.
+    It also converts mid-turn interruption into step-boundary interruption, which
+    `tests/test_model_call_runner.py::test_interruption_is_mid_turn_only_while_something_consumes_deltas`
+    pins. What this test guards is narrower and is the thing an operator actually fears: that
+    switching the channel off leaves the completed answer reaching no surface at all.
+
+    Both halves of the switch are engaged at once — the config flag and the environment variable —
+    because they disable different things (Studio's gateway streaming, and the loop's delta emission
+    for a run and every subagent it spawns), and the failure being guarded against is the one where
+    the answer reaches no surface at all.
+
+    The assertion order is what makes this load-bearing rather than tautological: `events.jsonl` is
+    checked *first* to confirm the settled event on disk carries only a digest, so the text that then
+    arrives through `poll_events` can only have come from the projection's hydration seam
+    (`backend/projection.py` -> `hydrate_settled_text`), which is the step a reader looking at the
+    emit site alone would miss. Without the disk assertion this test would still pass if the event
+    simply carried the text inline, i.e. if this release's core change had been reverted.
+    """
+    monkeypatch.setenv("MONOID_OUTPUT_DELTAS", "0")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    answer = "Here is the complete answer the operator needs to see."
+    fake = FakeModelAdapter(turns=[ModelTurn(final_text=answer)])
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+            stream_output_deltas=False,
+        ),
+        provider_factory=lambda _claims, _config: fake,
+    )
+    server.start()
+    try:
+        run_id = server.start_chat("say something")["run_id"]
+        _wait_settled(server, run_id, 1)
+
+        raw = (server._run_dir_for(run_id) / "events.jsonl").read_text(encoding="utf-8")
+        assert answer not in raw, "the durable stream is supposed to carry a digest, not the text"
+        assert "model.output.delta" not in raw, "the switch did not switch anything off"
+
+        events = server.poll_events(run_id, 0).get("events", [])
+        settled = [event for event in events if event.get("type") == "turn.settled"]
+        assert settled, "no settled event reached the reducer"
+        assert settled[0]["data"]["final_text"] == answer
+    finally:
+        server.shutdown()
 
 
 def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
@@ -419,3 +507,32 @@ def test_agent_reads_a_file_and_emits_activity(tmp_path: Path) -> None:
         assert settled and "notes.md" in settled[0]["data"]["final_text"]
     finally:
         server.shutdown()
+
+
+def test_get_routes_answer_with_json_instead_of_dropping_the_connection(
+    studio: StudioServer,
+) -> None:
+    """`do_GET` had no exception handler while `do_POST` had one all along.
+
+    Anything a route did not anticipate reached `BaseHTTPRequestHandler`, which logs the traceback
+    and closes the socket with no status line -- the browser sees a network error rather than a
+    server error. `/api/job-logs` catches `NativeAgentError` only, and `read_job_log_text` raises
+    `KeyError` for a job that has no log file, so an unknown job id was enough to reach it.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    run_id = studio.start_chat("summarize the workspace")["run_id"]
+    _wait_settled(studio, run_id, 1)
+
+    url = f"{studio.base_url}/api/job-logs?run_id={run_id}&job_id=does-not-exist"
+    try:
+        urllib.request.urlopen(url)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 500
+        assert json.loads(exc.read().decode("utf-8")) == {"error": "internal error"}
+    except urllib.error.URLError as exc:  # pragma: no cover - the pre-fix behaviour
+        raise AssertionError(f"connection dropped instead of answering: {exc}") from exc
+    else:
+        raise AssertionError("an unknown job id should not read as success")

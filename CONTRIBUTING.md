@@ -21,7 +21,7 @@ Requires Python 3.11+. Frontend development uses the Node.js version pinned in
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-pip install ruff                                     # linter (configured in pyproject.toml)
+pip install ruff==0.15.6                             # linter (configured in pyproject.toml); CI pins the same version
 ```
 
 Activate the pinned Node.js version from the repository root before working on Studio UI:

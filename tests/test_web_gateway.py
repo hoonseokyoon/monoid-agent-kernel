@@ -331,11 +331,202 @@ def test_web_gateway_rejects_signed_binding_and_numeric_escalation() -> None:
     with pytest.raises(Exception, match="binding_id exceeds signed token scope"):
         gateway.handle_search(token, {"binding_id": "other", "query": "binding"})
     with pytest.raises(Exception, match="max_calls must be positive"):
-        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_calls": 0})
+        gateway.handle_search(
+            token, {"binding_id": "search_docs", "query": "binding", "max_calls": 0}
+        )
     with pytest.raises(Exception, match="max_results exceeds signed token scope"):
-        gateway.handle_search(token, {"binding_id": "search_docs", "query": "binding", "max_results": 2})
+        gateway.handle_search(
+            token, {"binding_id": "search_docs", "query": "binding", "max_results": 2}
+        )
 
     assert provider.search_calls == 0
+
+
+def test_web_gateway_normalizes_direct_python_requests_before_provider_calls() -> None:
+    class ObservingProvider:
+        search_request: tuple[str, int] | None = None
+        fetch_request: dict[str, Any] | None = None
+        context_request: dict[str, Any] | None = None
+
+        def search(self, query: str, *, max_results: int) -> list[dict[str, Any]]:
+            self.search_request = (query, max_results)
+            return []
+
+        def fetch(
+            self,
+            url: str,
+            *,
+            format: str,
+            allowed_domains: tuple[str, ...] = (),
+            blocked_domains: tuple[str, ...] = (),
+            timeout_s: int | None = None,
+            max_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            self.fetch_request = {
+                "url": url,
+                "format": format,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+                "timeout_s": timeout_s,
+                "max_bytes": max_bytes,
+            }
+            return {
+                "final_url": url,
+                "title": "observed",
+                "content": "content",
+                "source": "test",
+            }
+
+        def context(
+            self,
+            query: str,
+            *,
+            max_tokens: int,
+            max_urls: int,
+            max_snippets: int,
+            locale: str | None,
+            freshness: str | None,
+            allowed_domains: tuple[str, ...],
+            blocked_domains: tuple[str, ...],
+        ) -> dict[str, Any]:
+            self.context_request = {
+                "query": query,
+                "max_tokens": max_tokens,
+                "max_urls": max_urls,
+                "max_snippets": max_snippets,
+                "locale": locale,
+                "freshness": freshness,
+                "allowed_domains": allowed_domains,
+                "blocked_domains": blocked_domains,
+            }
+            return {"context": "", "sources": [], "chunks": [], "source": "test"}
+
+    manager = _token_manager()
+    provider = ObservingProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+    token = _web_token(manager)
+    surrogate = chr(0xD800)
+
+    search = gateway.handle_search(
+        token,
+        {
+            "query": f"query{surrogate}",
+            "max_results": 2,
+            "extension": {"score": float("nan"), "text": f"open{surrogate}"},
+        },
+    )
+    fetched = gateway.handle_fetch(
+        token,
+        {
+            "url": f"https://docs.example.test/page{surrogate}",
+            "format": f"text{surrogate}",
+            "allowed_domains": ["docs.example.test"],
+            "blocked_domains": [f"blocked{surrogate}.example.test"],
+        },
+    )
+    context = gateway.handle_context(
+        token,
+        {
+            "query": f"context{surrogate}",
+            "locale": f"en{surrogate}",
+            "freshness": f"pd{surrogate}",
+            "blocked_domains": [f"blocked{surrogate}.example.test"],
+        },
+    )
+
+    assert provider.search_request == ("query�", 2)
+    assert provider.fetch_request == {
+        "url": "https://docs.example.test/page�",
+        "format": "text�",
+        "allowed_domains": ("docs.example.test",),
+        "blocked_domains": ("blocked�.example.test",),
+        "timeout_s": 30,
+        "max_bytes": 100_000,
+    }
+    assert provider.context_request == {
+        "query": "context�",
+        "max_tokens": 8_192,
+        "max_urls": 8,
+        "max_snippets": 50,
+        "locale": "en�",
+        "freshness": "pd�",
+        "allowed_domains": (),
+        "blocked_domains": ("blocked�.example.test",),
+    }
+    assert search["query"] == "query�"
+    assert fetched["url"] == "https://docs.example.test/page�"
+    assert fetched["format"] == "text�"
+    assert context["query"] == "context�"
+    json.dumps(
+        {"search": search, "fetch": fetched, "context": context},
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("method_name", "payload", "error"),
+    [
+        (
+            "handle_search",
+            {"query": "q", "max_results": float("nan")},
+            "max_results must be finite",
+        ),
+        ("handle_search", {"query": "q", "max_results": True}, "max_results must be an integer"),
+        ("handle_search", {"query": "q", "max_results": 1.0}, "max_results must be an integer"),
+        ("handle_search", {"query": "q", "max_results": 0}, "max_results must be positive"),
+        (
+            "handle_fetch",
+            {"url": "https://docs.example.test", "timeout_s": float("inf")},
+            "timeout_s must be finite",
+        ),
+        (
+            "handle_fetch",
+            {"url": "https://docs.example.test", "max_bytes": "1"},
+            "max_bytes must be an integer",
+        ),
+        (
+            "handle_context",
+            {"query": "q", "max_tokens": float("-inf")},
+            "max_tokens must be finite",
+        ),
+        ("handle_context", {"query": "q", "max_urls": False}, "max_urls must be an integer"),
+        ("handle_context", {"query": "q", "max_snippets": 0}, "max_snippets must be positive"),
+        ("handle_context", {"query": "q", "recency_days": 0}, "recency_days must be positive"),
+        ("handle_search", {"query": "q", "max_calls": -1}, "max_calls must be non-negative"),
+        (
+            "handle_fetch",
+            {"url": "https://docs.example.test", "max_calls": float("nan")},
+            "max_calls must be finite",
+        ),
+    ],
+)
+def test_web_gateway_rejects_malformed_direct_numeric_controls_before_side_effects(
+    method_name: str,
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    manager = _token_manager()
+    provider = _CountingWebProvider()
+    gateway = WebGatewayBackend(token_manager=manager, provider=provider)
+
+    with pytest.raises(ValueError, match=error):
+        getattr(gateway, method_name)(_web_token(manager), payload)
+
+    assert provider.search_calls == 0
+    assert provider.fetch_calls == 0
+    assert provider.context_calls == 0
+    assert gateway.tenant_usage("tenant_a") == {
+        "tenant_id": "tenant_a",
+        "search_calls": 0,
+        "fetch_calls": 0,
+        "context_calls": 0,
+        "failed_calls": 0,
+        "result_count": 0,
+        "context_source_count": 0,
+        "bytes_returned": 0,
+        "context_bytes_returned": 0,
+    }
 
 
 def test_web_gateway_client_retries_transient_connection_error(monkeypatch) -> None:
@@ -399,7 +590,9 @@ def test_web_gateway_http_client_and_usage() -> None:
         client = WebGatewayClient(base_url, token=_web_token(manager))
         search = client.search({"binding_id": "search_docs", "query": "binding", "max_results": 1})
         assert search["result_count"] == 1
-        fetched = client.fetch({"binding_id": "fetch_docs", "url": search["results"][0]["url"], "max_bytes": 80})
+        fetched = client.fetch(
+            {"binding_id": "fetch_docs", "url": search["results"][0]["url"], "max_bytes": 80}
+        )
         assert "content" in fetched
         usage = _json_get(f"{base_url}/internal/web/tenants/tenant_a/usage", token="admin")
         assert usage["search_calls"] == 1
@@ -426,25 +619,43 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
             turns=[
                 ModelTurn(
                     response_id="r1",
-                    tool_calls=(fake_tool_call("web_search", {"query": secret_query, "max_results": 1}, "search_1"),),
+                    tool_calls=(
+                        fake_tool_call(
+                            "web_search", {"query": secret_query, "max_results": 1}, "search_1"
+                        ),
+                    ),
                 ),
                 ModelTurn(
                     response_id="r2",
                     tool_calls=(
                         fake_tool_call(
                             "web_fetch",
-                            {"url": "https://docs.example.test/monoid-agent-kernel/web", "max_bytes": 120},
+                            {
+                                "url": "https://docs.example.test/monoid-agent-kernel/web",
+                                "max_bytes": 120,
+                            },
                             "fetch_1",
                         ),
                     ),
                 ),
-                ModelTurn(response_id="r3", tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "finish_1"),)),
+                ModelTurn(
+                    response_id="r3",
+                    tool_calls=(fake_tool_call("run_finish", {"summary": "done"}, "finish_1"),),
+                ),
             ]
         )
         config = runtime_config(
             bindings=(
-                tool_binding("web.search", scope=ToolScope(allowed_domains=("docs.example.test",)), runtime={"web": {"max_calls": 2}}),
-                tool_binding("web.fetch", scope=ToolScope(allowed_domains=("docs.example.test",)), runtime={"web": {"max_calls": 2}}),
+                tool_binding(
+                    "web.search",
+                    scope=ToolScope(allowed_domains=("docs.example.test",)),
+                    runtime={"web": {"max_calls": 2}},
+                ),
+                tool_binding(
+                    "web.fetch",
+                    scope=ToolScope(allowed_domains=("docs.example.test",)),
+                    runtime={"web": {"max_calls": 2}},
+                ),
                 tool_binding("run.finish"),
             )
         )
@@ -458,7 +669,9 @@ def test_agent_loop_web_bindings_events_metrics_and_private_transcript(tmp_path:
             spec=spec,
             model_adapter=adapter,
             runtime_config_provider=runtime_provider(config),
-            web_gateway_client=WebGatewayClient(base_url, token=_web_token(manager, run_id=spec.run_id)),
+            web_gateway_client=WebGatewayClient(
+                base_url, token=_web_token(manager, run_id=spec.run_id)
+            ),
         ).run_once("Use web.")
 
         assert result.status == "completed"
@@ -489,7 +702,9 @@ def test_web_providers_contract() -> None:
         provider = CompositeWebProvider(
             search_provider=search_provider,
             fetch_provider=fetch_provider,
-            context_provider=SearchFetchContextProvider(search_provider=search_provider, fetch_provider=fetch_provider),
+            context_provider=SearchFetchContextProvider(
+                search_provider=search_provider, fetch_provider=fetch_provider
+            ),
         )
         gateway = WebGatewayBackend(token_manager=_token_manager(), provider=provider)
         token = _web_token(gateway.token_manager)
@@ -503,11 +718,19 @@ def test_web_providers_contract() -> None:
             },
         )
         assert search["result_count"] == 1
-        fetched = gateway.handle_fetch(token, {"binding_id": "fetch", "url": search["results"][0]["url"], "format": "text"})
+        fetched = gateway.handle_fetch(
+            token, {"binding_id": "fetch", "url": search["results"][0]["url"], "format": "text"}
+        )
         assert "Brave search result body" in fetched["content"]
         context = gateway.handle_context(
             token,
-            {"binding_id": "context", "query": "native agent", "max_tokens": 1024, "max_urls": 1, "allowed_domains": ["127.0.0.1"]},
+            {
+                "binding_id": "context",
+                "query": "native agent",
+                "max_tokens": 1024,
+                "max_urls": 1,
+                "allowed_domains": ["127.0.0.1"],
+            },
         )
         assert "Brave search result body" in context["context"]
     finally:
@@ -576,9 +799,13 @@ def test_brave_llm_context_provider_contract() -> None:
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not os.environ.get("BRAVE_SEARCH_API_KEY"), reason="BRAVE_SEARCH_API_KEY is required")
+@pytest.mark.skipif(
+    not os.environ.get("BRAVE_SEARCH_API_KEY"), reason="BRAVE_SEARCH_API_KEY is required"
+)
 def test_brave_search_provider_live_smoke() -> None:
-    assert BraveSearchProvider.from_env(timeout_s=10).search("monoid agent kernel web tools", max_results=2)
+    assert BraveSearchProvider.from_env(timeout_s=10).search(
+        "monoid agent kernel web tools", max_results=2
+    )
 
 
 def _json_post(url: str, payload: dict, *, token: str | None = None) -> dict:
@@ -640,7 +867,12 @@ class _FakeUpstreamServer:
                     self._write_json(
                         {
                             "context": "LLM-ready Brave context for Monoid Agent Kernel.",
-                            "sources": [{"title": "Monoid Docs", "url": "https://docs.example.test/monoid-agent-kernel/web"}],
+                            "sources": [
+                                {
+                                    "title": "Monoid Docs",
+                                    "url": "https://docs.example.test/monoid-agent-kernel/web",
+                                }
+                            ],
                             "chunks": [
                                 {
                                     "title": "Monoid Docs",
