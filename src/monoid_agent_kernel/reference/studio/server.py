@@ -118,6 +118,8 @@ _MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflati
 _TENANT = "studio"
 _USER = "local"
 STUDIO_MODEL_CONTENT_SCHEMA_VERSION = "studio.model-content.v1"
+STUDIO_TRACE_EXPORT_SCHEMA_VERSION = "studio.trace-export.v1"
+STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION = "studio.trace-export.compact.v1"
 
 
 def _active_model_turn_ids(run_dir: Path) -> frozenset[str]:

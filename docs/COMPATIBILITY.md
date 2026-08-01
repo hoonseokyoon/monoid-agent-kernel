@@ -74,6 +74,8 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v2` | strict | `studio.chat.v1`<br>`studio.chat.v2` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
+| `studio-trace-export` | reference | `studio.trace-export.v1` | writer-only | None (writer-only) |
+| `studio-trace-export-compact` | reference | `studio.trace-export.compact.v1` | writer-only | None (writer-only) |
 | `studio-model-content` | reference | `studio.model-content.v1` | strict | `studio.model-content.v1` |
 <!-- compatibility-registry:end -->
 

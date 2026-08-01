@@ -433,6 +433,29 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         ),
     ),
     CompatibilityArtifact(
+        key="studio-trace-export",
+        kind="reference",
+        current_writer="studio.trace-export.v1",
+        supported_readers=(),
+        namespace_aliases=(),
+        reader_policy="writer-only",
+        source=("reference/studio/server.py:STUDIO_TRACE_EXPORT_SCHEMA_VERSION",),
+        notes="Raw Studio Trace download containing every source event in presentation order.",
+    ),
+    CompatibilityArtifact(
+        key="studio-trace-export-compact",
+        kind="reference",
+        current_writer="studio.trace-export.compact.v1",
+        supported_readers=(),
+        namespace_aliases=(),
+        reader_policy="writer-only",
+        source=("reference/studio/server.py:STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION",),
+        notes=(
+            "Operation-only Studio Trace download with source/omission counts and UTF-8 delta "
+            "text-byte totals."
+        ),
+    ),
+    CompatibilityArtifact(
         key="studio-model-content",
         kind="reference",
         current_writer="studio.model-content.v1",

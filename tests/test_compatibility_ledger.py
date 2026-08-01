@@ -67,7 +67,11 @@ from monoid_agent_kernel.reference.studio.chat_projection import (
     CHAT_SCHEMA_VERSION,
     SUPPORTED_CHAT_SCHEMA_VERSIONS,
 )
-from monoid_agent_kernel.reference.studio.server import STUDIO_MODEL_CONTENT_SCHEMA_VERSION
+from monoid_agent_kernel.reference.studio.server import (
+    STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
+    STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION,
+    STUDIO_TRACE_EXPORT_SCHEMA_VERSION,
+)
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     LEGACY_BACKEND_AUDIENCE,
@@ -86,7 +90,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 39
+    assert len(artifacts) == 41
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -137,6 +141,8 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "command-receipt": COMMAND_RECEIPT_VERSION,
         "studio-chat": CHAT_SCHEMA_VERSION,
         "studio-chat-message": CHAT_MESSAGE_SCHEMA_VERSION,
+        "studio-trace-export": STUDIO_TRACE_EXPORT_SCHEMA_VERSION,
+        "studio-trace-export-compact": STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION,
         "studio-model-content": STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
     }
 
@@ -146,6 +152,10 @@ def test_registry_matches_source_owned_version_constants() -> None:
     assert studio_chat.current_writer == CHAT_SCHEMA_VERSION
     assert studio_chat.supported_readers == SUPPORTED_CHAT_SCHEMA_VERSIONS
     assert studio_chat.supported_readers[0] == CHAT_SCHEMA_V1
+
+    trace_source = (ROOT / "studio-ui" / "src" / "lib" / "trace.ts").read_text(encoding="utf-8")
+    assert f'schema_version: "{STUDIO_TRACE_EXPORT_SCHEMA_VERSION}"' in trace_source
+    assert f'schema_version: "{STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION}"' in trace_source
 
 
 def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
