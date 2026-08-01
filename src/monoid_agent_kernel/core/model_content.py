@@ -9,11 +9,14 @@ independent recovery unit and reports an opened stream without a valid close as 
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TextIO, TypeAlias
+from typing import Any, BinaryIO, Literal, TextIO, TypeAlias
 
 from monoid_agent_kernel.core._util import utc_timestamp
 from monoid_agent_kernel.core.json_ingress import (
@@ -37,6 +40,13 @@ MODEL_CONTENT_SCHEMA_VERSION = namespaced_id("model-content.v1")
 MODEL_CONTENT_FILENAME = "model-content.jsonl"
 DEFAULT_MODEL_CONTENT_BATCH_INTERVAL_S = 0.25
 DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
+
+_ACTIVE_STORE_LOCK = threading.RLock()
+_ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
+# Revisions intentionally outlive registry membership. A store can be created, opened, closed, and
+# removed entirely between two snapshot probes; retaining one integer per touched sidecar makes
+# that full ABA visible to the second probe.
+_ACTIVE_STORE_EPOCHS: dict[str, int] = {}
 
 ModelContentSnapshotStatus: TypeAlias = Literal[
     "completed",
@@ -85,6 +95,24 @@ class ModelContentReadResult:
         object.__setattr__(self, "settled_texts", dict(self.settled_texts))
 
 
+@dataclass(frozen=True)
+class ModelContentFileIdentity:
+    """Stable identity for one verified sidecar inode."""
+
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class ActiveModelContentState:
+    """Process-local active writers and the sidecar descriptor they own."""
+
+    store_count: int = 0
+    stream_ids: frozenset[str] = frozenset()
+    file_identity: ModelContentFileIdentity | None = None
+    mutation_epoch: int = 0
+
+
 class ModelContentStore:
     """Best-effort observer that writes ``monoid.model-content.v1`` JSONL records.
 
@@ -118,28 +146,43 @@ class ModelContentStore:
         self._disabled = False
         self._closing = False
         self._closed = False
+        self._registry_key = _model_content_registry_key(path)
+        self._registry_ref: weakref.ReferenceType[ModelContentStore] = weakref.ref(
+            self,
+            lambda reference, key=self._registry_key: _remove_active_store(key, reference),
+        )
+        with _ACTIVE_STORE_LOCK:
+            _ACTIVE_STORES.setdefault(self._registry_key, set()).add(self._registry_ref)
+            _bump_active_store_epoch_locked(self._registry_key)
 
     def open(self, context: ModelStreamContext) -> ModelStreamWriter:
         with self._lock:
             if self._disabled or self._closing or self._closed:
                 return NOOP_MODEL_STREAM_WRITER
             writer = _ModelContentWriter(self, context)
+            persisted = self._append(
+                {
+                    "schema_version": MODEL_CONTENT_SCHEMA_VERSION,
+                    "kind": "stream_opened",
+                    "run_id": context.run_id,
+                    "root_run_id": context.root_run_id,
+                    "turn_id": context.turn_id,
+                    "stream_id": context.stream_id,
+                    "step": context.step,
+                    "provider": context.provider,
+                    "model": context.model,
+                    "started_at": context.started_at,
+                }
+            )
+            if not persisted:
+                return NOOP_MODEL_STREAM_WRITER
+            # Publish the process-local writer only after its opening record and descriptor are
+            # durable. active_state() can therefore never observe an active id without the exact
+            # sidecar identity that owns it.
             self._writers.add(writer)
-        self._append(
-            {
-                "schema_version": MODEL_CONTENT_SCHEMA_VERSION,
-                "kind": "stream_opened",
-                "run_id": context.run_id,
-                "root_run_id": context.root_run_id,
-                "turn_id": context.turn_id,
-                "stream_id": context.stream_id,
-                "step": context.step,
-                "provider": context.provider,
-                "model": context.model,
-                "started_at": context.started_at,
-            }
-        )
-        return writer
+            with _ACTIVE_STORE_LOCK:
+                _bump_active_store_epoch_locked(self._registry_key)
+            return writer
 
     def settled_text(self, text: str, digest: str, text_len: int) -> None:
         """Write one content-addressed settled result, retrying after a failed append."""
@@ -183,10 +226,104 @@ class ModelContentStore:
                 handle.close()
             except OSError:
                 pass
+        _remove_active_store(self._registry_key, self._registry_ref)
+
+    def flush(self) -> bool:
+        """Persist every currently buffered stream segment without closing its writer.
+
+        Studio uses this process-local coordination point before reset hydration. The private
+        sidecar observer runs before the live broker observer, so a reset visible to Studio has
+        already returned from the corresponding sidecar ``push``; flushing here commits that exact
+        prefix before the client accepts the reset cursor. ``False`` means the store could not
+        persist that prefix; callers must not advance a live cursor from a stale snapshot.
+        """
+
+        with self._lock:
+            if self._disabled:
+                return False
+            if self._closing or self._closed:
+                # A registry snapshot may race close after copying this store reference. It can no
+                # longer prove a live descriptor/path identity, so explicit hydration retries.
+                return False
+            if not self._handle_matches_path_locked():
+                self._disabled = True
+                return False
+            writers = tuple(self._writers)
+        for writer in writers:
+            writer._flush_pending()
+        with self._lock:
+            if self._disabled or not self._handle_matches_path_locked():
+                self._disabled = True
+                return False
+            return True
+
+    def active_stream_ids(self) -> frozenset[str]:
+        """Return stream ids with writers still owned by this live process-local store."""
+
+        try:
+            state = self.active_state()
+        except OSError:
+            return frozenset()
+        return frozenset() if state is None else state.stream_ids
+
+    def active_state(self) -> ActiveModelContentState | None:
+        """Return active writers tied to the currently named sidecar descriptor.
+
+        A regular-file replacement can leave this store writing a displaced inode. Such a handle
+        cannot establish that a pathname reader observes the same private prefix, so the store is
+        disabled and the active proof fails closed.
+        """
+
+        with self._lock:
+            if self._closing or self._closed:
+                return None
+            if self._disabled or not self._handle_matches_path_locked():
+                self._disabled = True
+                raise OSError("active model-content descriptor no longer matches its path")
+            stream_ids = frozenset(
+                writer._context.stream_id for writer in self._writers if not writer._closed
+            )
+            identity: ModelContentFileIdentity | None = None
+            if self._handle is not None:
+                try:
+                    identity = _file_identity(os.fstat(self._handle.fileno()))
+                except (OSError, ValueError) as exc:
+                    self._disabled = True
+                    raise OSError("active model-content descriptor is unavailable") from exc
+            if stream_ids and identity is None:
+                self._disabled = True
+                raise OSError("active model-content writer has no verified descriptor")
+            return ActiveModelContentState(
+                store_count=1,
+                stream_ids=stream_ids,
+                file_identity=identity,
+            )
+
+    def _handle_matches_path_locked(self) -> bool:
+        """Whether the active descriptor still names this run directory's single-link file."""
+
+        if self._handle is None:
+            return True
+        try:
+            opened = os.fstat(self._handle.fileno())
+            named = self.path.lstat()
+        except (OSError, ValueError):
+            return False
+        return (
+            stat.S_ISREG(opened.st_mode)
+            and stat.S_ISREG(named.st_mode)
+            and opened.st_nlink == 1
+            and named.st_nlink == 1
+            and os.path.samestat(opened, named)
+        )
 
     def _unregister(self, writer: _ModelContentWriter) -> None:
         with self._lock:
-            self._writers.discard(writer)
+            if writer not in self._writers:
+                return
+            self._writers.remove(writer)
+            with _ACTIVE_STORE_LOCK:
+                _bump_active_store_epoch_locked(self._registry_key)
 
     def _append(self, payload: dict[str, Any]) -> bool:
         try:
@@ -221,22 +358,41 @@ class ModelContentStore:
     def _ensure_handle_locked(self) -> TextIO | None:
         if self._handle is not None:
             return self._handle
+        descriptor: int | None = None
+        handle: TextIO | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists() and self.path.stat().st_size:
-                size = self.path.stat().st_size
-                with self.path.open("rb") as existing:
-                    existing.seek(size - 1)
-                    torn_tail = existing.read(1) != b"\n"
-            else:
-                torn_tail = False
-            self._handle = self.path.open("a", encoding="utf-8", newline="\n")
+            descriptor = _open_verified_regular_fd(
+                self.path,
+                os.O_RDWR | os.O_CREAT | os.O_APPEND,
+            )
+            if descriptor is None:
+                self._disabled = True
+                return None
+            size = os.fstat(descriptor).st_size
+            torn_tail = False
+            if size:
+                os.lseek(descriptor, size - 1, os.SEEK_SET)
+                torn_tail = os.read(descriptor, 1) != b"\n"
+            handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
+            descriptor = None  # owned by ``handle`` from here
             if torn_tail:
-                self._handle.write("\n")
-                self._handle.flush()
-        except OSError:
+                handle.write("\n")
+                handle.flush()
+            self._handle = handle
+        except (OSError, ValueError):
             self._disabled = True
             self._handle = None
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            elif descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
         return self._handle
 
 
@@ -324,6 +480,11 @@ class _ModelContentWriter:
             if not self._closed:
                 self._flush_locked()
 
+    def _flush_pending(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._flush_locked()
+
     def _cancel_timer_locked(self) -> None:
         timer, self._timer = self._timer, None
         if timer is not None:
@@ -403,24 +564,30 @@ class _RecoveredStream:
         )
 
 
-def read_model_content(path: Path) -> ModelContentReadResult:
+def read_model_content(
+    path: Path,
+    *,
+    expected_identity: ModelContentFileIdentity | None = None,
+) -> ModelContentReadResult:
     """Recover valid records from a sidecar path or run directory.
 
     Missing files, malformed lines, torn UTF-8, unknown record kinds, and invalid field shapes are
-    skipped.  This function is a presentation/recovery aid and never makes a run unreadable.
+    skipped. This function is a presentation/recovery aid and never makes a run unreadable. When
+    ``expected_identity`` is supplied, descriptor and pathname identity must remain equal to that
+    verified sidecar for the whole read or the snapshot fails closed with ``OSError``.
     """
 
     # The sidecar name is fixed. A run id may itself end in ``.jsonl``, so suffix-based file
     # detection mistakes a valid run directory for a JSONL file and silently returns no content.
-    if path.name != MODEL_CONTENT_FILENAME:
-        path = path / MODEL_CONTENT_FILENAME
+    path = _model_content_file_path(path)
     streams: dict[str, _RecoveredStream] = {}
     order: list[str] = []
     settled_texts: dict[str, str] = {}
     skipped = 0
-    try:
-        handle = path.open("rb")
-    except OSError:
+    handle = open_model_content_for_read(path, expected_identity=expected_identity)
+    if handle is None:
+        if expected_identity is not None:
+            raise OSError("model-content sidecar identity changed before read")
         return ModelContentReadResult()
     with handle:
         for raw_line in handle:
@@ -447,11 +614,250 @@ def read_model_content(path: Path) -> ModelContentReadResult:
                     skipped += 1
             else:
                 skipped += 1
-    return ModelContentReadResult(
+    result = ModelContentReadResult(
         snapshots=tuple(streams[stream_id].snapshot() for stream_id in order),
         settled_texts=settled_texts,
         skipped_records=skipped,
     )
+    if expected_identity is not None and not model_content_file_matches_identity(
+        path,
+        expected_identity,
+    ):
+        raise OSError("model-content sidecar identity changed during read")
+    return result
+
+
+def flush_active_model_content(path: Path) -> int:
+    """Flush in-process stores for ``path`` and return how many live stores were reached.
+
+    This helper is intentionally separate from :func:`read_model_content`: ordinary artifact reads
+    remain side-effect free, while a presentation layer handling an explicit live-stream reset can
+    request a coordinated, up-to-date snapshot. Cross-process writers are outside the Reference
+    process-local broker contract.
+    """
+
+    key = _model_content_registry_key(path)
+    with _ACTIVE_STORE_LOCK:
+        references = tuple(_ACTIVE_STORES.get(key, ()))
+    stores = tuple(store for reference in references if (store := reference()) is not None)
+    failures = 0
+    for store in stores:
+        try:
+            if not store.flush():
+                failures += 1
+        except Exception:  # noqa: BLE001 - explicit hydration must fail closed
+            failures += 1
+    if failures:
+        raise OSError(f"failed to flush {failures} active model-content store(s)")
+    return len(stores)
+
+
+def active_model_content_stream_ids(path: Path) -> frozenset[str]:
+    """Return exact stream ids that still have process-local writers for ``path``."""
+
+    try:
+        return active_model_content_state(path).stream_ids
+    except OSError:
+        return frozenset()
+
+
+def active_model_content_state(path: Path) -> ActiveModelContentState:
+    """Return active stream ids plus their shared, verified descriptor identity.
+
+    Every registered store for a path must either have no open descriptor or name the same inode.
+    Any displaced, disabled, or conflicting store invalidates the aggregate proof.
+    """
+
+    key = _model_content_registry_key(path)
+    with _ACTIVE_STORE_LOCK:
+        references = tuple(_ACTIVE_STORES.get(key, ()))
+        mutation_epoch = _ACTIVE_STORE_EPOCHS.get(key, 0)
+    active: set[str] = set()
+    identities: set[ModelContentFileIdentity] = set()
+    store_count = 0
+    for reference in references:
+        store = reference()
+        if store is None:
+            continue
+        state = store.active_state()
+        if state is None:
+            continue
+        store_count += 1
+        active.update(state.stream_ids)
+        if state.file_identity is not None:
+            identities.add(state.file_identity)
+    if len(identities) > 1:
+        raise OSError("active model-content stores reference conflicting sidecar identities")
+    identity = next(iter(identities), None)
+    if active and identity is None:
+        raise OSError("active model-content streams have no verified sidecar identity")
+    with _ACTIVE_STORE_LOCK:
+        if _ACTIVE_STORE_EPOCHS.get(key, 0) != mutation_epoch:
+            raise OSError("active model-content state changed while it was inspected")
+    return ActiveModelContentState(
+        store_count=store_count,
+        stream_ids=frozenset(active),
+        file_identity=identity,
+        mutation_epoch=mutation_epoch,
+    )
+
+
+def _model_content_registry_key(path: Path) -> str:
+    # Windows paths are case-insensitive. Detect the canonical filename with the same semantics as
+    # the final key so a differently-cased file path is not mistaken for a run directory.
+    path = _model_content_file_path(path)
+    try:
+        # Resolve the containing run directory, not the final artifact. Resolving the final member
+        # would alias a planted symlink with its target and let a snapshot flush an unrelated store.
+        resolved = path.parent.resolve(strict=False) / path.name
+    except (OSError, RuntimeError):
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _model_content_file_path(path: Path) -> Path:
+    if os.path.normcase(path.name) != os.path.normcase(MODEL_CONTENT_FILENAME):
+        return path / MODEL_CONTENT_FILENAME
+    return path
+
+
+def model_content_file_is_safe(path: Path, *, allow_missing: bool = True) -> bool:
+    """Whether a sidecar path is absent or an ordinary file, without following links.
+
+    A missing file is safe for the lazy writer to create unless ``allow_missing`` is false. Existing
+    links, directories, FIFOs, devices, and other special files fail closed for readers and writers.
+    """
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return allow_missing
+    except OSError:
+        return False
+    # A hard link is also an indirection across the run-directory boundary: appending here mutates
+    # the same inode through every other name. Sidecars are process-created single-link artifacts.
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+
+
+def model_content_file_identity(
+    path: Path,
+    *,
+    allow_missing: bool = True,
+) -> ModelContentFileIdentity | None:
+    """Return the identity of one verified sidecar pathname without following links."""
+
+    path = _model_content_file_path(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    except OSError as exc:
+        raise OSError("model-content sidecar metadata is unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise OSError("model-content sidecar is not a verified single-link regular file")
+    return _file_identity(metadata)
+
+
+def model_content_file_matches_identity(
+    path: Path,
+    expected_identity: ModelContentFileIdentity,
+) -> bool:
+    """Whether the currently named sidecar still has ``expected_identity``."""
+
+    try:
+        return model_content_file_identity(path, allow_missing=False) == expected_identity
+    except OSError:
+        return False
+
+
+def _file_identity(metadata: os.stat_result) -> ModelContentFileIdentity:
+    return ModelContentFileIdentity(device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def _open_verified_regular_fd(
+    path: Path,
+    flags: int,
+    *,
+    expected_identity: ModelContentFileIdentity | None = None,
+) -> int | None:
+    """Open ``path`` without accepting a link/special-file swap before the first I/O."""
+
+    if not model_content_file_is_safe(path):
+        return None
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o666)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or opened.st_nlink != 1
+            or named.st_nlink != 1
+            or not os.path.samestat(opened, named)
+            or (expected_identity is not None and _file_identity(opened) != expected_identity)
+        ):
+            os.close(descriptor)
+            return None
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        return None
+    return descriptor
+
+
+def open_model_content_for_read(
+    path: Path,
+    *,
+    expected_identity: ModelContentFileIdentity | None = None,
+) -> BinaryIO | None:
+    """Open the fixed sidecar for a verified, no-indirection binary read."""
+
+    path = _model_content_file_path(path)
+    descriptor = _open_verified_regular_fd(
+        path,
+        os.O_RDONLY,
+        expected_identity=expected_identity,
+    )
+    if descriptor is None:
+        return None
+    try:
+        return os.fdopen(descriptor, "rb")
+    except (OSError, ValueError):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        return None
+
+
+def _remove_active_store(
+    key: str,
+    reference: weakref.ReferenceType[ModelContentStore],
+) -> None:
+    with _ACTIVE_STORE_LOCK:
+        references = _ACTIVE_STORES.get(key)
+        if references is None:
+            return
+        if reference not in references:
+            return
+        references.remove(reference)
+        _bump_active_store_epoch_locked(key)
+        if not references:
+            _ACTIVE_STORES.pop(key, None)
+
+
+def _bump_active_store_epoch_locked(key: str) -> None:
+    """Record one registry/writer lifecycle mutation while ``_ACTIVE_STORE_LOCK`` is held."""
+
+    _ACTIVE_STORE_EPOCHS[key] = _ACTIVE_STORE_EPOCHS.get(key, 0) + 1
 
 
 def _read_record(raw_line: bytes) -> dict[str, Any] | None:

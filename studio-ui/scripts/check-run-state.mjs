@@ -12,7 +12,14 @@ const compiled = ts.transpileModule(source, {
   fileName: "run-state.ts",
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`;
-const { hydrateTranscript, initialRunState, isRunBusy, reduceRunEvent } = await import(moduleUrl);
+const {
+  hydrateTranscript,
+  initialRunState,
+  isInitialReplayEvent,
+  isRunBusy,
+  preserveHistoricalRecoveryState,
+  reduceRunEvent,
+} = await import(moduleUrl);
 
 function event(type, data, seq) {
   return {
@@ -200,4 +207,31 @@ state = reduceRunEvent(
 );
 assert.equal(state.planTruncatedItems, 0, "a later complete plan must clear the prior omission count");
 
-console.log("Run-state checks passed (19 scenarios).");
+const recoverable = hydrateTranscript(
+  { ...initialRunState("recoverable-run"), status: "stopped" },
+  {
+    schema_version: "studio.chat.v2",
+    run_id: "recoverable-run",
+    messages: [],
+    event_cursor: -1,
+    event_log_error: "",
+  },
+);
+const crashStart = event("model.turn.started", {}, 7);
+assert.equal(recoverable.replayCursor, -1);
+assert.equal(
+  isInitialReplayEvent(crashStart, 7),
+  true,
+  "the session high-watermark must classify starts beyond the chat cursor as replay",
+);
+const historicalStart = reduceRunEvent(
+  recoverable,
+  crashStart,
+);
+state = preserveHistoricalRecoveryState(recoverable, historicalStart, true, true);
+assert.equal(state.status, "stopped", "historical start must not revive a recoverable session");
+assert.equal(state.activeResponse, "", "historical start must not revive an abandoned bubble");
+const resumedStart = preserveHistoricalRecoveryState(recoverable, historicalStart, false, true);
+assert.equal(resumedStart.status, "running", "a newly committed start may reactivate recovery");
+
+console.log("Run-state checks passed (23 scenarios).");

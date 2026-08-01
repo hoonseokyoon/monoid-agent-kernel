@@ -74,7 +74,7 @@ Node.js, Svelte, Vite, or Tailwind CSS; those tools are confined to frontend dev
 release build.
 
 The default install runs Studio with complete one-shot gateway turns. Add the async HTTP extra
-to render live token deltas in Studio:
+to stream model output and reasoning through Studio's live, reconnectable content channel:
 
 ```bash
 pip install "monoid-agent-kernel[http-async]"
@@ -245,12 +245,14 @@ mirror that stream to OpenTelemetry. `AgentLoop.astream(user_input)` exposes liv
 and each run writes `metrics.json` with counters, timing, and token usage.
 
 `events.jsonl` carries metadata and bounded previews rather than content: model-authored settled
-text leaves as a digest that entitled readers join back from `transcript.jsonl`, and tool arguments
-are truncated to a byte budget. **One exception is on by default in Studio:** `model.output.delta`
-and `model.reasoning.delta` publish raw model text, and the bundled app enables them whenever the
-optional `httpx` extra is installed, because they are what renders tokens live. They are durable
-events, not a live-only side channel. Turn them off with `MONOID_OUTPUT_DELTAS=0` or
-`monoid studio serve --no-output-deltas`; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
+text leaves as a digest that entitled readers join back from private run artifacts, and tool
+arguments are truncated to a byte budget. Studio renders tokens through a separate passive live
+channel and records replayable output/reasoning in the private `model-content.jsonl` sidecar. Raw
+provider chunks therefore stay out of the durable operation log and its Trace/export surface.
+`MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
+egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
+integrations can still opt into the legacy durable `model.output.delta` and
+`model.reasoning.delta` events; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
 public/private split.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,

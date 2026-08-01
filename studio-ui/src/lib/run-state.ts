@@ -287,6 +287,27 @@ export function reduceRunEvent(state: RunViewState, event: RunEvent): RunViewSta
   }
 }
 
+/** Keep an authoritative recoverable/paused session stopped while its committed prefix replays. */
+export function preserveHistoricalRecoveryState(
+  prior: RunViewState,
+  reduced: RunViewState,
+  historical: boolean,
+  recoveryFenced: boolean,
+): RunViewState {
+  if (!historical || !recoveryFenced) return reduced;
+  return {
+    ...reduced,
+    status: "stopped",
+    activeResponse: prior.activeResponse,
+    reasoning: prior.reasoning,
+  };
+}
+
+/** Whether an event belongs to the committed prefix captured before an existing session opened. */
+export function isInitialReplayEvent(event: RunEvent, replayThrough: number): boolean {
+  return typeof event.seq === "number" && event.seq >= 0 && event.seq <= replayThrough;
+}
+
 export function appendOptimisticUserMessage(
   state: RunViewState,
   id: string,

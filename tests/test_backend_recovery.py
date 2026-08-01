@@ -32,6 +32,7 @@ from support.backend_harness import (
     write_json_atomic,
 )
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
+from monoid_agent_kernel.core._event_log import inspect_event_log_tail
 from monoid_agent_kernel.core.lifecycle import SessionState
 
 pytestmark = pytest.mark.integration
@@ -928,6 +929,15 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
         backend1.cancel_run(run_id, submission.run_token)
         backend1.wait_for_run(run_id, timeout_s=20)
 
+    # JSONL commits before the best-effort status projection. Simulate a kill in that window and
+    # require restart listing/status to use the authoritative committed tail.
+    run_dir = tmp_path / "runs" / run_id
+    committed_seq = inspect_event_log_tail(run_dir / "events.jsonl").last_seq
+    assert committed_seq >= 2
+    status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    status_payload["last_event_seq"] = committed_seq - 1
+    write_json_atomic(run_dir / "status.json", status_payload)
+
     # "restart": a brand-new backend over the same run_root, with NO in-memory records.
     backend2 = RunnerBackend(
         run_root=tmp_path / "runs",
@@ -939,6 +949,7 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     listing = backend2.list_runs("tenant_a")["runs"]
     entry = next(r for r in listing if r["run_id"] == run_id)
     assert entry["title"] == "hi"
+    assert entry["last_event_seq"] == committed_seq
     token = entry["read_token"]
     # historical event read with no live record
     events = backend2.events(run_id, token)["events"]
@@ -946,6 +957,7 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     historical_status = backend2.status(run_id, token)
     assert historical_status["state"] == "completed"
     assert historical_status["terminal"] is True
+    assert historical_status["last_event_seq"] == entry["last_event_seq"]
     assert "status" not in historical_status
     # tenant scoping
     assert backend2.list_runs("nobody")["runs"] == []
@@ -1040,6 +1052,7 @@ def test_backend_history_without_status_artifact_is_not_reported_completed(tmp_p
 
     assert entry["state"] == "created"
     assert entry["terminal"] is False
+    assert entry["last_event_seq"] == 0
     status = backend.status(run_id, entry["read_token"])
     assert status["state"] == "created"
     assert status["terminal"] is False

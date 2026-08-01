@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import gc
 import json
+import os
+import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from monoid_agent_kernel.core.model_content import (
     MODEL_CONTENT_SCHEMA_VERSION,
+    ActiveModelContentState,
     ModelContentStore,
+    active_model_content_state,
+    active_model_content_stream_ids,
+    flush_active_model_content,
+    model_content_file_identity,
     read_model_content,
 )
 from monoid_agent_kernel.core.model_io import content_digest
@@ -18,6 +29,7 @@ from monoid_agent_kernel.core.model_stream import (
     safe_open_model_stream,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
+from monoid_agent_kernel.reference.backend.model_stream import LiveModelStreamBroker
 
 
 def _context(
@@ -99,6 +111,278 @@ def test_first_segment_is_immediate_and_channel_switch_flushes(tmp_path: Path) -
     assert snapshot.final_text == "ab"
     assert snapshot.best_output_text == "ab"
     assert snapshot.usage == {"input_tokens": 2, "output_tokens": 2}
+
+
+def test_explicit_live_hydration_flush_commits_the_current_batch(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " buffered tail"))
+
+    assert read_model_content(path).snapshots[0].output_text == "persisted"
+    assert active_model_content_stream_ids(tmp_path) == frozenset({"stream-1"})
+    assert flush_active_model_content(tmp_path) == 1
+    assert read_model_content(path).snapshots[0].output_text == "persisted buffered tail"
+
+    store.close()
+    assert active_model_content_stream_ids(path) == frozenset()
+    assert flush_active_model_content(path) == 0
+
+
+def test_open_publishes_an_active_writer_only_after_its_descriptor_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1")
+    append_entered = threading.Event()
+    continue_append = threading.Event()
+    state_started = threading.Event()
+    state_done = threading.Event()
+    opened: list[object] = []
+    states: list[ActiveModelContentState | None] = []
+    original_append = store._append
+
+    def blocked_append(payload: dict[str, Any]) -> bool:
+        append_entered.set()
+        assert continue_append.wait(2)
+        return original_append(payload)
+
+    monkeypatch.setattr(store, "_append", blocked_append)
+
+    def open_writer() -> None:
+        opened.append(store.open(_context()))
+
+    def inspect_state() -> None:
+        state_started.set()
+        states.append(store.active_state())
+        state_done.set()
+
+    open_thread = threading.Thread(target=open_writer)
+    open_thread.start()
+    assert append_entered.wait(2)
+    state_thread = threading.Thread(target=inspect_state)
+    state_thread.start()
+    assert state_started.wait(2)
+    assert not state_done.wait(0.05)
+
+    continue_append.set()
+    open_thread.join(2)
+    state_thread.join(2)
+    assert not open_thread.is_alive()
+    assert not state_thread.is_alive()
+    assert len(opened) == 1
+    assert len(states) == 1
+    state = states[0]
+    assert state is not None
+    assert state.stream_ids == frozenset({"stream-1"})
+    assert state.file_identity is not None
+    assert not store._disabled
+    store.close()
+
+
+def test_path_mutation_epoch_survives_a_complete_store_writer_lifecycle(
+    tmp_path: Path,
+) -> None:
+    before = active_model_content_state(tmp_path)
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "short-lived prefix"))
+    writer.close(ModelStreamOutcome("completed", final_text="short-lived prefix"))
+    store.close()
+    after = active_model_content_state(tmp_path)
+
+    assert before.store_count == after.store_count == 0
+    assert before.stream_ids == after.stream_ids == frozenset()
+    assert after.mutation_epoch > before.mutation_epoch
+
+
+def test_active_store_registry_does_not_retain_an_unclosed_writer_cycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    store_reference = weakref.ref(store)
+
+    assert flush_active_model_content(path) == 1
+
+    # The process-local lookup must not become an owner. A recorder lost during exceptional
+    # teardown can otherwise leave its store/writer cycle alive and every later hydration would
+    # keep flushing a stale handle for the lifetime of Studio.
+    del writer
+    del store
+    gc.collect()
+
+    assert store_reference() is None
+    assert flush_active_model_content(path) == 0
+
+
+def test_live_hydration_flush_fails_closed_when_an_active_store_is_disabled(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " buffered tail"))
+    store._disabled = True
+
+    with pytest.raises(OSError, match="failed to flush 1 active model-content store"):
+        flush_active_model_content(path)
+
+    # A failed explicit flush never claims that the buffered tail reached the sidecar.
+    assert read_model_content(path).snapshots[0].output_text == "persisted"
+    store.close()
+
+
+def test_live_hydration_flush_rejects_regular_path_replacement(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " buffered tail"))
+    displaced = tmp_path / "displaced-model-content.jsonl"
+    try:
+        path.replace(displaced)
+        path.write_text("replacement must remain untouched\n", encoding="utf-8")
+    except OSError as exc:
+        store.close()
+        pytest.skip(f"open-file replacement is unavailable: {exc}")
+
+    assert active_model_content_stream_ids(path) == frozenset()
+    with pytest.raises(OSError, match="failed to flush 1 active model-content store"):
+        flush_active_model_content(path)
+
+    assert path.read_text(encoding="utf-8") == "replacement must remain untouched\n"
+    store.close()
+
+
+def test_identity_bound_reader_rejects_a_regular_file_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1")
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "trusted prefix"))
+    writer.close(ModelStreamOutcome("completed", final_text="trusted prefix"))
+    store.close()
+    expected_identity = model_content_file_identity(path, allow_missing=False)
+    assert expected_identity is not None
+
+    displaced = tmp_path / "trusted-model-content.jsonl"
+    path.replace(displaced)
+    path.write_bytes(displaced.read_bytes())
+
+    with pytest.raises(OSError, match="identity changed before read"):
+        read_model_content(path, expected_identity=expected_identity)
+
+
+def test_oversized_live_gap_flushes_the_exact_sidecar_prefix_before_resume(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    broker = LiveModelStreamBroker(generation="oversized-flush", max_bytes=700)
+    context = _context()
+    sidecar_writer = store.open(context)
+    live_writer = broker.observer("run-1").open(context)
+
+    for text in ("a", "x" * 5_001):
+        delta = ModelStreamDelta("output", text)
+        # AgentLoop deliberately orders the private sidecar before the passive live observer.
+        sidecar_writer.push(delta)
+        live_writer.push(delta)
+
+    reset = broker.subscribe("run-1", after_cursor="oversized-flush:2").poll()
+    assert len(reset) == 1
+    assert reset[0].kind == "reset"
+    assert reset[0].cursor.sequence == 3
+    assert len(read_model_content(path).snapshots[0].output_text) < 5_002
+
+    assert flush_active_model_content(path) == 1
+    assert read_model_content(path).snapshots[0].output_text == "a" + "x" * 5_001
+    store.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path comparison is case-insensitive")
+def test_active_store_registry_uses_windows_case_insensitive_file_keys(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " tail"))
+
+    assert flush_active_model_content(path.with_name("MODEL-CONTENT.JSONL")) == 1
+    assert read_model_content(path).snapshots[0].output_text == "persisted tail"
+    store.close()
+
+
+def test_model_content_reader_writer_and_registry_reject_a_planted_file_symlink(
+    tmp_path: Path,
+) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    target = outside_dir / "model-content.jsonl"
+    source = ModelContentStore(target, run_id="outside-run")
+    source_writer = source.open(_context(run_id="outside-run"))
+    source_writer.push(ModelStreamDelta("output", "outside private text"))
+    source_writer.close(ModelStreamOutcome("completed", final_text="outside private text"))
+    source.close()
+    original = target.read_bytes()
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    link = run_dir / "model-content.jsonl"
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    assert read_model_content(run_dir).snapshots == ()
+
+    planted = ModelContentStore(link, run_id="run-1")
+    planted_writer = planted.open(_context())
+    planted_writer.push(ModelStreamDelta("output", "must not append outside"))
+    with pytest.raises(OSError, match="failed to flush 1 active model-content store"):
+        flush_active_model_content(run_dir)
+    planted.close()
+
+    assert target.read_bytes() == original
+
+
+def test_model_content_reader_writer_and_registry_reject_a_planted_hardlink(
+    tmp_path: Path,
+) -> None:
+    outside_dir = tmp_path / "outside-hardlink"
+    outside_dir.mkdir()
+    target = outside_dir / "model-content.jsonl"
+    source = ModelContentStore(target, run_id="outside-run")
+    source_writer = source.open(_context(run_id="outside-run"))
+    source_writer.push(ModelStreamDelta("output", "outside hardlinked text"))
+    source_writer.close(ModelStreamOutcome("completed", final_text="outside hardlinked text"))
+    source.close()
+    original = target.read_bytes()
+
+    run_dir = tmp_path / "run-hardlink"
+    run_dir.mkdir()
+    link = run_dir / "model-content.jsonl"
+    try:
+        os.link(target, link)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    assert read_model_content(run_dir).snapshots == ()
+
+    planted = ModelContentStore(link, run_id="run-hardlink")
+    planted_writer = planted.open(_context(run_id="run-hardlink"))
+    planted_writer.push(ModelStreamDelta("output", "must not mutate hardlink target"))
+    with pytest.raises(OSError, match="failed to flush 1 active model-content store"):
+        flush_active_model_content(run_dir)
+    planted.close()
+
+    assert target.read_bytes() == original
 
 
 def test_segments_are_bounded_by_utf8_bytes_and_flush_on_size(tmp_path: Path) -> None:

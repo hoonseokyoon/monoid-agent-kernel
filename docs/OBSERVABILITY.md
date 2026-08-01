@@ -136,6 +136,24 @@ projection. The Studio UI restores user, assistant, and error messages from
 `transcript.jsonl` remains the private model-call log. `model-content.jsonl` is the private streamed
 content and settled-text sidecar.
 
+Studio receives provider output and reasoning through a separate passive model-stream channel.
+The browser subscribes to one root-scoped `/api/model-stream` SSE connection that multiplexes the
+root run and its descendants. Frames use `monoid.model-stream.live.v1` and a
+`generation:sequence` cursor. Each root ring retains at most 1,024 frames and 512 KiB, and the
+broker retains at most 64 root rings with least-recently-used eviction. A reconnect replays the
+retained suffix. A generation change, missing sequence, or evicted prefix emits `reset`; Studio
+flushes active in-process sidecar batches, hydrates root and descendant call snapshots from the
+private stores, and resumes at the broker-provided baseline. The observer order guarantees that a
+visible reset follows the corresponding sidecar push. UTF-8 channel offsets make the snapshot and
+retained suffix merge idempotent even when they were observed at different instants. Snapshot I/O
+accepts only regular, single-link sidecars with stable path/descriptor identity. An unsafe path or
+failed coordinated flush returns HTTP 503, and Studio retries the same hydration cursor.
+
+This SSE subscription has no execution control. Closing a tab or losing the connection closes only
+that subscriber. Provider generation, durable recording, Stop, interrupt, and cancellation remain
+owned by the run. Live frames enter the chat and subagent activity projections directly and never
+enter `events.jsonl`, the run event reducer, Trace, or raw trace export.
+
 The `/api/chat-transcript` response is `studio.chat.v2`. It requires `event_log_error`, which is
 empty after a complete read and carries the failure reason when Studio returns only the committed
 prefix of a corrupt `events.jsonl`. This member is the wire-format change from v1.
@@ -147,11 +165,17 @@ an events page, and `diagnostics()`, which returns the whole
 `failure.json` — both behind a run token, which `studio.chat.jsonl`'s route is not. It has to be: a chat UI
 that cannot re-render the conversation is not a chat UI, and the text is joined from
 `model-content.jsonl` with a legacy `transcript.jsonl` fallback by the same hydration seam the
-projection uses. Three consequences worth stating
+projection uses. Four consequences worth stating
 rather than leaving to be discovered:
 
-- `MONOID_OUTPUT_DELTAS=0` governs the legacy delta mirror in `events.jsonl`. The assembled answer
-  still lands here because private run-directory content has its own retention path.
+- A direct AgentLoop integration uses `MONOID_OUTPUT_DELTAS=0` to disable the legacy durable delta
+  mirror. Studio resolves the same variable at its composition boundary as a broader content-egress
+  gate: it disables the live SSE channel and `model-content.jsonl` sidecar together. The
+  `--no-output-deltas` Studio flag has the same effect. Provider streaming stays selected when the
+  async transport is available, preserving token-boundary Stop without exposing chunks.
+- A settled answer still lands in the Studio chat projection when live/private incremental content
+  is disabled because `transcript.jsonl` retains the completed model turn. Mid-turn and interrupted
+  partial hydration require the model-content sidecar.
 - The read path **writes**. Deleting the file and requesting `/api/chat-transcript` regenerates it
   from the private content artifacts, so removing it does not remove the content.
 - Treat it as **private by location**, like `artifacts/tasks/<id>/task.json` — with the difference

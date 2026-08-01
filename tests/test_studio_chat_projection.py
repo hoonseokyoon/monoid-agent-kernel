@@ -3,12 +3,49 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from monoid_agent_kernel.core.model_content import ModelContentStore
+from monoid_agent_kernel.core.model_io import content_digest, content_length
+from monoid_agent_kernel.core.model_stream import (
+    ModelStreamContext,
+    ModelStreamDelta,
+    ModelStreamOutcome,
+)
 from monoid_agent_kernel.reference.studio.chat_projection import (
     CHAT_SCHEMA_V1,
     CHAT_SCHEMA_V2,
     ChatProjection,
     is_supported_chat_response,
 )
+
+
+def _write_interrupted_model_content(
+    run_dir: Path,
+    *,
+    root_run_id: str = "run-1",
+    run_id: str | None = None,
+    turn_id: str = "turn_0001",
+    stream_id: str = "stream-partial",
+    text: str = "partial answer",
+) -> None:
+    resolved_run_id = run_id or root_run_id
+    store = ModelContentStore(run_dir / "model-content.jsonl", run_id=resolved_run_id)
+    writer = store.open(
+        ModelStreamContext(
+            run_id=resolved_run_id,
+            root_run_id=root_run_id,
+            turn_id=turn_id,
+            stream_id=stream_id,
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text=text))
+    writer.close(ModelStreamOutcome(status="interrupted", final_text=text))
+    store.close()
 
 
 def test_chat_response_reader_distinguishes_the_v1_and_v2_shapes() -> None:
@@ -172,6 +209,361 @@ def test_chat_projection_projects_assistant_and_non_retryable_errors_once(tmp_pa
     ]
     assert records[1]["source"]["event_type"] == "turn.failed"
     assert projection.event_cursor() == 5
+
+
+def test_chat_projection_hydrates_interrupted_partial_from_matching_private_stream(
+    tmp_path: Path,
+) -> None:
+    _write_interrupted_model_content(tmp_path)
+    interrupted = {
+        "type": "turn.interrupted",
+        "run_id": "run-1",
+        "turn_id": "turn_0001",
+        "event_id": "evt-interrupted",
+        "seq": 4,
+        "timestamp": "2026-08-01T00:00:01Z",
+        "data": {"reason": "user_stop"},
+    }
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps(interrupted) + "\n",
+        encoding="utf-8",
+    )
+    projection = ChatProjection(tmp_path)
+
+    first = projection.catch_up("run-1")
+    second = projection.catch_up("run-1")
+    hidden = projection.catch_up("run-1", include_model_stream_partials=False)
+
+    assert first == second
+    assert hidden["messages"] == []
+    assert hidden["event_cursor"] == -1
+    assert is_supported_chat_response(first)
+    assert first["event_cursor"] == 4
+    assert len(first["messages"]) == 1
+    partial = first["messages"][0]
+    assert partial["id"] == "assistant:model-stream:stream-partial:partial"
+    assert partial["role"] == "assistant"
+    assert partial["content"] == "partial answer"
+    assert partial["source"] == {
+        "kind": "model_stream_partial",
+        "event_type": "turn.interrupted",
+        "event_id": "evt-interrupted",
+        "seq": 4,
+        "turn_id": "turn_0001",
+        "stream_id": "stream-partial",
+        "status": "interrupted",
+        "partial": True,
+    }
+
+
+def test_chat_projection_hydrates_completed_digest_from_model_content(
+    tmp_path: Path,
+) -> None:
+    text = "completed answer retained outside the operation log"
+    digest = content_digest(text)
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    store.settled_text(text, digest, content_length(text))
+    store.close()
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn.settled",
+                "run_id": "run-1",
+                "turn_id": "turn_completed",
+                "event_id": "evt-completed",
+                "seq": 5,
+                "timestamp": "2026-08-01T00:00:01Z",
+                "data": {
+                    "status": "completed",
+                    "final_text_digest": digest,
+                    "final_text_len": content_length(text),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    response = ChatProjection(tmp_path).catch_up("run-1")
+
+    assert response["event_cursor"] == 5
+    assert [(message["role"], message["content"]) for message in response["messages"]] == [
+        ("assistant", text)
+    ]
+
+
+def test_chat_projection_returns_active_sidecar_prefix_without_persisting_it(
+    tmp_path: Path,
+) -> None:
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    older_writer = store.open(
+        ModelStreamContext(
+            run_id="run-1",
+            root_run_id="run-1",
+            turn_id="turn_0002",
+            stream_id="stream-active-old",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-07-31T23:59:59Z",
+        )
+    )
+    older_writer.push(ModelStreamDelta(channel="output", text="stale retry prefix"))
+    context = ModelStreamContext(
+        run_id="run-1",
+        root_run_id="run-1",
+        turn_id="turn_0002",
+        stream_id="stream-active",
+        step=2,
+        provider="test",
+        model="test-model",
+        started_at="2026-08-01T00:00:00Z",
+    )
+    writer = store.open(context)
+    writer.push(ModelStreamDelta(channel="output", text="durable prefix"))
+    started = {
+        "type": "model.turn.started",
+        "run_id": "run-1",
+        "turn_id": "turn_0002",
+        "event_id": "evt-started",
+        "seq": 8,
+        "timestamp": "2026-08-01T00:00:01Z",
+        "data": {"step": 2},
+    }
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(json.dumps(started) + "\n", encoding="utf-8")
+    projection = ChatProjection(tmp_path)
+    try:
+        body = projection.catch_up("run-1")
+        hidden = projection.catch_up("run-1", include_model_stream_partials=False)
+
+        assert is_supported_chat_response(body)
+        assert hidden["messages"] == []
+        assert len(body["messages"]) == 1
+        active = body["messages"][0]
+        assert active["id"] == "assistant:model-stream:stream-active:active"
+        assert active["content"] == "durable prefix"
+        assert active["source"]["kind"] == "model_stream_active"
+        assert active["source"]["stream_id"] == "stream-active"
+        # Response-only: catch-up may refresh this growing prefix, so it cannot be frozen into the
+        # append-only Studio chat sidecar.
+        assert not (tmp_path / "studio.chat.jsonl").exists()
+        assert "stale retry prefix" not in json.dumps(body)
+
+        writer.close(ModelStreamOutcome(status="interrupted", final_text="durable prefix"))
+        with events_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "turn.interrupted",
+                        "run_id": "run-1",
+                        "turn_id": "turn_0002",
+                        "event_id": "evt-interrupted",
+                        "seq": 9,
+                        "timestamp": "2026-08-01T00:00:02Z",
+                        "data": {"reason": "user_stop"},
+                    }
+                )
+                + "\n"
+            )
+        settled = projection.catch_up("run-1")
+        assert [message["id"] for message in settled["messages"]] == [
+            "assistant:model-stream:stream-active:partial"
+        ]
+    finally:
+        store.close()
+
+
+def test_chat_projection_does_not_revive_a_stream_closed_during_sidecar_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    context = ModelStreamContext(
+        run_id="run-1",
+        root_run_id="run-1",
+        turn_id="turn_0002",
+        stream_id="stream-closing",
+        step=1,
+        provider="test",
+        model="test-model",
+        started_at="2026-08-01T00:00:00Z",
+    )
+    writer = store.open(context)
+    writer.push(ModelStreamDelta(channel="output", text="prefix before close"))
+    started = {
+        "type": "model.turn.started",
+        "run_id": "run-1",
+        "turn_id": context.turn_id,
+        "event_id": "evt-started",
+        "seq": 8,
+        "timestamp": "2026-08-01T00:00:01Z",
+        "data": {"step": 1},
+    }
+    (tmp_path / "events.jsonl").write_text(json.dumps(started) + "\n", encoding="utf-8")
+
+    from monoid_agent_kernel.reference.studio import chat_projection as projection_module
+
+    original_read = projection_module.read_model_content
+    closed = False
+
+    def close_after_read(path: Path, **kwargs):  # noqa: ANN003, ANN202
+        nonlocal closed
+        result = original_read(path, **kwargs)
+        if not closed:
+            closed = True
+            writer.close(ModelStreamOutcome(status="interrupted", final_text="prefix before close"))
+        return result
+
+    monkeypatch.setattr(projection_module, "read_model_content", close_after_read)
+    try:
+        body = ChatProjection(tmp_path).catch_up("run-1")
+        assert body["messages"] == []
+    finally:
+        store.close()
+
+
+def test_chat_projection_does_not_revive_a_process_lost_sidecar_prefix(
+    tmp_path: Path,
+) -> None:
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    writer = store.open(
+        ModelStreamContext(
+            run_id="run-1",
+            root_run_id="run-1",
+            turn_id="turn_crashed",
+            stream_id="stream-crashed",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text="stale process prefix"))
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "model.turn.started",
+                "run_id": "run-1",
+                "turn_id": "turn_crashed",
+                "event_id": "evt-crashed-start",
+                "seq": 1,
+                "timestamp": "2026-08-01T00:00:01Z",
+                "data": {"step": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Process teardown flushes the prefix without inventing a terminal outcome. A later Studio
+    # process sees the same start-only durable shape but has no process-local writer proof.
+    store.close()
+
+    response = ChatProjection(tmp_path).catch_up("run-1")
+
+    assert response["messages"] == []
+
+
+def test_chat_projection_does_not_publish_active_prefix_from_corrupt_event_log(
+    tmp_path: Path,
+) -> None:
+    store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+    writer = store.open(
+        ModelStreamContext(
+            run_id="run-1",
+            root_run_id="run-1",
+            turn_id="turn_corrupt",
+            stream_id="stream-corrupt",
+            step=1,
+            provider="test",
+            model="test-model",
+            started_at="2026-08-01T00:00:00Z",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text="untrusted active prefix"))
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "model.turn.started",
+                "run_id": "run-1",
+                "turn_id": "turn_corrupt",
+                "event_id": "evt-corrupt-start",
+                "seq": 1,
+                "data": {"step": 1},
+            }
+        )
+        + "\n{not-json}\n",
+        encoding="utf-8",
+    )
+    try:
+        response = ChatProjection(tmp_path).catch_up("run-1")
+
+        assert response["messages"] == []
+        assert response["event_log_error"]
+    finally:
+        store.close()
+
+
+def test_chat_projection_does_not_invent_partial_without_matching_private_stream(
+    tmp_path: Path,
+) -> None:
+    _write_interrupted_model_content(
+        tmp_path,
+        root_run_id="run-1",
+        run_id="run-1.sub.foreign",
+    )
+    events = [
+        {
+            "type": "turn.interrupted",
+            "run_id": "run-1",
+            "turn_id": "turn_0001",
+            "event_id": "evt-mismatch",
+            "seq": 1,
+            "data": {"reason": "user_stop"},
+        }
+    ]
+    projection = ChatProjection(tmp_path)
+
+    projection.project_events(events)
+    assert projection.read() == []
+
+    (tmp_path / "model-content.jsonl").write_bytes(b'{"torn":"\xff')
+    projection.project_events(events)
+    assert projection.read() == []
+
+
+def test_chat_projection_rejects_foreign_event_and_sidecar_context_pair(
+    tmp_path: Path,
+) -> None:
+    """Two mutually consistent misplaced artifacts still cannot cross the requested root."""
+
+    _write_interrupted_model_content(
+        tmp_path,
+        root_run_id="foreign-run",
+        run_id="foreign-run",
+        turn_id="turn_foreign",
+        text="foreign private prefix",
+    )
+    (tmp_path / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn.interrupted",
+                "run_id": "foreign-run",
+                "turn_id": "turn_foreign",
+                "event_id": "evt-foreign",
+                "seq": 1,
+                "data": {"reason": "user_stop"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    response = ChatProjection(tmp_path).catch_up("run-1")
+
+    assert response["messages"] == []
+    assert response["event_cursor"] == -1
+    assert "foreign private prefix" not in json.dumps(response)
 
 
 def test_chat_projection_orders_catchup_events_between_existing_user_turns(tmp_path: Path) -> None:
