@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.model_content import (
     ModelContentSnapshot,
     active_model_content_state,
     read_model_content,
+    watch_active_model_content,
 )
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 
@@ -396,34 +397,33 @@ class ChatProjection:
                 active = {key: value for key, value in active.items() if key[0] != run_id}
         if not active:
             return []
-        try:
-            before_read = active_model_content_state(self.run_dir)
-        except OSError:
-            return []
-        if not before_read.stream_ids or before_read.file_identity is None:
-            return []
-
         latest: dict[
             tuple[str, str],
             tuple[tuple[int, str, str], ModelContentSnapshot],
         ] = {}
         try:
-            content = read_model_content(
-                self.run_dir,
-                expected_identity=before_read.file_identity,
-            )
-            after_read = active_model_content_state(self.run_dir)
+            with watch_active_model_content(self.run_dir) as mutation_watch:
+                before_read = active_model_content_state(self.run_dir)
+                if not before_read.stream_ids or before_read.file_identity is None:
+                    return []
+                content = read_model_content(
+                    self.run_dir,
+                    expected_identity=before_read.file_identity,
+                )
+                after_read = active_model_content_state(self.run_dir)
+                if (
+                    after_read.file_identity is not None
+                    and after_read.file_identity != before_read.file_identity
+                ):
+                    return []
+                active_stream_ids = before_read.stream_ids & after_read.stream_ids
+                if mutation_watch.changed:
+                    return []
         except OSError:
-            return []
-        if after_read.mutation_epoch != before_read.mutation_epoch or (
-            after_read.file_identity is not None
-            and after_read.file_identity != before_read.file_identity
-        ):
             return []
         # A writer can settle or be abandoned while the sidecar is being read. Promote only ids
         # that were active on both sides of that read, giving the response a clear linearization
         # boundary instead of reviving a stream that already closed.
-        active_stream_ids = before_read.stream_ids & after_read.stream_ids
         if not active_stream_ids:
             return []
         for snapshot in content.snapshots:

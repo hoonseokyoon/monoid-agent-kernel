@@ -61,6 +61,7 @@ from monoid_agent_kernel.core.model_content import (
     model_content_file_identity,
     model_content_file_is_safe,
     read_model_content,
+    watch_active_model_content,
 )
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.subagent_runtime import (
@@ -1883,33 +1884,37 @@ class StudioServer:
                     error_code="model_content_unavailable",
                 )
             try:
-                flush_active_model_content(run_dir)
-                before_read = active_model_content_state(run_dir)
-                named_identity = model_content_file_identity(sidecar_path)
-                if (
-                    before_read.file_identity is not None
-                    and named_identity != before_read.file_identity
-                ):
-                    raise OSError("active sidecar descriptor/path identity mismatch")
-                if before_read.stream_ids and before_read.file_identity is None:
-                    raise OSError("active streams have no verified sidecar descriptor")
-                expected_identity = before_read.file_identity or named_identity
-                content = (
-                    ModelContentReadResult()
-                    if expected_identity is None
-                    else read_model_content(
-                        run_dir,
-                        expected_identity=expected_identity,
+                with watch_active_model_content(run_dir) as mutation_watch:
+                    flush_active_model_content(run_dir)
+                    before_read = active_model_content_state(run_dir)
+                    named_identity = model_content_file_identity(sidecar_path)
+                    if (
+                        before_read.file_identity is not None
+                        and named_identity != before_read.file_identity
+                    ):
+                        raise OSError("active sidecar descriptor/path identity mismatch")
+                    if before_read.stream_ids and before_read.file_identity is None:
+                        raise OSError("active streams have no verified sidecar descriptor")
+                    expected_identity = before_read.file_identity or named_identity
+                    content = (
+                        ModelContentReadResult()
+                        if expected_identity is None
+                        else read_model_content(
+                            run_dir,
+                            expected_identity=expected_identity,
+                        )
                     )
-                )
-                after_read = active_model_content_state(run_dir)
-                if after_read.mutation_epoch != before_read.mutation_epoch:
-                    raise OSError("active model-content lifecycle changed during snapshot")
-                if (
-                    after_read.file_identity is not None
-                    and after_read.file_identity != expected_identity
-                ):
-                    raise OSError("active sidecar identity changed during snapshot")
+                    after_read = active_model_content_state(run_dir)
+                    if (
+                        after_read.file_identity is not None
+                        and after_read.file_identity != expected_identity
+                    ):
+                        raise OSError("active sidecar identity changed during snapshot")
+                    active_stream_ids = before_read.stream_ids & after_read.stream_ids
+                    transitioning_stream_ids = before_read.stream_ids ^ after_read.stream_ids
+                    active_turn_ids = _active_model_turn_ids(run_dir)
+                    if mutation_watch.changed:
+                        raise OSError("active model-content lifecycle changed during snapshot")
             except OSError as exc:
                 # A reset snapshot is a cursor-advancing proof. Serving a stale prefix after an
                 # in-process writer failed to flush, changed identity, or closed during the read
@@ -1918,9 +1923,6 @@ class StudioServer:
                     "model content snapshot is temporarily unavailable",
                     error_code="model_content_unavailable",
                 ) from exc
-            active_stream_ids = before_read.stream_ids & after_read.stream_ids
-            transitioning_stream_ids = before_read.stream_ids ^ after_read.stream_ids
-            active_turn_ids = _active_model_turn_ids(run_dir)
             for snapshot in content.snapshots:
                 context = snapshot.context
                 if (

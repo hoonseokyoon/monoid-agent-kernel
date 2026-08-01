@@ -13,7 +13,8 @@ import os
 import stat
 import threading
 import weakref
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, TextIO, TypeAlias
@@ -43,10 +44,6 @@ DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
-# Revisions intentionally outlive registry membership. A store can be created, opened, closed, and
-# removed entirely between two snapshot probes; retaining one integer per touched sidecar makes
-# that full ABA visible to the second probe.
-_ACTIVE_STORE_EPOCHS: dict[str, int] = {}
 
 ModelContentSnapshotStatus: TypeAlias = Literal[
     "completed",
@@ -110,7 +107,48 @@ class ActiveModelContentState:
     store_count: int = 0
     stream_ids: frozenset[str] = frozenset()
     file_identity: ModelContentFileIdentity | None = None
-    mutation_epoch: int = 0
+
+
+@dataclass(eq=False)
+class ModelContentMutationWatch:
+    """Request-scoped notice of registry or writer changes for one sidecar path."""
+
+    _registry_key: str
+    _changed: bool = False
+
+    @property
+    def changed(self) -> bool:
+        """Whether the watched path changed before this observation point."""
+
+        with _ACTIVE_STORE_LOCK:
+            return self._changed
+
+
+_ACTIVE_STORE_WATCHERS: dict[str, set[ModelContentMutationWatch]] = {}
+
+
+@contextmanager
+def watch_active_model_content(path: Path) -> Iterator[ModelContentMutationWatch]:
+    """Watch one sidecar path for a bounded snapshot operation.
+
+    Watch registrations live only for the duration of the caller's operation. This catches a
+    complete create/open/close/remove ABA cycle without retaining per-run tombstones or making
+    unrelated runs invalidate each other's snapshots.
+    """
+
+    key = _model_content_registry_key(path)
+    watch = ModelContentMutationWatch(key)
+    with _ACTIVE_STORE_LOCK:
+        _ACTIVE_STORE_WATCHERS.setdefault(key, set()).add(watch)
+    try:
+        yield watch
+    finally:
+        with _ACTIVE_STORE_LOCK:
+            watchers = _ACTIVE_STORE_WATCHERS.get(key)
+            if watchers is not None:
+                watchers.discard(watch)
+                if not watchers:
+                    _ACTIVE_STORE_WATCHERS.pop(key, None)
 
 
 class ModelContentStore:
@@ -153,7 +191,7 @@ class ModelContentStore:
         )
         with _ACTIVE_STORE_LOCK:
             _ACTIVE_STORES.setdefault(self._registry_key, set()).add(self._registry_ref)
-            _bump_active_store_epoch_locked(self._registry_key)
+            _mark_active_store_mutation_locked(self._registry_key)
 
     def open(self, context: ModelStreamContext) -> ModelStreamWriter:
         with self._lock:
@@ -181,7 +219,7 @@ class ModelContentStore:
             # sidecar identity that owns it.
             self._writers.add(writer)
             with _ACTIVE_STORE_LOCK:
-                _bump_active_store_epoch_locked(self._registry_key)
+                _mark_active_store_mutation_locked(self._registry_key)
             return writer
 
     def settled_text(self, text: str, digest: str, text_len: int) -> None:
@@ -280,9 +318,10 @@ class ModelContentStore:
             if self._disabled or not self._handle_matches_path_locked():
                 self._disabled = True
                 raise OSError("active model-content descriptor no longer matches its path")
-            stream_ids = frozenset(
-                writer._context.stream_id for writer in self._writers if not writer._closed
-            )
+            # A writer stays active until its terminal append (or abandonment flush) completes and
+            # unregisters it. Treating its earlier private ``_closed`` flag as authoritative would
+            # expose an unmarked interval where a snapshot could revive an abandoned prefix.
+            stream_ids = frozenset(writer._context.stream_id for writer in self._writers)
             identity: ModelContentFileIdentity | None = None
             if self._handle is not None:
                 try:
@@ -323,7 +362,7 @@ class ModelContentStore:
                 return
             self._writers.remove(writer)
             with _ACTIVE_STORE_LOCK:
-                _bump_active_store_epoch_locked(self._registry_key)
+                _mark_active_store_mutation_locked(self._registry_key)
 
     def _append(self, payload: dict[str, Any]) -> bool:
         try:
@@ -668,38 +707,36 @@ def active_model_content_state(path: Path) -> ActiveModelContentState:
     Any displaced, disabled, or conflicting store invalidates the aggregate proof.
     """
 
-    key = _model_content_registry_key(path)
-    with _ACTIVE_STORE_LOCK:
-        references = tuple(_ACTIVE_STORES.get(key, ()))
-        mutation_epoch = _ACTIVE_STORE_EPOCHS.get(key, 0)
-    active: set[str] = set()
-    identities: set[ModelContentFileIdentity] = set()
-    store_count = 0
-    for reference in references:
-        store = reference()
-        if store is None:
-            continue
-        state = store.active_state()
-        if state is None:
-            continue
-        store_count += 1
-        active.update(state.stream_ids)
-        if state.file_identity is not None:
-            identities.add(state.file_identity)
-    if len(identities) > 1:
-        raise OSError("active model-content stores reference conflicting sidecar identities")
-    identity = next(iter(identities), None)
-    if active and identity is None:
-        raise OSError("active model-content streams have no verified sidecar identity")
-    with _ACTIVE_STORE_LOCK:
-        if _ACTIVE_STORE_EPOCHS.get(key, 0) != mutation_epoch:
+    with watch_active_model_content(path) as mutation_watch:
+        key = mutation_watch._registry_key
+        with _ACTIVE_STORE_LOCK:
+            references = tuple(_ACTIVE_STORES.get(key, ()))
+        active: set[str] = set()
+        identities: set[ModelContentFileIdentity] = set()
+        store_count = 0
+        for reference in references:
+            store = reference()
+            if store is None:
+                continue
+            state = store.active_state()
+            if state is None:
+                continue
+            store_count += 1
+            active.update(state.stream_ids)
+            if state.file_identity is not None:
+                identities.add(state.file_identity)
+        if len(identities) > 1:
+            raise OSError("active model-content stores reference conflicting sidecar identities")
+        identity = next(iter(identities), None)
+        if active and identity is None:
+            raise OSError("active model-content streams have no verified sidecar identity")
+        if mutation_watch.changed:
             raise OSError("active model-content state changed while it was inspected")
-    return ActiveModelContentState(
-        store_count=store_count,
-        stream_ids=frozenset(active),
-        file_identity=identity,
-        mutation_epoch=mutation_epoch,
-    )
+        return ActiveModelContentState(
+            store_count=store_count,
+            stream_ids=frozenset(active),
+            file_identity=identity,
+        )
 
 
 def _model_content_registry_key(path: Path) -> str:
@@ -849,15 +886,16 @@ def _remove_active_store(
         if reference not in references:
             return
         references.remove(reference)
-        _bump_active_store_epoch_locked(key)
+        _mark_active_store_mutation_locked(key)
         if not references:
             _ACTIVE_STORES.pop(key, None)
 
 
-def _bump_active_store_epoch_locked(key: str) -> None:
-    """Record one registry/writer lifecycle mutation while ``_ACTIVE_STORE_LOCK`` is held."""
+def _mark_active_store_mutation_locked(key: str) -> None:
+    """Notify request-scoped watchers while ``_ACTIVE_STORE_LOCK`` is held."""
 
-    _ACTIVE_STORE_EPOCHS[key] = _ACTIVE_STORE_EPOCHS.get(key, 0) + 1
+    for watch in tuple(_ACTIVE_STORE_WATCHERS.get(key, ())):
+        watch._changed = True
 
 
 def _read_record(raw_line: bytes) -> dict[str, Any] | None:

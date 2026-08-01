@@ -516,34 +516,38 @@ def test_sync_frame_generator_close_releases_subscription() -> None:
     assert subscription.closed is True
 
 
-@pytest.mark.asyncio
-async def test_async_frame_generator_cancellation_wakes_poll_worker() -> None:
-    broker = LiveModelStreamBroker(generation="async-generator")
-    subscription = broker.subscribe("root-1")
-    waiting = asyncio.create_task(anext(subscription.aframes(heartbeat_interval_s=30.0)))
-    await asyncio.sleep(0.01)
+def test_async_frame_generator_cancellation_wakes_poll_worker() -> None:
+    async def exercise() -> None:
+        broker = LiveModelStreamBroker(generation="async-generator")
+        subscription = broker.subscribe("root-1")
+        waiting = asyncio.create_task(anext(subscription.aframes(heartbeat_interval_s=30.0)))
+        await asyncio.sleep(0.01)
 
-    started = time.monotonic()
-    waiting.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting
+        started = time.monotonic()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
 
-    assert subscription.closed is True
-    assert time.monotonic() - started < 1.0
+        assert subscription.closed is True
+        assert time.monotonic() - started < 1.0
+
+    asyncio.run(exercise())
 
 
-@pytest.mark.asyncio
-async def test_direct_async_poll_cancellation_closes_subscription() -> None:
-    broker = LiveModelStreamBroker(generation="async-poll")
-    subscription = broker.subscribe("root-1")
-    waiting = asyncio.create_task(subscription.apoll(timeout_s=30.0))
-    await asyncio.sleep(0.01)
+def test_direct_async_poll_cancellation_closes_subscription() -> None:
+    async def exercise() -> None:
+        broker = LiveModelStreamBroker(generation="async-poll")
+        subscription = broker.subscribe("root-1")
+        waiting = asyncio.create_task(subscription.apoll(timeout_s=30.0))
+        await asyncio.sleep(0.01)
 
-    waiting.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
 
-    assert subscription.closed is True
+        assert subscription.closed is True
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("root_run_id", ["root.sub.child", "../root", "root/child"])

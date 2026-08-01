@@ -20,6 +20,7 @@ from monoid_agent_kernel.core.model_content import (
     flush_active_model_content,
     model_content_file_identity,
     read_model_content,
+    watch_active_model_content,
 )
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.core.model_stream import (
@@ -182,20 +183,67 @@ def test_open_publishes_an_active_writer_only_after_its_descriptor_exists(
     store.close()
 
 
-def test_path_mutation_epoch_survives_a_complete_store_writer_lifecycle(
+def test_closing_writer_remains_active_until_terminal_append_completes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    before = active_model_content_state(tmp_path)
     store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
     writer = store.open(_context())
-    writer.push(ModelStreamDelta("output", "short-lived prefix"))
-    writer.close(ModelStreamOutcome("completed", final_text="short-lived prefix"))
-    store.close()
-    after = active_model_content_state(tmp_path)
+    writer.push(ModelStreamDelta("output", "prefix"))
+    close_entered = threading.Event()
+    continue_close = threading.Event()
+    original_append = store._append
 
-    assert before.store_count == after.store_count == 0
-    assert before.stream_ids == after.stream_ids == frozenset()
-    assert after.mutation_epoch > before.mutation_epoch
+    def blocked_terminal_append(payload: dict[str, Any]) -> bool:
+        if payload.get("kind") == "stream_closed":
+            close_entered.set()
+            assert continue_close.wait(2)
+        return original_append(payload)
+
+    monkeypatch.setattr(store, "_append", blocked_terminal_append)
+    close_thread = threading.Thread(
+        target=writer.close,
+        args=(ModelStreamOutcome("completed", final_text="prefix"),),
+    )
+    close_thread.start()
+    assert close_entered.wait(2)
+    try:
+        state = active_model_content_state(tmp_path)
+        assert state.stream_ids == frozenset({"stream-1"})
+    finally:
+        continue_close.set()
+        close_thread.join(2)
+        store.close()
+    assert not close_thread.is_alive()
+
+
+def test_path_mutation_watch_detects_a_complete_store_writer_lifecycle(
+    tmp_path: Path,
+) -> None:
+    with watch_active_model_content(tmp_path) as watch:
+        assert not watch.changed
+        store = ModelContentStore(tmp_path / "model-content.jsonl", run_id="run-1")
+        writer = store.open(_context())
+        writer.push(ModelStreamDelta("output", "short-lived prefix"))
+        writer.close(ModelStreamOutcome("completed", final_text="short-lived prefix"))
+        store.close()
+        assert watch.changed
+
+    state = active_model_content_state(tmp_path)
+    assert state.store_count == 0
+    assert state.stream_ids == frozenset()
+
+
+def test_path_mutation_watch_ignores_unrelated_store_lifecycle(tmp_path: Path) -> None:
+    watched_dir = tmp_path / "watched"
+    other_dir = tmp_path / "other"
+
+    with watch_active_model_content(watched_dir) as watch:
+        store = ModelContentStore(other_dir / "model-content.jsonl", run_id="run-2")
+        writer = store.open(_context(run_id="run-2"))
+        writer.close(ModelStreamOutcome("completed", final_text="done"))
+        store.close()
+        assert not watch.changed
 
 
 def test_active_store_registry_does_not_retain_an_unclosed_writer_cycle(
