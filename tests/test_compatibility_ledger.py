@@ -153,9 +153,15 @@ def test_registry_matches_source_owned_version_constants() -> None:
     assert studio_chat.supported_readers == SUPPORTED_CHAT_SCHEMA_VERSIONS
     assert studio_chat.supported_readers[0] == CHAT_SCHEMA_V1
 
-    trace_source = (ROOT / "studio-ui" / "src" / "lib" / "trace.ts").read_text(encoding="utf-8")
-    assert f'schema_version: "{STUDIO_TRACE_EXPORT_SCHEMA_VERSION}"' in trace_source
-    assert f'schema_version: "{STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION}"' in trace_source
+    compiled_assets = sorted(
+        (ROOT / "src" / "monoid_agent_kernel" / "reference" / "studio" / "web" / "dist").glob(
+            "assets/*.js"
+        )
+    )
+    assert compiled_assets
+    compiled_source = "\n".join(path.read_text(encoding="utf-8") for path in compiled_assets)
+    assert STUDIO_TRACE_EXPORT_SCHEMA_VERSION in compiled_source
+    assert STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION in compiled_source
 
 
 def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
