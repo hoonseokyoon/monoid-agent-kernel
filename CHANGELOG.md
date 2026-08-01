@@ -7,6 +7,69 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-08-01
+
+### Fixed — Studio traces tell the operational story
+
+- Studio hides `model.output.delta` and `model.reasoning.delta` events from Trace by default and
+  reports an operation count. The token-event toggle remains available for retained runs that
+  already contain legacy delta events, and the compact summary reports omitted event counts and
+  UTF-8 text bytes.
+- Trace export now offers two explicit contracts. Raw export preserves every source event as
+  `studio.trace-export.v1`; compact export writes `studio.trace-export.compact.v1`, its omission
+  summary, and operation-level events only. The side-panel preview uses the same operation filter,
+  so long answers no longer displace tool, task, and lifecycle activity.
+
+### Added — one live content path from provider to Studio
+
+- The kernel exposes a provider-independent, passive model-stream observer for output and reasoning
+  deltas. Synchronous, asynchronous, and streamed model calls share the same observer lifecycle;
+  observer failures stay contained and cannot replace the model-call outcome. `AgentLoop.astream`
+  remains the execution-owning stream, and `emit_output_deltas=True` retains the legacy durable
+  event mirror for integrations that explicitly use it.
+- Runs can opt into the private append-only `model-content.jsonl` sidecar. It batches deltas into
+  bounded UTF-8 segments, records terminal outcomes and content-addressed settled text, recovers
+  valid records around malformed or torn lines, and exposes interrupted or abandoned partial
+  output to entitled readers. Existing transcript-only runs continue to hydrate through the
+  transcript fallback.
+- The Reference backend adds a bounded, root-scoped `monoid.model-stream.live.v1` broker. One
+  subscription multiplexes the root run and validated descendants, replays a retained suffix after
+  reconnect, and emits a reset when a generation, sequence, capacity, or frame-size boundary makes
+  replay incomplete. Closing the presentation stream never cancels the run.
+
+### Added — replay-safe Studio chat recovery
+
+- Studio renders live root and subagent output/reasoning through a separate `/api/model-stream`
+  EventSource. These frames stay outside the event reducer, durable Trace, and raw operation-log
+  export, so users keep token-by-token feedback without multiplying `events.jsonl` envelopes.
+- A reset or missing UTF-8 byte range hydrates the latest authorized prefix from
+  `/api/model-content`, then applies retained live frames from the broker baseline. Reloads,
+  transient SSE gaps, broker eviction, and backend generation changes recover without duplicating
+  text. Interrupted work retains its available partial output.
+- Hydration binds every root/descendant record to its run directory and verified sidecar file
+  identity. Coordinated flush failures, file replacement, and writer lifecycle races return HTTP
+  503, which Studio retries. Request-scoped path watchers catch complete open/close ABA cycles
+  without retaining per-run registry tombstones or invalidating unrelated runs.
+
+### Compatibility and deployment notes
+
+- Studio now sets its legacy durable delta mirror to off and uses the live/private content channel.
+  Consumers that previously read token text from a Studio run's `/api/events` stream should use
+  `/api/model-stream`; direct `AgentLoop` users can continue to select durable delta events with
+  `emit_output_deltas=True`.
+- `MONOID_OUTPUT_DELTAS=0` and `monoid studio serve --no-output-deltas` form Studio's content-egress
+  gate: both the live SSE route and private model-content sidecar are disabled. Provider streaming
+  remains enabled when the async HTTP transport is installed, preserving token-boundary Stop.
+- Live Studio delivery requires the `[http-async]` extra. The new wire and artifact identifiers are
+  registered in the compatibility ledger, and old run directories remain readable.
+
+### Fixed — source distributions exclude local release scratch trees
+
+- The sdist exclusion now covers the full `.tmp/**` subtree. Git's repository-wide
+  `!.env.example` exception could re-include a nested copy from an ignored release-audit directory
+  when building from a developer worktree. Release archives now exclude that local scratch content
+  even when an inner filename is independently unignored.
+
 ## [0.20.0] - 2026-08-01
 
 ### Fixed — Studio plan truncation is visible (gap 9)

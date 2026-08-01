@@ -911,10 +911,10 @@ and returns output/reasoning text with their UTF-8 end offsets. Studio flushes a
 sidecar batches before reading the snapshot, so the snapshot covers the broker prefix represented
 by a reset cursor. Sidecar access requires a regular, single-link file whose path and open file
 descriptor keep the same identity across each read, write, and flush. An unsafe or unavailable
-sidecar, including an active-flush failure, returns `model_content_unavailable` with HTTP 503; the
-browser retries hydration without advancing its broker cursor. Both routes reject content requests
-with HTTP 403 when Studio's live/private egress gate is disabled. Their frames and snapshots stay
-out of the durable event reducer and Trace.
+sidecar, including an active-flush failure, returns HTTP 503; the browser retries hydration without
+advancing its broker cursor. Both routes reject content requests with HTTP 403 when Studio's
+live/private egress gate is disabled. Their frames and snapshots stay out of the durable event
+reducer and Trace.
 
 ### Diagnostics
 
