@@ -1322,12 +1322,13 @@ class AgentLoop:
         *,
         data: dict[str, Any] | None = None,
         level: str = "info",
+        turn_id: str | None = None,
     ) -> bool:
         """Emit an operator/backend event through the live recorder when a session is open."""
         session = self._session
         if session is None:
             return False
-        session.res.recorder.emit(event_type, data=data, level=level)
+        session.res.recorder.emit(event_type, data=data, level=level, turn_id=turn_id)
         return True
 
     def pending_outbox(self) -> list[OutboxRequest]:
@@ -2025,6 +2026,7 @@ class AgentLoop:
         outcome_final_text: str | None = None
         outcome_usage: Mapping[str, Any] | None = None
         outcome_error_code: str | None = None
+        outcome_retryable = False
         try:
             turn, _receipt = await runner.acall(
                 request,
@@ -2060,6 +2062,10 @@ class AgentLoop:
                 outcome_error_code = str(getattr(exc, "error_code", None) or "internal_error")
             except Exception:
                 outcome_error_code = "internal_error"
+            try:
+                outcome_retryable = isinstance(exc, ModelAdapterError) and exc.retryable is True
+            except Exception:
+                outcome_retryable = False
             raise
         else:
             outcome_status = "completed"
@@ -2073,6 +2079,7 @@ class AgentLoop:
                         final_text=outcome_final_text,
                         usage=outcome_usage,
                         error_code=outcome_error_code,
+                        retryable=outcome_retryable,
                     )
                 except Exception:
                     # Outcome capture is diagnostic too. Preserve the terminal status even if a

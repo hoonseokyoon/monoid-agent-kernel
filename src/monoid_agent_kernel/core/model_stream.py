@@ -62,12 +62,16 @@ class ModelStreamOutcome:
 
     ``final_text`` is the provider's settled or best available partial output.  ``usage`` remains
     provider-independent by carrying the normalized usage mapping produced by the adapter layer.
+    ``retryable`` records the provider's transient-failure signal used by a lifecycle owner to
+    decide whether the call is eligible for automatic retry. An explicit user reissue can still
+    replace a non-retryable call after configuration changes.
     """
 
     status: ModelStreamStatus
     final_text: str | None = None
     usage: Mapping[str, Any] | None = field(default=None)
     error_code: str | None = None
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in _STATUSES:
@@ -77,6 +81,8 @@ class ModelStreamOutcome:
             )
         if self.usage is not None:
             object.__setattr__(self, "usage", dict(self.usage))
+        if type(self.retryable) is not bool:
+            raise ValueError("model stream retryable must be a boolean")
 
 
 @runtime_checkable

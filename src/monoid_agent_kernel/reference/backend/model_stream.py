@@ -100,6 +100,7 @@ class LiveModelStreamFrame:
     final_text: str | None = None
     usage: Mapping[str, Any] | None = field(default=None)
     error_code: str | None = None
+    retryable: bool | None = None
     partial: bool | None = None
     content_omitted: bool = False
     reason: LiveModelStreamResetReason | None = None
@@ -109,6 +110,8 @@ class LiveModelStreamFrame:
     def __post_init__(self) -> None:
         if self.usage is not None:
             object.__setattr__(self, "usage", dict(self.usage))
+        if self.retryable is not None and type(self.retryable) is not bool:
+            raise ValueError("model stream retryable must be a boolean")
         if self.kind == "delta":
             if self.channel not in {"output", "reasoning"} or not isinstance(self.text, str):
                 raise ValueError("model stream delta requires a channel and text")
@@ -158,6 +161,7 @@ class LiveModelStreamFrame:
             "final_text": self.final_text,
             "usage": None if self.usage is None else dict(self.usage),
             "error_code": self.error_code,
+            "retryable": self.retryable,
             "partial": self.partial,
             "reason": self.reason,
             "oldest_available_cursor": self.oldest_available_cursor,
@@ -641,6 +645,7 @@ class _LiveModelStreamWriter(ModelStreamWriter):
                 ),
                 usage=usage,
                 error_code=outcome.error_code,
+                retryable=outcome.retryable,
                 partial=outcome.status != "completed",
             )
 

@@ -168,7 +168,6 @@ export function reduceRunEvent(state: RunViewState, event: RunEvent): RunViewSta
       return next;
     case "run.resumed":
     case "run.resume.completed":
-    case "run.retrying":
       return { ...next, status: "queued", error: null, errorRetryable: false, manualRetryCandidate: false, manualRetryReady: false };
     case "turn.failed": {
       const retryable = Boolean(data.retryable);

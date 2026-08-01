@@ -50,6 +50,7 @@ def _write_model_content_snapshot(
     output: str,
     reasoning: str = "",
     status: ModelStreamStatus = "completed",
+    retryable: bool = False,
     step: int = 1,
     turn_id: str | None = None,
     started_at: str = "2026-08-01T00:00:00Z",
@@ -76,6 +77,7 @@ def _write_model_content_snapshot(
             status=status,
             final_text=output,
             usage={"output_tokens": 1},
+            retryable=retryable,
         )
     )
     store.close()
@@ -192,11 +194,16 @@ def test_studio_retry_reissues_failed_by_value_request_without_duplicate_user_me
         assert retried["retried"] is True
         assert retried["retry_mode"] == "reissue_failed_turn"
         assert retried["retry_of_event_seq"] == failed["seq"]
+        assert retried["retry_of_turn_id"] == failed["turn_id"]
         assert retried["new_attempt"] is False
         assert retried["message_snapshot_reused"] is True
         assert retried["request_snapshot_reused"] is False
         assert retried["runtime_config_source"] == "current"
         assert retried["message_snapshot"] == "existing_by_value_messages"
+        retry_marker = _wait_event(server, run_id, "run.resumed")
+        assert retry_marker is not None
+        assert retry_marker["data"] == {"reason": "studio-retry"}
+        assert retry_marker["turn_id"] == failed["turn_id"]
         assert _wait_settled(server, run_id, 1)
 
         assert len(adapter.requests) == 2
@@ -238,7 +245,17 @@ def test_studio_retry_recovers_a_parked_session_before_enqueue(tmp_path: Path) -
             assert (received_run_id, received_token, from_seq) == (run_id, token, 0)
             return {
                 "events": [
-                    {"type": "turn.failed", "seq": 7, "data": {"retryable": False}},
+                    {
+                        "type": "model.turn.started",
+                        "seq": 6,
+                        "turn_id": "turn_0001",
+                        "data": {"step": 1},
+                    },
+                    {
+                        "type": "turn.failed",
+                        "seq": 7,
+                        "data": {"retryable": False},
+                    },
                 ]
             }
 
@@ -261,19 +278,87 @@ def test_studio_retry_recovers_a_parked_session_before_enqueue(tmp_path: Path) -
 
     assert retried["retried"] is True
     assert retried["retry_id"] == "studio_retry_7"
+    assert retried["retry_of_turn_id"] == "turn_0001"
     assert backend.resumed is True
     assert backend.send_calls == [
         {
             "message_id": "studio_retry_7",
             "source": "studio-retry",
-            "metadata": {"retry_of_event_seq": 7},
+            "metadata": {
+                "retry_of_event_seq": 7,
+                "retry_of_turn_id": "turn_0001",
+            },
         },
         {
             "message_id": "studio_retry_7",
             "source": "studio-retry",
-            "metadata": {"retry_of_event_seq": 7},
+            "metadata": {
+                "retry_of_event_seq": 7,
+                "retry_of_turn_id": "turn_0001",
+            },
         },
     ]
+
+
+def test_studio_retry_omits_unproven_malformed_turn_identity(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(workspace=workspace, host="127.0.0.1", port=0, run_root=tmp_path / "runs")
+    )
+    run_id = "run_malformed_retry_identity"
+    token = "run-token"
+    server._run_tokens[run_id] = token
+
+    class MalformedBackend:
+        def __init__(self) -> None:
+            self.send_kwargs: dict[str, object] | None = None
+
+        def status(self, received_run_id: str, received_token: str) -> dict[str, object]:
+            assert (received_run_id, received_token) == (run_id, token)
+            return {"state": "awaiting_input", "terminal": False}
+
+        def events(
+            self, received_run_id: str, received_token: str, *, from_seq: int
+        ) -> dict[str, object]:
+            assert (received_run_id, received_token, from_seq) == (run_id, token, 0)
+            return {
+                "events": [
+                    {
+                        "type": "model.turn.started",
+                        "seq": 6,
+                        "turn_id": 123,
+                        "data": {"step": 1},
+                    },
+                    {
+                        "type": "turn.failed",
+                        "seq": 7,
+                        "turn_id": ["turn_0001"],
+                        "data": {"retryable": False},
+                    },
+                ]
+            }
+
+        def send_message(
+            self,
+            received_run_id: str,
+            received_token: str,
+            message: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            assert (received_run_id, received_token, message) == (run_id, token, "")
+            self.send_kwargs = kwargs
+            return {"status": "queued"}
+
+    backend = MalformedBackend()
+    server._backend = backend  # type: ignore[assignment]
+
+    retried = server.retry_chat(run_id)
+
+    assert retried["retried"] is True
+    assert "retry_of_turn_id" not in retried
+    assert backend.send_kwargs is not None
+    assert backend.send_kwargs["metadata"] == {"retry_of_event_seq": 7}
 
 
 def test_studio_resume_route_reports_an_already_live_session(studio: StudioServer) -> None:
@@ -553,7 +638,8 @@ def test_studio_model_content_snapshot_multiplexes_only_authorized_lineage(
             stream_id=root_stream_id,
             output="child",
             reasoning="왜",
-            status="interrupted",
+            status="failed",
+            retryable=True,
             step=2,
             started_at="2026-08-01T00:00:01Z",
         )
@@ -616,8 +702,10 @@ def test_studio_model_content_snapshot_multiplexes_only_authorized_lineage(
         assert child["reasoning_end_offset"] == 3
         assert child["output_text"] == "child"
         assert child["output_end_offset"] == 5
-        assert child["status"] == "interrupted"
+        assert child["status"] == "failed"
         assert child["partial"] is True
+        assert child["retryable"] is True
+        assert root["retryable"] is False
         assert child["final_text"] == "child"
         assert child["step"] == 2
         assert root["stream_id"] == child["stream_id"] == root_stream_id

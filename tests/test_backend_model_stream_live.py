@@ -86,12 +86,33 @@ def test_broker_multiplexes_descendant_lifecycle_and_content_by_root() -> None:
     assert frames[3].final_text == "answer"
     assert frames[3].usage == {"output_tokens": 2, "ratio": None}
     assert frames[3].error_code == "turn_interrupted"
+    assert frames[3].retryable is False
     payload = frames[3].to_json()
     assert payload["schema_version"] == MODEL_STREAM_LIVE_SCHEMA_VERSION
     assert payload["cursor"] == "test-generation:4"
     sse = frames[3].to_sse().decode("utf-8")
     assert sse.startswith("id: test-generation:4\nevent: model-stream\ndata: ")
     assert json.loads(sse.split("data: ", 1)[1]) == payload
+
+
+def test_failed_close_carries_retryability_to_live_consumers() -> None:
+    broker = LiveModelStreamBroker(generation="retryable")
+    writer = broker.observer("root-1").open(_context())
+    writer.push(ModelStreamDelta(channel="output", text="partial"))
+    writer.close(
+        ModelStreamOutcome(
+            status="failed",
+            final_text="partial",
+            error_code="gateway_timeout",
+            retryable=True,
+        )
+    )
+
+    closed = broker.subscribe("root-1", after_cursor="retryable:0").poll()[-1]
+
+    assert closed.kind == "closed"
+    assert closed.retryable is True
+    assert closed.to_json()["retryable"] is True
 
 
 def test_broker_isolates_root_rings() -> None:
@@ -618,6 +639,13 @@ def test_delta_frame_validates_offsets_and_non_delta_frames_reject_them() -> Non
             root_run_id="root",
             start_offset=0,
             end_offset=0,
+        )
+    with pytest.raises(ValueError, match="retryable must be a boolean"):
+        LiveModelStreamFrame(
+            kind="closed",
+            cursor=cursor,
+            root_run_id="root",
+            retryable=1,  # type: ignore[arg-type]
         )
 
 

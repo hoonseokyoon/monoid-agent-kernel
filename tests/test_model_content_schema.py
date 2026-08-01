@@ -91,6 +91,24 @@ def test_model_content_schema_accepts_the_legacy_namespace() -> None:
     assert _errors(record) == []
 
 
+def test_model_content_schema_accepts_optional_retryability_and_rejects_non_boolean() -> None:
+    record = {
+        "schema_version": "monoid.model-content.v1",
+        "kind": "stream_closed",
+        "run_id": "run-1",
+        "stream_id": "stream-1",
+        "status": "failed",
+        "final_text": "partial",
+        "usage": None,
+        "error_code": "gateway_timeout",
+        "retryable": True,
+        "finished_at": "2026-08-01T00:00:02Z",
+    }
+
+    assert _errors(record) == []
+    assert _errors({**record, "retryable": 1})
+
+
 def test_model_content_schema_rejects_unknown_fields_and_missing_versions() -> None:
     record = {
         "kind": "stream_segment",

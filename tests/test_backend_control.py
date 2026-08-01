@@ -516,8 +516,9 @@ class _UnopenedLoop:
         *,
         data: dict[str, Any] | None = None,
         level: str = "info",
+        turn_id: str | None = None,
     ) -> bool:
-        del event_type, data, level
+        del event_type, data, level, turn_id
         self.calls += 1
         return False
 
@@ -641,7 +642,11 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(
     assert status.status == "ok"
     record = backend._record(run_id)
     assert record.loop is not None
-    assert record.loop.emit_external_event("control.test.after_audit", data={"ok": True})
+    assert record.loop.emit_external_event(
+        "control.test.after_audit",
+        data={"ok": True},
+        turn_id="turn_external",
+    )
 
     events = _events(backend, run_id)
     seqs = [event["seq"] for event in events]
@@ -650,10 +655,11 @@ def test_dispatch_control_audit_uses_live_recorder_sequence(
     completed_seq = max(
         event["seq"] for event in events if event["type"] == "control.command.completed"
     )
-    after_seq = next(
-        event["seq"] for event in events if event["type"] == "control.test.after_audit"
+    after_event = next(
+        event for event in events if event["type"] == "control.test.after_audit"
     )
-    assert after_seq > completed_seq
+    assert after_event["seq"] > completed_seq
+    assert after_event["turn_id"] == "turn_external"
 
     backend.cancel_run(run_id, token)
     backend.wait_for_run(run_id, timeout_s=20)

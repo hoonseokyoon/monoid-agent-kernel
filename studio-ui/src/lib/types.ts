@@ -160,6 +160,7 @@ export interface ResumeResponse extends ChatResponse {
 export interface RetryResponse extends ChatResponse {
   retried?: boolean;
   retry_of_event_seq?: number;
+  retry_of_turn_id?: string;
 }
 
 export interface RunEvent<T extends Record<string, unknown> = Record<string, unknown>> {

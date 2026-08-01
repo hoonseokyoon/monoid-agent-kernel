@@ -112,6 +112,54 @@ def test_first_segment_is_immediate_and_channel_switch_flushes(tmp_path: Path) -
     assert snapshot.final_text == "ab"
     assert snapshot.best_output_text == "ab"
     assert snapshot.usage == {"input_tokens": 2, "output_tokens": 2}
+    assert snapshot.retryable is False
+    closed = next(record for record in records if record["kind"] == "stream_closed")
+    assert closed["retryable"] is False
+
+
+def test_retryable_failed_stream_round_trips_through_private_content(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1")
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "retry prefix"))
+    writer.close(
+        ModelStreamOutcome(
+            "failed",
+            final_text="retry prefix",
+            error_code="gateway_timeout",
+            retryable=True,
+        )
+    )
+    store.close()
+
+    closed = next(record for record in _records(path) if record["kind"] == "stream_closed")
+    snapshot = read_model_content(path).snapshots[0]
+
+    assert closed["retryable"] is True
+    assert snapshot.status == "failed"
+    assert snapshot.retryable is True
+
+
+def test_reader_defaults_missing_stream_retryability_to_false(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1")
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "old prefix"))
+    writer.close(ModelStreamOutcome("failed", final_text="old prefix"))
+    store.close()
+
+    records = _records(path)
+    closed = next(record for record in records if record["kind"] == "stream_closed")
+    closed.pop("retryable")
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    snapshot = read_model_content(path).snapshots[0]
+
+    assert snapshot.status == "failed"
+    assert snapshot.retryable is False
 
 
 def test_explicit_live_hydration_flush_commits_the_current_batch(tmp_path: Path) -> None:

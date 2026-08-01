@@ -28,7 +28,9 @@
   import {
     ModelStreamEventSource,
     decodeModelContentResponse,
+    discardModelStreamAttempt,
     initialModelStreamState,
+    markModelStreamPartialSuperseded,
     projectModelContentSnapshot,
     projectModelStreamFrame,
     projectSubagentStarted,
@@ -651,6 +653,16 @@
               events: reducedRun.events,
             }
           : reducedRun;
+        if (event.type === "run.resumed"
+          && event.data.reason === "studio-retry"
+          && typeof event.turn_id === "string") {
+          const retryOfTurnId = event.turn_id;
+          run = discardModelStreamAttempt(run, modelStreamState, runId, retryOfTurnId);
+          modelStreamState = markModelStreamPartialSuperseded(
+            modelStreamState,
+            retryOfTurnId,
+          );
+        }
         if (((eventAlreadyProjected
           && !correlatedTerminal
           && !runTerminal
@@ -1015,6 +1027,12 @@
       const response = await studioApi.retry(runId);
       if (!isCurrentSession(runId, epoch)) return;
       if (response.retried === false) throw new Error("The failed request was not reissued.");
+      const retryOfTurnId = typeof response.retry_of_turn_id === "string"
+        ? response.retry_of_turn_id
+        : "";
+      if (retryOfTurnId) {
+        run = discardModelStreamAttempt(run, modelStreamState, runId, retryOfTurnId);
+      }
       run = {
         ...run,
         status: "queued",
@@ -1026,6 +1044,9 @@
       modelStreamRunTerminal = false;
       modelStreamRecoveryFenced = false;
       modelStreamState = initialModelStreamState(runId);
+      if (retryOfTurnId) {
+        modelStreamState = markModelStreamPartialSuperseded(modelStreamState, retryOfTurnId);
+      }
       modelStreamHydrationKey = null;
       modelStreamHydrationFailures = 0;
       openStream(runId, epoch);

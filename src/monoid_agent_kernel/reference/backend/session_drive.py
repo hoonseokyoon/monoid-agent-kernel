@@ -50,6 +50,27 @@ def _queued_message_to_loop_input(message: Any) -> str | tuple[ContentPart, ...]
     return message
 
 
+def _studio_retry_resume_event(message: Any) -> tuple[dict[str, Any], str | None] | None:
+    """Recover a v1-compatible durable marker from Studio's retry inbox envelope."""
+
+    if not is_inbox_envelope(message):
+        return None
+    try:
+        envelope = InboxMessage.from_json(message)
+    except (TypeError, ValueError):
+        return None
+    if envelope.source != "studio-retry":
+        return None
+    retry_of_event_seq = envelope.metadata.get("retry_of_event_seq")
+    retry_of_turn_id = envelope.metadata.get("retry_of_turn_id")
+    if type(retry_of_event_seq) is not int or retry_of_event_seq < 0:
+        return None
+    turn_id = retry_of_turn_id if isinstance(retry_of_turn_id, str) and retry_of_turn_id else None
+    # ``run.resumed`` and its envelope-level optional turn_id are already part of
+    # monoid.event.v1. Reusing that shape keeps mixed-version event readers compatible.
+    return {"reason": "studio-retry"}, turn_id
+
+
 async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
     """Awaitable, cancellable exponential backoff with jitter for turn-level retries."""
     delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
@@ -141,6 +162,17 @@ class SessionDriveService:
                     break
                 if message is self._context.close_signal:
                     break
+                retry_event = _studio_retry_resume_event(message)
+                if retry_event is not None:
+                    # The inbox envelope is checkpointed before enqueue. Emit its retry identity
+                    # before starting the replacement model turn so a lost HTTP response, browser
+                    # reload, or backend recovery can reconstruct the same chat supersession.
+                    retry_data, retry_turn_id = retry_event
+                    loop.emit_external_event(
+                        "run.resumed",
+                        data=retry_data,
+                        turn_id=retry_turn_id,
+                    )
                 turns += 1
                 suspension = await loop.arun_until_suspended(_queued_message_to_loop_input(message))
                 continue

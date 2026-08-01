@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
@@ -250,19 +252,32 @@ def test_stream_model_calls_forces_streaming_and_token_boundary_interrupt(tmp_pa
 
 def test_partial_output_closes_observer_as_failed(tmp_path: Path) -> None:
     observer = _RecordingObserver()
-    adapter = _ScriptedStreamAdapter([TextDelta("partial"), ModelAdapterError("provider broke")])
+    adapter = _ScriptedStreamAdapter(
+        [TextDelta("partial"), ModelAdapterError("provider broke", retryable=True)]
+    )
     loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,))
 
-    result = loop.run_once("go")
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.close()
 
-    assert result.status == "failed"
+    assert suspension.reason == "turn_failed"
+    assert suspension.retryable is True
     assert observer.writers[0].outcomes == [
         ModelStreamOutcome(
             status="failed",
             final_text="partial",
             error_code="model_error",
+            retryable=True,
         )
     ]
+
+
+def test_model_stream_outcome_requires_boolean_retryability() -> None:
+    with pytest.raises(ValueError, match="retryable must be a boolean"):
+        ModelStreamOutcome(status="failed", retryable=1)  # type: ignore[arg-type]
 
 
 def test_observer_factory_open_push_and_close_failures_are_isolated(tmp_path: Path) -> None:

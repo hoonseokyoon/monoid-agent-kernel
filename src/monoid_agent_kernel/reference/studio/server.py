@@ -1687,14 +1687,16 @@ class StudioServer:
             "run.failed",
             "run.finished",
         }
-        latest = next(
+        event_list = events if isinstance(events, list) else []
+        latest_index = next(
             (
-                event
-                for event in reversed(events if isinstance(events, list) else [])
-                if str(event.get("type") or "") in boundaries
+                index
+                for index in range(len(event_list) - 1, -1, -1)
+                if str(event_list[index].get("type") or "") in boundaries
             ),
             None,
         )
+        latest = event_list[latest_index] if latest_index is not None else None
         if latest is None or str(latest.get("type") or "") != "turn.failed":
             raise NativeAgentError(
                 "the latest turn boundary is not a failed turn",
@@ -1708,11 +1710,39 @@ class StudioServer:
             )
 
         failed_seq = int(latest.get("seq", -1))
+        raw_failed_turn_id = latest.get("turn_id")
+        failed_turn_id = (
+            raw_failed_turn_id
+            if isinstance(raw_failed_turn_id, str) and raw_failed_turn_id
+            else ""
+        )
+        if not failed_turn_id and latest_index is not None:
+            # v0.20.0 wrote turn.failed without turn_id. Its immediately preceding durable turn
+            # boundary is the correlated model.turn.started, so retained parked runs can still be
+            # retried after upgrade. If a malformed legacy log cannot prove that relationship,
+            # retry remains available and only the optional partial-suppression identity is absent.
+            previous_boundary = next(
+                (
+                    event_list[index]
+                    for index in range(latest_index - 1, -1, -1)
+                    if str(event_list[index].get("type") or "") in boundaries
+                ),
+                None,
+            )
+            if previous_boundary is not None and str(
+                previous_boundary.get("type") or ""
+            ) == "model.turn.started":
+                raw_previous_turn_id = previous_boundary.get("turn_id")
+                if isinstance(raw_previous_turn_id, str) and raw_previous_turn_id:
+                    failed_turn_id = raw_previous_turn_id
         retry_id = f"studio_retry_{failed_seq}"
+        retry_metadata: dict[str, Any] = {"retry_of_event_seq": failed_seq}
+        if failed_turn_id:
+            retry_metadata["retry_of_turn_id"] = failed_turn_id
         retry_kwargs = {
             "message_id": retry_id,
             "source": "studio-retry",
-            "metadata": {"retry_of_event_seq": failed_seq},
+            "metadata": retry_metadata,
         }
         try:
             queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
@@ -1720,7 +1750,7 @@ class StudioServer:
             self._backend.resume_run(run_id, token)
             queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
         queue_status = str(queued.get("status") or "")
-        return {
+        response = {
             "run_id": run_id,
             "state": str(status.get("state") or ""),
             "terminal": False,
@@ -1735,6 +1765,9 @@ class StudioServer:
             "runtime_config_source": "current",
             "message_snapshot": "existing_by_value_messages",
         }
+        if failed_turn_id:
+            response["retry_of_turn_id"] = failed_turn_id
+        return response
 
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -1960,6 +1993,7 @@ class StudioServer:
                     "reasoning_text": snapshot.reasoning_text,
                     "reasoning_end_offset": len(snapshot.reasoning_text.encode("utf-8")),
                     "partial": status != "completed",
+                    "retryable": snapshot.retryable,
                 }
                 if snapshot.final_text is not None:
                     item["final_text"] = snapshot.final_text

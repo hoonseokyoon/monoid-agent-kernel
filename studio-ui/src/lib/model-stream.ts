@@ -27,6 +27,7 @@ export interface ModelContentSnapshot {
   reasoning_text: string;
   reasoning_end_offset: number;
   partial: boolean;
+  retryable?: boolean;
   final_text?: string;
   usage?: Record<string, unknown>;
   error_code?: string;
@@ -74,6 +75,7 @@ export interface ModelStreamClosedFrame extends ModelStreamCallFrameBase {
   final_text?: string;
   usage?: Record<string, unknown>;
   error_code?: string;
+  retryable?: boolean;
   partial?: boolean;
   content_omitted?: boolean;
 }
@@ -113,6 +115,7 @@ export interface LiveModelCallState {
   reasoningBytes: number;
   finalText?: string;
   partial: boolean;
+  retryable: boolean;
 }
 
 export interface ModelStreamViewState {
@@ -129,6 +132,7 @@ export interface ModelStreamViewState {
   reasoning: string;
   rootTurnSealed: boolean;
   sealedRootTurnId: string | null;
+  supersededRootTurnIds: ReadonlySet<string>;
   needsHydration: boolean;
   resetReason: ModelStreamResetReason | "sequence_gap" | "content_omitted" | null;
   resetLatestCursor: string | null;
@@ -160,6 +164,7 @@ export function initialModelStreamState(rootRunId: string | null = null): ModelS
     reasoning: "",
     rootTurnSealed: false,
     sealedRootTurnId: null,
+    supersededRootTurnIds: new Set(),
     needsHydration: false,
     resetReason: null,
     resetLatestCursor: null,
@@ -276,6 +281,7 @@ export function decodeModelStreamFrame(payload: unknown): ModelStreamFrame | nul
       || (payload.final_text !== undefined && typeof payload.final_text !== "string")
       || (payload.usage !== undefined && !isRecord(payload.usage))
       || (payload.error_code !== undefined && typeof payload.error_code !== "string")
+      || (payload.retryable !== undefined && typeof payload.retryable !== "boolean")
       || (payload.partial !== undefined && typeof payload.partial !== "boolean")
       || (payload.content_omitted !== undefined && typeof payload.content_omitted !== "boolean")) {
       return null;
@@ -318,6 +324,7 @@ export function decodeModelContentResponse(payload: unknown): ModelContentRespon
       || !Number.isSafeInteger(stream.reasoning_end_offset)
       || Number(stream.reasoning_end_offset) !== utf8Length(stream.reasoning_text)
       || typeof stream.partial !== "boolean"
+      || (stream.retryable !== undefined && typeof stream.retryable !== "boolean")
       || (stream.final_text !== undefined && typeof stream.final_text !== "string")
       || (stream.usage !== undefined && !isRecord(stream.usage))
       || (stream.error_code !== undefined && typeof stream.error_code !== "string")) {
@@ -347,6 +354,7 @@ function callFromFrame(
     outputBytes: 0,
     reasoningBytes: 0,
     partial: false,
+    retryable: false,
   };
 }
 
@@ -423,6 +431,12 @@ export function reduceModelStreamFrame(
     frame,
     cursor,
   );
+  if (frame.run_id === frame.root_run_id
+    && state.supersededRootTurnIds.has(frame.turn_id)) {
+    // The durable retry signal can overtake this passive channel. Consume the broker cursor while
+    // refusing every late content frame from the exact attempt that was reissued.
+    return base;
+  }
   if (frame.kind === "closed" && frame.content_omitted) {
     // The broker deliberately retained this small terminal marker while the complete content was
     // flushed to the private sidecar. Resume after the marker so hydration cannot replay-loop.
@@ -527,6 +541,7 @@ export function reduceModelStreamFrame(
     output: finalText ?? call.output,
     outputBytes: finalText === undefined ? call.outputBytes : utf8Length(finalText),
     partial: frame.partial === true,
+    retryable: frame.retryable === true,
   };
   calls[identity] = updated;
   return {
@@ -553,6 +568,67 @@ function appendMessage(messages: ChatMessage[], message: ChatMessage): ChatMessa
   return [...messages, message];
 }
 
+/** Remember a root turn whose failed provider output was explicitly reissued. */
+export function markModelStreamPartialSuperseded(
+  state: ModelStreamViewState,
+  turnId: string,
+): ModelStreamViewState {
+  if (!turnId) return state;
+  const alreadySuperseded = state.supersededRootTurnIds.has(turnId);
+  const isActive = state.activeRootTurnId === turnId;
+  if (alreadySuperseded && !isActive) return state;
+  return {
+    ...state,
+    supersededRootTurnIds: alreadySuperseded
+      ? state.supersededRootTurnIds
+      : new Set([...state.supersededRootTurnIds, turnId]),
+    activeRootStreamId: isActive ? null : state.activeRootStreamId,
+    activeRootTurnId: isActive ? null : state.activeRootTurnId,
+    output: isActive ? "" : state.output,
+    reasoning: isActive ? "" : state.reasoning,
+  };
+}
+
+/** Remove the terminal row or active bubble owned by one explicitly reissued root turn. */
+export function discardModelStreamAttempt(
+  run: RunViewState,
+  state: ModelStreamViewState,
+  rootRunId: string,
+  turnId: string,
+): RunViewState {
+  const messages = run.messages.filter((message) => {
+    const source = message.source;
+    return !(source?.kind === "model_stream_partial"
+      && source.status === "failed"
+      && source.root_run_id === rootRunId
+      && source.run_id === rootRunId
+      && source.turn_id === turnId);
+  });
+  const discardActive = state.rootRunId === rootRunId && state.activeRootTurnId === turnId;
+  if (messages.length === run.messages.length && !discardActive) return run;
+  return {
+    ...run,
+    messages,
+    activeResponse: discardActive ? "" : run.activeResponse,
+    reasoning: discardActive ? "" : run.reasoning,
+  };
+}
+
+function discardSupersededRetryablePartials(
+  messages: ChatMessage[],
+  frame: ModelStreamOpenedFrame,
+): ChatMessage[] {
+  return messages.filter((message) => {
+    const source = message.source;
+    return !(source?.kind === "model_stream_partial"
+      && source.status === "failed"
+      && source.retryable === true
+      && source.root_run_id === frame.root_run_id
+      && source.run_id === frame.run_id
+      && source.stream_id !== frame.stream_id);
+  });
+}
+
 function compareCallFloor(
   incoming: ModelStreamCallFloor,
   existing: ModelStreamCallFloor | undefined,
@@ -575,6 +651,7 @@ export function projectModelStreamFrame(
 ): RunViewState {
   if (after.needsHydration || frame.kind === "reset" || frame.root_run_id !== run.runId) return run;
   if (frame.run_id !== frame.root_run_id) return run;
+  if (after.supersededRootTurnIds.has(frame.turn_id)) return run;
   if (run.messages.some((message) => message.source?.kind === "model_stream_active")) {
     // The initial private snapshot request may fail while the transcript and live SSE still work.
     // Once a root frame is valid, its bubble owns the ephemeral row and must not render beside it.
@@ -583,13 +660,30 @@ export function projectModelStreamFrame(
       messages: run.messages.filter((message) => message.source?.kind !== "model_stream_active"),
     };
   }
+  if (frame.kind === "opened") {
+    const identity = modelStreamCallKey(frame.run_id, frame.stream_id);
+    const acceptedReplacement = before.calls[identity] === undefined
+      && after.calls[identity]?.status === "running"
+      && after.activeRootStreamId === frame.stream_id
+      && !after.rootTurnSealed;
+    // A retry is a new kernel turn and stream over the same committed message log. Once that
+    // replacement starts, failed provider output is abandoned; interrupted output remains a
+    // deliberate user-visible partial.
+    if (acceptedReplacement) {
+      const messages = discardSupersededRetryablePartials(run.messages, frame);
+      if (messages.length !== run.messages.length) run = { ...run, messages };
+    }
+  }
 
   if (frame.kind === "closed") {
     const identity = modelStreamCallKey(frame.run_id, frame.stream_id);
     const prior = before.calls[identity];
     const call = after.calls[identity];
     const firstClose = prior?.status === "running" || (!prior && call?.status !== "running");
-    if (firstClose && call?.partial && call.output) {
+    if (firstClose
+      && call?.partial
+      && call.output
+      && !after.supersededRootTurnIds.has(frame.turn_id)) {
       const parsedStarted = call.startedAt ? Date.parse(call.startedAt) : Number.NaN;
       const parsedFinished = Date.parse(frame.finished_at);
       const createdAt = Number.isFinite(parsedFinished)
@@ -611,6 +705,7 @@ export function projectModelStreamFrame(
           stream_id: frame.stream_id,
           status: frame.status,
           partial: true,
+          retryable: call.retryable,
         },
       };
       return {
@@ -713,6 +808,7 @@ export function markModelStreamHydrated(state: ModelStreamViewState): ModelStrea
   const cursor = parseCursor(state.resumeCursor);
   return {
     ...initialModelStreamState(state.rootRunId),
+    supersededRootTurnIds: state.supersededRootTurnIds,
     generation: cursor?.generation ?? null,
     sequence: cursor?.sequence ?? -1,
     cursor: state.resumeCursor,
@@ -740,6 +836,7 @@ function callFromSnapshot(snapshot: ModelContentSnapshot): LiveModelCallState {
     reasoningBytes: snapshot.reasoning_end_offset,
     finalText: snapshot.final_text,
     partial: snapshot.partial,
+    retryable: snapshot.retryable === true,
   };
 }
 
@@ -761,10 +858,13 @@ export function seedModelStreamSnapshot(
       startedAt: call.startedAt ?? "",
       streamId: call.streamId,
     };
-    if (call.runId === response.root_run_id && call.status === "running") activeRoot = call;
+    if (call.runId === response.root_run_id
+      && call.status === "running"
+      && !state.supersededRootTurnIds.has(call.turnId)) activeRoot = call;
   }
   return {
     ...initialModelStreamState(response.root_run_id),
+    supersededRootTurnIds: state.supersededRootTurnIds,
     generation: cursor?.generation ?? null,
     sequence: cursor?.sequence ?? -1,
     cursor: state.resumeCursor,
@@ -783,7 +883,13 @@ export function projectModelContentSnapshot(
   run: RunViewState,
   state: ModelStreamViewState,
 ): RunViewState {
-  let messages = run.messages.filter((message) => message.source?.kind !== "model_stream_active");
+  let messages = run.messages.filter((message) => {
+    const source = message.source;
+    return source?.kind !== "model_stream_active"
+      && !(source?.kind === "model_stream_partial"
+        && typeof source.turn_id === "string"
+        && state.supersededRootTurnIds.has(source.turn_id));
+  });
   const rootFloor = state.rootRunId ? state.floors[state.rootRunId] : undefined;
   const terminal = state.rootRunId && rootFloor
     ? state.calls[modelStreamCallKey(state.rootRunId, rootFloor.streamId)]
@@ -793,7 +899,8 @@ export function projectModelContentSnapshot(
     && terminal.status !== "completed"
     && terminal.status !== "abandoned"
     && terminal.partial
-    && terminal.output) {
+    && terminal.output
+    && !state.supersededRootTurnIds.has(terminal.turnId)) {
     const parsedStarted = terminal.startedAt ? Date.parse(terminal.startedAt) : Number.NaN;
     messages = appendMessage(messages, {
       id: `assistant:model-stream:${terminal.streamId}:partial`,
@@ -809,6 +916,7 @@ export function projectModelContentSnapshot(
         stream_id: terminal.streamId,
         status: terminal.status,
         partial: true,
+        retryable: terminal.retryable,
       },
     });
   }

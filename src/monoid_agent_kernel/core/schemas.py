@@ -856,6 +856,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "final_text": {"type": ["string", "null"]},
                 "usage": {"type": ["object", "null"]},
                 "error_code": {"type": ["string", "null"]},
+                "retryable": {"type": "boolean"},
                 "finished_at": {"type": "string", "pattern": "Z$"},
             },
             "additionalProperties": False,

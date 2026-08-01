@@ -66,6 +66,7 @@ class ModelContentSnapshot:
     final_text: str | None = None
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
+    retryable: bool = False
     segment_count: int = 0
     last_segment_index: int | None = None
 
@@ -491,6 +492,7 @@ class _ModelContentWriter:
                 "final_text": outcome.final_text,
                 "usage": None if outcome.usage is None else dict(outcome.usage),
                 "error_code": outcome.error_code,
+                "retryable": outcome.retryable,
                 "finished_at": utc_timestamp(),
             }
         )
@@ -584,6 +586,7 @@ class _RecoveredStream:
     final_text: str | None = None
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
+    retryable: bool = False
 
     def snapshot(self) -> ModelContentSnapshot:
         ordered = sorted(self.segments.items())
@@ -598,6 +601,7 @@ class _RecoveredStream:
             final_text=self.final_text,
             usage=self.usage,
             error_code=self.error_code,
+            retryable=self.retryable,
             segment_count=len(ordered),
             last_segment_index=indexes[-1] if indexes else None,
         )
@@ -995,6 +999,7 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
     final_text = record.get("final_text")
     usage = record.get("usage")
     error_code = record.get("error_code")
+    retryable = record.get("retryable", False)
     finished_at = record.get("finished_at")
     if final_text is not None and not isinstance(final_text, str):
         return False
@@ -1002,12 +1007,15 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
         return False
     if error_code is not None and not isinstance(error_code, str):
         return False
+    if type(retryable) is not bool:
+        return False
     if not isinstance(finished_at, str) or not finished_at.endswith("Z"):
         return False
     recovered.status = status
     recovered.final_text = final_text
     recovered.usage = usage
     recovered.error_code = error_code
+    recovered.retryable = retryable
     return True
 
 

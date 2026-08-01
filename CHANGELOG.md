@@ -46,6 +46,11 @@ out in commit messages and here.
   `/api/model-content`, then applies retained live frames from the broker baseline. Reloads,
   transient SSE gaps, broker eviction, and backend generation changes recover without duplicating
   text. Interrupted work retains its available partial output.
+- Failed provider prefixes follow the retry lifecycle. A transient failed attempt disappears when
+  its automatic replacement stream starts; an explicit Studio Retry durably identifies and removes
+  the exact failed turn it reissues, including after a lost response or reload. Retained replay and
+  hydration cannot restore that abandoned prefix. Non-retryable failures followed by a new user
+  message and user-interrupted partials remain visible.
 - Hydration binds every root/descendant record to its run directory and verified sidecar file
   identity. Coordinated flush failures, file replacement, and writer lifecycle races return HTTP
   503, which Studio retries. Request-scoped path watchers catch complete open/close ABA cycles

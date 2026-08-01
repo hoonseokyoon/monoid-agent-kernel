@@ -17,7 +17,9 @@ const {
   ModelStreamEventSource,
   decodeModelContentResponse,
   decodeModelStreamFrame,
+  discardModelStreamAttempt,
   initialModelStreamState,
+  markModelStreamPartialSuperseded,
   markModelStreamHydrated,
   modelStreamCallKey,
   projectModelStreamFrame,
@@ -69,6 +71,13 @@ assert.match(appSource, /if \(!eventAlreadyProjected && runTerminal\)/);
 assert.match(appSource, /modelStreamRunTerminal = true;\s+modelStreamHydrationKey = null;/);
 assert.match(appSource, /if \(modelStreamRunTerminal\s+\|\| modelStreamRecoveryFenced\s+\|\| modelStreamHydrationKey === key/);
 assert.match(appSource, /modelStreamRunTerminal = false;\s+modelStreamRecoveryFenced = false;\s+modelStreamState = initialModelStreamState\(runId\);/);
+assert.match(appSource, /response\.retry_of_turn_id/);
+assert.match(appSource, /discardModelStreamAttempt\(run, modelStreamState, runId, retryOfTurnId\)/);
+assert.match(appSource, /markModelStreamPartialSuperseded\(modelStreamState, retryOfTurnId\)/);
+assert.match(
+  appSource,
+  /event\.type === "run\.resumed"[\s\S]*?event\.data\.reason === "studio-retry"[\s\S]*?event\.turn_id/,
+);
 
 const ROOT = "run-root";
 const GENERATION = "generation-a";
@@ -139,7 +148,10 @@ function runState() {
 
 assert.equal(decodeModelStreamFrame(opened(1))?.kind, "opened");
 assert.equal(decodeModelStreamFrame(delta(2, "output", "hello"))?.kind, "delta");
-assert.equal(decodeModelStreamFrame(closed(3, "interrupted", { final_text: "hello" }))?.kind, "closed");
+assert.equal(decodeModelStreamFrame(closed(3, "failed", {
+  final_text: "hello",
+  retryable: true,
+}))?.retryable, true);
 assert.equal(decodeModelStreamFrame({
   schema_version: "monoid.model-stream.live.v1",
   cursor: `${GENERATION}:4`,
@@ -155,6 +167,11 @@ assert.equal(decodeModelStreamFrame({ ...delta(2, "tool", "secret fragment") }),
 assert.equal(decodeModelStreamFrame({ ...delta(2, "output", "x"), step: 0 }), null);
 assert.equal(decodeModelStreamFrame({ ...delta(2, "output", "🙂"), end_offset: 2 }), null);
 assert.equal(decodeModelStreamFrame({ ...delta(2, "output", "x"), schema_version: "future.v2" }), null);
+assert.equal(
+  decodeModelStreamFrame(closed(3, "failed", { retryable: 1 })),
+  null,
+  "closed-frame retryability must be a boolean",
+);
 assert.equal(decodeModelStreamFrame({
   schema_version: "monoid.model-stream.live.v1",
   cursor: "generation-recreated:0",
@@ -277,6 +294,328 @@ assert.equal(run.messages[0].content, "partial");
 assert.equal(run.messages[0].source.kind, "model_stream_partial");
 const projectedAgain = projectModelStreamFrame(run, live, live, interrupted);
 assert.equal(projectedAgain.messages.length, 1, "replayed partial closes must use a stable id");
+
+// A retry starts a fresh kernel turn/stream while reissuing the same committed message log. The
+// failed provider attempt is ephemeral and must leave chat when that replacement stream opens.
+let retryState = initialModelStreamState(ROOT);
+let retryRun = runState();
+const failedOpen = opened(1, { turn_id: "failed-turn", stream_id: "failed-stream" });
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, failedOpen);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, failedOpen);
+const failedDelta = delta(2, "output", "abandoned prefix", {
+  turn_id: "failed-turn",
+  stream_id: "failed-stream",
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, failedDelta);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, failedDelta);
+const failedClose = closed(3, "failed", {
+  turn_id: "failed-turn",
+  stream_id: "failed-stream",
+  final_text: "abandoned prefix",
+  retryable: true,
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, failedClose);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, failedClose);
+assert.equal(retryRun.messages.at(-1).source.status, "failed");
+retryRun = {
+  ...retryRun,
+  messages: [run.messages[0], ...retryRun.messages],
+};
+const staleRetryOpen = opened(4, {
+  turn_id: "stale-retry-turn",
+  stream_id: "stale-retry-stream",
+  step: 1,
+  started_at: "2025-12-31T23:59:59Z",
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, staleRetryOpen);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, staleRetryOpen);
+assert.equal(
+  retryRun.messages.at(-1).id,
+  "assistant:model-stream:failed-stream:partial",
+  "a stale opened frame must not supersede a retryable failed partial",
+);
+const retryOpen = opened(5, {
+  turn_id: "replacement-turn",
+  stream_id: "replacement-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, retryOpen);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, retryOpen);
+assert.deepEqual(
+  retryRun.messages.map((message) => message.id),
+  ["assistant:model-stream:stream-2:partial"],
+  "a replacement stream must discard failed partials while preserving interrupted partials",
+);
+const retryDelta = delta(6, "output", "recovered answer", {
+  turn_id: "replacement-turn",
+  stream_id: "replacement-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, retryDelta);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, retryDelta);
+const retryClose = closed(7, "completed", {
+  turn_id: "replacement-turn",
+  stream_id: "replacement-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+  final_text: "recovered answer",
+});
+before = retryState;
+retryState = reduceModelStreamFrame(retryState, retryClose);
+retryRun = projectModelStreamFrame(retryRun, before, retryState, retryClose);
+assert.equal(retryRun.activeResponse, "recovered answer");
+assert.deepEqual(
+  retryRun.messages.map((message) => message.id),
+  ["assistant:model-stream:stream-2:partial"],
+  "a successful retry must not resurrect the abandoned provider attempt",
+);
+
+let staleState = initialModelStreamState(ROOT);
+let staleRun = runState();
+const latestOpen = opened(1, {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = staleState;
+staleState = reduceModelStreamFrame(staleState, latestOpen);
+staleRun = projectModelStreamFrame(staleRun, before, staleState, latestOpen);
+const latestDelta = delta(2, "output", "latest failed prefix", {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = staleState;
+staleState = reduceModelStreamFrame(staleState, latestDelta);
+staleRun = projectModelStreamFrame(staleRun, before, staleState, latestDelta);
+const latestClose = closed(3, "failed", {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+  final_text: "latest failed prefix",
+  retryable: false,
+});
+before = staleState;
+staleState = reduceModelStreamFrame(staleState, latestClose);
+staleRun = projectModelStreamFrame(staleRun, before, staleState, latestClose);
+const staleOpen = opened(4, {
+  turn_id: "stale-turn",
+  stream_id: "stale-stream",
+  step: 1,
+  started_at: "2026-01-01T00:00:01Z",
+});
+before = staleState;
+staleState = reduceModelStreamFrame(staleState, staleOpen);
+staleRun = projectModelStreamFrame(staleRun, before, staleState, staleOpen);
+assert.equal(
+  staleRun.messages.at(-1).id,
+  "assistant:model-stream:latest-failed-stream:partial",
+  "a stale opened replay must not discard the latest failed partial",
+);
+// The durable failure event can lag the independent live SSE channel. Retryability on the
+// provider close must preserve a non-retryable partial even when the next user turn opens first.
+let nextUserState = before;
+let nextUserRun = staleRun;
+const nextUserOpen = opened(4, {
+  turn_id: "next-user-turn",
+  stream_id: "next-user-stream",
+  step: 3,
+  started_at: "2026-01-01T00:00:03Z",
+});
+before = nextUserState;
+nextUserState = reduceModelStreamFrame(nextUserState, nextUserOpen);
+nextUserRun = projectModelStreamFrame(nextUserRun, before, nextUserState, nextUserOpen);
+assert.equal(
+  nextUserRun.messages.at(-1).id,
+  "assistant:model-stream:latest-failed-stream:partial",
+  "a new user turn racing a durable non-retryable failure must preserve its partial",
+);
+nextUserState = sealModelStreamTurn(nextUserState, "latest-failed-turn");
+assert.equal(
+  nextUserRun.messages.at(-1).id,
+  "assistant:model-stream:latest-failed-stream:partial",
+  "a late durable failure must not retroactively remove the non-retryable partial",
+);
+
+let manualRetryRun = discardModelStreamAttempt(
+  nextUserRun,
+  nextUserState,
+  ROOT,
+  "latest-failed-turn",
+);
+assert.equal(
+  manualRetryRun.messages.some((message) => (
+    message.id === "assistant:model-stream:latest-failed-stream:partial"
+  )),
+  false,
+  "an explicit retry must discard the exact non-retryable attempt it reissues",
+);
+let manualRetryState = markModelStreamPartialSuperseded(
+  initialModelStreamState(ROOT),
+  "latest-failed-turn",
+);
+const replayedManualOpen = opened(1, {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = manualRetryState;
+manualRetryState = reduceModelStreamFrame(manualRetryState, replayedManualOpen);
+manualRetryRun = projectModelStreamFrame(manualRetryRun, before, manualRetryState, replayedManualOpen);
+const replayedManualDelta = delta(2, "output", "latest failed prefix", {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = manualRetryState;
+manualRetryState = reduceModelStreamFrame(manualRetryState, replayedManualDelta);
+manualRetryRun = projectModelStreamFrame(manualRetryRun, before, manualRetryState, replayedManualDelta);
+const replayedManualClose = closed(3, "failed", {
+  turn_id: "latest-failed-turn",
+  stream_id: "latest-failed-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+  final_text: "latest failed prefix",
+  retryable: false,
+});
+before = manualRetryState;
+manualRetryState = reduceModelStreamFrame(manualRetryState, replayedManualClose);
+manualRetryRun = projectModelStreamFrame(manualRetryRun, before, manualRetryState, replayedManualClose);
+assert.equal(
+  manualRetryRun.messages.some((message) => (
+    message.id === "assistant:model-stream:latest-failed-stream:partial"
+  )),
+  false,
+  "retained-ring replay must not resurrect an explicitly superseded attempt",
+);
+
+// Durable operation events and passive model frames use independent SSE connections. A retry
+// identity can therefore arrive while the abandoned turn still owns the active chat bubble.
+let overtakenRetryState = initialModelStreamState(ROOT);
+let overtakenRetryRun = runState();
+const overtakenOpen = opened(1, {
+  turn_id: "overtaken-turn",
+  stream_id: "overtaken-stream",
+  step: 1,
+});
+before = overtakenRetryState;
+overtakenRetryState = reduceModelStreamFrame(overtakenRetryState, overtakenOpen);
+overtakenRetryRun = projectModelStreamFrame(
+  overtakenRetryRun,
+  before,
+  overtakenRetryState,
+  overtakenOpen,
+);
+const overtakenDelta = delta(2, "output", "abandoned live prefix", {
+  turn_id: "overtaken-turn",
+  stream_id: "overtaken-stream",
+  step: 1,
+});
+before = overtakenRetryState;
+overtakenRetryState = reduceModelStreamFrame(overtakenRetryState, overtakenDelta);
+overtakenRetryRun = projectModelStreamFrame(
+  overtakenRetryRun,
+  before,
+  overtakenRetryState,
+  overtakenDelta,
+);
+assert.equal(overtakenRetryRun.activeResponse, "abandoned live prefix");
+overtakenRetryRun = discardModelStreamAttempt(
+  overtakenRetryRun,
+  overtakenRetryState,
+  ROOT,
+  "overtaken-turn",
+);
+overtakenRetryState = markModelStreamPartialSuperseded(
+  overtakenRetryState,
+  "overtaken-turn",
+);
+assert.equal(overtakenRetryRun.activeResponse, "");
+assert.equal(overtakenRetryState.output, "");
+assert.equal(overtakenRetryState.activeRootTurnId, null);
+
+const overtakenLateClose = closed(3, "failed", {
+  turn_id: "overtaken-turn",
+  stream_id: "overtaken-stream",
+  step: 1,
+  final_text: "abandoned live prefix",
+  retryable: false,
+});
+before = overtakenRetryState;
+overtakenRetryState = reduceModelStreamFrame(overtakenRetryState, overtakenLateClose);
+overtakenRetryRun = projectModelStreamFrame(
+  overtakenRetryRun,
+  before,
+  overtakenRetryState,
+  overtakenLateClose,
+);
+assert.equal(
+  overtakenRetryRun.messages.length,
+  0,
+  "a late passive close must not restore the exact attempt superseded by durable retry",
+);
+
+const overtakenReplacementOpen = opened(4, {
+  turn_id: "overtaken-replacement-turn",
+  stream_id: "overtaken-replacement-stream",
+  step: 2,
+});
+before = overtakenRetryState;
+overtakenRetryState = reduceModelStreamFrame(overtakenRetryState, overtakenReplacementOpen);
+overtakenRetryRun = projectModelStreamFrame(
+  overtakenRetryRun,
+  before,
+  overtakenRetryState,
+  overtakenReplacementOpen,
+);
+const overtakenReplacementDelta = delta(5, "output", "replacement prefix", {
+  turn_id: "overtaken-replacement-turn",
+  stream_id: "overtaken-replacement-stream",
+  step: 2,
+});
+before = overtakenRetryState;
+overtakenRetryState = reduceModelStreamFrame(overtakenRetryState, overtakenReplacementDelta);
+overtakenRetryRun = projectModelStreamFrame(
+  overtakenRetryRun,
+  before,
+  overtakenRetryState,
+  overtakenReplacementDelta,
+);
+assert.equal(overtakenRetryRun.activeResponse, "replacement prefix");
+overtakenRetryState = {
+  ...overtakenRetryState,
+  supersededRootTurnIds: new Set(),
+};
+overtakenRetryRun = discardModelStreamAttempt(
+  overtakenRetryRun,
+  overtakenRetryState,
+  ROOT,
+  "overtaken-turn",
+);
+overtakenRetryState = markModelStreamPartialSuperseded(
+  overtakenRetryState,
+  "overtaken-turn",
+);
+assert.equal(
+  overtakenRetryRun.activeResponse,
+  "replacement prefix",
+  "a delayed durable retry signal must preserve the active replacement turn",
+);
+assert.equal(overtakenRetryState.output, "replacement prefix");
+assert.equal(overtakenRetryState.supersededRootTurnIds.has("overtaken-turn"), true);
 
 live = reduceModelStreamFrame(live, opened(11, {
   turn_id: "turn-3",
@@ -570,6 +909,10 @@ assert.equal(decodeModelContentResponse({
 }), null, "snapshot UTF-8 offsets must match their channel text");
 assert.equal(decodeModelContentResponse({
   ...activeSnapshotPayload,
+  streams: [{ ...activeSnapshotPayload.streams[0], retryable: "yes" }],
+}), null, "snapshot retryability must be a boolean");
+assert.equal(decodeModelContentResponse({
+  ...activeSnapshotPayload,
   streams: [
     activeSnapshotPayload.streams[0],
     {
@@ -608,6 +951,178 @@ hydratedRun = projectModelContentSnapshot(hydratedRun, hydrated);
 assert.equal(hydratedRun.messages.length, 0, "active sidecar rows must merge into the live bubble");
 assert.equal(hydratedRun.activeResponse, "A🙂");
 assert.equal(hydratedRun.events.length, 1);
+
+const failedRetrySnapshot = decodeModelContentResponse({
+  ...activeSnapshotPayload,
+  streams: [{
+    ...activeSnapshotPayload.streams[0],
+    turn_id: "snapshot-failed-turn",
+    stream_id: "snapshot-failed-stream",
+    status: "failed",
+    output_text: "snapshot failed prefix",
+    output_end_offset: byteLength("snapshot failed prefix"),
+    reasoning_text: "",
+    reasoning_end_offset: 0,
+    final_text: "snapshot failed prefix",
+    partial: true,
+    retryable: true,
+  }],
+});
+assert.ok(failedRetrySnapshot);
+let snapshotRetryState = seedModelStreamSnapshot(
+  { ...initialModelStreamState(ROOT), resumeCursor: `${GENERATION}:50` },
+  failedRetrySnapshot,
+);
+let snapshotRetryRun = projectModelContentSnapshot(runState(), snapshotRetryState);
+assert.equal(snapshotRetryRun.messages.at(-1).source.status, "failed");
+const snapshotRetryOpen = opened(51, {
+  turn_id: "snapshot-replacement-turn",
+  stream_id: "snapshot-replacement-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = snapshotRetryState;
+snapshotRetryState = reduceModelStreamFrame(snapshotRetryState, snapshotRetryOpen);
+snapshotRetryRun = projectModelStreamFrame(
+  snapshotRetryRun,
+  before,
+  snapshotRetryState,
+  snapshotRetryOpen,
+);
+assert.equal(
+  snapshotRetryRun.messages.length,
+  0,
+  "a live retry must supersede a failed partial restored from the private snapshot",
+);
+
+const nonRetryableSnapshot = decodeModelContentResponse({
+  ...activeSnapshotPayload,
+  streams: [{
+    ...activeSnapshotPayload.streams[0],
+    turn_id: "snapshot-non-retryable-turn",
+    stream_id: "snapshot-non-retryable-stream",
+    status: "failed",
+    output_text: "snapshot retained prefix",
+    output_end_offset: byteLength("snapshot retained prefix"),
+    reasoning_text: "",
+    reasoning_end_offset: 0,
+    final_text: "snapshot retained prefix",
+    partial: true,
+    retryable: false,
+  }],
+});
+assert.ok(nonRetryableSnapshot);
+let nonRetryableState = seedModelStreamSnapshot(
+  { ...initialModelStreamState(ROOT), resumeCursor: `${GENERATION}:60` },
+  nonRetryableSnapshot,
+);
+let nonRetryableRun = projectModelContentSnapshot(runState(), nonRetryableState);
+const postFailureUserOpen = opened(61, {
+  turn_id: "post-failure-user-turn",
+  stream_id: "post-failure-user-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = nonRetryableState;
+nonRetryableState = reduceModelStreamFrame(nonRetryableState, postFailureUserOpen);
+nonRetryableRun = projectModelStreamFrame(
+  nonRetryableRun,
+  before,
+  nonRetryableState,
+  postFailureUserOpen,
+);
+assert.equal(
+  nonRetryableRun.messages.at(-1).id,
+  "assistant:model-stream:snapshot-non-retryable-stream:partial",
+  "a new user turn must preserve a non-retryable failed partial restored after reload",
+);
+
+const legacyFailedSnapshot = decodeModelContentResponse({
+  ...activeSnapshotPayload,
+  streams: [{
+    ...activeSnapshotPayload.streams[0],
+    turn_id: "legacy-failed-turn",
+    stream_id: "legacy-failed-stream",
+    status: "failed",
+    output_text: "legacy failed prefix",
+    output_end_offset: byteLength("legacy failed prefix"),
+    reasoning_text: "",
+    reasoning_end_offset: 0,
+    final_text: "legacy failed prefix",
+    partial: true,
+  }],
+});
+assert.ok(legacyFailedSnapshot);
+let legacyFailedState = seedModelStreamSnapshot(
+  { ...initialModelStreamState(ROOT), resumeCursor: `${GENERATION}:70` },
+  legacyFailedSnapshot,
+);
+let legacyFailedRun = projectModelContentSnapshot(runState(), legacyFailedState);
+const legacyNextOpen = opened(71, {
+  turn_id: "legacy-next-turn",
+  stream_id: "legacy-next-stream",
+  step: 2,
+  started_at: "2026-01-01T00:00:02Z",
+});
+before = legacyFailedState;
+legacyFailedState = reduceModelStreamFrame(legacyFailedState, legacyNextOpen);
+legacyFailedRun = projectModelStreamFrame(
+  legacyFailedRun,
+  before,
+  legacyFailedState,
+  legacyNextOpen,
+);
+assert.equal(
+  legacyFailedRun.messages.at(-1).id,
+  "assistant:model-stream:legacy-failed-stream:partial",
+  "an old failed snapshot without retryability must be preserved conservatively",
+);
+
+let suppressedSnapshotState = markModelStreamPartialSuperseded(
+  { ...initialModelStreamState(ROOT), resumeCursor: `${GENERATION}:80` },
+  "snapshot-non-retryable-turn",
+);
+suppressedSnapshotState = seedModelStreamSnapshot(
+  suppressedSnapshotState,
+  nonRetryableSnapshot,
+);
+const suppressedSnapshotRun = projectModelContentSnapshot(runState(), suppressedSnapshotState);
+assert.equal(
+  suppressedSnapshotRun.messages.length,
+  0,
+  "hydration must not resurrect a failed partial superseded by an explicit retry",
+);
+
+// A reload can hydrate the failed sidecar before its durable Studio retry marker is replayed.
+// Applying that event must remove the row immediately and fence every later hydration attempt.
+let lostResponseState = seedModelStreamSnapshot(
+  { ...initialModelStreamState(ROOT), resumeCursor: `${GENERATION}:81` },
+  nonRetryableSnapshot,
+);
+let lostResponseRun = projectModelContentSnapshot(runState(), lostResponseState);
+assert.equal(lostResponseRun.messages.length, 1);
+lostResponseState = markModelStreamPartialSuperseded(
+  lostResponseState,
+  "snapshot-non-retryable-turn",
+);
+lostResponseRun = discardModelStreamAttempt(
+  lostResponseRun,
+  lostResponseState,
+  ROOT,
+  "snapshot-non-retryable-turn",
+);
+assert.equal(
+  lostResponseRun.messages.length,
+  0,
+  "durable retry replay must remove a failed partial hydrated after a lost HTTP response",
+);
+lostResponseState = seedModelStreamSnapshot(lostResponseState, nonRetryableSnapshot);
+lostResponseRun = projectModelContentSnapshot(lostResponseRun, lostResponseState);
+assert.equal(
+  lostResponseRun.messages.length,
+  0,
+  "later hydration must preserve durable retry suppression after reload",
+);
 
 const abandonedSnapshot = decodeModelContentResponse({
   ...activeSnapshotPayload,

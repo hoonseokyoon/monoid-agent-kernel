@@ -357,7 +357,9 @@ fragments during autonomous runs. Each factory returns a `ModelStreamObserver`; 
 one `ModelStreamWriter` for every provider call using a `ModelStreamContext`. The writer receives
 ordered `ModelStreamDelta` values and one terminal `ModelStreamOutcome`. `TextDelta` maps to the
 `output` channel and `ReasoningDelta` maps to `reasoning`. Tool-call fragments stay inside model
-turn assembly.
+turn assembly. A failed outcome's `retryable` flag carries the provider's transient-failure signal
+used for automatic retry eligibility; `false` does not prevent an explicit user reissue after a
+configuration change.
 
 Factories materialize a fresh observer set for every activation and every in-process subagent.
 This ownership prevents a restored run or child from closing another activation's live channel.
@@ -378,7 +380,8 @@ is enabled during the compatibility window, settled text is written to both the 
 `transcript.jsonl`. Entitled readers resolve a digest from the sidecar before falling back to the
 transcript. `flush_active_model_content(path)` gives an in-process presentation layer a coordinated
 flush point for currently buffered segments while a stream remains open. Ordinary sidecar reads
-remain side-effect free.
+remain side-effect free. A `stream_closed` record carries the boolean `retryable` signal; readers
+treat its absence as `false` for records written before that field was introduced.
 
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
@@ -895,7 +898,8 @@ SSE after validating the root run token. `Last-Event-ID` takes precedence over t
 `id: <generation>:<sequence>` cursor. `opened`, `delta`, and `closed` frames multiplex the root and
 all validated descendant run ids. A delta includes separate output/reasoning-channel UTF-8 byte
 `start_offset` and `end_offset` values; clients use them to merge private snapshots with a replayed
-suffix without duplicating content.
+suffix without duplicating content. A `closed` frame and the corresponding Studio hydration
+snapshot carry the same optional boolean `retryable` signal, with absence interpreted as `false`.
 
 Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
 least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
@@ -915,6 +919,14 @@ sidecar, including an active-flush failure, returns HTTP 503; the browser retrie
 advancing its broker cursor. Both routes reject content requests with HTTP 403 when Studio's
 live/private egress gate is disabled. Their frames and snapshots stay out of the durable event
 reducer and Trace.
+
+Studio removes a retryable failed partial only after a newer root stream is accepted. The manual
+retry endpoint returns the exact failed `turn_id`, and the session driver durably emits
+the existing `run.resumed` v1 shape with `reason="studio-retry"` and that envelope-level `turn_id`
+before starting the replacement turn. The browser removes and suppresses that turn from either
+signal, so a lost HTTP response, reload, retained live frames, or hydration cannot restore the
+abandoned prefix. A normal new user turn does not supersede a non-retryable failed partial, and
+interrupted partials remain visible.
 
 ### Diagnostics
 
