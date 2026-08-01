@@ -319,12 +319,128 @@ def test_root_ring_lru_bounds_long_lived_broker_memory_and_preserves_gap_waterma
     assert evicted.latest_sequence == 0
     assert broker.buffered_root_count == 2
 
-    frames = broker.subscribe("root-a", after_cursor="lru:0").poll()
-    assert len(frames) == 1
+    subscription = broker.subscribe("root-a", after_cursor="lru:0")
+    assert subscription.poll() == ()
+    assert broker.buffered_root_count == 2
+
+    broker.observer("root-a").open(
+        _context(root_run_id="root-a", run_id="root-a", stream_id="root-a-next")
+    )
+    frames = subscription.poll()
+    assert len(frames) == 2
     assert frames[0].kind == "reset"
     assert frames[0].reason == "generation_changed"
     assert frames[0].cursor == LiveModelStreamCursor("lru.4", 0)
-    assert frames[0].oldest_available_cursor is None
+    assert frames[0].oldest_available_cursor == "lru.4:1"
+    assert frames[1].kind == "opened"
+
+
+def test_idle_subscriptions_do_not_allocate_or_evict_publication_rings() -> None:
+    broker = LiveModelStreamBroker(generation="passive", max_roots=1)
+    writer = broker.observer("active").open(
+        _context(root_run_id="active", run_id="active", stream_id="active-stream")
+    )
+    writer.push(ModelStreamDelta(channel="output", text="prefix"))
+    active_cursor = broker.stats("active").latest_sequence
+
+    for root_run_id in ("historical-a", "historical-b"):
+        subscription = broker.subscribe(root_run_id)
+        assert subscription.poll() == ()
+
+    assert broker.buffered_root_count == 1
+    assert broker.stats("active").latest_sequence == active_cursor
+
+    writer.push(ModelStreamDelta(channel="output", text="suffix"))
+    frames = broker.subscribe("active", after_cursor=f"passive:{active_cursor}").poll()
+
+    assert [frame.kind for frame in frames] == ["delta"]
+    assert frames[0].text == "suffix"
+
+
+def test_prepublication_subscription_adopts_first_ring_without_false_reset() -> None:
+    broker = LiveModelStreamBroker(generation="waiting", max_roots=1)
+    broker.observer("previous").open(
+        _context(root_run_id="previous", run_id="previous", stream_id="previous-stream")
+    )
+    broker.drop_root("previous")
+
+    subscription = broker.subscribe("future")
+    assert subscription.poll() == ()
+    assert broker.buffered_root_count == 0
+
+    broker.observer("future").open(
+        _context(root_run_id="future", run_id="future", stream_id="future-stream")
+    )
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["opened"]
+    assert frames[0].cursor == LiveModelStreamCursor("waiting.2", 1)
+
+
+def test_prepublication_blocking_poll_wakes_for_first_publish() -> None:
+    broker = LiveModelStreamBroker(generation="waiting")
+    subscription = broker.subscribe("future")
+    completed = threading.Event()
+    received: list[LiveModelStreamFrame] = []
+
+    def wait_for_first_publish() -> None:
+        received.extend(subscription.poll(timeout_s=2))
+        completed.set()
+
+    thread = threading.Thread(target=wait_for_first_publish)
+    thread.start()
+    time.sleep(0.02)
+    broker.observer("future").open(
+        _context(root_run_id="future", run_id="future", stream_id="future-stream")
+    )
+
+    assert completed.wait(1)
+    thread.join(timeout=1)
+    assert [frame.kind for frame in received] == ["opened"]
+    assert received[0].cursor == LiveModelStreamCursor("waiting", 1)
+
+
+def test_prepublication_subscription_detects_eviction_before_first_poll() -> None:
+    broker = LiveModelStreamBroker(generation="race", max_roots=1)
+    subscription = broker.subscribe("target")
+    writer = broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    writer.push(ModelStreamDelta(channel="output", text="tail"))
+
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset", "delta"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == LiveModelStreamCursor("race.3", 0)
+    assert frames[0].oldest_available_cursor == "race.3:1"
+    assert frames[1].text == "tail"
+
+
+def test_readers_do_not_change_publication_lru_order() -> None:
+    broker = LiveModelStreamBroker(generation="publish-lru", max_roots=2)
+    for root_run_id in ("root-a", "root-b"):
+        broker.observer(root_run_id).open(
+            _context(
+                root_run_id=root_run_id,
+                run_id=root_run_id,
+                stream_id=f"{root_run_id}-stream",
+            )
+        )
+
+    subscription = broker.subscribe("root-a", after_cursor="publish-lru:1")
+    assert subscription.poll() == ()
+    assert broker.stats("root-a").latest_sequence == 1
+    broker.observer("root-c").open(
+        _context(root_run_id="root-c", run_id="root-c", stream_id="root-c-stream")
+    )
+
+    assert broker.stats("root-a").latest_sequence == 0
+    assert broker.stats("root-b").latest_sequence == 1
+    assert broker.stats("root-c").latest_sequence == 1
 
 
 def test_backend_subscription_requires_root_token_and_enabled_broker(

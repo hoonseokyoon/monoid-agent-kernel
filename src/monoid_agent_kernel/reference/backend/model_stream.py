@@ -17,6 +17,7 @@ import re
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -235,6 +236,9 @@ class LiveModelStreamBroker:
         self.max_roots = max_roots
         self._condition = threading.Condition(threading.RLock())
         self._rings: OrderedDict[str, _RootRing] = OrderedDict()
+        self._pending_subscriptions: weakref.WeakSet[LiveModelStreamSubscription] = (
+            weakref.WeakSet()
+        )
         self._ring_serial = 0
         self._closed = False
 
@@ -255,6 +259,7 @@ class LiveModelStreamBroker:
                 return
             self._closed = True
             self._rings.clear()
+            self._pending_subscriptions.clear()
             self._condition.notify_all()
 
     def observer(self, root_run_id: str | None = None) -> LiveModelStreamObserver:
@@ -275,7 +280,10 @@ class LiveModelStreamBroker:
     ) -> LiveModelStreamSubscription:
         _validate_root_run_id(root_run_id)
         with self._condition:
-            ring = None if self._closed else self._ring_locked(root_run_id)
+            # Subscriptions are passive readers.  Creating or promoting a publication ring here
+            # lets historical/idle readers evict a root that is actively carrying content.
+            ring = None if self._closed else self._rings.get(root_run_id)
+            await_initial_generation = after_cursor is None and ring is None and not self._closed
             # A first-time client may connect after execution has already started.  Replay the
             # retained ring; an evicted prefix produces a reset frame so Studio can hydrate.
             if after_cursor is None:
@@ -292,6 +300,11 @@ class LiveModelStreamBroker:
                 root_run_id=root_run_id,
                 cursor=cursor,
             )
+            if await_initial_generation:
+                # Bind an implicit pre-publication cursor when publication creates its first ring,
+                # rather than whichever generation the reader happens to observe on its first
+                # poll.  The weak set keeps passive subscription lifetime outside ring ownership.
+                self._pending_subscriptions.add(subscription)
             if self._closed:
                 subscription._closed = True
             return subscription
@@ -308,7 +321,6 @@ class LiveModelStreamBroker:
                     0,
                     0,
                 )
-            self._rings.move_to_end(root_run_id)
             return LiveModelStreamBufferStats(
                 generation=ring.generation,
                 latest_sequence=ring.latest_sequence,
@@ -406,8 +418,13 @@ class LiveModelStreamBroker:
                 if self._closed or subscription._closed:
                     subscription._closed = True
                     return ()
-                ring = self._ring_locked(subscription.root_run_id)
-                frames = self._collect_locked(subscription, ring, limit=limit)
+                # Publication alone owns ring allocation and LRU recency.  A subscription may wait
+                # before a call starts without consuming a root slot or changing eviction order.
+                ring = self._rings.get(subscription.root_run_id)
+                if ring is None:
+                    frames = ()
+                else:
+                    frames = self._collect_locked(subscription, ring, limit=limit)
                 if frames or timeout_s == 0:
                     return frames
                 remaining = deadline - time.monotonic()
@@ -515,6 +532,7 @@ class LiveModelStreamBroker:
     def _close_subscription(self, subscription: LiveModelStreamSubscription) -> None:
         with self._condition:
             subscription._closed = True
+            self._pending_subscriptions.discard(subscription)
             self._condition.notify_all()
 
     def _heartbeat(self, subscription: LiveModelStreamSubscription) -> LiveModelStreamFrame:
@@ -544,6 +562,12 @@ class LiveModelStreamBroker:
             evicted = True
         if evicted:
             self._condition.notify_all()
+        for subscription in tuple(self._pending_subscriptions):
+            if subscription.root_run_id != root_run_id:
+                continue
+            self._pending_subscriptions.discard(subscription)
+            if not subscription._closed:
+                subscription._cursor = LiveModelStreamCursor(generation, 0)
         return ring
 
 
