@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from monoid_agent_kernel.core.spec import ReasoningConfig
+from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
@@ -19,6 +19,25 @@ def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
         payload["effort"] = reasoning.effort
     if reasoning.summary != "off":
         payload["summary"] = reasoning.summary
+    return payload
+
+
+def build_generation_payload(generation: GenerationConfig) -> dict[str, Any]:
+    """Sampling block for a model request: ``{}`` when nothing is set, else only the set keys.
+
+    ``on_unsupported`` never rides here -- it is the caller's policy, not a provider knob. The
+    gateway server's ``generation_applied`` echo is this same block, so the two sides of that
+    wire agree on the *shape* of "applied" by construction. Whether to emit it at all is a
+    separate question the server answers from its upstream adapter's ``generation_support``
+    declaration -- this builder cannot know what an adapter does with the config it is handed.
+    """
+    payload: dict[str, Any] = {}
+    if generation.temperature is not None:
+        payload["temperature"] = generation.temperature
+    if generation.top_p is not None:
+        payload["top_p"] = generation.top_p
+    if generation.max_output_tokens is not None:
+        payload["max_output_tokens"] = generation.max_output_tokens
     return payload
 
 

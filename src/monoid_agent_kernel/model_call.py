@@ -219,6 +219,11 @@ def _request_payload(
     payload["model"] = model.to_json()
     payload["provider"] = provider
     payload["destination"] = destination
+    # Omit-when-absent (the W5 digest stability rule): a schema-free request keeps the
+    # replay key it had before this field existed; setting a schema changes the key, which
+    # is correct -- constrained and unconstrained calls are different requests.
+    if request.output_schema is not None:
+        payload["output_schema"] = request.output_schema
     return payload
 
 

@@ -86,7 +86,9 @@ class Suspension:
     or a gateway-flagged retryable error): the session is **not** terminal, the
     conversation up to the user message is preserved, and a caller may re-issue
     the turn via ``arun_until_suspended(None)`` or park for new user input.
-    ``retryable``/``http_status`` carry the classification for that decision.
+    ``retryable``/``http_status``/``config_recoverable`` carry the classification for that
+    decision (``config_recoverable`` — the error's remedy is configuration the user fixes
+    and resends, so park rather than backoff-retry).
     ``interrupted`` — an external caller stopped the current turn (a "stop"); like
     ``turn_failed`` the session is **not** terminal (no error), so a caller parks for
     the next user message. ``paused`` — a cooperative pause froze the turn at the start of
@@ -94,8 +96,11 @@ class Suspension:
     ``run_until_suspended(None)`` re-pump resumes the same turn where it left off. The
     non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the failure
     (``"failed"``) for ``turn_failed`` since ``RunStatus`` has no non-terminal value, so
-    callers must branch on ``reason``, not ``status``, to detect a live run. For every
-    reason except ``awaiting_tasks`` a settle checkpoint ran and ``turn`` carries its result.
+    callers must branch on ``reason``, not ``status``, to detect a live run. Every reason
+    except ``awaiting_tasks`` persists a checkpoint, but only the settled outcomes
+    (``settled``/``limited``/``terminal``) attach an ``AgentTurnResult`` as ``turn``:
+    ``turn_failed``/``interrupted``/``paused`` produced nothing to settle, so ``turn`` is
+    ``None`` there and the blocking facades surface those parks as ``TurnNotSettled``.
     """
 
     reason: Literal[
@@ -110,6 +115,7 @@ class Suspension:
     turn: AgentTurnResult | None = None
     retryable: bool = False
     http_status: int | None = None
+    config_recoverable: bool = False
 
 
 _SUSPENSION_REASONS = frozenset(
@@ -142,6 +148,7 @@ def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
         "has_external": suspension.has_external,
         "retryable": suspension.retryable,
         "http_status": suspension.http_status,
+        "config_recoverable": suspension.config_recoverable,
     }
 
 
@@ -169,6 +176,8 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
         has_external=parse_bool(payload, "has_external"),
         retryable=parse_bool(payload, "retryable"),
         http_status=http_status,
+        # Absent on pre-v0.21 checkpoints; the default (False) is what those runs meant.
+        config_recoverable=parse_bool(payload, "config_recoverable"),
     )
 
 

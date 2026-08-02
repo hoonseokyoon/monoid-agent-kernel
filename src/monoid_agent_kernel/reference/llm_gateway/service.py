@@ -18,11 +18,16 @@ from monoid_agent_kernel.core.wire_validation import (
     require_list,
     require_object,
 )
-from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
-from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
+from monoid_agent_kernel.providers.base import (
+    generation_support,
+    provider_usage_of,
+    structured_output_support,
+)
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -56,6 +61,8 @@ class LlmGatewayTurnRequest:
     # By-value conversation: the full message log, forwarded to the upstream provider
     # statelessly. When set, no previous_turn_handle lookup is needed.
     messages: tuple[dict[str, Any], ...] | None = None
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
+    output_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -104,7 +111,7 @@ class LlmGatewayBackend:
 
     def handle_turn(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        payload = normalize_json_ingress(payload)
+        payload = _normalized_turn_payload(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         # By-value carries the full conversation as messages → forward statelessly, no
@@ -114,28 +121,33 @@ class LlmGatewayBackend:
             if request.messages is not None
             else self._provider_previous_response_id(request, claims)
         )
-        adapter = self._build_adapter(claims, request)
-        turn = normalize_model_turn(
-            adapter.next_turn(
-                ModelRequest(
-                    instruction=request.instruction,
-                    system_prompt=request.system_prompt,
-                    tools=request.tools,
-                    previous_turn_handle=provider_previous_response_id,
-                    observations=request.observations,
-                    model=ModelConfig(
-                        provider="openai", model=request.model, reasoning=request.reasoning
-                    ),
-                    messages=request.messages,
+        config = _upstream_model_config(request)
+        adapter = self._build_adapter(claims, config)
+        # A failure can arrive *after* the upstream produced and billed an answer -- an
+        # applied-parameters refusal raised by an upstream that is itself a gateway is exactly
+        # that. This handler exits on the raise, before the meter below, so those tokens left
+        # the tenant's ledger entirely. Metered here, then re-raised unchanged.
+        try:
+            turn = normalize_model_turn(
+                adapter.next_turn(
+                    ModelRequest(
+                        instruction=request.instruction,
+                        system_prompt=request.system_prompt,
+                        tools=request.tools,
+                        previous_turn_handle=provider_previous_response_id,
+                        observations=request.observations,
+                        model=config,
+                        messages=request.messages,
+                        output_schema=request.output_schema,
+                    )
                 )
             )
-        )
+        except ModelAdapterError as failed:
+            self._meter(claims.tenant_id, provider_usage_of(failed))
+            raise
         turn_handle = self._record_turn(claims, request, turn)
-        with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
-                turn.usage
-            )
-        return {
+        self._meter(claims.tenant_id, turn.usage)
+        result = {
             "protocol": namespaced_id("llm-turn-result.v1"),
             "turn_handle": turn_handle,
             "final_text": turn.final_text,
@@ -150,6 +162,8 @@ class LlmGatewayBackend:
             # own HTTP attempts and this call succeeded on the first of those.
             "provider_retried": turn.provider_retried,
         }
+        result.update(_applied_echoes(request, adapter, config))
+        return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Streaming form of :meth:`handle_turn` — yields SSE-ready frame dicts.
@@ -163,7 +177,7 @@ class LlmGatewayBackend:
         ``turn_complete`` frame is yielded.
         """
         claims = self._authorize(token)
-        payload = normalize_json_ingress(payload)
+        payload = _normalized_turn_payload(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         provider_previous_response_id = (
@@ -171,15 +185,17 @@ class LlmGatewayBackend:
             if request.messages is not None
             else self._provider_previous_response_id(request, claims)
         )
-        adapter = self._build_adapter(claims, request)
+        config = _upstream_model_config(request)
+        adapter = self._build_adapter(claims, config)
         model_request = ModelRequest(
             instruction=request.instruction,
             system_prompt=request.system_prompt,
             tools=request.tools,
             previous_turn_handle=provider_previous_response_id,
             observations=request.observations,
-            model=ModelConfig(provider="openai", model=request.model, reasoning=request.reasoning),
+            model=config,
             messages=request.messages,
+            output_schema=request.output_schema,
         )
         # Everything above can raise; only past this point are we committed to a stream body.
         return self._stream_turn(claims, request, adapter, model_request)
@@ -192,78 +208,92 @@ class LlmGatewayBackend:
         model_request: ModelRequest,
     ) -> Iterator[dict[str, Any]]:
         collected: list[ModelStreamChunk] = []
-        astream_turn = getattr(adapter, "astream_turn", None)
-        if astream_turn is not None:
-            ingress = ModelStreamIngressNormalizer()
-            try:
-                for provider_chunk in _pump_astream(astream_turn, model_request):
-                    for chunk in ingress.normalize(provider_chunk):
+        try:
+            astream_turn = getattr(adapter, "astream_turn", None)
+            if astream_turn is not None:
+                ingress = ModelStreamIngressNormalizer()
+                try:
+                    for provider_chunk in _pump_astream(astream_turn, model_request):
+                        for chunk in ingress.normalize(provider_chunk):
+                            collected.append(chunk)
+                            frame = _chunk_to_frame(chunk)
+                            if frame is not None:
+                                yield frame
+                except BaseException:
+                    for chunk in ingress.finish():
                         collected.append(chunk)
                         frame = _chunk_to_frame(chunk)
                         if frame is not None:
                             yield frame
-            except BaseException:
+                    raise
                 for chunk in ingress.finish():
                     collected.append(chunk)
                     frame = _chunk_to_frame(chunk)
                     if frame is not None:
                         yield frame
-                raise
-            for chunk in ingress.finish():
-                collected.append(chunk)
-                frame = _chunk_to_frame(chunk)
-                if frame is not None:
-                    yield frame
-        else:
-            # The provider can't stream: synthesize a minimal delta sequence from the
-            # one-shot turn so consumers still see text/tool frames before turn_complete.
-            turn = normalize_model_turn(adapter.next_turn(model_request))
-            # The synthesized chunks carry the turn's retry evidence too. They stand in for a
-            # stream the provider could not produce, so anything the turn reports about the call
-            # has to survive the substitution.
-            if turn.final_text:
-                chunk: ModelStreamChunk = TextDelta(
-                    turn.final_text, provider_retried=turn.provider_retried
+            else:
+                # The provider can't stream: synthesize a minimal delta sequence from the
+                # one-shot turn so consumers still see text/tool frames before turn_complete.
+                turn = normalize_model_turn(adapter.next_turn(model_request))
+                # The synthesized chunks carry the turn's retry evidence too. They stand in for a
+                # stream the provider could not produce, so anything the turn reports about the call
+                # has to survive the substitution.
+                if turn.final_text:
+                    chunk: ModelStreamChunk = TextDelta(
+                        turn.final_text, provider_retried=turn.provider_retried
+                    )
+                    collected.append(chunk)
+                    yield _chunk_to_frame(chunk)
+                for index, call in enumerate(turn.tool_calls):
+                    chunk = ToolCallDelta(
+                        index=index,
+                        arguments_fragment=json.dumps(
+                            call.arguments,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        id=call.id,
+                        name=call.name,
+                        provider_retried=turn.provider_retried,
+                    )
+                    collected.append(chunk)
+                    yield _chunk_to_frame(chunk)
+                collected.append(
+                    TurnComplete(
+                        response_id=turn.response_id,
+                        usage=turn.usage,
+                        stop_reason=turn.stop_reason,
+                        provider_retried=turn.provider_retried,
+                    )
                 )
-                collected.append(chunk)
-                yield _chunk_to_frame(chunk)
-            for index, call in enumerate(turn.tool_calls):
-                chunk = ToolCallDelta(
-                    index=index,
-                    arguments_fragment=json.dumps(
-                        call.arguments,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                    ),
-                    id=call.id,
-                    name=call.name,
-                    provider_retried=turn.provider_retried,
-                )
-                collected.append(chunk)
-                yield _chunk_to_frame(chunk)
-            collected.append(
-                TurnComplete(
-                    response_id=turn.response_id,
-                    usage=turn.usage,
-                    stop_reason=turn.stop_reason,
-                    provider_retried=turn.provider_retried,
-                )
-            )
-        # Assemble once: the same usage drives both the meter and the outgoing frame, and the
-        # assembled response id is what the opaque turn_handle maps to for continuation.
-        turn = normalize_model_turn(assemble_streamed_turn(collected))
+            # Assemble once: the same usage drives both the meter and the outgoing frame, and the
+            # assembled response id is what the opaque turn_handle maps to for continuation.
+            turn = normalize_model_turn(assemble_streamed_turn(collected))
+        except ModelAdapterError as failed:
+            # The streaming twin of handle_turn's failure meter: a refusal can arrive *after*
+            # the upstream produced and billed an answer (a chained hop's proof refusal is
+            # exactly that), and this generator exits on the raise before the success-path
+            # meter below -- so the billed tokens left the tenant ledger entirely on this
+            # transport while the sync twin metered them. One handler around both sub-branches
+            # (the astream drive and the non-streaming fallback); ``provider_usage_of`` reads
+            # {} for an unbilled failure and ``_meter`` skips empty usage, so it stays a no-op
+            # there.
+            self._meter(claims.tenant_id, provider_usage_of(failed))
+            raise
         turn_handle = self._record_turn(claims, request, turn)
-        with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
-                turn.usage
-            )
-        yield {
+        self._meter(claims.tenant_id, turn.usage)
+        frame = {
             "type": "turn_complete",
             "turn_handle": turn_handle,
             "usage": turn.usage,
             "stop_reason": turn.stop_reason,
             "provider_retried": turn.provider_retried,
         }
+        # Streaming twin of handle_turn's echo -- the terminal frame is the only one a
+        # streaming client can read it from, and it is built by the same function so the two
+        # transports cannot answer differently.
+        frame.update(_applied_echoes(request, adapter, model_request.model))
+        yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
         with self._lock:
@@ -305,16 +335,24 @@ class LlmGatewayBackend:
     def _build_adapter(
         self,
         claims: TokenClaims,
-        request: LlmGatewayTurnRequest,
+        config: ModelConfig,
     ) -> ModelAdapter:
-        config = ModelConfig(
-            provider="openai",
-            model=request.model,
-            reasoning=request.reasoning,
-        )
+        """Takes the already-built per-call config (``_upstream_model_config``) rather than
+        rebuilding it, so the adapter, the upstream request, and the applied-parameters proof
+        share one object — "cannot disagree" by identity, not merely by value."""
+
         if self.provider_adapter_factory is not None:
             return self.provider_adapter_factory(claims, config)
         return OpenAIModelAdapter(config, allow_direct_provider_api=True)
+
+    def _meter(self, tenant_id: str, usage: dict[str, int]) -> None:
+        """Add one call's tokens to the tenant ledger. One writer, so the success paths and
+        the billed-failure path cannot come to disagree about what gets counted."""
+
+        if not usage:
+            return
+        with self._lock:
+            self._usage.setdefault(tenant_id, LlmGatewayUsage(tenant_id)).add(usage)
 
     def _record_turn(
         self,
@@ -334,6 +372,77 @@ class LlmGatewayBackend:
                 created_at=time.time(),
             )
         return turn_handle
+
+
+def _normalized_turn_payload(payload: dict[str, Any]) -> Any:
+    """The server-side ingress rule, matching the client's exactly.
+
+    The blanket normalize substitutes non-finite *content* values; ``output_schema`` is
+    config, not content -- the client ingress keeps it verbatim
+    (``normalize_model_request``, ``substitute_nonfinite=False``) so a non-finite value is
+    *refused* downstream rather than silently rewritten into a different constraint. Riding
+    the blanket normalize here turned the caller's ``NaN`` into ``null`` before the upstream
+    adapter ever saw it -- the exact rewrite the rule exists to rule out, on the one route
+    (in-process Python callers) the JSON parsers don't guard. One function, both handlers.
+    """
+
+    normalized = normalize_json_ingress(payload)
+    if isinstance(normalized, dict) and normalized.get("output_schema") is not None:
+        normalized["output_schema"] = normalize_json_ingress(
+            payload.get("output_schema"), substitute_nonfinite=False
+        )
+    return normalized
+
+
+def _upstream_model_config(request: LlmGatewayTurnRequest) -> ModelConfig:
+    """The one config this turn runs under.
+
+    Built once and shared by the adapter construction, the upstream request, and the
+    applied-parameters proof, so the three cannot disagree about policy: the adapter enforces
+    under ``request.model or self.config``, and the proof is only honest if it is probed under
+    the same config the enforcement will read.
+    """
+
+    return ModelConfig(
+        provider="openai",
+        model=request.model,
+        reasoning=request.reasoning,
+        generation=request.generation,
+    )
+
+
+def _applied_echoes(
+    request: LlmGatewayTurnRequest, adapter: ModelAdapter, config: ModelConfig
+) -> dict[str, Any]:
+    """The applied-parameters proofs for one turn — built once, emitted by both transports.
+
+    Both echoes answer the same question, so both are derived the same way: **from what the
+    upstream adapter declared it does**, never from what the request asked for. A gateway that
+    copied the requested block back would produce an exact match no matter what the upstream
+    did with it — an offline echo adapter, a text-only backend, or any
+    ``provider_adapter_factory`` that ignores ``ModelConfig.generation`` would all read as
+    "applied", and the client's ``on_unsupported="fail"`` would accept sampling parameters that
+    were never sent to a model. Unproven is reported as unproven: the generation echo is simply
+    absent (which a fail-closed client refuses), and the schema echo is an explicit ``False``.
+
+    ``config`` is the per-call config the upstream call runs under (``_upstream_model_config``),
+    threaded into the probes because a declaration may be policy-conditional: a *chained*
+    ``GatewayModelAdapter`` claims "native" only while it is enforcing, and it enforces under
+    the per-call config, not its standing one. Probing the standing config let a shared
+    factory-built adapter mint proof for a call whose wire policy said ``"omit"`` — the exact
+    copied-back-proof defect this function exists to rule out, one config-source hop later.
+
+    Both stay off the response entirely when the request did not use the feature, so traffic
+    that configures neither keeps its exact pre-W5 wire shape.
+    """
+
+    echoes: dict[str, Any] = {}
+    requested_generation = build_generation_payload(config.generation)
+    if requested_generation and generation_support(adapter, config) == "native":
+        echoes["generation_applied"] = requested_generation
+    if request.output_schema is not None:
+        echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
+    return echoes
 
 
 def _pump_astream(
@@ -404,9 +513,6 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
     protocol = parse_str(payload, "protocol")
     if protocol not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
         raise ValueError("unsupported LLM gateway protocol")
-    reasoning_raw = (
-        require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else {}
-    )
     previous_turn_handle = parse_str(payload, "previous_turn_handle") or None
     observations = tuple(
         _parse_observation(item) for item in optional_list(payload, "observations")
@@ -427,9 +533,21 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
         model=parse_required_str(payload, "model"),
         system_prompt=parse_required_str(payload, "system_prompt", non_empty=False),
         tools=tuple(_parse_tool(item) for item in optional_list(payload, "tools")),
-        reasoning=ReasoningConfig(
-            effort=parse_str(reasoning_raw, "effort", default="medium"),
-            summary=parse_str(reasoning_raw, "summary", default="off"),
+        # The shared codecs are the parser (fail-closed, spec.py) rather than a second
+        # per-key reader that would drift from them: an out-of-range temperature or an
+        # unknown effort 400s at this boundary instead of travelling to the provider.
+        reasoning=ReasoningConfig.from_json(
+            require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else None
+        ),
+        generation=GenerationConfig.from_json(
+            require_object(payload["generation"], "generation")
+            if "generation" in payload
+            else None
+        ),
+        output_schema=(
+            dict(require_object(payload["output_schema"], "output_schema"))
+            if payload.get("output_schema") is not None
+            else None
         ),
         instruction=instruction,
         previous_turn_handle=previous_turn_handle,

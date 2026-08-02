@@ -39,7 +39,9 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
   `ControlDispatcher`); capability leases; agent-as-tool delegation; Agent Skills;
-  output validation; model-stream observation; and multimodal input. `ImagePart` and
+  output validation and the standalone validated call (`ValidatedCallRunner` /
+  `ValidatedCallResult`); generation-parameter and output-schema delivery with the
+  gateway applied echo; model-stream observation; and multimodal input. `ImagePart` and
   `DocumentPart` are forwarded
   to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported content
   contracts and round-trip through core JSON/checkpoint paths; provider forwarding is
@@ -129,13 +131,37 @@ The run lifecycle is:
   `submit()` gets a fresh `max_steps` budget; `max_tool_calls`, token usage, and
   `max_duration_s` are session-wide. `AgentTurnResult` carries the settle status,
   final text, the accumulated (preview) proposal, and the continuation
-  `turn_handle`.
+  `turn_handle`. A park that settles nothing — a *recoverable* turn failure
+  (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
+  (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
+  `suspension` carries the reason plus the `retryable` / `http_status` /
+  `config_recoverable` classification. The non-blocking pump
+  (`run_until_suspended`) returns the same park as a `Suspension` with
+  `turn=None` instead of raising; `astream` ends the stream with it as
+  `stream.suspension`.
 - `commit_checkpoint()` — opt-in: adopt the current proposed workspace state as
   the new diff baseline, so later proposals report only post-commit changes.
 - `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
   proposal, emit `run.finished`, close the recorder.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
-  `open()` + `submit(user_input)` + `close()`.
+  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
+  park does not raise here: the closing `finally` promotes an unrecovered
+  `turn_failed` park to the terminal failure record, and that failed
+  `AgentRunResult` is the return value — for `turn_failed` only, the one park
+  `close()` can promote; an `interrupted` or `paused` park has no record to
+  return as, so it surfaces as `TurnNotSettled` after the same close. That
+  raise is the *only* signal for those two parks: the run record still
+  finalizes `completed` (a user stop is not a failure) and the completed-run
+  cleanup deletes its checkpoints — a caller that wants to resume an
+  interrupted turn uses the multi-turn facades, where the session stays alive.
+  `close()` performs the same promotion
+  for any driver (the explicit form is `fail_recoverable`): a run closed on an
+  unrecovered recoverable failure finalizes `failed` with `failure.json`
+  written and its checkpoints kept, never as a clean success. The promotion
+  survives a restart: `restore()` rehydrates the pending failure from the
+  checkpoint's `last_suspension` (only `reason="turn_failed"`; a later settle
+  clears it), so a recovered run left idle and then closed records the failure
+  it parked on rather than a clean success that deletes its own checkpoints.
 
 ### AgentRunSpec
 
@@ -212,6 +238,15 @@ while omitting only `tools[*].scope.path_pattern_encoding`. That additive field 
 literal leading `!` for fresh JSON readers and does not change the in-memory `ToolScope` meaning.
 This normalization lets pre-v0.20 readers ignore the field and recompute the same hash during a
 rolling deployment.
+
+`ModelConfig.to_json` emits its `generation` block only when a generation value is configured, so
+a generation-free config — the entire pre-generation population — serializes and hashes
+identically before and after the field existed. A config that *sets* a generation value hashes
+differently by design: sampling parameters change model behavior, so the
+`path_pattern_encoding`-style hash exclusion would make the hash lie about what the run does.
+Consequence for rolling deployments: backend-run recovery metadata written with a configured
+generation block does not verify against a pre-generation reader (and vice versa) — configure
+generation values only on a fleet that has fully rolled past the version that introduced them.
 
 `ToolBinding` is the public tool unit:
 
@@ -299,6 +334,35 @@ adapter that implements only `next_turn`. Each member that is a *value* is decla
 property so a `ClassVar`, an instance attribute, and a property all satisfy it;
 `resolve_destination` is a method because it answers for a given `ModelConfig`.
 
+Two further capability declarations are plain attributes rather than Protocol members:
+`structured_output_support` (the adapter translates `ModelRequest.output_schema` into
+provider-enforced constrained decoding) and `generation_support` (the adapter puts
+`ModelConfig.generation` on its provider request). The exact string `"native"` declares the
+capability; both probes (exported from `contracts` as `structured_output_support(adapter,
+config=None)` / `generation_support(adapter, config=None)`) are fail-closed through one shared
+implementation — absence, any other value, and a declaration that raises (on read **or on
+call**) all read as `"none"` — so a consumer can never over-trust an adapter that did not
+explicitly claim it. These are what a transport in front of an adapter is allowed to base an
+applied-parameters proof on: a gateway can see what it *forwarded*, never what the adapter
+behind it did with it.
+
+The probe reads the **instance**: the declaration is a `ClassVar` when the answer is fixed, and
+a **callable taking the effective per-call `ModelConfig`** when it depends on policy — the
+probe passes its `config` argument through to a callable declaration, and `None` probes the
+adapter's standing configuration. (Before v0.21.0 the conditional convention was a *property*;
+a property still probes fine but cannot receive the per-call config, so a property-declared
+conditional adapter silently answers from its standing configuration — migrate conditional
+declarations to the callable form.) The claim and the enforcement must read the same config:
+enforcement runs under `request.model or self.config`, so a claim probed off the standing
+config alone would let a shared adapter mint proof for a call it enforces under a
+wire-supplied `"omit"`. `OpenAIModelAdapter` applies the parameters itself and declares both
+unconditionally. `GatewayModelAdapter` only *forwards*, so its claim is worth exactly the
+proof it insists on: it answers `"native"` when the effective config says
+`on_unsupported="fail"`, where a returned turn is a proven turn, and `"none"` under `"omit"`,
+where it deliberately accepts an unproven one. Without that, a chained gateway would mint a
+fresh positive echo out of a static declaration and report proof for a call whose inner hop
+had none.
+
 An adapter with its own retry loop should call `report_provider_retried()` when it decides to make
 another attempt. The kernel counts one adapter call per turn however many attempts happen inside it,
 so without this a call that failed twice and succeeded on the third try is recorded as a clean
@@ -312,6 +376,110 @@ because a refused call belongs in the audit trail — so a consumer summing `att
 "no adapter call was made" rather than as a missing value. A failure *while* reaching into the
 adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
 as 1, which is what older records mean.
+
+#### Generation parameters, output schema, and the applied echo
+
+`ModelConfig.generation: GenerationConfig` carries per-call sampling controls — `temperature`
+(0–2), `top_p` ((0, 1]), `max_output_tokens` (≥ 1) — where `None` means "delegate to the
+provider default". Both ingresses (the JSON codec and direct-Python normalization) share one
+fail-closed rule source, so a range accepted from JSON can never diverge from the range accepted
+from a constructor. One projection (`build_generation_payload`, emitting only the set keys)
+produces the OpenAI request-body parameters, the gateway wire block, and the gateway's
+`generation_applied` echo, so all three agree on what "applied" means by construction.
+
+`GenerationConfig.on_unsupported` (`"fail"` default / `"omit"`) governs what happens when a
+transport cannot prove the parameters were applied. It is enforced where proof exists: the
+gateway client compares the `generation_applied` echo (and the `schema_applied` boolean for
+`output_schema`) against what it sent, on both the sync response and the terminal stream frame
+— and when a stream ends cleanly **without** a terminal frame, the drain runs the same checks
+with an absent echo, so a frameless stream (the older-gateway shape
+`assemble_streamed_turn` otherwise tolerates by synthesizing `stop_reason="stop"`) is refused
+under `"fail"` exactly like a frameless sync response; plain traffic that configures neither
+knob keeps the pre-W5 tolerance. The refusal is non-retryable `gateway_generation_not_applied`
+/ `gateway_schema_not_applied`, flagged `config_recoverable`: resending the same call cannot
+help, but the remedy is configuration (`"omit"`, or a proving transport), so `AgentLoop`
+classifies it like a 4xx — the turn fails, the session survives — and the reference gateway's
+HTTP layer maps it to 422 rather than 502 so the same classification survives a chained hop.
+A refused turn was still generated and billed, so the refusal carries the usage the provider
+reported: it reaches the failed `ModelCallReceipt` and the run's cumulative token totals on
+both transports. A budget that skipped refused calls would not be a bound. The cost also
+survives a hop — the gateway error envelope carries `usage` (present only when the failed call
+actually spent tokens, so an error raised before reaching a provider keeps its previous wire
+shape), and a gateway meters a billed failure against the tenant rather than losing it to the
+raise.
+One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
+been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
+call sees the unproven text before the error arrives; the sync transport delivers nothing on
+refusal. A malformed echo (a non-object `generation_applied`, a non-boolean `schema_applied`)
+is a wire-shape error, not a policy question: it answers `gateway_bad_response` on both
+transports regardless of `on_unsupported`.
+
+The echo comparison is not Python equality. A requested **number is proven only by a number**:
+`True == 1` and `False == 0.0` in Python, so a plain dict comparison let a server answering
+JSON booleans prove the most ordinary settings this block carries (`max_output_tokens=1`,
+`top_p=1`, `temperature=0`). Numbers still compare across JSON's single numeric type — a
+non-Python gateway re-serializes `1.0` as `1`, and refusing that would be a false refusal —
+so `1` proves `1.0`, while `true` proves nothing.
+
+A server may only emit these proofs from what its **upstream adapter declares** (the
+`generation_support` / `structured_output_support` probes), never from what the request asked
+for: copying the requested block back would match exactly on the client and let `"fail"` accept
+parameters an adapter silently ignored. The reference gateway therefore omits
+`generation_applied` and echoes `schema_applied: false` when its upstream does not declare the
+capability, and the client refuses the turn. A direct provider call has no echo, so `"fail"`
+and `"omit"` behave identically there and an unsupported parameter surfaces as the provider's
+own error. One knob deliberately governs both echoes — "how to treat a parameter the transport
+cannot prove was applied" is one question, and two half-settable knobs would be a new
+asymmetry surface.
+
+`ModelRequest.output_schema` is a standard, provider-neutral JSON Schema for the final answer.
+An adapter declaring `structured_output_support = "native"` translates it into its provider's
+constrained-decoding dialect **verbatim — never adjusted** toward a provider subset — so the
+request digest identifies exactly what the provider was asked to enforce; a schema the provider
+rejects is the provider's own error. Concretely for the shipped adapter: `OpenAIModelAdapter`
+delivers the schema in a strict-mode envelope (`text.format` with `strict: true` — anything
+less is not *enforced* decoding, and `schema_applied: true` would be a false proof), and
+OpenAI's strict mode has subset requirements of its own — every object needs
+`additionalProperties: false`, every listed property must be `required`, and some keywords are
+unsupported. A schema outside that subset is rejected by the provider with an HTTP 400 whose
+classified error names the offending `param` (e.g. `text.format.schema`); the kernel never
+rewrites the schema to fit. "Never rewrites" includes ingress: unlike model content, a schema
+keeps its non-finite floats through `normalize_model_request` (substituting `NaN` → `null`
+would silently change `{"enum": [NaN]}` into a different constraint), so the value reaches the
+strict serializer both adapters run over the assembled request body and is refused there as a
+non-retryable, `config_recoverable` bad request (`gateway_bad_request` /
+`unserializable_request`) — the same answer either adapter gives any value that cannot be sent.
+Adapters without the declaration ignore the field, and post-hoc
+output validation remains the guarantee on every adapter: native delivery only reduces
+repairs. `AgentLoop` never sets the field; it belongs to standalone `ModelCallRunner` /
+`ValidatedCallRunner` callers.
+
+Two same-named fields are different controls:
+
+| field | what it bounds | enforced by |
+|---|---|---|
+| `RunLimits.max_output_tokens` | a run's cumulative output-token budget, checked against API-reported usage after each turn | the kernel (settles `limited`) |
+| `GenerationConfig.max_output_tokens` | one call's maximum generated length | the provider, per request |
+
+#### Request digests and identity stability
+
+`ModelCallReceipt.prompt_digest` covers the assembled prompt and stays stable when tool
+definitions or generation settings change around it; `request_digest` covers the whole request
+and is the exact replay key. Both are computed on the **raw** request, before any redaction or
+capture policy, so consumers on different policies agree on the identity of what the provider
+was sent. An empty digest means *no key was issued* (the payload could not be canonically
+encoded, or exceeded the size cap) and must never be read as a key.
+
+Two rules keep digests stable across kernel versions:
+
+1. **Additive request fields are omitted when unset.** `generation` and `output_schema` appear
+   in the digest payload only when configured, so a request that does not use them keeps the
+   digest it had before the field existed. Setting one changes the digest — deliberately, since
+   the request's meaning changed.
+2. **Canonicalization changes are generation changes.** If the digest's encoding rules
+   themselves ever change, the digest domain gains a version tag (domain separation), rather
+   than letting two incompatible encodings collide in one key space. Adding an omitted-when-unset
+   field is *not* a generation change.
 
 #### AgentLoop model-I/O subscriptions
 
@@ -428,9 +596,101 @@ the dispatch helper, and are tracked for a later release.
 - `previous_turn_handle`
 - `observations`
 - `model: ModelConfig | None`
+- `messages` — the by-value conversation log; when set it overrides the handle path
+- `output_schema` — provider-neutral response schema (see the delivery section above)
 
 Adapters must use `request.model` for turn-level model selection when present.
 `GatewayModelAdapter` and `OpenAIModelAdapter` follow that rule.
+
+### Output Validation
+
+A developer-supplied `OutputValidator` guarantees the final response conforms to a shape the
+caller defines — a JSON schema, business rules, cross-checks against produced files. The engine
+owns the bounded re-prompt orchestration; the validator owns the judgment. Two execution
+surfaces consume one shared routine (`run_output_validators` / `build_repair_message` in
+`core.output_validator`), so the exception classification and the repair dialect cannot drift
+between them.
+
+The types:
+
+- `OutputValidator` — protocol: `id: str`, `schema: dict | None` (carried, inert — the
+  delivery mechanism is `ModelRequest.output_schema`), and a synchronous
+  `validate(view: FinalOutputView) -> ValidationOutcome`.
+- `ValidationOutcome` — `ok` + `value` (the validated value, surfaced as `final_output`; must
+  be JSON-serializable to persist) + `feedback` (the repair text on rejection).
+- `FinalOutputView` — the read-only composite a validator sees: `final_text` (always),
+  `artifacts`, `final_outputs`, a jailed size-capped `read_bytes`, and `parsed` (best-effort
+  JSON view when the call carried an `output_schema`; a convenience, never the guarantee).
+  `parsed` goes through the kernel's strict JSON ingress, not bare `json.loads`, so Python's
+  non-standard `NaN` / `Infinity` constants — which a schema validator would happily call
+  numbers — leave it unparsed like prose does, along with duplicate keys, unbounded integers,
+  and runaway nesting. **`parsed_ok` is the authority, not `parsed is None`**: a schema
+  permitting a root `null` produces a valid parsed value of `None`, so a validator rejecting on
+  `parsed is None` would fail a conforming answer. Every field but `final_text` defaults
+  (`parsed_ok` to `False`), so the view is constructible with zero loop context.
+- `OutputRetry` — raising it from `validate` equals returning a rejection with feedback.
+- `OutputValidatorBinding` — the per-run opt-out: a registered validator runs by default
+  (registration = activation); a binding with `enabled=False` disables it for that run.
+- `OutputValidatorError` (`error_code="output_validator_error"`) — a validator *defect*.
+
+**Exception classification is the protocol contract.** `OutputRetry` and `ValueError` (which
+covers `pydantic.ValidationError`) are rejections whose text becomes repair feedback; any other
+exception is a defect — the model cannot fix a validator bug, so the run terminalizes (or the
+standalone call raises) rather than re-prompting, and the exception text is never fed back to
+the model.
+
+**In `AgentLoop`** validators run at both settle points (natural text settle and `run.finish`),
+after the refusal/truncation branch: a refusal terminalizes `output_refused`, a
+length-truncated answer settles `limited`/`output_truncated` **without validating** — a cut-off
+but well-formed prefix must not pass as success. All active validators run and all failures are
+collected into one re-prompt; `RunLimits.max_output_retries` (default 1) bounds re-prompts, and
+exhaustion settles `limited` with `output_validator_unsatisfied`. A repair turn is a full agent
+turn: it may call tools and shares the global step/tool/token budgets, so `max_output_retries`
+bounds settle attempts, not total cost. The retry counter is checkpointed; a mid-repair restart
+does not re-grant the budget.
+
+**Standalone** (`ValidatedCallRunner` / `ValidatedCallResult`): the same guarantee for a caller
+invoking `ModelCallRunner` directly, with the opposite tool posture — **a repair call never
+carries tools** (there is no executor behind the surface, and a validation failure must not
+escalate into a tool loop). `max_repair_calls` (default 1) bounds explicit repair calls;
+exhaustion is a *result* (`status="unsatisfied"`), and three outcomes short-circuit before any
+validator runs, in the loop's ordering: refusal (`"refusal"`), truncation (`"truncated"`), and
+a **tool-call answer** (`status="tool_calls"`, keyed on `turn.tool_calls` as well as the
+stop reason) — this surface has no executor, so a turn that stopped to request tools is handed
+back with its calls rather than having its empty text judged and repaired. `receipts` carries
+every call made on every settled result, and an exception escaping `acall` carries the
+completed calls' receipts as its `receipts` attribute (declared on `OutputValidatorError`,
+stamped best-effort on anything else); the failing call's own receipt exists only on
+`ModelCallRunner.subscriptions`, because the adapter raised instead of returning it. Repair
+follows the shape of **how the incoming request carried its conversation**, never what the
+answer came back with (by-value messages append; a request that itself arrived on a
+continuation handle carries the repair as the next instruction on the new handle; a one-shot
+instruction is synthesized into by-value form), preserves `output_schema`, and **clears the
+carriage fields of the shapes it did not choose** — a repair request carries its conversation
+exactly one way, so its `request_digest` describes a request an adapter actually sends. A
+one-shot call is never promoted to the handle path just because
+the provider returned a response id — `OpenAIModelAdapter` sends `store=False`, so that id was
+never persisted and the repair would 404. A request that
+came in *on* a continuation handle whose turn came back *without* a new handle has no fourth
+shape — the conversation lives on the provider's side of that handle — so it settles
+`unsatisfied` without repairing rather than repairing against a prompt the model never saw;
+`repair_calls_used < max_repair_calls` on an `unsatisfied` result is that signal.
+
+Streaming is per attempt: `acall` takes an `AttemptDeltaConsumer`
+(`(attempt_index, event) -> None`, `0` = the original call) rather than a plain
+`DeltaConsumer`, because a rejected attempt's text is discarded output. When the index
+advances, everything the consumer holds from the previous index is retracted; the signature
+carries the boundary so a consumer cannot concatenate a rejected answer onto the accepted one.
+Every attempt opens with an `AttemptStarted(attempt)` event, delivered before any of that
+attempt's chunks and **whether or not any arrive** — the index alone could not carry the
+boundary, since it rides chunks and an attempt may produce none (a non-streaming adapter, a
+stream carrying only its terminal frame, a frameless gateway stream accepted under `"omit"`).
+Without it a consumer went on rendering a rejected attempt's text beside an `ok` result. The
+events a consumer sees are therefore `AttemptStarted | ModelStreamChunk`.
+The sync facade `call` refuses to run inside an active event loop, so it takes no consumer.
+`ValidatedCallRunner` is frozen: `max_repair_calls` must be an exact non-negative `int`, and a
+budget checked once at construction would not be a budget if a reusable runner could be
+reassigned past the check. Reconfigure with `dataclasses.replace`, which revalidates.
 
 ### Tool Contract
 
@@ -1180,9 +1440,28 @@ bindings.
     }
   ],
   "reasoning": {"effort": "medium", "summary": "off"},
+  "generation": {"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 256},
+  "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
   "instruction": "First turn text"
 }
 ```
+
+`generation` and `output_schema` are additive and present only when configured — traffic that
+configures neither keeps its exact pre-existing request shape, and the protocol identifier is
+unchanged. Both `generation` and `reasoning` carry their `on_unsupported` when it is
+off-default: the server rebuilds a config object from the block, so a field left off is not
+"unset" there but the *default*, and a caller's `"omit"` would come back as `"fail"` on the
+server's copy — which the next hop then enforces when a gateway's upstream is another gateway.
+For the same reconstruction reason `reasoning` carries `effort` explicitly when it is
+`"default"`: that is the one field whose omission sentinel differs from the codec's
+reconstruction default (`"medium"`), so leaving it off silently asked the server's upstream
+for medium reasoning on a call that asked for the provider default. Every other value keeps
+its pre-existing wire bytes, and digests never read this wire.
+The applied-echo comparison is unaffected: it is built from `build_generation_payload`, which
+carries provider knobs only, never policy. The
+server parses both blocks with the kernel's own fail-closed codecs: an out-of-range or
+out-of-enum value answers 400 `gateway_bad_request` at this boundary instead of travelling to
+the upstream provider.
 
 The kernel sends one of two request styles. **By-value `messages` is the default**: the
 full provider-neutral conversation log (`messages`, a list of `{role, content}` user /
@@ -1223,6 +1502,22 @@ additionally carry optional priced sub-counts when the provider reports them —
 `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `audio_tokens` —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
+
+**Applied echoes.** When the request carried a `generation` block **and the upstream adapter
+declared `generation_support = "native"` for this call's config**, the response body and the
+terminal `turn_complete` stream frame echo `generation_applied` — the exact block the gateway
+forwarded upstream; a non-declaring upstream gets **no** generation echo at all, which a
+fail-closed client refuses (emitting one unconditionally is the copied-back-proof defect the
+declaration gate exists to rule out). When the request carried `output_schema`, they echo
+`schema_applied` (boolean; `true` only when the upstream adapter declared native schema
+enforcement, so a forwarded-but-ignored schema honestly reads `false`). Both proofs are probed
+under the **per-call** config the turn runs under, not the adapter's standing one. Both echo
+keys are additive and absent for requests that configured neither. The client refuses an
+unproven turn under the default `generation.on_unsupported="fail"` with non-retryable,
+config-recoverable `gateway_generation_not_applied` / `gateway_schema_not_applied`, on the
+sync response, on the streamed terminal frame, and on a stream that ends without one;
+`"omit"` accepts best-effort transport. An older server that ignores the new request keys
+sends no echo and therefore fails closed at the client rather than silently misapplying.
 
 The reference gateway tokens authenticate run identity. New tokens include a `kid` header. A
 `TokenManager` can be built from a keyring, rotated to a new active key, and configured to accept

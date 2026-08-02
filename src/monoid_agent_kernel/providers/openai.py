@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
 )
@@ -178,6 +179,11 @@ class OpenAIModelAdapter:
 
     # Maps resolved base64 image blocks to Responses ``input_image`` items.
     supports_multimodal: ClassVar[bool] = True
+    # Translates ``ModelRequest.output_schema`` to the Responses API ``text.format`` block.
+    structured_output_support: ClassVar[str] = "native"
+    # Puts ``ModelConfig.generation`` on the Responses API request body, so a transport in
+    # front of this adapter may honestly report those parameters as applied.
+    generation_support: ClassVar[str] = "native"
     # Identifies which provider's reasoning artifacts this adapter produces, so the loop tags
     # the captured reasoning block and replay only happens against a matching model.
     provider_name: ClassVar[str] = "openai"
@@ -319,7 +325,6 @@ class OpenAIModelAdapter:
         if not key:
             raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
 
-        payload = self._payload(request)
         config = request.model or self.config
         # The client owns an httpx connection pool and nothing else closes it, so whoever owns the
         # client owns the pool. Unscoped that is this call, and the ``finally`` releases it on
@@ -333,8 +338,11 @@ class OpenAIModelAdapter:
         # that is the only type ``AgentLoop._recoverable_turn_error`` will even look at, so an
         # unclassified one terminalizes the run. Same boundary the gateway adapter's streamed path
         # draws around its own client (see its ``httpx.HTTPError`` handler); one handler, because
-        # the rule is one rule.
+        # the rule is one rule. The payload build sits inside for the same reason: its
+        # ``json.dumps`` of observations and tool arguments is part of this call's failure
+        # surface too, and outside the boundary it escaped as a raw ``TypeError``.
         try:
+            payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
             try:
                 try:
@@ -377,7 +385,6 @@ class OpenAIModelAdapter:
         if not key:
             raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
 
-        payload = self._payload(request)
         config = request.model or self.config
         final_data: dict[str, Any] = {}
         # An unscoped call owns its client for the same reason ``next_turn``'s does -- the pool --
@@ -395,6 +402,7 @@ class OpenAIModelAdapter:
         # undo it -- the gateway's handler does not either. What it prevents is the replacement
         # being a raw exception, which the loop cannot classify at all.
         try:
+            payload = self._classified_payload(request)
             client, call_owned = self._async_client(AsyncOpenAI, key)
             # Bound before the request, so the cleanup below can run even when creating the stream is
             # what failed -- there is nothing to release then, and it must not raise looking.
@@ -497,6 +505,43 @@ class OpenAIModelAdapter:
             stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
         )
 
+    def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
+        """Build the request body **and prove it serializes**, naming a failure what it is.
+
+        The gateway twin (``_encode_request_body``) classifies an unserializable request as a
+        config-recoverable bad request; without this, the same defect here fell through
+        ``_model_error_from_openai``'s no-status tail as an anonymous
+        ``unclassified_provider_error`` -- classified, but not *named*, and the code is what
+        receipts and failure records carry. One helper, both call paths.
+
+        The encode covers the *whole* payload, not only the pieces ``_payload`` serializes on
+        its way through. ``output_schema`` is placed into the body as an object and never
+        touched, so a set or a cycle inside it reached ``json.dumps`` for the first time deep
+        inside the SDK -- past this boundary, where the failure is anonymous and *not*
+        config-recoverable, so the loop terminalized the run for what the gateway twin reports
+        as a recoverable bad request. ``allow_nan=False`` matches that twin too: the SDK's
+        encoder would otherwise emit the JSON-invalid literals ``NaN``/``Infinity`` onto the
+        wire. The string is discarded -- the SDK wants the object -- which costs one extra
+        encode per call, the same encode the gateway path already pays exactly once.
+
+        ``RecursionError`` joins the caught family for the reason the gateway twin catches it:
+        ``json.dumps`` recurses, so a container nested past the interpreter limit fails with a
+        ``RuntimeError`` subclass instead, and an unsendable request must answer the same way
+        whichever exception the encoder chose to say so with.
+        """
+
+        try:
+            payload = self._payload(request)
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+            return payload
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ModelAdapterError(
+                f"model request is invalid or not JSON-serializable: {exc}",
+                provider_error_code="unserializable_request",
+                retryable=False,
+                config_recoverable=True,
+            ) from exc
+
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
         config = request.model or self.config
         payload: dict[str, Any] = {
@@ -512,6 +557,25 @@ class OpenAIModelAdapter:
         reasoning_payload = build_reasoning_payload(config.reasoning)
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
+        # Sampling controls ride the Responses API body verbatim (temperature / top_p /
+        # max_output_tokens are its own top-level names). A direct provider call has no
+        # applied-echo, so ``on_unsupported`` is not enforceable here: "fail" and "omit"
+        # behave identically, and an unsupported parameter surfaces as the provider's own
+        # 400 through the error taxonomy.
+        payload.update(build_generation_payload(config.generation))
+        if request.output_schema is not None:
+            # ResponseContract delivery: the schema goes out verbatim -- never adjusted to
+            # OpenAI's strict subset -- so the request digest identifies exactly what the
+            # provider was asked to enforce. A schema the provider rejects is its own 400
+            # through the taxonomy, same policy note as the sampling controls above.
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "response",
+                    "strict": True,
+                    "schema": request.output_schema,
+                }
+            }
 
         if request.messages is not None:
             # By-value: the full conversation travels as input; no server-side handle. Reasoning
@@ -567,10 +631,15 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     body = getattr(exc, "body", None)
     code = (body.get("code") or body.get("type")) if isinstance(body, dict) else None
     code = str(code) if code else ""
+    # The provider's ``param`` is a field path it authored ("text.format.schema"), not user
+    # content, so it survives the body-free policy -- and it is the only thing that tells a
+    # 400 about an unsupported knob apart from a 400 about a non-strict output_schema.
+    param = body.get("param") if isinstance(body, dict) else None
+    param_detail = f", param={param}" if isinstance(param, str) and param else ""
 
     if isinstance(status, int) and 400 <= status < 500:
         return ModelAdapterError(
-            f"provider rejected the request (HTTP {status})",
+            f"provider rejected the request (HTTP {status}{param_detail})",
             error_code="model_error",
             provider_error_code=code,
             retryable=(status == 429 and code not in {"insufficient_quota"}),

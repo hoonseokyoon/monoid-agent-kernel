@@ -155,6 +155,37 @@ def test_facade_satisfies_agentsession_protocol(tmp_path: Path) -> None:
     assert isinstance(session, AgentSession)
 
 
+def test_blocking_submit_park_moves_the_fsm_like_the_pump(tmp_path: Path) -> None:
+    """The blocking facade's park must transition the FSM exactly as the pump half does:
+    without it, a `TurnNotSettled` escaping `submit` left the state RUNNING
+    (can_accept_input=False) for a session that is in fact parked and accepting input."""
+
+    from monoid_agent_kernel.errors import ModelAdapterError, TurnNotSettled
+
+    class _FailsOnce:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("bad config", http_status=400, error_code="model_error")
+            return ModelTurn(response_id="r2", final_text="recovered")
+
+    session = LoopSession(_loop(tmp_path, _FailsOnce()))
+    session.open()
+    with pytest.raises(TurnNotSettled):
+        session.submit("go")
+    assert session.state is SessionState.TURN_FAILED
+    assert session.health().can_accept_input is True
+    assert session.inspect().last_suspension_reason == "turn_failed"
+    # The park is recoverable through the same facade.
+    suspension = session.run_until_suspended(None)
+    assert suspension.reason == "settled"
+    result = session.close()
+    assert result.status == "completed"
+
+
 def test_inspect_and_health_before_open(tmp_path: Path) -> None:
     session = LoopSession(_loop(tmp_path, FakeModelAdapter(turns=[])))
     inspection = session.inspect()

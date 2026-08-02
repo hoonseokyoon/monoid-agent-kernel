@@ -10,7 +10,12 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import (
+    CheckpointRecord,
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+)
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
@@ -1176,8 +1181,173 @@ def test_recoverable_turn_error_classifier() -> None:
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=429, retryable=True))
     assert _recoverable_turn_error(ModelAdapterError("x", retryable=True))  # any status
+    assert _recoverable_turn_error(ModelAdapterError("x", config_recoverable=True))  # no status
     assert not _recoverable_turn_error(ModelAdapterError("x", http_status=500))
     assert not _recoverable_turn_error(RuntimeError("x"))
+
+
+def test_a_config_recoverable_refusal_ends_the_turn_not_the_run(tmp_path: Path) -> None:
+    """A client-side proof refusal (gateway_generation_not_applied) carries no HTTP status,
+    so the classifier saw an unflagged non-retryable error and terminalized the run — while
+    the identical condition reported by a gateway server as HTTP 400 ended only the turn.
+    The error's own remedy ('set on_unsupported=\"omit\"') is config the user fixes and
+    resends against, which is this classifier's definition of recoverable."""
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError(
+                "the gateway sent no generation_applied echo",
+                provider_error_code="gateway_generation_not_applied",
+                retryable=False,
+                config_recoverable=True,
+            )
+        ]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hello")
+        assert susp.reason == "turn_failed"
+        # The classification the loop decided on must be observable by the driver that
+        # decides what to do next: the suspension and the turn.failed event both carry it.
+        assert susp.config_recoverable is True
+        failed = [e for e in sink.events if e.type == "turn.failed"]
+        assert failed and failed[-1].data["config_recoverable"] is True
+        assert loop._session is not None and loop._session.terminal is False
+        types = [e.type for e in sink.events]
+        assert "run.failed" not in types
+        assert list(run_root.rglob("failure.json")) == []
+    finally:
+        loop.close()
+
+
+def test_submit_surfaces_a_recoverable_turn_failure_typed(tmp_path: Path) -> None:
+    """submit/asubmit are the blocking twins of run_until_suspended, and a turn that parked
+    without settling has no AgentTurnResult to return. The assert this pins the replacement
+    of (``suspension.turn is not None``) crashed submit() with a message-less AssertionError
+    on the first recoverable turn failure — any provider 4xx, an exhausted retryable error,
+    or W5's proof refusal — and under ``python -O`` silently returned None. The rule was
+    bound on the astream half only (``_astream_drive`` returns the suspension)."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("bad config", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        with pytest.raises(TurnNotSettled) as parked:
+            loop.submit("hello")
+        assert parked.value.reason == "turn_failed"
+        assert parked.value.suspension.http_status == 400
+        assert loop._session is not None and loop._session.terminal is False
+        # The session is alive: re-issuing the turn settles.
+        again = loop.run_until_suspended(None)
+        assert again.reason == "settled"
+        assert again.final_text == "recovered"
+    finally:
+        loop.close()
+
+
+def test_interrupt_during_submit_surfaces_typed_not_assert(tmp_path: Path) -> None:
+    """interrupt_turn() is documented as a thread-safe stop whose park keeps the session
+    alive — fired while a caller blocks in submit(), the park must reach that caller as a
+    typed outcome, not an AssertionError."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _SelfInterruptingAdapter()
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter, "fs.list", "run.finish")
+    adapter.loop = loop
+    loop.open()
+    try:
+        with pytest.raises(TurnNotSettled) as parked:
+            loop.submit("go")
+        assert parked.value.reason == "interrupted"
+        again = loop.run_until_suspended(None)
+        assert again.reason == "settled"
+        assert again.final_text == "resumed ok"
+    finally:
+        loop.close()
+
+
+def test_run_once_returns_the_promoted_failure_instead_of_escaping(tmp_path: Path) -> None:
+    """run_once is one-shot: its own finally closes the run, and close() promotes an
+    unrecovered turn_failed park to the terminal failure record. That record IS the call's
+    result — escaping past the close that wrote it skipped the fork-subagent roll-up and
+    terminal event and left the CLI with a raw traceback, while the record itself claimed a
+    clean success and the completed-run cleanup deleted the park's checkpoints."""
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    result = loop.run_once("hello")
+    assert result.status == "failed"
+    assert result.error_code == "model_error"
+    assert list(run_root.rglob("failure.json"))
+    types = [e.type for e in sink.events]
+    assert "run.failed" in types
+
+
+def test_closing_on_an_unrecovered_turn_failure_records_a_failed_run(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    susp = loop.run_until_suspended("hello")
+    assert susp.reason == "turn_failed"
+    result = loop.close()
+    assert result.status == "failed"
+    assert list(run_root.rglob("failure.json"))
+    assert "run.failed" in [e.type for e in sink.events]
+
+
+def test_a_recovered_turn_failure_still_closes_completed(tmp_path: Path) -> None:
+    """The promotion keys on the LAST park: a re-attempt that settles supersedes it."""
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("transient", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    assert loop.run_until_suspended(None).reason == "settled"
+    result = loop.close()
+    assert result.status == "completed"
+    assert list(run_root.rglob("failure.json")) == []
+    assert "run.failed" not in [e.type for e in sink.events]
+
+
+def test_a_turn_failed_run_dir_still_validates(tmp_path: Path) -> None:
+    """The new turn.failed data key must be bound on its third twin — the pinned event-data
+    schema — or `mak validate` rejects every run containing a recoverable turn failure."""
+
+    from monoid_agent_kernel.core.schemas import validate_run_dir
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("bad config", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        assert loop.run_until_suspended(None).reason == "settled"
+    finally:
+        loop.close()
+    run_dir = next(run_root.rglob("manifest.json")).parent
+    assert validate_run_dir(run_dir) == []
 
 
 def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:
@@ -1760,3 +1930,209 @@ def test_tool_result_is_normalized_before_background_event_decision(tmp_path: Pa
     assert len(changed) == 1
     assert changed[0]["data"]["paths"] == ["normalized.txt"]
     assert adapter.requests[1].observations[0].output["result"]["job_id"] is None
+
+
+def _spec_for(tmp_path: Path) -> AgentRunSpec:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+
+def _loop_for(spec: AgentRunSpec, adapter, sink: MemoryEventSink) -> AgentLoop:
+    return AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("run.finish"),
+        event_sinks=(sink,),
+    )
+
+
+def _restored_loop(spec: AgentRunSpec, adapter, sink: MemoryEventSink) -> AgentLoop:
+    """A fresh loop over the same run, rehydrated from the latest durable checkpoint."""
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    loop = _loop_for(spec, adapter, sink)
+    loop.restore(record.checkpoint, blobs=record.blob)
+    return loop
+
+
+def test_a_restored_turn_failed_park_still_closes_as_the_failure_it_is(tmp_path: Path) -> None:
+    """The promotion must survive the process boundary, or it only exists in memory.
+
+    ``close()`` promotes an unrecovered ``turn_failed`` park from a session field, and
+    ``restore()`` rebuilt the session without it — so a crash-and-recover of exactly the run
+    the park exists for (a non-retryable config failure, recovered, left idle, then closed)
+    finalized ``completed``, wrote no ``failure.json``, and let the completed-run cleanup
+    delete the very checkpoints the park preserves for an operator restore. The durable
+    ``last_suspension`` is the evidence, and on this path it is the only evidence there is —
+    it demonstrably committed, since the restore is reading it."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec,
+        _ScriptedAdapter(
+            [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+        ),
+        MemoryEventSink(),
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    del loop  # process death: no close()
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(spec, _ScriptedAdapter([]), sink)
+    result = restored.close()
+
+    assert result.status == "failed"
+    assert list(spec.run_root.rglob("failure.json"))
+    assert "run.failed" in [e.type for e in sink.events]
+    # The failure detail survives the hop rather than degrading to a generic message.
+    assert "bad config" in (result.error or "")
+
+
+def test_a_restored_park_recovered_by_a_later_turn_still_closes_completed(
+    tmp_path: Path,
+) -> None:
+    """The rehydrated field is a park, not a verdict: a re-attempt that settles clears it,
+    exactly as it does for a park that never left memory."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec,
+        _ScriptedAdapter(
+            [ModelAdapterError("transient", http_status=400, error_code="model_error")]
+        ),
+        MemoryEventSink(),
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    del loop
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(
+        spec, _ScriptedAdapter([ModelTurn(response_id="r2", final_text="recovered")]), sink
+    )
+    assert restored.run_until_suspended(None).reason == "settled"
+    result = restored.close()
+
+    assert result.status == "completed"
+    assert list(spec.run_root.rglob("failure.json")) == []
+    assert "run.failed" not in [e.type for e in sink.events]
+
+
+def test_a_restored_settled_park_is_not_promoted_into_a_failure(tmp_path: Path) -> None:
+    """Only ``turn_failed`` rehydrates. A restore of any other park must close normally, or
+    the fix would invent a failure for every recovered run."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec, _ScriptedAdapter([ModelTurn(response_id="r1", final_text="done")]), MemoryEventSink()
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "settled"
+    del loop
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(spec, _ScriptedAdapter([]), sink)
+    assert restored.close().status == "completed"
+    assert list(spec.run_root.rglob("failure.json")) == []
+
+
+def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path) -> None:
+    """``run_once`` absorbs a non-settling park because ``close()`` turns it into the record
+    that IS the call's result — but ``close()`` promotes only ``turn_failed``. An interrupt
+    (and a pause) produced no record at all, so the run finalized ``completed`` with no
+    settled answer: a one-shot caller told to stop was told it had succeeded, and the
+    completed-run cleanup deleted the checkpoints the park had preserved. Only the park
+    ``close()`` can honestly promote is absorbed; the others surface typed, after the same
+    cleanup."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _SelfInterruptingAdapter()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.list", "run.finish"),
+        event_sinks=(MemoryEventSink(),),
+    )
+    adapter.loop = loop
+
+    with pytest.raises(TurnNotSettled) as parked:
+        loop.run_once("go")
+    assert parked.value.reason == "interrupted"
+
+
+def test_run_once_still_returns_the_promoted_failure_for_a_turn_failure(
+    tmp_path: Path,
+) -> None:
+    """The half that must not change: ``turn_failed`` is the park ``close()`` promotes, so it
+    is still absorbed and returned as the failed result rather than raised."""
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    result = loop.run_once("hello")
+    assert result.status == "failed"
+    assert list(run_root.rglob("failure.json"))
+
+
+def test_a_refused_turns_tokens_still_reach_the_run_budget(tmp_path: Path) -> None:
+    """A call can fail *after* the provider produced and billed a complete answer — that is
+    exactly the shape of the applied-parameters proof refusals. The loop's accumulation runs
+    only on the returned-turn path, so those tokens never reached ``total_usage``: the metrics
+    reported a run cheaper than it was, and the cumulative token budget under-counted every
+    refused call, which makes it a bound that does not hold."""
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    refusal = ModelAdapterError(
+        "did not apply the requested generation parameters",
+        provider_error_code="gateway_generation_not_applied",
+        error_code="model_error",
+        config_recoverable=True,
+    )
+    mark_provider_usage(refusal, {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460})
+
+    adapter = _ScriptedAdapter([refusal, ModelTurn(response_id="r2", final_text="recovered")])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+        # A later settle adds to the refused call's cost rather than replacing it, so the
+        # next metrics event — the first one this run emits — already carries it.
+        assert loop.run_until_suspended(None).reason == "settled"
+        assert loop._session.state.total_usage["total_tokens"] >= 460  # type: ignore[union-attr]
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] >= 460
+    finally:
+        loop.close()
+
+
+def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
+    """The counterweight: an ordinary provider failure produced nothing and must cost
+    nothing, or every failed call would inflate the budget."""
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        # The run's zeroed counters, untouched — a failed call that produced nothing costs
+        # nothing, or every provider error would inflate the budget.
+        assert dict(loop._session.state.total_usage) == {  # type: ignore[union-attr]
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+    finally:
+        loop.close()

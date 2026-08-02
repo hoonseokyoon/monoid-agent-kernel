@@ -190,6 +190,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "provider_error_code": _STR,
             "http_status": {"type": ["integer", "null"]},
             "retryable": _BOOL,
+            "config_recoverable": _BOOL,
         },
         required=("error_code",),
     ),

@@ -7,6 +7,354 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
+
+- **A stream that ends without a terminal frame is no longer accepted unproven.** The
+  applied-parameter checks lived only on the `turn_complete` frame — which is exactly the frame
+  an older gateway never sends; its stream ends cleanly, `assemble_streamed_turn` synthesizes
+  `stop_reason="stop"`, and the turn was accepted with every parameter unproven while the sync
+  transport refused the same server. The drain now runs the same shared checks with an absent
+  echo; traffic that configures neither knob keeps the old tolerance for frameless streams.
+- **The capability question is answered per call, not per adapter.** `GatewayModelAdapter`'s
+  `generation_support` / `structured_output_support` declarations are now callables taking the
+  effective per-call config (the probes pass it through; a raising callable still reads
+  `"none"`), and the reference gateway probes them under the same config the upstream call runs
+  under (`_upstream_model_config`, built once for the adapter, the request, and the proof). A
+  shared factory-built adapter could previously mint proof from its standing config for a call
+  it enforced under a wire-supplied `"omit"` — the copied-back-proof defect one config-source
+  hop later.
+- **Direct-Python reasoning configs fail closed.** `validate_reasoning_config` now exists as
+  the one rule source (the codec, `normalize_model_config`, and the runtime-config ingress all
+  consume it; the ingress's hand-copied enum frozensets are deleted). A Python-constructed
+  `ReasoningConfig(effort="turbo")` previously sailed through normalization to die mid-run as a
+  provider 400 while the JSON codec rejected the same value at config time.
+- **`effort="default"` survives the gateway wire.** It is the one reasoning field whose
+  omission sentinel differs from the codec's reconstruction default (`"medium"`), so a client
+  asking for provider-default reasoning silently got medium — only through a gateway. The
+  client payload now carries it explicitly, like the off-default policy beside it; all other
+  values keep their exact wire bytes.
+- **A tool-call answer on the standalone surface is an outcome, not empty text.**
+  `ValidatedCallStatus` gains `"tool_calls"`, short-circuiting before validation like refusal
+  and truncation; previously the validators judged `final_text or ""`, burned a paid repair
+  rewriting an answer the model never gave, and with zero validators the turn read `"ok"` with
+  `final_text=None`.
+- **Receipts survive exceptions.** `OutputValidatorError` (and any exception escaping
+  `ValidatedCallRunner.acall`) now carries the completed calls' receipts as a `receipts`
+  attribute; they were dropped with the raise, contradicting the audit-trail claim.
+- **An unserializable request is a classified error on every path.** The gateway body encode
+  (both transports) now raises non-retryable `gateway_bad_request` instead of leaking a raw
+  `TypeError`, and the OpenAI payload build moved inside its classifier on both paths — one
+  rule covering `output_schema`, `messages`, and observations.
+- **A proof refusal ends the turn, not the run.** `ModelAdapterError` gains
+  `config_recoverable`; `gateway_generation_not_applied` / `gateway_schema_not_applied` set it,
+  `AgentLoop`'s classifier honors it (the error's own remedy is config the user fixes and
+  resends), and the reference gateway's HTTP layer maps such errors to 422 rather than
+  laundering them into a run-killing 502 across a chained hop.
+- **Repair requests carry their conversation exactly one way.** `_repair_request` clears the
+  carriage fields of the shapes it did not choose, so a repair's `request_digest` describes a
+  request an adapter actually sends and a stale `instruction` can never be re-read beside the
+  appended messages.
+- The capability probes (`structured_output_support` / `generation_support`) and
+  `AttemptDeltaConsumer` are exported from `contracts` — all three are documented contract
+  surface a third-party gateway or streaming caller implements against, and previously
+  required importing provider modules. OpenAI 4xx classification now names the provider's
+  `param` (a provider-authored field path, not user content) so a schema-subset rejection is
+  distinguishable from any other bad request.
+- **`submit()` / `asubmit()` / `run_once()` surface a non-settling park honestly instead of
+  crashing.** A turn that parked without settling — a *recoverable* turn failure (any
+  provider 4xx, an exhausted retryable error, W5's proof refusals), an interrupt, or a pause —
+  produces a `Suspension` with `turn=None`; the blocking facades asserted `turn is not None`
+  and crashed with a message-less `AssertionError` (silently returning `None` under
+  `python -O`), including on the fork-subagent path through `arun_once`. `submit`/`asubmit`
+  now raise `TurnNotSettled` (`monoid_agent_kernel.errors`), carrying the suspension and its
+  classification, with the session alive exactly as the `run_until_suspended` / `astream`
+  halves always kept it; `LoopSession.submit` maps the park onto the FSM exactly like its
+  pump half before re-raising. `run_once` is one-shot — its own `finally` closes the run —
+  so it **returns** the promoted failed `AgentRunResult` instead of raising past the close
+  that recorded it (which also restores the fork-subagent `subagent.failed` event and usage
+  roll-up, and a clean CLI exit). The stale "every non-awaiting reason attaches a turn"
+  claim is corrected in the docstrings and `Suspension` docs.
+- **`close()` promotes an unrecovered `turn_failed` park to the terminal failure record.**
+  Closing a run whose last park was a recoverable turn failure previously finalized from the
+  per-turn reset state: `run.finished` claimed `status=completed` with no `failure.json`,
+  and the completed-run cleanup then deleted the very checkpoints the park preserves for an
+  operator-driven restore. `close()` now performs the same promotion `fail_recoverable`
+  offers drivers explicitly (`failure.json` + `run.failed` + checkpoints kept); a park
+  recovered by a later settle still closes `completed`. The `turn.failed` event schema
+  gains `config_recoverable`, so `mak validate` accepts runs containing recoverable turn
+  failures (the third twin of that key, after the Suspension and the checkpoint payload).
+- `Suspension` and the `turn.failed` event carry `config_recoverable`, so a driver can
+  distinguish "park for a config fix" from other non-retryable turn failures without
+  hard-coding provider codes; the durable park payload round-trips it (absent on
+  pre-v0.21 checkpoints reads `False`).
+- The unserializable-request errors on both adapters are `config_recoverable` too — the
+  same mistake reported by a gateway server is an HTTP 400, which was already
+  turn-recoverable; and the OpenAI twin now names the defect (`unserializable_request`)
+  instead of falling through as `unclassified_provider_error`.
+- `run_output_validators` hands each validator its own copy of `parsed`, keeping
+  `FinalOutputView` read-only in fact: one validator's in-place mutation was previously
+  judged — and surfaced as a value — by the next. An exception already stamped with an inner
+  validated call's `receipts` keeps the innermost stamp instead of being overwritten.
+- **A boolean can no longer prove a sampling parameter.** The `generation_applied` echo was
+  compared with `==`, and Python holds `True == 1` and `False == 0.0` — so a gateway
+  answering JSON booleans proved exactly the most ordinary settings this block carries
+  (`max_output_tokens=1`, `top_p=1`, `temperature=0`) under the default fail-closed policy.
+  The comparison is now per key and non-coercive (a number is proven only by a number,
+  through the same `is_finite_json_number` rule the rest of this wire reads with), while
+  still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
+  `1.0` is not falsely refused.
+- **`output_schema` is not rewritten by ingress.** `normalize_model_request` substituted
+  non-finite floats with `null` — right for model content, wrong for a control document
+  promised verbatim: `{"enum": [NaN]}` became `{"enum": [null]}`, a different constraint the
+  provider then enforced, and the strict serializer that exists to refuse the value never saw
+  it. Strings and containers are still normalized; the value now reaches the boundary and is
+  refused there.
+- **The OpenAI adapter preflights the whole request body.** `_payload` embeds `output_schema`
+  without serializing it, so its classifier saw nothing: a set or a cycle inside the schema
+  failed later inside the SDK as an anonymous `unclassified_provider_error` with no
+  `config_recoverable` (terminalizing the run for what the gateway twin reports recoverably),
+  and a `NaN` was serialized to the JSON-invalid literal `NaN` and sent. The assembled payload
+  is now strict-encoded (`allow_nan=False`) inside the classification boundary on both the
+  blocking and the streaming path.
+- **A request too deep to encode is classified, not raw.** `json.dumps` recurses, so a
+  container nested past the interpreter limit raises `RecursionError` — a `RuntimeError`
+  subclass, outside the `TypeError`/`ValueError` family both encoders caught — and nothing
+  upstream refuses it first (`normalize_json_ingress` is iterative by design, and the
+  512-level nesting cap guards the JSON *text* parsers, not a Python-constructed value). It
+  escaped raw from the gateway encoder and reached the OpenAI adapter's outer handler as an
+  anonymous `unclassified_provider_error`, terminalizing the run either way. Both encoders now
+  answer it like any other unsendable request.
+- **The unrecovered-park promotion survives a restart.** `close()` promotes an unrecovered
+  `turn_failed` park from a session field, and `restore()` rebuilt the session without it — so
+  a crash-and-recover of exactly the run the park exists for (a non-retryable configuration
+  failure, recovered, left idle, then closed) finalized `completed`, wrote no `failure.json`,
+  and let the completed-run cleanup delete the checkpoints the park preserves for an operator
+  restore. `restore()` now rehydrates it from the checkpoint's `last_suspension` (only
+  `reason="turn_failed"`; a later settle clears it at pump entry, exactly as in-process).
+- **A conforming deeply-nested answer is still validated.** The per-validator copy of
+  `FinalOutputView.parsed` used `deepcopy`, which recurses: the strict ingress accepts JSON
+  nested to 512 levels — deep enough to exhaust the interpreter's default 1000-frame stack —
+  so an answer the *parser accepted* raised `RecursionError` in the copy, outside any
+  classification, before a single validator ran, and `ValidatedCallRunner.acall` leaked it raw.
+  The copy now goes through the kernel's iterative JSON copier with both substitutions off, so
+  it is isolation and nothing else.
+- **An attempt that streams nothing still announces itself.** `AttemptDeltaConsumer` carried
+  the attempt boundary on chunks alone, so an attempt that produced none delivered nothing at
+  all — a consumer holding a rejected attempt's text was never told to drop it and rendered it
+  beside an `ok` result. Every attempt now opens with an `AttemptStarted(attempt)` event
+  (exported from `contracts`), delivered before that attempt's chunks and whether or not any
+  arrive; the consumer's event type is `AttemptStarted | ModelStreamChunk`.
+- **A refused turn still reports the tokens it burned.** The applied-parameters refusals fire
+  *after* the gateway returned a complete, billed answer with its usage — the client simply
+  refuses to trust that its parameters shaped it. The failed `ModelCallReceipt` reported zero
+  tokens and the loop's accumulation runs only on the returned-turn path, so a paid call
+  vanished from the metrics and from the cumulative token budget, which makes that budget a
+  bound that does not hold. The refusal now carries the reported usage (`mark_provider_usage`,
+  the twin of `mark_provider_retried`) on both transports; `ModelCallReceipt.with_error` reads
+  it back, and `AgentLoop` accumulates it on the failure path. A failure that reports no usage
+  still adds nothing. **The cost survives a gateway hop too**: when a reference gateway's own
+  upstream refuses a billed turn, the error envelope carries `usage` (JSON body and SSE error
+  frame alike, omitted when empty so an error raised before reaching a provider keeps its exact
+  wire shape), all three client error readers stamp it back onto the reconstructed exception,
+  and the gateway meters the call against the tenant before re-raising instead of losing it to
+  the raise.
+- **`run_once` no longer *returns* an interrupted run as a success.** It absorbs a
+  non-settling park because `close()` turns it into the record that *is* the call's result —
+  but `close()` promotes only `turn_failed`. An `interrupted`/`paused` park has no failure to
+  promote, so absorbing it returned a `completed` result for a run with no settled answer.
+  Only the park `close()` can promote is absorbed; the others surface as `TurnNotSettled`
+  after the same close. Note the scope honestly: the typed raise is the *only* signal — the
+  one-shot's closing `finally` still finalizes the run record `completed` (a user stop is not
+  a failure) and the completed-run cleanup still deletes its checkpoints. A caller that wants
+  to resume an interrupted turn uses the multi-turn facades (`open`/`submit`/`close`), where
+  the session stays alive.
+
+### Fixed — pre-merge twin census over the whole PR surface
+
+- A three-dimension twin census (transport/topology, facade/lifecycle carriers,
+  adapter/shape/codec) swept every fact this PR introduced for the branch's dominant defect
+  shape — a rule bound on N−1 of its N parallel sites — and found three unbound cells, all in
+  the newest commits no external round had reviewed:
+  the tenant ledger metered a billed failure on `/turns` but not on `/turns/stream` (both
+  stream sub-branches; the sync twin was test-pinned, the stream twin untested);
+  a malformed applied-echo on a *billed* terminal frame raised `gateway_bad_response` without
+  the frame's own `usage`, while the sync transport stamped it;
+  and the reference server's blanket ingress normalize rewrote non-finite `output_schema`
+  values (`NaN` → `null`) that the client-side rule keeps verbatim precisely so they are
+  refused rather than silently turned into a different constraint (live only for in-process
+  Python callers — HTTP bodies reject the constants at the JSON parser). All three fixed at
+  shared seams (`_stream_turn`'s one failure meter; the frame parser stamps before
+  re-raising; `_normalized_turn_payload` shared by both handlers).
+
+### Added — `GenerationConfig`: per-call sampling controls (kernel types)
+
+- `ModelConfig` gains `generation: GenerationConfig` — `temperature` (0–2), `top_p` ((0, 1]),
+  `max_output_tokens` (≥ 1), and `on_unsupported` (`"fail"` default / `"omit"`). Every value
+  field defaults to `None`, meaning "delegate to the provider". The JSON codec and direct-Python
+  normalization share one fail-closed rule source (`validate_generation_config`), so a range
+  accepted from JSON can never diverge from the range accepted from a constructor. **This
+  release adds the type and its ingress only; provider and gateway threading land next**, so a
+  configured value has no request-body effect yet.
+- **`ModelConfig.to_json` omits the `generation` key entirely when the block was never
+  configured.** That single rule is the compatibility mechanism for three consumers at once: a
+  generation-free config keeps its pre-existing `request_digest` (replay key), its
+  `AgentRuntimeConfig.config_hash` (durable recovery compares this hash across versions), and
+  its wire shape. Setting any generation value changes all three, deliberately — pinned by
+  literal-hash tests captured on v0.20.1.
+- `GenerationConfig` is exported from `monoid_agent_kernel.contracts` (and the package root)
+  alongside its siblings `ModelConfig` / `ModelRetryConfig` / `ReasoningConfig`, so configuring
+  generation does not require reaching into `core.spec`.
+
+### Documentation — the output-validation and model-call contracts are now written down
+
+- `docs/CONTRACTS.md` gains an Output Validation section documenting all six exported types
+  (`OutputValidator`, `ValidationOutcome`, `FinalOutputView`, `OutputRetry`,
+  `OutputValidatorBinding`, `OutputValidatorError`), the exception-classification contract, the
+  loop's settle orchestration, and the standalone `ValidatedCallRunner` contract — these types
+  had shipped in `contracts.py` since their introduction with no per-symbol contract entry.
+- The Model Adapter section documents generation-parameter and output-schema delivery, the
+  applied-echo enforcement, the fail-closed `structured_output_support` probe, the two digest
+  stability rules (additive fields omitted when unset; canonicalization changes are
+  domain-version changes), and the `RunLimits.max_output_tokens` vs
+  `GenerationConfig.max_output_tokens` distinction. The stale `ModelRequest` field list gains
+  the `messages` and `output_schema` fields.
+- The LLM Gateway wire contract shows the `generation` / `output_schema` request keys and the
+  applied-echo response keys; `docs/COMPATIBILITY.md` records the additive-key policy for
+  `monoid.llm-turn.v1`, the fail-closed version-skew behavior, and the mixed-fleet caveat for
+  configured generation blocks in `config_hash`.
+
+### Added — output-schema delivery on the standalone path (ResponseContract)
+
+- `ModelRequest.output_schema` carries a standard, provider-neutral JSON Schema for the final
+  answer. The OpenAI adapter translates it to the Responses API `text.format` json_schema
+  block **verbatim — never adjusted to the provider's strict subset** — so the request digest
+  identifies exactly what the provider was asked to enforce (a schema the provider rejects is
+  its own error through the taxonomy). The envelope is strict mode (`strict: true` — anything
+  less is not *enforced* decoding and would make `schema_applied: true` a false proof), and
+  OpenAI's strict subset has requirements of its own (`additionalProperties: false` on every
+  object, every property required); a schema outside it 400s with the offending `param` named
+  in the classified error. The digest follows the omission rule: schema-free
+  requests keep their pre-existing replay key. `AgentLoop` does not set the field; this is the
+  standalone/LLM-only path only.
+- Adapters opt in with a `structured_output_support = "native"` declaration, read through a
+  fail-closed probe (absence and unknown values mean `"none"`). The `monoid.llm-turn.v1` wire
+  gains `output_schema` (request) and a `schema_applied` boolean echo (response body and
+  terminal stream frame): the reference gateway threads the schema to its upstream adapter and
+  echoes `True` only when that adapter declared native enforcement, so a forwarded-but-ignored
+  schema reads `False`. The client refuses an unproven schema under the same
+  `on_unsupported="fail"` knob that governs the sampling-parameter echo — one policy for "the
+  transport cannot prove application", deliberately not two half-settable ones.
+- `FinalOutputView.parsed` gives validators a best-effort structured view of the answer when a
+  schema was requested, with `parsed_ok` saying whether there was a parse at all — `parsed is
+  None` cannot, because a schema permitting a root `null` yields a valid parsed `None`, and a
+  validator rejecting on `parsed is None` would fail a conforming answer and spend its repair
+  budget on it. The parse goes through the kernel's strict JSON ingress
+  rather than bare `json.loads`, which accepts Python's non-standard `NaN` / `Infinity`
+  constants: a validator reading `parsed` — a schema validator will call `NaN` a number — would
+  otherwise accept an answer that is not JSON at all. `ValidatedCallRunner` populates
+  it; repair calls keep the schema riding while still stripping tools. Post-hoc validation
+  remains the guarantee on every adapter — native delivery only reduces repairs, and adapters
+  without support keep working unchanged.
+
+### Added — `ValidatedCallRunner`: one validated model call, outside any loop
+
+- A caller invoking `ModelCallRunner` directly — an LLM-only skill, a gateway, a batch driver —
+  gets the same validate-and-re-prompt guarantee `AgentLoop` applies at its settle points:
+  dispatch, run the registered `OutputValidator`s, and repair with at most `max_repair_calls`
+  (default 1) explicit follow-up calls. Exhaustion is a result (`status="unsatisfied"`), not an
+  exception; refusal, truncation, and a tool-call answer (`status="tool_calls"` — this surface
+  has no executor, so a turn that stopped to request tools is handed back with its calls
+  rather than having its empty text judged) short-circuit **before** validation, in the same
+  order the loop decides them; a validator defect raises `OutputValidatorError` and never
+  re-prompts. `ValidatedCallResult` carries the receipts of every call made on every settled
+  result, and an exception escaping `acall` carries the completed calls' receipts as its
+  `receipts` attribute — the failing call's own receipt reaches only
+  `ModelCallRunner.subscriptions`, because the adapter raised instead of returning it.
+  A thin sync facade (`call`) covers callers with no event loop and
+  refuses to run inside an active one. The runner is **frozen**, and `max_repair_calls` must be
+  an exact non-negative `int`, like every other budget control in the kernel — the loop bound is
+  `repair_calls >= budget`, which `nan` makes permanently false and `inf` never reaches, so
+  neither a budget arriving from dynamically typed configuration nor one reassigned onto a
+  reusable runner afterwards can authorize unbounded paid model calls.
+- **A repair call never carries tools.** The standalone surface has no tool executor, and a
+  validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
+  deliberately a full agent turn; here it is deliberately not. Repair follows the shape of how
+  the **incoming request** carried its conversation, never what the answer came back with:
+  by-value messages append the answer and the repair prompt, a request that itself arrived on a
+  continuation handle carries the repair as the next instruction on the new handle, and a
+  one-shot instruction is synthesized into the by-value form. A one-shot call is never promoted
+  onto the handle path because the provider returned a response id — `OpenAIModelAdapter` sends
+  `store=False`, so that id was never persisted and the repair would 404, losing the whole call
+  to an exception. A request that arrived **on** a continuation handle whose turn came
+  back **without** a new handle has no repairable shape — the conversation is on the provider's
+  side of that handle — so it settles `unsatisfied` without spending a repair call rather than
+  repairing against a synthesized prompt that drops every prior message.
+- **Streaming is per attempt.** `acall` takes an `AttemptDeltaConsumer`
+  (`(attempt_index, chunk) -> None`) instead of a plain `DeltaConsumer`: a rejected attempt's
+  text is discarded output, and a consumer that renders or accumulates chunks must be told when
+  the previous attempt is retracted. Carrying the index in the signature makes the boundary
+  impossible to miss rather than a convention to remember.
+- The validation routine, exception classification, repair text, and failure rollup moved from
+  the loop's settle module into `core.output_validator`
+  (`run_output_validators` / `build_repair_message` / `failures_by_validator`) and the loop now
+  imports them — one rule source for both execution surfaces, so the repair dialect and the
+  defect boundary cannot drift. No behavior change on the loop path.
+
+### Added — generation parameters reach the providers, and the gateway proves it applied them
+
+- The OpenAI adapter sends `temperature` / `top_p` / `max_output_tokens` on the Responses API
+  body when configured (one shared payload builder covers the one-shot and streamed paths). A
+  direct provider call has no applied-echo, so `on_unsupported` is not enforceable there:
+  `"fail"` and `"omit"` behave identically and an unsupported parameter surfaces as the
+  provider's own error through the existing taxonomy.
+- The `monoid.llm-turn.v1` wire carries a `generation` block (only when configured — the
+  protocol id is unchanged and generation-free traffic keeps its exact previous shape), and the
+  reference gateway parses it **fail-closed with the same codec the kernel uses**, threads it
+  into the upstream adapter's config on both the blocking and streaming paths, and echoes
+  `generation_applied` (response body, and the terminal `turn_complete` frame on the stream).
+- **The echo is derived from what the upstream adapter declares, never from the request.**
+  Adapters opt in with `generation_support = "native"`, read through the same fail-closed probe
+  as `structured_output_support`; the reference gateway omits the echo when its upstream does
+  not declare it. Echoing the requested block back would have matched exactly on the client
+  and let `on_unsupported="fail"` accept sampling controls that an ignoring adapter — the
+  offline echo adapter, any `provider_adapter_factory` backend — never put on a request.
+  A declaration can therefore be conditional: `GatewayModelAdapter` only *forwards*, so it
+  declares `"native"` under `on_unsupported="fail"` (where a returned turn is a proven turn)
+  and `"none"` under `"omit"` (where it deliberately accepts an unproven one). Otherwise a
+  chained gateway would mint a fresh positive echo for a call whose inner hop proved nothing.
+- **The gateway client refuses a turn whose parameters cannot be proven applied.** Under the
+  default `on_unsupported="fail"`, a response without a matching `generation_applied` echo —
+  an older gateway that silently discarded the block, exactly the deployment this exists to
+  catch — fails with non-retryable `gateway_generation_not_applied`; `"omit"` accepts
+  best-effort transport. Both the sync response and the streamed terminal frame enforce it,
+  through one shape rule and one policy rule shared by both: a malformed echo is
+  `gateway_bad_response` on either transport whatever the policy says, and the rejection
+  carries this client's own retry evidence (`provider_retried`) since no turn is returned to
+  carry it.
+- The gateway wire also carries `reasoning.on_unsupported` and `generation.on_unsupported` now
+  (off-default only). The server rebuilds a config object from each block, so a field left off
+  is not "unset" there but the *default*: a client's `"omit"` came back as `"fail"` on the
+  server's copy. That becomes a live failure as soon as a gateway's upstream is another
+  gateway — the next hop enforces the reset policy and rejects a turn the caller asked to
+  accept best-effort — and it hits `output_schema` callers too, since the same knob gates the
+  schema echo. The applied-echo comparison is untouched: it is built from
+  `build_generation_payload`, which carries provider knobs only, never policy.
+- `TurnComplete` gains an optional `generation_applied` field so the streamed echo has a place
+  to ride; absent means the wire never mentioned it.
+
+### Changed — `ReasoningConfig.from_json` is now fail-closed
+
+- `effort`, `summary`, and `on_unsupported` reject values outside their documented enums with a
+  field-named `ValueError`. Previously the codec accepted arbitrary values and the mistake
+  surfaced later (or not at all) depending on which ingress the config travelled through.
+  Payloads that only ever carried documented values are unaffected. The reference gateway's
+  request parser now reuses this codec (and the generation one), so an out-of-enum reasoning
+  value or an out-of-range sampling value answers 400 `gateway_bad_request` at the boundary
+  instead of travelling to the upstream provider. The direct-Python half of the 0.20.1
+  "retained and direct-Python controls fail closed" contract landed with the internal-review
+  pass above (`validate_reasoning_config` consumed by `normalize_model_config`); this entry
+  closed the codec half.
+
 ## [0.20.1] - 2026-08-01
 
 ### Fixed — Studio traces tell the operational story

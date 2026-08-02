@@ -214,6 +214,17 @@ Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `
 `checkpoint.v1`, and retained `command-inbox.v1` runtime-config payloads. Fresh operator
 configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
 `\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
+The v0.21 `monoid.llm-turn.v1` writer adds `generation` and `output_schema` to the request and
+`generation_applied` / `schema_applied` to the response and terminal stream frame without
+changing either protocol identifier (the `metadata_generation` precedent). Every new key is
+present only when the caller configured the feature, so traffic that does not use it keeps its
+exact previous wire shape. Version skew fails closed on the client: under the default
+`generation.on_unsupported="fail"`, a server that does not echo is refused rather than allowed
+to silently discard parameters. Separately, `ModelConfig.to_json` emits its `generation` block
+only when configured — a generation-free runtime config keeps its pre-v0.21 `config_hash`, and
+a *configured* one intentionally does not verify across mixed-version backend-run recovery
+(configure generation only on a fully rolled fleet).
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other

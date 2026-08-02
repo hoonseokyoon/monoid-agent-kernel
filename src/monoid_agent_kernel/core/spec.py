@@ -4,7 +4,7 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.content import (
     ContentPart,
@@ -22,6 +22,19 @@ WorkspaceBackendKind = Literal["overlay", "staging"]
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]
 ReasoningSummary = Literal["off", "auto", "detailed"]
 
+_REASONING_EFFORTS = get_args(ReasoningEffort)
+_REASONING_SUMMARIES = get_args(ReasoningSummary)
+# Shared by reasoning and generation: what to do when a transport cannot prove the
+# setting was applied.
+_MODEL_FALLBACK_MODES = ("fail", "omit")
+
+
+def _model_choice(value: Any, field_name: str, choices: tuple[str, ...]) -> Any:
+    if value not in choices:
+        rendered = ", ".join(choices)
+        raise ValueError(f"{field_name} must be one of: {rendered}")
+    return value
+
 
 @dataclass(frozen=True)
 class ReasoningConfig:
@@ -36,10 +49,12 @@ class ReasoningConfig:
         if not isinstance(payload, dict):
             raise ValueError("model reasoning config must be an object or null")
         defaults = cls()
-        return cls(
-            effort=payload.get("effort", defaults.effort),
-            summary=payload.get("summary", defaults.summary),
-            on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+        return validate_reasoning_config(
+            cls(
+                effort=payload.get("effort", defaults.effort),
+                summary=payload.get("summary", defaults.summary),
+                on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+            )
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -48,6 +63,28 @@ class ReasoningConfig:
             "summary": self.summary,
             "on_unsupported": self.on_unsupported,
         }
+
+
+def validate_reasoning_config(reasoning: ReasoningConfig) -> ReasoningConfig:
+    """Fail-closed check shared by the JSON codec and direct-Python normalization.
+
+    The reasoning twin of :func:`validate_generation_config`, and for the same reason: one
+    rule source for both ingresses, so a value accepted from JSON can never diverge from a
+    value accepted from a constructor. Before this existed, the codec and the gateway server
+    both rejected an unknown effort while a Python-constructed one sailed through
+    ``normalize_model_config`` to fail mid-run as a provider 400.
+    """
+
+    if not isinstance(reasoning, ReasoningConfig):
+        raise ValueError("model.reasoning must be a ReasoningConfig")
+    _model_choice(reasoning.effort, "model.reasoning.effort", _REASONING_EFFORTS)
+    _model_choice(reasoning.summary, "model.reasoning.summary", _REASONING_SUMMARIES)
+    _model_choice(
+        reasoning.on_unsupported,
+        "model.reasoning.on_unsupported",
+        _MODEL_FALLBACK_MODES,
+    )
+    return reasoning
 
 
 def _model_control_number(
@@ -92,6 +129,113 @@ def _model_text(value: Any, field_name: str, *, allow_none: bool = False) -> str
     if not value:
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _generation_number(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: int | float,
+    maximum: int | float,
+    exclusive_minimum: bool = False,
+) -> int | float | None:
+    """Validate an optional sampling control; ``None`` delegates to the provider default."""
+
+    if value is None:
+        return None
+    if type(value) not in (int, float):
+        raise ValueError(f"{field_name} must be a finite number or null")
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite:
+        raise ValueError(f"{field_name} must be a finite number or null")
+    below = value <= minimum if exclusive_minimum else value < minimum
+    if below or value > maximum:
+        lower = f"greater than {minimum}" if exclusive_minimum else f"at least {minimum}"
+        raise ValueError(f"{field_name} must be {lower} and at most {maximum}")
+    return value
+
+
+@dataclass(frozen=True)
+class GenerationConfig:
+    """Per-call sampling controls. ``None`` on a value field delegates to the provider default.
+
+    ``on_unsupported`` is enforced where non-application is detectable: the gateway transport
+    echoes what it applied, so ``"fail"`` rejects a turn whose parameters were silently dropped
+    by an older server. A direct provider call has no echo; there the provider's own error is
+    the only signal, so ``"fail"`` and ``"omit"`` behave identically.
+    """
+
+    temperature: int | float | None = None
+    top_p: int | float | None = None
+    max_output_tokens: int | None = None
+    on_unsupported: Literal["fail", "omit"] = "fail"
+
+    @property
+    def is_default(self) -> bool:
+        return self == GenerationConfig()
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any] | None) -> GenerationConfig:
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("model generation config must be an object or null")
+        defaults = cls()
+        return validate_generation_config(
+            cls(
+                temperature=payload.get("temperature", defaults.temperature),
+                top_p=payload.get("top_p", defaults.top_p),
+                max_output_tokens=payload.get("max_output_tokens", defaults.max_output_tokens),
+                on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+            )
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_output_tokens": self.max_output_tokens,
+            "on_unsupported": self.on_unsupported,
+        }
+
+
+def validate_generation_config(generation: GenerationConfig) -> GenerationConfig:
+    """Fail-closed check shared by the JSON codec and direct-Python normalization.
+
+    One rule source for both ingresses, so a range accepted from JSON can never diverge from
+    the range accepted from a constructor.
+    """
+
+    if not isinstance(generation, GenerationConfig):
+        raise ValueError("model.generation must be a GenerationConfig")
+    _generation_number(
+        generation.temperature,
+        "model.generation.temperature",
+        minimum=0,
+        maximum=2,
+    )
+    _generation_number(
+        generation.top_p,
+        "model.generation.top_p",
+        minimum=0,
+        maximum=1,
+        exclusive_minimum=True,
+    )
+    if generation.max_output_tokens is not None and (
+        type(generation.max_output_tokens) is not int or generation.max_output_tokens < 1
+    ):
+        raise ValueError(
+            "model.generation.max_output_tokens must be an integer greater than zero or null"
+        )
+    _model_choice(
+        generation.on_unsupported,
+        "model.generation.on_unsupported",
+        _MODEL_FALLBACK_MODES,
+    )
+    return generation
 
 
 @dataclass(frozen=True)
@@ -162,6 +306,7 @@ class ModelConfig:
     timeout_s: int | float = 600
     gateway_url: str | None = None
     retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ModelConfig:
@@ -186,10 +331,11 @@ class ModelConfig:
                 allow_none=True,
             ),
             retry=ModelRetryConfig.from_json(payload.get("retry")),
+            generation=GenerationConfig.from_json(payload.get("generation")),
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "provider": self.provider,
             "model": self.model,
             "reasoning": self.reasoning.to_json(),
@@ -197,6 +343,13 @@ class ModelConfig:
             "gateway_url": self.gateway_url,
             "retry": self.retry.to_json(),
         }
+        # The one key emitted only when configured, unlike every sibling: this dict feeds the
+        # request digest (replay key), the runtime-config semantic hash (durable recovery
+        # compares it across versions), and the gateway wire, so a never-configured block must
+        # serialize byte-identically to a config that predates the field.
+        if not self.generation.is_default:
+            payload["generation"] = self.generation.to_json()
+        return payload
 
 
 def _validate_run_limit(

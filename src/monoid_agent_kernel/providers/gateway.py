@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
     loads_json_ingress,
     loads_model_envelope_json_ingress,
     loads_model_json_ingress,
@@ -25,6 +26,7 @@ from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
     project_message_to_text,
@@ -39,6 +41,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     TurnComplete,
     mark_provider_retried,
+    mark_provider_usage,
     report_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -52,7 +55,42 @@ GATEWAY_RATE_LIMITED = "gateway_rate_limited"
 GATEWAY_SERVER_ERROR = "gateway_server_error"
 GATEWAY_AUTH_ERROR = "gateway_auth_error"
 GATEWAY_BAD_RESPONSE = "gateway_bad_response"
+GATEWAY_GENERATION_NOT_APPLIED = "gateway_generation_not_applied"
+GATEWAY_SCHEMA_NOT_APPLIED = "gateway_schema_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
+
+
+def _encode_request_body(payload: dict[str, Any]) -> bytes:
+    """Serialize one request payload, classifying what cannot be serialized.
+
+    ``normalize_json_ingress`` deliberately leaves arbitrary non-JSON scalars alone (the
+    documented arbitrary-scalar gap), so a Python-direct caller can hand ``output_schema``,
+    ``messages``, or an observation a value ``json.dumps`` refuses -- a ``set``, a function, a
+    NaN under ``allow_nan=False``. Encoded here, once, for both transports: outside a
+    classifier that failure escaped as a raw ``TypeError``/``ValueError`` the loop cannot
+    classify at all, terminalizing the run unrecoverably for what is a config-shaped mistake.
+    ``config_recoverable`` completes that sentence: the same mistake reported by a gateway
+    *server* is an HTTP 400, which the loop treats as turn-recoverable -- one condition, one
+    classification, whichever side of the wire noticed.
+
+    ``RecursionError`` is caught beside them because it is the same condition wearing a
+    different type: ``json.dumps`` recurses, so a container nested deeper than the interpreter
+    limit raises a ``RuntimeError`` subclass rather than a ``TypeError``. Nothing upstream
+    refuses it first -- ``normalize_json_ingress`` is deliberately iterative, and the 512-level
+    nesting cap guards the JSON *text* parsers, not a Python-constructed value -- so this is
+    the boundary, and "a request that cannot be encoded" must answer the same way however the
+    encoder says so.
+    """
+
+    try:
+        return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ModelAdapterError(
+            f"model request is not JSON-serializable: {exc}",
+            provider_error_code=GATEWAY_BAD_REQUEST,
+            retryable=False,
+            config_recoverable=True,
+        ) from exc
 
 
 def _stamp_retry(error: BaseException, attempt: int) -> None:
@@ -84,12 +122,41 @@ class GatewayModelAdapter:
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
+    def structured_output_support(self, config: ModelConfig | None = None) -> str:
+        """This adapter *forwards*; it does not apply. So its claim is only as good as the
+        proof it insists on, and that is exactly what ``on_unsupported`` controls.
+
+        Under ``"fail"`` a returned turn is a proven turn: the echo checks refuse anything
+        else, so a gateway chained in front of this adapter inherits real proof. Under
+        ``"omit"`` the same adapter deliberately accepts an unproven turn -- and a static
+        ``"native"`` would then let the outer hop mint a *fresh* positive echo out of a
+        declaration, reporting proof for a call where the inner hop had none. A proof that
+        survives a hop that admitted it was not proving is not a proof.
+
+        A method, not a property, because the question takes an argument a property cannot
+        carry: *which call*. Enforcement runs under the effective per-call config
+        (``request.model or self.config``), so the claim must be answered from the same
+        config -- a claim probed off the standing config alone let a shared adapter (a
+        ``provider_adapter_factory`` that ignores its config parameter) mint proof for a call
+        it enforces under a wire-supplied ``"omit"``, and withhold proof from a call it
+        enforces under ``"fail"``. ``None`` falls back to the standing config, which is the
+        right answer for a probe made outside any call.
+        """
+
+        effective = config or self.config
+        return "native" if effective.generation.on_unsupported == "fail" else "none"
+
+    def generation_support(self, config: ModelConfig | None = None) -> str:
+        """The sampling twin of :meth:`structured_output_support`, same policy, same reason --
+        one knob, one answer."""
+
+        effective = config or self.config
+        return "native" if effective.generation.on_unsupported == "fail" else "none"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
         url = self._resolve_gateway_url(config)
-        payload = self._payload(request)
-        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        body = _encode_request_body(self._payload(request))
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -144,6 +211,35 @@ class GatewayModelAdapter:
                     turn = _parse_gateway_response(data)
                     if attempt > 1:
                         turn = replace(turn, provider_retried=True)
+                    # Stamped *before* the applied-parameter checks, exactly as the streaming
+                    # twin stamps the chunk before checking it: those checks raise, and the
+                    # error they raise carries the retry evidence. Reading the un-stamped turn
+                    # here recorded a call this client retried as a clean single attempt on
+                    # every not-applied failure -- the one path where the retry evidence has no
+                    # other carrier, since no turn is returned.
+                    #
+                    # The refusal carries the turn's usage, because this is a failure that
+                    # happens *after* a complete, billed answer: the provider generated it, we
+                    # simply refuse to trust that our parameters shaped it. A receipt reporting
+                    # zero tokens there drops the call out of the metrics and out of the
+                    # cumulative token budget. Stamped around both checks rather than inside
+                    # them, since the usage belongs to the turn, not to either proof.
+                    try:
+                        _check_generation_applied(
+                            build_generation_payload(config.generation),
+                            config.generation.on_unsupported,
+                            data.get("generation_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
+                        _check_schema_applied(
+                            request.output_schema is not None,
+                            config.generation.on_unsupported,
+                            data.get("schema_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
+                    except ModelAdapterError as unproven:
+                        mark_provider_usage(unproven, turn.usage)
+                        raise
                     return turn
                 except ModelAdapterError as exc:
                     last_error = exc
@@ -215,9 +311,7 @@ class GatewayModelAdapter:
 
         config = request.model or self.config
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
-        body = json.dumps(self._payload(request), ensure_ascii=False, allow_nan=False).encode(
-            "utf-8"
-        )
+        body = _encode_request_body(self._payload(request))
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -271,6 +365,7 @@ class GatewayModelAdapter:
                             retry.jitter_s,
                         )
                     committed = False  # reset per attempt; see the binding above the loop
+                    saw_terminal = False
                     # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
                     # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
                     # expiry (see the field), and a backoff is exactly where a token crosses that
@@ -297,7 +392,56 @@ class GatewayModelAdapter:
                                 # the marker above, so the two cannot disagree.
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
+                                # The terminal frame is the streaming twin of the sync check in
+                                # ``next_turn`` -- both transports enforce or neither does.
+                                if isinstance(chunk, TurnComplete):
+                                    saw_terminal = True
+                                    # The streamed twin of the sync stamp: the terminal frame
+                                    # is refused before it is yielded, so its usage reaches
+                                    # nothing that assembles a turn -- the refusal is the only
+                                    # carrier left for a call the provider already billed.
+                                    try:
+                                        _check_generation_applied(
+                                            build_generation_payload(config.generation),
+                                            config.generation.on_unsupported,
+                                            chunk.generation_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
+                                        _check_schema_applied(
+                                            request.output_schema is not None,
+                                            config.generation.on_unsupported,
+                                            chunk.schema_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
+                                    except ModelAdapterError as unproven:
+                                        mark_provider_usage(unproven, chunk.usage)
+                                        raise
                                 yield chunk
+                        if not saw_terminal:
+                            # "Both transports enforce or neither does" has to include the
+                            # stream that never sends the frame the checks above live on: a
+                            # body that ends cleanly after its last delta is assembled into a
+                            # normal turn (``assemble_streamed_turn`` synthesizes
+                            # ``stop_reason="stop"``), so without this the one server the
+                            # fail-closed policy exists to catch -- an older gateway that
+                            # ignores the new request keys, terminal frame included -- was
+                            # accepted on this transport and refused on the sync twin. Absent
+                            # frame = absent echo; the shared checks already encode that case,
+                            # so run them with nothing once the drain is complete. Traffic
+                            # that configures neither knob keeps the pre-W5 tolerance for a
+                            # frameless stream: both checks pass when nothing was requested.
+                            _check_generation_applied(
+                                build_generation_payload(config.generation),
+                                config.generation.on_unsupported,
+                                None,
+                                known_provider_retried=attempt > 1,
+                            )
+                            _check_schema_applied(
+                                request.output_schema is not None,
+                                config.generation.on_unsupported,
+                                None,
+                                known_provider_retried=attempt > 1,
+                            )
                         return
                     except _StreamRetry as retry_signal:
                         last_error = retry_signal.error
@@ -406,9 +550,35 @@ class GatewayModelAdapter:
             "system_prompt": request.system_prompt,
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],
         }
+        # Both blocks carry their off-default ``on_unsupported``, for one reason: the server
+        # rebuilds a config object from this wire block, and a field left off is not "unset"
+        # there -- it is the *default*, so a caller's "omit" silently became "fail" on the
+        # server's copy. That matters as soon as a gateway's upstream is another gateway: the
+        # next hop enforces the reset policy and rejects a turn the caller asked to accept
+        # best-effort. Emitted only off-default, so default configs keep their exact wire shape.
+        # ``build_*_payload`` deliberately does not carry policy -- those dicts are also the
+        # applied-echo comparison, which is about provider knobs only.
         reasoning_payload = build_reasoning_payload(config.reasoning)
+        if config.reasoning.on_unsupported != "fail":
+            reasoning_payload["on_unsupported"] = config.reasoning.on_unsupported
+        if config.reasoning.effort == "default":
+            # ``effort`` is the one reasoning field whose omission sentinel ("default") is not
+            # the codec's reconstruction default ("medium"): ``build_reasoning_payload`` leaves
+            # "default" off because a *provider* payload means "no effort key", but this block
+            # is a *config* the server rebuilds with ``ReasoningConfig.from_json``, where a
+            # missing effort reads back as "medium" -- so a client asking for the provider
+            # default silently got medium reasoning, only through a gateway. Carried
+            # explicitly, like the policy above; every other effort value already rides.
+            reasoning_payload["effort"] = "default"
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
+        generation_payload = build_generation_payload(config.generation)
+        if config.generation.on_unsupported != "fail":
+            generation_payload["on_unsupported"] = config.generation.on_unsupported
+        if generation_payload:
+            payload["generation"] = generation_payload
+        if request.output_schema is not None:
+            payload["output_schema"] = request.output_schema
 
         if request.messages is not None:
             # By-value: the full conversation travels as messages; no continuation handle.
@@ -613,6 +783,151 @@ def _portable_gateway_payload(
         ) from exc
 
 
+def _validated_generation_echo(
+    applied: Any, *, provider_retried: bool = False
+) -> dict[str, Any] | None:
+    """Shape-check one ``generation_applied`` echo. One rule, both transports.
+
+    Wire shape is not a policy question: a server that answers with a non-object here is
+    malformed whatever ``on_unsupported`` says and whatever this call requested, so this is
+    ``gateway_bad_response`` and it fires before any policy branch. Written once because the
+    sync response and the streamed terminal frame read the same key out of different
+    envelopes -- the streamed side used to reject a malformed echo that the sync side accepted
+    under ``"omit"``.
+    """
+
+    if applied is None or isinstance(applied, dict):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid generation_applied echo: expected an object",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=provider_retried,
+    )
+
+
+def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> bool | None:
+    """The ``schema_applied`` twin of :func:`_validated_generation_echo`, same rule."""
+
+    if applied is None or isinstance(applied, bool):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid schema_applied echo: expected a boolean",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=provider_retried,
+    )
+
+
+def _same_echoed_value(echoed: Any, requested: Any) -> bool:
+    """One requested knob against its echo, without Python's cross-type numeric equality.
+
+    ``==`` is not a proof test on a wire. Python compares ``True == 1`` and ``False == 0.0``,
+    so a server answering JSON booleans proved exactly the most ordinary settings this block
+    carries: ``max_output_tokens=1``, ``top_p=1``, ``temperature=0``. Every other read of this
+    wire already refuses that coercion (``_exact_gateway_bool``, ``_exact_gateway_int``, and
+    ``is_finite_json_number`` itself, which rejects ``bool`` and its subclasses); the proof
+    comparison was the one place it did not.
+
+    A number is proven only by a number -- but by a number of *either* JSON spelling: JSON has
+    one numeric type, so a gateway that is not Python re-serializes ``1.0`` as ``1``, and
+    demanding an exact Python type would invent a false refusal for every non-Python server.
+    Anything else must match by type and value, which is what a non-numeric future knob needs.
+    """
+
+    if is_finite_json_number(requested):
+        return is_finite_json_number(echoed) and echoed == requested
+    return type(echoed) is type(requested) and echoed == requested
+
+
+def _generation_echo_matches(applied: Any, requested: dict[str, Any]) -> bool:
+    """Whether the echo is the block this client sent -- same keys, same values, no coercion."""
+
+    if not isinstance(applied, dict) or set(applied) != set(requested):
+        return False
+    return all(_same_echoed_value(applied[key], value) for key, value in requested.items())
+
+
+def _check_generation_applied(
+    requested: dict[str, Any],
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """Refuse a turn whose sampling parameters cannot be proven applied (scope §5 D-a).
+
+    ``requested`` is the exact wire block this client sent; the server echoes the block it
+    forwarded upstream as ``generation_applied``. Matching it -- key for key, without numeric
+    coercion (see :func:`_same_echoed_value`) -- is the proof. An absent echo is
+    indistinguishable from an older server that silently discarded the block -- precisely the
+    deployment ``"fail"`` exists to catch -- so under the default policy it is an error, and
+    ``"omit"`` is the documented way to accept a best-effort transport.
+    """
+
+    applied = _validated_generation_echo(applied, provider_retried=known_provider_retried)
+    if not requested:
+        return
+    if _generation_echo_matches(applied, requested):
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no generation_applied echo (older gateway?)"
+        if applied is None
+        else "the generation_applied echo does not match the requested parameters"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested generation parameters: {detail}; "
+        'set model.generation.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
+        retryable=False,
+        # The remedy in the message is configuration: the session survives, the user
+        # switches policy or transport and resends. Without this the run terminalized on a
+        # condition the same server would have reported recoverably as an HTTP 400.
+        config_recoverable=True,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _check_schema_applied(
+    schema_sent: bool,
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """The schema twin of :func:`_check_generation_applied`, same policy knob.
+
+    One ``on_unsupported`` governs both proofs deliberately: "how to treat a parameter the
+    transport cannot prove was applied" is one question, and two half-set knobs (fail for one,
+    omit for the other) would be a new surface for exactly the kind of asymmetry W5 exists to
+    close. ``applied`` is a tri-state: ``True`` proves it, ``False`` is the server saying its
+    upstream cannot enforce schemas, absent (``None``) is an older server.
+    """
+
+    applied = _validated_schema_echo(applied, provider_retried=known_provider_retried)
+    if not schema_sent:
+        return
+    if applied is True:
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no schema_applied echo (older gateway?)"
+        if applied is None
+        else "the gateway's upstream does not enforce output schemas"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested output schema: {detail}; "
+        'set model.generation.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
+        retryable=False,
+        config_recoverable=True,
+        provider_retried=known_provider_retried,
+    )
+
+
 def _parse_gateway_response(data: Any) -> ModelTurn:
     if not isinstance(data, dict):
         raise ModelAdapterError(
@@ -646,7 +961,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=error_http_status,
             known_provider_retried=provider_retried,
         )
-        raise ModelAdapterError(
+        envelope_error = ModelAdapterError(
             _gateway_string(
                 data,
                 "error",
@@ -670,6 +985,10 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=error_http_status,
             provider_retried=provider_retried,
         )
+        # Third error reader on this wire, and the rule is the same on all three: a failure
+        # that reports what it cost is recorded as having cost it.
+        mark_provider_usage(envelope_error, _reported_error_usage(data))
+        raise envelope_error
     _exact_gateway_bool(
         data,
         "retryable",
@@ -913,8 +1232,28 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             provider_retried=retried,
         )
     if event_type == "turn_complete":
+        # Same shape rule the sync response is held to; the enforcement functions call these
+        # too, so neither transport can be stricter than the other.
+        try:
+            applied = _validated_generation_echo(
+                event.get("generation_applied"), provider_retried=retried
+            )
+            schema_applied = _validated_schema_echo(
+                event.get("schema_applied"), provider_retried=retried
+            )
+        except ModelAdapterError as malformed:
+            # A malformed echo on a *billed* frame still cost the tokens the same frame
+            # reports. The sync twin validates inside the stamped check block, so its
+            # ``gateway_bad_response`` carries ``provider_usage``; raising here at parse
+            # time, before any stamp, lost the same money on one of two transports. Read
+            # leniently -- a second malformation in ``usage`` must not replace the failure
+            # being reported.
+            mark_provider_usage(malformed, _reported_error_usage(event))
+            raise
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
+            generation_applied=applied,
+            schema_applied=schema_applied,
             response_id=_gateway_string(
                 event,
                 "turn_handle",
@@ -954,7 +1293,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             http_status=error_http_status,
             known_provider_retried=retried,
         )
-        raise ModelAdapterError(
+        stream_error = ModelAdapterError(
             _gateway_string(
                 event,
                 "error",
@@ -977,7 +1316,29 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             http_status=error_http_status,
             provider_retried=retried,
         )
+        mark_provider_usage(stream_error, _reported_error_usage(event))
+        raise stream_error
     return None  # unknown frame type: forward-compatible, ignore
+
+
+def _reported_error_usage(payload: dict[str, Any]) -> dict[str, int]:
+    """Tokens a *failed* gateway call reported spending, read leniently.
+
+    The twin of the client-side stamp, for the hop: a gateway whose own upstream refused a
+    billed turn carries the cost in its error envelope, and without reading it back the outer
+    client reports zero for a call the provider charged for. Lenient on purpose -- a malformed
+    ``usage`` on an error path must not replace the failure being reported with a different
+    one, so anything unreadable simply reads as "not reported".
+    """
+
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
 
 
 def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
@@ -1043,7 +1404,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         or detail
         or f"HTTP {status}"
     )
-    return ModelAdapterError(
+    error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
         retryable=retryable,
@@ -1053,6 +1414,8 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
         provider_retried=provider_retried,
     )
+    mark_provider_usage(error, _reported_error_usage(error_payload))
+    return error
 
 
 def _error_from_http_error(exc: HTTPError) -> ModelAdapterError:

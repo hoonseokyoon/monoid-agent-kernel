@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class NativeAgentError(Exception):
     """Base error for Monoid Agent Kernel."""
@@ -33,17 +35,52 @@ class ModelAdapterError(NativeAgentError):
         retryable: bool = False,
         http_status: int | None = None,
         provider_retried: bool = False,
+        config_recoverable: bool = False,
     ) -> None:
         super().__init__(message, error_code=error_code)
         self.provider_error_code = provider_error_code or ""
         self.retryable = retryable
         self.http_status = http_status
+        # A refusal the user resolves by changing configuration and resending -- the
+        # client-side twin of a provider 4xx, which classifiers treat as "end the turn, keep
+        # the session". A client-detected failure (an applied-parameters proof refusal) has no
+        # HTTP status to carry that meaning, and without this flag it was classified like an
+        # unflagged 5xx: terminal for the whole run. Orthogonal to ``retryable``: resending
+        # the same call cannot help (retryable=False), but the session can survive it.
+        self.config_recoverable = config_recoverable
         # Whether the adapter's own retry loop ran before giving up. ``retryable`` is a forecast
         # about a *future* attempt; this is a fact about attempts already made, and the two are
         # independent -- an exhausted retry budget leaves a retryable error that will not be
         # retried again. Without it a failed audit record denies retries in exactly the case where
         # they happened most.
         self.provider_retried = provider_retried
+
+
+class TurnNotSettled(NativeAgentError):
+    """A blocking submit facade parked without a settled turn to return.
+
+    Raised by ``AgentLoop.submit`` / ``asubmit`` when the turn suspended with
+    ``reason="turn_failed"`` (a *recoverable* model-turn failure), ``"interrupted"``, or
+    ``"paused"`` — outcomes that produce no ``AgentTurnResult`` because nothing settled. The
+    session stays alive; the non-blocking pump (``run_until_suspended``) hands the same park
+    back as a :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising, and
+    the one-shot ``run_once`` absorbs it — its closing ``finally`` promotes an unrecovered
+    park to the terminal failure record and returns that failed result. ``suspension``
+    carries the full evidence (reason, error, ``retryable``, ``http_status``,
+    ``config_recoverable``) so a driver can decide between re-attempt, config fix, and
+    giving up — the same decision the Suspension-reading driver makes.
+    """
+
+    error_code = "turn_not_settled"
+
+    def __init__(self, suspension: Any) -> None:
+        detail = suspension.error or suspension.reason
+        super().__init__(f"turn did not settle ({suspension.reason}): {detail}")
+        self.suspension = suspension
+        self.reason = suspension.reason
+        self.retryable = suspension.retryable
+        self.http_status = suspension.http_status
+        self.config_recoverable = suspension.config_recoverable
 
 
 class PermissionDenied(NativeAgentError):

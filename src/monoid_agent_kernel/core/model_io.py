@@ -697,12 +697,33 @@ class ModelCallReceipt:
             )
         except Exception:
             provider_retried = False
+        # What the provider already produced and billed for before the call was refused. A
+        # failure after a complete answer is a real shape -- the applied-parameters proof
+        # refusals parse a turn, read its usage, and only then reject it -- and a receipt that
+        # reports zero there drops a paid call out of the metrics and out of the cumulative
+        # token budget. Same guarded read as `provider_retried`, and the same combine rule: a
+        # receipt that already carried counts keeps them.
+        try:
+            stamped_usage = getattr(exc, "provider_usage", None)
+        except Exception:
+            stamped_usage = None
+        usage = self.usage
+        if not usage and isinstance(stamped_usage, Mapping):
+            try:
+                usage = {
+                    str(key): int(value)
+                    for key, value in stamped_usage.items()
+                    if type(value) is int and value >= 0
+                }
+            except Exception:
+                usage = self.usage
         return replace(
             self,
             error_code=normalized_error_code,
             provider_error_code=provider_error_code,
             retryable=retryable,
             http_status=http_status,
+            usage=usage,
             # A failed call is the one most likely to have been retried, so the marker has to
             # survive the failure path too -- recording it only on success would deny retries in
             # exactly the exhausted-budget case.

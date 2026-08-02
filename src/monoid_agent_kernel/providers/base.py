@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import math
 from copy import copy
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import (
+    ModelConfig,
+    validate_generation_config,
+    validate_reasoning_config,
+)
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -161,6 +165,74 @@ class ModelRequest:
     # by-reference handle + ``instruction``/``observations`` delta. ``system_prompt`` is
     # NOT part of ``messages`` — it is regenerated each turn and applied separately.
     messages: tuple[dict[str, Any], ...] | None = None
+    # ResponseContract delivery (W5): a standard JSON Schema the final answer should satisfy,
+    # provider-neutral data. An adapter that declares ``structured_output_support = "native"``
+    # translates it into its provider's constrained-decoding dialect **verbatim, never
+    # transformed** — the request digest identifies exactly what was asked for. Adapters
+    # without the declaration ignore it, and post-hoc validation remains the guarantee either
+    # way (native delivery only reduces repairs). ``None`` = unconstrained.
+    output_schema: dict[str, Any] | None = None
+
+
+def _declared_support(
+    adapter: Any, attribute: str, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """The fail-closed probe shared by every opt-in adapter capability declaration.
+
+    One rule for all of them: only the exact string ``"native"`` claims the capability.
+    Absence, ``None``, ``True``, and unknown future spellings all read as ``"none"``, so a
+    consumer can never over-trust an adapter that did not explicitly claim it — and the two
+    capabilities below cannot drift into different notions of "declared".
+
+    Read off the *instance*. An adapter whose answer is fixed declares with a ``ClassVar``;
+    one whose answer depends on configuration declares with a **callable** taking the
+    effective per-call config (``request.model or self.config`` — the config the adapter will
+    actually enforce with). ``config`` is passed through to it, because the claim and the
+    enforcement must read the same policy: a forwarding transport probed on its *standing*
+    config alone would mint proof for a call it enforces under a different per-call policy.
+    An attribute that raises — on read or on call — is not a claim: the failure reads as
+    ``"none"`` like any other non-declaration, because a probe that can take the call down is
+    a worse contract than one that under-claims.
+    """
+
+    try:
+        value = getattr(adapter, attribute, "none")
+        if callable(value):
+            value = value(config)
+    except Exception:
+        return "none"
+    return "native" if value == "native" else "none"
+
+
+def structured_output_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` translates :attr:`ModelRequest.output_schema` into provider-native
+    constrained decoding.
+
+    Opt-in declaration, like ``supports_multimodal``: adapters set a
+    ``structured_output_support`` class attribute, or define it as a method taking the
+    effective per-call :class:`ModelConfig` when the answer depends on policy. Pass ``config``
+    when probing on behalf of a specific call; ``None`` probes the adapter's standing
+    configuration.
+    """
+
+    return _declared_support(adapter, "structured_output_support", config)
+
+
+def generation_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.generation` to the provider request.
+
+    The twin of :func:`structured_output_support`, and for the same reason: a transport that
+    *forwards* generation parameters to an adapter cannot know whether that adapter puts them
+    on the wire. Only an adapter that declares this may be used to justify an
+    applied-parameters proof; anything else must be reported as unproven so a fail-closed
+    client refuses the turn rather than trusting parameters nobody applied.
+    """
+
+    return _declared_support(adapter, "generation_support", config)
 
 
 class ModelAdapter(Protocol):
@@ -387,9 +459,17 @@ class TurnComplete:
     # caller out of chunks, so an adapter that retried before committing its stream has no other
     # place to say so.
     provider_retried: bool = False
+    # The gateway transport's applied-parameters echo (scope §5 D-a), riding the terminal frame
+    # because the streaming caller has no response object to read it from. ``None`` = the wire
+    # never mentioned it (an older gateway, or a transport with no echo).
+    generation_applied: dict[str, Any] | None = None
+    # The schema twin of ``generation_applied`` (W5 PR 4): whether the gateway forwarded
+    # ``output_schema`` to an upstream that natively enforces it. A sibling key, not a member
+    # of the generation echo -- changing an existing key's shape is how old clients break.
+    schema_applied: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "type": "turn_complete",
             "response_id": self.response_id,
             "usage": dict(self.usage),
@@ -397,6 +477,11 @@ class TurnComplete:
             "stop_reason": self.stop_reason,
             "provider_retried": self.provider_retried,
         }
+        if self.generation_applied is not None:
+            payload["generation_applied"] = dict(self.generation_applied)
+        if self.schema_applied is not None:
+            payload["schema_applied"] = self.schema_applied
+        return payload
 
 
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
@@ -495,15 +580,11 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
 
     if config is None:
         return None
-    reasoning = _copy_with_fields(
-        config.reasoning,
-        effort=_normalize_required_text(config.reasoning.effort, "model.reasoning.effort"),
-        summary=_normalize_required_text(config.reasoning.summary, "model.reasoning.summary"),
-        on_unsupported=_normalize_required_text(
-            config.reasoning.on_unsupported,
-            "model.reasoning.on_unsupported",
-        ),
-    )
+    # validate_reasoning_config enforces the enum, so a passing value is already inside the
+    # portable ASCII domain -- same reasoning as the generation call below, same single rule
+    # source as the JSON codec. Per-field text normalization here accepted any non-empty
+    # string, leaving direct-Python reasoning the one construction route that failed open.
+    reasoning = validate_reasoning_config(config.reasoning)
     retry = _copy_with_fields(
         config.retry,
         max_attempts=_positive_control_int(config.retry.max_attempts, "model.retry.max_attempts"),
@@ -533,6 +614,9 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
         ),
         retry_on=_normalize_retry_codes(config.retry.retry_on),
     )
+    # validate_generation_config enforces the enum, so a passing on_unsupported is already
+    # inside the portable ASCII domain -- no per-field text normalization step is needed.
+    generation = validate_generation_config(config.generation)
     return _copy_with_fields(
         config,
         provider=_normalize_required_text(config.provider, "model.provider"),
@@ -546,6 +630,7 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
         gateway_url=_normalize_optional_text(config.gateway_url, "model.gateway_url"),
         reasoning=reasoning,
         retry=retry,
+        generation=generation,
     )
 
 
@@ -572,6 +657,19 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     messages = None
     if request.messages is not None:
         messages = tuple(normalize_json_ingress(request.messages))
+    output_schema = request.output_schema
+    if output_schema is not None:
+        if not isinstance(output_schema, dict):
+            raise ValueError("model request output_schema must be an object or null")
+        # Strings and containers are normalized; non-finite floats are deliberately NOT
+        # substituted. Everything else here is model *content*, where turning a stray ``NaN``
+        # into ``null`` loses nothing -- but this is a control document the contract promises
+        # to deliver **verbatim**. Substituting rewrote ``{"enum": [NaN]}`` into
+        # ``{"enum": [null]}``: a different constraint, silently enforced by the provider, and
+        # the strict serializer that exists to refuse the value (``allow_nan=False``, on both
+        # adapters) never got to see it. Left in place, the request is refused as the
+        # config-recoverable bad request it is.
+        output_schema = normalize_json_ingress(output_schema, substitute_nonfinite=False)
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),
@@ -587,6 +685,7 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
         observations=observations,
         model=normalize_model_config(request.model),
         messages=messages,
+        output_schema=output_schema,
     )
 
 
@@ -924,6 +1023,52 @@ def mark_provider_retried(error: BaseException) -> None:
         error.provider_retried = True  # type: ignore[attr-defined]
     except Exception:
         pass
+
+
+def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -> None:
+    """Record on an escaping error the token usage the provider already reported.
+
+    Some failures happen *after* the provider produced — and billed for — a complete answer.
+    The applied-parameters proof refusals are the clearest case: the turn parsed, its usage is
+    known, and only then is the turn refused. Without this, the receipt for that call carries
+    an empty usage, the loop's post-turn accounting never runs, and a paid call disappears
+    from the metrics and from the cumulative token budget — a budget that under-counts is a
+    bound that does not hold.
+
+    The guarded-setattr twin of :func:`mark_provider_retried`, for the same reason: an
+    exception type that refuses the attribute (``__slots__``) simply carries no usage rather
+    than replacing the provider's failure with an ``AttributeError``. Read back by
+    ``ModelCallReceipt.with_error`` through ``getattr``.
+    """
+
+    if not usage:
+        return
+    try:
+        error.provider_usage = dict(usage)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def provider_usage_of(error: BaseException) -> dict[str, int]:
+    """Read back what :func:`mark_provider_usage` stamped, as clean non-negative counts.
+
+    One reader for every consumer of the stamp -- the loop's budget, the reference gateway's
+    tenant meter, the error envelope that carries it across a hop. A guarded read like the
+    stamp itself, and it filters rather than raises: a malformed count on a *failure* path
+    must not replace the failure being reported.
+    """
+
+    try:
+        usage = getattr(error, "provider_usage", None)
+    except Exception:
+        return {}
+    if not isinstance(usage, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
 
 
 @dataclass

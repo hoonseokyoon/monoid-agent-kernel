@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.result import AgentTurnResult, Suspension
-from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.errors import NativeAgentError, TurnNotSettled
 
 if TYPE_CHECKING:
     from monoid_agent_kernel.loop import AgentLoop
@@ -374,9 +374,19 @@ class LoopSession:
         )
 
     def submit(self, user_input: Any) -> AgentTurnResult:
-        """Blocking convenience: run one user turn to settle. Mirrors ``AgentLoop.submit``."""
+        """Blocking convenience: run one user turn to settle. Mirrors ``AgentLoop.submit``,
+        including its typed park: ``TurnNotSettled`` re-raises after the FSM transition."""
         self._set_state(SessionState.RUNNING)
-        turn = self.loop.submit(user_input)
+        try:
+            turn = self.loop.submit(user_input)
+        except TurnNotSettled as exc:
+            # The blocking twin of run_until_suspended's mapping below: the park must move
+            # the FSM exactly as the Suspension-returning half does, or this facade reports
+            # RUNNING (can_accept_input=False) for a session that is in fact parked and
+            # accepting input.
+            self._last_suspension = exc.suspension
+            self._set_state(state_from_suspension(exc.suspension))
+            raise
         self._set_state(self._derive_after_settle(turn))
         return turn
 
