@@ -23,6 +23,24 @@ out in commit messages and here.
   its wire shape. Setting any generation value changes all three, deliberately — pinned by
   literal-hash tests captured on v0.20.1.
 
+### Documentation — the output-validation and model-call contracts are now written down
+
+- `docs/CONTRACTS.md` gains an Output Validation section documenting all six exported types
+  (`OutputValidator`, `ValidationOutcome`, `FinalOutputView`, `OutputRetry`,
+  `OutputValidatorBinding`, `OutputValidatorError`), the exception-classification contract, the
+  loop's settle orchestration, and the standalone `ValidatedCallRunner` contract — these types
+  had shipped in `contracts.py` since their introduction with no per-symbol contract entry.
+- The Model Adapter section documents generation-parameter and output-schema delivery, the
+  applied-echo enforcement, the fail-closed `structured_output_support` probe, the two digest
+  stability rules (additive fields omitted when unset; canonicalization changes are
+  domain-version changes), and the `RunLimits.max_output_tokens` vs
+  `GenerationConfig.max_output_tokens` distinction. The stale `ModelRequest` field list gains
+  the `messages` and `output_schema` fields.
+- The LLM Gateway wire contract shows the `generation` / `output_schema` request keys and the
+  applied-echo response keys; `docs/COMPATIBILITY.md` records the additive-key policy for
+  `monoid.llm-turn.v1`, the fail-closed version-skew behavior, and the mixed-fleet caveat for
+  configured generation blocks in `config_hash`.
+
 ### Added — output-schema delivery on the standalone path (ResponseContract)
 
 - `ModelRequest.output_schema` carries a standard, provider-neutral JSON Schema for the final
