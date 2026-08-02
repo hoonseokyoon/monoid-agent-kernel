@@ -7,6 +7,33 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — a field-carriage conformance suite (repo-internal drift tooling)
+
+- **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier
+  obliged to repeat it.** The dominant defect shape here is a fact that rides N parallel carriers
+  — dataclass, checkpoint payload, event data, event schema, wire body, SSE frame, client reader,
+  transcript record — with a change binding N−1 of them; review finds those one at a time. The
+  suite takes an authority per fact family (`dataclasses.fields`, the `__init__` signature, the
+  normalizer's emitted-key domain) and set-diffs it against each carrier, so a field added to an
+  authority without a carrier fails by construction. Four families are covered: `Suspension`,
+  `ModelAdapterError` transport, usage counts, and the W5 applied-echo protocol.
+- Three properties make the census trustworthy: one hand-written *maximal builder* per authority
+  with a reflection guard (a generic synthesizer would silently skip a new field); *behavioral*
+  reader censuses that diff reconstructed attributes rather than key sets, because a reader that
+  ignores a wire key leaves no trace in any key set; and *declared* alias tables for the three
+  facts that are renamed at a hop (wire `error_code` carries `provider_error_code`, `RunCheckpoint`
+  spells `http_status` as `provider_http_status`, `awaiting_task_ids` is `task_ids` on one event).
+  An AST backstop pins the set of files mentioning each headline field, so a new carrier file
+  appearing without census registration fails.
+- **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
+  one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
+  exist, so a rename rots the entry loudly) and a disposition — `burn-down`, `v0.21-track:B1`, or
+  `by-design`. The assertions encode today's reality exactly, so closing a gap *breaks* the suite
+  and the fixer must update the expected set and delete the registry entry in the same change.
+- Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
+  CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
+  in the parallel shard. No public surface, wire format, or shipped contract changes.
+
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 
 - **A stream that ends without a terminal frame is no longer accepted unproven.** The
