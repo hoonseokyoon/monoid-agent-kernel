@@ -87,13 +87,30 @@ class GatewayModelAdapter:
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
-    # Forwards ``output_schema`` on the wire; the ``schema_applied`` echo (checked under
-    # ``on_unsupported``) is what turns this claim into proof per call.
-    structured_output_support: ClassVar[str] = "native"
-    # Forwards ``generation`` on the wire and refuses a turn the server cannot prove it applied
-    # (``generation_applied``), so a gateway chained in front of this adapter inherits proof
-    # rather than an assumption.
-    generation_support: ClassVar[str] = "native"
+    @property
+    def structured_output_support(self) -> str:
+        """This adapter *forwards*; it does not apply. So its claim is only as good as the
+        proof it insists on, and that is exactly what ``on_unsupported`` controls.
+
+        Under ``"fail"`` a returned turn is a proven turn: the echo checks refuse anything
+        else, so a gateway chained in front of this adapter inherits real proof. Under
+        ``"omit"`` the same adapter deliberately accepts an unproven turn -- and a static
+        ``"native"`` would then let the outer hop mint a *fresh* positive echo out of a
+        declaration, reporting proof for a call where the inner hop had none. A proof that
+        survives a hop that admitted it was not proving is not a proof.
+
+        Reads the adapter's standing config, which is what the reference gateway builds it
+        from (``_build_adapter``), so the probe and the call agree on the same policy.
+        """
+
+        return "native" if self.config.generation.on_unsupported == "fail" else "none"
+
+    @property
+    def generation_support(self) -> str:
+        """The sampling twin of :attr:`structured_output_support`, same policy, same reason --
+        one knob, one answer."""
+
+        return "native" if self.config.generation.on_unsupported == "fail" else "none"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config

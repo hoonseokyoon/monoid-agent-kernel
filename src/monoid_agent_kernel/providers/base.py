@@ -177,9 +177,19 @@ def _declared_support(adapter: Any, attribute: str) -> Literal["native", "none"]
     Absence, ``None``, ``True``, and unknown future spellings all read as ``"none"``, so a
     consumer can never over-trust an adapter that did not explicitly claim it — and the two
     capabilities below cannot drift into different notions of "declared".
+
+    Read off the *instance*, so an adapter whose answer depends on its own configuration
+    (a forwarding transport whose claim holds only while it is enforcing) declares with a
+    property while one whose answer is fixed declares with a ``ClassVar``. An attribute that
+    raises is not a claim: the failure reads as ``"none"`` like any other non-declaration,
+    because a probe that can take the call down is a worse contract than one that under-claims.
     """
 
-    return "native" if getattr(adapter, attribute, "none") == "native" else "none"
+    try:
+        value = getattr(adapter, attribute, "none")
+    except Exception:
+        return "none"
+    return "native" if value == "native" else "none"
 
 
 def structured_output_support(adapter: Any) -> Literal["native", "none"]:

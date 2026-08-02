@@ -9,6 +9,7 @@ path, and the reference gateway server echo. If one survives, the binding is bro
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from urllib.error import URLError
 
 import pytest
@@ -21,6 +22,7 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     TurnComplete,
     generation_support,
+    structured_output_support,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
 from monoid_agent_kernel.providers.gateway import (
@@ -32,7 +34,11 @@ from monoid_agent_kernel.providers.gateway import (
 )
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
-from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.reference.llm_gateway.service import (
+    LlmGatewayBackend,
+    LlmGatewayTurnRequest,
+    _applied_echoes,
+)
 
 _SET = GenerationConfig(temperature=0.2, top_p=0.9, max_output_tokens=256)
 _SET_WIRE = {"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 256}
@@ -369,6 +375,70 @@ def test_generation_support_probe_is_opt_in_and_fail_closed() -> None:
         generation_support = True
 
     assert generation_support(Vague()) == "none"
+
+    class Hostile:
+        @property
+        def generation_support(self) -> str:
+            raise RuntimeError("boom")
+
+    # A declaration that raises is not a declaration; it must not take the call down either.
+    assert generation_support(Hostile()) == "none"
+
+
+def test_a_forwarding_adapter_claims_only_while_it_is_enforcing() -> None:
+    """The gateway adapter forwards, it does not apply -- so its claim is worth exactly the
+    proof it insists on. Under "omit" it deliberately accepts an unproven turn, and a static
+    claim would let the *next* hop mint a fresh positive echo out of it."""
+
+    proving = GatewayModelAdapter(config=ModelConfig())
+    assert generation_support(proving) == "native"
+    assert structured_output_support(proving) == "native"
+
+    best_effort = GatewayModelAdapter(
+        config=ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+    )
+    assert generation_support(best_effort) == "none"
+    assert structured_output_support(best_effort) == "none"
+
+    # OpenAI applies the parameters itself, so its claim is unconditional.
+    assert (
+        generation_support(
+            OpenAIModelAdapter(
+                ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+            )
+        )
+        == "native"
+    )
+
+
+def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None:
+    request = LlmGatewayTurnRequest(
+        protocol="monoid.llm-turn.v1",
+        model="gpt-5.5",
+        system_prompt="sys",
+        tools=(),
+        reasoning=ReasoningConfig(),
+        generation=GenerationConfig(temperature=0.2, on_unsupported="omit"),
+        output_schema={"type": "object"},
+    )
+    upstream = GatewayModelAdapter(
+        config=ModelConfig(generation=GenerationConfig(temperature=0.2, on_unsupported="omit"))
+    )
+    echoes = _applied_echoes(request, upstream)
+    assert "generation_applied" not in echoes
+    assert echoes["schema_applied"] is False
+
+    proving_request = replace(
+        request,
+        generation=GenerationConfig(temperature=0.2),
+        output_schema={"type": "object"},
+    )
+    proving_upstream = GatewayModelAdapter(
+        config=ModelConfig(generation=GenerationConfig(temperature=0.2))
+    )
+    proven = _applied_echoes(proving_request, proving_upstream)
+    assert proven["generation_applied"] == {"temperature": 0.2}
+    assert proven["schema_applied"] is True
 
 
 def test_gateway_service_never_asserts_application_from_the_request() -> None:

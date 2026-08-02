@@ -372,6 +372,16 @@ def test_validated_call_populates_parsed_when_a_schema_was_requested() -> None:
     [
         ({}, '{"answer": "hi"}'),  # no schema requested -> parsed stays None
         ({"output_schema": _SCHEMA}, "plain prose"),  # not JSON -> parsed stays None
+        # Python's json.loads accepts these non-standard constants. A validator reading
+        # `parsed` -- a schema validator will call NaN a number -- would then accept an answer
+        # that is not JSON at all, so they must leave `parsed` exactly where prose leaves it.
+        ({"output_schema": _SCHEMA}, "NaN"),
+        ({"output_schema": _SCHEMA}, "Infinity"),
+        ({"output_schema": _SCHEMA}, '{"answer": NaN}'),
+        ({"output_schema": _SCHEMA}, '{"answer": -Infinity}'),
+        # The neighbouring strictness the same ingress brings, for the same reason.
+        ({"output_schema": _SCHEMA}, '{"answer": "a", "answer": "b"}'),
+        ({"output_schema": _SCHEMA}, '{"answer": 1e400}'),
     ],
 )
 def test_parsed_stays_none_without_schema_or_without_json(

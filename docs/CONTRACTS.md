@@ -314,11 +314,20 @@ Two further capability declarations are plain attributes rather than Protocol me
 `structured_output_support` (the adapter translates `ModelRequest.output_schema` into
 provider-enforced constrained decoding) and `generation_support` (the adapter puts
 `ModelConfig.generation` on its provider request). The exact string `"native"` declares the
-capability; both probes are fail-closed through one shared implementation — absence and any
-other value read as `"none"` — so a consumer can never over-trust an adapter that did not
-explicitly claim it. `OpenAIModelAdapter` and `GatewayModelAdapter` declare both. These are
-what a transport in front of an adapter is allowed to base an applied-parameters proof on: a
-gateway can see what it *forwarded*, never what the adapter behind it did with it.
+capability; both probes are fail-closed through one shared implementation — absence, any other
+value, and a declaration that raises all read as `"none"` — so a consumer can never over-trust
+an adapter that did not explicitly claim it. These are what a transport in front of an adapter
+is allowed to base an applied-parameters proof on: a gateway can see what it *forwarded*, never
+what the adapter behind it did with it.
+
+The probe reads the **instance**, so the declaration can be a `ClassVar` when the answer is
+fixed or a property when it depends on the adapter's own configuration. `OpenAIModelAdapter`
+applies the parameters itself and declares both unconditionally. `GatewayModelAdapter` only
+*forwards*, so its claim is worth exactly the proof it insists on: it declares `"native"` under
+`on_unsupported="fail"`, where a returned turn is a proven turn, and `"none"` under `"omit"`,
+where it deliberately accepts an unproven one. Without that, a chained gateway would mint a
+fresh positive echo out of a static declaration and report proof for a call whose inner hop
+had none.
 
 An adapter with its own retry loop should call `report_provider_retried()` when it decides to make
 another attempt. The kernel counts one adapter call per turn however many attempts happen inside it,
@@ -541,7 +550,11 @@ The types:
 - `FinalOutputView` — the read-only composite a validator sees: `final_text` (always),
   `artifacts`, `final_outputs`, a jailed size-capped `read_bytes`, and `parsed` (best-effort
   JSON view when the call carried an `output_schema`; a convenience, never the guarantee).
-  Every field but `final_text` defaults, so the view is constructible with zero loop context.
+  `parsed` goes through the kernel's strict JSON ingress, not bare `json.loads`, so Python's
+  non-standard `NaN` / `Infinity` constants — which a schema validator would happily call
+  numbers — leave it at `None` like prose does, along with duplicate keys, unbounded integers,
+  and runaway nesting. Every field but `final_text` defaults, so the view is constructible with
+  zero loop context.
 - `OutputRetry` — raising it from `validate` equals returning a rejection with feedback.
 - `OutputValidatorBinding` — the per-run opt-out: a registered validator runs by default
   (registration = activation); a binding with `enabled=False` disables it for that run.
@@ -583,6 +596,9 @@ Streaming is per attempt: `acall` takes an `AttemptDeltaConsumer`
 advances, everything the consumer holds from the previous index is retracted; the signature
 carries the boundary so a consumer cannot concatenate a rejected answer onto the accepted one.
 The sync facade `call` refuses to run inside an active event loop, so it takes no consumer.
+`ValidatedCallRunner` is frozen: `max_repair_calls` must be an exact non-negative `int`, and a
+budget checked once at construction would not be a budget if a reusable runner could be
+reassigned past the check. Reconfigure with `dataclasses.replace`, which revalidates.
 
 ### Tool Contract
 

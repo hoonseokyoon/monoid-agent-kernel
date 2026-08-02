@@ -9,6 +9,7 @@ byte-identical to the loop's -- both import ``build_repair_message`` from
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 
 import pytest
@@ -278,6 +279,23 @@ def test_zero_and_positive_int_budgets_are_still_accepted() -> None:
             runner=ModelCallRunner(adapter=FakeModelAdapter()), max_repair_calls=budget
         )
         assert runner.max_repair_calls == budget
+
+
+def test_the_budget_cannot_be_reassigned_past_the_check() -> None:
+    """A budget checked once at construction is not a budget if the object can be
+    reconfigured afterwards -- a reusable runner reassigned to nan walks straight past
+    __post_init__ into unbounded paid repair calls. The runner is frozen."""
+
+    runner = ValidatedCallRunner(runner=ModelCallRunner(adapter=FakeModelAdapter()))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        runner.max_repair_calls = float("nan")  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        runner.validators = ()  # type: ignore[misc]
+
+    # replace() is the supported way to reconfigure, and it revalidates.
+    assert dataclasses.replace(runner, max_repair_calls=3).max_repair_calls == 3
+    with pytest.raises(ValueError, match="max_repair_calls"):
+        dataclasses.replace(runner, max_repair_calls=float("inf"))  # type: ignore[arg-type]
 
 
 # --- a repair must not silently change which conversation is being repaired --------------

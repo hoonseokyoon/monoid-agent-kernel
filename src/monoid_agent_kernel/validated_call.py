@@ -21,12 +21,12 @@ does not import ``providers``.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -74,9 +74,15 @@ class ValidatedCallResult:
     repair_calls_used: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class ValidatedCallRunner:
     """Wrap a :class:`ModelCallRunner` with validators and an explicit repair budget.
+
+    Frozen, because a budget checked once at construction is not a budget if the object can be
+    reconfigured afterwards: a reusable runner whose ``max_repair_calls`` is reassigned to
+    ``nan`` walks straight past ``__post_init__`` into an unbounded sequence of paid repair
+    calls. Immutability makes the one check a guarantee instead of a hope, and it covers the
+    other two fields for free. Reconfigure with :func:`dataclasses.replace`, which revalidates.
 
     ``max_repair_calls`` bounds *repair calls*, not attempts: 1 (the default, matching
     ``RunLimits.max_output_retries``) means one original call plus at most one repair. The
@@ -227,12 +233,20 @@ def _parsed_output(request: ModelRequest, turn: ModelTurn) -> Any:
     deliberately NOT gated on the adapter declaring native support, because a best-effort
     provider often returns parseable JSON too and the validator (not this convenience) is the
     guarantee either way. ``None`` for prose; the validator sees the raw text regardless.
+
+    Parsed through the kernel's strict ingress rather than bare ``json.loads``, which accepts
+    Python's non-standard ``NaN`` / ``Infinity`` constants: a validator reading ``parsed`` --
+    a schema validator will happily call ``NaN`` a number -- would then accept an answer that
+    is not JSON at all. One rule for what counts as JSON here, and it is the rule the rest of
+    the kernel already applies (which also rules out duplicate keys, unbounded integers, and
+    runaway nesting). Anything it refuses leaves ``parsed`` at ``None``, which is the same
+    answer prose gets.
     """
 
     if request.output_schema is None or not turn.final_text:
         return None
     try:
-        return json.loads(turn.final_text)
+        return loads_json_ingress(turn.final_text)
     except ValueError:
         return None
 

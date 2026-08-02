@@ -62,7 +62,10 @@ out in commit messages and here.
   `on_unsupported="fail"` knob that governs the sampling-parameter echo — one policy for "the
   transport cannot prove application", deliberately not two half-settable ones.
 - `FinalOutputView.parsed` gives validators a best-effort structured view of the answer when a
-  schema was requested (guarded JSON parse; `None` for prose). `ValidatedCallRunner` populates
+  schema was requested (`None` for prose). It goes through the kernel's strict JSON ingress
+  rather than bare `json.loads`, which accepts Python's non-standard `NaN` / `Infinity`
+  constants: a validator reading `parsed` — a schema validator will call `NaN` a number — would
+  otherwise accept an answer that is not JSON at all. `ValidatedCallRunner` populates
   it; repair calls keep the schema riding while still stripping tools. Post-hoc validation
   remains the guarantee on every adapter — native delivery only reduces repairs, and adapters
   without support keep working unchanged.
@@ -77,10 +80,11 @@ out in commit messages and here.
   loop decides them; a validator defect raises `OutputValidatorError` and never re-prompts.
   `ValidatedCallResult` carries the receipts of every call made, so the audit trail is complete
   whatever the outcome. A thin sync facade (`call`) covers callers with no event loop and
-  refuses to run inside an active one. `max_repair_calls` must be an exact non-negative `int`,
-  like every other budget control in the kernel — the loop bound is `repair_calls >= budget`,
-  which `nan` makes permanently false and `inf` never reaches, so a budget arriving from
-  dynamically typed configuration must not be able to authorize unbounded paid model calls.
+  refuses to run inside an active one. The runner is **frozen**, and `max_repair_calls` must be
+  an exact non-negative `int`, like every other budget control in the kernel — the loop bound is
+  `repair_calls >= budget`, which `nan` makes permanently false and `inf` never reaches, so
+  neither a budget arriving from dynamically typed configuration nor one reassigned onto a
+  reusable runner afterwards can authorize unbounded paid model calls.
 - **A repair call never carries tools.** The standalone surface has no tool executor, and a
   validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
   deliberately a full agent turn; here it is deliberately not. Repair follows the request's own
@@ -119,6 +123,10 @@ out in commit messages and here.
   not declare it. Echoing the requested block back would have matched exactly on the client
   and let `on_unsupported="fail"` accept sampling controls that an ignoring adapter — the
   offline echo adapter, any `provider_adapter_factory` backend — never put on a request.
+  A declaration can therefore be conditional: `GatewayModelAdapter` only *forwards*, so it
+  declares `"native"` under `on_unsupported="fail"` (where a returned turn is a proven turn)
+  and `"none"` under `"omit"` (where it deliberately accepts an unproven one). Otherwise a
+  chained gateway would mint a fresh positive echo for a call whose inner hop proved nothing.
 - **The gateway client refuses a turn whose parameters cannot be proven applied.** Under the
   default `on_unsupported="fail"`, a response without a matching `generation_applied` echo —
   an older gateway that silently discarded the block, exactly the deployment this exists to
