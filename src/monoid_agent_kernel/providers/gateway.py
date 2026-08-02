@@ -41,6 +41,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     TurnComplete,
     mark_provider_retried,
+    mark_provider_usage,
     report_provider_retried,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
@@ -216,18 +217,29 @@ class GatewayModelAdapter:
                     # here recorded a call this client retried as a clean single attempt on
                     # every not-applied failure -- the one path where the retry evidence has no
                     # other carrier, since no turn is returned.
-                    _check_generation_applied(
-                        build_generation_payload(config.generation),
-                        config.generation.on_unsupported,
-                        data.get("generation_applied"),
-                        known_provider_retried=turn.provider_retried,
-                    )
-                    _check_schema_applied(
-                        request.output_schema is not None,
-                        config.generation.on_unsupported,
-                        data.get("schema_applied"),
-                        known_provider_retried=turn.provider_retried,
-                    )
+                    #
+                    # The refusal carries the turn's usage, because this is a failure that
+                    # happens *after* a complete, billed answer: the provider generated it, we
+                    # simply refuse to trust that our parameters shaped it. A receipt reporting
+                    # zero tokens there drops the call out of the metrics and out of the
+                    # cumulative token budget. Stamped around both checks rather than inside
+                    # them, since the usage belongs to the turn, not to either proof.
+                    try:
+                        _check_generation_applied(
+                            build_generation_payload(config.generation),
+                            config.generation.on_unsupported,
+                            data.get("generation_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
+                        _check_schema_applied(
+                            request.output_schema is not None,
+                            config.generation.on_unsupported,
+                            data.get("schema_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
+                    except ModelAdapterError as unproven:
+                        mark_provider_usage(unproven, turn.usage)
+                        raise
                     return turn
                 except ModelAdapterError as exc:
                     last_error = exc
@@ -384,18 +396,26 @@ class GatewayModelAdapter:
                                 # ``next_turn`` -- both transports enforce or neither does.
                                 if isinstance(chunk, TurnComplete):
                                     saw_terminal = True
-                                    _check_generation_applied(
-                                        build_generation_payload(config.generation),
-                                        config.generation.on_unsupported,
-                                        chunk.generation_applied,
-                                        known_provider_retried=chunk.provider_retried,
-                                    )
-                                    _check_schema_applied(
-                                        request.output_schema is not None,
-                                        config.generation.on_unsupported,
-                                        chunk.schema_applied,
-                                        known_provider_retried=chunk.provider_retried,
-                                    )
+                                    # The streamed twin of the sync stamp: the terminal frame
+                                    # is refused before it is yielded, so its usage reaches
+                                    # nothing that assembles a turn -- the refusal is the only
+                                    # carrier left for a call the provider already billed.
+                                    try:
+                                        _check_generation_applied(
+                                            build_generation_payload(config.generation),
+                                            config.generation.on_unsupported,
+                                            chunk.generation_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
+                                        _check_schema_applied(
+                                            request.output_schema is not None,
+                                            config.generation.on_unsupported,
+                                            chunk.schema_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
+                                    except ModelAdapterError as unproven:
+                                        mark_provider_usage(unproven, chunk.usage)
+                                        raise
                                 yield chunk
                         if not saw_terminal:
                             # "Both transports enforce or neither does" has to include the

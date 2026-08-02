@@ -144,6 +144,21 @@ out in commit messages and here.
   beside an `ok` result. Every attempt now opens with an `AttemptStarted(attempt)` event
   (exported from `contracts`), delivered before that attempt's chunks and whether or not any
   arrive; the consumer's event type is `AttemptStarted | ModelStreamChunk`.
+- **A refused turn still reports the tokens it burned.** The applied-parameters refusals fire
+  *after* the gateway returned a complete, billed answer with its usage — the client simply
+  refuses to trust that its parameters shaped it. The failed `ModelCallReceipt` reported zero
+  tokens and the loop's accumulation runs only on the returned-turn path, so a paid call
+  vanished from the metrics and from the cumulative token budget, which makes that budget a
+  bound that does not hold. The refusal now carries the reported usage (`mark_provider_usage`,
+  the twin of `mark_provider_retried`) on both transports; `ModelCallReceipt.with_error` reads
+  it back, and `AgentLoop` accumulates it on the failure path. A failure that reports no usage
+  still adds nothing.
+- **`run_once` no longer reports an interrupted run as a success.** It absorbs a non-settling
+  park because `close()` turns it into the record that *is* the call's result — but `close()`
+  promotes only `turn_failed`. An `interrupted` or `paused` park produced no record, so the run
+  finalized `completed` with no settled answer (and the completed-run cleanup deleted the
+  checkpoints the park had preserved). Only the park `close()` can promote is absorbed; the
+  others surface as `TurnNotSettled` after the same close.
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 

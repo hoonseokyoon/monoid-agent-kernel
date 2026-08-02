@@ -841,3 +841,92 @@ def test_a_boolean_echo_is_refused_on_the_streamed_terminal_frame(
     with pytest.raises(ModelAdapterError) as rejected:
         _drain(adapter, _request(config))
     assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+
+# --- a refused turn was still paid for ----------------------------------------------------
+
+
+_BILLED = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+
+def _receipt_for(adapter: GatewayModelAdapter, request: ModelRequest):
+    """Drive one call through ``ModelCallRunner`` and return the receipt it published."""
+
+    import asyncio
+
+    from monoid_agent_kernel.core.model_io import ModelIOSubscription
+    from monoid_agent_kernel.model_call import ModelCallRunner
+
+    class _Observer:
+        def __init__(self) -> None:
+            self.receipts: list = []
+
+        def on_model_call(self, capture) -> None:  # noqa: ANN001
+            self.receipts.append(capture.receipt)
+
+    observer = _Observer()
+    runner = ModelCallRunner(
+        adapter=adapter, subscriptions=(ModelIOSubscription(observer=observer),)
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        asyncio.run(runner.acall(request))
+    assert refused.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+    assert len(observer.receipts) == 1
+    return observer.receipts[0]
+
+
+def test_a_refused_turn_still_reports_the_tokens_it_burned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proof refusal happens *after* a complete, billed answer: the gateway generated the
+    text and reported its usage, and only then does the client refuse to trust that its
+    parameters shaped it. The failed receipt reported zero tokens, so the call vanished from
+    the metrics and from the cumulative token budget — a budget that under-counts is a bound
+    that does not hold."""
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(_served_turn({"usage": dict(_BILLED)})),
+    )
+    config = ModelConfig(generation=_SET, gateway_url="http://gateway.test")
+    receipt = _receipt_for(GatewayModelAdapter(config=config), _request(config))
+
+    assert dict(receipt.usage) == _BILLED
+    assert receipt.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+
+def test_the_streamed_refusal_reports_its_tokens_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The twin transport. Here the terminal frame is refused *before* it is yielded, so its
+    usage reaches nothing that assembles a turn — the refusal is the only carrier left."""
+
+    config = ModelConfig(generation=_SET, gateway_url="http://gateway.test")
+    adapter = _sse_adapter(
+        monkeypatch,
+        config,
+        [
+            'data: {"type":"text_delta","text":"an answer that was generated and billed"}',
+            "",
+            'data: {"type":"turn_complete","turn_handle":"t1","usage":'
+            '{"input_tokens":120,"output_tokens":340,"total_tokens":460}}',
+            "",
+        ],
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _drain(adapter, _request(config))
+    assert refused.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+    assert getattr(refused.value, "provider_usage", None) == _BILLED
+
+
+def test_a_refusal_with_no_usage_reported_stays_empty() -> None:
+    """The stamp carries what the provider said, and invents nothing when it said nothing."""
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    error = ModelAdapterError("refused")
+    mark_provider_usage(error, {})
+    assert getattr(error, "provider_usage", None) is None
+    mark_provider_usage(error, None)
+    assert getattr(error, "provider_usage", None) is None

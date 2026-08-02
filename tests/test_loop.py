@@ -2037,3 +2037,102 @@ def test_a_restored_settled_park_is_not_promoted_into_a_failure(tmp_path: Path) 
     restored = _restored_loop(spec, _ScriptedAdapter([]), sink)
     assert restored.close().status == "completed"
     assert list(spec.run_root.rglob("failure.json")) == []
+
+
+def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path) -> None:
+    """``run_once`` absorbs a non-settling park because ``close()`` turns it into the record
+    that IS the call's result — but ``close()`` promotes only ``turn_failed``. An interrupt
+    (and a pause) produced no record at all, so the run finalized ``completed`` with no
+    settled answer: a one-shot caller told to stop was told it had succeeded, and the
+    completed-run cleanup deleted the checkpoints the park had preserved. Only the park
+    ``close()`` can honestly promote is absorbed; the others surface typed, after the same
+    cleanup."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _SelfInterruptingAdapter()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("fs.list", "run.finish"),
+        event_sinks=(MemoryEventSink(),),
+    )
+    adapter.loop = loop
+
+    with pytest.raises(TurnNotSettled) as parked:
+        loop.run_once("go")
+    assert parked.value.reason == "interrupted"
+
+
+def test_run_once_still_returns_the_promoted_failure_for_a_turn_failure(
+    tmp_path: Path,
+) -> None:
+    """The half that must not change: ``turn_failed`` is the park ``close()`` promotes, so it
+    is still absorbed and returned as the failed result rather than raised."""
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    result = loop.run_once("hello")
+    assert result.status == "failed"
+    assert list(run_root.rglob("failure.json"))
+
+
+def test_a_refused_turns_tokens_still_reach_the_run_budget(tmp_path: Path) -> None:
+    """A call can fail *after* the provider produced and billed a complete answer — that is
+    exactly the shape of the applied-parameters proof refusals. The loop's accumulation runs
+    only on the returned-turn path, so those tokens never reached ``total_usage``: the metrics
+    reported a run cheaper than it was, and the cumulative token budget under-counted every
+    refused call, which makes it a bound that does not hold."""
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    refusal = ModelAdapterError(
+        "did not apply the requested generation parameters",
+        provider_error_code="gateway_generation_not_applied",
+        error_code="model_error",
+        config_recoverable=True,
+    )
+    mark_provider_usage(refusal, {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460})
+
+    adapter = _ScriptedAdapter([refusal, ModelTurn(response_id="r2", final_text="recovered")])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+        # A later settle adds to the refused call's cost rather than replacing it, so the
+        # next metrics event — the first one this run emits — already carries it.
+        assert loop.run_until_suspended(None).reason == "settled"
+        assert loop._session.state.total_usage["total_tokens"] >= 460  # type: ignore[union-attr]
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] >= 460
+    finally:
+        loop.close()
+
+
+def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
+    """The counterweight: an ordinary provider failure produced nothing and must cost
+    nothing, or every failed call would inflate the budget."""
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        # The run's zeroed counters, untouched — a failed call that produced nothing costs
+        # nothing, or every provider error would inflate the budget.
+        assert dict(loop._session.state.total_usage) == {  # type: ignore[union-attr]
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+    finally:
+        loop.close()

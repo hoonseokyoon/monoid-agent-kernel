@@ -1857,7 +1857,7 @@ class AgentLoop:
                     session.state.media_blobs = dict(seed_media_blobs)
                 try:
                     await self.asubmit(user_input)
-                except TurnNotSettled:
+                except TurnNotSettled as parked:
                     # One-shot: there is no next submit for the park to stay alive for, and
                     # the finally below closes the run — where an unrecovered turn_failed
                     # park is promoted to the terminal failure record (failure.json,
@@ -1865,7 +1865,16 @@ class AgentLoop:
                     # it returns as the failed AgentRunResult instead of escaping past the
                     # close that wrote it: the escape skipped the fork-subagent roll-up and
                     # terminal event, and left the CLI with a raw traceback.
-                    pass
+                    #
+                    # Absorbed for exactly the park close() can promote, and no wider.
+                    # ``TurnNotSettled`` also carries ``interrupted`` and ``paused``, which
+                    # produce no record at all — swallowing those finalized the run
+                    # ``completed`` with no settled answer, telling a caller who asked it to
+                    # stop that it had succeeded, and letting the completed-run cleanup
+                    # delete the checkpoints the park preserved. They surface typed instead,
+                    # after the same close() the absorbed case gets.
+                    if parked.reason != "turn_failed":
+                        raise
         finally:
             result = self.close()
         return result
@@ -3551,6 +3560,15 @@ class AgentLoop:
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
+                # A failure after a billed answer still costs tokens. The proof refusals parse
+                # a complete turn, read its usage, and only then reject it -- so the provider
+                # generated the output and charged for it while this path returns no turn and
+                # never reaches the accumulation below. Counted here, or the cumulative token
+                # budget silently under-counts every refused call and the metrics report a run
+                # cheaper than it was.
+                billed = _billed_usage(exc)
+                if billed:
+                    _accumulate_usage_mapping(state.total_usage, billed)
                 recorder.transcript(
                     {
                         "kind": "model_turn",
@@ -3558,7 +3576,7 @@ class AgentLoop:
                         "response_id": None,
                         "final_text": None,
                         "tool_calls": [],
-                        "usage": {},
+                        "usage": dict(billed),
                         "error": str(exc),
                         "error_code": exc.error_code,
                         "provider_error_code": exc.provider_error_code,
@@ -5222,6 +5240,41 @@ class AgentLoop:
             return
         operation = "read" if spec.side_effect in {"read", "artifact"} else "write"
         self.permission_policy.check_paths(operation, paths)  # type: ignore[arg-type]
+
+
+def _billed_usage(exc: BaseException) -> dict[str, int]:
+    """Usage a failing call already incurred, as stamped by ``mark_provider_usage``.
+
+    A call can fail *after* the provider produced and billed a complete answer -- the
+    applied-parameters proof refusals are exactly that shape. Those tokens are spent whether or
+    not the turn is accepted, so they belong in the run's totals; a budget that skips them is a
+    bound that does not hold. Guarded read, like every other fact carried on an exception here.
+    """
+
+    try:
+        billed = getattr(exc, "provider_usage", None)
+    except Exception:
+        return {}
+    if not isinstance(billed, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in billed.items()
+        if type(value) is int and value >= 0
+    }
+
+
+def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:
+    """The mapping form of :func:`_accumulate_usage` -- one summation rule, two carriers."""
+
+    for key, value in usage.items():
+        if type(value) is not int or value < 0:
+            raise ModelAdapterError(
+                f"model usage {key} must be a non-negative integer",
+                provider_error_code="model_bad_response",
+                retryable=False,
+            )
+        total_usage[key] = total_usage.get(key, 0) + value
 
 
 def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:

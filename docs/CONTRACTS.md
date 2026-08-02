@@ -147,7 +147,10 @@ The run lifecycle is:
   `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
   park does not raise here: the closing `finally` promotes an unrecovered
   `turn_failed` park to the terminal failure record, and that failed
-  `AgentRunResult` is the return value. `close()` performs the same promotion
+  `AgentRunResult` is the return value — for `turn_failed` only, the one park
+  `close()` can promote; an `interrupted` or `paused` park has no record to
+  return as, so it surfaces as `TurnNotSettled` after the same close.
+  `close()` performs the same promotion
   for any driver (the explicit form is `fail_recoverable`): a run closed on an
   unrecovered recoverable failure finalizes `failed` with `failure.json`
   written and its checkpoints kept, never as a clean success. The promotion
@@ -393,6 +396,9 @@ knob keeps the pre-W5 tolerance. The refusal is non-retryable `gateway_generatio
 help, but the remedy is configuration (`"omit"`, or a proving transport), so `AgentLoop`
 classifies it like a 4xx — the turn fails, the session survives — and the reference gateway's
 HTTP layer maps it to 422 rather than 502 so the same classification survives a chained hop.
+A refused turn was still generated and billed, so the refusal carries the usage the provider
+reported: it reaches the failed `ModelCallReceipt` and the run's cumulative token totals on
+both transports. A budget that skipped refused calls would not be a bound.
 One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
 been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
 call sees the unproven text before the error arrives; the sync transport delivers nothing on

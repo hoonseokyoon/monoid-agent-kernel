@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from copy import copy
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -1021,6 +1021,30 @@ def mark_provider_retried(error: BaseException) -> None:
 
     try:
         error.provider_retried = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -> None:
+    """Record on an escaping error the token usage the provider already reported.
+
+    Some failures happen *after* the provider produced — and billed for — a complete answer.
+    The applied-parameters proof refusals are the clearest case: the turn parsed, its usage is
+    known, and only then is the turn refused. Without this, the receipt for that call carries
+    an empty usage, the loop's post-turn accounting never runs, and a paid call disappears
+    from the metrics and from the cumulative token budget — a budget that under-counts is a
+    bound that does not hold.
+
+    The guarded-setattr twin of :func:`mark_provider_retried`, for the same reason: an
+    exception type that refuses the attribute (``__slots__``) simply carries no usage rather
+    than replacing the provider's failure with an ``AttributeError``. Read back by
+    ``ModelCallReceipt.with_error`` through ``getattr``.
+    """
+
+    if not usage:
+        return
+    try:
+        error.provider_usage = dict(usage)  # type: ignore[attr-defined]
     except Exception:
         pass
 
