@@ -325,7 +325,6 @@ class OpenAIModelAdapter:
         if not key:
             raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
 
-        payload = self._payload(request)
         config = request.model or self.config
         # The client owns an httpx connection pool and nothing else closes it, so whoever owns the
         # client owns the pool. Unscoped that is this call, and the ``finally`` releases it on
@@ -339,8 +338,11 @@ class OpenAIModelAdapter:
         # that is the only type ``AgentLoop._recoverable_turn_error`` will even look at, so an
         # unclassified one terminalizes the run. Same boundary the gateway adapter's streamed path
         # draws around its own client (see its ``httpx.HTTPError`` handler); one handler, because
-        # the rule is one rule.
+        # the rule is one rule. The payload build sits inside for the same reason: its
+        # ``json.dumps`` of observations and tool arguments is part of this call's failure
+        # surface too, and outside the boundary it escaped as a raw ``TypeError``.
         try:
+            payload = self._payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
             try:
                 try:
@@ -383,7 +385,6 @@ class OpenAIModelAdapter:
         if not key:
             raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
 
-        payload = self._payload(request)
         config = request.model or self.config
         final_data: dict[str, Any] = {}
         # An unscoped call owns its client for the same reason ``next_turn``'s does -- the pool --
@@ -401,6 +402,7 @@ class OpenAIModelAdapter:
         # undo it -- the gateway's handler does not either. What it prevents is the replacement
         # being a raw exception, which the loop cannot classify at all.
         try:
+            payload = self._payload(request)
             client, call_owned = self._async_client(AsyncOpenAI, key)
             # Bound before the request, so the cleanup below can run even when creating the stream is
             # what failed -- there is nothing to release then, and it must not raise looking.

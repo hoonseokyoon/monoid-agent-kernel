@@ -58,6 +58,27 @@ GATEWAY_SCHEMA_NOT_APPLIED = "gateway_schema_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
+def _encode_request_body(payload: dict[str, Any]) -> bytes:
+    """Serialize one request payload, classifying what cannot be serialized.
+
+    ``normalize_json_ingress`` deliberately leaves arbitrary non-JSON scalars alone (the
+    documented arbitrary-scalar gap), so a Python-direct caller can hand ``output_schema``,
+    ``messages``, or an observation a value ``json.dumps`` refuses -- a ``set``, a function, a
+    NaN under ``allow_nan=False``. Encoded here, once, for both transports: outside a
+    classifier that failure escaped as a raw ``TypeError``/``ValueError`` the loop cannot
+    classify at all, terminalizing the run unrecoverably for what is a config-shaped mistake.
+    """
+
+    try:
+        return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ModelAdapterError(
+            f"model request is not JSON-serializable: {exc}",
+            provider_error_code=GATEWAY_BAD_REQUEST,
+            retryable=False,
+        ) from exc
+
+
 def _stamp_retry(error: BaseException, attempt: int) -> None:
     """Record on an escaping error that the adapter's retry loop had already run.
 
@@ -121,8 +142,7 @@ class GatewayModelAdapter:
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
         url = self._resolve_gateway_url(config)
-        payload = self._payload(request)
-        body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        body = _encode_request_body(self._payload(request))
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None
@@ -266,9 +286,7 @@ class GatewayModelAdapter:
 
         config = request.model or self.config
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
-        body = json.dumps(self._payload(request), ensure_ascii=False, allow_nan=False).encode(
-            "utf-8"
-        )
+        body = _encode_request_body(self._payload(request))
         retry = config.retry
         max_attempts = max(1, retry.max_attempts)
         last_error: ModelAdapterError | None = None

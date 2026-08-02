@@ -458,3 +458,88 @@ def test_repair_preserves_the_schema_while_stripping_tools() -> None:
     repair = adapter.requests[1]
     assert repair.output_schema == _SCHEMA
     assert repair.tools == ()
+
+
+# --- an unserializable request is a classified error, not a raw TypeError ---------------
+
+
+def test_an_unserializable_request_is_a_classified_bad_request() -> None:
+    """``normalize_json_ingress`` deliberately passes arbitrary scalars through (the
+    documented arbitrary-scalar gap), so the serialization boundary is where the failure
+    lands -- and ``json.dumps`` sat outside the adapter's classifier, escaping as a raw
+    ``TypeError`` the loop cannot classify at all. One encoder, both transports, covering
+    ``output_schema``, ``messages``, and observations uniformly."""
+
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
+    config = ModelConfig(gateway_url="http://gateway.test")
+    adapter = GatewayModelAdapter(config=config)
+
+    with pytest.raises(ModelAdapterError) as schema_case:
+        adapter.next_turn(_request(config, output_schema={"a": {1, 2}}))  # type: ignore[dict-item]
+    assert schema_case.value.provider_error_code == GATEWAY_BAD_REQUEST
+    assert schema_case.value.retryable is False
+
+    with pytest.raises(ModelAdapterError) as messages_case:
+        adapter.next_turn(
+            ModelRequest(
+                instruction=None,
+                system_prompt="sys",
+                tools=(),
+                model=config,
+                messages=({"role": "user", "content": print},),  # type: ignore[dict-item]
+            )
+        )
+    assert messages_case.value.provider_error_code == GATEWAY_BAD_REQUEST
+
+    # NaN rides a different exception (ValueError, from allow_nan=False) -- same rule.
+    with pytest.raises(ModelAdapterError) as nan_case:
+        adapter.next_turn(_request(config, output_schema={"a": float("nan")}))
+    assert nan_case.value.provider_error_code == GATEWAY_BAD_REQUEST
+
+
+def test_an_unserializable_request_is_classified_on_the_stream_too() -> None:
+    pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
+    config = ModelConfig(gateway_url="http://gateway.test")
+    adapter = GatewayModelAdapter(config=config)
+
+    async def _drive() -> None:
+        async for _chunk in adapter.astream_turn(
+            _request(config, output_schema={"a": {1, 2}})  # type: ignore[dict-item]
+        ):
+            pass
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        asyncio.run(_drive())
+    assert rejected.value.provider_error_code == GATEWAY_BAD_REQUEST
+
+
+def test_openai_payload_build_failures_are_classified_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenAI twin: ``_payload`` ran outside the classifier ``try`` whose own comment
+    says unclassified exceptions terminalize the run -- an unserializable observation
+    escaped as a raw ``TypeError`` before the classifier could see anything."""
+
+    pytest.importorskip("openai")
+    from monoid_agent_kernel.providers.base import ToolObservation
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = ModelConfig(provider="openai")
+    adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
+    request = ModelRequest(
+        instruction="go",
+        system_prompt="sys",
+        tools=(),
+        model=config,
+        previous_turn_handle="resp_1",
+        observations=(
+            ToolObservation(
+                call_id="c1", tool_name="fs.read", output={"bytes": {1, 2}}
+            ),
+        ),
+    )
+    with pytest.raises(ModelAdapterError):
+        adapter.next_turn(request)
