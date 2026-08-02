@@ -8,7 +8,7 @@ This module defines the integration surface; the orchestration lives in the loop
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -114,3 +114,63 @@ class OutputValidatorError(NativeAgentError):
     """
 
     error_code = "output_validator_error"
+
+
+def run_output_validators(
+    validators: tuple[OutputValidator, ...], view: FinalOutputView
+) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
+    """Run every validator over one view; collect all failures rather than short-circuiting.
+
+    Returns ``(failures, ok_values, defect)``. Exception classification is the protocol
+    contract: :class:`OutputRetry`/``ValueError`` (which covers ``pydantic.ValidationError``)
+    are rejections carrying feedback; anything else is a validator *defect* reported as
+    ``(validator_id, exception)`` -- the model cannot fix a validator bug, so callers must not
+    re-prompt on it. Shared by the AgentLoop settle path and the standalone validated call, so
+    the classification cannot drift between them.
+    """
+
+    failures: list[tuple[str, str]] = []
+    ok_values: list[tuple[str, Any]] = []
+    for validator in validators:
+        try:
+            outcome = validate_validation_outcome(validator.validate(view))
+        except OutputRetry as exc:
+            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
+        except ValueError as exc:
+            outcome = ValidationOutcome(ok=False, feedback=str(exc))
+        except Exception as exc:
+            return failures, ok_values, (validator.id, exc)
+        if outcome.ok:
+            ok_values.append((validator.id, outcome.value))
+        else:
+            failures.append((validator.id, outcome.feedback))
+    return failures, ok_values, None
+
+
+def build_repair_message(failures: Sequence[tuple[str, str]]) -> str:
+    """The re-prompt text for a failed validation.
+
+    One dialect of repair for every execution surface: the loop's settle re-prompt and the
+    standalone validated call both feed the model exactly this text.
+    """
+
+    lines = [
+        "Your final response did not satisfy the required output format. "
+        "Correct it and respond again:"
+    ]
+    for validator_id, feedback in failures:
+        lines.append(
+            f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output"
+        )
+    return "\n".join(lines)
+
+
+def failures_by_validator(history: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Roll a failure history up to per-validator counts (diagnostics surfaces)."""
+
+    counts: dict[str, int] = {}
+    for attempt in history:
+        for failure in attempt.get("failures", ()):
+            vid = str(failure.get("validator_id", ""))
+            counts[vid] = counts.get(vid, 0) + 1
+    return counts

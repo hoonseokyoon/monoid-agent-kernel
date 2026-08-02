@@ -14,11 +14,10 @@ from monoid_agent_kernel.core.manifest import build_run_manifest
 from monoid_agent_kernel.core.model_io import content_length
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
-    OutputRetry,
-    OutputValidator,
     OutputValidatorError,
-    ValidationOutcome,
-    validate_validation_outcome,
+    build_repair_message,
+    failures_by_validator,
+    run_output_validators,
 )
 from monoid_agent_kernel.core.result import (
     AgentArtifact,
@@ -79,47 +78,9 @@ class SettleDecision:
     defect: tuple[str, BaseException] | None = None
 
 
-def _output_repair_message(failures: list[tuple[str, str]]) -> str:
-    lines = [
-        "Your final response did not satisfy the required output format. "
-        "Correct it and respond again:"
-    ]
-    for validator_id, feedback in failures:
-        lines.append(
-            f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output"
-        )
-    return "\n".join(lines)
-
-
-def _run_output_validators(
-    validators: tuple[OutputValidator, ...], view: FinalOutputView
-) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
-    failures: list[tuple[str, str]] = []
-    ok_values: list[tuple[str, Any]] = []
-    for validator in validators:
-        try:
-            outcome = validate_validation_outcome(validator.validate(view))
-        except OutputRetry as exc:
-            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
-        except ValueError as exc:
-            outcome = ValidationOutcome(ok=False, feedback=str(exc))
-        except Exception as exc:
-            return failures, ok_values, (validator.id, exc)
-        if outcome.ok:
-            ok_values.append((validator.id, outcome.value))
-        else:
-            failures.append((validator.id, outcome.feedback))
-    return failures, ok_values, None
-
-
-def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for attempt in history:
-        for failure in attempt.get("failures", ()):
-            vid = str(failure.get("validator_id", ""))
-            counts[vid] = counts.get(vid, 0) + 1
-    return counts
-
+# The validation routine, the repair text, and the history rollup were promoted to
+# ``core.output_validator`` (W5 PR 3) so the standalone validated call shares them verbatim;
+# this module keeps only the loop-side orchestration around them.
 
 _OUTPUT_CONTRACT_STOPPED = "Stopped: the final response did not satisfy the output contract."
 
@@ -365,7 +326,7 @@ class LoopSettleCoordinator:
 
         view = self.build_final_output_view(state, res, context)
         failures, ok_values, defect = await asyncio.to_thread(
-            _run_output_validators, validators, view
+            run_output_validators, validators, view
         )
         if defect is not None:
             return SettleDecision(kind="defect", defect=defect)
@@ -441,7 +402,7 @@ class LoopSettleCoordinator:
                 "output.validator.exhausted",
                 data={
                     "retries": state.output_retries,
-                    "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                    "failures_by_validator": failures_by_validator(state.output_failure_history),
                     "history": list(state.output_failure_history),
                 },
                 level="warning",
@@ -462,7 +423,7 @@ class LoopSettleCoordinator:
         if decision.kind == "reprompt":
             state.pending_observations = ()
             state.messages.append(
-                {"role": "user", "content": _output_repair_message(list(decision.failures))}
+                {"role": "user", "content": build_repair_message(list(decision.failures))}
             )
             return None
 
@@ -584,7 +545,7 @@ class LoopFinalizer:
         if state.output_failure_history:
             metrics["output_validation"] = {
                 "retries": state.output_retries,
-                "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                "failures_by_validator": failures_by_validator(state.output_failure_history),
             }
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
