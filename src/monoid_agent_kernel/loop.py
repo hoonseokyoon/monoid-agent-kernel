@@ -860,6 +860,13 @@ class _Session:
     # The observable boundary paired with the latest checkpoint. Backend-owned persistence can
     # commit another snapshot (for example after a task report) without losing this observation.
     last_suspension: dict[str, Any] | None = None
+    # The unpromoted turn_failed park, ``(error, error_code)``. Set by the recoverable branch,
+    # cleared at every pump entry (a re-attempt that settles leaves it cleared; one that fails
+    # again re-sets it), read by ``close()`` to promote an unrecovered park to the terminal
+    # failure record. Deliberately NOT derived from ``last_suspension``: that field only
+    # updates when the park's checkpoint snapshot committed, and the promotion must not
+    # depend on checkpointing having worked.
+    unrecovered_turn_failure: tuple[str, str] | None = None
     # Recovery-driver input identities survive every later snapshot without coupling the loop to
     # a command transport or orchestration implementation.
     applied_input_ids: set[str] = field(default_factory=set)
@@ -1440,6 +1447,9 @@ class AgentLoop:
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
+        # A fresh pump supersedes the prior park: if this attempt settles, the failure was
+        # recovered; if it fails again, the branch below re-sets it.
+        session.unrecovered_turn_failure = None
         state, res = session.state, session.res
         if user_input is not None:
             session.active_turn_id = None
@@ -1538,6 +1548,9 @@ class AgentLoop:
                 http_status=exc.http_status,
                 config_recoverable=exc.config_recoverable,
             )
+            # Remembered on the session (not just the returned Suspension) so a close() with
+            # no later settle can promote this park to the terminal failure record.
+            session.unrecovered_turn_failure = (result.error, result.error_code)
             self._persist_checkpoint(session, result)
             return result
         except TurnInterrupted:
@@ -1657,6 +1670,18 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         try:
+            if session.unrecovered_turn_failure is not None and not session.terminal:
+                # Closing on an unrecovered turn_failed park IS the driver giving up — the
+                # same promotion ``fail_recoverable`` performs explicitly. Without it,
+                # finalize read the per-turn reset state and recorded this run as a clean
+                # success (run.finished status=completed, no failure.json), and the
+                # completed-run cleanup below then deleted the very checkpoints the park
+                # preserves for an operator-driven restore. One seam here covers run_once,
+                # the fork-subagent child, and a direct open/submit/close driver alike.
+                error, error_code = session.unrecovered_turn_failure
+                self.fail_recoverable(
+                    error or "turn failed", error_code=error_code or "model_error"
+                )
             result = self._finalize(session.state, session.res)
         except BaseException:
             # A failed terminal transition cannot remain submit-capable with already-closed
@@ -1806,7 +1831,17 @@ class AgentLoop:
                     session.state.messages = [dict(message) for message in normalized_messages]
                 if seed_media_blobs:
                     session.state.media_blobs = dict(seed_media_blobs)
-                await self.asubmit(user_input)
+                try:
+                    await self.asubmit(user_input)
+                except TurnNotSettled:
+                    # One-shot: there is no next submit for the park to stay alive for, and
+                    # the finally below closes the run — where an unrecovered turn_failed
+                    # park is promoted to the terminal failure record (failure.json,
+                    # run.failed, checkpoints kept). That record IS this call's result, so
+                    # it returns as the failed AgentRunResult instead of escaping past the
+                    # close that wrote it: the escape skipped the fork-subagent roll-up and
+                    # terminal event, and left the CLI with a raw traceback.
+                    pass
         finally:
             result = self.close()
         return result
@@ -3496,6 +3531,7 @@ class AgentLoop:
                         "provider_error_code": exc.provider_error_code,
                         "retryable": exc.retryable,
                         "http_status": exc.http_status,
+                        "config_recoverable": exc.config_recoverable,
                     }
                 )
                 raise

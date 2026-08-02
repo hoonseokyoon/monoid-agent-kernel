@@ -315,16 +315,16 @@ def _stamp_receipts(
     provider's failure with an ``AttributeError``. ``OutputValidatorError`` declares the
     attribute so its carriage is part of the type's contract; everything else gets it stamped.
 
-    An already-stamped exception is left alone: an adapter that internally delegates to
-    another validated call propagates an error carrying the *inner* call's receipts, and the
-    innermost stamp is the one closest to the failure -- overwriting it with the outer
-    runner's (possibly empty) list destroyed the very audit trail this exists to preserve.
+    An already-stamped exception is appended to, never overwritten: an adapter that
+    internally delegates to another validated call propagates an error carrying the *inner*
+    call's receipts, and both audit trails are paid calls -- the inner stamp (closest to the
+    failure) keeps its place at the front, the outer runner's completed calls follow.
+    Overwriting lost the inner trail; skipping lost the outer one.
     """
 
-    if getattr(error, "receipts", None):
-        return
+    existing = getattr(error, "receipts", None) or ()
     try:
-        error.receipts = receipts  # type: ignore[attr-defined]
+        error.receipts = tuple(existing) + tuple(receipts)  # type: ignore[attr-defined]
     except Exception:
         return
 

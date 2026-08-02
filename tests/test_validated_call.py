@@ -578,17 +578,23 @@ def test_a_validator_defect_carries_the_receipts_of_every_call_made() -> None:
     assert len(defect.value.receipts) == 2
 
 
-def test_receipt_stamping_keeps_the_innermost_stamp() -> None:
+def test_receipt_stamping_merges_inner_before_outer() -> None:
     """An adapter that internally delegates to another ValidatedCallRunner propagates an
-    exception already carrying the inner call's receipts; the outer stamp must not overwrite
-    them with its own (possibly empty) list — the innermost stamp is closest to the failure."""
+    exception already carrying the inner call's receipts; the outer stamp appends its own
+    completed calls' receipts after them — both trails are paid calls, and either
+    overwriting (losing the inner) or skipping (losing the outer) destroys one."""
 
     from monoid_agent_kernel.validated_call import _stamp_receipts
 
     error = RuntimeError("boom")
     _stamp_receipts(error, ("inner-receipt",))  # type: ignore[arg-type]
-    _stamp_receipts(error, ())
-    assert error.receipts == ("inner-receipt",)  # type: ignore[attr-defined]
+    _stamp_receipts(error, ("outer-receipt",))  # type: ignore[arg-type]
+    assert error.receipts == ("inner-receipt", "outer-receipt")  # type: ignore[attr-defined]
+
+    empty_outer = RuntimeError("boom")
+    _stamp_receipts(empty_outer, ("inner-receipt",))  # type: ignore[arg-type]
+    _stamp_receipts(empty_outer, ())
+    assert empty_outer.receipts == ("inner-receipt",)  # type: ignore[attr-defined]
 
 
 def test_each_validator_sees_its_own_parsed_view() -> None:

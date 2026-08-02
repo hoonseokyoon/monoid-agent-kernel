@@ -1270,21 +1270,79 @@ def test_interrupt_during_submit_surfaces_typed_not_assert(tmp_path: Path) -> No
         loop.close()
 
 
-def test_run_once_surfaces_a_recoverable_failure_typed(tmp_path: Path) -> None:
-    """run_once is the facade the fork-subagent path drives (child.arun_once): a child's
-    provider 400 must surface as a classified error the parent machinery can record, not an
-    anonymous AssertionError."""
-
-    from monoid_agent_kernel.errors import TurnNotSettled
+def test_run_once_returns_the_promoted_failure_instead_of_escaping(tmp_path: Path) -> None:
+    """run_once is one-shot: its own finally closes the run, and close() promotes an
+    unrecovered turn_failed park to the terminal failure record. That record IS the call's
+    result — escaping past the close that wrote it skipped the fork-subagent roll-up and
+    terminal event and left the CLI with a raw traceback, while the record itself claimed a
+    clean success and the completed-run cleanup deleted the park's checkpoints."""
 
     adapter = _ScriptedAdapter(
         [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
     )
-    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
-    with pytest.raises(TurnNotSettled) as parked:
-        loop.run_once("hello")
-    assert parked.value.reason == "turn_failed"
-    assert parked.value.error_code == "turn_not_settled"
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    result = loop.run_once("hello")
+    assert result.status == "failed"
+    assert result.error_code == "model_error"
+    assert list(run_root.rglob("failure.json"))
+    types = [e.type for e in sink.events]
+    assert "run.failed" in types
+
+
+def test_closing_on_an_unrecovered_turn_failure_records_a_failed_run(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    susp = loop.run_until_suspended("hello")
+    assert susp.reason == "turn_failed"
+    result = loop.close()
+    assert result.status == "failed"
+    assert list(run_root.rglob("failure.json"))
+    assert "run.failed" in [e.type for e in sink.events]
+
+
+def test_a_recovered_turn_failure_still_closes_completed(tmp_path: Path) -> None:
+    """The promotion keys on the LAST park: a re-attempt that settles supersedes it."""
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("transient", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    assert loop.run_until_suspended(None).reason == "settled"
+    result = loop.close()
+    assert result.status == "completed"
+    assert list(run_root.rglob("failure.json")) == []
+    assert "run.failed" not in [e.type for e in sink.events]
+
+
+def test_a_turn_failed_run_dir_still_validates(tmp_path: Path) -> None:
+    """The new turn.failed data key must be bound on its third twin — the pinned event-data
+    schema — or `mak validate` rejects every run containing a recoverable turn failure."""
+
+    from monoid_agent_kernel.core.schemas import validate_run_dir
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("bad config", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        assert loop.run_until_suspended(None).reason == "settled"
+    finally:
+        loop.close()
+    run_dir = next(run_root.rglob("manifest.json")).parent
+    assert validate_run_dir(run_dir) == []
 
 
 def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:

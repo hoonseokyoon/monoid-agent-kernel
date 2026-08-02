@@ -59,12 +59,13 @@ class ModelAdapterError(NativeAgentError):
 class TurnNotSettled(NativeAgentError):
     """A blocking submit facade parked without a settled turn to return.
 
-    Raised by ``AgentLoop.submit`` / ``asubmit`` / ``run_once`` when the turn suspended with
+    Raised by ``AgentLoop.submit`` / ``asubmit`` when the turn suspended with
     ``reason="turn_failed"`` (a *recoverable* model-turn failure), ``"interrupted"``, or
     ``"paused"`` — outcomes that produce no ``AgentTurnResult`` because nothing settled. The
-    session itself is still alive (``run_once`` closes it in its own ``finally``, as always);
-    the non-blocking pump (``run_until_suspended``) hands the same park back as a
-    :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising. ``suspension``
+    session stays alive; the non-blocking pump (``run_until_suspended``) hands the same park
+    back as a :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising, and
+    the one-shot ``run_once`` absorbs it — its closing ``finally`` promotes an unrecovered
+    park to the terminal failure record and returns that failed result. ``suspension``
     carries the full evidence (reason, error, ``retryable``, ``http_status``,
     ``config_recoverable``) so a driver can decide between re-attempt, config fix, and
     giving up — the same decision the Suspension-reading driver makes.
@@ -79,6 +80,7 @@ class TurnNotSettled(NativeAgentError):
         self.reason = suspension.reason
         self.retryable = suspension.retryable
         self.http_status = suspension.http_status
+        self.config_recoverable = suspension.config_recoverable
 
 
 class PermissionDenied(NativeAgentError):

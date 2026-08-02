@@ -144,7 +144,13 @@ The run lifecycle is:
 - `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
   proposal, emit `run.finished`, close the recorder.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
-  `open()` + `submit(user_input)` + `close()`.
+  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
+  park does not raise here: the closing `finally` promotes an unrecovered
+  `turn_failed` park to the terminal failure record, and that failed
+  `AgentRunResult` is the return value. `close()` performs the same promotion
+  for any driver (the explicit form is `fail_recoverable`): a run closed on an
+  unrecovered recoverable failure finalizes `failed` with `failure.json`
+  written and its checkpoints kept, never as a clean success.
 
 ### AgentRunSpec
 

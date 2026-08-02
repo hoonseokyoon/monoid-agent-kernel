@@ -60,16 +60,29 @@ out in commit messages and here.
   required importing provider modules. OpenAI 4xx classification now names the provider's
   `param` (a provider-authored field path, not user content) so a schema-subset rejection is
   distinguishable from any other bad request.
-- **`submit()` / `asubmit()` / `run_once()` surface a non-settling park typed instead of
+- **`submit()` / `asubmit()` / `run_once()` surface a non-settling park honestly instead of
   crashing.** A turn that parked without settling — a *recoverable* turn failure (any
   provider 4xx, an exhausted retryable error, W5's proof refusals), an interrupt, or a pause —
   produces a `Suspension` with `turn=None`; the blocking facades asserted `turn is not None`
   and crashed with a message-less `AssertionError` (silently returning `None` under
-  `python -O`), including on the fork-subagent path through `arun_once`. They now raise
-  `TurnNotSettled` (`monoid_agent_kernel.errors`), carrying the suspension and its
-  classification; the session stays alive exactly as the `run_until_suspended` /
-  `astream` halves always kept it. The stale "every non-awaiting reason attaches a turn"
+  `python -O`), including on the fork-subagent path through `arun_once`. `submit`/`asubmit`
+  now raise `TurnNotSettled` (`monoid_agent_kernel.errors`), carrying the suspension and its
+  classification, with the session alive exactly as the `run_until_suspended` / `astream`
+  halves always kept it; `LoopSession.submit` maps the park onto the FSM exactly like its
+  pump half before re-raising. `run_once` is one-shot — its own `finally` closes the run —
+  so it **returns** the promoted failed `AgentRunResult` instead of raising past the close
+  that recorded it (which also restores the fork-subagent `subagent.failed` event and usage
+  roll-up, and a clean CLI exit). The stale "every non-awaiting reason attaches a turn"
   claim is corrected in the docstrings and `Suspension` docs.
+- **`close()` promotes an unrecovered `turn_failed` park to the terminal failure record.**
+  Closing a run whose last park was a recoverable turn failure previously finalized from the
+  per-turn reset state: `run.finished` claimed `status=completed` with no `failure.json`,
+  and the completed-run cleanup then deleted the very checkpoints the park preserves for an
+  operator-driven restore. `close()` now performs the same promotion `fail_recoverable`
+  offers drivers explicitly (`failure.json` + `run.failed` + checkpoints kept); a park
+  recovered by a later settle still closes `completed`. The `turn.failed` event schema
+  gains `config_recoverable`, so `mak validate` accepts runs containing recoverable turn
+  failures (the third twin of that key, after the Suspension and the checkpoint payload).
 - `Suspension` and the `turn.failed` event carry `config_recoverable`, so a driver can
   distinguish "park for a config fix" from other non-retryable turn failures without
   hard-coding provider codes; the durable park payload round-trips it (absent on
