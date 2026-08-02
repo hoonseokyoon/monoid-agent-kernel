@@ -138,6 +138,12 @@ from monoid_agent_kernel.core.model_stream import (
 # it names the provider vocabulary it drives; see the module docstring.
 from monoid_agent_kernel.model_call import ModelCallRunner
 
+# One validated model call: dispatch + validate + bounded explicit repair, outside any loop.
+from monoid_agent_kernel.validated_call import (
+    ValidatedCallResult,
+    ValidatedCallRunner,
+)
+
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
@@ -363,6 +369,8 @@ __all__ = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    "ValidatedCallRunner",
+    "ValidatedCallResult",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

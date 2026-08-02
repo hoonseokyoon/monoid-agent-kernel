@@ -95,6 +95,8 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    "ValidatedCallRunner",
+    "ValidatedCallResult",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

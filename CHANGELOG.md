@@ -23,6 +23,29 @@ out in commit messages and here.
   its wire shape. Setting any generation value changes all three, deliberately — pinned by
   literal-hash tests captured on v0.20.1.
 
+### Added — `ValidatedCallRunner`: one validated model call, outside any loop
+
+- A caller invoking `ModelCallRunner` directly — an LLM-only skill, a gateway, a batch driver —
+  gets the same validate-and-re-prompt guarantee `AgentLoop` applies at its settle points:
+  dispatch, run the registered `OutputValidator`s, and repair with at most `max_repair_calls`
+  (default 1) explicit follow-up calls. Exhaustion is a result (`status="unsatisfied"`), not an
+  exception; refusal and truncation short-circuit **before** validation, in the same order the
+  loop decides them; a validator defect raises `OutputValidatorError` and never re-prompts.
+  `ValidatedCallResult` carries the receipts of every call made, so the audit trail is complete
+  whatever the outcome. A thin sync facade (`call`) covers callers with no event loop and
+  refuses to run inside an active one.
+- **A repair call never carries tools.** The standalone surface has no tool executor, and a
+  validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
+  deliberately a full agent turn; here it is deliberately not. Repair follows the request's own
+  shape: by-value messages append the answer and the repair prompt, a provider continuation
+  handle carries the repair as the next instruction, and a one-shot instruction is synthesized
+  into the by-value form.
+- The validation routine, exception classification, repair text, and failure rollup moved from
+  the loop's settle module into `core.output_validator`
+  (`run_output_validators` / `build_repair_message` / `failures_by_validator`) and the loop now
+  imports them — one rule source for both execution surfaces, so the repair dialect and the
+  defect boundary cannot drift. No behavior change on the loop path.
+
 ### Added — generation parameters reach the providers, and the gateway proves it applied them
 
 - The OpenAI adapter sends `temperature` / `top_p` / `max_output_tokens` on the Responses API
