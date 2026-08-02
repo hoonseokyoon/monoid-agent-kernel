@@ -179,6 +179,8 @@ class OpenAIModelAdapter:
 
     # Maps resolved base64 image blocks to Responses ``input_image`` items.
     supports_multimodal: ClassVar[bool] = True
+    # Translates ``ModelRequest.output_schema`` to the Responses API ``text.format`` block.
+    structured_output_support: ClassVar[str] = "native"
     # Identifies which provider's reasoning artifacts this adapter produces, so the loop tags
     # the captured reasoning block and replay only happens against a matching model.
     provider_name: ClassVar[str] = "openai"
@@ -519,6 +521,19 @@ class OpenAIModelAdapter:
         # behave identically, and an unsupported parameter surfaces as the provider's own
         # 400 through the error taxonomy.
         payload.update(build_generation_payload(config.generation))
+        if request.output_schema is not None:
+            # ResponseContract delivery: the schema goes out verbatim -- never adjusted to
+            # OpenAI's strict subset -- so the request digest identifies exactly what the
+            # provider was asked to enforce. A schema the provider rejects is its own 400
+            # through the taxonomy, same policy note as the sampling controls above.
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "response",
+                    "strict": True,
+                    "schema": request.output_schema,
+                }
+            }
 
         if request.messages is not None:
             # By-value: the full conversation travels as input; no server-side handle. Reasoning

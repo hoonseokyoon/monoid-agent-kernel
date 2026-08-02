@@ -70,6 +70,11 @@ class FinalOutputView:
     artifacts: tuple[AgentArtifact, ...] = ()
     final_outputs: tuple[str, ...] = ()
     read_bytes: Callable[..., bytes] = field(default=lambda path, **_: b"")
+    # Best-effort structured view of ``final_text`` when the call carried an
+    # ``output_schema`` (W5 ResponseContract). ``None`` when the text is not valid JSON or
+    # no schema was requested -- a validator must treat it as a convenience, never as the
+    # guarantee; the guarantee is the validator itself.
+    parsed: Any = None
 
 
 @runtime_checkable

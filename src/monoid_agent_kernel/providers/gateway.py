@@ -54,6 +54,7 @@ GATEWAY_SERVER_ERROR = "gateway_server_error"
 GATEWAY_AUTH_ERROR = "gateway_auth_error"
 GATEWAY_BAD_RESPONSE = "gateway_bad_response"
 GATEWAY_GENERATION_NOT_APPLIED = "gateway_generation_not_applied"
+GATEWAY_SCHEMA_NOT_APPLIED = "gateway_schema_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
@@ -86,6 +87,9 @@ class GatewayModelAdapter:
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
+    # Forwards ``output_schema`` on the wire; the ``schema_applied`` echo (checked under
+    # ``on_unsupported``) is what turns this claim into proof per call.
+    structured_output_support: ClassVar[str] = "native"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
@@ -148,6 +152,12 @@ class GatewayModelAdapter:
                         build_generation_payload(config.generation),
                         config.generation.on_unsupported,
                         data.get("generation_applied"),
+                        known_provider_retried=turn.provider_retried,
+                    )
+                    _check_schema_applied(
+                        request.output_schema is not None,
+                        config.generation.on_unsupported,
+                        data.get("schema_applied"),
                         known_provider_retried=turn.provider_retried,
                     )
                     if attempt > 1:
@@ -314,6 +324,12 @@ class GatewayModelAdapter:
                                         chunk.generation_applied,
                                         known_provider_retried=chunk.provider_retried,
                                     )
+                                    _check_schema_applied(
+                                        request.output_schema is not None,
+                                        config.generation.on_unsupported,
+                                        chunk.schema_applied,
+                                        known_provider_retried=chunk.provider_retried,
+                                    )
                                 yield chunk
                         return
                     except _StreamRetry as retry_signal:
@@ -434,6 +450,8 @@ class GatewayModelAdapter:
         generation_payload = build_generation_payload(config.generation)
         if generation_payload:
             payload["generation"] = generation_payload
+        if request.output_schema is not None:
+            payload["output_schema"] = request.output_schema
 
         if request.messages is not None:
             # By-value: the full conversation travels as messages; no continuation handle.
@@ -669,6 +687,49 @@ def _check_generation_applied(
         f"LLM gateway did not apply the requested generation parameters: {detail}; "
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
+        retryable=False,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _check_schema_applied(
+    schema_sent: bool,
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """The schema twin of :func:`_check_generation_applied`, same policy knob.
+
+    One ``on_unsupported`` governs both proofs deliberately: "how to treat a parameter the
+    transport cannot prove was applied" is one question, and two half-set knobs (fail for one,
+    omit for the other) would be a new surface for exactly the kind of asymmetry W5 exists to
+    close. ``applied`` is a tri-state: ``True`` proves it, ``False`` is the server saying its
+    upstream cannot enforce schemas, absent (``None``) is an older server.
+    """
+
+    if not schema_sent:
+        return
+    if applied is not None and not isinstance(applied, bool):
+        raise ModelAdapterError(
+            "LLM gateway returned an invalid schema_applied echo: expected a boolean",
+            provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False,
+            provider_retried=known_provider_retried,
+        )
+    if applied is True:
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no schema_applied echo (older gateway?)"
+        if applied is None
+        else "the gateway's upstream does not enforce output schemas"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested output schema: {detail}; "
+        'set model.generation.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
         retryable=False,
         provider_retried=known_provider_retried,
     )
@@ -982,9 +1043,18 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 retryable=False,
                 provider_retried=retried,
             )
+        schema_applied = event.get("schema_applied")
+        if schema_applied is not None and not isinstance(schema_applied, bool):
+            raise ModelAdapterError(
+                "LLM gateway returned an invalid schema_applied echo: expected a boolean",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+                retryable=False,
+                provider_retried=retried,
+            )
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
             generation_applied=applied,
+            schema_applied=schema_applied,
             response_id=_gateway_string(
                 event,
                 "turn_handle",

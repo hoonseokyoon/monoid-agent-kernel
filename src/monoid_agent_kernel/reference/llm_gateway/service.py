@@ -23,6 +23,7 @@ from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
+from monoid_agent_kernel.providers.base import structured_output_support
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -57,6 +58,7 @@ class LlmGatewayTurnRequest:
     # statelessly. When set, no previous_turn_handle lookup is needed.
     messages: tuple[dict[str, Any], ...] | None = None
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    output_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -131,6 +133,7 @@ class LlmGatewayBackend:
                         generation=request.generation,
                     ),
                     messages=request.messages,
+                    output_schema=request.output_schema,
                 )
             )
         )
@@ -161,6 +164,11 @@ class LlmGatewayBackend:
         applied = build_generation_payload(request.generation)
         if applied:
             result["generation_applied"] = applied
+        # The schema twin: True only when the upstream adapter *declared* native enforcement --
+        # a forwarded-but-ignored schema is echoed False, so the client's "fail" policy can
+        # refuse it honestly.
+        if request.output_schema is not None:
+            result["schema_applied"] = structured_output_support(adapter) == "native"
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -197,6 +205,7 @@ class LlmGatewayBackend:
                 generation=request.generation,
             ),
             messages=request.messages,
+            output_schema=request.output_schema,
         )
         # Everything above can raise; only past this point are we committed to a stream body.
         return self._stream_turn(claims, request, adapter, model_request)
@@ -286,6 +295,8 @@ class LlmGatewayBackend:
         applied = build_generation_payload(request.generation)
         if applied:
             frame["generation_applied"] = applied
+        if request.output_schema is not None:
+            frame["schema_applied"] = structured_output_support(adapter) == "native"
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -457,6 +468,11 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
         generation=GenerationConfig.from_json(
             require_object(payload["generation"], "generation")
             if "generation" in payload
+            else None
+        ),
+        output_schema=(
+            dict(require_object(payload["output_schema"], "output_schema"))
+            if payload.get("output_schema") is not None
             else None
         ),
         instruction=instruction,

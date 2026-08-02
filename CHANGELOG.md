@@ -23,6 +23,29 @@ out in commit messages and here.
   its wire shape. Setting any generation value changes all three, deliberately — pinned by
   literal-hash tests captured on v0.20.1.
 
+### Added — output-schema delivery on the standalone path (ResponseContract)
+
+- `ModelRequest.output_schema` carries a standard, provider-neutral JSON Schema for the final
+  answer. The OpenAI adapter translates it to the Responses API `text.format` json_schema
+  block **verbatim — never adjusted to the provider's strict subset** — so the request digest
+  identifies exactly what the provider was asked to enforce (a schema the provider rejects is
+  its own error through the taxonomy). The digest follows the omission rule: schema-free
+  requests keep their pre-existing replay key. `AgentLoop` does not set the field; this is the
+  standalone/LLM-only path only.
+- Adapters opt in with a `structured_output_support = "native"` declaration, read through a
+  fail-closed probe (absence and unknown values mean `"none"`). The `monoid.llm-turn.v1` wire
+  gains `output_schema` (request) and a `schema_applied` boolean echo (response body and
+  terminal stream frame): the reference gateway threads the schema to its upstream adapter and
+  echoes `True` only when that adapter declared native enforcement, so a forwarded-but-ignored
+  schema reads `False`. The client refuses an unproven schema under the same
+  `on_unsupported="fail"` knob that governs the sampling-parameter echo — one policy for "the
+  transport cannot prove application", deliberately not two half-settable ones.
+- `FinalOutputView.parsed` gives validators a best-effort structured view of the answer when a
+  schema was requested (guarded JSON parse; `None` for prose). `ValidatedCallRunner` populates
+  it; repair calls keep the schema riding while still stripping tools. Post-hoc validation
+  remains the guarantee on every adapter — native delivery only reduces repairs, and adapters
+  without support keep working unchanged.
+
 ### Added — `ValidatedCallRunner`: one validated model call, outside any loop
 
 - A caller invoking `ModelCallRunner` directly — an LLM-only skill, a gateway, a batch driver —

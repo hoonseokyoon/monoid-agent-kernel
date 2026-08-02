@@ -161,6 +161,27 @@ class ModelRequest:
     # by-reference handle + ``instruction``/``observations`` delta. ``system_prompt`` is
     # NOT part of ``messages`` — it is regenerated each turn and applied separately.
     messages: tuple[dict[str, Any], ...] | None = None
+    # ResponseContract delivery (W5): a standard JSON Schema the final answer should satisfy,
+    # provider-neutral data. An adapter that declares ``structured_output_support = "native"``
+    # translates it into its provider's constrained-decoding dialect **verbatim, never
+    # transformed** — the request digest identifies exactly what was asked for. Adapters
+    # without the declaration ignore it, and post-hoc validation remains the guarantee either
+    # way (native delivery only reduces repairs). ``None`` = unconstrained.
+    output_schema: dict[str, Any] | None = None
+
+
+def structured_output_support(adapter: Any) -> Literal["native", "none"]:
+    """Whether ``adapter`` translates :attr:`ModelRequest.output_schema` into provider-native
+    constrained decoding.
+
+    Opt-in declaration, like ``supports_multimodal``: adapters set a
+    ``structured_output_support`` class attribute. Anything other than the exact string
+    ``"native"`` — including absence and unknown future values — reads as ``"none"``, so a
+    consumer can never over-trust an adapter that did not explicitly claim the capability.
+    """
+
+    value = getattr(adapter, "structured_output_support", "none")
+    return "native" if value == "native" else "none"
 
 
 class ModelAdapter(Protocol):
@@ -391,6 +412,10 @@ class TurnComplete:
     # because the streaming caller has no response object to read it from. ``None`` = the wire
     # never mentioned it (an older gateway, or a transport with no echo).
     generation_applied: dict[str, Any] | None = None
+    # The schema twin of ``generation_applied`` (W5 PR 4): whether the gateway forwarded
+    # ``output_schema`` to an upstream that natively enforces it. A sibling key, not a member
+    # of the generation echo -- changing an existing key's shape is how old clients break.
+    schema_applied: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -403,6 +428,8 @@ class TurnComplete:
         }
         if self.generation_applied is not None:
             payload["generation_applied"] = dict(self.generation_applied)
+        if self.schema_applied is not None:
+            payload["schema_applied"] = self.schema_applied
         return payload
 
 
@@ -583,6 +610,11 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     messages = None
     if request.messages is not None:
         messages = tuple(normalize_json_ingress(request.messages))
+    output_schema = request.output_schema
+    if output_schema is not None:
+        if not isinstance(output_schema, dict):
+            raise ValueError("model request output_schema must be an object or null")
+        output_schema = normalize_json_ingress(output_schema)
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),
@@ -598,6 +630,7 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
         observations=observations,
         model=normalize_model_config(request.model),
         messages=messages,
+        output_schema=output_schema,
     )
 
 

@@ -21,6 +21,7 @@ does not import ``providers``.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -126,7 +127,10 @@ class ValidatedCallRunner:
             if not self.validators:
                 return _result("ok")
 
-            view = FinalOutputView(final_text=turn.final_text or "")
+            view = FinalOutputView(
+                final_text=turn.final_text or "",
+                parsed=_parsed_output(current, turn),
+            )
             failures, ok_values, defect = await asyncio.to_thread(
                 run_output_validators, self.validators, view
             )
@@ -180,6 +184,23 @@ class ValidatedCallRunner:
         raise RuntimeError(
             "ValidatedCallRunner.call cannot run inside an active event loop; await acall instead"
         )
+
+
+def _parsed_output(request: ModelRequest, turn: ModelTurn) -> Any:
+    """Best-effort structured view of the answer for :attr:`FinalOutputView.parsed`.
+
+    Populated whenever the call carried an ``output_schema`` and the text parses as JSON --
+    deliberately NOT gated on the adapter declaring native support, because a best-effort
+    provider often returns parseable JSON too and the validator (not this convenience) is the
+    guarantee either way. ``None`` for prose; the validator sees the raw text regardless.
+    """
+
+    if request.output_schema is None or not turn.final_text:
+        return None
+    try:
+        return json.loads(turn.final_text)
+    except ValueError:
+        return None
 
 
 def _repair_request(request: ModelRequest, turn: ModelTurn, repair_text: str) -> ModelRequest:
