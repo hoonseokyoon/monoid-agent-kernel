@@ -661,7 +661,15 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     if output_schema is not None:
         if not isinstance(output_schema, dict):
             raise ValueError("model request output_schema must be an object or null")
-        output_schema = normalize_json_ingress(output_schema)
+        # Strings and containers are normalized; non-finite floats are deliberately NOT
+        # substituted. Everything else here is model *content*, where turning a stray ``NaN``
+        # into ``null`` loses nothing -- but this is a control document the contract promises
+        # to deliver **verbatim**. Substituting rewrote ``{"enum": [NaN]}`` into
+        # ``{"enum": [null]}``: a different constraint, silently enforced by the provider, and
+        # the strict serializer that exists to refuse the value (``allow_nan=False``, on both
+        # adapters) never got to see it. Left in place, the request is refused as the
+        # config-recoverable bad request it is.
+        output_schema = normalize_json_ingress(output_schema, substitute_nonfinite=False)
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),

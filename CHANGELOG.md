@@ -95,6 +95,27 @@ out in commit messages and here.
   `FinalOutputView` read-only in fact: one validator's in-place mutation was previously
   judged — and surfaced as a value — by the next. An exception already stamped with an inner
   validated call's `receipts` keeps the innermost stamp instead of being overwritten.
+- **A boolean can no longer prove a sampling parameter.** The `generation_applied` echo was
+  compared with `==`, and Python holds `True == 1` and `False == 0.0` — so a gateway
+  answering JSON booleans proved exactly the most ordinary settings this block carries
+  (`max_output_tokens=1`, `top_p=1`, `temperature=0`) under the default fail-closed policy.
+  The comparison is now per key and non-coercive (a number is proven only by a number,
+  through the same `is_finite_json_number` rule the rest of this wire reads with), while
+  still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
+  `1.0` is not falsely refused.
+- **`output_schema` is not rewritten by ingress.** `normalize_model_request` substituted
+  non-finite floats with `null` — right for model content, wrong for a control document
+  promised verbatim: `{"enum": [NaN]}` became `{"enum": [null]}`, a different constraint the
+  provider then enforced, and the strict serializer that exists to refuse the value never saw
+  it. Strings and containers are still normalized; the value now reaches the boundary and is
+  refused there.
+- **The OpenAI adapter preflights the whole request body.** `_payload` embeds `output_schema`
+  without serializing it, so its classifier saw nothing: a set or a cycle inside the schema
+  failed later inside the SDK as an anonymous `unclassified_provider_error` with no
+  `config_recoverable` (terminalizing the run for what the gateway twin reports recoverably),
+  and a `NaN` was serialized to the JSON-invalid literal `NaN` and sent. The assembled payload
+  is now strict-encoded (`allow_nan=False`) inside the classification boundary on both the
+  blocking and the streaming path.
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 

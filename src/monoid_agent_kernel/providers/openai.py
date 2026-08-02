@@ -506,17 +506,29 @@ class OpenAIModelAdapter:
         )
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
-        """Build the request body, naming a build failure what it is: a bad request.
+        """Build the request body **and prove it serializes**, naming a failure what it is.
 
         The gateway twin (``_encode_request_body``) classifies an unserializable request as a
         config-recoverable bad request; without this, the same defect here fell through
         ``_model_error_from_openai``'s no-status tail as an anonymous
         ``unclassified_provider_error`` -- classified, but not *named*, and the code is what
         receipts and failure records carry. One helper, both call paths.
+
+        The encode covers the *whole* payload, not only the pieces ``_payload`` serializes on
+        its way through. ``output_schema`` is placed into the body as an object and never
+        touched, so a set or a cycle inside it reached ``json.dumps`` for the first time deep
+        inside the SDK -- past this boundary, where the failure is anonymous and *not*
+        config-recoverable, so the loop terminalized the run for what the gateway twin reports
+        as a recoverable bad request. ``allow_nan=False`` matches that twin too: the SDK's
+        encoder would otherwise emit the JSON-invalid literals ``NaN``/``Infinity`` onto the
+        wire. The string is discarded -- the SDK wants the object -- which costs one extra
+        encode per call, the same encode the gateway path already pays exactly once.
         """
 
         try:
-            return self._payload(request)
+            payload = self._payload(request)
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+            return payload
         except (TypeError, ValueError) as exc:
             raise ModelAdapterError(
                 f"model request is invalid or not JSON-serializable: {exc}",

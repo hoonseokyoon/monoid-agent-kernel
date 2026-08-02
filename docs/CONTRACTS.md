@@ -396,6 +396,13 @@ refusal. A malformed echo (a non-object `generation_applied`, a non-boolean `sch
 is a wire-shape error, not a policy question: it answers `gateway_bad_response` on both
 transports regardless of `on_unsupported`.
 
+The echo comparison is not Python equality. A requested **number is proven only by a number**:
+`True == 1` and `False == 0.0` in Python, so a plain dict comparison let a server answering
+JSON booleans prove the most ordinary settings this block carries (`max_output_tokens=1`,
+`top_p=1`, `temperature=0`). Numbers still compare across JSON's single numeric type — a
+non-Python gateway re-serializes `1.0` as `1`, and refusing that would be a false refusal —
+so `1` proves `1.0`, while `true` proves nothing.
+
 A server may only emit these proofs from what its **upstream adapter declares** (the
 `generation_support` / `structured_output_support` probes), never from what the request asked
 for: copying the requested block back would match exactly on the client and let `"fail"` accept
@@ -418,7 +425,13 @@ OpenAI's strict mode has subset requirements of its own — every object needs
 `additionalProperties: false`, every listed property must be `required`, and some keywords are
 unsupported. A schema outside that subset is rejected by the provider with an HTTP 400 whose
 classified error names the offending `param` (e.g. `text.format.schema`); the kernel never
-rewrites the schema to fit. Adapters without the declaration ignore the field, and post-hoc
+rewrites the schema to fit. "Never rewrites" includes ingress: unlike model content, a schema
+keeps its non-finite floats through `normalize_model_request` (substituting `NaN` → `null`
+would silently change `{"enum": [NaN]}` into a different constraint), so the value reaches the
+strict serializer both adapters run over the assembled request body and is refused there as a
+non-retryable, `config_recoverable` bad request (`gateway_bad_request` /
+`unserializable_request`) — the same answer either adapter gives any value that cannot be sent.
+Adapters without the declaration ignore the field, and post-hoc
 output validation remains the guarantee on every adapter: native delivery only reduces
 repairs. `AgentLoop` never sets the field; it belongs to standalone `ModelCallRunner` /
 `ValidatedCallRunner` callers.

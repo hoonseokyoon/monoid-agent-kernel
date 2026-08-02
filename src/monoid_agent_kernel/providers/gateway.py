@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
     loads_json_ingress,
     loads_model_envelope_json_ingress,
     loads_model_json_ingress,
@@ -790,6 +791,35 @@ def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> b
     )
 
 
+def _same_echoed_value(echoed: Any, requested: Any) -> bool:
+    """One requested knob against its echo, without Python's cross-type numeric equality.
+
+    ``==`` is not a proof test on a wire. Python compares ``True == 1`` and ``False == 0.0``,
+    so a server answering JSON booleans proved exactly the most ordinary settings this block
+    carries: ``max_output_tokens=1``, ``top_p=1``, ``temperature=0``. Every other read of this
+    wire already refuses that coercion (``_exact_gateway_bool``, ``_exact_gateway_int``, and
+    ``is_finite_json_number`` itself, which rejects ``bool`` and its subclasses); the proof
+    comparison was the one place it did not.
+
+    A number is proven only by a number -- but by a number of *either* JSON spelling: JSON has
+    one numeric type, so a gateway that is not Python re-serializes ``1.0`` as ``1``, and
+    demanding an exact Python type would invent a false refusal for every non-Python server.
+    Anything else must match by type and value, which is what a non-numeric future knob needs.
+    """
+
+    if is_finite_json_number(requested):
+        return is_finite_json_number(echoed) and echoed == requested
+    return type(echoed) is type(requested) and echoed == requested
+
+
+def _generation_echo_matches(applied: Any, requested: dict[str, Any]) -> bool:
+    """Whether the echo is the block this client sent -- same keys, same values, no coercion."""
+
+    if not isinstance(applied, dict) or set(applied) != set(requested):
+        return False
+    return all(_same_echoed_value(applied[key], value) for key, value in requested.items())
+
+
 def _check_generation_applied(
     requested: dict[str, Any],
     on_unsupported: str,
@@ -800,7 +830,8 @@ def _check_generation_applied(
     """Refuse a turn whose sampling parameters cannot be proven applied (scope §5 D-a).
 
     ``requested`` is the exact wire block this client sent; the server echoes the block it
-    forwarded upstream as ``generation_applied``. Equality is the proof. An absent echo is
+    forwarded upstream as ``generation_applied``. Matching it -- key for key, without numeric
+    coercion (see :func:`_same_echoed_value`) -- is the proof. An absent echo is
     indistinguishable from an older server that silently discarded the block -- precisely the
     deployment ``"fail"`` exists to catch -- so under the default policy it is an error, and
     ``"omit"`` is the documented way to accept a best-effort transport.
@@ -809,7 +840,7 @@ def _check_generation_applied(
     applied = _validated_generation_echo(applied, provider_retried=known_provider_retried)
     if not requested:
         return
-    if applied == requested:
+    if _generation_echo_matches(applied, requested):
         return
     if on_unsupported == "omit":
         return

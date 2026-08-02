@@ -571,3 +571,94 @@ def test_openai_payload_build_failures_are_classified_too(
     # fixing the value — not an anonymous "provider call failed (TypeError)".
     assert rejected.value.provider_error_code == "unserializable_request"
     assert rejected.value.config_recoverable is True
+
+
+# --- the schema is delivered verbatim, and refused at the serialization boundary ----------
+
+
+def test_a_non_finite_schema_value_survives_ingress_for_the_serializer() -> None:
+    """``output_schema`` is a control document promised verbatim, so ingress must not
+    *rewrite* it. ``normalize_json_ingress`` substitutes non-finite floats with ``None`` --
+    correct for model content, wrong for a schema: ``{"enum": [NaN]}`` became
+    ``{"enum": [null]}``, a different constraint the provider silently enforced, and the
+    strict serializer that exists to refuse the value never saw it."""
+
+    import math
+
+    config = ModelConfig(gateway_url="http://gateway.test")
+    normalized = normalize_model_request(_request(config, output_schema={"enum": [float("nan")]}))
+    assert math.isnan(normalized.output_schema["enum"][0])
+
+    # Strings and containers are still normalized -- only the substitution is dropped.
+    text = normalize_model_request(
+        _request(config, output_schema={"title": "a\ud800b", "any_of": ({"type": "string"},)})
+    )
+    assert text.output_schema["title"] == "a\ufffdb"
+    assert text.output_schema["any_of"] == [{"type": "string"}]
+
+    # ... and the boundary that was stepped over now refuses the value, classified.
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        GatewayModelAdapter(config=config).next_turn(normalized)
+    assert rejected.value.provider_error_code == GATEWAY_BAD_REQUEST
+    assert rejected.value.config_recoverable is True
+
+
+def test_openai_preflights_the_whole_payload_not_only_what_it_serializes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_payload`` embeds ``output_schema`` without serializing it, so the classifier saw
+    nothing: a set inside the schema failed later inside ``client.responses.create`` and the
+    outer handler named it an anonymous ``unclassified_provider_error`` with no
+    ``config_recoverable`` -- terminalizing the run for what the gateway twin reports as a
+    recoverable bad request. ``NaN`` was worse: it serialized to the JSON-invalid literal
+    ``NaN`` and went out to the provider."""
+
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = ModelConfig(provider="openai")
+    adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
+
+    for schema in ({"a": {1, 2}}, {"a": float("nan")}, {"a": float("inf")}):
+        with pytest.raises(ModelAdapterError) as rejected:
+            adapter.next_turn(_request(config, output_schema=schema))  # type: ignore[arg-type]
+        assert rejected.value.provider_error_code == "unserializable_request"
+        assert rejected.value.config_recoverable is True
+        assert rejected.value.retryable is False
+
+
+def test_the_openai_stream_preflights_the_same_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streamed twin of the preflight -- one helper, both call paths, or the rule is
+    bound on one transport only."""
+
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = ModelConfig(provider="openai")
+    adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
+
+    async def _drive() -> None:
+        async for _chunk in adapter.astream_turn(
+            _request(config, output_schema={"a": {1, 2}})  # type: ignore[arg-type]
+        ):
+            pass
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        asyncio.run(_drive())
+    assert rejected.value.provider_error_code == "unserializable_request"
+    assert rejected.value.config_recoverable is True
+
+
+def test_a_well_formed_schema_still_reaches_the_provider_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preflight must refuse only what cannot be sent: an ordinary schema still builds."""
+
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = ModelConfig(provider="openai")
+    adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
+    payload = adapter._classified_payload(_request(config, output_schema=_SCHEMA))
+    assert payload["text"]["format"]["schema"] == _SCHEMA

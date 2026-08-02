@@ -562,13 +562,13 @@ def test_not_applied_errors_are_config_recoverable_on_both_checks() -> None:
 # --- streaming enforcement without a terminal frame -------------------------------------
 
 
-def _terminal_frameless_adapter(monkeypatch: pytest.MonkeyPatch, config: ModelConfig) -> GatewayModelAdapter:
-    """A gateway whose SSE body ends cleanly after one delta — no ``turn_complete`` frame.
+def _sse_adapter(
+    monkeypatch: pytest.MonkeyPatch, config: ModelConfig, lines: list[str]
+) -> GatewayModelAdapter:
+    """A gateway adapter whose streamed body is exactly ``lines``.
 
-    This is the older/foreign-server shape ``assemble_streamed_turn`` tolerates by
-    synthesizing ``stop_reason="stop"``, so nothing downstream of the adapter can tell the
-    frame was missing. If the applied-parameter checks run only on the frame, this stream is
-    accepted with the parameters unproven while the sync twin refuses the same server.
+    One fake server for every streaming case here, so the frameless shape and the
+    terminal-frame shapes cannot drift into two differently-behaving doubles.
     """
 
     httpx = pytest.importorskip("httpx")
@@ -583,8 +583,8 @@ def _terminal_frameless_adapter(monkeypatch: pytest.MonkeyPatch, config: ModelCo
             return None
 
         async def aiter_lines(self):
-            yield 'data: {"type":"text_delta","text":"unproven answer"}'
-            yield ""
+            for line in lines:
+                yield line
 
     class _Client:
         def __init__(self, **_kwargs: object) -> None:
@@ -601,6 +601,22 @@ def _terminal_frameless_adapter(monkeypatch: pytest.MonkeyPatch, config: ModelCo
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     return GatewayModelAdapter(config=config)
+
+
+def _terminal_frameless_adapter(
+    monkeypatch: pytest.MonkeyPatch, config: ModelConfig
+) -> GatewayModelAdapter:
+    """A gateway whose SSE body ends cleanly after one delta — no ``turn_complete`` frame.
+
+    This is the older/foreign-server shape ``assemble_streamed_turn`` tolerates by
+    synthesizing ``stop_reason="stop"``, so nothing downstream of the adapter can tell the
+    frame was missing. If the applied-parameter checks run only on the frame, this stream is
+    accepted with the parameters unproven while the sync twin refuses the same server.
+    """
+
+    return _sse_adapter(
+        monkeypatch, config, ['data: {"type":"text_delta","text":"unproven answer"}', ""]
+    )
 
 
 def _drain(adapter: GatewayModelAdapter, request: ModelRequest) -> list:
@@ -741,3 +757,87 @@ def test_gateway_service_probes_the_config_the_call_runs_under() -> None:
     result = backend.handle_turn(_llm_token(manager), wire_fail)
     assert result["generation_applied"] == {"temperature": 0.2}
     assert result["schema_applied"] is True
+
+
+# --- a proof is not Python equality -----------------------------------------------------
+
+
+_BOOLEAN_SPOOFS = [
+    (GenerationConfig(max_output_tokens=1), {"max_output_tokens": True}),
+    (GenerationConfig(top_p=1), {"top_p": True}),
+    (GenerationConfig(temperature=0), {"temperature": False}),
+    (GenerationConfig(temperature=0.0), {"temperature": False}),
+]
+
+
+@pytest.mark.parametrize("generation,echo", _BOOLEAN_SPOOFS)
+def test_a_boolean_echo_never_proves_a_numeric_parameter(
+    generation: GenerationConfig, echo: dict
+) -> None:
+    """``True == 1`` and ``False == 0`` in Python, so comparing the echo dict with ``==``
+    let a gateway answering JSON booleans prove the most ordinary settings on this wire --
+    ``temperature=0``, ``top_p=1``, ``max_output_tokens=1``. Every other read of this wire
+    already refuses that coercion (``_exact_gateway_bool`` / ``_exact_gateway_int``); the
+    proof comparison was the one place it slipped through. A number is proven by a number."""
+
+    requested = build_generation_payload(generation)
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_generation_applied(requested, "fail", echo)
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+    assert rejected.value.config_recoverable is True
+    # "omit" still accepts best-effort transport — the policy half is untouched.
+    _check_generation_applied(requested, "omit", echo)
+
+
+def test_an_equal_number_of_the_other_json_type_still_proves() -> None:
+    """The defect is boolean coercion, not int-vs-float: a gateway that is not Python
+    re-serializes ``1.0`` as ``1`` (JSON has one number type), and refusing that would be a
+    new false refusal invented by the fix."""
+
+    _check_generation_applied({"top_p": 1.0}, "fail", {"top_p": 1})
+    _check_generation_applied({"max_output_tokens": 256}, "fail", {"max_output_tokens": 256.0})
+
+
+def test_a_boolean_echo_is_refused_on_the_sync_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(
+            _served_turn({"generation_applied": {"max_output_tokens": True}})
+        ),
+    )
+    config = ModelConfig(
+        generation=GenerationConfig(max_output_tokens=1), gateway_url="http://gateway.test"
+    )
+    with pytest.raises(ModelAdapterError) as rejected:
+        GatewayModelAdapter(config=config).next_turn(_request(config))
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+
+def test_a_boolean_echo_is_refused_on_the_streamed_terminal_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The twin transport: the same spoof riding ``turn_complete``. Either both refuse it or
+    the client's answer depends on which transport it happened to use."""
+
+    config = ModelConfig(
+        generation=GenerationConfig(max_output_tokens=1), gateway_url="http://gateway.test"
+    )
+    adapter = _sse_adapter(
+        monkeypatch,
+        config,
+        [
+            'data: {"type":"text_delta","text":"unproven answer"}',
+            "",
+            'data: {"type":"turn_complete","turn_handle":"t1",'
+            '"generation_applied":{"max_output_tokens":true}}',
+            "",
+        ],
+    )
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
