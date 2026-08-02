@@ -36,11 +36,6 @@ from monoid_agent_kernel.permissions import validate_internal_path_patterns
 from monoid_agent_kernel.providers.base import normalize_model_config
 
 _MODEL_PROVIDERS = frozenset({"fake", "gateway", "openai"})
-_REASONING_EFFORTS = frozenset(
-    {"default", "none", "minimal", "low", "medium", "high", "xhigh"}
-)
-_REASONING_SUMMARIES = frozenset({"off", "auto", "detailed"})
-_REASONING_FALLBACKS = frozenset({"fail", "omit"})
 _TOOL_EXPOSURES = frozenset({"immediate", "searchable", "hidden"})
 _TOOL_AUTHORIZATIONS = frozenset({"allow", "ask", "deny"})
 
@@ -180,13 +175,10 @@ def _normalize_model(model: ModelConfig | None) -> ModelConfig | None:
     normalized = normalize_model_config(model)
     assert normalized is not None
     _enum(normalized.provider, _MODEL_PROVIDERS, "model.provider")
-    _enum(normalized.reasoning.effort, _REASONING_EFFORTS, "model.reasoning.effort")
-    _enum(normalized.reasoning.summary, _REASONING_SUMMARIES, "model.reasoning.summary")
-    _enum(
-        normalized.reasoning.on_unsupported,
-        _REASONING_FALLBACKS,
-        "model.reasoning.on_unsupported",
-    )
+    # The reasoning enums are enforced inside normalize_model_config via
+    # validate_reasoning_config -- the same single rule source the JSON codec uses. The local
+    # frozensets this file used to re-declare were a third, hand-copied edition of that rule,
+    # one new ReasoningEffort value away from silently diverging.
     _integer_at_least(normalized.retry.max_attempts, 1, "model.retry.max_attempts")
     return normalized
 

@@ -9,7 +9,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from monoid_agent_kernel.core.spec import ModelConfig, validate_generation_config
+from monoid_agent_kernel.core.spec import (
+    ModelConfig,
+    validate_generation_config,
+    validate_reasoning_config,
+)
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -576,15 +580,11 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
 
     if config is None:
         return None
-    reasoning = _copy_with_fields(
-        config.reasoning,
-        effort=_normalize_required_text(config.reasoning.effort, "model.reasoning.effort"),
-        summary=_normalize_required_text(config.reasoning.summary, "model.reasoning.summary"),
-        on_unsupported=_normalize_required_text(
-            config.reasoning.on_unsupported,
-            "model.reasoning.on_unsupported",
-        ),
-    )
+    # validate_reasoning_config enforces the enum, so a passing value is already inside the
+    # portable ASCII domain -- same reasoning as the generation call below, same single rule
+    # source as the JSON codec. Per-field text normalization here accepted any non-empty
+    # string, leaving direct-Python reasoning the one construction route that failed open.
+    reasoning = validate_reasoning_config(config.reasoning)
     retry = _copy_with_fields(
         config.retry,
         max_attempts=_positive_control_int(config.retry.max_attempts, "model.retry.max_attempts"),

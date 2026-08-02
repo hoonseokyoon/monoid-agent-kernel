@@ -234,3 +234,44 @@ def test_runtime_config_ingress_rejects_non_generation_config_type() -> None:
 def test_validate_generation_config_requires_the_type() -> None:
     with pytest.raises(ValueError, match="model.generation must be a GenerationConfig"):
         validate_generation_config({"temperature": 0.5})  # type: ignore[arg-type]
+
+
+# --- the reasoning twin of direct-Python normalization --------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "field_name"),
+    [
+        (ReasoningConfig(effort="turbo"), "effort"),  # type: ignore[arg-type]
+        (ReasoningConfig(summary="verbose"), "summary"),  # type: ignore[arg-type]
+        (ReasoningConfig(on_unsupported="ignore"), "on_unsupported"),  # type: ignore[arg-type]
+    ],
+)
+def test_normalize_model_config_rejects_invalid_direct_reasoning(
+    reasoning: ReasoningConfig, field_name: str
+) -> None:
+    """The generation half of this function fails closed through validate_generation_config;
+    a direct-Python ReasoningConfig was the one construction route left open (the codec and
+    the gateway server both reject) — exactly the "retained and direct-Python controls fail
+    closed" contract, unbound on its twin."""
+
+    with pytest.raises(ValueError, match=f"model.reasoning.{field_name}"):
+        normalize_model_config(ModelConfig(reasoning=reasoning))
+
+
+def test_normalize_model_config_passes_valid_reasoning_through_unchanged() -> None:
+    config = ModelConfig(reasoning=ReasoningConfig(effort="low", summary="auto"))
+    normalized = normalize_model_config(config)
+    assert normalized is not None
+    assert normalized.reasoning == config.reasoning
+
+
+def test_validate_reasoning_config_is_the_single_rule_source() -> None:
+    from monoid_agent_kernel.core.spec import validate_reasoning_config
+
+    with pytest.raises(ValueError, match="model.reasoning.effort"):
+        validate_reasoning_config(ReasoningConfig(effort="turbo"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="model.reasoning must be a ReasoningConfig"):
+        validate_reasoning_config({"effort": "low"})  # type: ignore[arg-type]
+    valid = ReasoningConfig(effort="low", summary="auto", on_unsupported="omit")
+    assert validate_reasoning_config(valid) == valid

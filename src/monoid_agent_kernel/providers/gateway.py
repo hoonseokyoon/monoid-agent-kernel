@@ -510,6 +510,15 @@ class GatewayModelAdapter:
         reasoning_payload = build_reasoning_payload(config.reasoning)
         if config.reasoning.on_unsupported != "fail":
             reasoning_payload["on_unsupported"] = config.reasoning.on_unsupported
+        if config.reasoning.effort == "default":
+            # ``effort`` is the one reasoning field whose omission sentinel ("default") is not
+            # the codec's reconstruction default ("medium"): ``build_reasoning_payload`` leaves
+            # "default" off because a *provider* payload means "no effort key", but this block
+            # is a *config* the server rebuilds with ``ReasoningConfig.from_json``, where a
+            # missing effort reads back as "medium" -- so a client asking for the provider
+            # default silently got medium reasoning, only through a gateway. Carried
+            # explicitly, like the policy above; every other effort value already rides.
+            reasoning_payload["effort"] = "default"
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
         generation_payload = build_generation_payload(config.generation)

@@ -49,22 +49,12 @@ class ReasoningConfig:
         if not isinstance(payload, dict):
             raise ValueError("model reasoning config must be an object or null")
         defaults = cls()
-        return cls(
-            effort=_model_choice(
-                payload.get("effort", defaults.effort),
-                "model.reasoning.effort",
-                _REASONING_EFFORTS,
-            ),
-            summary=_model_choice(
-                payload.get("summary", defaults.summary),
-                "model.reasoning.summary",
-                _REASONING_SUMMARIES,
-            ),
-            on_unsupported=_model_choice(
-                payload.get("on_unsupported", defaults.on_unsupported),
-                "model.reasoning.on_unsupported",
-                _MODEL_FALLBACK_MODES,
-            ),
+        return validate_reasoning_config(
+            cls(
+                effort=payload.get("effort", defaults.effort),
+                summary=payload.get("summary", defaults.summary),
+                on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+            )
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -73,6 +63,28 @@ class ReasoningConfig:
             "summary": self.summary,
             "on_unsupported": self.on_unsupported,
         }
+
+
+def validate_reasoning_config(reasoning: ReasoningConfig) -> ReasoningConfig:
+    """Fail-closed check shared by the JSON codec and direct-Python normalization.
+
+    The reasoning twin of :func:`validate_generation_config`, and for the same reason: one
+    rule source for both ingresses, so a value accepted from JSON can never diverge from a
+    value accepted from a constructor. Before this existed, the codec and the gateway server
+    both rejected an unknown effort while a Python-constructed one sailed through
+    ``normalize_model_config`` to fail mid-run as a provider 400.
+    """
+
+    if not isinstance(reasoning, ReasoningConfig):
+        raise ValueError("model.reasoning must be a ReasoningConfig")
+    _model_choice(reasoning.effort, "model.reasoning.effort", _REASONING_EFFORTS)
+    _model_choice(reasoning.summary, "model.reasoning.summary", _REASONING_SUMMARIES)
+    _model_choice(
+        reasoning.on_unsupported,
+        "model.reasoning.on_unsupported",
+        _MODEL_FALLBACK_MODES,
+    )
+    return reasoning
 
 
 def _model_control_number(

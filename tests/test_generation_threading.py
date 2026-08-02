@@ -107,6 +107,26 @@ def test_gateway_payload_seals_the_reasoning_on_unsupported_drop() -> None:
     assert "on_unsupported" not in default_payload["reasoning"]
 
 
+def test_gateway_wire_carries_the_default_effort_sentinel() -> None:
+    """``effort="default"`` is the one reasoning field whose omission sentinel differs from
+    the codec's reconstruction default ("medium"): left off the wire, the server's rebuilt
+    config silently asked its upstream for medium reasoning on a call that asked for the
+    provider default. The client payload therefore carries it explicitly — and only it; every
+    other effort keeps its exact pre-W5 wire shape."""
+
+    config = ModelConfig(reasoning=ReasoningConfig(effort="default"))
+    payload = GatewayModelAdapter(config=config)._payload(_request(config))
+    assert payload["reasoning"] == {"effort": "default"}
+    # The server-side codec reads the block back as what the client meant.
+    assert ReasoningConfig.from_json(payload["reasoning"]).effort == "default"
+
+    default_config = ModelConfig()
+    default_payload = GatewayModelAdapter(config=default_config)._payload(
+        _request(default_config)
+    )
+    assert default_payload["reasoning"] == {"effort": "medium"}
+
+
 def test_gateway_payload_seals_the_generation_on_unsupported_drop() -> None:
     """The reasoning fix's twin. The server rebuilds a GenerationConfig from this block, so a
     field left off is not "unset" there -- it is the default, and a caller's "omit" came back
