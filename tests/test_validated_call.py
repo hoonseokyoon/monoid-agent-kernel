@@ -448,3 +448,223 @@ def test_a_single_attempt_still_streams_under_attempt_zero() -> None:
 
     assert asyncio.run(_drive()).status == "ok"
     assert seen == [(0, '{"a": 1}')]
+
+
+# --- a tool-call answer is a distinct outcome, not empty text ---------------------------
+
+
+def _read_tool():
+    from monoid_agent_kernel.tools.base import ToolSpec
+
+    return ToolSpec(
+        id="fs.read",
+        description="read",
+        input_schema={"type": "object"},
+        capability="fs.read",
+        side_effect="read",
+        handler=lambda *_a: None,
+    )
+
+
+def test_a_tool_call_turn_short_circuits_before_validation() -> None:
+    """A turn that stopped to call tools has no final answer to judge. Validating its empty
+    ``final_text`` burned a paid repair on rewriting an answer the model never gave, and the
+    repair conversation recorded ``{'role': 'assistant', 'content': ''}`` as what the model
+    said. The short-circuit precedes validation, exactly like refusal and truncation."""
+
+    from monoid_agent_kernel.providers.base import ToolCall
+
+    request = ModelRequest(instruction="answer", system_prompt="sys", tools=(_read_tool(),))
+    h = _harness(
+        [
+            ModelTurn(
+                final_text=None,
+                stop_reason="tool_calls",
+                tool_calls=(ToolCall(id="c1", name="fs.read", arguments={}),),
+            )
+        ],
+        request=request,
+    )
+    result = h.run()
+
+    assert result.status == "tool_calls"
+    assert result.turn.tool_calls
+    assert h.validator.calls == 0
+    assert result.repair_calls_used == 0
+    assert len(result.receipts) == 1
+
+
+def test_a_tool_call_turn_is_not_ok_even_with_no_validators() -> None:
+    """The zero-validator path returned ``"ok"`` with ``final_text=None`` for a turn that
+    was a tool request — a caller reading ``status == "ok"`` treated "the model asked for a
+    tool nobody will run" as a successful answer."""
+
+    from monoid_agent_kernel.providers.base import ToolCall
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text=None,
+                stop_reason="tool_calls",
+                tool_calls=(ToolCall(id="c1", name="fs.read", arguments={}),),
+            )
+        ]
+    )
+    runner = ValidatedCallRunner(runner=ModelCallRunner(adapter=adapter))
+    result = asyncio.run(
+        runner.acall(
+            ModelRequest(instruction="answer", system_prompt="sys", tools=(_read_tool(),))
+        )
+    )
+    assert result.status == "tool_calls"
+
+
+def test_a_tool_call_turn_without_the_stop_reason_still_short_circuits() -> None:
+    """The two signals are one rule: an adapter (a gateway with server-side tools, or a
+    misbehaving one) can return tool calls under ``stop_reason="stop"`` — the calls
+    themselves are the fact that matters."""
+
+    from monoid_agent_kernel.providers.base import ToolCall
+
+    request = ModelRequest(instruction="answer", system_prompt="sys", tools=())
+    h = _harness(
+        [
+            ModelTurn(
+                final_text="",
+                stop_reason="stop",
+                tool_calls=(ToolCall(id="c1", name="fs.read", arguments={}),),
+            )
+        ],
+        request=request,
+    )
+    result = h.run()
+    assert result.status == "tool_calls"
+    assert h.validator.calls == 0
+
+
+# --- receipts survive an exception ------------------------------------------------------
+
+
+def test_a_validator_defect_carries_the_receipts_of_every_call_made() -> None:
+    """The docstring promises the audit trail is complete whatever the outcome — a defect
+    raise that dropped the receipts made both paid calls unaccountable to the caller."""
+
+    class _DefectOnSecond:
+        id = "defective"
+        schema = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            self.calls += 1
+            if self.calls == 1:
+                return ValidationOutcome(ok=False, feedback="try again")
+            raise RuntimeError("validator defect")
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(final_text="prose", stop_reason="stop"),
+            ModelTurn(final_text="still prose", stop_reason="stop"),
+        ]
+    )
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter),
+        validators=(_DefectOnSecond(),),
+        max_repair_calls=2,
+    )
+    with pytest.raises(OutputValidatorError) as defect:
+        asyncio.run(runner.acall(ModelRequest(instruction="q", system_prompt="s", tools=())))
+    assert len(defect.value.receipts) == 2
+
+
+def test_receipts_ride_an_escaping_adapter_error() -> None:
+    """A repair call that fails at the boundary loses its own receipt to the adapter (it
+    rides ``ModelCallRunner.subscriptions`` only), but the completed calls' receipts must
+    not be lost with it."""
+
+    from monoid_agent_kernel.errors import ModelAdapterError
+
+    class _FailsOnSecond:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ModelTurn(final_text="prose", stop_reason="stop")
+            raise ModelAdapterError("boom", provider_error_code="gateway_network_error")
+
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=_FailsOnSecond()), validators=(_Validator(),)
+    )
+    with pytest.raises(ModelAdapterError) as failed:
+        asyncio.run(runner.acall(ModelRequest(instruction="q", system_prompt="s", tools=())))
+    assert len(getattr(failed.value, "receipts")) == 1
+
+
+# --- the repair request carries its conversation exactly one way ------------------------
+
+
+def test_a_by_value_repair_clears_the_carriage_fields_it_did_not_choose() -> None:
+    """The repair follows the shape of how the request carried its conversation — so the
+    fields of the shapes it did NOT choose must not ride along. A stale ``instruction`` on a
+    messages-shape repair invites a conforming adapter to re-inject the original question,
+    and both stale fields dirty the repair's ``request_digest``. Also the both-set
+    precedence pin: ``messages`` wins over a handle, exactly as the shipped adapters read
+    the original request."""
+
+    request = ModelRequest(
+        instruction="latest q",
+        system_prompt="sys",
+        tools=(),
+        messages=({"role": "user", "content": "q"},),
+        previous_turn_handle="resp_0",
+    )
+    h = _harness(
+        [
+            ModelTurn(final_text="prose", stop_reason="stop", response_id="resp_1"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    assert h.run().status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None and repair.messages[-2] == {
+        "role": "assistant",
+        "content": "prose",
+    }
+    assert repair.instruction is None
+    assert repair.previous_turn_handle is None
+
+
+def test_a_synthesized_repair_clears_the_instruction_it_absorbed() -> None:
+    request = ModelRequest(instruction="one shot q", system_prompt="sys", tools=())
+    h = _harness(
+        [
+            ModelTurn(final_text="prose", stop_reason="stop", response_id="resp_1"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    assert h.run().status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None
+    assert repair.messages[0] == {"role": "user", "content": "one shot q"}
+    assert repair.instruction is None
+    assert repair.previous_turn_handle is None
+
+
+def test_an_instructionless_one_shot_still_synthesizes_a_consistent_repair() -> None:
+    request = ModelRequest(instruction=None, system_prompt="sys", tools=())
+    h = _harness(
+        [
+            ModelTurn(final_text="prose", stop_reason="stop"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    assert h.run().status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None
+    assert repair.messages[0] == {"role": "user", "content": ""}

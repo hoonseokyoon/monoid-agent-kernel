@@ -38,7 +38,7 @@ from monoid_agent_kernel.core.output_validator import (
 from monoid_agent_kernel.model_call import DeltaConsumer, ModelCallRunner, ShouldAbort
 from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, ModelTurn
 
-ValidatedCallStatus = Literal["ok", "unsatisfied", "refusal", "truncated"]
+ValidatedCallStatus = Literal["ok", "unsatisfied", "refusal", "truncated", "tool_calls"]
 
 # The streaming consumer for a *validated* call, which is not one stream but one per attempt.
 # The attempt index (0 = the original call, 1 = the first repair) rides every chunk because a
@@ -55,10 +55,16 @@ class ValidatedCallResult:
     """What one validated call produced, across every model call it made.
 
     Exhaustion is a *result* (``status="unsatisfied"``), not an exception -- mirroring the
-    loop's ``limited`` settle. Refusal and truncation short-circuit **before** validation, so
-    a cut-off-but-parseable answer can never pass as success; both carry the turn so the
-    caller can inspect what arrived. ``receipts`` records the original call and every repair
-    call, in order: the audit trail is complete even when the outcome is not ``"ok"``.
+    loop's ``limited`` settle. Refusal, truncation, and a tool-call answer short-circuit
+    **before** validation: a cut-off-but-parseable answer can never pass as success, and a
+    turn that stopped to request tools has no final answer to judge -- this surface has no
+    executor, so ``status="tool_calls"`` hands the turn (calls included) back to the caller
+    instead of validating its empty text. All three carry the turn so the caller can inspect
+    what arrived. ``receipts`` records the original call and every repair call, in order: the
+    audit trail is complete even when the outcome is not ``"ok"``, and an exception escaping
+    :meth:`ValidatedCallRunner.acall` carries the completed calls' receipts as its
+    ``receipts`` attribute (the failing call's own receipt reaches only
+    ``ModelCallRunner.subscriptions`` -- the adapter raised instead of returning it).
 
     ``repair_calls_used < max_repair_calls`` on an ``"unsatisfied"`` result means the budget was
     not the limit: the answer was unrepairable without repairing against a different
@@ -120,6 +126,37 @@ class ValidatedCallRunner:
     ) -> ValidatedCallResult:
         receipts: list[ModelCallReceipt] = []
         history: list[dict[str, Any]] = []
+        try:
+            return await self._acall_attempts(
+                request,
+                receipts,
+                history,
+                context=context,
+                deadline=deadline,
+                should_abort=should_abort,
+                delta_consumer=delta_consumer,
+            )
+        except BaseException as exc:
+            # Receipts of completed calls must survive the exception: the result carries them
+            # on every settled outcome, and an escaping ``OutputValidatorError`` /
+            # ``ModelAdapterError`` / boundary error otherwise discarded calls the caller
+            # already paid for. Same guarded attribute-stamp pattern as
+            # ``mark_provider_retried`` -- an exception that refuses the attribute simply
+            # carries none rather than replacing the failure.
+            _stamp_receipts(exc, tuple(receipts))
+            raise
+
+    async def _acall_attempts(
+        self,
+        request: ModelRequest,
+        receipts: list[ModelCallReceipt],
+        history: list[dict[str, Any]],
+        *,
+        context: InvocationContext | None,
+        deadline: float | None,
+        should_abort: ShouldAbort | None,
+        delta_consumer: AttemptDeltaConsumer | None,
+    ) -> ValidatedCallResult:
         repair_calls = 0
         current = request
         while True:
@@ -155,6 +192,15 @@ class ValidatedCallRunner:
                 return _result("refusal")
             if turn.stop_reason == "length":
                 return _result("truncated")
+            # A tool-call answer is a distinct outcome, not empty text. This surface has no
+            # executor, so there is nothing to do with the calls except hand them back --
+            # validating ``final_text or ""`` judged an answer the model never gave, burned a
+            # paid repair rewriting it, and recorded an empty assistant message as what the
+            # model said (with zero validators it read as a successful ``"ok"``). Both
+            # signals are one rule: the calls themselves matter even under a stop_reason a
+            # misbehaving adapter or a server-side-tools gateway got wrong.
+            if turn.tool_calls or turn.stop_reason == "tool_calls":
+                return _result("tool_calls")
             if not self.validators:
                 return _result("ok")
 
@@ -259,6 +305,23 @@ def _parsed_output(request: ModelRequest, turn: ModelTurn) -> tuple[bool, Any]:
         return False, None
 
 
+def _stamp_receipts(
+    error: BaseException, receipts: tuple[ModelCallReceipt, ...]
+) -> None:
+    """Attach the completed calls' receipts to an escaping exception, best-effort.
+
+    The guarded-setattr pattern of ``mark_provider_retried``: an exception type that refuses
+    the attribute (``__slots__``) simply carries no receipts rather than replacing the
+    provider's failure with an ``AttributeError``. ``OutputValidatorError`` declares the
+    attribute so its carriage is part of the type's contract; everything else gets it stamped.
+    """
+
+    try:
+        error.receipts = receipts  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
 def _attempt_scoped(
     consumer: AttemptDeltaConsumer | None, attempt: int
 ) -> DeltaConsumer | None:
@@ -307,11 +370,19 @@ def _repair_request(
     question.
     """
 
+    # Each branch carries the conversation exactly one way and clears the other shapes'
+    # carriage fields. The shipped adapters would ignore the extras (``messages`` is read
+    # first), but the contract never forbids a conforming adapter from *also* reading
+    # ``instruction`` on the by-value shape -- a stale one would re-inject the original
+    # question -- and every stale field is hashed into the repair's ``request_digest``,
+    # making the replay key describe a request no adapter sends.
     if request.messages is not None:
         return replace(
             request,
             tools=(),
             observations=(),
+            instruction=None,
+            previous_turn_handle=None,
             messages=(
                 *request.messages,
                 {"role": "assistant", "content": turn.final_text or ""},
@@ -332,6 +403,8 @@ def _repair_request(
         request,
         tools=(),
         observations=(),
+        instruction=None,
+        previous_turn_handle=None,
         messages=(
             {"role": "user", "content": request.instruction or ""},
             {"role": "assistant", "content": turn.final_text or ""},

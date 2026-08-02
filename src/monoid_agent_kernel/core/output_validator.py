@@ -122,9 +122,15 @@ class OutputValidatorError(NativeAgentError):
 
     The model cannot fix a validator bug, so the run terminalizes rather than re-prompting; the
     exception text is recorded but never fed back to the model.
+
+    ``receipts`` carries the completed model calls' receipts when the standalone validated
+    call raises this (the loop accounts for usage per call as it goes, so its raises leave the
+    default). Without it, a defect on attempt N discarded the receipts of every call the
+    caller had already paid for.
     """
 
     error_code = "output_validator_error"
+    receipts: tuple[Any, ...] = ()
 
 
 def run_output_validators(
