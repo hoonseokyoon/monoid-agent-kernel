@@ -41,6 +41,7 @@ MODEL_CONTENT_SCHEMA_VERSION = namespaced_id("model-content.v1")
 MODEL_CONTENT_FILENAME = "model-content.jsonl"
 DEFAULT_MODEL_CONTENT_BATCH_INTERVAL_S = 0.25
 DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
+_WINDOWS_REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
@@ -757,6 +758,18 @@ def _model_content_registry_key(path: Path) -> str:
 
 
 def _model_content_file_path(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        metadata = None
+    is_reparse_point = bool(
+        metadata is not None
+        and getattr(metadata, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT_ATTRIBUTE
+    )
+    if metadata is not None and stat.S_ISDIR(metadata.st_mode) and not is_reparse_point:
+        # A valid run id can equal the reserved sidecar basename. Prefer the existing filesystem
+        # type over the lexical shortcut, without following a planted symlink or Windows junction.
+        return path / MODEL_CONTENT_FILENAME
     if os.path.normcase(path.name) != os.path.normcase(MODEL_CONTENT_FILENAME):
         return path / MODEL_CONTENT_FILENAME
     return path

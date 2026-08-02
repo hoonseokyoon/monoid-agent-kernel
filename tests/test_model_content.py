@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import stat
 import threading
 import time
 import weakref
@@ -12,6 +13,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core.model_content import (
+    MODEL_CONTENT_FILENAME,
     MODEL_CONTENT_SCHEMA_VERSION,
     ActiveModelContentState,
     ModelContentStore,
@@ -21,6 +23,7 @@ from monoid_agent_kernel.core.model_content import (
     model_content_file_identity,
     read_model_content,
     watch_active_model_content,
+    _model_content_file_path,
 )
 from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.core.model_stream import (
@@ -556,6 +559,67 @@ def test_reader_accepts_a_run_directory_whose_name_ends_in_jsonl(tmp_path: Path)
     result = read_model_content(run_dir)
 
     assert result.snapshots[0].best_output_text == "recovered"
+
+
+def test_reserved_sidecar_basename_can_be_a_run_directory(tmp_path: Path) -> None:
+    run_dir = tmp_path / MODEL_CONTENT_FILENAME
+    run_dir.mkdir()
+    path = run_dir / MODEL_CONTENT_FILENAME
+    with watch_active_model_content(run_dir) as watch:
+        store = ModelContentStore(
+            path,
+            run_id=MODEL_CONTENT_FILENAME,
+            batch_interval_s=60.0,
+        )
+        writer = store.open(_context(run_id=MODEL_CONTENT_FILENAME))
+        writer.push(ModelStreamDelta("output", "persisted"))
+        writer.push(ModelStreamDelta("output", " buffered tail"))
+
+        assert active_model_content_stream_ids(run_dir) == frozenset({"stream-1"})
+        assert flush_active_model_content(run_dir) == 1
+        assert model_content_file_identity(run_dir, allow_missing=False) == (
+            model_content_file_identity(path, allow_missing=False)
+        )
+        writer.close(ModelStreamOutcome("completed", final_text="persisted buffered tail"))
+        store.close()
+        assert watch.changed
+
+    result = read_model_content(run_dir)
+
+    assert result.snapshots[0].best_output_text == "persisted buffered tail"
+
+
+def test_reserved_sidecar_basename_directory_symlink_is_not_followed(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside-run"
+    outside_path = outside_dir / MODEL_CONTENT_FILENAME
+    store = ModelContentStore(outside_path, run_id="outside-run")
+    writer = store.open(_context(run_id="outside-run"))
+    writer.push(ModelStreamDelta("output", "outside private text"))
+    writer.close(ModelStreamOutcome("completed", final_text="outside private text"))
+    store.close()
+
+    link = tmp_path / MODEL_CONTENT_FILENAME
+    try:
+        link.symlink_to(outside_dir, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    assert read_model_content(link).snapshots == ()
+    assert flush_active_model_content(link) == 0
+
+
+def test_reserved_sidecar_basename_windows_junction_is_not_treated_as_run_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DirectoryReparseMetadata:
+        st_mode = stat.S_IFDIR
+        st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+
+    path = tmp_path / MODEL_CONTENT_FILENAME
+    monkeypatch.setattr(Path, "lstat", lambda _path: DirectoryReparseMetadata())
+
+    assert _model_content_file_path(path) == path
 
 
 def test_reader_skips_schema_invalid_stream_metadata(tmp_path: Path) -> None:
