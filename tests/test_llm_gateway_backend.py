@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from pathlib import Path
 from urllib.error import HTTPError
@@ -153,10 +154,14 @@ def test_llm_gateway_python_boundary_normalizes_request_and_response_values() ->
     result = gateway.handle_turn(_llm_token(manager), payload)
 
     assert seen_requests[0].instruction == "prompt�"
-    assert seen_requests[0].tools[0].input_schema["example"] == {
-        "text": "�",
-        "number": None,
-    }
+    # The schema's *strings* are repaired like any other; its non-finite number is not
+    # substituted. A tool schema is a control document the request promises to forward
+    # verbatim -- rewriting `-inf` to `null` would hand the upstream provider a different
+    # constraint than the caller wrote -- so the value survives to the strict serializer,
+    # which refuses the request there (see tests/test_tool_schema_delivery.py).
+    forwarded_schema = seen_requests[0].tools[0].input_schema["example"]
+    assert forwarded_schema["text"] == "�"
+    assert math.isinf(forwarded_schema["number"]) and forwarded_schema["number"] < 0
     assert result["final_text"] == "done�"
     assert result["tool_calls"] == [
         {"call_id": "call�", "name": "tool�", "arguments": {"text": "�", "number": None}}

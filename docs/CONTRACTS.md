@@ -449,6 +449,15 @@ would silently change `{"enum": [NaN]}` into a different constraint), so the val
 strict serializer both adapters run over the assembled request body and is refused there as a
 non-retryable, `config_recoverable` bad request (`gateway_bad_request` /
 `unserializable_request`) — the same answer either adapter gives any value that cannot be sent.
+**The same rule governs a tool's `input_schema`** (`normalize_tool_spec`, and the reference
+gateway's server-side ingress over the `tools` it forwards): that schema is both the constraint
+the registry validates calls against and the definition the provider is sent, so it is delivered
+as its author wrote it or refused — never quietly changed. Strings and containers are still
+normalized on both schemas; only the substitution is dropped. A **record** of a schema is a
+different boundary and keeps the substitution, because portable JSON cannot carry the value at
+all: the run manifest, the transcript's tool-surface snapshot, and the event log store `null`
+there, so a schema no provider will accept fails the calls it rides on rather than the run's
+durability.
 Adapters without the declaration ignore the field, and post-hoc
 output validation remains the guarantee on every adapter: native delivery only reduces
 repairs. `AgentLoop` never sets the field; it belongs to standalone `ModelCallRunner` /

@@ -211,7 +211,16 @@ def normalize_tool_spec(spec: ToolSpec) -> ToolSpec:
         spec,
         id=_required_text(spec.id, "tool id"),
         description=_required_text(spec.description, "tool description"),
-        input_schema=normalize_json_ingress(spec.input_schema),
+        # Strings and containers are normalized; non-finite floats are deliberately NOT
+        # substituted -- the same rule ``normalize_model_request`` applies to ``output_schema``,
+        # for the same reason. A tool's ``input_schema`` is a control document, not model
+        # content: the registry builds its ``Draft202012Validator`` from this copy and the
+        # provider is sent this copy, so substituting rewrote ``{"enum": [NaN]}`` into
+        # ``{"enum": [null]}`` -- a different constraint, silently validated against and
+        # silently enforced -- while the strict serializer that exists to refuse the value
+        # (``allow_nan=False``, on both adapters) never got to see it. Left in place, the
+        # request is refused at that boundary as the config-recoverable bad request it is.
+        input_schema=normalize_json_ingress(spec.input_schema, substitute_nonfinite=False),
         capability=_required_text(spec.capability, "tool capability"),
         side_effect=_required_text(spec.side_effect, "tool side_effect"),
         provider_name=_optional_text(spec.provider_name, "tool provider_name"),

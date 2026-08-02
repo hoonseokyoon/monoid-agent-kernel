@@ -103,6 +103,19 @@ out in commit messages and here.
   through the same `is_finite_json_number` rule the rest of this wire reads with), while
   still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
   `1.0` is not falsely refused.
+- **A tool's `input_schema` is not rewritten by ingress either.** The `output_schema` rule
+  below was bound on one of the two schemas this request carries. `normalize_tool_spec`
+  substituted non-finite floats with `null`, so `{"enum": [NaN]}` became `{"enum": [null]}` —
+  the constraint the registry's `Draft202012Validator` then judged every call against and the
+  definition the provider was then sent, neither being what the tool author wrote. The value
+  now survives ingress (strings and containers are still normalized) and is refused at the
+  serialization boundary as a non-retryable, `config_recoverable` bad request, on both
+  adapters and both transports. The reference gateway's server-side ingress carried the same
+  defect for the `tools` it forwards (under either wire spelling, `input_schema` or
+  `parameters`) and is bound the same way, on `handle_turn` and `handle_turn_stream` alike.
+  A *record* of a schema keeps the substitution — the manifest, the transcript's tool-surface
+  snapshot and the event log cannot carry a non-finite value at all — so such a schema fails
+  the call it rides on, classified, instead of killing the run at a durability writer.
 - **`output_schema` is not rewritten by ingress.** `normalize_model_request` substituted
   non-finite floats with `null` — right for model content, wrong for a control document
   promised verbatim: `{"enum": [NaN]}` became `{"enum": [null]}`, a different constraint the
