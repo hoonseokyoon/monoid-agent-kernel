@@ -103,6 +103,20 @@ out in commit messages and here.
   through the same `is_finite_json_number` rule the rest of this wire reads with), while
   still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
   `1.0` is not falsely refused.
+- **The OpenAI adapter refuses the by-reference shape instead of sending an unusable one.**
+  `OpenAIModelAdapter` sets `store=False` on every request (zero data retention, paired with
+  `include=["reasoning.encrypted_content"]`) and still emitted `previous_response_id` when a
+  request carried `previous_turn_handle` — a handle naming a response the adapter guaranteed was
+  never persisted. One of `ModelRequest`'s three documented shapes was therefore dead on this
+  adapter, and said so only as an opaque provider 404 at call time, on the original call and not
+  merely on a validation repair. It is now refused at the adapter boundary with a non-retryable,
+  `config_recoverable` `unsupported_request_shape` naming `messages` as the supported route, on
+  `next_turn` and `astream_turn` alike; the unreachable branch (and its observation-item helper)
+  is deleted. The refusal is bound to the *shape*, not to the field: `messages` still overrides a
+  leftover handle, exactly as documented. The reference gateway's own by-reference continuation
+  inherits it when its upstream is this adapter — as a classified `422` the outer client survives
+  rather than an opaque 404 — while gateway by-reference support for upstreams that really do
+  persist responses is untouched.
 - **A tool's `input_schema` is not rewritten by ingress either.** The `output_schema` rule
   below was bound on one of the two schemas this request carries. `normalize_tool_spec`
   substituted non-finite floats with `null`, so `{"enum": [NaN]}` became `{"enum": [null]}` —

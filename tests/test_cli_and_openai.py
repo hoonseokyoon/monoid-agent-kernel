@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -291,6 +292,109 @@ def test_openai_payload_sets_zdr_store_and_include() -> None:
     assert payload["store"] is False
     assert payload["include"] == ["reasoning.encrypted_content"]
     assert "previous_response_id" not in payload
+
+
+def test_openai_refuses_the_by_reference_shape_under_zdr() -> None:
+    """``store=False`` above and ``previous_response_id`` are contradictory in one adapter: no
+    response is ever persisted, so a handle naming one can never resolve. The shape was emitted
+    anyway and failed as an opaque provider 404 at call time -- on the *original* call, not
+    merely on a validation repair. It is refused at the adapter boundary instead, classified
+    the same way every other config-shaped refusal here is, and the message names the supported
+    route."""
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    request = ModelRequest(
+        instruction=None,
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_1",
+    )
+
+    with pytest.raises(ModelAdapterError) as refused:
+        adapter._payload(request)
+
+    assert refused.value.provider_error_code == "unsupported_request_shape"
+    assert refused.value.retryable is False
+    assert refused.value.config_recoverable is True
+    assert "messages" in str(refused.value)
+
+
+def test_the_by_reference_refusal_fires_on_both_openai_entry_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``next_turn`` and ``astream_turn`` are the adapter's only two entry points and both
+    build their body through ``_classified_payload`` -> ``_payload``; the refusal must reach
+    the caller unchanged through each (``ModelAdapterError`` is outside the
+    ``TypeError``/``ValueError``/``RecursionError`` family that classifier converts)."""
+
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), allow_direct_provider_api=True)
+    request = ModelRequest(
+        instruction="follow up",
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_1",
+    )
+
+    with pytest.raises(ModelAdapterError) as blocking:
+        adapter.next_turn(request)
+    assert blocking.value.provider_error_code == "unsupported_request_shape"
+    assert blocking.value.config_recoverable is True
+
+    async def _drive() -> None:
+        async for _chunk in adapter.astream_turn(request):
+            pass
+
+    with pytest.raises(ModelAdapterError) as streamed:
+        asyncio.run(_drive())
+    assert streamed.value.provider_error_code == "unsupported_request_shape"
+    assert streamed.value.config_recoverable is True
+
+
+def test_a_stale_handle_beside_by_value_messages_is_not_refused() -> None:
+    """The refusal is bound to the *shape*, not to the field: ``messages`` overrides the handle
+    path (documented, and both adapters select on ``messages is not None``), and the loop does
+    hand a by-value request a leftover handle. Refusing on the field alone would have killed
+    the ordinary production path."""
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    payload = adapter._payload(
+        ModelRequest(
+            instruction=None,
+            system_prompt="sys",
+            tools=(),
+            previous_turn_handle="stale-handle",
+            messages=({"role": "user", "content": "hi"},),
+        )
+    )
+
+    assert payload["input"] == [{"role": "user", "content": "hi"}]
+    assert "previous_response_id" not in payload
+
+
+def test_the_gateway_maps_the_by_reference_refusal_to_a_bad_request() -> None:
+    """Blast radius: the reference gateway's own by-reference continuation maps its opaque
+    turn_handle to a stored provider response id and passes it upstream, so with the default
+    OpenAI upstream that continuation now inherits this refusal. That is the coherent outcome
+    -- a classified 422 the outer client survives, instead of the opaque provider 404 it used
+    to become. Gateway by-reference support itself is untouched: an upstream that *does* keep
+    responses still continues by handle."""
+
+    from monoid_agent_kernel.reference.llm_gateway.http import _model_error_status
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    with pytest.raises(ModelAdapterError) as refused:
+        adapter._payload(
+            ModelRequest(
+                instruction=None,
+                system_prompt="sys",
+                tools=(),
+                previous_turn_handle="provider_response_1",
+            )
+        )
+
+    assert _model_error_status(refused.value) == HTTPStatus.UNPROCESSABLE_ENTITY
 
 
 def test_openai_parse_captures_reasoning_subsequence_verbatim() -> None:

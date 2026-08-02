@@ -571,25 +571,25 @@ def test_openai_payload_build_failures_are_classified_too(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The OpenAI twin: ``_payload`` ran outside the classifier ``try`` whose own comment
-    says unclassified exceptions terminalize the run -- an unserializable observation
-    escaped as a raw ``TypeError`` before the classifier could see anything."""
+    says unclassified exceptions terminalize the run -- an unserializable tool result
+    escaped as a raw ``TypeError`` before the classifier could see anything.
+
+    Carried by the by-value ``messages`` log, which is where a tool result travels on this
+    adapter: the by-reference shape it used to ride is refused outright under ZDR."""
 
     pytest.importorskip("openai")
-    from monoid_agent_kernel.providers.base import ToolObservation
 
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     config = ModelConfig(provider="openai")
     adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
     request = ModelRequest(
-        instruction="go",
+        instruction=None,
         system_prompt="sys",
         tools=(),
         model=config,
-        previous_turn_handle="resp_1",
-        observations=(
-            ToolObservation(
-                call_id="c1", tool_name="fs.read", output={"bytes": {1, 2}}
-            ),
+        messages=(
+            {"role": "user", "content": "go"},
+            {"role": "tool", "call_id": "c1", "content": {"bytes": {1, 2}}},
         ),
     )
     with pytest.raises(ModelAdapterError) as rejected:
