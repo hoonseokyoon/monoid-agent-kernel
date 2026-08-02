@@ -77,7 +77,10 @@ out in commit messages and here.
   loop decides them; a validator defect raises `OutputValidatorError` and never re-prompts.
   `ValidatedCallResult` carries the receipts of every call made, so the audit trail is complete
   whatever the outcome. A thin sync facade (`call`) covers callers with no event loop and
-  refuses to run inside an active one.
+  refuses to run inside an active one. `max_repair_calls` must be an exact non-negative `int`,
+  like every other budget control in the kernel — the loop bound is `repair_calls >= budget`,
+  which `nan` makes permanently false and `inf` never reaches, so a budget arriving from
+  dynamically typed configuration must not be able to authorize unbounded paid model calls.
 - **A repair call never carries tools.** The standalone surface has no tool executor, and a
   validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
   deliberately a full agent turn; here it is deliberately not. Repair follows the request's own
@@ -125,9 +128,14 @@ out in commit messages and here.
   `gateway_bad_response` on either transport whatever the policy says, and the rejection
   carries this client's own retry evidence (`provider_retried`) since no turn is returned to
   carry it.
-- The gateway wire also carries `reasoning.on_unsupported` now (off-default only). The server
-  used to rebuild its `ReasoningConfig` without the field, silently resetting a client's
-  `"omit"` to `"fail"` on the server's copy.
+- The gateway wire also carries `reasoning.on_unsupported` and `generation.on_unsupported` now
+  (off-default only). The server rebuilds a config object from each block, so a field left off
+  is not "unset" there but the *default*: a client's `"omit"` came back as `"fail"` on the
+  server's copy. That becomes a live failure as soon as a gateway's upstream is another
+  gateway — the next hop enforces the reset policy and rejects a turn the caller asked to
+  accept best-effort — and it hits `output_schema` callers too, since the same knob gates the
+  schema echo. The applied-echo comparison is untouched: it is built from
+  `build_generation_payload`, which carries provider knobs only, never policy.
 - `TurnComplete` gains an optional `generation_applied` field so the streamed echo has a place
   to ride; absent means the wire never mentioned it.
 

@@ -93,8 +93,15 @@ class ValidatedCallRunner:
     max_repair_calls: int = 1
 
     def __post_init__(self) -> None:
-        if self.max_repair_calls < 0:
-            raise ValueError("max_repair_calls must not be negative")
+        # Exact int, like every other budget control in the kernel (``RunLimits``,
+        # ``ModelRetryConfig.max_attempts``). ``< 0`` alone let three shapes through from
+        # dynamically typed configuration, and the loop bound is ``repair_calls >= budget``:
+        # ``nan`` makes that comparison permanently false and ``inf`` never reaches it, so an
+        # unbounded sequence of *paid* model calls follows from one bad config value. A float
+        # like 1.5 quietly rounds the stated bound up, and ``True`` is 1 by accident rather
+        # than by intent. A budget is a count.
+        if type(self.max_repair_calls) is not int or self.max_repair_calls < 0:
+            raise ValueError("max_repair_calls must be a non-negative integer")
 
     async def acall(
         self,

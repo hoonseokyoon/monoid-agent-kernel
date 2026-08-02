@@ -449,15 +449,22 @@ class GatewayModelAdapter:
             "system_prompt": request.system_prompt,
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],
         }
+        # Both blocks carry their off-default ``on_unsupported``, for one reason: the server
+        # rebuilds a config object from this wire block, and a field left off is not "unset"
+        # there -- it is the *default*, so a caller's "omit" silently became "fail" on the
+        # server's copy. That matters as soon as a gateway's upstream is another gateway: the
+        # next hop enforces the reset policy and rejects a turn the caller asked to accept
+        # best-effort. Emitted only off-default, so default configs keep their exact wire shape.
+        # ``build_*_payload`` deliberately does not carry policy -- those dicts are also the
+        # applied-echo comparison, which is about provider knobs only.
         reasoning_payload = build_reasoning_payload(config.reasoning)
-        # The server rebuilds a ReasoningConfig from this wire object; leaving the field off
-        # silently reset it to "fail" on the server's copy (the drop flagged in the W5
-        # pre-investigation). Emitted only off-default so default configs keep their wire shape.
         if config.reasoning.on_unsupported != "fail":
             reasoning_payload["on_unsupported"] = config.reasoning.on_unsupported
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
         generation_payload = build_generation_payload(config.generation)
+        if config.generation.on_unsupported != "fail":
+            generation_payload["on_unsupported"] = config.generation.on_unsupported
         if generation_payload:
             payload["generation"] = generation_payload
         if request.output_schema is not None:

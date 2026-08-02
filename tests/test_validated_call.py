@@ -249,11 +249,35 @@ def test_no_validators_means_plain_dispatch() -> None:
     assert len(result.receipts) == 1
 
 
-def test_negative_budget_is_rejected_at_construction() -> None:
+@pytest.mark.parametrize(
+    "budget",
+    [
+        -1,
+        float("nan"),  # ``repair_calls >= nan`` is never true: unbounded paid repair calls
+        float("inf"),  # never reached either
+        1.5,  # a fractional budget rounds the stated bound up
+        True,  # an int by accident, not by intent
+        "1",
+        None,
+    ],
+)
+def test_only_an_exact_non_negative_int_budget_is_accepted(budget: object) -> None:
+    """A budget is a count. Everything here reached the loop bound from dynamically typed
+    configuration, and two of them made it permanently unsatisfiable."""
+
     with pytest.raises(ValueError, match="max_repair_calls"):
         ValidatedCallRunner(
-            runner=ModelCallRunner(adapter=FakeModelAdapter()), max_repair_calls=-1
+            runner=ModelCallRunner(adapter=FakeModelAdapter()),
+            max_repair_calls=budget,  # type: ignore[arg-type]
         )
+
+
+def test_zero_and_positive_int_budgets_are_still_accepted() -> None:
+    for budget in (0, 1, 7):
+        runner = ValidatedCallRunner(
+            runner=ModelCallRunner(adapter=FakeModelAdapter()), max_repair_calls=budget
+        )
+        assert runner.max_repair_calls == budget
 
 
 # --- a repair must not silently change which conversation is being repaired --------------

@@ -100,6 +100,49 @@ def test_gateway_payload_seals_the_reasoning_on_unsupported_drop() -> None:
     assert "on_unsupported" not in default_payload["reasoning"]
 
 
+def test_gateway_payload_seals_the_generation_on_unsupported_drop() -> None:
+    """The reasoning fix's twin. The server rebuilds a GenerationConfig from this block, so a
+    field left off is not "unset" there -- it is the default, and a caller's "omit" came back
+    as "fail". It matters as soon as a gateway's upstream is another gateway: the next hop
+    enforces the reset policy and rejects a turn the caller asked to accept best-effort. The
+    same knob gates the schema echo, so schema callers are reset too."""
+
+    config = ModelConfig(
+        generation=GenerationConfig(temperature=0.2, on_unsupported="omit"),
+    )
+    payload = GatewayModelAdapter(config=config)._payload(_request(config))
+    assert payload["generation"] == {"temperature": 0.2, "on_unsupported": "omit"}
+
+    default = ModelConfig(generation=GenerationConfig(temperature=0.2))
+    default_payload = GatewayModelAdapter(config=default)._payload(_request(default))
+    assert "on_unsupported" not in default_payload["generation"]
+
+    # Policy alone is still an explicit configuration -- it must survive even with no sampling
+    # values, because that is exactly the shape an output_schema-only caller sends.
+    policy_only = ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+    policy_payload = GatewayModelAdapter(config=policy_only)._payload(_request(policy_only))
+    assert policy_payload["generation"] == {"on_unsupported": "omit"}
+
+
+def test_gateway_server_reconstructs_the_caller_policy_from_the_wire() -> None:
+    """End of the hop: what the client seals must be what the server rebuilds, or the fix is
+    only half a wire."""
+
+    backend, manager, captured = _recording_backend()
+    config = ModelConfig(generation=GenerationConfig(temperature=0.2, on_unsupported="omit"))
+    wire = GatewayModelAdapter(config=config)._payload(_request(config))
+
+    backend.handle_turn(_llm_token(manager), _turn_payload(generation=wire["generation"]))
+    assert captured[0].generation == GenerationConfig(temperature=0.2, on_unsupported="omit")
+
+    policy_only = ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+    policy_wire = GatewayModelAdapter(config=policy_only)._payload(_request(policy_only))
+    backend.handle_turn(
+        _llm_token(manager), _turn_payload(generation=policy_wire["generation"])
+    )
+    assert captured[1].generation.on_unsupported == "omit"
+
+
 def test_check_generation_applied_matrix() -> None:
     # No generation requested: transport owes no proof, any echo state passes.
     _check_generation_applied({}, "fail", None)

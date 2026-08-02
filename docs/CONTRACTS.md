@@ -1340,9 +1340,12 @@ bindings.
 
 `generation` and `output_schema` are additive and present only when configured — traffic that
 configures neither keeps its exact pre-existing request shape, and the protocol identifier is
-unchanged. `generation` carries only the set sampling values (`on_unsupported` is client
-policy and stays off the wire); `reasoning` additionally carries `on_unsupported` when it is
-off-default, so the server's reconstructed `ReasoningConfig` cannot silently reset it. The
+unchanged. Both `generation` and `reasoning` carry their `on_unsupported` when it is
+off-default: the server rebuilds a config object from the block, so a field left off is not
+"unset" there but the *default*, and a caller's `"omit"` would come back as `"fail"` on the
+server's copy — which the next hop then enforces when a gateway's upstream is another gateway.
+The applied-echo comparison is unaffected: it is built from `build_generation_payload`, which
+carries provider knobs only, never policy. The
 server parses both blocks with the kernel's own fail-closed codecs: an out-of-range or
 out-of-enum value answers 400 `gateway_bad_request` at this boundary instead of travelling to
 the upstream provider.
