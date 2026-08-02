@@ -387,9 +387,13 @@ class TurnComplete:
     # caller out of chunks, so an adapter that retried before committing its stream has no other
     # place to say so.
     provider_retried: bool = False
+    # The gateway transport's applied-parameters echo (scope §5 D-a), riding the terminal frame
+    # because the streaming caller has no response object to read it from. ``None`` = the wire
+    # never mentioned it (an older gateway, or a transport with no echo).
+    generation_applied: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "type": "turn_complete",
             "response_id": self.response_id,
             "usage": dict(self.usage),
@@ -397,6 +401,9 @@ class TurnComplete:
             "stop_reason": self.stop_reason,
             "provider_retried": self.provider_retried,
         }
+        if self.generation_applied is not None:
+            payload["generation_applied"] = dict(self.generation_applied)
+        return payload
 
 
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete

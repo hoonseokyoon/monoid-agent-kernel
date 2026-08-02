@@ -23,13 +23,40 @@ out in commit messages and here.
   its wire shape. Setting any generation value changes all three, deliberately — pinned by
   literal-hash tests captured on v0.20.1.
 
+### Added — generation parameters reach the providers, and the gateway proves it applied them
+
+- The OpenAI adapter sends `temperature` / `top_p` / `max_output_tokens` on the Responses API
+  body when configured (one shared payload builder covers the one-shot and streamed paths). A
+  direct provider call has no applied-echo, so `on_unsupported` is not enforceable there:
+  `"fail"` and `"omit"` behave identically and an unsupported parameter surfaces as the
+  provider's own error through the existing taxonomy.
+- The `monoid.llm-turn.v1` wire carries a `generation` block (only when configured — the
+  protocol id is unchanged and generation-free traffic keeps its exact previous shape), and the
+  reference gateway parses it **fail-closed with the same codec the kernel uses**, threads it
+  into the upstream adapter's config on both the blocking and streaming paths, and echoes the
+  block it actually forwarded as `generation_applied` (response body, and the terminal
+  `turn_complete` frame on the stream).
+- **The gateway client refuses a turn whose parameters cannot be proven applied.** Under the
+  default `on_unsupported="fail"`, a response without a matching `generation_applied` echo —
+  an older gateway that silently discarded the block, exactly the deployment this exists to
+  catch — fails with non-retryable `gateway_generation_not_applied`; `"omit"` accepts
+  best-effort transport. Both the sync response and the streamed terminal frame enforce it.
+- The gateway wire also carries `reasoning.on_unsupported` now (off-default only). The server
+  used to rebuild its `ReasoningConfig` without the field, silently resetting a client's
+  `"omit"` to `"fail"` on the server's copy.
+- `TurnComplete` gains an optional `generation_applied` field so the streamed echo has a place
+  to ride; absent means the wire never mentioned it.
+
 ### Changed — `ReasoningConfig.from_json` is now fail-closed
 
 - `effort`, `summary`, and `on_unsupported` reject values outside their documented enums with a
   field-named `ValueError`, matching the 0.20.1 "retained and direct-Python controls fail
   closed" contract. Previously the codec accepted arbitrary values and the mistake surfaced
   later (or not at all) depending on which ingress the config travelled through. Payloads that
-  only ever carried documented values are unaffected.
+  only ever carried documented values are unaffected. The reference gateway's request parser
+  now reuses this codec (and the generation one), so an out-of-enum reasoning value or an
+  out-of-range sampling value answers 400 `gateway_bad_request` at the boundary instead of
+  travelling to the upstream provider.
 
 ## [0.20.1] - 2026-08-01
 

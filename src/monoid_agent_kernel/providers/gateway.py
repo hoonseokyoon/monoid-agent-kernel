@@ -25,6 +25,7 @@ from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
     project_message_to_text,
@@ -52,6 +53,7 @@ GATEWAY_RATE_LIMITED = "gateway_rate_limited"
 GATEWAY_SERVER_ERROR = "gateway_server_error"
 GATEWAY_AUTH_ERROR = "gateway_auth_error"
 GATEWAY_BAD_RESPONSE = "gateway_bad_response"
+GATEWAY_GENERATION_NOT_APPLIED = "gateway_generation_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
@@ -142,6 +144,12 @@ class GatewayModelAdapter:
                     # retry loops sit on this path and either one having run is the fact a receipt
                     # records.
                     turn = _parse_gateway_response(data)
+                    _check_generation_applied(
+                        build_generation_payload(config.generation),
+                        config.generation.on_unsupported,
+                        data.get("generation_applied"),
+                        known_provider_retried=turn.provider_retried,
+                    )
                     if attempt > 1:
                         turn = replace(turn, provider_retried=True)
                     return turn
@@ -297,6 +305,15 @@ class GatewayModelAdapter:
                                 # the marker above, so the two cannot disagree.
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
+                                # The terminal frame is the streaming twin of the sync check in
+                                # ``next_turn`` -- both transports enforce or neither does.
+                                if isinstance(chunk, TurnComplete):
+                                    _check_generation_applied(
+                                        build_generation_payload(config.generation),
+                                        config.generation.on_unsupported,
+                                        chunk.generation_applied,
+                                        known_provider_retried=chunk.provider_retried,
+                                    )
                                 yield chunk
                         return
                     except _StreamRetry as retry_signal:
@@ -407,8 +424,16 @@ class GatewayModelAdapter:
             "tools": [_gateway_tool_schema(tool) for tool in request.tools],
         }
         reasoning_payload = build_reasoning_payload(config.reasoning)
+        # The server rebuilds a ReasoningConfig from this wire object; leaving the field off
+        # silently reset it to "fail" on the server's copy (the drop flagged in the W5
+        # pre-investigation). Emitted only off-default so default configs keep their wire shape.
+        if config.reasoning.on_unsupported != "fail":
+            reasoning_payload["on_unsupported"] = config.reasoning.on_unsupported
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
+        generation_payload = build_generation_payload(config.generation)
+        if generation_payload:
+            payload["generation"] = generation_payload
 
         if request.messages is not None:
             # By-value: the full conversation travels as messages; no continuation handle.
@@ -611,6 +636,42 @@ def _portable_gateway_payload(
             retryable=False,
             provider_retried=known_provider_retried,
         ) from exc
+
+
+def _check_generation_applied(
+    requested: dict[str, Any],
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """Refuse a turn whose sampling parameters cannot be proven applied (scope §5 D-a).
+
+    ``requested`` is the exact wire block this client sent; the server echoes the block it
+    forwarded upstream as ``generation_applied``. Equality is the proof. An absent echo is
+    indistinguishable from an older server that silently discarded the block -- precisely the
+    deployment ``"fail"`` exists to catch -- so under the default policy it is an error, and
+    ``"omit"`` is the documented way to accept a best-effort transport.
+    """
+
+    if not requested:
+        return
+    if applied == requested:
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no generation_applied echo (older gateway?)"
+        if applied is None
+        else "the generation_applied echo does not match the requested parameters"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested generation parameters: {detail}; "
+        'set model.generation.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
+        retryable=False,
+        provider_retried=known_provider_retried,
+    )
 
 
 def _parse_gateway_response(data: Any) -> ModelTurn:
@@ -913,8 +974,17 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             provider_retried=retried,
         )
     if event_type == "turn_complete":
+        applied = event.get("generation_applied")
+        if applied is not None and not isinstance(applied, dict):
+            raise ModelAdapterError(
+                "LLM gateway returned an invalid generation_applied echo: expected an object",
+                provider_error_code=GATEWAY_BAD_RESPONSE,
+                retryable=False,
+                provider_retried=retried,
+            )
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
+            generation_applied=applied,
             response_id=_gateway_string(
                 event,
                 "turn_handle",

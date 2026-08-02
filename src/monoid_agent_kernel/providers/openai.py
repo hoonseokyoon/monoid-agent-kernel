@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
 )
@@ -512,6 +513,12 @@ class OpenAIModelAdapter:
         reasoning_payload = build_reasoning_payload(config.reasoning)
         if reasoning_payload:
             payload["reasoning"] = reasoning_payload
+        # Sampling controls ride the Responses API body verbatim (temperature / top_p /
+        # max_output_tokens are its own top-level names). A direct provider call has no
+        # applied-echo, so ``on_unsupported`` is not enforceable here: "fail" and "omit"
+        # behave identically, and an unsupported parameter surfaces as the provider's own
+        # 400 through the error taxonomy.
+        payload.update(build_generation_payload(config.generation))
 
         if request.messages is not None:
             # By-value: the full conversation travels as input; no server-side handle. Reasoning

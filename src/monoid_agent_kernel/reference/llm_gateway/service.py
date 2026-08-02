@@ -18,11 +18,11 @@ from monoid_agent_kernel.core.wire_validation import (
     require_list,
     require_object,
 )
-from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
-from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -56,6 +56,7 @@ class LlmGatewayTurnRequest:
     # By-value conversation: the full message log, forwarded to the upstream provider
     # statelessly. When set, no previous_turn_handle lookup is needed.
     messages: tuple[dict[str, Any], ...] | None = None
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
 
 @dataclass
@@ -124,7 +125,10 @@ class LlmGatewayBackend:
                     previous_turn_handle=provider_previous_response_id,
                     observations=request.observations,
                     model=ModelConfig(
-                        provider="openai", model=request.model, reasoning=request.reasoning
+                        provider="openai",
+                        model=request.model,
+                        reasoning=request.reasoning,
+                        generation=request.generation,
                     ),
                     messages=request.messages,
                 )
@@ -135,7 +139,7 @@ class LlmGatewayBackend:
             self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
                 turn.usage
             )
-        return {
+        result = {
             "protocol": namespaced_id("llm-turn-result.v1"),
             "turn_handle": turn_handle,
             "final_text": turn.final_text,
@@ -150,6 +154,14 @@ class LlmGatewayBackend:
             # own HTTP attempts and this call succeeded on the first of those.
             "provider_retried": turn.provider_retried,
         }
+        # The applied-parameters echo (client enforces under on_unsupported="fail"). Honest by
+        # construction: this is the same block ``_build_adapter``'s config makes the upstream
+        # adapter emit, produced by the same builder. Only present when the request carried
+        # generation, so generation-free traffic keeps its pre-W5 response shape.
+        applied = build_generation_payload(request.generation)
+        if applied:
+            result["generation_applied"] = applied
+        return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Streaming form of :meth:`handle_turn` — yields SSE-ready frame dicts.
@@ -178,7 +190,12 @@ class LlmGatewayBackend:
             tools=request.tools,
             previous_turn_handle=provider_previous_response_id,
             observations=request.observations,
-            model=ModelConfig(provider="openai", model=request.model, reasoning=request.reasoning),
+            model=ModelConfig(
+                provider="openai",
+                model=request.model,
+                reasoning=request.reasoning,
+                generation=request.generation,
+            ),
             messages=request.messages,
         )
         # Everything above can raise; only past this point are we committed to a stream body.
@@ -257,13 +274,19 @@ class LlmGatewayBackend:
             self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
                 turn.usage
             )
-        yield {
+        frame = {
             "type": "turn_complete",
             "turn_handle": turn_handle,
             "usage": turn.usage,
             "stop_reason": turn.stop_reason,
             "provider_retried": turn.provider_retried,
         }
+        # Streaming twin of handle_turn's echo -- the terminal frame is the only one a
+        # streaming client can read it from.
+        applied = build_generation_payload(request.generation)
+        if applied:
+            frame["generation_applied"] = applied
+        yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
         with self._lock:
@@ -311,6 +334,7 @@ class LlmGatewayBackend:
             provider="openai",
             model=request.model,
             reasoning=request.reasoning,
+            generation=request.generation,
         )
         if self.provider_adapter_factory is not None:
             return self.provider_adapter_factory(claims, config)
@@ -404,9 +428,6 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
     protocol = parse_str(payload, "protocol")
     if protocol not in ACCEPTED_LLM_TURN_PROTOCOL_VERSIONS:
         raise ValueError("unsupported LLM gateway protocol")
-    reasoning_raw = (
-        require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else {}
-    )
     previous_turn_handle = parse_str(payload, "previous_turn_handle") or None
     observations = tuple(
         _parse_observation(item) for item in optional_list(payload, "observations")
@@ -427,9 +448,16 @@ def _parse_turn_request(payload: dict[str, Any]) -> LlmGatewayTurnRequest:
         model=parse_required_str(payload, "model"),
         system_prompt=parse_required_str(payload, "system_prompt", non_empty=False),
         tools=tuple(_parse_tool(item) for item in optional_list(payload, "tools")),
-        reasoning=ReasoningConfig(
-            effort=parse_str(reasoning_raw, "effort", default="medium"),
-            summary=parse_str(reasoning_raw, "summary", default="off"),
+        # The shared codecs are the parser (fail-closed, spec.py) rather than a second
+        # per-key reader that would drift from them: an out-of-range temperature or an
+        # unknown effort 400s at this boundary instead of travelling to the provider.
+        reasoning=ReasoningConfig.from_json(
+            require_object(payload["reasoning"], "reasoning") if "reasoning" in payload else None
+        ),
+        generation=GenerationConfig.from_json(
+            require_object(payload["generation"], "generation")
+            if "generation" in payload
+            else None
         ),
         instruction=instruction,
         previous_turn_handle=previous_turn_handle,
