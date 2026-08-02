@@ -849,8 +849,11 @@ def test_a_boolean_echo_is_refused_on_the_streamed_terminal_frame(
 _BILLED = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
 
 
-def _receipt_for(adapter: GatewayModelAdapter, request: ModelRequest):
-    """Drive one call through ``ModelCallRunner`` and return the receipt it published."""
+def _receipt_for(adapter: GatewayModelAdapter, request: ModelRequest, *, stream: bool = False):
+    """Drive one call through ``ModelCallRunner`` and return the receipt it published.
+
+    ``stream=True`` passes a consumer, which is what selects the streamed dispatch shape.
+    """
 
     import asyncio
 
@@ -869,7 +872,11 @@ def _receipt_for(adapter: GatewayModelAdapter, request: ModelRequest):
         adapter=adapter, subscriptions=(ModelIOSubscription(observer=observer),)
     )
     with pytest.raises(ModelAdapterError) as refused:
-        asyncio.run(runner.acall(request))
+        asyncio.run(
+            runner.acall(
+                request, delta_consumer=(lambda _chunk: None) if stream else None
+            )
+        )
     assert refused.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
     assert len(observer.receipts) == 1
     return observer.receipts[0]
@@ -918,6 +925,11 @@ def test_the_streamed_refusal_reports_its_tokens_too(monkeypatch: pytest.MonkeyP
         _drain(adapter, _request(config))
     assert refused.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
     assert getattr(refused.value, "provider_usage", None) == _BILLED
+
+    # ...and it reaches the receipt, which is where the accounting actually reads it. Asserting
+    # only on the exception would pin the stamp without pinning that anything consumes it.
+    receipt = _receipt_for(adapter, _request(config), stream=True)
+    assert dict(receipt.usage) == _BILLED
 
 
 def test_a_refusal_with_no_usage_reported_stays_empty() -> None:
