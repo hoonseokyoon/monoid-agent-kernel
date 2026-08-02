@@ -83,7 +83,15 @@ out in commit messages and here.
   deliberately a full agent turn; here it is deliberately not. Repair follows the request's own
   shape: by-value messages append the answer and the repair prompt, a provider continuation
   handle carries the repair as the next instruction, and a one-shot instruction is synthesized
-  into the by-value form.
+  into the by-value form. A request that arrived **on** a continuation handle whose turn came
+  back **without** a new handle has no repairable shape — the conversation is on the provider's
+  side of that handle — so it settles `unsatisfied` without spending a repair call rather than
+  repairing against a synthesized prompt that drops every prior message.
+- **Streaming is per attempt.** `acall` takes an `AttemptDeltaConsumer`
+  (`(attempt_index, chunk) -> None`) instead of a plain `DeltaConsumer`: a rejected attempt's
+  text is discarded output, and a consumer that renders or accumulates chunks must be told when
+  the previous attempt is retracted. Carrying the index in the signature makes the boundary
+  impossible to miss rather than a convention to remember.
 - The validation routine, exception classification, repair text, and failure rollup moved from
   the loop's settle module into `core.output_validator`
   (`run_output_validators` / `build_repair_message` / `failures_by_validator`) and the loop now

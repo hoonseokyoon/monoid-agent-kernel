@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -35,9 +36,18 @@ from monoid_agent_kernel.core.output_validator import (
     run_output_validators,
 )
 from monoid_agent_kernel.model_call import DeltaConsumer, ModelCallRunner, ShouldAbort
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
+from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, ModelTurn
 
 ValidatedCallStatus = Literal["ok", "unsatisfied", "refusal", "truncated"]
+
+# The streaming consumer for a *validated* call, which is not one stream but one per attempt.
+# The attempt index (0 = the original call, 1 = the first repair) rides every chunk because a
+# rejected attempt's text is discarded output: a consumer that renders or accumulates it must
+# know, when the index advances, that everything it holds from the previous index is retracted.
+# A plain ``DeltaConsumer`` cannot express that -- it would deliver the rejected answer and the
+# corrected answer as one undelimited stream -- so this surface takes the wider callable
+# instead, and a caller cannot ignore the boundary by accident.
+AttemptDeltaConsumer = Callable[[int, ModelStreamChunk], None]
 
 
 @dataclass(frozen=True)
@@ -49,6 +59,10 @@ class ValidatedCallResult:
     a cut-off-but-parseable answer can never pass as success; both carry the turn so the
     caller can inspect what arrived. ``receipts`` records the original call and every repair
     call, in order: the audit trail is complete even when the outcome is not ``"ok"``.
+
+    ``repair_calls_used < max_repair_calls`` on an ``"unsatisfied"`` result means the budget was
+    not the limit: the answer was unrepairable without repairing against a different
+    conversation (see :func:`_repair_request`), so no repair was attempted.
     """
 
     status: ValidatedCallStatus
@@ -68,6 +82,10 @@ class ValidatedCallRunner:
     ``RunLimits.max_output_retries``) means one original call plus at most one repair. The
     deadline and cancellation passed to :meth:`acall` span the whole validated call --
     repairs run under the same boundary, not a fresh one each.
+
+    Streaming is per attempt, not per call: :meth:`acall` takes an
+    :data:`AttemptDeltaConsumer` and tags every chunk with the attempt that produced it, so a
+    rejected attempt's text is never handed to a consumer that cannot tell it was discarded.
     """
 
     runner: ModelCallRunner
@@ -85,7 +103,7 @@ class ValidatedCallRunner:
         context: InvocationContext | None = None,
         deadline: float | None = None,
         should_abort: ShouldAbort | None = None,
-        delta_consumer: DeltaConsumer | None = None,
+        delta_consumer: AttemptDeltaConsumer | None = None,
     ) -> ValidatedCallResult:
         receipts: list[ModelCallReceipt] = []
         history: list[dict[str, Any]] = []
@@ -97,7 +115,7 @@ class ValidatedCallRunner:
                 context=context,
                 deadline=deadline,
                 should_abort=should_abort,
-                delta_consumer=delta_consumer,
+                delta_consumer=_attempt_scoped(delta_consumer, repair_calls),
             )
             receipts.append(receipt)
 
@@ -153,8 +171,17 @@ class ValidatedCallRunner:
             )
             if repair_calls >= self.max_repair_calls:
                 return _result("unsatisfied")
+            repair = _repair_request(current, turn, build_repair_message(failures))
+            if repair is None:
+                # The answer is unrepairable without changing which conversation is being
+                # repaired (see ``_repair_request``). Stopping here rather than repairing
+                # against a different prompt: an ``unsatisfied`` answer is a result the caller
+                # can act on, a confidently-repaired answer to a prompt the model never saw is
+                # not. ``repair_calls_used < max_repair_calls`` on an ``unsatisfied`` result is
+                # the observable signal that this happened.
+                return _result("unsatisfied")
             repair_calls += 1
-            current = _repair_request(current, turn, build_repair_message(failures))
+            current = repair
 
     def call(
         self,
@@ -203,8 +230,25 @@ def _parsed_output(request: ModelRequest, turn: ModelTurn) -> Any:
         return None
 
 
-def _repair_request(request: ModelRequest, turn: ModelTurn, repair_text: str) -> ModelRequest:
-    """The follow-up call asking the model to fix its answer.
+def _attempt_scoped(
+    consumer: AttemptDeltaConsumer | None, attempt: int
+) -> DeltaConsumer | None:
+    """Bind one attempt's index onto the caller's consumer.
+
+    ``ModelCallRunner`` streams into a plain ``DeltaConsumer`` that knows nothing about
+    attempts, so the index is bound here, once per call, rather than left for the consumer to
+    infer from chunk order it cannot see the boundaries of.
+    """
+
+    if consumer is None:
+        return None
+    return lambda chunk: consumer(attempt, chunk)
+
+
+def _repair_request(
+    request: ModelRequest, turn: ModelTurn, repair_text: str
+) -> ModelRequest | None:
+    """The follow-up call asking the model to fix its answer, or ``None`` when there isn't one.
 
     ``tools=()`` on every shape: the standalone surface has no tool executor, so a repair turn
     that could request tools would be requesting calls nobody will run -- and allowing them is
@@ -215,8 +259,18 @@ def _repair_request(request: ModelRequest, turn: ModelTurn, repair_text: str) ->
     - by-value ``messages``: append the assistant's answer and the repair prompt;
     - a provider continuation handle: repair rides ``instruction`` on ``previous_turn_handle``;
     - one-shot instruction with no handle: synthesize the by-value form.
+
+    ``None`` is the fourth outcome, and it is the honest one: a request that came in **on** a
+    continuation handle whose turn came back **without** a new handle has nowhere to continue
+    from. The conversation lives on the provider's side of that handle, so synthesizing the
+    by-value form would repair against a prompt containing only this turn's instruction --
+    losing every prior message, and for an observation-only continuation losing the prompt
+    entirely. The caller gets ``unsatisfied`` instead of a confident answer to a different
+    question.
     """
 
+    if request.messages is None and not turn.response_id and request.previous_turn_handle:
+        return None
     if request.messages is not None:
         return replace(
             request,

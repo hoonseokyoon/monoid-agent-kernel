@@ -571,8 +571,18 @@ exhaustion is a *result* (`status="unsatisfied"`), refusal/truncation short-circ
 validation with the loop's ordering, and `receipts` carries every call made so the audit trail
 is complete whatever the outcome. Repair follows the request's own shape (by-value messages
 append; a continuation handle carries the repair as the next instruction; a one-shot
-instruction is synthesized into by-value form) and preserves `output_schema`. The sync facade
-`call` refuses to run inside an active event loop.
+instruction is synthesized into by-value form) and preserves `output_schema`. A request that
+came in *on* a continuation handle whose turn came back *without* a new handle has no fourth
+shape — the conversation lives on the provider's side of that handle — so it settles
+`unsatisfied` without repairing rather than repairing against a prompt the model never saw;
+`repair_calls_used < max_repair_calls` on an `unsatisfied` result is that signal.
+
+Streaming is per attempt: `acall` takes an `AttemptDeltaConsumer`
+(`(attempt_index, chunk) -> None`, `0` = the original call) rather than a plain
+`DeltaConsumer`, because a rejected attempt's text is discarded output. When the index
+advances, everything the consumer holds from the previous index is retracted; the signature
+carries the boundary so a consumer cannot concatenate a rejected answer onto the accepted one.
+The sync facade `call` refuses to run inside an active event loop, so it takes no consumer.
 
 ### Tool Contract
 

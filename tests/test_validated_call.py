@@ -20,8 +20,8 @@ from monoid_agent_kernel.core.output_validator import (
     build_repair_message,
 )
 from monoid_agent_kernel.model_call import ModelCallRunner
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, TextDelta
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
 from monoid_agent_kernel.validated_call import ValidatedCallResult, ValidatedCallRunner
 
 
@@ -254,3 +254,120 @@ def test_negative_budget_is_rejected_at_construction() -> None:
         ValidatedCallRunner(
             runner=ModelCallRunner(adapter=FakeModelAdapter()), max_repair_calls=-1
         )
+
+
+# --- a repair must not silently change which conversation is being repaired --------------
+
+
+def test_a_continuation_without_a_new_handle_is_unsatisfied_not_repaired() -> None:
+    """The request rode ``previous_turn_handle``, so the conversation lives on the provider's
+    side of that handle. A turn that comes back without a new handle leaves nowhere to
+    continue from: synthesizing the by-value form would repair against a prompt holding only
+    this turn's instruction, discarding everything behind the handle. Stop instead."""
+
+    request = ModelRequest(
+        instruction="and now summarize it",
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_prior",
+    )
+    h = _harness(
+        [
+            ModelTurn(final_text="not json", stop_reason="stop", response_id=None),
+            ModelTurn(final_text='{"never": "dispatched"}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    result = h.run()
+
+    assert result.status == "unsatisfied"
+    assert len(h.adapter.requests) == 1
+    # Budget left over is the observable signal that the shape, not the budget, stopped it.
+    assert result.repair_calls_used == 0
+    assert result.failures_history != ()
+
+
+def test_an_observation_only_continuation_is_never_repaired_into_an_empty_prompt() -> None:
+    request = ModelRequest(
+        instruction=None,
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_prior",
+    )
+    h = _harness([ModelTurn(final_text="not json", stop_reason="stop", response_id=None)])
+    h.request = request
+    assert h.run().status == "unsatisfied"
+    assert len(h.adapter.requests) == 1
+
+
+def test_a_one_shot_request_with_no_handle_still_synthesizes_by_value() -> None:
+    """The neighbouring shape must keep working: with no incoming handle there is no context
+    behind the request, so the synthesized form loses nothing."""
+
+    h = _harness(
+        [
+            ModelTurn(final_text="not json", stop_reason="stop", response_id=None),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ]
+    )
+    result = h.run()
+    assert result.status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None and len(repair.messages) == 3
+    assert repair.messages[0] == {"role": "user", "content": "answer"}
+
+
+# --- streamed chunks carry the attempt that produced them ---------------------------------
+
+
+def test_streamed_chunks_are_tagged_with_their_attempt() -> None:
+    """A rejected attempt's text is discarded output. Tagging every chunk with its attempt is
+    what lets a consumer retract it; without the tag the rejected answer and the corrected one
+    arrive as one undelimited stream while the result reports ``status="ok"``."""
+
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[
+            [TextDelta("prose, "), TextDelta("not json")],
+            [TextDelta('{"fixed": '), TextDelta("true}")],
+        ]
+    )
+    validator = _Validator()
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter), validators=(validator,), max_repair_calls=1
+    )
+    seen: list[tuple[int, str]] = []
+
+    async def _drive() -> ValidatedCallResult:
+        return await runner.acall(
+            ModelRequest(instruction="answer", system_prompt="sys", tools=()),
+            delta_consumer=lambda attempt, chunk: seen.append(
+                (attempt, getattr(chunk, "text", ""))
+            ),
+        )
+
+    result = asyncio.run(_drive())
+
+    assert result.status == "ok"
+    assert [attempt for attempt, _ in seen] == [0, 0, 1, 1]
+    # Everything under attempt 0 is retracted; the answer is exactly the last attempt's text.
+    accepted = "".join(text for attempt, text in seen if attempt == result.repair_calls_used)
+    assert accepted == result.turn.final_text == '{"fixed": true}'
+
+
+def test_a_single_attempt_still_streams_under_attempt_zero() -> None:
+    adapter = FakeStreamingModelAdapter(chunk_turns=[[TextDelta('{"a": 1}')]])
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter), validators=(_Validator(),)
+    )
+    seen: list[tuple[int, str]] = []
+
+    async def _drive() -> ValidatedCallResult:
+        return await runner.acall(
+            ModelRequest(instruction="answer", system_prompt="sys", tools=()),
+            delta_consumer=lambda attempt, chunk: seen.append(
+                (attempt, getattr(chunk, "text", ""))
+            ),
+        )
+
+    assert asyncio.run(_drive()).status == "ok"
+    assert seen == [(0, '{"a": 1}')]
