@@ -23,7 +23,11 @@ from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
-from monoid_agent_kernel.providers.base import generation_support, structured_output_support
+from monoid_agent_kernel.providers.base import (
+    generation_support,
+    provider_usage_of,
+    structured_output_support,
+)
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -119,25 +123,30 @@ class LlmGatewayBackend:
         )
         config = _upstream_model_config(request)
         adapter = self._build_adapter(claims, config)
-        turn = normalize_model_turn(
-            adapter.next_turn(
-                ModelRequest(
-                    instruction=request.instruction,
-                    system_prompt=request.system_prompt,
-                    tools=request.tools,
-                    previous_turn_handle=provider_previous_response_id,
-                    observations=request.observations,
-                    model=config,
-                    messages=request.messages,
-                    output_schema=request.output_schema,
+        # A failure can arrive *after* the upstream produced and billed an answer -- an
+        # applied-parameters refusal raised by an upstream that is itself a gateway is exactly
+        # that. This handler exits on the raise, before the meter below, so those tokens left
+        # the tenant's ledger entirely. Metered here, then re-raised unchanged.
+        try:
+            turn = normalize_model_turn(
+                adapter.next_turn(
+                    ModelRequest(
+                        instruction=request.instruction,
+                        system_prompt=request.system_prompt,
+                        tools=request.tools,
+                        previous_turn_handle=provider_previous_response_id,
+                        observations=request.observations,
+                        model=config,
+                        messages=request.messages,
+                        output_schema=request.output_schema,
+                    )
                 )
             )
-        )
+        except ModelAdapterError as failed:
+            self._meter(claims.tenant_id, provider_usage_of(failed))
+            raise
         turn_handle = self._record_turn(claims, request, turn)
-        with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
-                turn.usage
-            )
+        self._meter(claims.tenant_id, turn.usage)
         result = {
             "protocol": namespaced_id("llm-turn-result.v1"),
             "turn_handle": turn_handle,
@@ -260,10 +269,7 @@ class LlmGatewayBackend:
         # assembled response id is what the opaque turn_handle maps to for continuation.
         turn = normalize_model_turn(assemble_streamed_turn(collected))
         turn_handle = self._record_turn(claims, request, turn)
-        with self._lock:
-            self._usage.setdefault(claims.tenant_id, LlmGatewayUsage(claims.tenant_id)).add(
-                turn.usage
-            )
+        self._meter(claims.tenant_id, turn.usage)
         frame = {
             "type": "turn_complete",
             "turn_handle": turn_handle,
@@ -326,6 +332,15 @@ class LlmGatewayBackend:
         if self.provider_adapter_factory is not None:
             return self.provider_adapter_factory(claims, config)
         return OpenAIModelAdapter(config, allow_direct_provider_api=True)
+
+    def _meter(self, tenant_id: str, usage: dict[str, int]) -> None:
+        """Add one call's tokens to the tenant ledger. One writer, so the success paths and
+        the billed-failure path cannot come to disagree about what gets counted."""
+
+        if not usage:
+            return
+        with self._lock:
+            self._usage.setdefault(tenant_id, LlmGatewayUsage(tenant_id)).add(usage)
 
     def _record_turn(
         self,

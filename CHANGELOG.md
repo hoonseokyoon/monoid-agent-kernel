@@ -152,7 +152,12 @@ out in commit messages and here.
   bound that does not hold. The refusal now carries the reported usage (`mark_provider_usage`,
   the twin of `mark_provider_retried`) on both transports; `ModelCallReceipt.with_error` reads
   it back, and `AgentLoop` accumulates it on the failure path. A failure that reports no usage
-  still adds nothing.
+  still adds nothing. **The cost survives a gateway hop too**: when a reference gateway's own
+  upstream refuses a billed turn, the error envelope carries `usage` (JSON body and SSE error
+  frame alike, omitted when empty so an error raised before reaching a provider keeps its exact
+  wire shape), all three client error readers stamp it back onto the reconstructed exception,
+  and the gateway meters the call against the tenant before re-raising instead of losing it to
+  the raise.
 - **`run_once` no longer reports an interrupted run as a success.** It absorbs a non-settling
   park because `close()` turns it into the record that *is* the call's result — but `close()`
   promotes only `turn_failed`. An `interrupted` or `paused` park produced no record, so the run

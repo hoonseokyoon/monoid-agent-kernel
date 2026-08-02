@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -16,6 +16,7 @@ from monoid_agent_kernel.reference._shared.http_util import (
     read_json_limited,
     redact_internal_error,
 )
+from monoid_agent_kernel.providers.base import provider_usage_of
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.providers.gateway import (
     GATEWAY_AUTH_ERROR,
@@ -108,6 +109,7 @@ def make_llm_gateway_handler(
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
                     provider_retried=exc.provider_retried,
+                    usage=provider_usage_of(exc),
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -146,6 +148,7 @@ def make_llm_gateway_handler(
             error_code: str = GATEWAY_BAD_RESPONSE,
             retryable: bool = False,
             provider_retried: bool = False,
+            usage: Mapping[str, int] | None = None,
         ) -> None:
             self._write_json(
                 _error_body(
@@ -154,6 +157,7 @@ def make_llm_gateway_handler(
                     error_code=error_code,
                     retryable=retryable,
                     provider_retried=provider_retried,
+                    usage=usage,
                 ),
                 status=status,
             )
@@ -206,6 +210,7 @@ def _error_body(
     error_code: str = GATEWAY_BAD_RESPONSE,
     retryable: bool = False,
     provider_retried: bool = False,
+    usage: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """The fields every gateway error carries, whatever transport reports it.
 
@@ -214,19 +219,31 @@ def _error_body(
     remembered for the other -- ``provider_retried`` was added to both in the same commit only
     because they were reviewed together. One definition removes the chance to forget.
 
+    ``usage`` is what the failing call already cost. Some failures happen *after* a complete,
+    billed answer -- an applied-parameters refusal raised by an upstream that is itself a
+    gateway is exactly that -- and without carrying it the hop turned a paid call into a
+    zero-token one for every client behind it: the outer receipt, the run's token budget, and
+    the metrics all under-counted. Omitted when empty, which is what an error raised before
+    reaching a provider means.
+
     ``provider_retried`` is a retry the gateway's *backend* made before failing. The client can only
     see its own attempts, so without it a call the provider retried and then failed was recorded as
     a clean single attempt -- and a failure is where that record matters most. It defaults False,
     which is what an error the gateway raised on its own, before reaching a provider, means.
     """
 
-    return {
+    body: dict[str, Any] = {
         "error": message,
         "error_code": error_code,
         "retryable": retryable,
         "http_status": int(status),
         "provider_retried": provider_retried,
     }
+    # Present only when the failing call actually burned tokens, so an error the gateway
+    # raised on its own keeps its exact previous wire shape.
+    if usage:
+        body["usage"] = dict(usage)
+    return body
 
 
 def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict[str, Any]:
@@ -241,6 +258,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
                 error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                 retryable=exc.retryable,
                 provider_retried=exc.provider_retried,
+                usage=provider_usage_of(exc),
             ),
         }
     return {

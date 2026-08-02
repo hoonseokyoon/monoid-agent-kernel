@@ -398,7 +398,11 @@ classifies it like a 4xx — the turn fails, the session survives — and the re
 HTTP layer maps it to 422 rather than 502 so the same classification survives a chained hop.
 A refused turn was still generated and billed, so the refusal carries the usage the provider
 reported: it reaches the failed `ModelCallReceipt` and the run's cumulative token totals on
-both transports. A budget that skipped refused calls would not be a bound.
+both transports. A budget that skipped refused calls would not be a bound. The cost also
+survives a hop — the gateway error envelope carries `usage` (present only when the failed call
+actually spent tokens, so an error raised before reaching a provider keeps its previous wire
+shape), and a gateway meters a billed failure against the tenant rather than losing it to the
+raise.
 One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
 been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
 call sees the unproven text before the error arrives; the sync transport delivers nothing on

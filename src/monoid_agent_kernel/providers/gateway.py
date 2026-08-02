@@ -961,7 +961,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=error_http_status,
             known_provider_retried=provider_retried,
         )
-        raise ModelAdapterError(
+        envelope_error = ModelAdapterError(
             _gateway_string(
                 data,
                 "error",
@@ -985,6 +985,10 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=error_http_status,
             provider_retried=provider_retried,
         )
+        # Third error reader on this wire, and the rule is the same on all three: a failure
+        # that reports what it cost is recorded as having cost it.
+        mark_provider_usage(envelope_error, _reported_error_usage(data))
+        raise envelope_error
     _exact_gateway_bool(
         data,
         "retryable",
@@ -1279,7 +1283,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             http_status=error_http_status,
             known_provider_retried=retried,
         )
-        raise ModelAdapterError(
+        stream_error = ModelAdapterError(
             _gateway_string(
                 event,
                 "error",
@@ -1302,7 +1306,29 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             http_status=error_http_status,
             provider_retried=retried,
         )
+        mark_provider_usage(stream_error, _reported_error_usage(event))
+        raise stream_error
     return None  # unknown frame type: forward-compatible, ignore
+
+
+def _reported_error_usage(payload: dict[str, Any]) -> dict[str, int]:
+    """Tokens a *failed* gateway call reported spending, read leniently.
+
+    The twin of the client-side stamp, for the hop: a gateway whose own upstream refused a
+    billed turn carries the cost in its error envelope, and without reading it back the outer
+    client reports zero for a call the provider charged for. Lenient on purpose -- a malformed
+    ``usage`` on an error path must not replace the failure being reported with a different
+    one, so anything unreadable simply reads as "not reported".
+    """
+
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
 
 
 def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
@@ -1368,7 +1394,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         or detail
         or f"HTTP {status}"
     )
-    return ModelAdapterError(
+    error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
         retryable=retryable,
@@ -1378,6 +1404,8 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
         provider_retried=provider_retried,
     )
+    mark_provider_usage(error, _reported_error_usage(error_payload))
+    return error
 
 
 def _error_from_http_error(exc: HTTPError) -> ModelAdapterError:

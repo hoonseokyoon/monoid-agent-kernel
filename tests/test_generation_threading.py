@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from http import HTTPStatus
 from urllib.error import URLError
 
 import pytest
@@ -942,3 +943,109 @@ def test_a_refusal_with_no_usage_reported_stays_empty() -> None:
     assert getattr(error, "provider_usage", None) is None
     mark_provider_usage(error, None)
     assert getattr(error, "provider_usage", None) is None
+
+
+def test_billed_usage_survives_the_gateway_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The chained-hop twin of the direct-call fix.
+
+    When a reference gateway's upstream is another ``GatewayModelAdapter`` and the inner hop
+    returns a billed turn without the required echo, the inner adapter stamps the usage on the
+    refusal — and the hop then dropped it: the error envelope carried only message, code,
+    retryability, status and retry evidence, so the outer client rebuilt an exception with no
+    usage and reported zero tokens for a call the provider billed. The gateway's own tenant
+    meter missed it too, because ``handle_turn`` raises before ``_usage.add``."""
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body, _model_error_status
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(_served_turn({"usage": dict(_BILLED)})),
+    )
+    manager = _token_manager()
+    inner = ModelConfig(generation=_SET, gateway_url="http://inner.test")
+
+    def factory(_claims, _config):
+        return GatewayModelAdapter(config=inner)
+
+    backend = LlmGatewayBackend(token_manager=manager, provider_adapter_factory=factory)
+    token = _llm_token(manager)
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(token, _turn_payload(generation=dict(_SET_WIRE)))
+    assert refused.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+    assert getattr(refused.value, "provider_usage", None) == _BILLED
+
+    # 1. The hop's error envelope carries what the call cost.
+    body = _error_body(
+        _model_error_status(refused.value),
+        str(refused.value),
+        error_code=refused.value.provider_error_code,
+        retryable=refused.value.retryable,
+        provider_retried=refused.value.provider_retried,
+        usage=getattr(refused.value, "provider_usage", None),
+    )
+    assert body["usage"] == _BILLED
+    assert body["http_status"] == 422
+
+    # 2. The outer client reads it back onto the exception it reconstructs.
+    rebuilt = _error_from_status_body(422, json.dumps(body))
+    assert getattr(rebuilt, "provider_usage", None) == _BILLED
+
+    # 3. And the gateway metered the call locally rather than losing it to the raise.
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+def test_a_gateway_error_that_cost_nothing_keeps_its_wire_shape() -> None:
+    """The counterweight to the hop fix: an error the gateway raised on its own reached no
+    provider, so its envelope must be byte-identical to what it was before ``usage`` existed
+    — and the client must not invent tokens for it."""
+
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    body = _error_body(
+        HTTPStatus.BAD_REQUEST, "bad request", error_code=GATEWAY_BAD_RESPONSE, retryable=False
+    )
+    assert "usage" not in body
+    assert getattr(_error_from_status_body(400, json.dumps(body)), "provider_usage", None) is None
+
+
+def test_a_streamed_error_frame_carries_the_cost_too() -> None:
+    """The SSE twin of the hop: same ``_error_body``, so the frame gains the field for free —
+    but the *client's* stream-frame reader is a separate function, and a rule bound on one of
+    two readers is the shape this branch keeps tripping over."""
+
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event
+
+    with pytest.raises(ModelAdapterError) as raised:
+        _chunk_from_event(
+            {
+                "type": "error",
+                "error": "upstream refused an unproven turn",
+                "error_code": GATEWAY_GENERATION_NOT_APPLIED,
+                "retryable": False,
+                "http_status": 422,
+                "usage": dict(_BILLED),
+            }
+        )
+    assert getattr(raised.value, "provider_usage", None) == _BILLED
+
+
+def test_a_two_hundred_error_envelope_carries_the_cost_too() -> None:
+    """The third reader on this wire: a 200 response whose body is an error object."""
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    with pytest.raises(ModelAdapterError) as raised:
+        _parse_gateway_response(
+            {
+                "error": "upstream refused an unproven turn",
+                "error_code": GATEWAY_GENERATION_NOT_APPLIED,
+                "http_status": 422,
+                "usage": dict(_BILLED),
+            }
+        )
+    assert getattr(raised.value, "provider_usage", None) == _BILLED

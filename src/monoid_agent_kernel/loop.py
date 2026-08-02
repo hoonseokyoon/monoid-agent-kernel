@@ -201,6 +201,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolObservation,
     format_async_result_text,
+    provider_usage_of,
 )
 from monoid_agent_kernel.public_view import (
     args_preview,
@@ -5251,17 +5252,7 @@ def _billed_usage(exc: BaseException) -> dict[str, int]:
     bound that does not hold. Guarded read, like every other fact carried on an exception here.
     """
 
-    try:
-        billed = getattr(exc, "provider_usage", None)
-    except Exception:
-        return {}
-    if not isinstance(billed, Mapping):
-        return {}
-    return {
-        str(key): value
-        for key, value in billed.items()
-        if type(value) is int and value >= 0
-    }
+    return provider_usage_of(exc)
 
 
 def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:

@@ -1049,6 +1049,28 @@ def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -
         pass
 
 
+def provider_usage_of(error: BaseException) -> dict[str, int]:
+    """Read back what :func:`mark_provider_usage` stamped, as clean non-negative counts.
+
+    One reader for every consumer of the stamp -- the loop's budget, the reference gateway's
+    tenant meter, the error envelope that carries it across a hop. A guarded read like the
+    stamp itself, and it filters rather than raises: a malformed count on a *failure* path
+    must not replace the failure being reported.
+    """
+
+    try:
+        usage = getattr(error, "provider_usage", None)
+    except Exception:
+        return {}
+    if not isinstance(usage, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
+
+
 @dataclass
 class RetryProgress:
     """What an adapter has managed to report about a call that may never return one.
