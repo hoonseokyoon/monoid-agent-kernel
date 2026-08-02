@@ -67,6 +67,9 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
     NaN under ``allow_nan=False``. Encoded here, once, for both transports: outside a
     classifier that failure escaped as a raw ``TypeError``/``ValueError`` the loop cannot
     classify at all, terminalizing the run unrecoverably for what is a config-shaped mistake.
+    ``config_recoverable`` completes that sentence: the same mistake reported by a gateway
+    *server* is an HTTP 400, which the loop treats as turn-recoverable -- one condition, one
+    classification, whichever side of the wire noticed.
     """
 
     try:
@@ -76,6 +79,7 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
             f"model request is not JSON-serializable: {exc}",
             provider_error_code=GATEWAY_BAD_REQUEST,
             retryable=False,
+            config_recoverable=True,
         ) from exc
 
 

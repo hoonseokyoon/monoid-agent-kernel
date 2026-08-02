@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class NativeAgentError(Exception):
     """Base error for Monoid Agent Kernel."""
@@ -52,6 +54,31 @@ class ModelAdapterError(NativeAgentError):
         # retried again. Without it a failed audit record denies retries in exactly the case where
         # they happened most.
         self.provider_retried = provider_retried
+
+
+class TurnNotSettled(NativeAgentError):
+    """A blocking submit facade parked without a settled turn to return.
+
+    Raised by ``AgentLoop.submit`` / ``asubmit`` / ``run_once`` when the turn suspended with
+    ``reason="turn_failed"`` (a *recoverable* model-turn failure), ``"interrupted"``, or
+    ``"paused"`` — outcomes that produce no ``AgentTurnResult`` because nothing settled. The
+    session itself is still alive (``run_once`` closes it in its own ``finally``, as always);
+    the non-blocking pump (``run_until_suspended``) hands the same park back as a
+    :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising. ``suspension``
+    carries the full evidence (reason, error, ``retryable``, ``http_status``,
+    ``config_recoverable``) so a driver can decide between re-attempt, config fix, and
+    giving up — the same decision the Suspension-reading driver makes.
+    """
+
+    error_code = "turn_not_settled"
+
+    def __init__(self, suspension: Any) -> None:
+        detail = suspension.error or suspension.reason
+        super().__init__(f"turn did not settle ({suspension.reason}): {detail}")
+        self.suspension = suspension
+        self.reason = suspension.reason
+        self.retryable = suspension.retryable
+        self.http_status = suspension.http_status
 
 
 class PermissionDenied(NativeAgentError):

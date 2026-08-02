@@ -578,6 +578,57 @@ def test_a_validator_defect_carries_the_receipts_of_every_call_made() -> None:
     assert len(defect.value.receipts) == 2
 
 
+def test_receipt_stamping_keeps_the_innermost_stamp() -> None:
+    """An adapter that internally delegates to another ValidatedCallRunner propagates an
+    exception already carrying the inner call's receipts; the outer stamp must not overwrite
+    them with its own (possibly empty) list — the innermost stamp is closest to the failure."""
+
+    from monoid_agent_kernel.validated_call import _stamp_receipts
+
+    error = RuntimeError("boom")
+    _stamp_receipts(error, ("inner-receipt",))  # type: ignore[arg-type]
+    _stamp_receipts(error, ())
+    assert error.receipts == ("inner-receipt",)  # type: ignore[attr-defined]
+
+
+def test_each_validator_sees_its_own_parsed_view() -> None:
+    """FinalOutputView is documented read-only. The dataclass is frozen but ``parsed`` was one
+    shared mutable object, so validator A's in-place mutation was judged — and surfaced as a
+    value — by validator B."""
+
+    class _Mutator:
+        id = "mutator"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            if isinstance(view.parsed, dict):
+                view.parsed["injected"] = True
+            return ValidationOutcome(ok=True, value=view.parsed)
+
+    class _Reader:
+        id = "reader"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            return ValidationOutcome(ok=True, value=view.parsed)
+
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text='{"a": 1}', stop_reason="stop")])
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter), validators=(_Mutator(), _Reader())
+    )
+    result = asyncio.run(
+        runner.acall(
+            ModelRequest(
+                instruction="q", system_prompt="s", tools=(), output_schema={"type": "object"}
+            )
+        )
+    )
+    assert result.status == "ok"
+    values = dict(result.ok_values)
+    assert values["reader"] == {"a": 1}
+    assert result.value == {"a": 1}
+
+
 def test_receipts_ride_an_escaping_adapter_error() -> None:
     """A repair call that fails at the boundary loses its own receipt to the adapter (it
     rides ``ModelCallRunner.subscriptions`` only), but the completed calls' receipts must

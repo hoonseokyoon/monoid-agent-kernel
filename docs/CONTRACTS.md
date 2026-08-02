@@ -131,7 +131,14 @@ The run lifecycle is:
   `submit()` gets a fresh `max_steps` budget; `max_tool_calls`, token usage, and
   `max_duration_s` are session-wide. `AgentTurnResult` carries the settle status,
   final text, the accumulated (preview) proposal, and the continuation
-  `turn_handle`.
+  `turn_handle`. A park that settles nothing — a *recoverable* turn failure
+  (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
+  (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
+  `suspension` carries the reason plus the `retryable` / `http_status` /
+  `config_recoverable` classification. The non-blocking pump
+  (`run_until_suspended`) returns the same park as a `Suspension` with
+  `turn=None` instead of raising; `astream` ends the stream with it as
+  `stream.suspension`.
 - `commit_checkpoint()` — opt-in: adopt the current proposed workspace state as
   the new diff baseline, so later proposals report only post-commit changes.
 - `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
@@ -325,7 +332,10 @@ behind it did with it.
 The probe reads the **instance**: the declaration is a `ClassVar` when the answer is fixed, and
 a **callable taking the effective per-call `ModelConfig`** when it depends on policy — the
 probe passes its `config` argument through to a callable declaration, and `None` probes the
-adapter's standing configuration. The claim and the enforcement must read the same config:
+adapter's standing configuration. (Before v0.21.0 the conditional convention was a *property*;
+a property still probes fine but cannot receive the per-call config, so a property-declared
+conditional adapter silently answers from its standing configuration — migrate conditional
+declarations to the callable form.) The claim and the enforcement must read the same config:
 enforcement runs under `request.model or self.config`, so a claim probed off the standing
 config alone would let a shared adapter mint proof for a call it enforces under a
 wire-supplied `"omit"`. `OpenAIModelAdapter` applies the parameters itself and declares both

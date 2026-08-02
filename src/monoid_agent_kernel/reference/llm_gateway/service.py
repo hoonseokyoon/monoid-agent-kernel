@@ -117,8 +117,8 @@ class LlmGatewayBackend:
             if request.messages is not None
             else self._provider_previous_response_id(request, claims)
         )
-        adapter = self._build_adapter(claims, request)
         config = _upstream_model_config(request)
+        adapter = self._build_adapter(claims, config)
         turn = normalize_model_turn(
             adapter.next_turn(
                 ModelRequest(
@@ -176,14 +176,15 @@ class LlmGatewayBackend:
             if request.messages is not None
             else self._provider_previous_response_id(request, claims)
         )
-        adapter = self._build_adapter(claims, request)
+        config = _upstream_model_config(request)
+        adapter = self._build_adapter(claims, config)
         model_request = ModelRequest(
             instruction=request.instruction,
             system_prompt=request.system_prompt,
             tools=request.tools,
             previous_turn_handle=provider_previous_response_id,
             observations=request.observations,
-            model=_upstream_model_config(request),
+            model=config,
             messages=request.messages,
             output_schema=request.output_schema,
         )
@@ -316,9 +317,12 @@ class LlmGatewayBackend:
     def _build_adapter(
         self,
         claims: TokenClaims,
-        request: LlmGatewayTurnRequest,
+        config: ModelConfig,
     ) -> ModelAdapter:
-        config = _upstream_model_config(request)
+        """Takes the already-built per-call config (``_upstream_model_config``) rather than
+        rebuilding it, so the adapter, the upstream request, and the applied-parameters proof
+        share one object — "cannot disagree" by identity, not merely by value."""
+
         if self.provider_adapter_factory is not None:
             return self.provider_adapter_factory(claims, config)
         return OpenAIModelAdapter(config, allow_direct_provider_api=True)

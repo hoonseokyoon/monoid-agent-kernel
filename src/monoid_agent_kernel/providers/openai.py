@@ -342,7 +342,7 @@ class OpenAIModelAdapter:
         # ``json.dumps`` of observations and tool arguments is part of this call's failure
         # surface too, and outside the boundary it escaped as a raw ``TypeError``.
         try:
-            payload = self._payload(request)
+            payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
             try:
                 try:
@@ -402,7 +402,7 @@ class OpenAIModelAdapter:
         # undo it -- the gateway's handler does not either. What it prevents is the replacement
         # being a raw exception, which the loop cannot classify at all.
         try:
-            payload = self._payload(request)
+            payload = self._classified_payload(request)
             client, call_owned = self._async_client(AsyncOpenAI, key)
             # Bound before the request, so the cleanup below can run even when creating the stream is
             # what failed -- there is nothing to release then, and it must not raise looking.
@@ -504,6 +504,26 @@ class OpenAIModelAdapter:
             reasoning=_capture_reasoning_items(output_items),
             stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
         )
+
+    def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
+        """Build the request body, naming a build failure what it is: a bad request.
+
+        The gateway twin (``_encode_request_body``) classifies an unserializable request as a
+        config-recoverable bad request; without this, the same defect here fell through
+        ``_model_error_from_openai``'s no-status tail as an anonymous
+        ``unclassified_provider_error`` -- classified, but not *named*, and the code is what
+        receipts and failure records carry. One helper, both call paths.
+        """
+
+        try:
+            return self._payload(request)
+        except (TypeError, ValueError) as exc:
+            raise ModelAdapterError(
+                f"model request is invalid or not JSON-serializable: {exc}",
+                provider_error_code="unserializable_request",
+                retryable=False,
+                config_recoverable=True,
+            ) from exc
 
     def _payload(self, request: ModelRequest) -> dict[str, Any]:
         config = request.model or self.config

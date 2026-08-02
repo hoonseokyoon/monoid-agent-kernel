@@ -1203,13 +1203,88 @@ def test_a_config_recoverable_refusal_ends_the_turn_not_the_run(tmp_path: Path) 
     try:
         susp = loop.run_until_suspended("hello")
         assert susp.reason == "turn_failed"
+        # The classification the loop decided on must be observable by the driver that
+        # decides what to do next: the suspension and the turn.failed event both carry it.
+        assert susp.config_recoverable is True
+        failed = [e for e in sink.events if e.type == "turn.failed"]
+        assert failed and failed[-1].data["config_recoverable"] is True
         assert loop._session is not None and loop._session.terminal is False
         types = [e.type for e in sink.events]
-        assert "turn.failed" in types
         assert "run.failed" not in types
         assert list(run_root.rglob("failure.json")) == []
     finally:
         loop.close()
+
+
+def test_submit_surfaces_a_recoverable_turn_failure_typed(tmp_path: Path) -> None:
+    """submit/asubmit are the blocking twins of run_until_suspended, and a turn that parked
+    without settling has no AgentTurnResult to return. The assert this pins the replacement
+    of (``suspension.turn is not None``) crashed submit() with a message-less AssertionError
+    on the first recoverable turn failure — any provider 4xx, an exhausted retryable error,
+    or W5's proof refusal — and under ``python -O`` silently returned None. The rule was
+    bound on the astream half only (``_astream_drive`` returns the suspension)."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError("bad config", http_status=400, error_code="model_error"),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        with pytest.raises(TurnNotSettled) as parked:
+            loop.submit("hello")
+        assert parked.value.reason == "turn_failed"
+        assert parked.value.suspension.http_status == 400
+        assert loop._session is not None and loop._session.terminal is False
+        # The session is alive: re-issuing the turn settles.
+        again = loop.run_until_suspended(None)
+        assert again.reason == "settled"
+        assert again.final_text == "recovered"
+    finally:
+        loop.close()
+
+
+def test_interrupt_during_submit_surfaces_typed_not_assert(tmp_path: Path) -> None:
+    """interrupt_turn() is documented as a thread-safe stop whose park keeps the session
+    alive — fired while a caller blocks in submit(), the park must reach that caller as a
+    typed outcome, not an AssertionError."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _SelfInterruptingAdapter()
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter, "fs.list", "run.finish")
+    adapter.loop = loop
+    loop.open()
+    try:
+        with pytest.raises(TurnNotSettled) as parked:
+            loop.submit("go")
+        assert parked.value.reason == "interrupted"
+        again = loop.run_until_suspended(None)
+        assert again.reason == "settled"
+        assert again.final_text == "resumed ok"
+    finally:
+        loop.close()
+
+
+def test_run_once_surfaces_a_recoverable_failure_typed(tmp_path: Path) -> None:
+    """run_once is the facade the fork-subagent path drives (child.arun_once): a child's
+    provider 400 must surface as a classified error the parent machinery can record, not an
+    anonymous AssertionError."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter)
+    with pytest.raises(TurnNotSettled) as parked:
+        loop.run_once("hello")
+    assert parked.value.reason == "turn_failed"
+    assert parked.value.error_code == "turn_not_settled"
 
 
 def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:

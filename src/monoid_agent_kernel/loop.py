@@ -152,6 +152,7 @@ from monoid_agent_kernel.errors import (
     PermissionDenied,
     RunCancelled,
     RunTimeout,
+    TurnNotSettled,
     ToolExecutionError,
     TurnInterrupted,
     TurnPaused,
@@ -1196,6 +1197,9 @@ class AgentLoop:
         Blocking wrapper over ``run_until_suspended``: when the run parks on tasks it
         waits in-process (shell monitor completes them, or an external thread reports
         a hosted-task result) and resumes, returning only once the turn settles.
+        A park that settles nothing — a recoverable turn failure, an interrupt, a
+        pause — raises :class:`TurnNotSettled` (the session stays alive; the
+        exception's ``suspension`` carries the evidence).
 
         Sync facade over :meth:`asubmit`; from an async context call ``asubmit``."""
         return self._run_sync(self.asubmit(user_input))
@@ -1213,7 +1217,18 @@ class AgentLoop:
                 session.res.deadline,
             )
             suspension = await self.arun_until_suspended(None)
-        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        if suspension.turn is None:
+            # turn_failed / interrupted / paused: nothing settled, so there is no
+            # AgentTurnResult to hand back. The non-blocking pump returns the park as a
+            # Suspension the driver inspects; a blocking facade's only channel is an
+            # exception, so the park surfaces typed. The assert this replaces encoded the
+            # stale claim that every non-awaiting reason attaches a turn — it crashed
+            # submit()/run_once() (and the fork-subagent path through arun_once) with a
+            # message-less AssertionError on the first recoverable turn failure, and under
+            # ``python -O`` it was stripped and returned None typed as AgentTurnResult.
+            # The astream half already handled this (``_astream_drive`` returns the
+            # suspension); this binds the rule on its blocking twin.
+            raise TurnNotSettled(suspension)
         return suspension.turn
 
     def astream(self, user_input: str | tuple[ContentPart, ...]) -> RunStream:
@@ -1273,7 +1288,9 @@ class AgentLoop:
         ``None`` it resumes a run parked on a task (whose result was already injected
         via report_task_result). Returns why the run suspended without blocking on
         tasks — the caller decides how to wait. Every non-``awaiting_tasks`` reason
-        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``.
+        persists a checkpoint; the settled outcomes (``settled``/``limited``/``terminal``)
+        attach the ``AgentTurnResult`` as ``turn``, while ``turn_failed``/``interrupted``/
+        ``paused`` settle nothing and carry ``turn=None`` — branch on ``reason``.
 
         Sync facade over :meth:`arun_until_suspended`."""
         return self._run_sync(self.arun_until_suspended(user_input))
@@ -1508,6 +1525,7 @@ class AgentLoop:
                     "provider_error_code": exc.provider_error_code,
                     "http_status": exc.http_status,
                     "retryable": exc.retryable,
+                    "config_recoverable": exc.config_recoverable,
                 },
                 level="warning",
             )
@@ -1518,6 +1536,7 @@ class AgentLoop:
                 error_code=exc.error_code,
                 retryable=exc.retryable,
                 http_status=exc.http_status,
+                config_recoverable=exc.config_recoverable,
             )
             self._persist_checkpoint(session, result)
             return result

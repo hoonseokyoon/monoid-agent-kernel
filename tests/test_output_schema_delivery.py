@@ -499,6 +499,10 @@ def test_an_unserializable_request_is_a_classified_bad_request() -> None:
         adapter.next_turn(_request(config, output_schema={"a": {1, 2}}))  # type: ignore[dict-item]
     assert schema_case.value.provider_error_code == GATEWAY_BAD_REQUEST
     assert schema_case.value.retryable is False
+    # The classifier's own rationale is "a config-shaped mistake" — the same mistake reported
+    # by a gateway *server* is an HTTP 400, which the loop treats as turn-recoverable, so the
+    # client-side detection must carry the same classification.
+    assert schema_case.value.config_recoverable is True
 
     with pytest.raises(ModelAdapterError) as messages_case:
         adapter.next_turn(
@@ -561,5 +565,9 @@ def test_openai_payload_build_failures_are_classified_too(
             ),
         ),
     )
-    with pytest.raises(ModelAdapterError):
+    with pytest.raises(ModelAdapterError) as rejected:
         adapter.next_turn(request)
+    # The twin names the same defect the gateway path names: a bad request, recoverable by
+    # fixing the value — not an anonymous "provider call failed (TypeError)".
+    assert rejected.value.provider_error_code == "unserializable_request"
+    assert rejected.value.config_recoverable is True

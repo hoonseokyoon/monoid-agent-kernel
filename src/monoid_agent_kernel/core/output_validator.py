@@ -9,7 +9,8 @@ This module defines the integration surface; the orchestration lives in the loop
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.result import AgentArtifact
@@ -149,8 +150,14 @@ def run_output_validators(
     failures: list[tuple[str, str]] = []
     ok_values: list[tuple[str, Any]] = []
     for validator in validators:
+        # Each validator gets its own copy of the parsed view. The dataclass is frozen but
+        # ``parsed`` is one mutable object; shared, one validator's in-place mutation was
+        # judged -- and surfaced as a value -- by the next, defeating the documented
+        # "read-only" contract. ``parsed`` is plain JSON data (strict-ingress output), so the
+        # copy is cheap and total.
+        per_view = view if view.parsed is None else replace(view, parsed=deepcopy(view.parsed))
         try:
-            outcome = validate_validation_outcome(validator.validate(view))
+            outcome = validate_validation_outcome(validator.validate(per_view))
         except OutputRetry as exc:
             outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
         except ValueError as exc:

@@ -314,8 +314,15 @@ def _stamp_receipts(
     the attribute (``__slots__``) simply carries no receipts rather than replacing the
     provider's failure with an ``AttributeError``. ``OutputValidatorError`` declares the
     attribute so its carriage is part of the type's contract; everything else gets it stamped.
+
+    An already-stamped exception is left alone: an adapter that internally delegates to
+    another validated call propagates an error carrying the *inner* call's receipts, and the
+    innermost stamp is the one closest to the failure -- overwriting it with the outer
+    runner's (possibly empty) list destroyed the very audit trail this exists to preserve.
     """
 
+    if getattr(error, "receipts", None):
+        return
     try:
         error.receipts = receipts  # type: ignore[attr-defined]
     except Exception:

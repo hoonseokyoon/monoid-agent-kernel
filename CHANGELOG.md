@@ -60,6 +60,28 @@ out in commit messages and here.
   required importing provider modules. OpenAI 4xx classification now names the provider's
   `param` (a provider-authored field path, not user content) so a schema-subset rejection is
   distinguishable from any other bad request.
+- **`submit()` / `asubmit()` / `run_once()` surface a non-settling park typed instead of
+  crashing.** A turn that parked without settling — a *recoverable* turn failure (any
+  provider 4xx, an exhausted retryable error, W5's proof refusals), an interrupt, or a pause —
+  produces a `Suspension` with `turn=None`; the blocking facades asserted `turn is not None`
+  and crashed with a message-less `AssertionError` (silently returning `None` under
+  `python -O`), including on the fork-subagent path through `arun_once`. They now raise
+  `TurnNotSettled` (`monoid_agent_kernel.errors`), carrying the suspension and its
+  classification; the session stays alive exactly as the `run_until_suspended` /
+  `astream` halves always kept it. The stale "every non-awaiting reason attaches a turn"
+  claim is corrected in the docstrings and `Suspension` docs.
+- `Suspension` and the `turn.failed` event carry `config_recoverable`, so a driver can
+  distinguish "park for a config fix" from other non-retryable turn failures without
+  hard-coding provider codes; the durable park payload round-trips it (absent on
+  pre-v0.21 checkpoints reads `False`).
+- The unserializable-request errors on both adapters are `config_recoverable` too — the
+  same mistake reported by a gateway server is an HTTP 400, which was already
+  turn-recoverable; and the OpenAI twin now names the defect (`unserializable_request`)
+  instead of falling through as `unclassified_provider_error`.
+- `run_output_validators` hands each validator its own copy of `parsed`, keeping
+  `FinalOutputView` read-only in fact: one validator's in-place mutation was previously
+  judged — and surfaced as a value — by the next. An exception already stamped with an inner
+  validated call's `receipts` keeps the innermost stamp instead of being overwritten.
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 
