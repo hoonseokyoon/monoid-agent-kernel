@@ -662,3 +662,62 @@ def test_a_well_formed_schema_still_reaches_the_provider_body(
     adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
     payload = adapter._classified_payload(_request(config, output_schema=_SCHEMA))
     assert payload["text"]["format"]["schema"] == _SCHEMA
+
+
+def _deeply_nested_schema() -> dict:
+    """An acyclic schema deeper than the interpreter's recursion limit.
+
+    Nothing upstream refuses it: ``normalize_json_ingress`` is deliberately iterative, and the
+    512-level nesting cap belongs to the JSON *text* parsers, not to a Python-constructed
+    value. ``json.dumps`` is recursive, so this is where it lands.
+    """
+
+    import sys
+
+    node: dict = {"type": "object"}
+    for _ in range(sys.getrecursionlimit() * 6):
+        node = {"type": "object", "properties": {"x": node}}
+    return node
+
+
+def test_a_too_deep_request_is_classified_on_both_adapters() -> None:
+    """``json.dumps`` answers a too-deep container with ``RecursionError`` — a ``RuntimeError``
+    subclass, not the ``TypeError``/``ValueError`` family the classifiers caught — so it
+    escaped raw from both encoders. ``AgentLoop._recoverable_turn_error`` only inspects a
+    ``ModelAdapterError``, so a nesting mistake terminalized the whole run on both shipped
+    adapters instead of failing the turn recoverably like every other unsendable request."""
+
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
+    schema = _deeply_nested_schema()
+    config = ModelConfig(gateway_url="http://gateway.test")
+    request = normalize_model_request(_request(config, output_schema=schema))
+
+    with pytest.raises(ModelAdapterError) as gateway_sync:
+        GatewayModelAdapter(config=config).next_turn(request)
+    assert gateway_sync.value.provider_error_code == GATEWAY_BAD_REQUEST
+    assert gateway_sync.value.config_recoverable is True
+
+    pytest.importorskip("httpx")
+
+    async def _drive() -> None:
+        async for _chunk in GatewayModelAdapter(config=config).astream_turn(request):
+            pass
+
+    with pytest.raises(ModelAdapterError) as gateway_stream:
+        asyncio.run(_drive())
+    assert gateway_stream.value.provider_error_code == GATEWAY_BAD_REQUEST
+
+
+def test_a_too_deep_request_is_classified_on_the_openai_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = ModelConfig(provider="openai")
+    adapter = OpenAIModelAdapter(config, allow_direct_provider_api=True)
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        adapter.next_turn(_request(config, output_schema=_deeply_nested_schema()))
+    assert rejected.value.provider_error_code == "unserializable_request"
+    assert rejected.value.config_recoverable is True

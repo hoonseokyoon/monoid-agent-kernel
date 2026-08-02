@@ -71,11 +71,19 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
     ``config_recoverable`` completes that sentence: the same mistake reported by a gateway
     *server* is an HTTP 400, which the loop treats as turn-recoverable -- one condition, one
     classification, whichever side of the wire noticed.
+
+    ``RecursionError`` is caught beside them because it is the same condition wearing a
+    different type: ``json.dumps`` recurses, so a container nested deeper than the interpreter
+    limit raises a ``RuntimeError`` subclass rather than a ``TypeError``. Nothing upstream
+    refuses it first -- ``normalize_json_ingress`` is deliberately iterative, and the 512-level
+    nesting cap guards the JSON *text* parsers, not a Python-constructed value -- so this is
+    the boundary, and "a request that cannot be encoded" must answer the same way however the
+    encoder says so.
     """
 
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ModelAdapterError(
             f"model request is not JSON-serializable: {exc}",
             provider_error_code=GATEWAY_BAD_REQUEST,

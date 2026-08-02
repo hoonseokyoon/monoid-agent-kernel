@@ -116,6 +116,14 @@ out in commit messages and here.
   and a `NaN` was serialized to the JSON-invalid literal `NaN` and sent. The assembled payload
   is now strict-encoded (`allow_nan=False`) inside the classification boundary on both the
   blocking and the streaming path.
+- **A request too deep to encode is classified, not raw.** `json.dumps` recurses, so a
+  container nested past the interpreter limit raises `RecursionError` — a `RuntimeError`
+  subclass, outside the `TypeError`/`ValueError` family both encoders caught — and nothing
+  upstream refuses it first (`normalize_json_ingress` is iterative by design, and the
+  512-level nesting cap guards the JSON *text* parsers, not a Python-constructed value). It
+  escaped raw from the gateway encoder and reached the OpenAI adapter's outer handler as an
+  anonymous `unclassified_provider_error`, terminalizing the run either way. Both encoders now
+  answer it like any other unsendable request.
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 

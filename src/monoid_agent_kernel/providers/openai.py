@@ -523,13 +523,18 @@ class OpenAIModelAdapter:
         encoder would otherwise emit the JSON-invalid literals ``NaN``/``Infinity`` onto the
         wire. The string is discarded -- the SDK wants the object -- which costs one extra
         encode per call, the same encode the gateway path already pays exactly once.
+
+        ``RecursionError`` joins the caught family for the reason the gateway twin catches it:
+        ``json.dumps`` recurses, so a container nested past the interpreter limit fails with a
+        ``RuntimeError`` subclass instead, and an unsendable request must answer the same way
+        whichever exception the encoder chose to say so with.
         """
 
         try:
             payload = self._payload(request)
             json.dumps(payload, ensure_ascii=False, allow_nan=False)
             return payload
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             raise ModelAdapterError(
                 f"model request is invalid or not JSON-serializable: {exc}",
                 provider_error_code="unserializable_request",
