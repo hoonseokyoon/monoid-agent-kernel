@@ -35,7 +35,8 @@ out in commit messages and here.
 - The Reference backend adds a bounded, root-scoped `monoid.model-stream.live.v1` broker. One
   subscription multiplexes the root run and validated descendants, replays a retained suffix after
   reconnect, and emits a reset when a generation, sequence, capacity, or frame-size boundary makes
-  replay incomplete. Closing the presentation stream never cancels the run.
+  replay incomplete. An acknowledged no-ring cursor carries eviction resets across reconnects
+  without repeating hydration. Closing the presentation stream never cancels the run.
 
 ### Added — replay-safe Studio chat recovery
 

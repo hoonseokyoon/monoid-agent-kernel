@@ -904,8 +904,14 @@ snapshot carry the same optional boolean `retryable` signal, with absence interp
 Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
 least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
 oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
-the missing prefix from an entitled private store, then resumes from that baseline. Closing the SSE
-subscription removes only that reader. It never interrupts or cancels model execution. Backend
+the missing prefix from an entitled private store, then resumes from that baseline. When no ring
+remains, the reset baseline uses a root-bound idle cursor carrying the broker's bounded eviction
+epoch; reconnecting with the current cursor waits without repeating hydration until a new ring
+generation appears. The broker retains acknowledgement epochs for at most the root-ring budget;
+an older forgotten acknowledgement resets conservatively to the current epoch. A cursor-free
+reader resets for a recently evicted root and waits as pre-publication only for an unseen root.
+Closing the SSE subscription removes only that reader. It never interrupts or cancels model
+execution. Backend
 shutdown closes the broker, wakes blocking subscribers, and makes later observer writes inert.
 
 Studio composes this into `/api/model-stream` and exposes a separate authorized

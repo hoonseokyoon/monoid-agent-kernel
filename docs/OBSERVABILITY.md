@@ -149,6 +149,12 @@ retained suffix merge idempotent even when they were observed at different insta
 accepts only regular, single-link sidecars with stable path/descriptor identity. An unsafe path or
 failed coordinated flush returns HTTP 503, and Studio retries the same hydration cursor.
 
+If the root ring is already gone, the reset baseline uses a root-bound idle cursor carrying the
+broker's bounded eviction epoch. A reconnect with the current cursor waits without repeating
+hydration until a new generation appears, while an older or cross-root `Last-Event-ID` receives the
+reset it missed on the prior connection. A bounded acknowledgement table covers the root-ring
+budget; forgotten entries reset conservatively to the current broker epoch.
+
 This SSE subscription has no execution control. Closing a tab or losing the connection closes only
 that subscriber. Provider generation, durable recording, Stop, interrupt, and cancellation remain
 owned by the run. Live frames enter the chat and subagent activity projections directly and never

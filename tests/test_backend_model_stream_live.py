@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -50,6 +51,11 @@ def _context(
         model="model",
         started_at="2026-08-01T00:00:00Z",
     )
+
+
+def _idle_cursor(generation: str, root_run_id: str, epoch: int) -> LiveModelStreamCursor:
+    root_digest = hashlib.sha256(root_run_id.encode("utf-8")).hexdigest()
+    return LiveModelStreamCursor(f"{generation}.idle.{root_digest}", epoch)
 
 
 def test_broker_multiplexes_descendant_lifecycle_and_content_by_root() -> None:
@@ -341,7 +347,10 @@ def test_root_ring_lru_bounds_long_lived_broker_memory_and_preserves_gap_waterma
     assert broker.buffered_root_count == 2
 
     subscription = broker.subscribe("root-a", after_cursor="lru:0")
-    assert subscription.poll() == ()
+    unavailable = subscription.poll()
+    assert [frame.kind for frame in unavailable] == ["reset"]
+    assert unavailable[0].reason == "generation_changed"
+    assert unavailable[0].cursor == _idle_cursor("lru", "root-a", 1)
     assert broker.buffered_root_count == 2
 
     broker.observer("root-a").open(
@@ -439,6 +448,321 @@ def test_prepublication_subscription_detects_eviction_before_first_poll() -> Non
     assert frames[0].cursor == LiveModelStreamCursor("race.3", 0)
     assert frames[0].oldest_available_cursor == "race.3:1"
     assert frames[1].text == "tail"
+
+
+def test_cursor_free_subscription_resets_for_a_known_evicted_root() -> None:
+    broker = LiveModelStreamBroker(generation="known-evicted", max_roots=2)
+    for root_run_id in ("target", "other-a", "other-b"):
+        broker.observer(root_run_id).open(
+            _context(
+                root_run_id=root_run_id,
+                run_id=root_run_id,
+                stream_id=f"{root_run_id}-stream",
+            )
+        )
+
+    frames = broker.subscribe("target").poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == _idle_cursor("known-evicted", "target", 1)
+
+
+def test_existing_subscription_reports_eviction_before_first_poll() -> None:
+    broker = LiveModelStreamBroker(generation="evicted", max_roots=1)
+    writer = broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    writer.push(ModelStreamDelta(channel="output", text="lost-prefix"))
+    subscription = broker.subscribe("target")
+
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "cursor_gap"
+    assert frames[0].cursor == _idle_cursor("evicted", "target", 1)
+    assert frames[0].oldest_available_cursor is None
+    assert frames[0].latest_cursor == str(_idle_cursor("evicted", "target", 1))
+    assert subscription.poll() == ()
+    assert broker.buffered_root_count == 1
+
+
+@pytest.mark.parametrize(
+    ("after_cursor", "reason"),
+    [
+        ("previous-generation:4", "generation_changed"),
+        ("eviction-reason:4", "cursor_ahead"),
+    ],
+)
+def test_eviction_preserves_unconsumed_cursor_reset_reason(
+    after_cursor: str,
+    reason: str,
+) -> None:
+    broker = LiveModelStreamBroker(generation="eviction-reason", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    subscription = broker.subscribe("target", after_cursor=after_cursor)
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == reason
+    assert frames[0].cursor == _idle_cursor("eviction-reason", "target", 1)
+    assert frames[0].latest_cursor == str(_idle_cursor("eviction-reason", "target", 1))
+
+
+def test_caught_up_subscription_reports_later_eviction_while_behind() -> None:
+    broker = LiveModelStreamBroker(generation="behind", max_roots=1)
+    writer = broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    subscription = broker.subscribe("target")
+    assert [frame.kind for frame in subscription.poll()] == ["opened"]
+
+    writer.push(ModelStreamDelta(channel="output", text="unread-tail"))
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "cursor_gap"
+    assert frames[0].cursor == _idle_cursor("behind", "target", 1)
+    assert frames[0].latest_cursor == str(_idle_cursor("behind", "target", 1))
+
+
+def test_blocking_subscription_wakes_when_its_ring_is_evicted() -> None:
+    broker = LiveModelStreamBroker(generation="eviction-wake", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    subscription = broker.subscribe("target", after_cursor="eviction-wake:1")
+    completed = threading.Event()
+    received: list[LiveModelStreamFrame] = []
+
+    def wait_for_eviction() -> None:
+        received.extend(subscription.poll(timeout_s=2))
+        completed.set()
+
+    thread = threading.Thread(target=wait_for_eviction)
+    thread.start()
+    time.sleep(0.02)
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+
+    assert completed.wait(1)
+    thread.join(timeout=1)
+    assert [frame.kind for frame in received] == ["reset"]
+    assert received[0].cursor == _idle_cursor("eviction-wake", "target", 1)
+
+
+def test_recreated_ring_supersedes_pending_eviction_notice() -> None:
+    broker = LiveModelStreamBroker(generation="recreated", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-first")
+    )
+    subscription = broker.subscribe("target", after_cursor="recreated:1")
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-second")
+    )
+
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset", "opened"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == LiveModelStreamCursor("recreated.3", 0)
+    assert frames[1].cursor == LiveModelStreamCursor("recreated.3", 1)
+
+
+def test_latest_eviction_watermark_supersedes_an_unpolled_notice() -> None:
+    broker = LiveModelStreamBroker(generation="repeated", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-first")
+    )
+    subscription = broker.subscribe("target", after_cursor="repeated:1")
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-first")
+    )
+    writer = broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-second")
+    )
+    writer.push(ModelStreamDelta(channel="output", text="newer-lost-prefix"))
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-second")
+    )
+
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == _idle_cursor("repeated", "target", 3)
+    assert frames[0].latest_cursor == str(_idle_cursor("repeated", "target", 3))
+
+
+def test_reconnect_after_missed_eviction_resets_once_to_idle_cursor() -> None:
+    broker = LiveModelStreamBroker(generation="reconnect", max_roots=1)
+    writer = broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-first")
+    )
+    writer.push(ModelStreamDelta(channel="output", text="missed-before-disconnect"))
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+
+    reconnected = broker.subscribe("target", after_cursor="reconnect:1")
+    frames = reconnected.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == _idle_cursor("reconnect", "target", 1)
+    assert frames[0].latest_cursor == str(_idle_cursor("reconnect", "target", 1))
+    reconnected.close()
+
+    hydrated = broker.subscribe("target", after_cursor=str(frames[0].cursor))
+    assert hydrated.poll() == ()
+
+
+def test_reconnect_detects_a_newer_same_root_eviction_epoch() -> None:
+    broker = LiveModelStreamBroker(generation="epoch-race", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-first")
+    )
+    first_subscription = broker.subscribe("target")
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-first")
+    )
+    first_reset = first_subscription.poll()[0]
+    assert first_reset.cursor == _idle_cursor("epoch-race", "target", 1)
+    first_subscription.close()
+
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-second")
+    )
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-second")
+    )
+    reconnected = broker.subscribe("target", after_cursor=str(first_reset.cursor))
+    second_reset = reconnected.poll()[0]
+
+    assert second_reset.reason == "cursor_gap"
+    assert second_reset.cursor == _idle_cursor("epoch-race", "target", 3)
+    reconnected.close()
+    assert broker.subscribe("target", after_cursor=str(second_reset.cursor)).poll() == ()
+
+
+def test_idle_acknowledgement_is_bound_to_its_root() -> None:
+    broker = LiveModelStreamBroker(generation="root-bound", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    target_subscription = broker.subscribe("target")
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    target_reset = target_subscription.poll()[0]
+
+    wrong_root = broker.subscribe("different", after_cursor=str(target_reset.cursor))
+    frames = wrong_root.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == _idle_cursor("root-bound", "different", 1)
+    assert frames[0].cursor != target_reset.cursor
+
+
+def test_unrelated_evictions_do_not_stale_an_idle_acknowledgement() -> None:
+    broker = LiveModelStreamBroker(generation="root-local", max_roots=3)
+    initial = broker.subscribe("target", after_cursor="previous:4").poll()[0]
+    assert initial.cursor == _idle_cursor("root-local", "target", 0)
+
+    for root_run_id in ("other-a", "other-b", "other-c", "other-d"):
+        broker.observer(root_run_id).open(
+            _context(
+                root_run_id=root_run_id,
+                run_id=root_run_id,
+                stream_id=f"{root_run_id}-stream",
+            )
+        )
+
+    reconnected = broker.subscribe("target", after_cursor=str(initial.cursor))
+    assert reconnected.poll() == ()
+
+
+def test_forgotten_tombstone_uses_current_epoch_instead_of_reusing_zero() -> None:
+    broker = LiveModelStreamBroker(generation="forgotten", max_roots=1)
+    initial = broker.subscribe("target", after_cursor="previous:4").poll()[0]
+    assert initial.cursor == _idle_cursor("forgotten", "target", 0)
+
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    broker.observer("other-a").open(
+        _context(root_run_id="other-a", run_id="other-a", stream_id="other-a-stream")
+    )
+    broker.observer("other-b").open(
+        _context(root_run_id="other-b", run_id="other-b", stream_id="other-b-stream")
+    )
+    reconnected = broker.subscribe("target", after_cursor=str(initial.cursor))
+    frames = reconnected.poll()
+
+    assert [frame.kind for frame in frames] == ["reset"]
+    assert frames[0].reason == "cursor_gap"
+    assert frames[0].cursor == _idle_cursor("forgotten", "target", 2)
+    reconnected.close()
+    assert broker.subscribe("target", after_cursor=str(frames[0].cursor)).poll() == ()
+
+
+def test_emitted_ack_survives_tombstone_churn_before_poll() -> None:
+    broker = LiveModelStreamBroker(generation="ack-current", max_roots=1)
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+    subscription = broker.subscribe("target")
+    broker.observer("other-a").open(
+        _context(root_run_id="other-a", run_id="other-a", stream_id="other-a-stream")
+    )
+    broker.observer("other-b").open(
+        _context(root_run_id="other-b", run_id="other-b", stream_id="other-b-stream")
+    )
+
+    reset = subscription.poll()[0]
+
+    assert reset.cursor == _idle_cursor("ack-current", "target", 2)
+    assert len(broker._eviction_epochs) == broker.max_roots
+    subscription.close()
+    assert broker.subscribe("target", after_cursor=str(reset.cursor)).poll() == ()
+
+
+def test_idle_cursor_transitions_to_a_recreated_ring_without_a_reset_loop() -> None:
+    broker = LiveModelStreamBroker(generation="idle-replay", max_roots=1)
+    broker.observer("other").open(
+        _context(root_run_id="other", run_id="other", stream_id="other-stream")
+    )
+    subscription = broker.subscribe(
+        "target",
+        after_cursor=str(_idle_cursor("idle-replay", "target", 0)),
+    )
+    broker.observer("target").open(
+        _context(root_run_id="target", run_id="target", stream_id="target-stream")
+    )
+
+    frames = subscription.poll()
+
+    assert [frame.kind for frame in frames] == ["reset", "opened"]
+    assert frames[0].reason == "generation_changed"
+    assert frames[0].cursor == LiveModelStreamCursor("idle-replay.2", 0)
+    assert frames[1].cursor == LiveModelStreamCursor("idle-replay.2", 1)
 
 
 def test_readers_do_not_change_publication_lru_order() -> None:

@@ -12,6 +12,7 @@ writers and other subscribers continue independently.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -240,10 +241,13 @@ class LiveModelStreamBroker:
         self.max_roots = max_roots
         self._condition = threading.Condition(threading.RLock())
         self._rings: OrderedDict[str, _RootRing] = OrderedDict()
+        self._subscriptions: weakref.WeakSet[LiveModelStreamSubscription] = weakref.WeakSet()
         self._pending_subscriptions: weakref.WeakSet[LiveModelStreamSubscription] = (
             weakref.WeakSet()
         )
         self._ring_serial = 0
+        self._eviction_serial = 0
+        self._eviction_epochs: OrderedDict[str, int] = OrderedDict()
         self._closed = False
 
     @property
@@ -263,7 +267,9 @@ class LiveModelStreamBroker:
                 return
             self._closed = True
             self._rings.clear()
+            self._subscriptions.clear()
             self._pending_subscriptions.clear()
+            self._eviction_epochs.clear()
             self._condition.notify_all()
 
     def observer(self, root_run_id: str | None = None) -> LiveModelStreamObserver:
@@ -287,7 +293,15 @@ class LiveModelStreamBroker:
             # Subscriptions are passive readers.  Creating or promoting a publication ring here
             # lets historical/idle readers evict a root that is actively carrying content.
             ring = None if self._closed else self._rings.get(root_run_id)
-            await_initial_generation = after_cursor is None and ring is None and not self._closed
+            known_missing_ring = (
+                ring is None and root_run_id in self._eviction_epochs and not self._closed
+            )
+            await_initial_generation = (
+                after_cursor is None
+                and ring is None
+                and not known_missing_ring
+                and not self._closed
+            )
             # A first-time client may connect after execution has already started.  Replay the
             # retained ring; an evicted prefix produces a reset frame so Studio can hydrate.
             if after_cursor is None:
@@ -299,15 +313,25 @@ class LiveModelStreamBroker:
                 cursor = after_cursor
             else:
                 cursor = LiveModelStreamCursor.parse(after_cursor)
+            idle_cursor = self._idle_cursor_locked(root_run_id)
+            reset_missing_cursor = (
+                ring is None
+                and not self._closed
+                and (known_missing_ring if after_cursor is None else cursor != idle_cursor)
+            )
             subscription = LiveModelStreamSubscription(
                 self,
                 root_run_id=root_run_id,
                 cursor=cursor,
+                observed_generation=None if ring is None else ring.generation,
+                adopt_initial_generation=await_initial_generation,
+                reset_missing_cursor=reset_missing_cursor,
             )
-            if await_initial_generation:
-                # Bind an implicit pre-publication cursor when publication creates its first ring,
-                # rather than whichever generation the reader happens to observe on its first
-                # poll.  The weak set keeps passive subscription lifetime outside ring ownership.
+            if not self._closed:
+                self._subscriptions.add(subscription)
+            if ring is None and not self._closed:
+                # Observe the first publication even when it is evicted before this reader polls.
+                # Only an implicit pre-publication cursor adopts that ring without a reset.
                 self._pending_subscriptions.add(subscription)
             if self._closed:
                 subscription._closed = True
@@ -338,7 +362,9 @@ class LiveModelStreamBroker:
 
         _validate_root_run_id(root_run_id)
         with self._condition:
-            self._rings.pop(root_run_id, None)
+            ring = self._rings.pop(root_run_id, None)
+            if ring is not None:
+                self._mark_ring_evicted_locked(root_run_id, ring)
             self._condition.notify_all()
 
     @property
@@ -426,7 +452,7 @@ class LiveModelStreamBroker:
                 # before a call starts without consuming a root slot or changing eviction order.
                 ring = self._rings.get(subscription.root_run_id)
                 if ring is None:
-                    frames = ()
+                    frames = self._collect_missing_ring_locked(subscription)
                 else:
                     frames = self._collect_locked(subscription, ring, limit=limit)
                 if frames or timeout_s == 0:
@@ -443,6 +469,11 @@ class LiveModelStreamBroker:
         *,
         limit: int | None,
     ) -> tuple[LiveModelStreamFrame, ...]:
+        subscription._observed_generation = ring.generation
+        subscription._evicted_cursor = None
+        subscription._adopt_initial_generation = False
+        subscription._reset_missing_cursor = False
+        self._pending_subscriptions.discard(subscription)
         output: list[LiveModelStreamFrame] = []
         cursor = subscription._cursor
         oldest = ring.frames[0][0].sequence if ring.frames else ring.latest_sequence + 1
@@ -511,6 +542,53 @@ class LiveModelStreamBroker:
             )
         return tuple(output)
 
+    def _collect_missing_ring_locked(
+        self,
+        subscription: LiveModelStreamSubscription,
+    ) -> tuple[LiveModelStreamFrame, ...]:
+        evicted_cursor = subscription._evicted_cursor
+        if evicted_cursor is None and not subscription._reset_missing_cursor:
+            return ()
+        if evicted_cursor is None:
+            idle_cursor = self._idle_cursor_locked(subscription.root_run_id)
+            if subscription._cursor.generation != idle_cursor.generation:
+                reason: LiveModelStreamResetReason = "generation_changed"
+            elif subscription._cursor.sequence > idle_cursor.sequence:
+                reason = "cursor_ahead"
+            else:
+                reason = "cursor_gap"
+        else:
+            idle_cursor = self._idle_cursor_locked(subscription.root_run_id)
+            if subscription._cursor.generation != evicted_cursor.generation:
+                reason = "generation_changed"
+            elif subscription._cursor.sequence > evicted_cursor.sequence:
+                reason = "cursor_ahead"
+            else:
+                reason = "cursor_gap"
+        # The root-bound idle cursor acknowledges that no replay ring exists.  It makes a
+        # reconnect after hydration distinguishable from a client that missed this reset when its
+        # previous subscription disconnected.  A bounded acknowledgement table advances the
+        # cursor across later losses without letting readers allocate or promote rings.
+        subscription._cursor = idle_cursor
+        subscription._evicted_cursor = None
+        subscription._observed_generation = None
+        subscription._adopt_initial_generation = False
+        subscription._reset_missing_cursor = False
+        self._remember_eviction_epoch_locked(
+            subscription.root_run_id,
+            idle_cursor.sequence,
+        )
+        self._pending_subscriptions.add(subscription)
+        return (
+            LiveModelStreamFrame(
+                kind="reset",
+                cursor=idle_cursor,
+                root_run_id=subscription.root_run_id,
+                reason=reason,
+                latest_cursor=str(idle_cursor),
+            ),
+        )
+
     def _reset_frame(
         self,
         root_run_id: str,
@@ -536,6 +614,7 @@ class LiveModelStreamBroker:
     def _close_subscription(self, subscription: LiveModelStreamSubscription) -> None:
         with self._condition:
             subscription._closed = True
+            self._subscriptions.discard(subscription)
             self._pending_subscriptions.discard(subscription)
             self._condition.notify_all()
 
@@ -560,19 +639,56 @@ class LiveModelStreamBroker:
         )
         ring = _RootRing(generation=generation)
         self._rings[root_run_id] = ring
-        evicted = False
+        self._eviction_epochs.pop(root_run_id, None)
         while len(self._rings) > self.max_roots:
-            self._rings.popitem(last=False)
-            evicted = True
-        if evicted:
+            evicted_root_run_id, evicted_ring = self._rings.popitem(last=False)
+            self._mark_ring_evicted_locked(evicted_root_run_id, evicted_ring)
             self._condition.notify_all()
         for subscription in tuple(self._pending_subscriptions):
             if subscription.root_run_id != root_run_id:
                 continue
             self._pending_subscriptions.discard(subscription)
             if not subscription._closed:
-                subscription._cursor = LiveModelStreamCursor(generation, 0)
+                subscription._observed_generation = generation
+                if subscription._adopt_initial_generation:
+                    subscription._cursor = LiveModelStreamCursor(generation, 0)
+                    subscription._adopt_initial_generation = False
         return ring
+
+    def _mark_ring_evicted_locked(self, root_run_id: str, ring: _RootRing) -> None:
+        self._eviction_serial += 1
+        eviction_epoch = self._eviction_serial
+        self._remember_eviction_epoch_locked(root_run_id, eviction_epoch)
+        evicted_cursor = LiveModelStreamCursor(ring.generation, ring.latest_sequence)
+        for subscription in tuple(self._subscriptions):
+            if (
+                not subscription._closed
+                and subscription.root_run_id == root_run_id
+                and subscription._observed_generation == ring.generation
+            ):
+                subscription._evicted_cursor = evicted_cursor
+                subscription._reset_missing_cursor = False
+                # Track a replacement that may itself disappear before the reader polls.  Its
+                # newer eviction watermark then supersedes this notice without retaining either
+                # ring; the bounded epoch table preserves reconnect acknowledgement separately.
+                self._pending_subscriptions.add(subscription)
+
+    def _remember_eviction_epoch_locked(self, root_run_id: str, epoch: int) -> None:
+        self._eviction_epochs[root_run_id] = epoch
+        self._eviction_epochs.move_to_end(root_run_id)
+        while len(self._eviction_epochs) > self.max_roots:
+            self._eviction_epochs.popitem(last=False)
+
+    def _idle_cursor_locked(
+        self,
+        root_run_id: str,
+    ) -> LiveModelStreamCursor:
+        root_digest = hashlib.sha256(root_run_id.encode("utf-8")).hexdigest()
+        resolved_epoch = self._eviction_epochs.get(root_run_id, self._eviction_serial)
+        return LiveModelStreamCursor(
+            f"{self.generation}.idle.{root_digest}",
+            resolved_epoch,
+        )
 
 
 class LiveModelStreamObserver(ModelStreamObserver):
@@ -659,10 +775,17 @@ class LiveModelStreamSubscription:
         *,
         root_run_id: str,
         cursor: LiveModelStreamCursor,
+        observed_generation: str | None,
+        adopt_initial_generation: bool,
+        reset_missing_cursor: bool,
     ) -> None:
         self._broker = broker
         self.root_run_id = root_run_id
         self._cursor = cursor
+        self._observed_generation = observed_generation
+        self._evicted_cursor: LiveModelStreamCursor | None = None
+        self._adopt_initial_generation = adopt_initial_generation
+        self._reset_missing_cursor = reset_missing_cursor
         self._closed = False
 
     @property
