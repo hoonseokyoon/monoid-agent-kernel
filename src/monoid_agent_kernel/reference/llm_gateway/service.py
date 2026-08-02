@@ -111,7 +111,7 @@ class LlmGatewayBackend:
 
     def handle_turn(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         claims = self._authorize(token)
-        payload = normalize_json_ingress(payload)
+        payload = _normalized_turn_payload(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         # By-value carries the full conversation as messages → forward statelessly, no
@@ -177,7 +177,7 @@ class LlmGatewayBackend:
         ``turn_complete`` frame is yielded.
         """
         claims = self._authorize(token)
-        payload = normalize_json_ingress(payload)
+        payload = _normalized_turn_payload(payload)
         request = _parse_turn_request(payload)
         self._validate_request_against_claims(request, claims)
         provider_previous_response_id = (
@@ -208,66 +208,78 @@ class LlmGatewayBackend:
         model_request: ModelRequest,
     ) -> Iterator[dict[str, Any]]:
         collected: list[ModelStreamChunk] = []
-        astream_turn = getattr(adapter, "astream_turn", None)
-        if astream_turn is not None:
-            ingress = ModelStreamIngressNormalizer()
-            try:
-                for provider_chunk in _pump_astream(astream_turn, model_request):
-                    for chunk in ingress.normalize(provider_chunk):
+        try:
+            astream_turn = getattr(adapter, "astream_turn", None)
+            if astream_turn is not None:
+                ingress = ModelStreamIngressNormalizer()
+                try:
+                    for provider_chunk in _pump_astream(astream_turn, model_request):
+                        for chunk in ingress.normalize(provider_chunk):
+                            collected.append(chunk)
+                            frame = _chunk_to_frame(chunk)
+                            if frame is not None:
+                                yield frame
+                except BaseException:
+                    for chunk in ingress.finish():
                         collected.append(chunk)
                         frame = _chunk_to_frame(chunk)
                         if frame is not None:
                             yield frame
-            except BaseException:
+                    raise
                 for chunk in ingress.finish():
                     collected.append(chunk)
                     frame = _chunk_to_frame(chunk)
                     if frame is not None:
                         yield frame
-                raise
-            for chunk in ingress.finish():
-                collected.append(chunk)
-                frame = _chunk_to_frame(chunk)
-                if frame is not None:
-                    yield frame
-        else:
-            # The provider can't stream: synthesize a minimal delta sequence from the
-            # one-shot turn so consumers still see text/tool frames before turn_complete.
-            turn = normalize_model_turn(adapter.next_turn(model_request))
-            # The synthesized chunks carry the turn's retry evidence too. They stand in for a
-            # stream the provider could not produce, so anything the turn reports about the call
-            # has to survive the substitution.
-            if turn.final_text:
-                chunk: ModelStreamChunk = TextDelta(
-                    turn.final_text, provider_retried=turn.provider_retried
+            else:
+                # The provider can't stream: synthesize a minimal delta sequence from the
+                # one-shot turn so consumers still see text/tool frames before turn_complete.
+                turn = normalize_model_turn(adapter.next_turn(model_request))
+                # The synthesized chunks carry the turn's retry evidence too. They stand in for a
+                # stream the provider could not produce, so anything the turn reports about the call
+                # has to survive the substitution.
+                if turn.final_text:
+                    chunk: ModelStreamChunk = TextDelta(
+                        turn.final_text, provider_retried=turn.provider_retried
+                    )
+                    collected.append(chunk)
+                    yield _chunk_to_frame(chunk)
+                for index, call in enumerate(turn.tool_calls):
+                    chunk = ToolCallDelta(
+                        index=index,
+                        arguments_fragment=json.dumps(
+                            call.arguments,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        id=call.id,
+                        name=call.name,
+                        provider_retried=turn.provider_retried,
+                    )
+                    collected.append(chunk)
+                    yield _chunk_to_frame(chunk)
+                collected.append(
+                    TurnComplete(
+                        response_id=turn.response_id,
+                        usage=turn.usage,
+                        stop_reason=turn.stop_reason,
+                        provider_retried=turn.provider_retried,
+                    )
                 )
-                collected.append(chunk)
-                yield _chunk_to_frame(chunk)
-            for index, call in enumerate(turn.tool_calls):
-                chunk = ToolCallDelta(
-                    index=index,
-                    arguments_fragment=json.dumps(
-                        call.arguments,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                    ),
-                    id=call.id,
-                    name=call.name,
-                    provider_retried=turn.provider_retried,
-                )
-                collected.append(chunk)
-                yield _chunk_to_frame(chunk)
-            collected.append(
-                TurnComplete(
-                    response_id=turn.response_id,
-                    usage=turn.usage,
-                    stop_reason=turn.stop_reason,
-                    provider_retried=turn.provider_retried,
-                )
-            )
-        # Assemble once: the same usage drives both the meter and the outgoing frame, and the
-        # assembled response id is what the opaque turn_handle maps to for continuation.
-        turn = normalize_model_turn(assemble_streamed_turn(collected))
+            # Assemble once: the same usage drives both the meter and the outgoing frame, and the
+            # assembled response id is what the opaque turn_handle maps to for continuation.
+            turn = normalize_model_turn(assemble_streamed_turn(collected))
+        except ModelAdapterError as failed:
+            # The streaming twin of handle_turn's failure meter: a refusal can arrive *after*
+            # the upstream produced and billed an answer (a chained hop's proof refusal is
+            # exactly that), and this generator exits on the raise before the success-path
+            # meter below -- so the billed tokens left the tenant ledger entirely on this
+            # transport while the sync twin metered them. One handler around both sub-branches
+            # (the astream drive and the non-streaming fallback); ``provider_usage_of`` reads
+            # {} for an unbilled failure and ``_meter`` skips empty usage, so it stays a no-op
+            # there.
+            self._meter(claims.tenant_id, provider_usage_of(failed))
+            raise
         turn_handle = self._record_turn(claims, request, turn)
         self._meter(claims.tenant_id, turn.usage)
         frame = {
@@ -360,6 +372,26 @@ class LlmGatewayBackend:
                 created_at=time.time(),
             )
         return turn_handle
+
+
+def _normalized_turn_payload(payload: dict[str, Any]) -> Any:
+    """The server-side ingress rule, matching the client's exactly.
+
+    The blanket normalize substitutes non-finite *content* values; ``output_schema`` is
+    config, not content -- the client ingress keeps it verbatim
+    (``normalize_model_request``, ``substitute_nonfinite=False``) so a non-finite value is
+    *refused* downstream rather than silently rewritten into a different constraint. Riding
+    the blanket normalize here turned the caller's ``NaN`` into ``null`` before the upstream
+    adapter ever saw it -- the exact rewrite the rule exists to rule out, on the one route
+    (in-process Python callers) the JSON parsers don't guard. One function, both handlers.
+    """
+
+    normalized = normalize_json_ingress(payload)
+    if isinstance(normalized, dict) and normalized.get("output_schema") is not None:
+        normalized["output_schema"] = normalize_json_ingress(
+            payload.get("output_schema"), substitute_nonfinite=False
+        )
+    return normalized
 
 
 def _upstream_model_config(request: LlmGatewayTurnRequest) -> ModelConfig:

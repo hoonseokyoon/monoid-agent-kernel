@@ -149,7 +149,11 @@ The run lifecycle is:
   `turn_failed` park to the terminal failure record, and that failed
   `AgentRunResult` is the return value — for `turn_failed` only, the one park
   `close()` can promote; an `interrupted` or `paused` park has no record to
-  return as, so it surfaces as `TurnNotSettled` after the same close.
+  return as, so it surfaces as `TurnNotSettled` after the same close. That
+  raise is the *only* signal for those two parks: the run record still
+  finalizes `completed` (a user stop is not a failure) and the completed-run
+  cleanup deletes its checkpoints — a caller that wants to resume an
+  interrupted turn uses the multi-turn facades, where the session stays alive.
   `close()` performs the same promotion
   for any driver (the explicit form is `fail_recoverable`): a run closed on an
   unrecovered recoverable failure finalizes `failed` with `failure.json`

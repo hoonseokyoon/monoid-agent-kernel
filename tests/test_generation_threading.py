@@ -998,6 +998,68 @@ def test_billed_usage_survives_the_gateway_hop(monkeypatch: pytest.MonkeyPatch) 
     assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
 
 
+def test_a_billed_failure_is_metered_on_the_stream_transport_too() -> None:
+    """The sync twin (`handle_turn`) meters a billed refusal before re-raising; `_stream_turn`
+    exited on the raise before its success-path meter, so the same refused call left the
+    tenant ledger at zero on this transport — on both its sub-branches (the astream drive
+    and the non-streaming fallback)."""
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    _BILLED_LOCAL = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+    class _BilledRefusal:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            error = ModelAdapterError(
+                "upstream refused an unproven billed turn",
+                provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
+                retryable=False,
+                config_recoverable=True,
+            )
+            mark_provider_usage(error, dict(_BILLED_LOCAL))
+            raise error
+
+    class _BilledStreamRefusal(_BilledRefusal):
+        async def astream_turn(self, request: ModelRequest):
+            self.next_turn(request)
+            yield  # pragma: no cover — next_turn always raises
+
+    for upstream in (_BilledRefusal(), _BilledStreamRefusal()):
+        manager = _token_manager()
+        backend = LlmGatewayBackend(
+            token_manager=manager,
+            provider_adapter_factory=lambda _claims, _config, _u=upstream: _u,
+        )
+        with pytest.raises(ModelAdapterError):
+            list(
+                backend.handle_turn_stream(
+                    _llm_token(manager), _turn_payload(generation=dict(_SET_WIRE))
+                )
+            )
+        assert backend.tenant_usage("tenant_a")["total_tokens"] == 460, type(upstream).__name__
+
+
+def test_a_malformed_echo_on_a_billed_frame_keeps_the_cost() -> None:
+    """The sync transport validates the echo inside the stamped check block, so a malformed
+    echo on a billed 200 response raises `gateway_bad_response` WITH `provider_usage`; the
+    stream-frame parser raised at parse time, before any stamp could run — the same money,
+    gone on one of two transports."""
+
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event
+
+    with pytest.raises(ModelAdapterError) as bad:
+        _chunk_from_event(
+            {
+                "type": "turn_complete",
+                "turn_handle": "t1",
+                "usage": dict(_BILLED),
+                "generation_applied": [1, 2],
+            }
+        )
+    assert bad.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert getattr(bad.value, "provider_usage", None) == _BILLED
+
+
 def test_a_gateway_error_that_cost_nothing_keeps_its_wire_shape() -> None:
     """The counterweight to the hop fix: an error the gateway raised on its own reached no
     provider, so its envelope must be byte-identical to what it was before ``usage`` existed

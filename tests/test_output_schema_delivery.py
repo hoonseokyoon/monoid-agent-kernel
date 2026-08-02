@@ -336,6 +336,33 @@ def test_gateway_service_stream_terminal_frame_echoes_schema_applied() -> None:
     assert "schema_applied" not in plain[-1]
 
 
+def test_the_server_never_rewrites_the_schema_it_forwards() -> None:
+    """'Never rewrites' includes the server's own ingress. The blanket request normalize
+    substitutes non-finite content values, and `output_schema` riding it was silently
+    rewritten (`NaN` → `None`) — enforcing a *different* constraint than the caller wrote,
+    the exact rewrite the client-side rule (normalize_model_request,
+    substitute_nonfinite=False) exists to refuse. Live path: in-process Python callers —
+    HTTP bodies already reject non-finite constants at the JSON parser."""
+
+    import math
+
+    upstream = _NativeUpstream()
+    backend, manager = _backend(upstream)
+    hostile = {"type": "number", "maximum": float("nan")}
+
+    backend.handle_turn(_llm_token(manager), _turn_payload(output_schema=dict(hostile)))
+    forwarded = upstream.requests[0].output_schema
+    assert forwarded is not None and math.isnan(forwarded["maximum"])
+
+    list(
+        backend.handle_turn_stream(
+            _llm_token(manager), _turn_payload(output_schema=dict(hostile))
+        )
+    )
+    forwarded_stream = upstream.requests[1].output_schema
+    assert forwarded_stream is not None and math.isnan(forwarded_stream["maximum"])
+
+
 # --- the standalone executor: parsed + fallback -----------------------------------------
 
 

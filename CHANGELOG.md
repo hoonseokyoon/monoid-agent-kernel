@@ -158,12 +158,33 @@ out in commit messages and here.
   wire shape), all three client error readers stamp it back onto the reconstructed exception,
   and the gateway meters the call against the tenant before re-raising instead of losing it to
   the raise.
-- **`run_once` no longer reports an interrupted run as a success.** It absorbs a non-settling
-  park because `close()` turns it into the record that *is* the call's result — but `close()`
-  promotes only `turn_failed`. An `interrupted` or `paused` park produced no record, so the run
-  finalized `completed` with no settled answer (and the completed-run cleanup deleted the
-  checkpoints the park had preserved). Only the park `close()` can promote is absorbed; the
-  others surface as `TurnNotSettled` after the same close.
+- **`run_once` no longer *returns* an interrupted run as a success.** It absorbs a
+  non-settling park because `close()` turns it into the record that *is* the call's result —
+  but `close()` promotes only `turn_failed`. An `interrupted`/`paused` park has no failure to
+  promote, so absorbing it returned a `completed` result for a run with no settled answer.
+  Only the park `close()` can promote is absorbed; the others surface as `TurnNotSettled`
+  after the same close. Note the scope honestly: the typed raise is the *only* signal — the
+  one-shot's closing `finally` still finalizes the run record `completed` (a user stop is not
+  a failure) and the completed-run cleanup still deletes its checkpoints. A caller that wants
+  to resume an interrupted turn uses the multi-turn facades (`open`/`submit`/`close`), where
+  the session stays alive.
+
+### Fixed — pre-merge twin census over the whole PR surface
+
+- A three-dimension twin census (transport/topology, facade/lifecycle carriers,
+  adapter/shape/codec) swept every fact this PR introduced for the branch's dominant defect
+  shape — a rule bound on N−1 of its N parallel sites — and found three unbound cells, all in
+  the newest commits no external round had reviewed:
+  the tenant ledger metered a billed failure on `/turns` but not on `/turns/stream` (both
+  stream sub-branches; the sync twin was test-pinned, the stream twin untested);
+  a malformed applied-echo on a *billed* terminal frame raised `gateway_bad_response` without
+  the frame's own `usage`, while the sync transport stamped it;
+  and the reference server's blanket ingress normalize rewrote non-finite `output_schema`
+  values (`NaN` → `null`) that the client-side rule keeps verbatim precisely so they are
+  refused rather than silently turned into a different constraint (live only for in-process
+  Python callers — HTTP bodies reject the constants at the JSON parser). All three fixed at
+  shared seams (`_stream_turn`'s one failure meter; the frame parser stamps before
+  re-raising; `_normalized_turn_payload` shared by both handlers).
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 

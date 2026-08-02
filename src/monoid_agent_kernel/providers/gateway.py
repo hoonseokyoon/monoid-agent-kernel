@@ -1234,12 +1234,22 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
     if event_type == "turn_complete":
         # Same shape rule the sync response is held to; the enforcement functions call these
         # too, so neither transport can be stricter than the other.
-        applied = _validated_generation_echo(
-            event.get("generation_applied"), provider_retried=retried
-        )
-        schema_applied = _validated_schema_echo(
-            event.get("schema_applied"), provider_retried=retried
-        )
+        try:
+            applied = _validated_generation_echo(
+                event.get("generation_applied"), provider_retried=retried
+            )
+            schema_applied = _validated_schema_echo(
+                event.get("schema_applied"), provider_retried=retried
+            )
+        except ModelAdapterError as malformed:
+            # A malformed echo on a *billed* frame still cost the tokens the same frame
+            # reports. The sync twin validates inside the stamped check block, so its
+            # ``gateway_bad_response`` carries ``provider_usage``; raising here at parse
+            # time, before any stamp, lost the same money on one of two transports. Read
+            # leniently -- a second malformation in ``usage`` must not replace the failure
+            # being reported.
+            mark_provider_usage(malformed, _reported_error_usage(event))
+            raise
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
             generation_applied=applied,
