@@ -33,12 +33,18 @@ const {
   projectSubagentStarted,
 } = await import(moduleUrl);
 
-// App-level ownership: a durable terminal boundary cancels pending hydration/reconnect work. A
-// retry/recovery can reopen the same run. The sessions high-watermark, rather than the narrower
-// chat cursor, fences the complete committed prefix for a process-lost recoverable run.
+// App-level ownership: a durable terminal boundary stops live reconnects while allowing a pending
+// private snapshot to reach its terminal state. A retry/recovery can reopen the same run. The
+// sessions high-watermark, rather than the narrower chat cursor, fences the complete committed
+// prefix for a process-lost recoverable run.
 assert.match(appSource, /const replayedThrough = run\.lastSeq;/);
 assert.match(appSource, /event\.seq <= Math\.max\(run\.replayCursor, replayedThrough\)/);
 assert.match(appSource, /const initialReplayEvent = isInitialReplayEvent\(event, initialReplayBoundary\);/);
+assert.match(
+  appSource,
+  /const hasAuthoritativeInitialReplayBoundary = initialReplayThrough !== undefined;[\s\S]*?const terminalAtInitialTail = hasAuthoritativeInitialReplayBoundary\s+&& !recoveryReplayFenced\s+&& !modelStreamRunTerminal\s+&& typeof event\.seq === "number"\s+&& event\.seq >= initialReplayBoundary;\s+const runTerminalNeedsFence = runTerminal\s+&& \(!eventAlreadyProjected \|\| terminalAtInitialTail\);/,
+  "a terminal event at a stale initial sessions tail must be fenced without reviving older retry history",
+);
 assert.match(
   appSource,
   /const live = \(await studioApi\.sessions\(\)\)\.sessions\.find\([\s\S]*?summary: live \?\? cached,\s*exact: live !== undefined,[\s\S]*?\} catch \{\s*return \{ summary: cached, exact: false \};/,
@@ -67,9 +73,38 @@ assert.match(
   /handleSubagentLifecycle\(\s*event,\s*parentRunId,\s*epoch,\s*childRunId,\s*poller\.historicalTraceDrain,\s*poller\.historicalTraceDrain,/,
   "a recovered child trace drain must keep nested child lifecycle events behind the recovery fence",
 );
-assert.match(appSource, /if \(!eventAlreadyProjected && runTerminal\)/);
-assert.match(appSource, /modelStreamRunTerminal = true;\s+modelStreamHydrationKey = null;/);
-assert.match(appSource, /if \(modelStreamRunTerminal\s+\|\| modelStreamRecoveryFenced\s+\|\| modelStreamHydrationKey === key/);
+assert.match(appSource, /if \(runTerminalNeedsFence\)/);
+assert.match(appSource, /let modelStreamSnapshotPending = false;/);
+assert.match(
+  appSource,
+  /modelStreamRunTerminal = true;\s+modelStreamSnapshotPending = config\.model_stream_enabled === true;\s+const terminalHydrationKey = modelStreamHydrationKeyFor\(epoch, "terminal"\);\s+if \(modelStreamHydrationKey !== terminalHydrationKey\) \{\s+modelStreamHydrationKey = null;/,
+  "a terminal boundary must require a final snapshot and cancel only live hydration",
+);
+assert.match(
+  appSource,
+  /if \(modelStreamSnapshotPending\) \{\s+void rehydrateModelStream\(runId, epoch, "terminal"\);/,
+  "a terminal boundary must carry pending private snapshot hydration across the SSE fence",
+);
+assert.match(
+  appSource,
+  /return hydrationMode === "terminal"\s+\? modelStreamRunTerminal && modelStreamSnapshotPending\s+: !modelStreamRunTerminal && !modelStreamRecoveryFenced;/,
+  "terminal hydration and live reconnection must have separate eligibility fences",
+);
+assert.match(
+  appSource,
+  /modelStreamSnapshotPending = config\.model_stream_enabled === true[\s\S]*?!modelContentMatchesRun[\s\S]*?modelStreamRunTerminal[\s\S]*?latestRootSnapshotIsRunning\(modelContent, runId\)/,
+  "initial fetch failures and terminal snapshots that are still running must be retried",
+);
+assert.match(
+  appSource,
+  /hydrationMode === "terminal" && latestRootSnapshotIsRunning\(modelContent, runId\)[\s\S]*?modelStreamState = sealModelStreamTurn\(modelStreamState\)[\s\S]*?modelStreamSnapshotPending = false;\s+if \(hydrationMode === "live"\) openModelStream/,
+  "terminal hydration must wait for a closed snapshot, restore the terminal fence, and stay offline",
+);
+assert.match(
+  appSource,
+  /window\.setTimeout\(\(\) => void rehydrateModelStream\(runId, epoch, hydrationMode\), delay\);/,
+  "snapshot retries must preserve their live or terminal mode",
+);
 assert.match(appSource, /modelStreamRunTerminal = false;\s+modelStreamRecoveryFenced = false;\s+modelStreamState = initialModelStreamState\(runId\);/);
 assert.match(appSource, /response\.retry_of_turn_id/);
 assert.match(appSource, /discardModelStreamAttempt\(run, modelStreamState, runId, retryOfTurnId\)/);

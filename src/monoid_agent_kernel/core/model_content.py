@@ -590,7 +590,13 @@ class _RecoveredStream:
     retryable: bool = False
 
     def snapshot(self) -> ModelContentSnapshot:
-        ordered = sorted(self.segments.items())
+        # A valid segment after a malformed/missing record has no trustworthy placement offset.
+        # Preserve only the shared output/reasoning prefix proven contiguous from index zero.
+        ordered: list[tuple[int, tuple[ModelStreamChannel, str]]] = []
+        for expected_index, item in enumerate(sorted(self.segments.items())):
+            if item[0] != expected_index:
+                break
+            ordered.append(item)
         output = "".join(text for _, (channel, text) in ordered if channel == "output")
         reasoning = "".join(text for _, (channel, text) in ordered if channel == "reasoning")
         indexes = [index for index, _ in ordered]

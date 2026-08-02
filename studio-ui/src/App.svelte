@@ -40,6 +40,7 @@
     seedModelStreamSnapshot,
     seedSubagentModelContent,
     sealModelStreamTurn,
+    type ModelContentResponse,
   } from "./lib/model-stream";
   import { operationTraceEvents } from "./lib/trace";
   import type {
@@ -95,6 +96,8 @@
     built_in: true,
   };
 
+  type ModelStreamHydrationMode = "live" | "terminal";
+
   let config = $state<StudioConfig>({ workspace: "studio-workspace", provider: "offline", offline: true });
   let settings = $state<SettingsResponse>({ ...fallbackSettings });
   let profiles = $state<Profile[]>([fallbackProfile]);
@@ -123,6 +126,7 @@
   let modelStreamState = $state(initialModelStreamState());
   let modelStreamHydrationKey: string | null = null;
   let modelStreamHydrationFailures = 0;
+  let modelStreamSnapshotPending = false;
   let modelStreamRunTerminal = false;
   let modelStreamRecoveryFenced = false;
   let navigationButton = $state<HTMLButtonElement>();
@@ -593,13 +597,14 @@
   function openStream(
     runId: string,
     epoch = sessionEpoch,
-    initialReplayThrough = -1,
+    initialReplayThrough?: number,
   ): void {
     stream?.close();
     modelStream?.close();
     const replayedThrough = run.lastSeq;
     const recoveryReplayFenced = modelStreamRecoveryFenced;
-    const initialReplayBoundary = initialReplayThrough >= 0
+    const hasAuthoritativeInitialReplayBoundary = initialReplayThrough !== undefined;
+    const initialReplayBoundary = hasAuthoritativeInitialReplayBoundary
       ? initialReplayThrough
       : recoveryReplayFenced ? replayedThrough : -1;
     stream = new RunEventStream({
@@ -640,6 +645,16 @@
           && Boolean(activeTurnId)
           && event.turn_id === activeTurnId;
         const runTerminal = event.type === "run.finished" || event.type === "run.failed";
+        // The event high-watermark can expose the terminal record just before the sessions
+        // lifecycle row flips to terminal. Correct that tail race without reviving older failed
+        // attempts or a recoverable crash replay that still requires explicit activation.
+        const terminalAtInitialTail = hasAuthoritativeInitialReplayBoundary
+          && !recoveryReplayFenced
+          && !modelStreamRunTerminal
+          && typeof event.seq === "number"
+          && event.seq >= initialReplayBoundary;
+        const runTerminalNeedsFence = runTerminal
+          && (!eventAlreadyProjected || terminalAtInitialTail);
         const reducedRun = preserveHistoricalRecoveryState(
           priorRun,
           reduceRunEvent(run, event),
@@ -676,19 +691,26 @@
           // seeded by hydration or received just before its correlated durable start event.
           run = restoreActiveModelContent(run, modelStreamState);
         }
-        if (!eventAlreadyProjected && runTerminal) {
+        if (runTerminalNeedsFence) {
           modelStreamState = sealModelStreamTurn(modelStreamState);
           modelStreamRunTerminal = true;
-          modelStreamHydrationKey = null;
+          modelStreamSnapshotPending = config.model_stream_enabled === true;
+          const terminalHydrationKey = modelStreamHydrationKeyFor(epoch, "terminal");
+          if (modelStreamHydrationKey !== terminalHydrationKey) {
+            modelStreamHydrationKey = null;
+          }
         } else if (!eventAlreadyProjected
           && turnTerminal
           && !(event.type === "turn.failed" && event.data.retryable === true)
           && typeof event.turn_id === "string") {
           modelStreamState = sealModelStreamTurn(modelStreamState, event.turn_id);
         }
-        if (!eventAlreadyProjected && runTerminal) {
+        if (runTerminalNeedsFence) {
           modelStream?.close();
           modelStream = null;
+          if (modelStreamSnapshotPending) {
+            void rehydrateModelStream(runId, epoch, "terminal");
+          }
         }
         handleSubagentLifecycle(
           event,
@@ -709,6 +731,13 @@
     });
     stream.open();
     openModelStream(runId, epoch);
+    if (modelStreamSnapshotPending) {
+      void rehydrateModelStream(
+        runId,
+        epoch,
+        modelStreamRunTerminal ? "terminal" : "live",
+      );
+    }
   }
 
   async function resolveSessionSummary(runId: string): Promise<SessionSummaryResolution> {
@@ -766,15 +795,50 @@
     modelStream.open();
   }
 
-  async function rehydrateModelStream(runId: string, epoch: number): Promise<void> {
+  function modelStreamHydrationKeyFor(
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode,
+    resumeCursor: string | null = null,
+  ): string {
+    return hydrationMode === "terminal"
+      ? `${epoch}:terminal`
+      : `${epoch}:live:${resumeCursor ?? "none"}`;
+  }
+
+  function canRehydrateModelStream(
+    runId: string,
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode,
+  ): boolean {
+    if (!config.model_stream_enabled || !isCurrentSession(runId, epoch)) return false;
+    return hydrationMode === "terminal"
+      ? modelStreamRunTerminal && modelStreamSnapshotPending
+      : !modelStreamRunTerminal && !modelStreamRecoveryFenced;
+  }
+
+  function latestRootSnapshotIsRunning(
+    response: ModelContentResponse,
+    runId: string,
+  ): boolean {
+    for (let index = response.streams.length - 1; index >= 0; index -= 1) {
+      const snapshot = response.streams[index];
+      if (snapshot.run_id === runId) return snapshot.status === "running";
+    }
+    return false;
+  }
+
+  async function rehydrateModelStream(
+    runId: string,
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode = "live",
+  ): Promise<void> {
     const resumeCursor = modelStreamState.resumeCursor;
-    const key = `${epoch}:${resumeCursor ?? "none"}`;
-    if (modelStreamRunTerminal
-      || modelStreamRecoveryFenced
-      || modelStreamHydrationKey === key
-      || !isCurrentSession(runId, epoch)) return;
+    const key = modelStreamHydrationKeyFor(epoch, hydrationMode, resumeCursor);
+    if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+      || modelStreamHydrationKey === key) return;
     const durableCursor = run.lastSeq;
     modelStreamHydrationKey = key;
+    modelStreamSnapshotPending = true;
     modelStream?.close();
     modelStream = null;
     try {
@@ -782,37 +846,46 @@
         studioApi.transcript(runId),
         studioApi.modelContent(runId),
       ]);
-      if (modelStreamRunTerminal
-        || modelStreamRecoveryFenced
-        || !isCurrentSession(runId, epoch)
-        || modelStreamHydrationKey !== key) return;
+      if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+        || modelStreamHydrationKey !== key) {
+        if (modelStreamHydrationKey === key) modelStreamHydrationKey = null;
+        return;
+      }
       if (run.lastSeq !== durableCursor) {
         // Never replace a just-committed durable message or terminal fence with an older pair of
         // snapshots. Retry once the independently scheduled operation stream is caught up.
         modelStreamHydrationKey = null;
-        window.setTimeout(() => void rehydrateModelStream(runId, epoch), 0);
+        window.setTimeout(() => void rehydrateModelStream(runId, epoch, hydrationMode), 0);
         return;
       }
       const modelContent = decodeModelContentResponse(rawModelContent);
       if (!modelContent || modelContent.root_run_id !== runId) {
         throw new Error("Studio returned a malformed model-content snapshot.");
       }
+      if (hydrationMode === "terminal" && latestRootSnapshotIsRunning(modelContent, runId)) {
+        throw new Error("Studio returned a model-content snapshot that is still running.");
+      }
       run = hydrateTranscript({ ...run, activeResponse: "", reasoning: "" }, transcript);
       modelStreamState = seedModelStreamSnapshot(modelStreamState, modelContent);
+      if (hydrationMode === "terminal") {
+        modelStreamState = sealModelStreamTurn(modelStreamState);
+      }
       run = projectModelContentSnapshot(run, modelStreamState);
       subagents = seedSubagentModelContent(subagents, modelContent);
       modelStreamHydrationFailures = 0;
       modelStreamHydrationKey = null;
-      openModelStream(runId, epoch);
+      modelStreamSnapshotPending = false;
+      if (hydrationMode === "live") openModelStream(runId, epoch);
     } catch {
-      if (modelStreamRunTerminal
-        || modelStreamRecoveryFenced
-        || !isCurrentSession(runId, epoch)
-        || modelStreamHydrationKey !== key) return;
+      if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+        || modelStreamHydrationKey !== key) {
+        if (modelStreamHydrationKey === key) modelStreamHydrationKey = null;
+        return;
+      }
       modelStreamHydrationKey = null;
       modelStreamHydrationFailures += 1;
       const delay = Math.min(3_000, 400 * 2 ** Math.min(modelStreamHydrationFailures, 3));
-      window.setTimeout(() => void rehydrateModelStream(runId, epoch), delay);
+      window.setTimeout(() => void rehydrateModelStream(runId, epoch, hydrationMode), delay);
     }
   }
 
@@ -824,6 +897,7 @@
     modelStreamState = initialModelStreamState(runId);
     modelStreamHydrationKey = null;
     modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
     modelStreamRunTerminal = false;
     modelStreamRecoveryFenced = false;
     clearSubagents();
@@ -846,12 +920,18 @@
       const { summary, exact: summaryIsExact } = summaryResolution;
       run = hydrateTranscript(run, transcript);
       const modelContent = decodeModelContentResponse(rawModelContent);
-      if (modelContent?.root_run_id === runId) {
+      const modelContentMatchesRun = modelContent?.root_run_id === runId;
+      if (modelContentMatchesRun) {
         modelStreamState = seedModelStreamSnapshot(modelStreamState, modelContent);
         run = projectModelContentSnapshot(run, modelStreamState);
         subagents = seedSubagentModelContent(subagents, modelContent);
       }
       modelStreamRunTerminal = summaryIsExact && summary?.terminal === true;
+      modelStreamSnapshotPending = config.model_stream_enabled === true
+        && (!modelContentMatchesRun
+          || (modelStreamRunTerminal
+            && modelContent !== null
+            && latestRootSnapshotIsRunning(modelContent, runId)));
       modelStreamRecoveryFenced = !summaryIsExact
         || summary?.recoverable === true
         || summary?.state === "paused";
@@ -886,6 +966,7 @@
     modelStreamState = initialModelStreamState();
     modelStreamHydrationKey = null;
     modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
     modelStreamRunTerminal = false;
     modelStreamRecoveryFenced = false;
     streamConnected = false;
@@ -920,6 +1001,7 @@
       if (!run.runId && response.run_id) {
         run = { ...run, runId: response.run_id };
         modelStreamState = initialModelStreamState(response.run_id);
+        modelStreamSnapshotPending = false;
         modelStreamRunTerminal = response.terminal === true;
         modelStreamRecoveryFenced = false;
         openStream(response.run_id, epoch);
@@ -1004,6 +1086,7 @@
         modelStreamState = initialModelStreamState(runId);
         modelStreamHydrationKey = null;
         modelStreamHydrationFailures = 0;
+        modelStreamSnapshotPending = false;
       }
       openStream(runId, epoch);
       announce(response.resumed
@@ -1049,6 +1132,7 @@
       }
       modelStreamHydrationKey = null;
       modelStreamHydrationFailures = 0;
+      modelStreamSnapshotPending = false;
       openStream(runId, epoch);
       announce("Request reissued with the current runtime configuration.");
     } catch (error) {
@@ -1112,6 +1196,7 @@
     modelStreamState = initialModelStreamState();
     modelStreamHydrationKey = null;
     modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
     modelStreamRunTerminal = false;
     modelStreamRecoveryFenced = false;
     run = initialRunState();
@@ -1216,6 +1301,7 @@
     modelStreamState = initialModelStreamState();
     modelStreamHydrationKey = null;
     modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
     modelStreamRunTerminal = false;
     modelStreamRecoveryFenced = false;
     history.replaceState({}, "", "/");

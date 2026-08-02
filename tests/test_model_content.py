@@ -740,6 +740,54 @@ def test_reader_does_not_fabricate_text_from_invalid_utf8_inside_json(tmp_path: 
     assert result.snapshots[0].output_text == "valid"
 
 
+@pytest.mark.parametrize(
+    ("missing_index", "expected_output", "expected_segment_count", "expected_last_index"),
+    [
+        (0, "", 0, None),
+        (1, "abcd", 1, 0),
+    ],
+)
+def test_reader_stops_both_channels_at_first_missing_segment(
+    tmp_path: Path,
+    missing_index: int,
+    expected_output: str,
+    expected_segment_count: int,
+    expected_last_index: int | None,
+) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", max_segment_bytes=4)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "abcd"))
+    writer.push(ModelStreamDelta("reasoning", "wxyz"))
+    writer.push(ModelStreamDelta("output", "ijkl"))
+    writer.close(ModelStreamOutcome("cancelled", error_code="user_cancelled"))
+    store.close()
+
+    records = _records(path)
+    missing = next(
+        record
+        for record in records
+        if record.get("kind") == "stream_segment"
+        and record.get("segment_index") == missing_index
+    )
+    missing["text_len"] += 1
+    path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    result = read_model_content(path)
+
+    assert result.skipped_records == 1
+    snapshot = result.snapshots[0]
+    assert snapshot.status == "cancelled"
+    assert snapshot.error_code == "user_cancelled"
+    assert snapshot.output_text == expected_output
+    assert snapshot.reasoning_text == ""
+    assert snapshot.segment_count == expected_segment_count
+    assert snapshot.last_segment_index == expected_last_index
+
+
 class _FailingWriter:
     def __init__(self) -> None:
         self.push_calls = 0
