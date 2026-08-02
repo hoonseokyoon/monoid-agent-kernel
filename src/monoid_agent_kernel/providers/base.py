@@ -170,7 +170,9 @@ class ModelRequest:
     output_schema: dict[str, Any] | None = None
 
 
-def _declared_support(adapter: Any, attribute: str) -> Literal["native", "none"]:
+def _declared_support(
+    adapter: Any, attribute: str, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
     """The fail-closed probe shared by every opt-in adapter capability declaration.
 
     One rule for all of them: only the exact string ``"native"`` claims the capability.
@@ -178,32 +180,45 @@ def _declared_support(adapter: Any, attribute: str) -> Literal["native", "none"]
     consumer can never over-trust an adapter that did not explicitly claim it — and the two
     capabilities below cannot drift into different notions of "declared".
 
-    Read off the *instance*, so an adapter whose answer depends on its own configuration
-    (a forwarding transport whose claim holds only while it is enforcing) declares with a
-    property while one whose answer is fixed declares with a ``ClassVar``. An attribute that
-    raises is not a claim: the failure reads as ``"none"`` like any other non-declaration,
-    because a probe that can take the call down is a worse contract than one that under-claims.
+    Read off the *instance*. An adapter whose answer is fixed declares with a ``ClassVar``;
+    one whose answer depends on configuration declares with a **callable** taking the
+    effective per-call config (``request.model or self.config`` — the config the adapter will
+    actually enforce with). ``config`` is passed through to it, because the claim and the
+    enforcement must read the same policy: a forwarding transport probed on its *standing*
+    config alone would mint proof for a call it enforces under a different per-call policy.
+    An attribute that raises — on read or on call — is not a claim: the failure reads as
+    ``"none"`` like any other non-declaration, because a probe that can take the call down is
+    a worse contract than one that under-claims.
     """
 
     try:
         value = getattr(adapter, attribute, "none")
+        if callable(value):
+            value = value(config)
     except Exception:
         return "none"
     return "native" if value == "native" else "none"
 
 
-def structured_output_support(adapter: Any) -> Literal["native", "none"]:
+def structured_output_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
     """Whether ``adapter`` translates :attr:`ModelRequest.output_schema` into provider-native
     constrained decoding.
 
     Opt-in declaration, like ``supports_multimodal``: adapters set a
-    ``structured_output_support`` class attribute.
+    ``structured_output_support`` class attribute, or define it as a method taking the
+    effective per-call :class:`ModelConfig` when the answer depends on policy. Pass ``config``
+    when probing on behalf of a specific call; ``None`` probes the adapter's standing
+    configuration.
     """
 
-    return _declared_support(adapter, "structured_output_support")
+    return _declared_support(adapter, "structured_output_support", config)
 
 
-def generation_support(adapter: Any) -> Literal["native", "none"]:
+def generation_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
     """Whether ``adapter`` applies :attr:`ModelConfig.generation` to the provider request.
 
     The twin of :func:`structured_output_support`, and for the same reason: a transport that
@@ -213,7 +228,7 @@ def generation_support(adapter: Any) -> Literal["native", "none"]:
     client refuses the turn rather than trusting parameters nobody applied.
     """
 
-    return _declared_support(adapter, "generation_support")
+    return _declared_support(adapter, "generation_support", config)
 
 
 class ModelAdapter(Protocol):

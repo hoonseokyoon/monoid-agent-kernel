@@ -87,8 +87,7 @@ class GatewayModelAdapter:
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
-    @property
-    def structured_output_support(self) -> str:
+    def structured_output_support(self, config: ModelConfig | None = None) -> str:
         """This adapter *forwards*; it does not apply. So its claim is only as good as the
         proof it insists on, and that is exactly what ``on_unsupported`` controls.
 
@@ -99,18 +98,25 @@ class GatewayModelAdapter:
         declaration, reporting proof for a call where the inner hop had none. A proof that
         survives a hop that admitted it was not proving is not a proof.
 
-        Reads the adapter's standing config, which is what the reference gateway builds it
-        from (``_build_adapter``), so the probe and the call agree on the same policy.
+        A method, not a property, because the question takes an argument a property cannot
+        carry: *which call*. Enforcement runs under the effective per-call config
+        (``request.model or self.config``), so the claim must be answered from the same
+        config -- a claim probed off the standing config alone let a shared adapter (a
+        ``provider_adapter_factory`` that ignores its config parameter) mint proof for a call
+        it enforces under a wire-supplied ``"omit"``, and withhold proof from a call it
+        enforces under ``"fail"``. ``None`` falls back to the standing config, which is the
+        right answer for a probe made outside any call.
         """
 
-        return "native" if self.config.generation.on_unsupported == "fail" else "none"
+        effective = config or self.config
+        return "native" if effective.generation.on_unsupported == "fail" else "none"
 
-    @property
-    def generation_support(self) -> str:
-        """The sampling twin of :attr:`structured_output_support`, same policy, same reason --
+    def generation_support(self, config: ModelConfig | None = None) -> str:
+        """The sampling twin of :meth:`structured_output_support`, same policy, same reason --
         one knob, one answer."""
 
-        return "native" if self.config.generation.on_unsupported == "fail" else "none"
+        effective = config or self.config
+        return "native" if effective.generation.on_unsupported == "fail" else "none"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
@@ -316,6 +322,7 @@ class GatewayModelAdapter:
                             retry.jitter_s,
                         )
                     committed = False  # reset per attempt; see the binding above the loop
+                    saw_terminal = False
                     # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
                     # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
                     # expiry (see the field), and a backoff is exactly where a token crosses that
@@ -345,6 +352,7 @@ class GatewayModelAdapter:
                                 # The terminal frame is the streaming twin of the sync check in
                                 # ``next_turn`` -- both transports enforce or neither does.
                                 if isinstance(chunk, TurnComplete):
+                                    saw_terminal = True
                                     _check_generation_applied(
                                         build_generation_payload(config.generation),
                                         config.generation.on_unsupported,
@@ -358,6 +366,31 @@ class GatewayModelAdapter:
                                         known_provider_retried=chunk.provider_retried,
                                     )
                                 yield chunk
+                        if not saw_terminal:
+                            # "Both transports enforce or neither does" has to include the
+                            # stream that never sends the frame the checks above live on: a
+                            # body that ends cleanly after its last delta is assembled into a
+                            # normal turn (``assemble_streamed_turn`` synthesizes
+                            # ``stop_reason="stop"``), so without this the one server the
+                            # fail-closed policy exists to catch -- an older gateway that
+                            # ignores the new request keys, terminal frame included -- was
+                            # accepted on this transport and refused on the sync twin. Absent
+                            # frame = absent echo; the shared checks already encode that case,
+                            # so run them with nothing once the drain is complete. Traffic
+                            # that configures neither knob keeps the pre-W5 tolerance for a
+                            # frameless stream: both checks pass when nothing was requested.
+                            _check_generation_applied(
+                                build_generation_payload(config.generation),
+                                config.generation.on_unsupported,
+                                None,
+                                known_provider_retried=attempt > 1,
+                            )
+                            _check_schema_applied(
+                                request.output_schema is not None,
+                                config.generation.on_unsupported,
+                                None,
+                                known_provider_retried=attempt > 1,
+                            )
                         return
                     except _StreamRetry as retry_signal:
                         last_error = retry_signal.error

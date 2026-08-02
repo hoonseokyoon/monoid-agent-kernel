@@ -118,6 +118,7 @@ class LlmGatewayBackend:
             else self._provider_previous_response_id(request, claims)
         )
         adapter = self._build_adapter(claims, request)
+        config = _upstream_model_config(request)
         turn = normalize_model_turn(
             adapter.next_turn(
                 ModelRequest(
@@ -126,12 +127,7 @@ class LlmGatewayBackend:
                     tools=request.tools,
                     previous_turn_handle=provider_previous_response_id,
                     observations=request.observations,
-                    model=ModelConfig(
-                        provider="openai",
-                        model=request.model,
-                        reasoning=request.reasoning,
-                        generation=request.generation,
-                    ),
+                    model=config,
                     messages=request.messages,
                     output_schema=request.output_schema,
                 )
@@ -157,7 +153,7 @@ class LlmGatewayBackend:
             # own HTTP attempts and this call succeeded on the first of those.
             "provider_retried": turn.provider_retried,
         }
-        result.update(_applied_echoes(request, adapter))
+        result.update(_applied_echoes(request, adapter, config))
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -187,12 +183,7 @@ class LlmGatewayBackend:
             tools=request.tools,
             previous_turn_handle=provider_previous_response_id,
             observations=request.observations,
-            model=ModelConfig(
-                provider="openai",
-                model=request.model,
-                reasoning=request.reasoning,
-                generation=request.generation,
-            ),
+            model=_upstream_model_config(request),
             messages=request.messages,
             output_schema=request.output_schema,
         )
@@ -282,7 +273,7 @@ class LlmGatewayBackend:
         # Streaming twin of handle_turn's echo -- the terminal frame is the only one a
         # streaming client can read it from, and it is built by the same function so the two
         # transports cannot answer differently.
-        frame.update(_applied_echoes(request, adapter))
+        frame.update(_applied_echoes(request, adapter, model_request.model))
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -327,12 +318,7 @@ class LlmGatewayBackend:
         claims: TokenClaims,
         request: LlmGatewayTurnRequest,
     ) -> ModelAdapter:
-        config = ModelConfig(
-            provider="openai",
-            model=request.model,
-            reasoning=request.reasoning,
-            generation=request.generation,
-        )
+        config = _upstream_model_config(request)
         if self.provider_adapter_factory is not None:
             return self.provider_adapter_factory(claims, config)
         return OpenAIModelAdapter(config, allow_direct_provider_api=True)
@@ -357,8 +343,25 @@ class LlmGatewayBackend:
         return turn_handle
 
 
+def _upstream_model_config(request: LlmGatewayTurnRequest) -> ModelConfig:
+    """The one config this turn runs under.
+
+    Built once and shared by the adapter construction, the upstream request, and the
+    applied-parameters proof, so the three cannot disagree about policy: the adapter enforces
+    under ``request.model or self.config``, and the proof is only honest if it is probed under
+    the same config the enforcement will read.
+    """
+
+    return ModelConfig(
+        provider="openai",
+        model=request.model,
+        reasoning=request.reasoning,
+        generation=request.generation,
+    )
+
+
 def _applied_echoes(
-    request: LlmGatewayTurnRequest, adapter: ModelAdapter
+    request: LlmGatewayTurnRequest, adapter: ModelAdapter, config: ModelConfig
 ) -> dict[str, Any]:
     """The applied-parameters proofs for one turn — built once, emitted by both transports.
 
@@ -371,16 +374,23 @@ def _applied_echoes(
     were never sent to a model. Unproven is reported as unproven: the generation echo is simply
     absent (which a fail-closed client refuses), and the schema echo is an explicit ``False``.
 
+    ``config`` is the per-call config the upstream call runs under (``_upstream_model_config``),
+    threaded into the probes because a declaration may be policy-conditional: a *chained*
+    ``GatewayModelAdapter`` claims "native" only while it is enforcing, and it enforces under
+    the per-call config, not its standing one. Probing the standing config let a shared
+    factory-built adapter mint proof for a call whose wire policy said ``"omit"`` — the exact
+    copied-back-proof defect this function exists to rule out, one config-source hop later.
+
     Both stay off the response entirely when the request did not use the feature, so traffic
     that configures neither keeps its exact pre-W5 wire shape.
     """
 
     echoes: dict[str, Any] = {}
-    requested_generation = build_generation_payload(request.generation)
-    if requested_generation and generation_support(adapter) == "native":
+    requested_generation = build_generation_payload(config.generation)
+    if requested_generation and generation_support(adapter, config) == "native":
         echoes["generation_applied"] = requested_generation
     if request.output_schema is not None:
-        echoes["schema_applied"] = structured_output_support(adapter) == "native"
+        echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
     return echoes
 
 

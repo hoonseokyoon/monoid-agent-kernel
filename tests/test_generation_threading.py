@@ -38,6 +38,7 @@ from monoid_agent_kernel.reference.llm_gateway.service import (
     LlmGatewayBackend,
     LlmGatewayTurnRequest,
     _applied_echoes,
+    _upstream_model_config,
 )
 
 _SET = GenerationConfig(temperature=0.2, top_p=0.9, max_output_tokens=256)
@@ -424,7 +425,7 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     upstream = GatewayModelAdapter(
         config=ModelConfig(generation=GenerationConfig(temperature=0.2, on_unsupported="omit"))
     )
-    echoes = _applied_echoes(request, upstream)
+    echoes = _applied_echoes(request, upstream, _upstream_model_config(request))
     assert "generation_applied" not in echoes
     assert echoes["schema_applied"] is False
 
@@ -436,7 +437,9 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     proving_upstream = GatewayModelAdapter(
         config=ModelConfig(generation=GenerationConfig(temperature=0.2))
     )
-    proven = _applied_echoes(proving_request, proving_upstream)
+    proven = _applied_echoes(
+        proving_request, proving_upstream, _upstream_model_config(proving_request)
+    )
     assert proven["generation_applied"] == {"temperature": 0.2}
     assert proven["schema_applied"] is True
 
@@ -510,3 +513,187 @@ def test_not_applied_error_carries_the_clients_own_retry(
     assert attempts["n"] == 2
     assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
     assert rejected.value.provider_retried is True
+
+
+# --- streaming enforcement without a terminal frame -------------------------------------
+
+
+def _terminal_frameless_adapter(monkeypatch: pytest.MonkeyPatch, config: ModelConfig) -> GatewayModelAdapter:
+    """A gateway whose SSE body ends cleanly after one delta — no ``turn_complete`` frame.
+
+    This is the older/foreign-server shape ``assemble_streamed_turn`` tolerates by
+    synthesizing ``stop_reason="stop"``, so nothing downstream of the adapter can tell the
+    frame was missing. If the applied-parameter checks run only on the frame, this stream is
+    accepted with the parameters unproven while the sync twin refuses the same server.
+    """
+
+    httpx = pytest.importorskip("httpx")
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"text_delta","text":"unproven answer"}'
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> object:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return GatewayModelAdapter(config=config)
+
+
+def _drain(adapter: GatewayModelAdapter, request: ModelRequest) -> list:
+    import asyncio
+
+    async def _collect() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    return asyncio.run(_collect())
+
+
+def test_a_stream_without_a_terminal_frame_is_an_unproven_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both transports enforce or neither does — including when the frame the streaming
+    check lives on never arrives. Absent frame = absent echo, the same older-gateway case
+    the shared checks already refuse under "fail"."""
+
+    config = ModelConfig(generation=_SET, gateway_url="http://gateway.test")
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+
+def test_a_stream_without_a_terminal_frame_refuses_an_unproven_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.gateway import GATEWAY_SCHEMA_NOT_APPLIED
+
+    config = ModelConfig(gateway_url="http://gateway.test")
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    request = replace(_request(config), output_schema={"type": "object"})
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, request)
+    assert rejected.value.provider_error_code == GATEWAY_SCHEMA_NOT_APPLIED
+
+
+def test_a_stream_without_a_terminal_frame_is_accepted_under_omit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ModelConfig(
+        generation=GenerationConfig(temperature=0.2, on_unsupported="omit"),
+        gateway_url="http://gateway.test",
+    )
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    chunks = _drain(adapter, _request(config))
+    assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
+
+
+def test_a_stream_without_a_terminal_frame_still_streams_plain_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No generation, no schema: the transport owes no proof, so the pre-W5 tolerance for a
+    frameless stream (older gateway) must survive the enforcement fix."""
+
+    config = ModelConfig(gateway_url="http://gateway.test")
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    chunks = _drain(adapter, _request(config))
+    assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
+
+
+# --- the proof question is per call, not per adapter ------------------------------------
+
+
+def test_forwarding_adapter_claim_follows_the_effective_config() -> None:
+    """The claim and the enforcement must read the same policy. The adapter enforces under
+    ``request.model or self.config``; a claim probed off the standing config alone lets a
+    shared adapter (a ``provider_adapter_factory`` that ignores its config parameter) mint
+    proof for a call it will not enforce — or withhold proof from a call it will."""
+
+    standing_fail = GatewayModelAdapter(config=ModelConfig())
+    per_call_omit = ModelConfig(generation=GenerationConfig(temperature=0.2, on_unsupported="omit"))
+    assert generation_support(standing_fail, per_call_omit) == "none"
+    assert structured_output_support(standing_fail, per_call_omit) == "none"
+
+    standing_omit = GatewayModelAdapter(
+        config=ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+    )
+    per_call_fail = ModelConfig(generation=GenerationConfig(temperature=0.2))
+    assert generation_support(standing_omit, per_call_fail) == "native"
+    assert structured_output_support(standing_omit, per_call_fail) == "native"
+
+    # No per-call config: the standing config is the effective config (a client-side probe).
+    assert generation_support(standing_fail) == "native"
+    assert generation_support(standing_omit) == "none"
+
+    # A declaration that raises when *called* is not a claim either.
+    class HostileCallable:
+        def generation_support(self, _config: object = None) -> str:
+            raise RuntimeError("boom")
+
+    assert generation_support(HostileCallable(), per_call_fail) == "none"
+
+
+def test_gateway_service_probes_the_config_the_call_runs_under() -> None:
+    """A shared/preconfigured chained adapter must not answer the capability question from
+    its standing config: the call enforces under the wire request's policy. Standing "fail" +
+    wire "omit" minted proof nothing enforced; standing "omit" + wire "fail" withheld proof
+    the inner hop actually insisted on."""
+
+    manager = _token_manager()
+
+    def _shared(standing: ModelConfig) -> GatewayModelAdapter:
+        class _StubbedChainedGateway(GatewayModelAdapter):
+            def next_turn(self, request: ModelRequest) -> ModelTurn:
+                return ModelTurn(
+                    response_id="inner_1",
+                    final_text="ok",
+                    usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    stop_reason="stop",
+                )
+
+        return _StubbedChainedGateway(config=standing)
+
+    proving_shared = _shared(ModelConfig())  # standing "fail"
+    backend = LlmGatewayBackend(
+        token_manager=manager, provider_adapter_factory=lambda _claims, _config: proving_shared
+    )
+    wire_omit = _turn_payload(
+        generation={"temperature": 0.2, "on_unsupported": "omit"},
+        output_schema={"type": "object"},
+    )
+    result = backend.handle_turn(_llm_token(manager), wire_omit)
+    assert "generation_applied" not in result
+    assert result["schema_applied"] is False
+
+    best_effort_shared = _shared(
+        ModelConfig(generation=GenerationConfig(on_unsupported="omit"))
+    )
+    backend = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: best_effort_shared,
+    )
+    wire_fail = _turn_payload(
+        generation={"temperature": 0.2}, output_schema={"type": "object"}
+    )
+    result = backend.handle_turn(_llm_token(manager), wire_fail)
+    assert result["generation_applied"] == {"temperature": 0.2}
+    assert result["schema_applied"] is True
