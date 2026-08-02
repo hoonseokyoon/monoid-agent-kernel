@@ -32,11 +32,34 @@ defeated by drifts they were built to catch, all for one reason: an authority th
 transcription.  A key set copied off the normalizer missed an eighth emit branch; a probe that
 re-implemented a server call missed a field threaded into the real one; a reader list written by
 hand missed a fourth reader.  So each authority is now derived from the thing it describes —
-the assignable key domain of the *live* ``normalize_usage`` (a wrapper is censused too), the
-shipped ``_write_exception`` driven against a capturing host, the reader set discovered from the
-module.  Where a hand-written EXPECTED remains it is pinned in full and diffed against a derived
-set, never spot-checked; and the file-scan backstop reads code occurrences (AST), because
-substring containment counted a comment as a carrier and so failed open.
+the assignable key domain of the *live* ``normalize_usage``, the shipped ``_write_exception``
+driven against a capturing host, the reader set discovered from the module.  Where a
+hand-written EXPECTED remains it is pinned in full and diffed against a derived set, never
+spot-checked; and the file-scan backstop reads code occurrences (AST), because substring
+containment counted a comment as a carrier and so failed open.
+
+*Then the derivations were attacked in turn, and they fell too.*  Every "read the live
+callable" census read the wrong object, because ``inspect.getsource`` and ``inspect.signature``
+both follow ``__wrapped__`` — so a ``functools.wraps`` wrapper adding an eighth usage key passed
+untouched (``_live_callable`` now refuses a wrapper).  The assignable-domain reader claimed to
+fail closed and looked at one of the four ways to write a key into a dict, so ``result.update``
+walked past it.  Bucket *membership* was unpinned, so moving a field between two checkpoint
+validation buckets changed the rule it is validated under while the union, the disjointness and
+the count all stayed put — and a bucket nobody loops over validated nothing at all.  The wire
+censuses pinned only the *maximal* request, so a writer that omitted a key whenever it held its
+default value was indistinguishable from one that always writes it; each has a minimal-probe
+twin now, and the difference between the two probes is the conditional half of the wire.  And
+reader discovery was a predicate on where a function was *written* (module level) and how it
+*spelled* its raise (a literal constructor), so a reader in a class body or one delegating to a
+factory was not a reader.
+
+*A registry entry with no assertion is prose.*  The registry's contract is "closing a gap breaks
+this suite", which holds only for entries something actually asserts.  Five round-1 entries had
+no pin at all — the drivers and consumers designed for a fact that ignore it, a closed schema,
+an unconsumed event, a vocabulary collision — and the "Registered-gap pins" section below closes
+that, one assertion per entry, each flipping the moment its gap is fixed.  The numeric claims in
+:data:`FUTURE_FAMILIES` are pinned the same way, because a prediction carrying a stale count is
+worse than no prediction.
 
 **The green-with-registered-gaps contract.**  This suite is GREEN today, and today's reality
 is not the ideal: many cells are unbound.  Every one of them is registered in
@@ -52,9 +75,12 @@ a family with no failing cell reads exactly like a family nobody looked at — a
 defect shape this repository keeps producing, an uncensused family with a carrier count is a
 prediction rather than a footnote.
 
-Seven families are covered: ``Suspension``, ``ModelAdapterError`` transport, usage counts, the
+Seven families are censused: ``Suspension``, ``ModelAdapterError`` transport, usage counts, the
 W5 applied-echo protocol, the tool catalog, the checkpoint validator's field coverage, and the
-success envelope (the main wire).
+success envelope (the main wire).  :data:`KNOWN_GAPS` also carries cells that belong to no
+census — the raw-vs-filtered error asymmetry, the run-status projections, the checkpoint's
+un-carried run state — because a cell found by hand still has to be registered and pinned; those
+pins live in the "Registered-gap pins" section rather than in a family.
 """
 
 from __future__ import annotations
@@ -141,6 +167,21 @@ class CarriageGap:
 DISPOSITIONS = frozenset({"burn-down", "v0.21-track:B1", "by-design"})
 
 KNOWN_GAPS: tuple[CarriageGap, ...] = (
+    # --- the public-error filter: applied on three of four paths out of one payload ----
+    CarriageGap(
+        "public-error-filter",
+        "error",
+        "reference/backend/projection.py:result",
+        "the ready branch serves the RAW AgentRunResult.error at the top level while the "
+        "not-ready branch of the same method serves record.error and the metrics block of the "
+        "same payload serves metrics[\"error\"] — both of which went through "
+        "public_view.py:public_error_message (run_state.py:record_run_result and "
+        "loop_phases.py:build_metrics). AgentRunResult.error is deliberately raw because the "
+        "embedding application is inside the trust boundary; this response is not, so the one "
+        "branch that omits the filter publishes over HTTP exactly what the filter beside it was "
+        "added to withhold",
+        "burn-down",
+    ),
     # --- config_recoverable: born on the client, dies at the hop -----------------------
     CarriageGap(
         "transportable-error",
@@ -264,7 +305,12 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "provider_usage",
         "core/schemas.py:EVENT_DATA_SCHEMAS",
         "turn.failed declares no usage (nor provider_retried) although the transcript twin "
-        "written on the same failure records both cost and classification",
+        "written on the same failure records both cost and classification. Borderline sibling, "
+        "noted rather than registered separately: the CADENCE of the cumulative meter has the "
+        "same shape. loop.py's ModelAdapterError arm accumulates the billed usage into "
+        "state.total_usage and emits no metrics.updated, while the success path below it emits "
+        "one per turn — so a billed-refused turn's cost is in the totals but not yet on the "
+        "live stream, and a run that only ever fails never publishes it at all",
         "burn-down",
     ),
     CarriageGap(
@@ -308,6 +354,25 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "loop.py:_run_subagent_child",
         "the parent roll-up hard-codes a 3-key tuple, so a child's sub-counts never reach the "
         "parent's budget — an undercount in exactly the aggregate a bound is checked against",
+        "burn-down",
+    ),
+    CarriageGap(
+        "usage",
+        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
+        "reference/backend/run_state.py:TenantUsage",
+        "the unregistered twin of the gateway meter above: add_metrics sums input/output/total "
+        "and eleven web counters and drops the four priced sub-counts, so the BACKEND tenant "
+        "ledger under-reports a cache-heavy or reasoning-heavy run exactly like the gateway's. "
+        "Two meters, one omission, and fixing one of them leaves the other",
+        "burn-down",
+    ),
+    CarriageGap(
+        "usage",
+        "metrics",
+        "reference/backend/run_state.py:record_run_failure",
+        "meters nothing at all, while record_run_result beside it feeds result.metrics into the "
+        "tenant ledger — so a run that dies of a driver exception after N billed turns leaves "
+        "the ledger reporting zero for every one of them (not even the run count)",
         "burn-down",
     ),
     CarriageGap(
@@ -368,6 +433,48 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "session.state.changed, so the two sibling parks are not observable the same way",
         "burn-down",
     ),
+    # --- one event vocabulary, three projections that each drop a different cell --------
+    CarriageGap(
+        "run-status projection",
+        "run.awaiting_input",
+        "core/projections.py:_apply_event_projection",
+        "the offline projection handles run.waiting and not run.awaiting_input, so a run parked "
+        "for a hosted task or user input still reads as running to `monoid status` — while "
+        "recorder.py:StatusJsonSink, which consumes the same stream, handles both",
+        "burn-down",
+    ),
+    CarriageGap(
+        "run-status projection",
+        "run.waiting",
+        "reference/backend/run_state.py:record_event",
+        "the exact mirror image of the offline projection's hole: this consumer handles "
+        "run.awaiting_input and not run.waiting, so the two readers of one event stream are "
+        "each blind to the park the other sees. StatusJsonSink is the control — it handles "
+        "both, and clears the wait on model.turn.started",
+        "burn-down",
+    ),
+    CarriageGap(
+        "run-status projection",
+        "limited",
+        "core/lifecycle.py:state_from_suspension",
+        "three mappers, three answers for one terminal budget-limited run: this one reports "
+        "FAILED (a terminal park arrives as reason=\"terminal\" and only error_code=\"cancelled\" "
+        "escapes that branch), session_state_from_run_status(\"limited\") reports LIMITED, and "
+        "LoopSession.close reports COMPLETED because it tests only for \"failed\". The state an "
+        "operator sees is decided by which surface they asked",
+        "burn-down",
+    ),
+    CarriageGap(
+        "suspension",
+        "status",
+        "reference/backend/recovery.py:run_recovered",
+        "constructs Suspension(status=\"running\"), which is outside the vocabulary every "
+        "durable reader accepts (core/result.py:suspension_from_checkpoint_payload admits only "
+        "completed/failed/limited). Latent because this synthetic park is re-driven and never "
+        "serialized — but nothing on the type says so, and the first code path that checkpoints "
+        "it raises at the recovery boundary it was built to serve",
+        "burn-down",
+    ),
     CarriageGap(
         "suspension",
         "last_suspension",
@@ -409,6 +516,42 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "back is carried entirely by exported_name being stable: by design, and the reason a "
         "provider_name change is a wire-compatibility change",
         "by-design",
+    ),
+    # --- checkpoint carriage: what the snapshot leaves behind ---------------------------
+    # Hand-found cells of the family FUTURE_FAMILIES declares as "run-state -> checkpoint
+    # carriage": there is no census diffing ``snapshot()``'s written key set against the live
+    # RunState + tool context, so these three were found one at a time and are pinned one at a
+    # time.
+    CarriageGap(
+        "checkpoint",
+        "output_failure_history",
+        "loop.py:snapshot",
+        "the sibling of a checkpointed field is not checkpointed: output_retries rides the "
+        "snapshot and its history does not, so a run restored mid-repair renumbers its attempts "
+        "from an empty history and loses failures_by_validator — the retry BUDGET survives and "
+        "the evidence the budget was spent on does not",
+        "burn-down",
+    ),
+    CarriageGap(
+        "checkpoint",
+        "subagent_count/subagent_usage/skill_activation_count",
+        "loop.py:snapshot",
+        "the context-owned counters have no checkpoint slot although their RunState twins "
+        "(total_usage, total_tool_calls) do, and loop_phases.py:build_metrics writes all of "
+        "them into one metrics.json — so a restored run reports pre-restart token totals beside "
+        "post-restart subagent and skill counts, an artifact mixing two epochs with nothing "
+        "saying which is which",
+        "burn-down",
+    ),
+    CarriageGap(
+        "checkpoint",
+        "cancellation_requested",
+        "loop.py:_rehydrate",
+        "asymmetric write/read: snapshot() records the flag unconditionally, and the restore "
+        "applies it only when a cancellation token is already installed on the loop. A recovery "
+        "driver that rebuilds the loop without one silently un-cancels a run whose cancellation "
+        "was durable",
+        "burn-down",
     ),
     # --- checkpoint validation ---------------------------------------------------------
     CarriageGap(
@@ -569,8 +712,8 @@ FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
         "run limits",
         "core/spec.py:RunLimits",
         1,
-        "core/manifest.py:_run_manifest carries 4 of 15 limits into the run manifest, so the "
-        "durable record of what a run was allowed to do omits every token budget, every "
+        "core/manifest.py:build_run_manifest carries 4 of 15 limits into the run manifest, so "
+        "the durable record of what a run was allowed to do omits every token budget, every "
         "subagent bound and the message-log caps",
         "burn-down",
     ),
@@ -639,6 +782,31 @@ FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
         "status file is already wider than its own schema",
         "burn-down",
     ),
+    FutureFamily(
+        "run-state -> checkpoint carriage",
+        "loop.py:snapshot",
+        2,
+        "the authority is the key set snapshot() writes, and the carriers are the two live "
+        "states it must cover: RunState and the AgentToolContext. Nothing diffs them, so the "
+        "three registered cells (output_failure_history, the context-owned "
+        "subagent/skill counters, and cancellation_requested's asymmetric restore) were each "
+        "found by hand — which is the definition of an uncensused family, not of three "
+        "unrelated bugs",
+        "burn-down",
+    ),
+    FutureFamily(
+        "settled-text digest",
+        "loop_phases.py:_settled_text_fields",
+        6,
+        "one settle payload is EITHER final_text OR final_text_digest+final_text_len, and the "
+        "choice is re-implemented at every hop: the writer here, two schema branches "
+        "(core/schemas.py), the hydration reader "
+        "(reference/backend/content_hydration.py:DIGEST_FIELD), a second hand reader in "
+        "reference/studio/cli.py, a third path in reference/studio/chat_projection.py, and the "
+        "sidecar join key in core/model_content.py. Renaming the fact, or adding a third "
+        "encoding, has to land on all of them at once and nothing says so",
+        "burn-down",
+    ),
 )
 
 
@@ -673,6 +841,58 @@ def test_registry_carrier_locations_exist() -> None:
         if symbol not in path.read_text(encoding="utf-8"):
             missing.append(f"{location} (symbol absent)")
     assert missing == [], {"stale_registry_entries": missing}
+
+
+# --------------------------------------------------------------------------------------
+# Live-callable guard — the census must read the object it just called
+# --------------------------------------------------------------------------------------
+
+
+def _unwrap_chain(function: Any) -> list[Any]:
+    """``function`` followed by everything its ``__wrapped__`` chain points at."""
+
+    chain = [function]
+    seen = {id(function)}
+    current = function
+    while True:
+        current = getattr(current, "__wrapped__", None)
+        if current is None or id(current) in seen:
+            return chain
+        seen.add(id(current))
+        chain.append(current)
+
+
+def _live_callable(function: Any) -> Any:
+    """``function``, refused if it is a ``functools.wraps`` wrapper over something else.
+
+    ``inspect.getsource`` and ``inspect.signature`` both FOLLOW ``__wrapped__``. That defeated the
+    "census the live callable, not the file" rule at the one place it was supposed to hold: a
+    ``@functools.wraps`` wrapper around ``normalize_usage`` emitting an eighth key was invisible
+    to every assertion here, because ``getsource`` handed back the *wrapped* function's body and
+    the wrapper's own branch was never read. The signature censuses have the same hole.
+
+    Refused rather than merged. A wrapper is usually not analyzable at all (``*args, **kwargs``
+    and a call), so merging its key domain would mean teaching each census a second shape; and a
+    wrapper installed over a censused carrier is a carriage change, which is exactly the kind of
+    thing this suite exists to make someone declare.
+    """
+
+    chain = _unwrap_chain(function)
+    assert len(chain) == 1, {
+        "censused_callable": getattr(function, "__qualname__", repr(function)),
+        "wraps": [getattr(item, "__qualname__", repr(item)) for item in chain[1:]],
+        "hint": "inspect.getsource/signature follow __wrapped__, so this census would have read "
+        "the wrapped function and missed every branch the wrapper adds",
+    }
+    return function
+
+
+def _live_signature(function: Any) -> inspect.Signature:
+    return inspect.signature(_live_callable(function))
+
+
+def _live_source(function: Any) -> str:
+    return inspect.getsource(_live_callable(function))
 
 
 # --------------------------------------------------------------------------------------
@@ -761,7 +981,7 @@ def _maximal_adapter_error() -> ModelAdapterError:
 def test_maximal_adapter_error_covers_every_authority_attribute() -> None:
     """ModelAdapterError is not a dataclass: authority is the ctor signature plus the stamp."""
 
-    signature = inspect.signature(ModelAdapterError.__init__)
+    signature = _live_signature(ModelAdapterError.__init__)
     keyword_only = {
         name
         for name, param in signature.parameters.items()
@@ -913,15 +1133,52 @@ def _dict_keys(node: ast.Dict) -> frozenset[str]:
     )
 
 
+def _literal_dict_bindings(tree: ast.AST) -> dict[str, list[frozenset[str]]]:
+    """``name -> the key sets of every dict literal assigned to it``, plus its constant-key
+    subscript writes. This is how a ``data=<name>`` emit site is resolved back to a key set."""
+
+    bindings: dict[str, list[set[str]]] = {}
+    for node in ast.walk(tree):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
+            bindings.setdefault(target.id, []).append(set(_dict_keys(value)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+            continue
+        index = target.slice
+        if not (isinstance(index, ast.Constant) and isinstance(index.value, str)):
+            continue
+        for keys in bindings.get(target.value.id, []):
+            keys.add(index.value)
+    return {name: [frozenset(keys) for keys in sets] for name, sets in bindings.items()}
+
+
 def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
-    """Keys of the ``data=`` dict literal at ``recorder.emit("<event_type>", ..., data={...})``.
+    """Keys the module can put on ``recorder.emit("<event_type>", ..., data=...)``.
 
     The emit site is an inline literal inside a long pump method, so it cannot be imported and
     diffed — but it is exactly where a new key is added without a matching schema entry.
+
+    Every call site for the event type is counted, whatever shape its ``data=`` argument has.
+    Counting only the sites with a literal dict was a fail-open that the census's own comment
+    described as a twin check: a second emit passing ``data=some_name`` (the shape
+    ``metrics.updated`` already uses) left the count at one and the twin went uncensused. A site
+    this function cannot resolve is now a failure naming the shape, not a site it skips.
     """
 
-    found: list[frozenset[str]] = []
-    for node in ast.walk(_module_tree(relative_path)):
+    tree = _module_tree(relative_path)
+    bindings = _literal_dict_bindings(tree)
+    resolved: list[frozenset[str]] = []
+    unresolved: list[str] = []
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if node.func.attr != "emit" or not node.args:
@@ -929,15 +1186,29 @@ def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
         first = node.args[0]
         if not (isinstance(first, ast.Constant) and first.value == event_type):
             continue
-        for keyword in node.keywords:
-            if keyword.arg == "data" and isinstance(keyword.value, ast.Dict):
-                found.append(_dict_keys(keyword.value))
-    assert len(found) == 1, {
+        data = next((keyword.value for keyword in node.keywords if keyword.arg == "data"), None)
+        if isinstance(data, ast.Dict):
+            resolved.append(_dict_keys(data))
+        elif isinstance(data, ast.Name) and len(bindings.get(data.id, ())) == 1:
+            resolved.append(bindings[data.id][0])
+        else:
+            unresolved.append(
+                f"line {node.lineno}: data="
+                + ("<absent>" if data is None else ast.unparse(data))
+            )
+    assert unresolved == [], {
         "event_type": event_type,
-        "emit_sites_with_a_literal_data_dict": len(found),
+        "emit_sites_whose_data_the_census_cannot_read": unresolved,
+        "hint": "resolve the shape here rather than skipping the site — a skipped emit is a wire "
+        "key with no schema diff",
+    }
+    assert len(resolved) == 1, {
+        "event_type": event_type,
+        "emit_sites": len(resolved),
+        "key_sets": [sorted(item) for item in resolved],
         "hint": "a second emit site is a twin that must be censused too",
     }
-    return found[0]
+    return resolved[0]
 
 
 def _literal_dict_keys_where(relative_path: str, key: str, value: str) -> list[frozenset[str]]:
@@ -1000,7 +1271,7 @@ def _live_function_body(function: Any) -> _FunctionNode:
     this suite just called declares N branches", and only the second one survives a wrapper.
     """
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    tree = ast.parse(textwrap.dedent(_live_source(function)))
     node = tree.body[0]
     assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)), type(node)
     return node
@@ -1017,6 +1288,14 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
     subscript write, and the keys of any dict the function copies in wholesale through a
     ``for key, value in <dict>.items(): result[key] = value`` loop (which is how the priced
     sub-counts actually land). An emit shape it cannot analyze fails rather than passing empty.
+
+    "Fails rather than passing empty" used to hold for exactly one shape — a computed subscript
+    key — and the docstring claimed it in general. Three other ways to write a key into a dict
+    were simply not looked at, so ``result.update({"tool_tokens": ...})``, ``result |= {...}``
+    and any augmented assignment onto it were each an eighth emitted key this census reported as
+    nonexistent. They are now unanalyzable-by-construction: a *method call* on the result name is
+    refused whatever it is called, because the point is not to enumerate the mutators but to
+    refuse the ones this function cannot read.
     """
 
     returns = [
@@ -1054,15 +1333,31 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
         ):
             loop_sources[names[0]] = iterated.func.value.id
 
+    def _is_result(node: ast.expr | None) -> bool:
+        return isinstance(node, ast.Name) and node.id == result_name
+
     keys = set(literals.get(result_name, set()))
     unanalyzable: list[str] = []
     for node in ast.walk(function):
+        # ``result.update({...})``, ``result.setdefault(...)`` — any method call on the result.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and _is_result(node.func.value)
+        ):
+            unanalyzable.append(f"{result_name}.{node.func.attr}(...)")
+            continue
+        # ``result |= {...}`` / ``result["k"] += ...`` — an augmented assignment onto it.
+        if isinstance(node, ast.AugAssign) and (
+            _is_result(node.target)
+            or (isinstance(node.target, ast.Subscript) and _is_result(node.target.value))
+        ):
+            unanalyzable.append(f"{ast.unparse(node.target)} {type(node.op).__name__} ...")
+            continue
         if not isinstance(node, ast.Assign):
             continue
         for target in node.targets:
-            if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
-                continue
-            if target.value.id != result_name:
+            if not isinstance(target, ast.Subscript) or not _is_result(target.value):
                 continue
             index = target.slice
             if isinstance(index, ast.Constant) and isinstance(index.value, str):
@@ -1070,16 +1365,23 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
             elif isinstance(index, ast.Name) and index.id in loop_sources:
                 keys |= literals.get(loop_sources[index.id], set())
             else:
-                unanalyzable.append(ast.dump(index))
+                unanalyzable.append(f"{result_name}[{ast.unparse(index)}] = ...")
     assert unanalyzable == [], {
-        "writes_the_census_cannot_read": unanalyzable,
-        "hint": "a new emit shape: teach _emitted_result_keys about it rather than dropping it",
+        "writes_the_census_cannot_read": sorted(set(unanalyzable)),
+        "hint": "a new emit shape: teach _emitted_result_keys about it rather than dropping it — "
+        "an unread write is an emitted key the whole usage census below never hears about",
     }
     return frozenset(keys)
 
 
 # The gateway module's wire-reading helpers. A function that both constructs a
 # ``ModelAdapterError`` and reads the wire through one of these *is* an error reader.
+#
+# This is a HAND list, and every census below that resolves a key through it inherits its
+# blindness: ``_literal_wire_keys`` picks a reader's keys out of the arguments it hands these
+# helpers, so a ninth helper carrying a ninth key would make that key invisible and the pinned
+# read-set would still match. ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``
+# below derives the same set from the module and diffs it against this one.
 GATEWAY_WIRE_READ_HELPERS = frozenset(
     {
         "_gateway_string",
@@ -1092,6 +1394,23 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_portable_gateway_payload",
     }
 )
+
+# The helpers a derived scan can find: they take the wire mapping itself and read a key off it
+# (a literal one, or the ``key`` parameter their callers pass). Pinned in full, so a new
+# ``_gateway_float(payload, key, *, http_status)`` carrying a new key fails here.
+GATEWAY_MAPPING_READ_HELPERS = frozenset(
+    {
+        "_exact_gateway_bool",
+        "_exact_gateway_int",
+        "_gateway_fragment_string",
+        "_gateway_http_status_hint",
+        "_gateway_string",
+        "_reported_error_usage",
+    }
+)
+# The two registered helpers no mapping scan can reach: they validate an already-extracted
+# ``value: Any``, so they carry no wire key of their own and the caller names the key.
+GATEWAY_WIRE_VALUE_VALIDATORS = frozenset({"_gateway_usage", "_portable_gateway_payload"})
 
 
 def _literal_wire_keys(function: ast.AST) -> frozenset[str]:
@@ -1157,6 +1476,91 @@ def _wire_keys_read_in(function: _FunctionNode) -> frozenset[str]:
                 )
             keys |= _HELPER_INTERNAL_READS[helper]
     return frozenset(keys)
+
+
+def _all_functions(relative_path: str) -> dict[str, list[_FunctionNode]]:
+    """Every function in the module *including* methods, keyed by name.
+
+    ``ast.walk`` rather than ``tree.body``: a scan of module-level definitions only is a
+    predicate on where a function was written, not on what it does, and moving a reader into a
+    class body is not a change to the wire it reads.
+    """
+
+    functions: dict[str, list[_FunctionNode]] = {}
+    for node in ast.walk(_module_tree(relative_path)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.setdefault(node.name, []).append(node)
+    return functions
+
+
+def _called_local_names(function: ast.AST) -> frozenset[str]:
+    return frozenset(
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    )
+
+
+def _constructs_directly(function: ast.AST, class_name: str) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == class_name
+        for node in ast.walk(function)
+    )
+
+
+def _mapping_parameters(function: _FunctionNode) -> frozenset[str]:
+    """Parameters annotated as a mapping — the wire payload a helper reads keys off."""
+
+    arguments = function.args
+    return frozenset(
+        argument.arg
+        for argument in (
+            list(arguments.posonlyargs) + list(arguments.args) + list(arguments.kwonlyargs)
+        )
+        if argument.annotation is not None
+        and any(
+            token in ast.unparse(argument.annotation)
+            for token in ("Mapping", "dict", "Dict")
+        )
+    )
+
+
+def _reads_a_mapping_parameter(function: _FunctionNode) -> bool:
+    """``payload[k]`` / ``payload.get(k)`` / ``k in payload`` on a mapping parameter.
+
+    The key may be a literal or the ``key`` parameter the caller passes: both make the function
+    the place a wire key is actually read, which is what the helper list is for.
+    """
+
+    parameters = _mapping_parameters(function)
+    if not parameters:
+        return False
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in parameters
+        ):
+            return True
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in parameters
+        ):
+            return True
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.In)
+            and isinstance(node.comparators[0], ast.Name)
+            and node.comparators[0].id in parameters
+        ):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------------------
@@ -1505,7 +1909,7 @@ SERVER_ERROR_BODY_POSITIONAL_WIRE_KEYS = frozenset({"http_status", "error"})
 
 
 def test_2a_the_error_body_signature_and_the_wire_key_set_determine_each_other() -> None:
-    signature = inspect.signature(_error_body)
+    signature = _live_signature(_error_body)
     positional = tuple(
         name
         for name, parameter in signature.parameters.items()
@@ -1879,39 +2283,93 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
 }
 
 
-def test_2b_the_registered_reader_list_is_every_reader_the_module_has() -> None:
-    """The reader list was a hand-written dict of three, so a fourth sibling joined unseen.
+def _discovered_gateway_error_readers() -> set[str]:
+    """Every function in the module that turns the wire into a ``ModelAdapterError``.
 
-    A module-level function that both constructs a ``ModelAdapterError`` and reads the wire
-    through this module's own reading helpers *is* an error reader, whatever it is called.
+    Two predicates, each widened after a drift walked straight past the old one:
+
+    *Where it is written.* The scan read ``tree.body`` — module-level definitions only — so a
+    reader born as a method inside a ``ClassDef`` was not a reader. ``_all_functions`` walks the
+    whole tree.
+
+    *How it raises.* "Constructs a ``ModelAdapterError``" meant a literal ``ModelAdapterError(...)``
+    call in the function's own body, so a reader that hands the job to a one-line local factory
+    evaded by moving the constructor one frame away. One level of delegation is resolved, which
+    is as far as this module delegates anywhere else (see ``_wire_keys_read_in``).
     """
 
-    tree = _module_tree("providers/gateway.py")
-    discovered = set()
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        constructs_error = any(
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, ast.Name)
-            and inner.func.id == "ModelAdapterError"
-            for inner in ast.walk(node)
-        )
-        reads_the_wire = any(
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, ast.Name)
-            and inner.func.id in GATEWAY_WIRE_READ_HELPERS
-            for inner in ast.walk(node)
-        )
-        if constructs_error and reads_the_wire:
-            discovered.add(f"providers/gateway.py:{node.name}")
+    functions = _all_functions("providers/gateway.py")
+    constructing = {
+        name
+        for name, nodes in functions.items()
+        if any(_constructs_directly(node, "ModelAdapterError") for node in nodes)
+    }
+    discovered: set[str] = set()
+    for name, nodes in functions.items():
+        for node in nodes:
+            raises_a_model_error = _constructs_directly(node, "ModelAdapterError") or bool(
+                (_called_local_names(node) & constructing) - {name}
+            )
+            reads_the_wire = bool(_called_local_names(node) & GATEWAY_WIRE_READ_HELPERS)
+            if raises_a_model_error and reads_the_wire:
+                discovered.add(f"providers/gateway.py:{name}")
+    return discovered
 
+
+def test_2b_the_registered_reader_list_is_every_reader_the_module_has() -> None:
+    """The reader list was a hand-written dict of three, so a fourth sibling joined unseen."""
+
+    discovered = _discovered_gateway_error_readers()
     assert discovered == set(GATEWAY_ERROR_READERS), {
         "unregistered_readers": sorted(discovered - set(GATEWAY_ERROR_READERS)),
         "registered_but_no_longer_a_reader": sorted(set(GATEWAY_ERROR_READERS) - discovered),
         "hint": "a fourth reader must join every reader census below, not just this one",
     }
     assert set(GATEWAY_ERROR_READERS) == set(SILENT_BODY_READERS) == set(GATEWAY_READER_WIRE_KEYS)
+
+
+def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> None:
+    """The second closed hand list in this family, derived rather than trusted.
+
+    ``GATEWAY_WIRE_READ_HELPERS`` is what ``_literal_wire_keys`` resolves a reader's keys
+    through, so a helper missing from it makes the keys it carries invisible to every read-key
+    census — and the pinned sets keep matching, because the key was never counted on either
+    side. Discovered here: a function that takes the wire mapping, reads a key off it, and is
+    called by one of the registered readers.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    called_by_readers: set[str] = set()
+    for reader in GATEWAY_ERROR_READERS:
+        for node in functions[reader.split(":", 1)[1]]:
+            called_by_readers |= _called_local_names(node)
+    discovered = {
+        name
+        for name in called_by_readers
+        if name in functions
+        and any(_reads_a_mapping_parameter(node) for node in functions[name])
+    }
+    assert discovered == GATEWAY_MAPPING_READ_HELPERS, {
+        "newly_reading_the_wire_mapping": sorted(discovered - GATEWAY_MAPPING_READ_HELPERS),
+        "no_longer_reading_it": sorted(GATEWAY_MAPPING_READ_HELPERS - discovered),
+        "hint": "a new wire-reading helper: add it to GATEWAY_WIRE_READ_HELPERS or every read-key "
+        "census below silently stops counting the keys it carries",
+    }
+    assert discovered <= GATEWAY_WIRE_READ_HELPERS
+    # The hand list is exactly the discovered mapping readers plus the two value validators,
+    # which take an already-extracted value and therefore name no key of their own.
+    assert GATEWAY_MAPPING_READ_HELPERS | GATEWAY_WIRE_VALUE_VALIDATORS == (
+        GATEWAY_WIRE_READ_HELPERS
+    ), {
+        "registered_but_neither_discovered_nor_declared_a_value_validator": sorted(
+            GATEWAY_WIRE_READ_HELPERS - GATEWAY_MAPPING_READ_HELPERS - GATEWAY_WIRE_VALUE_VALIDATORS
+        ),
+    }
+    for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        assert _mapping_parameters(functions[name][0]) == frozenset(), {
+            "value_validator_now_takes_a_mapping": name,
+            "hint": "it reads its own key now: move it to GATEWAY_MAPPING_READ_HELPERS",
+        }
 
 
 @pytest.mark.parametrize("reader", sorted(GATEWAY_READER_WIRE_KEYS))
@@ -1972,7 +2430,7 @@ def test_2c_only_two_of_five_gateway_validators_forward_the_status_they_know() -
         "_gateway_usage",
         "_portable_gateway_payload",
     ):
-        parameters = inspect.signature(getattr(gateway_client, name)).parameters
+        parameters = _live_signature(getattr(gateway_client, name)).parameters
         if "http_status" in parameters:
             forwarding.add(name)
     assert forwarding == {"_exact_gateway_bool", "_gateway_string"}, {
@@ -2310,7 +2768,7 @@ def test_4a_a_default_generation_block_is_absent_from_the_config_wire_by_design(
 def test_4a_the_echo_domain_matches_the_writers_assignment_sites() -> None:
     """Static twin of the behavioral probe: a third key added to the function fails here too."""
 
-    source = inspect.getsource(_applied_echoes)
+    source = _live_source(_applied_echoes)
     assigned = {
         node.slice.value
         for node in ast.walk(ast.parse(inspect.cleandoc(source)))
@@ -2736,7 +3194,7 @@ def test_5b_only_the_record_projections_substitute_a_non_finite_schema() -> None
     manifest_payload = _manifest_tool_spec_payload(spec)
     assert manifest_payload["input_schema"]["enum"][0] != manifest_payload["input_schema"]["enum"][0]
     assert normalize_json_ingress(manifest_payload)["input_schema"]["enum"] == [None]
-    assert "normalize_json_ingress" in inspect.getsource(RunManifest.to_json)
+    assert "normalize_json_ingress" in _live_source(RunManifest.to_json)
 
 
 # reference/llm_gateway/service.py:_parse_tool — the server's reader. Its schema spellings come
@@ -2805,7 +3263,7 @@ def test_5c_the_server_reader_reconstructs_only_the_fields_the_wire_carries() ->
 # Family 6 — the checkpoint validator's field coverage
 # --------------------------------------------------------------------------------------
 
-# core/checkpoint.py:_validate_checkpoint_payload is driven by five hand-maintained field-name
+# core/checkpoint.py:_validate_checkpoint_payload is driven by six hand-maintained field-name
 # frozensets plus a handful of inline branches. It is the durable-recovery boundary and it fails
 # OPEN: a field nobody listed is simply never type-checked, so a corrupt or hostile payload
 # reaches ``RunCheckpoint(**payload)`` with an arbitrary Python value in it. The names below are
@@ -2830,19 +3288,82 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
 # payload validator never sees a checkpoint whose schema_version it did not accept.
 CHECKPOINT_UNVALIDATED = frozenset({"schema_version"})
 
+# And each bucket's MEMBERSHIP, not only the union of them. Moving ``error_code`` from
+# ``_CHECKPOINT_STRING_FIELDS`` to ``_CHECKPOINT_OPTIONAL_STRING_FIELDS`` — which changes it from
+# "must be a string" to "may be null" at the recovery boundary — left the union, the disjointness
+# and the count all unchanged and passed the whole suite. A validation bucket is a rule, and
+# which rule a field is under is the fact.
+CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
+    "_CHECKPOINT_STRING_FIELDS": frozenset(
+        {"status", "error", "error_code", "provider_error_code", "final_text"}
+    ),
+    "_CHECKPOINT_OPTIONAL_STRING_FIELDS": frozenset({"previous_turn_handle"}),
+    "_CHECKPOINT_NONNEGATIVE_INT_FIELDS": frozenset(
+        {
+            "seq",
+            "provider_http_status",
+            "total_tool_calls",
+            "output_retries",
+            "session_step",
+            "submit_local_step",
+        }
+    ),
+    "_CHECKPOINT_BOOL_FIELDS": frozenset({"terminal", "revoked_all", "cancellation_requested"}),
+    "_CHECKPOINT_LIST_OF_DICT_FIELDS": frozenset(
+        {
+            "pending_observations",
+            "messages",
+            "hosted_tasks",
+            "workspace_delta",
+            "capability_leases",
+            "pending_capability_replays",
+            "pending_tool_approval_replays",
+            "outbox_requests",
+        }
+    ),
+    "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
+        {
+            "pending_binding_loads",
+            "reentry_queue",
+            "delivered_reentry_jobs",
+            "revoked_lease_ids",
+            "revoked_capabilities",
+            "inbox_seen_ids",
+            "applied_input_ids",
+        }
+    ),
+}
 
-def test_6a_every_checkpoint_field_is_validated_by_exactly_one_mechanism() -> None:
+
+def _live_checkpoint_buckets() -> dict[str, frozenset[str]]:
     from monoid_agent_kernel.core import checkpoint as checkpoint_module
-    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 
-    frozensets = {
+    return {
         name: value
         for name, value in vars(checkpoint_module).items()
         if name.startswith("_CHECKPOINT_") and isinstance(value, frozenset)
     }
-    assert len(frozensets) == 6, {
-        "checkpoint_field_frozensets": sorted(frozensets),
-        "hint": "a new validation bucket must join this census",
+
+
+def test_6a_every_checkpoint_field_is_validated_by_exactly_one_mechanism() -> None:
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+
+    frozensets = _live_checkpoint_buckets()
+    assert frozensets == CHECKPOINT_VALIDATION_BUCKETS, {
+        "buckets_that_gained_a_field": {
+            name: sorted(value - CHECKPOINT_VALIDATION_BUCKETS.get(name, frozenset()))
+            for name, value in frozensets.items()
+            if value - CHECKPOINT_VALIDATION_BUCKETS.get(name, frozenset())
+        },
+        "buckets_that_lost_a_field": {
+            name: sorted(value - frozensets.get(name, frozenset()))
+            for name, value in CHECKPOINT_VALIDATION_BUCKETS.items()
+            if value - frozensets.get(name, frozenset())
+        },
+        "new_buckets": sorted(set(frozensets) - set(CHECKPOINT_VALIDATION_BUCKETS)),
+        "removed_buckets": sorted(set(CHECKPOINT_VALIDATION_BUCKETS) - set(frozensets)),
+        "hint": "a field that MOVED between buckets is a changed validation rule at the "
+        "recovery boundary, and it leaves the union and the count untouched",
     }
     listed: set[str] = set()
     for name, value in frozensets.items():
@@ -2861,6 +3382,29 @@ def test_6a_every_checkpoint_field_is_validated_by_exactly_one_mechanism() -> No
         "hint": "a new RunCheckpoint field escapes validation entirely — this validator fails "
         "open, so an unlisted field is never type-checked at the recovery boundary",
     }
+
+
+def test_6a_every_bucket_is_actually_consumed_by_the_validator() -> None:
+    """A bucket nobody loops over is a validation rule that does not run.
+
+    Membership and coverage are both computed from the bucket *contents*, so a new
+    ``_CHECKPOINT_FLOAT_FIELDS`` naming a real field satisfies the census above and the field
+    reads as validated — while ``_validate_checkpoint_payload`` never mentions it and the field
+    reaches ``RunCheckpoint(**payload)`` unchecked. The validator is asked whether it reads each
+    bucket by name.
+    """
+
+    validator = _function_node("core/checkpoint.py", "_validate_checkpoint_payload")
+    consumed = {node.id for node in ast.walk(validator) if isinstance(node, ast.Name)}
+    buckets = set(_live_checkpoint_buckets())
+    dangling = buckets - consumed
+    assert dangling == set(), {
+        "buckets_the_validator_never_reads": sorted(dangling),
+        "hint": "a declared bucket that no loop consumes validates nothing — this validator "
+        "fails open, so its fields are silently unchecked",
+    }
+    # ...and the validator does not read a bucket that no longer exists.
+    assert {name for name in consumed if name.startswith("_CHECKPOINT_")} == buckets
 
 
 def test_6a_the_inline_branches_named_here_are_the_branches_that_exist() -> None:
@@ -2965,11 +3509,34 @@ class _EverythingAdapter:
         )
 
 
-def _gateway_and_token() -> tuple[LlmGatewayBackend, str]:
+class _PlainAdapter:
+    """The MINIMAL upstream: no retry to report, and no native-support declaration to echo.
+
+    Its counterpart to ``_EverythingAdapter`` is the point. A census driven only by the maximal
+    probe pins the *union* of the wire keys, so a writer that started omitting a key whenever it
+    holds its default value — ``provider_retried`` when the call was not retried — kept passing:
+    the maximal probe sets it True and the key stays. Required-vs-conditional is a property of
+    the wire, and only a minimal request can state it.
+    """
+
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        return ModelTurn(
+            response_id="provider_response_secret",
+            final_text="answered",
+            tool_calls=(),
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            stop_reason="stop",
+            provider_retried=False,
+        )
+
+
+def _gateway_and_token(adapter: Any = None) -> tuple[LlmGatewayBackend, str]:
     manager = TokenManager.from_secret("c" * 32)
+    upstream = _EverythingAdapter() if adapter is None else adapter
     gateway = LlmGatewayBackend(
         token_manager=manager,
-        provider_adapter_factory=lambda _claims, _config: _EverythingAdapter(),
+        provider_adapter_factory=lambda _claims, _config: upstream,
     )
     token = manager.issue(
         kind="llm_gateway",
@@ -2995,6 +3562,85 @@ def _maximal_turn_payload() -> dict[str, Any]:
         "output_schema": {"type": "object"},
         "tools": [gateway_client._gateway_tool_schema(_maximal_tool_spec())],
     }
+
+
+def _minimal_turn_payload() -> dict[str, Any]:
+    """A request that uses no optional feature at all, so no echo can be emitted."""
+
+    return {
+        "protocol": LLM_TURN_PROTOCOL_VERSION,
+        "model": "gateway-model",
+        "system_prompt": "sys",
+        "instruction": "do the thing",
+        "tools": [],
+    }
+
+
+# What the two writers emit for a request that configured nothing, answered by an upstream with
+# nothing to report. This is the REQUIRED half of each key set: the maximal sets above are the
+# union, and the difference between the two is precisely the conditional keys.
+GATEWAY_MINIMAL_BODY_KEYS = frozenset(
+    {
+        "protocol",
+        "turn_handle",
+        "final_text",
+        "tool_calls",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+    }
+)
+GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
+    {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
+)
+# The keys that appear only when the request asked for the feature (registered by-design on
+# ``_applied_echoes``: traffic that configures neither keeps its exact pre-W5 wire shape).
+GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS)
+
+
+def test_7a_the_minimal_request_pins_which_body_keys_are_conditional() -> None:
+    """The minimal twin of the maximal body census — the half that sees an omission.
+
+    ``provider_retried`` is the case this exists for: the maximal probe reports it True, so a
+    writer that emitted it only when true was indistinguishable from one that always emits it,
+    and the client's ``False`` default would have silently absorbed the change. Here the fact is
+    False and the key must still be on the wire.
+    """
+
+    gateway, token = _gateway_and_token(_PlainAdapter())
+    body = gateway.handle_turn(token, _minimal_turn_payload())
+    assert frozenset(body) == GATEWAY_MINIMAL_BODY_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_BODY_KEYS - set(body)),
+        "extra": sorted(set(body) - GATEWAY_MINIMAL_BODY_KEYS),
+        "hint": "a key that vanished when its value was the default: that is an omit-when-empty "
+        "contract, and it has to be declared like the two on _applied_echoes",
+    }
+    assert body["provider_retried"] is False
+    assert GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_MINIMAL_BODY_KEYS == GATEWAY_CONDITIONAL_WIRE_KEYS
+    assert GATEWAY_MINIMAL_BODY_KEYS <= GATEWAY_SUCCESS_BODY_KEYS
+
+
+def test_7a_the_minimal_request_pins_which_terminal_frame_keys_are_conditional() -> None:
+    """The streamed twin of the probe above, because the two writers are separate code."""
+
+    gateway, token = _gateway_and_token(_PlainAdapter())
+    frames = list(gateway.handle_turn_stream(token, _minimal_turn_payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert frozenset(terminal) == GATEWAY_MINIMAL_FRAME_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_FRAME_KEYS - set(terminal)),
+        "extra": sorted(set(terminal) - GATEWAY_MINIMAL_FRAME_KEYS),
+        "hint": "the frame writer and the body writer must be conditional about the same keys",
+    }
+    assert terminal["provider_retried"] is False
+    assert (
+        GATEWAY_TERMINAL_FRAME_KEYS - GATEWAY_MINIMAL_FRAME_KEYS == GATEWAY_CONDITIONAL_WIRE_KEYS
+    )
+    # Both transports are conditional about exactly the same keys, which is the property that
+    # makes the echo protocol a protocol rather than two behaviours.
+    assert (GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_MINIMAL_BODY_KEYS) == (
+        GATEWAY_TERMINAL_FRAME_KEYS - GATEWAY_MINIMAL_FRAME_KEYS
+    )
 
 
 def test_7a_the_sync_success_body_writes_exactly_the_censused_key_set() -> None:
@@ -3180,6 +3826,638 @@ def test_7d_one_fact_two_spellings_across_the_success_hop() -> None:
     frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
     chunk = gateway_client._chunk_from_event(dict(frames[-1]))
     assert chunk.response_id == frames[-1]["turn_handle"]
+
+
+# --------------------------------------------------------------------------------------
+# Registered-gap pins — a registry entry with no assertion is prose
+# --------------------------------------------------------------------------------------
+#
+# The registry's contract is "fixing a gap breaks this suite". That only holds for an entry with
+# an assertion behind it, and five round-1 entries had none: the drivers and consumers that were
+# *designed* for a fact and ignore it, the closed stream_closed schema, the unread ``turn.failed``
+# and the ``turn.interrupted`` vocabulary collision were described and never pinned. Each one
+# below flips to a failure the moment its gap is closed, which is the whole mechanism.
+
+
+def _handled_event_types(function: _FunctionNode, subject: str) -> frozenset[str]:
+    """Event types ``function`` dispatches on, read off ``<subject> == "x"`` / ``in {...}``."""
+
+    handled: set[str] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            continue
+        if ast.unparse(node.left) != subject:
+            continue
+        comparator = node.comparators[0]
+        if isinstance(node.ops[0], ast.Eq) and isinstance(comparator, ast.Constant):
+            handled.add(comparator.value)
+        elif isinstance(node.ops[0], ast.In) and isinstance(
+            comparator, (ast.Set, ast.Tuple, ast.List)
+        ):
+            handled |= {
+                element.value
+                for element in comparator.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            }
+    return frozenset(handled)
+
+
+def _names_in(function: ast.AST) -> frozenset[str]:
+    """Every identifier and string constant occurring in ``function``'s code."""
+
+    constants, identifiers = _code_occurrences(function)
+    return constants | identifiers
+
+
+def _getattr_names(function: ast.AST) -> frozenset[str]:
+    """The attribute names ``function`` reads through ``getattr(obj, "name", ...)``."""
+
+    return frozenset(
+        node.args[1].value
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    )
+
+
+def test_gap_the_designed_consumer_of_config_recoverable_never_names_it() -> None:
+    """Registered: reference/backend/session_drive.py:drive_open_session branches on retryable.
+
+    The driver is the consumer the classification was added for — it is the code that decides
+    retry-vs-give-up on a parked turn — and ``config_recoverable`` does not appear in it at all.
+    Pinned by absence, so the first branch that reads the fact fails here and the registry entry
+    has to go with it.
+    """
+
+    driver = _function_node("reference/backend/session_drive.py", "drive_open_session")
+    names = _names_in(driver)
+    assert "retryable" in names, "the driver stopped branching on retryable — recheck this pin"
+    assert "config_recoverable" not in names, {
+        "hint": "the driver reads it now: drop the registry entry and pin the new behaviour",
+    }
+
+
+# core/model_io.py:ModelCallReceipt.with_error — every fact it lifts off the exception, by name.
+RECEIPT_ERROR_FACTS = frozenset(
+    {
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "http_status",
+        "provider_retried",
+        # Read too, and for the same reason the wire carries it: a failure after a billed answer.
+        "provider_usage",
+    }
+)
+
+
+def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_sixth() -> None:
+    """Registered: the immutable record of a call cannot say the failure was config-fixable."""
+
+    with_error = _function_node("core/model_io.py", "with_error", within="ModelCallReceipt")
+    read = _getattr_names(with_error)
+    assert read == RECEIPT_ERROR_FACTS, {
+        "newly_read": sorted(read - RECEIPT_ERROR_FACTS),
+        "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
+        "hint": "the receipt's read set is the record's whole vocabulary",
+    }
+    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(read)
+    # Every fact it does read is a real attribute of the exception it reads them from.
+    maximal = _maximal_adapter_error()
+    assert read <= set(vars(maximal)) | {"provider_usage"}
+
+
+# core/schemas.py, MODEL_CONTENT_RECORD_SCHEMA's stream_closed branch. additionalProperties is
+# False, so this is the total domain of the record and adding a fact to it is a schema change.
+STREAM_CLOSED_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "run_id",
+        "stream_id",
+        "status",
+        "final_text",
+        "usage",
+        "error_code",
+        "retryable",
+        "finished_at",
+    }
+)
+
+
+def _stream_closed_branch() -> dict[str, Any]:
+    from monoid_agent_kernel.core.schemas import MODEL_CONTENT_RECORD_SCHEMA
+
+    for variant in MODEL_CONTENT_RECORD_SCHEMA["oneOf"]:
+        if variant["properties"]["kind"].get("const") == "stream_closed":
+            return variant
+    raise AssertionError("MODEL_CONTENT_RECORD_SCHEMA has no stream_closed branch")
+
+
+def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> None:
+    """Registered: the live stream lane carries retryable and no config_recoverable."""
+
+    branch = _stream_closed_branch()
+    declared = frozenset(branch["properties"])
+    assert declared == STREAM_CLOSED_RECORD_KEYS, {
+        "missing": sorted(STREAM_CLOSED_RECORD_KEYS - declared),
+        "extra": sorted(declared - STREAM_CLOSED_RECORD_KEYS),
+    }
+    assert branch["additionalProperties"] is False, {
+        "hint": "the closed cap is why adding the fact is a schema change, not a patch",
+    }
+    assert "retryable" in declared
+    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(declared), {
+        "hint": "carried now? update EXPECTED and drop the registry entry",
+    }
+
+
+# The three consumers of one event stream, and the event types each one dispatches on. Pinned
+# per consumer, because the defect here is not a missing branch anywhere in particular — it is
+# that no two of them handle the same set and nothing said so.
+EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
+    # name -> (module, enclosing class, the expression it switches on)
+    "core/projections.py:_apply_event_projection": (
+        "core/projections.py",
+        None,
+        "event_type",
+    ),
+    "reference/backend/run_state.py:record_event": (
+        "reference/backend/run_state.py",
+        "RunStateMutationService",
+        "event.type",
+    ),
+    "recorder.py:StatusJsonSink.emit": ("recorder.py", "StatusJsonSink", "event.type"),
+}
+EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
+    # No ``run.awaiting_input``: an offline ``monoid status`` reports a parked run as running.
+    "core/projections.py:_apply_event_projection": frozenset(
+        {
+            "run.started",
+            "run.finished",
+            "run.failed",
+            "run.waiting",
+            "run.resumed",
+            "agent.config.updated",
+            "model.turn.started",
+            "tool.call.started",
+            "tool.call.finished",
+            "tool.call.failed",
+            "workspace.proposal.updated",
+            "proposal.package.exported",
+            "proposal.approved",
+            "proposal.rejected",
+            "proposal.applied",
+            "proposal.conflict",
+        }
+    ),
+    # The mirror image: ``run.awaiting_input`` and no ``run.waiting``.
+    "reference/backend/run_state.py:record_event": frozenset(
+        {
+            "run.started",
+            "run.awaiting_input",
+            "run.resumed",
+            "model.turn.started",
+            "run.finished",
+            "run.failed",
+        }
+    ),
+    # The control: both parks, and it clears the wait on model.turn.started. (``job.*`` is
+    # matched by prefix rather than equality, so it is outside this census by construction.)
+    "recorder.py:StatusJsonSink.emit": frozenset(
+        {
+            "run.started",
+            "run.finished",
+            "run.failed",
+            "run.waiting",
+            "run.resumed",
+            "run.awaiting_input",
+            "agent.config.updated",
+            "model.turn.started",
+            "tool.call.started",
+            "tool.call.finished",
+            "tool.call.failed",
+            "plan.updated",
+            "metrics.updated",
+            "workspace.proposal.updated",
+        }
+    ),
+}
+
+
+@pytest.mark.parametrize("consumer", sorted(EVENT_CONSUMERS))
+def test_gap_each_status_consumer_handles_its_own_subset_of_one_event_stream(
+    consumer: str,
+) -> None:
+    """Registered (three entries): two projections, each blind to the park the other sees."""
+
+    relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
+    name = consumer.split(":", 1)[1].split(".")[-1]
+    handled = _handled_event_types(
+        _function_node(relative_path, name, within=class_name), subject
+    )
+    expected = EVENT_CONSUMER_HANDLED[consumer]
+    assert handled == expected, {
+        "consumer": consumer,
+        "newly_handled": sorted(handled - expected),
+        "no_longer_handled": sorted(expected - handled),
+        "hint": "a consumer that gained a branch closes a registered gap: drop its entry",
+    }
+    # Registered burn-down, stated once per consumer: nothing projects the terminal
+    # classification a parked run carries, so the surface an operator reads shows none of it.
+    assert "turn.failed" not in handled, {
+        "consumer": consumer,
+        "hint": "a status projection consumes turn.failed now — drop the registry entry",
+    }
+
+
+def test_gap_the_two_run_status_projections_are_each_blind_to_the_others_park() -> None:
+    """The diff itself, so the asymmetry is the assertion rather than an inference."""
+
+    offline = EVENT_CONSUMER_HANDLED["core/projections.py:_apply_event_projection"]
+    backend = EVENT_CONSUMER_HANDLED["reference/backend/run_state.py:record_event"]
+    control = EVENT_CONSUMER_HANDLED["recorder.py:StatusJsonSink.emit"]
+    assert "run.waiting" in offline and "run.awaiting_input" not in offline
+    assert "run.awaiting_input" in backend and "run.waiting" not in backend
+    assert {"run.waiting", "run.awaiting_input"} <= control, {
+        "hint": "the sink is the control: it proves both parks are observable from this stream",
+    }
+
+
+def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
+    """Registered: one word, two vocabularies, on one event.
+
+    ``data.reason`` on ``turn.interrupted`` names the CAUSE (``user_stop``); ``Suspension.reason``
+    names the PARK (``interrupted``). Pinned as the collision it is: the emit's literal and the
+    proof that its value is not a member of the park vocabulary it shares a field name with.
+    """
+
+    emitted = _emit_data_keys("loop.py", "turn.interrupted")
+    assert emitted == {"reason"}, {"emitted": sorted(emitted)}
+    values = _literal_dict_keys_where("loop.py", "reason", "user_stop")
+    assert len(values) == 1, {"turn_interrupted_reason_literals": len(values)}
+    assert values[0] == {"reason"}
+    assert "user_stop" not in _SUSPENSION_REASONS, {
+        "hint": "the two vocabularies merged: drop the registry entry",
+    }
+    assert "interrupted" in _SUSPENSION_REASONS
+    # The pause twin emits no event of its own, which is the other half of the entry.
+    assert not [
+        node
+        for node in ast.walk(_module_tree("loop.py"))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "emit"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "turn.paused"
+    ], {"hint": "turn.paused exists now: the two parks are symmetric — drop the entry"}
+
+
+def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> None:
+    """Registered (round 2, leak-adjacent): three of four paths out of one payload filter.
+
+    ``record.error`` and ``metrics["error"]`` are written through
+    ``public_view.py:public_error_message``; the ready branch of ``result()`` serves
+    ``result.error`` — the deliberately raw ``AgentRunResult.error`` — straight to an HTTP
+    response. Pinned statically, because a value-level probe would need a whole finished run and
+    the fact is which expression the branch names.
+    """
+
+    projection = _function_node("reference/backend/projection.py", "result")
+    served: list[str] = []
+    for node in ast.walk(projection):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "error":
+                served.append(ast.unparse(value))
+    assert sorted(served) == ["record.error", "result.error"], {
+        "error_expressions_served": sorted(served),
+        "hint": "the raw one is the ready branch; a filter here closes the gap",
+    }
+    assert "public_error_message" not in _names_in(projection), {
+        "hint": "the projection filters now: drop the registry entry",
+    }
+    # The two writers this branch disagrees with, so the asymmetry is asserted and not assumed.
+    assert "public_error_message" in _names_in(
+        _function_node("reference/backend/run_state.py", "record_run_result")
+    )
+    assert "public_error_message" in _names_in(
+        _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+    )
+
+
+def _snapshot_written_keys() -> frozenset[str]:
+    """The RunCheckpoint field names ``loop.py:snapshot`` actually writes."""
+
+    snapshot = _function_node("loop.py", "snapshot")
+    calls = [
+        node
+        for node in ast.walk(snapshot)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "RunCheckpoint"
+    ]
+    assert len(calls) == 1, {"run_checkpoint_construction_sites": len(calls)}
+    return frozenset(keyword.arg for keyword in calls[0].keywords if keyword.arg)
+
+
+def test_gap_the_snapshot_omits_the_siblings_of_the_fields_it_writes() -> None:
+    """Registered (round 2, three cells of the uncensused run-state carriage family)."""
+
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+    from monoid_agent_kernel.loop import AgentToolContext, RunState
+
+    written = _snapshot_written_keys()
+    state_fields = {field.name for field in dataclasses.fields(RunState)}
+    context_fields = {field.name for field in dataclasses.fields(AgentToolContext)}
+
+    # (a) output_retries rides; its history does not.
+    assert {"output_retries", "output_failure_history"} <= state_fields
+    assert "output_retries" in written
+    assert "output_failure_history" not in written, {
+        "hint": "checkpointed now? add it to RunCheckpoint's census and drop the registry entry",
+    }
+    assert "output_failure_history" not in RunCheckpoint.__dataclass_fields__
+
+    # (b) the RunState counters ride; the context-owned ones do not, and metrics.json mixes them.
+    context_counters = {"subagent_count", "subagent_usage", "skill_activation_count"}
+    assert context_counters <= context_fields
+    assert {"total_usage", "total_tool_calls"} <= written
+    assert context_counters.isdisjoint(written), {
+        "carried_now": sorted(context_counters & written),
+        "hint": "one epoch at last: drop the registry entry",
+    }
+    assert context_counters.isdisjoint(RunCheckpoint.__dataclass_fields__)
+    metrics_names = _names_in(
+        _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+    )
+    assert context_counters <= metrics_names, {
+        "hint": "these are the counters that reach metrics.json beside the restored totals",
+    }
+
+
+def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally() -> None:
+    """Registered (round 2): a restore without a token un-cancels a durably-cancelled run."""
+
+    assert "cancellation_requested" in _snapshot_written_keys()
+    restore = _function_node("loop.py", "_rehydrate")
+    guards = [
+        ast.unparse(node.test)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.If) and "cancellation_requested" in ast.unparse(node.test)
+    ]
+    assert guards == ["cp.cancellation_requested and self.cancellation_token is not None"], {
+        "restore_guards": guards,
+        "hint": "the read is unconditional now (or the guard changed): update EXPECTED and drop "
+        "the registry entry",
+    }
+
+
+def test_gap_the_backend_tenant_meter_drops_the_same_sub_counts_the_gateway_does() -> None:
+    """Registered (round 2): the unregistered twin of the gateway meter, pinned behaviorally."""
+
+    from monoid_agent_kernel.reference.backend.run_state import TenantUsage
+
+    meter = TenantUsage("tenant-1")
+    meter.add_metrics({**_MAXIMAL_USAGE, "web_search_calls": 3})
+    reported = meter.to_json()
+    dropped = NORMALIZED_USAGE_KEYS - set(reported)
+    assert dropped == {
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "reasoning_tokens",
+        "audio_tokens",
+    }, {"dropped_sub_counts": sorted(dropped)}
+    # ...the exact set the gateway meter drops, so the two ledgers are wrong the same way.
+    assert dropped == NORMALIZED_USAGE_KEYS - GATEWAY_METER_KEYS
+    assert reported["total_tokens"] == _MAXIMAL_USAGE["total_tokens"]
+    assert reported["web_search_calls"] == 3
+
+
+def test_gap_a_run_that_dies_of_an_exception_meters_nothing() -> None:
+    """Registered (round 2): record_run_failure has no meter, its sibling does."""
+
+    failure = _function_node(
+        "reference/backend/run_state.py", "record_run_failure", within="RunStateMutationService"
+    )
+    success = _function_node(
+        "reference/backend/run_state.py", "record_run_result", within="RunStateMutationService"
+    )
+    assert "add_metrics" in _names_in(success)
+    assert "add_metrics" not in _names_in(failure), {
+        "hint": "the failure path meters now: drop the registry entry",
+    }
+    # Not even the run count, which is what add_metrics increments first.
+    assert "_usage" not in _names_in(failure)
+
+
+def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
+    """Registered (round 2): one run, three surfaces, three states.
+
+    Pinned value-level on all three, so a fix to any one of them trips this census and forces
+    the semantic decision the divergence has been deferring.
+    """
+
+    from monoid_agent_kernel.core.lifecycle import (
+        LoopSession,
+        SessionState,
+        session_state_from_run_status,
+        state_from_suspension,
+    )
+
+    parked = Suspension(
+        reason="terminal", status="limited", error_code="output_validator_unsatisfied"
+    )
+
+    class _ClosingLoop:
+        def close(self) -> Any:
+            return dataclasses.replace(_maximal_turn(), status="limited")
+
+    session = LoopSession(loop=_ClosingLoop())  # type: ignore[arg-type]
+    session.close()
+
+    verdicts = {
+        "core/lifecycle.py:state_from_suspension": state_from_suspension(parked),
+        "core/lifecycle.py:session_state_from_run_status": session_state_from_run_status(
+            "limited", terminal=True
+        ),
+        "core/lifecycle.py:LoopSession.close": session.state,
+    }
+    assert verdicts == {
+        "core/lifecycle.py:state_from_suspension": SessionState.FAILED,
+        "core/lifecycle.py:session_state_from_run_status": SessionState.LIMITED,
+        "core/lifecycle.py:LoopSession.close": SessionState.COMPLETED,
+    }, {
+        "verdicts": {name: value.value for name, value in verdicts.items()},
+        "hint": "harmonized? make them agree, update EXPECTED and drop the registry entry",
+    }
+    # And LIMITED is a real state all three could have returned.
+    assert REASON_TO_STATE["limited"] is SessionState.LIMITED
+
+
+def test_gap_the_recovery_park_is_built_outside_the_durable_status_vocabulary() -> None:
+    """Registered (round 2): reference/backend/recovery.py mints Suspension(status="running").
+
+    Latent, and pinned as latent: the synthetic park is re-driven rather than serialized, so the
+    landmine is documented by showing what happens the first time something checkpoints it.
+    """
+
+    recovered = _function_node("reference/backend/recovery.py", "run_recovered")
+    minted = [
+        {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in node.keywords
+            if keyword.arg
+        }
+        for node in ast.walk(recovered)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Suspension"
+    ]
+    assert minted == [
+        {"reason": "'awaiting_tasks'", "status": "'running'", "has_external": "True"}
+    ], {"suspensions_minted_during_recovery": minted}
+
+    synthetic = Suspension(reason="awaiting_tasks", status="running", has_external=True)  # type: ignore[arg-type]
+    payload = suspension_checkpoint_payload(synthetic)
+    assert payload["status"] == "running"
+    with pytest.raises(ValueError):
+        suspension_from_checkpoint_payload(payload)
+
+
+# --------------------------------------------------------------------------------------
+# FUTURE_FAMILIES — the numeric claims, pinned so they rot loudly
+# --------------------------------------------------------------------------------------
+#
+# A declared-but-uncensused family is a prediction, and a prediction with a stale number is
+# worse than none. The counts in the risk notes are asserted here against the code they
+# describe.
+
+
+def _future_family(name: str) -> FutureFamily:
+    return next(family for family in FUTURE_FAMILIES if family.family == name)
+
+
+# core/manifest.py:build_run_manifest — the four limits the durable record of a run carries.
+MANIFEST_LIMIT_KEYS = frozenset(
+    {"max_steps", "max_tool_calls", "max_bytes_read", "max_duration_s"}
+)
+RUN_LIMITS_FIELD_COUNT = 15
+
+
+def test_future_family_run_limits_carries_four_of_fifteen() -> None:
+    from monoid_agent_kernel.core.spec import RunLimits
+
+    fields = {field.name for field in dataclasses.fields(RunLimits)}
+    assert len(fields) == RUN_LIMITS_FIELD_COUNT, {
+        "run_limits_fields": sorted(fields),
+        "hint": "the '4 of 15' claim in FUTURE_FAMILIES is now wrong: update both",
+    }
+    builder = _function_node("core/manifest.py", "build_run_manifest")
+    carried = [
+        _dict_keys(keyword.value)
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "limits" and isinstance(keyword.value, ast.Dict)
+    ]
+    assert len(carried) == 1, {"manifest_limits_literals": len(carried)}
+    assert carried[0] == MANIFEST_LIMIT_KEYS, {
+        "carried_into_the_manifest": sorted(carried[0]),
+        "hint": "widened? update EXPECTED and the FUTURE_FAMILIES risk note together",
+    }
+    assert carried[0] <= fields
+    assert _future_family("run limits").carrier_count == 1
+
+
+def test_future_family_stream_frames_has_two_hand_built_carriers() -> None:
+    """The frame writer and the frame reader, and the chunk union they both re-implement."""
+
+    from monoid_agent_kernel.providers.base import ModelStreamChunk
+
+    members = {member.__name__ for member in get_args(ModelStreamChunk)}
+    assert members == {"TextDelta", "ReasoningDelta", "ToolCallDelta", "TurnComplete"}, {
+        "chunk_union": sorted(members),
+        "hint": "a fifth chunk type must reach both hand-built carriers",
+    }
+    writer = _function_node("reference/llm_gateway/service.py", "_chunk_to_frame")
+    branches = {
+        ast.unparse(node.args[1])
+        for node in ast.walk(writer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "isinstance"
+        and len(node.args) == 2
+    }
+    # ``TurnComplete`` is dropped by design: the gateway mints its own terminal frame.
+    assert branches == members - {"TurnComplete"}, {
+        "frame_writer_branches": sorted(branches),
+        "hint": "a chunk type the frame writer cannot translate is dropped silently",
+    }
+    # The two carriers bound to each other: every frame type the writer can put on the wire is a
+    # frame type the reader dispatches on, and the reader's extra two are the gateway's own
+    # terminal/error frames (which no ``ModelStreamChunk`` produces).
+    written = {
+        value.value
+        for node in ast.walk(writer)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if isinstance(key, ast.Constant)
+        and key.value == "type"
+        and isinstance(value, ast.Constant)
+    }
+    read = _handled_event_types(
+        _function_node("providers/gateway.py", "_chunk_from_event"), "event_type"
+    )
+    assert written == {"text_delta", "reasoning_delta", "tool_call_delta"}, sorted(written)
+    assert written <= read, {
+        "written_but_not_dispatched_on": sorted(written - read),
+        "hint": "a frame the writer emits and the reader drops",
+    }
+    assert read - written == {"turn_complete", "error"}
+    assert _future_family("stream frames").carrier_count == 2
+
+
+# core/schemas.py:STATUS_SCHEMA — what the operator-facing status file declares about itself.
+STATUS_SCHEMA_KEYS = frozenset(
+    {"run_id", "state", "terminal", "last_event_seq", "last_event_type", "updated_at"}
+)
+
+
+def test_future_family_status_json_is_already_wider_than_its_own_schema() -> None:
+    from monoid_agent_kernel.core.schemas import STATUS_SCHEMA
+
+    declared = frozenset(STATUS_SCHEMA["properties"])
+    assert declared == STATUS_SCHEMA_KEYS, {
+        "missing": sorted(STATUS_SCHEMA_KEYS - declared),
+        "extra": sorted(declared - STATUS_SCHEMA_KEYS),
+        "hint": "the schema moved: recheck the FUTURE_FAMILIES claim it backs",
+    }
+    assert STATUS_SCHEMA["additionalProperties"] is True, {
+        "hint": "the cap closed: every undeclared key the sink writes is now a failure",
+    }
+    # The claim itself: the sink writes a ``metrics`` block the schema never declares.
+    sink = _function_node("recorder.py", "emit", within="StatusJsonSink")
+    written = {
+        node.slice.value
+        for node in ast.walk(sink)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "state"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+    assert "metrics" in written and "metrics" not in declared, {
+        "written_but_undeclared": sorted(written - declared),
+        "hint": "declared now? update EXPECTED and the FUTURE_FAMILIES risk note",
+    }
+    assert _future_family("status.json projection").carrier_count == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -3401,6 +4679,14 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
         # Registered by the ToolSpec family, whose authority is a dataclass rather than a
         # headline field name — its census (family 5) is the backstop for these.
         "core/manifest.py",
+        # Round-2 registrations whose fact is not a headline wire field either: the raw/filtered
+        # error asymmetry, the two half-blind run-status projections, the three disagreeing
+        # terminal-state mappers, and a Suspension built outside the durable status vocabulary.
+        # Each is pinned by its own assertion below; no name scan can reach them.
+        "reference/backend/projection.py",
+        "core/projections.py",
+        "core/lifecycle.py",
+        "reference/backend/recovery.py",
     }
     unaccounted = registered_paths - all_carriers - alias_only
     assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}

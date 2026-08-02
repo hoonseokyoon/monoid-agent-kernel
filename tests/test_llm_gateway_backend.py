@@ -764,22 +764,15 @@ def test_the_clients_own_retry_is_combined_with_the_gateways_not_written_over_it
     assert _parse_gateway_response(response).provider_retried is True
 
 
-def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None:
-    """Blast radius of the OpenAI adapter's by-reference refusal, end to end over the hop.
+def _seeded_by_reference_gateway() -> tuple[LlmGatewayBackend, TokenManager]:
+    """A gateway whose upstream is the real OpenAI adapter, with one handle already mapped.
 
-    The refusal itself is unit-tested against ``_payload``, and ``_model_error_status`` is
-    tested against the exception -- but those are two halves that only *compose* into the 422
-    a client sees. This drives the whole chain the deployment actually runs: a by-reference
-    continuation request → ``handle_turn`` → the real ``OpenAIModelAdapter`` upstream (the
-    gateway's default) → its boundary refusal → ``handle_turn``'s ``except ModelAdapterError``
-    arm → ``_write_exception`` → the non-200 body. Break any link and this fails.
-
-    The handle→provider-response mapping is seeded directly: recording it the normal way needs
+    Shared by the two transport twins below so the request they refuse cannot drift apart: the
+    handle→provider-response mapping is seeded directly because recording it the normal way needs
     a live upstream turn, and the shape under test is selected by the *lookup*, not by how the
-    record got there. No API key is used -- ``_payload`` refuses before any client is built.
+    record got there.
     """
 
-    pytest.importorskip("openai")
     manager = _token_manager()
     gateway = LlmGatewayBackend(
         token_manager=manager,
@@ -796,6 +789,26 @@ def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None
         model="gpt-5.5",
         created_at=time.time(),
     )
+    return gateway, manager
+
+
+def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None:
+    """Blast radius of the OpenAI adapter's by-reference refusal, end to end over the hop.
+
+    The refusal itself is unit-tested against ``_payload``, and ``_model_error_status`` is
+    tested against the exception -- but those are two halves that only *compose* into the 422
+    a client sees. This drives the whole chain the deployment actually runs: a by-reference
+    continuation request → ``handle_turn`` → the real ``OpenAIModelAdapter`` upstream (the
+    gateway's default) → its boundary refusal → ``handle_turn``'s ``except ModelAdapterError``
+    arm → ``_write_exception`` → the non-200 body. Break any link and this fails.
+
+    The handle→provider-response mapping is seeded directly: recording it the normal way needs
+    a live upstream turn, and the shape under test is selected by the *lookup*, not by how the
+    record got there. No API key is used -- ``_payload`` refuses before any client is built.
+    """
+
+    pytest.importorskip("openai")
+    gateway, manager = _seeded_by_reference_gateway()
     server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
     with serving(server) as base_url:
         with pytest.raises(HTTPError) as caught:
@@ -815,3 +828,53 @@ def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None
     reconstructed = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
     assert reconstructed.provider_error_code == "unsupported_request_shape"
     assert reconstructed.http_status == 422
+
+
+def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_frame() -> None:
+    """The streamed twin of the 422 above, and it takes a materially different route.
+
+    The refusal is raised inside the generator, i.e. *after* the HTTP layer has committed to a
+    200 SSE body — so the whole classification has to survive as a terminal `type: "error"` frame
+    instead of a non-200 response. Testing only the sync route left that route's composition
+    unproven end to end: the pieces (`_stream_error_frame`, `_model_error_status`, the adapter's
+    boundary refusal) are each unit-tested and none of them says the stream commits first.
+
+    No API key is used: `_classified_payload` refuses before any client is constructed, on the
+    async path exactly as on the sync one.
+    """
+
+    pytest.importorskip("openai")
+    gateway, manager = _seeded_by_reference_gateway()
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = Request(
+            f"{base_url}/internal/llm/turns/stream",
+            data=json.dumps(_payload(previous_turn_handle="turn_seeded")).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_llm_token(manager)}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=10) as response:
+            # Committed to a 200 stream before the upstream was ever called.
+            assert response.status == 200
+            assert response.headers.get("Content-Type", "").startswith("text/event-stream")
+            raw = response.read().decode("utf-8")
+
+    frames = [
+        json.loads(block.strip()[len("data:") :].strip())
+        for block in raw.split("\n\n")
+        if block.strip().startswith("data:")
+    ]
+    assert [frame["type"] for frame in frames] == ["error"]
+    terminal = frames[0]
+    assert terminal["error_code"] == "unsupported_request_shape"
+    assert terminal["retryable"] is False
+    assert terminal["http_status"] == 422
+    assert "messages" in terminal["error"]
+    # And the client's frame parser reconstructs the same classification the sync reader does.
+    reconstructed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(terminal)).value
+    assert reconstructed.provider_error_code == "unsupported_request_shape"
+    assert reconstructed.http_status == 422
+    assert reconstructed.retryable is False

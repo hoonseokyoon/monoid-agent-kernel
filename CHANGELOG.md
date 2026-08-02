@@ -18,7 +18,7 @@ out in commit messages and here.
   authority without a carrier fails by construction. Seven families are covered: `Suspension`,
   `ModelAdapterError` transport, usage counts, the W5 applied-echo protocol, the tool catalog
   (one `ToolSpec` projected by five hand-written builders, each omission justified in place),
-  the checkpoint validator's field coverage (five hand-maintained frozensets over a validator
+  the checkpoint validator's field coverage (six hand-maintained frozensets over a validator
   that fails open), and the success envelope — the main wire, two server writers against two
   client parsers.
 - Four properties make the census trustworthy: one hand-written *maximal builder* per authority
@@ -43,6 +43,46 @@ out in commit messages and here.
   A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
   each with the authority a census would take, its carrier count, and a one-line risk note — so
   the suite's silence about a family is a decision on the record rather than an oversight.
+- **Round-2 hardening: the census mechanisms were attacked, and the ones that failed open are
+  repaired here.** Each repair is a mechanism, not a patched assertion. Every drift below was run
+  against the suite as it stood and passed all 89 tests; each now fails with a diagnostic naming
+  the shape. *Wrapper transparency* — `inspect.getsource`
+  and `inspect.signature` both follow `__wrapped__`, so a `functools.wraps` wrapper adding an
+  eighth usage key passed the whole suite; every live-callable census now refuses a wrapped
+  object rather than reading the function underneath it. *Fail-closed emit reading* — the
+  assignable-domain reader documented itself as fail-closed and looked at one of the four ways to
+  write a key into a dict, so `result.update({...})`, `|=` and augmented assignment were each an
+  emitted key it reported as nonexistent; any method call or augmented assignment on the result
+  is now an unanalyzable shape that fails by name. *Bucket membership and consumption* — moving a
+  field between two checkpoint validation buckets changes the rule it is validated under at the
+  recovery boundary and left the union, the disjointness and the count untouched; membership is
+  pinned per bucket, and every bucket must be read by the validator, so a declared-but-unused one
+  fails. *Minimal-probe twins* — the wire censuses pinned only the maximal request, so a writer
+  that omitted a key whenever it held its default value was invisible; each family-7 census has a
+  minimal twin, and the difference between the two probes is the conditional half of the wire.
+  *Widened discovery* — reader discovery was a predicate on where a function was written (module
+  level) and how it spelled its raise (a literal constructor); it now walks class bodies and
+  resolves one level of delegation. The gateway's wire-reading helper list, the other closed hand
+  list in the family, is derived from the module and diffed against it, and the emit-site census
+  counts every emit for an event type instead of only those with a literal `data={...}`.
+- **Every registry entry now has an assertion behind it.** Five round-1 entries were prose: the
+  driver and the call receipt that were designed for `config_recoverable` and never name it, the
+  closed `stream_closed` schema, the `turn.failed` event that no status projection consumes, and
+  the `turn.interrupted` cause-vs-park vocabulary collision. Ten further gaps found by the round-2
+  black-box pass are registered and pinned — among them the `result()` ready branch serving the
+  raw error its two siblings filter, three checkpoint-carriage cells (`output_failure_history`,
+  the context-owned subagent/skill counters, and a cancellation flag written unconditionally and
+  applied conditionally), the backend tenant meter dropping the same four priced sub-counts the
+  gateway meter does, a failed run metering nothing at all, two run-status projections each blind
+  to the park the other sees, three lifecycle mappers answering one terminal-limited run three
+  ways, and a recovery-path `Suspension` built outside the durable status vocabulary. Two new
+  `FUTURE_FAMILIES` entries (run-state → checkpoint carriage; the settled-text digest family with
+  six hand carriers), and the numeric claims in that registry are pinned so a stale prediction
+  rots loudly.
+- An end-to-end streamed twin of the by-reference 422 (`tests/test_llm_gateway_backend.py`): the
+  refusal is raised after the HTTP layer has committed to a 200 SSE body, so it travels as a
+  terminal `type: "error"` frame rather than a non-200 response — a materially different route
+  whose composition the sync test could not prove.
 - Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
   CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
   in the parallel shard. No public surface, wire format, or shipped contract changes.
