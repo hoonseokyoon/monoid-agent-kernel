@@ -51,7 +51,8 @@ out in commit messages and here.
   its automatic replacement stream starts; an explicit Studio Retry durably identifies and removes
   the exact failed turn it reissues, including after a lost response or reload. Retained replay and
   hydration cannot restore that abandoned prefix. Non-retryable failures followed by a new user
-  message and user-interrupted partials remain visible.
+  message are joined into the durable chat projection, so their partial output remains visible after
+  later calls replace the live hydration snapshot. User-interrupted partials remain visible too.
 - Hydration binds every root/descendant record to its run directory and verified sidecar file
   identity. Coordinated flush failures, file replacement, and writer lifecycle races return HTTP
   503, which Studio retries. Request-scoped path watchers catch complete open/close ABA cycles

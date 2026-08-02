@@ -136,6 +136,12 @@ projection. The Studio UI restores user, assistant, and error messages from
 `transcript.jsonl` remains the private model-call log. `model-content.jsonl` is the private streamed
 content and settled-text sidecar.
 
+On catch-up, the chat projection joins interrupted and non-retryable failed root turns to their
+exact private sidecar snapshots and stores available partial output with a stable stream message
+id. Failed partials remain in transcript history when a later normal turn becomes the latest live
+snapshot. A durable `run.resumed(reason="studio-retry")` marker suppresses only the explicitly
+reissued failed turn.
+
 Studio receives provider output and reasoning through a separate passive model-stream channel.
 The browser subscribes to one root-scoped `/api/model-stream` SSE connection that multiplexes the
 root run and its descendants. Frames use `monoid.model-stream.live.v1` and a

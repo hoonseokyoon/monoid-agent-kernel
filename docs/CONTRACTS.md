@@ -929,10 +929,12 @@ reducer and Trace.
 Studio removes a retryable failed partial only after a newer root stream is accepted. The manual
 retry endpoint returns the exact failed `turn_id`, and the session driver durably emits
 the existing `run.resumed` v1 shape with `reason="studio-retry"` and that envelope-level `turn_id`
-before starting the replacement turn. The browser removes and suppresses that turn from either
-signal, so a lost HTTP response, reload, retained live frames, or hydration cannot restore the
-abandoned prefix. A normal new user turn does not supersede a non-retryable failed partial, and
-interrupted partials remain visible.
+before starting the replacement turn. The chat projection joins a non-retryable `turn.failed` to
+the exact root/run/turn private sidecar snapshot and stores its available output beside the error.
+This keeps an earlier failed prefix after a normal new turn replaces the bounded live-hydration
+snapshot. The projection and browser suppress only the exact turn named by an explicit Studio
+Retry, so a lost HTTP response, reload, retained live frames, or hydration cannot restore that
+abandoned prefix. Interrupted partials remain visible.
 
 ### Diagnostics
 
