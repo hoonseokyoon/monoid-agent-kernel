@@ -170,18 +170,40 @@ class ModelRequest:
     output_schema: dict[str, Any] | None = None
 
 
+def _declared_support(adapter: Any, attribute: str) -> Literal["native", "none"]:
+    """The fail-closed probe shared by every opt-in adapter capability declaration.
+
+    One rule for all of them: only the exact string ``"native"`` claims the capability.
+    Absence, ``None``, ``True``, and unknown future spellings all read as ``"none"``, so a
+    consumer can never over-trust an adapter that did not explicitly claim it — and the two
+    capabilities below cannot drift into different notions of "declared".
+    """
+
+    return "native" if getattr(adapter, attribute, "none") == "native" else "none"
+
+
 def structured_output_support(adapter: Any) -> Literal["native", "none"]:
     """Whether ``adapter`` translates :attr:`ModelRequest.output_schema` into provider-native
     constrained decoding.
 
     Opt-in declaration, like ``supports_multimodal``: adapters set a
-    ``structured_output_support`` class attribute. Anything other than the exact string
-    ``"native"`` — including absence and unknown future values — reads as ``"none"``, so a
-    consumer can never over-trust an adapter that did not explicitly claim the capability.
+    ``structured_output_support`` class attribute.
     """
 
-    value = getattr(adapter, "structured_output_support", "none")
-    return "native" if value == "native" else "none"
+    return _declared_support(adapter, "structured_output_support")
+
+
+def generation_support(adapter: Any) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.generation` to the provider request.
+
+    The twin of :func:`structured_output_support`, and for the same reason: a transport that
+    *forwards* generation parameters to an adapter cannot know whether that adapter puts them
+    on the wire. Only an adapter that declares this may be used to justify an
+    applied-parameters proof; anything else must be reported as unproven so a fail-closed
+    client refuses the turn rather than trusting parameters nobody applied.
+    """
+
+    return _declared_support(adapter, "generation_support")
 
 
 class ModelAdapter(Protocol):

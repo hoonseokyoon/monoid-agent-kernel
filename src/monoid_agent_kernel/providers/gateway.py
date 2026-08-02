@@ -90,6 +90,10 @@ class GatewayModelAdapter:
     # Forwards ``output_schema`` on the wire; the ``schema_applied`` echo (checked under
     # ``on_unsupported``) is what turns this claim into proof per call.
     structured_output_support: ClassVar[str] = "native"
+    # Forwards ``generation`` on the wire and refuses a turn the server cannot prove it applied
+    # (``generation_applied``), so a gateway chained in front of this adapter inherits proof
+    # rather than an assumption.
+    generation_support: ClassVar[str] = "native"
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
@@ -148,6 +152,14 @@ class GatewayModelAdapter:
                     # retry loops sit on this path and either one having run is the fact a receipt
                     # records.
                     turn = _parse_gateway_response(data)
+                    if attempt > 1:
+                        turn = replace(turn, provider_retried=True)
+                    # Stamped *before* the applied-parameter checks, exactly as the streaming
+                    # twin stamps the chunk before checking it: those checks raise, and the
+                    # error they raise carries the retry evidence. Reading the un-stamped turn
+                    # here recorded a call this client retried as a clean single attempt on
+                    # every not-applied failure -- the one path where the retry evidence has no
+                    # other carrier, since no turn is returned.
                     _check_generation_applied(
                         build_generation_payload(config.generation),
                         config.generation.on_unsupported,
@@ -160,8 +172,6 @@ class GatewayModelAdapter:
                         data.get("schema_applied"),
                         known_provider_retried=turn.provider_retried,
                     )
-                    if attempt > 1:
-                        turn = replace(turn, provider_retried=True)
                     return turn
                 except ModelAdapterError as exc:
                     last_error = exc
@@ -656,6 +666,42 @@ def _portable_gateway_payload(
         ) from exc
 
 
+def _validated_generation_echo(
+    applied: Any, *, provider_retried: bool = False
+) -> dict[str, Any] | None:
+    """Shape-check one ``generation_applied`` echo. One rule, both transports.
+
+    Wire shape is not a policy question: a server that answers with a non-object here is
+    malformed whatever ``on_unsupported`` says and whatever this call requested, so this is
+    ``gateway_bad_response`` and it fires before any policy branch. Written once because the
+    sync response and the streamed terminal frame read the same key out of different
+    envelopes -- the streamed side used to reject a malformed echo that the sync side accepted
+    under ``"omit"``.
+    """
+
+    if applied is None or isinstance(applied, dict):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid generation_applied echo: expected an object",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=provider_retried,
+    )
+
+
+def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> bool | None:
+    """The ``schema_applied`` twin of :func:`_validated_generation_echo`, same rule."""
+
+    if applied is None or isinstance(applied, bool):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid schema_applied echo: expected a boolean",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        provider_retried=provider_retried,
+    )
+
+
 def _check_generation_applied(
     requested: dict[str, Any],
     on_unsupported: str,
@@ -672,6 +718,7 @@ def _check_generation_applied(
     ``"omit"`` is the documented way to accept a best-effort transport.
     """
 
+    applied = _validated_generation_echo(applied, provider_retried=known_provider_retried)
     if not requested:
         return
     if applied == requested:
@@ -708,15 +755,9 @@ def _check_schema_applied(
     upstream cannot enforce schemas, absent (``None``) is an older server.
     """
 
+    applied = _validated_schema_echo(applied, provider_retried=known_provider_retried)
     if not schema_sent:
         return
-    if applied is not None and not isinstance(applied, bool):
-        raise ModelAdapterError(
-            "LLM gateway returned an invalid schema_applied echo: expected a boolean",
-            provider_error_code=GATEWAY_BAD_RESPONSE,
-            retryable=False,
-            provider_retried=known_provider_retried,
-        )
     if applied is True:
         return
     if on_unsupported == "omit":
@@ -1035,22 +1076,14 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             provider_retried=retried,
         )
     if event_type == "turn_complete":
-        applied = event.get("generation_applied")
-        if applied is not None and not isinstance(applied, dict):
-            raise ModelAdapterError(
-                "LLM gateway returned an invalid generation_applied echo: expected an object",
-                provider_error_code=GATEWAY_BAD_RESPONSE,
-                retryable=False,
-                provider_retried=retried,
-            )
-        schema_applied = event.get("schema_applied")
-        if schema_applied is not None and not isinstance(schema_applied, bool):
-            raise ModelAdapterError(
-                "LLM gateway returned an invalid schema_applied echo: expected a boolean",
-                provider_error_code=GATEWAY_BAD_RESPONSE,
-                retryable=False,
-                provider_retried=retried,
-            )
+        # Same shape rule the sync response is held to; the enforcement functions call these
+        # too, so neither transport can be stricter than the other.
+        applied = _validated_generation_echo(
+            event.get("generation_applied"), provider_retried=retried
+        )
+        schema_applied = _validated_schema_echo(
+            event.get("schema_applied"), provider_retried=retried
+        )
         # The gateway's opaque turn_handle is the continuation handle the core stores.
         return TurnComplete(
             generation_applied=applied,

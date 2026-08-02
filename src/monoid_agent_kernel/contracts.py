@@ -17,6 +17,7 @@ from __future__ import annotations
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
+    GenerationConfig,
     ModelConfig,
     ModelRetryConfig,
     ReasoningConfig,
@@ -283,6 +284,7 @@ __all__ = [
     "ModelConfig",
     "ModelRetryConfig",
     "ReasoningConfig",
+    "GenerationConfig",
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",

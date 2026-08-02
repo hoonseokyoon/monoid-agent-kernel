@@ -181,6 +181,9 @@ class OpenAIModelAdapter:
     supports_multimodal: ClassVar[bool] = True
     # Translates ``ModelRequest.output_schema`` to the Responses API ``text.format`` block.
     structured_output_support: ClassVar[str] = "native"
+    # Puts ``ModelConfig.generation`` on the Responses API request body, so a transport in
+    # front of this adapter may honestly report those parameters as applied.
+    generation_support: ClassVar[str] = "native"
     # Identifies which provider's reasoning artifacts this adapter produces, so the loop tags
     # the captured reasoning block and replay only happens against a matching model.
     provider_name: ClassVar[str] = "openai"

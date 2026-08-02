@@ -9,13 +9,20 @@ path, and the reference gateway server echo. If one survives, the binding is bro
 from __future__ import annotations
 
 import json
+from urllib.error import URLError
 
 import pytest
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import build_generation_payload
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, TurnComplete
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    TurnComplete,
+    generation_support,
+)
+from monoid_agent_kernel.providers.fake import FakeModelAdapter
 from monoid_agent_kernel.providers.gateway import (
     GATEWAY_BAD_RESPONSE,
     GATEWAY_GENERATION_NOT_APPLIED,
@@ -225,7 +232,16 @@ def _turn_payload(**extra: object) -> dict:
     return payload
 
 
-def _recording_backend() -> tuple[LlmGatewayBackend, TokenManager, list[ModelConfig]]:
+def _recording_backend(
+    *, upstream_applies: bool = True
+) -> tuple[LlmGatewayBackend, TokenManager, list[ModelConfig]]:
+    """A backend whose upstream adapter is a stub.
+
+    ``upstream_applies`` mirrors the real question the echo answers: does the adapter behind
+    the gateway actually put the sampling controls on its provider request? Only an adapter
+    that declares so may be used to justify the proof.
+    """
+
     manager = _token_manager()
     captured: list[ModelConfig] = []
 
@@ -233,6 +249,9 @@ def _recording_backend() -> tuple[LlmGatewayBackend, TokenManager, list[ModelCon
         captured.append(config)
 
         class Adapter:
+            if upstream_applies:
+                generation_support = "native"
+
             def next_turn(self, request):
                 return ModelTurn(
                     response_id="provider_1",
@@ -296,3 +315,85 @@ def test_gateway_service_stream_terminal_frame_echoes_too() -> None:
 
     plain = list(backend.handle_turn_stream(_llm_token(manager), _turn_payload()))
     assert "generation_applied" not in plain[-1]
+
+
+def test_generation_support_probe_is_opt_in_and_fail_closed() -> None:
+    assert generation_support(OpenAIModelAdapter(ModelConfig())) == "native"
+    assert generation_support(GatewayModelAdapter(config=ModelConfig())) == "native"
+    assert generation_support(FakeModelAdapter()) == "none"
+
+    class Vague:
+        generation_support = True
+
+    assert generation_support(Vague()) == "none"
+
+
+def test_gateway_service_never_asserts_application_from_the_request() -> None:
+    """An upstream that ignores ``ModelConfig.generation`` -- the offline echo adapter, or any
+    ``provider_adapter_factory`` backend -- must not produce a proof. Echoing the requested
+    block back would match exactly on the client and let ``on_unsupported="fail"`` accept
+    sampling parameters no model ever saw."""
+
+    backend, manager, _ = _recording_backend(upstream_applies=False)
+    payload = _turn_payload(generation=dict(_SET_WIRE))
+
+    assert "generation_applied" not in backend.handle_turn(_llm_token(manager), payload)
+    frames = list(backend.handle_turn_stream(_llm_token(manager), payload))
+    assert "generation_applied" not in frames[-1]
+
+    # ...and the client refuses that turn under the default policy, on both transports.
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_generation_applied(_SET_WIRE, "fail", None)
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+
+@pytest.mark.parametrize("policy", ("fail", "omit"))
+@pytest.mark.parametrize("requested", ({}, dict(_SET_WIRE)))
+def test_a_malformed_echo_is_a_bad_response_on_both_transports(
+    policy: str, requested: dict
+) -> None:
+    """Wire shape is not a policy question. The streamed frame parser always rejected a
+    non-object echo; the sync check used to accept one under "omit" (and misreport it as
+    "not applied" under "fail"), so the two transports disagreed about the same bytes."""
+
+    with pytest.raises(ModelAdapterError) as sync_side:
+        _check_generation_applied(requested, policy, "not-an-object")
+    assert sync_side.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+    with pytest.raises(ModelAdapterError) as stream_side:
+        _chunk_from_event(
+            {
+                "type": "turn_complete",
+                "turn_handle": "turn_1",
+                "generation_applied": "not-an-object",
+            }
+        )
+    assert stream_side.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
+def test_not_applied_error_carries_the_clients_own_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The receipt's only carrier for a retried-then-rejected call is the error itself: no
+    turn is returned. The streaming twin stamps the chunk before checking it, so the sync path
+    must stamp the turn before checking it too."""
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    attempts = {"n": 0}
+
+    def _urlopen(*_a: object, **_k: object) -> _FakeHttpResponse:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise URLError("connection reset")
+        return _FakeHttpResponse(_served_turn())
+
+    monkeypatch.setattr(gateway_module, "urlopen", _urlopen)
+    monkeypatch.setattr(gateway_module, "_sleep_before_retry", lambda *_a, **_k: None)
+    config = ModelConfig(generation=_SET, gateway_url="http://gateway.test")
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        GatewayModelAdapter(config=config).next_turn(_request(config))
+    assert attempts["n"] == 2
+    assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+    assert rejected.value.provider_retried is True

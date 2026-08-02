@@ -137,6 +137,27 @@ def test_check_schema_applied_matrix() -> None:
     assert malformed.value.provider_error_code == GATEWAY_BAD_RESPONSE
 
 
+@pytest.mark.parametrize("policy", ("fail", "omit"))
+@pytest.mark.parametrize("schema_sent", (True, False))
+def test_a_malformed_schema_echo_is_a_bad_response_on_both_transports(
+    policy: str, schema_sent: bool
+) -> None:
+    """The generation echo's twin rule: a non-boolean ``schema_applied`` is malformed whatever
+    the policy says and whether or not this call sent a schema. The streamed frame parser
+    always rejected it; the sync check skipped the shape check entirely when no schema went
+    out, so the same bytes were accepted on one transport and refused on the other."""
+
+    with pytest.raises(ModelAdapterError) as sync_side:
+        _check_schema_applied(schema_sent, policy, "yes")
+    assert sync_side.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+    with pytest.raises(ModelAdapterError) as stream_side:
+        _chunk_from_event(
+            {"type": "turn_complete", "turn_handle": "turn_1", "schema_applied": "yes"}
+        )
+    assert stream_side.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
 def test_turn_complete_frame_carries_and_validates_schema_applied() -> None:
     frame = {
         "type": "turn_complete",

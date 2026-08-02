@@ -16,6 +16,7 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelConfig",
     "ModelRetryConfig",
     "ReasoningConfig",
+    "GenerationConfig",
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",

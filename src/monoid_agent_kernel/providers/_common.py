@@ -25,9 +25,11 @@ def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
 def build_generation_payload(generation: GenerationConfig) -> dict[str, Any]:
     """Sampling block for a model request: ``{}`` when nothing is set, else only the set keys.
 
-    ``on_unsupported`` never rides here -- it is the caller's policy, not a provider knob. This
-    dict is also the ``generation_applied`` echo the gateway server returns, so both sides of
-    that wire agree on what "applied" means by construction.
+    ``on_unsupported`` never rides here -- it is the caller's policy, not a provider knob. The
+    gateway server's ``generation_applied`` echo is this same block, so the two sides of that
+    wire agree on the *shape* of "applied" by construction. Whether to emit it at all is a
+    separate question the server answers from its upstream adapter's ``generation_support``
+    declaration -- this builder cannot know what an adapter does with the config it is handed.
     """
     payload: dict[str, Any] = {}
     if generation.temperature is not None:

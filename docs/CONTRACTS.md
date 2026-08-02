@@ -310,13 +310,15 @@ adapter that implements only `next_turn`. Each member that is a *value* is decla
 property so a `ClassVar`, an instance attribute, and a property all satisfy it;
 `resolve_destination` is a method because it answers for a given `ModelConfig`.
 
-One further capability declaration is a plain attribute rather than a Protocol:
-`structured_output_support`. The exact string `"native"` declares that the adapter translates
-`ModelRequest.output_schema` into provider-enforced constrained decoding. The probe is
-fail-closed — absence and any other value read as `"none"` — so a consumer can never over-trust
-an adapter that did not explicitly claim the capability. `OpenAIModelAdapter` and
-`GatewayModelAdapter` declare it; the gateway's claim is turned into per-call proof by the
-`schema_applied` echo below.
+Two further capability declarations are plain attributes rather than Protocol members:
+`structured_output_support` (the adapter translates `ModelRequest.output_schema` into
+provider-enforced constrained decoding) and `generation_support` (the adapter puts
+`ModelConfig.generation` on its provider request). The exact string `"native"` declares the
+capability; both probes are fail-closed through one shared implementation — absence and any
+other value read as `"none"` — so a consumer can never over-trust an adapter that did not
+explicitly claim it. `OpenAIModelAdapter` and `GatewayModelAdapter` declare both. These are
+what a transport in front of an adapter is allowed to base an applied-parameters proof on: a
+gateway can see what it *forwarded*, never what the adapter behind it did with it.
 
 An adapter with its own retry loop should call `report_provider_retried()` when it decides to make
 another attempt. The kernel counts one adapter call per turn however many attempts happen inside it,
@@ -348,7 +350,16 @@ gateway client compares the `generation_applied` echo (and the `schema_applied` 
 `output_schema`) against what it sent, on both the sync response and the terminal stream frame,
 and refuses an unproven turn with non-retryable `gateway_generation_not_applied` /
 `gateway_schema_not_applied`. An older gateway that silently discards the new keys therefore
-fails closed instead of silently misapplying. A direct provider call has no echo, so `"fail"`
+fails closed instead of silently misapplying. A malformed echo (a non-object
+`generation_applied`, a non-boolean `schema_applied`) is a wire-shape error, not a policy
+question: it answers `gateway_bad_response` on both transports regardless of `on_unsupported`.
+
+A server may only emit these proofs from what its **upstream adapter declares** (the
+`generation_support` / `structured_output_support` probes), never from what the request asked
+for: copying the requested block back would match exactly on the client and let `"fail"` accept
+parameters an adapter silently ignored. The reference gateway therefore omits
+`generation_applied` and echoes `schema_applied: false` when its upstream does not declare the
+capability, and the client refuses the turn. A direct provider call has no echo, so `"fail"`
 and `"omit"` behave identically there and an unsupported parameter surfaces as the provider's
 own error. One knob deliberately governs both echoes — "how to treat a parameter the transport
 cannot prove was applied" is one question, and two half-settable knobs would be a new

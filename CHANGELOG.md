@@ -22,6 +22,9 @@ out in commit messages and here.
   `AgentRuntimeConfig.config_hash` (durable recovery compares this hash across versions), and
   its wire shape. Setting any generation value changes all three, deliberately — pinned by
   literal-hash tests captured on v0.20.1.
+- `GenerationConfig` is exported from `monoid_agent_kernel.contracts` (and the package root)
+  alongside its siblings `ModelConfig` / `ModelRetryConfig` / `ReasoningConfig`, so configuring
+  generation does not require reaching into `core.spec`.
 
 ### Documentation — the output-validation and model-call contracts are now written down
 
@@ -97,14 +100,23 @@ out in commit messages and here.
 - The `monoid.llm-turn.v1` wire carries a `generation` block (only when configured — the
   protocol id is unchanged and generation-free traffic keeps its exact previous shape), and the
   reference gateway parses it **fail-closed with the same codec the kernel uses**, threads it
-  into the upstream adapter's config on both the blocking and streaming paths, and echoes the
-  block it actually forwarded as `generation_applied` (response body, and the terminal
-  `turn_complete` frame on the stream).
+  into the upstream adapter's config on both the blocking and streaming paths, and echoes
+  `generation_applied` (response body, and the terminal `turn_complete` frame on the stream).
+- **The echo is derived from what the upstream adapter declares, never from the request.**
+  Adapters opt in with `generation_support = "native"`, read through the same fail-closed probe
+  as `structured_output_support`; the reference gateway omits the echo when its upstream does
+  not declare it. Echoing the requested block back would have matched exactly on the client
+  and let `on_unsupported="fail"` accept sampling controls that an ignoring adapter — the
+  offline echo adapter, any `provider_adapter_factory` backend — never put on a request.
 - **The gateway client refuses a turn whose parameters cannot be proven applied.** Under the
   default `on_unsupported="fail"`, a response without a matching `generation_applied` echo —
   an older gateway that silently discarded the block, exactly the deployment this exists to
   catch — fails with non-retryable `gateway_generation_not_applied`; `"omit"` accepts
-  best-effort transport. Both the sync response and the streamed terminal frame enforce it.
+  best-effort transport. Both the sync response and the streamed terminal frame enforce it,
+  through one shape rule and one policy rule shared by both: a malformed echo is
+  `gateway_bad_response` on either transport whatever the policy says, and the rejection
+  carries this client's own retry evidence (`provider_retried`) since no turn is returned to
+  carry it.
 - The gateway wire also carries `reasoning.on_unsupported` now (off-default only). The server
   used to rebuild its `ReasoningConfig` without the field, silently resetting a client's
   `"omit"` to `"fail"` on the server's copy.

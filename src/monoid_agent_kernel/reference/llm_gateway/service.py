@@ -23,7 +23,7 @@ from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
-from monoid_agent_kernel.providers.base import structured_output_support
+from monoid_agent_kernel.providers.base import generation_support, structured_output_support
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     ModelRequest,
@@ -157,18 +157,7 @@ class LlmGatewayBackend:
             # own HTTP attempts and this call succeeded on the first of those.
             "provider_retried": turn.provider_retried,
         }
-        # The applied-parameters echo (client enforces under on_unsupported="fail"). Honest by
-        # construction: this is the same block ``_build_adapter``'s config makes the upstream
-        # adapter emit, produced by the same builder. Only present when the request carried
-        # generation, so generation-free traffic keeps its pre-W5 response shape.
-        applied = build_generation_payload(request.generation)
-        if applied:
-            result["generation_applied"] = applied
-        # The schema twin: True only when the upstream adapter *declared* native enforcement --
-        # a forwarded-but-ignored schema is echoed False, so the client's "fail" policy can
-        # refuse it honestly.
-        if request.output_schema is not None:
-            result["schema_applied"] = structured_output_support(adapter) == "native"
+        result.update(_applied_echoes(request, adapter))
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -291,12 +280,9 @@ class LlmGatewayBackend:
             "provider_retried": turn.provider_retried,
         }
         # Streaming twin of handle_turn's echo -- the terminal frame is the only one a
-        # streaming client can read it from.
-        applied = build_generation_payload(request.generation)
-        if applied:
-            frame["generation_applied"] = applied
-        if request.output_schema is not None:
-            frame["schema_applied"] = structured_output_support(adapter) == "native"
+        # streaming client can read it from, and it is built by the same function so the two
+        # transports cannot answer differently.
+        frame.update(_applied_echoes(request, adapter))
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -369,6 +355,33 @@ class LlmGatewayBackend:
                 created_at=time.time(),
             )
         return turn_handle
+
+
+def _applied_echoes(
+    request: LlmGatewayTurnRequest, adapter: ModelAdapter
+) -> dict[str, Any]:
+    """The applied-parameters proofs for one turn — built once, emitted by both transports.
+
+    Both echoes answer the same question, so both are derived the same way: **from what the
+    upstream adapter declared it does**, never from what the request asked for. A gateway that
+    copied the requested block back would produce an exact match no matter what the upstream
+    did with it — an offline echo adapter, a text-only backend, or any
+    ``provider_adapter_factory`` that ignores ``ModelConfig.generation`` would all read as
+    "applied", and the client's ``on_unsupported="fail"`` would accept sampling parameters that
+    were never sent to a model. Unproven is reported as unproven: the generation echo is simply
+    absent (which a fail-closed client refuses), and the schema echo is an explicit ``False``.
+
+    Both stay off the response entirely when the request did not use the feature, so traffic
+    that configures neither keeps its exact pre-W5 wire shape.
+    """
+
+    echoes: dict[str, Any] = {}
+    requested_generation = build_generation_payload(request.generation)
+    if requested_generation and generation_support(adapter) == "native":
+        echoes["generation_applied"] = requested_generation
+    if request.output_schema is not None:
+        echoes["schema_applied"] = structured_output_support(adapter) == "native"
+    return echoes
 
 
 def _pump_astream(
