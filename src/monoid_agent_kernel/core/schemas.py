@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
@@ -775,6 +776,116 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
     ]
 }
 
+MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "kind",
+                "run_id",
+                "root_run_id",
+                "turn_id",
+                "stream_id",
+                "step",
+                "provider",
+                "model",
+                "started_at",
+            ],
+            "properties": {
+                "schema_version": schema_version_property("model-content.v1"),
+                "kind": {"const": "stream_opened"},
+                "run_id": {"type": "string", "minLength": 1},
+                "root_run_id": {"type": "string", "minLength": 1},
+                "turn_id": {"type": "string", "minLength": 1},
+                "stream_id": {"type": "string", "minLength": 1},
+                "step": {"type": "integer", "minimum": 1},
+                "provider": {"type": ["string", "null"]},
+                "model": {"type": ["string", "null"]},
+                "started_at": {"type": "string", "pattern": "Z$"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "kind",
+                "run_id",
+                "stream_id",
+                "segment_index",
+                "channel",
+                "text",
+                "text_len",
+                "emitted_at",
+            ],
+            "properties": {
+                "schema_version": schema_version_property("model-content.v1"),
+                "kind": {"const": "stream_segment"},
+                "run_id": {"type": "string", "minLength": 1},
+                "stream_id": {"type": "string", "minLength": 1},
+                "segment_index": {"type": "integer", "minimum": 0},
+                "channel": {"enum": ["output", "reasoning"]},
+                "text": {"type": "string"},
+                "text_len": {"type": "integer", "minimum": 0},
+                "emitted_at": {"type": "string", "pattern": "Z$"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "kind",
+                "run_id",
+                "stream_id",
+                "status",
+                "final_text",
+                "usage",
+                "error_code",
+                "finished_at",
+            ],
+            "properties": {
+                "schema_version": schema_version_property("model-content.v1"),
+                "kind": {"const": "stream_closed"},
+                "run_id": {"type": "string", "minLength": 1},
+                "stream_id": {"type": "string", "minLength": 1},
+                "status": {
+                    "enum": ["completed", "interrupted", "failed", "cancelled", "timed_out"]
+                },
+                "final_text": {"type": ["string", "null"]},
+                "usage": {"type": ["object", "null"]},
+                "error_code": {"type": ["string", "null"]},
+                "retryable": {"type": "boolean"},
+                "finished_at": {"type": "string", "pattern": "Z$"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "kind",
+                "run_id",
+                "final_text",
+                "final_text_digest",
+                "final_text_len",
+                "recorded_at",
+            ],
+            "properties": {
+                "schema_version": schema_version_property("model-content.v1"),
+                "kind": {"const": "settled_text"},
+                "run_id": {"type": "string", "minLength": 1},
+                "final_text": {"type": "string"},
+                "final_text_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "final_text_len": {"type": "integer", "minimum": 0},
+                "recorded_at": {"type": "string", "pattern": "Z$"},
+            },
+            "additionalProperties": False,
+        },
+    ]
+}
+
 PROPOSAL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
@@ -1141,6 +1252,10 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     if transcript_path.exists():
         _validate_jsonl_file(transcript_path, TRANSCRIPT_RECORD_SCHEMA, issues)
         _validate_settled_text_digests(transcript_path, issues)
+    model_content_path = run_dir / MODEL_CONTENT_FILENAME
+    if model_content_path.exists():
+        _validate_jsonl_file(model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues)
+        _validate_settled_text_digests(model_content_path, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):

@@ -1,10 +1,10 @@
-"""Resolve settled text back onto event payloads from the run-dir record.
+"""Resolve settled text back onto event payloads from private run-dir records.
 
 v0.20 stops publishing model-authored ``final_text`` on the fan-out event stream — ``events.jsonl``
 is documented as public/redacted (``docs/OBSERVABILITY.md``) and was carrying raw model output.
-The text moves to a ``settled_text`` record in ``transcript.jsonl``, the private debug/replay
-artifact, and the event carries ``final_text_digest`` instead. Readers that are entitled to the
-text join the two back together here.
+The event carries ``final_text_digest`` instead. v0.20.1 writes settled text to the private
+``model-content.jsonl`` sidecar and retains a compatibility copy in ``transcript.jsonl``. Readers
+that are entitled to the text resolve the sidecar first and fall back to the transcript here.
 
 **Applied at the reader seam, not at call sites.** Every consumer that reaches events through the
 backend projection — the backend's own REST and SSE twins, the Studio BFF, ``monoid studio
@@ -15,11 +15,11 @@ was first planned as, and it missed two transports outright.
 which is what makes this a no-op until the emit change lands, and what keeps kernel-authored text
 (``"Stopped after reaching max steps."``, which never leaves the event) untouched.
 
-**Never fails a read.** Durability of the record is best-effort — no fsync, and the transcript's
-only repair confines a torn line rather than recovering it — so a committed event's digest can
+**Never fails a read.** Durability of the records is best-effort — no fsync, and JSONL tail repair
+confines a torn line rather than recovering it — so a committed event's digest can
 resolve to nothing. A crash is not the only cause: on a shared run root a second node can resume a
 run a live peer still owns (neither ``recover_runs`` nor ``resume_run`` consults the lease store),
-and two recorders then append to one transcript. Content-missing is a tolerated outcome either
+and two recorders then append to the same private artifacts. Content-missing is tolerated either
 way: the field stays absent and the reader sees what it would have seen anyway. Raising here would
 turn a cosmetic gap into a dead endpoint.
 """
@@ -30,8 +30,13 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
-from monoid_agent_kernel.core.model_io import content_digest
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.model_content import (
+    MODEL_CONTENT_FILENAME,
+    open_model_content_for_read,
+)
+from monoid_agent_kernel.core.model_io import content_digest, content_length
+from monoid_agent_kernel.identifiers import accepts_namespaced_id
 
 TRANSCRIPT_FILE_NAME = "transcript.jsonl"
 SETTLED_TEXT_KIND = "settled_text"
@@ -39,7 +44,7 @@ DIGEST_FIELD = "final_text_digest"
 TEXT_FIELD = "final_text"
 
 # No positional bound on the scan. Two earlier attempts both lost text, in mirrored ways: a cap
-# counting lines from the START dropped the newest settled text (the transcript grows by append),
+# counting lines from the START dropped the newest settled text (the records grow by append),
 # and anchoring the same budget at the END dropped the oldest — which broke Studio catch-up, since
 # ``_read_committed_events`` hydrates every committed event of a run in one call and therefore
 # wants digests spanning the whole session.
@@ -49,9 +54,9 @@ TEXT_FIELD = "final_text"
 # about events outside it, and hydration silently returning less than it holds is worse than being
 # slow: every consumer normalises an absent field to "" and hides it, so the loss is invisible.
 #
-# What is bounded is the working set, not the file position: the transcript is read streaming a
+# What is bounded is the working set, not the file position: each artifact is read streaming a
 # line at a time, and only the wanted digests are retained — so peak memory is the combined size
-# of the answers actually being resolved, not the transcript.
+# of the answers actually being resolved, not the artifact.
 #
 # The cost is honestly one full pass in the common case, not just the worst one. The early exit
 # fires only when every wanted digest has been found, so a page whose record was appended last
@@ -68,10 +73,16 @@ def hydrate_settled_text(events: Any, run_dir: Path) -> Any:
     """
     wanted = _wanted_digests(events)
     if not wanted:
-        # The common case, and today the *only* case: nothing asked for text, so the transcript is
-        # never opened. Hydration costs one pass over an in-memory page until the emit change.
+        # Nothing asked for text, so neither private artifact is opened. Hydration costs one pass
+        # over the in-memory page.
         return events
-    resolved = _resolve(run_dir / TRANSCRIPT_FILE_NAME, wanted)
+    resolved = _resolve(run_dir / MODEL_CONTENT_FILENAME, wanted)
+    unresolved = wanted.difference(resolved)
+    if unresolved:
+        # Retained v0.20 runs have no sidecar, and a crash may leave only one of the dual writes.
+        # Resolve only the remaining digests from the transcript so a healthy sidecar hit does not
+        # force a full pass over the older private artifact.
+        resolved.update(_resolve(run_dir / TRANSCRIPT_FILE_NAME, unresolved))
     if not resolved:
         return events
     for event in _event_data(events):
@@ -128,8 +139,9 @@ def _wanted_digests(events: Any) -> set[str]:
     return wanted
 
 
-def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
+def _resolve(record_path: Path, wanted: set[str]) -> dict[str, str]:
     found: dict[str, str] = {}
+    require_model_content_version = record_path.name == MODEL_CONTENT_FILENAME
     try:
         # Read bytes and decode per line rather than opening in text mode: a crash can tear a
         # multi-byte sequence mid-write, and decoding is lazy, so strict text mode raises
@@ -137,9 +149,31 @@ def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
         # ``OSError`` handler below and turned every read needing a digest into a failed request
         # rather than the promised absent field. A replaced line then fails to parse as JSON, or
         # fails the digest check, and is skipped like any other malformed record.
-        with transcript_path.open("rb") as handle:
+        handle = (
+            open_model_content_for_read(record_path)
+            if require_model_content_version
+            else record_path.open("rb")
+        )
+        if handle is None:
+            # A private run artifact is not an indirection seam. The verified opener rejects a
+            # planted or concurrently swapped link/special file before any content is read.
+            return found
+        with handle:
             for raw_line in handle:
-                digest, text = _settled_text_entry(raw_line.decode("utf-8", errors="replace"))
+                try:
+                    line = raw_line.decode(
+                        "utf-8",
+                        # Legacy transcripts historically used replacement decoding, so retain
+                        # that reader behavior. The v0.20.1 sidecar has a strict schema; replacing
+                        # a bad byte could fabricate schema-valid content.
+                        errors="strict" if require_model_content_version else "replace",
+                    )
+                except UnicodeDecodeError:
+                    continue
+                digest, text = _settled_text_entry(
+                    line,
+                    require_model_content_version=require_model_content_version,
+                )
                 if digest is None or text is None or digest not in wanted:
                     continue
                 if content_digest(text) != digest:
@@ -152,12 +186,16 @@ def _resolve(transcript_path: Path, wanted: set[str]) -> dict[str, str]:
                 if len(found) == len(wanted):
                     break
     except OSError:
-        # Missing transcript (an older run dir, a run dir copied without it) or an unreadable one.
+        # Missing private artifact (including an older run without a sidecar) or an unreadable one.
         return found
     return found
 
 
-def _settled_text_entry(line: str) -> tuple[str | None, str | None]:
+def _settled_text_entry(
+    line: str,
+    *,
+    require_model_content_version: bool = False,
+) -> tuple[str | None, str | None]:
     line = line.strip()
     if not line:
         return None, None
@@ -168,14 +206,33 @@ def _settled_text_entry(line: str) -> tuple[str | None, str | None]:
         # exceed the interpreter's stack, and the read path runs on a deeper HTTP-handler stack
         # than the writer did. This module promises never to fail a read, and a corrupted or
         # foreign run dir is exactly the case that promise exists for.
-        # A torn tail, or a line another writer is mid-way through. The transcript has no
+        # A torn tail, or a line another writer is mid-way through. The JSONL record has no
         # repair that RECOVERS a torn line — the recorder's only one confines a tear to the record
         # it tore — so a malformed line is expected rather than exceptional.
         return None, None
     if not isinstance(record, dict) or record.get("kind") != SETTLED_TEXT_KIND:
         return None, None
+    if require_model_content_version and not accepts_namespaced_id(
+        record.get("schema_version"), "model-content.v1"
+    ):
+        return None, None
     digest = record.get(DIGEST_FIELD)
     text = record.get(TEXT_FIELD)
+    if require_model_content_version:
+        run_id = record.get("run_id")
+        text_len = record.get("final_text_len")
+        recorded_at = record.get("recorded_at")
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or isinstance(text_len, bool)
+            or not isinstance(text_len, int)
+            or not isinstance(text, str)
+            or content_length(text) != text_len
+            or not isinstance(recorded_at, str)
+            or not recorded_at.endswith("Z")
+        ):
+            return None, None
     if isinstance(digest, str) and isinstance(text, str):
         return digest, text
     return None, None

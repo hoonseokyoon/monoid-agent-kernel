@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from monoid_agent_kernel.core._util import read_text_resilient
+from monoid_agent_kernel.core._event_log import (
+    EventLogCorruption,
+    inspect_event_log_tail,
+    read_committed_event_payloads,
+)
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.durable_metadata import DurableMetadataCommitter
 from monoid_agent_kernel.core.event_sequencing import (
@@ -102,6 +107,25 @@ def _status_payload_lifecycle(
     return {"state": session_state_value(state), "terminal": terminal}
 
 
+def _status_last_event_seq(status_payload: Mapping[str, Any] | None) -> int:
+    raw = (status_payload or {}).get("last_event_seq", 0)
+    return raw if type(raw) is int and raw >= 0 else 0
+
+
+def _committed_event_highwatermark(run_dir: Path, advertised: int) -> int:
+    """Reconcile a best-effort status watermark with the authoritative committed JSONL tail."""
+
+    events_path = run_dir / "events.jsonl"
+    try:
+        committed = inspect_event_log_tail(events_path).last_seq
+    except (EventLogCorruption, OSError):
+        # Tail corruption is exceptional. Preserve the last fully decoded prefix so a committed
+        # start before the damaged record is still classified as recovery replay.
+        readable = read_committed_event_payloads(events_path).payloads
+        committed = int(readable[-1]["seq"]) if readable else 0
+    return max(advertised, committed)
+
+
 @dataclass(frozen=True)
 class RunProjectionContext:
     authorized_run_dir: Callable[[str, str], Path]
@@ -131,9 +155,14 @@ class RunProjectionService:
             status_payload = loads_json_ingress(read_text_resilient(status_file))
         record = self._context.active_record(run_id)
         if record is None:
+            last_event_seq = _committed_event_highwatermark(
+                run_dir,
+                _status_last_event_seq(status_payload),
+            )
             return {
                 "run_id": run_id,
                 **_status_payload_lifecycle(status_payload, run_dir),
+                "last_event_seq": last_event_seq,
                 "run_dir": str(run_dir),
                 "status_file": status_payload,
             }
@@ -146,7 +175,10 @@ class RunProjectionService:
             "started_at": record.started_at,
             "finished_at": record.finished_at,
             "run_dir": str(record.run_dir),
-            "last_event_seq": record.last_event_seq,
+            "last_event_seq": _committed_event_highwatermark(
+                record.run_dir,
+                record.last_event_seq,
+            ),
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
@@ -328,7 +360,13 @@ class RunProjectionService:
             run_id = meta.get("run_id") or run_dir.name
             record = self._context.active_record(run_id)
             if record is not None:
-                lifecycle = _record_lifecycle_payload(record)
+                lifecycle = {
+                    **_record_lifecycle_payload(record),
+                    "last_event_seq": _committed_event_highwatermark(
+                        run_dir,
+                        record.last_event_seq,
+                    ),
+                }
             else:
                 status_payload: dict[str, Any] | None = None
                 status_path = run_dir / "status.json"
@@ -338,7 +376,13 @@ class RunProjectionService:
                         status_payload = payload if isinstance(payload, dict) else None
                     except (ValueError, OSError):
                         status_payload = None
-                lifecycle = _status_payload_lifecycle(status_payload, run_dir)
+                lifecycle = {
+                    **_status_payload_lifecycle(status_payload, run_dir),
+                    "last_event_seq": _committed_event_highwatermark(
+                        run_dir,
+                        _status_last_event_seq(status_payload),
+                    ),
+                }
             recoverable = False
             if (
                 record is None

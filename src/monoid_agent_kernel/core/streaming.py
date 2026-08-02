@@ -18,7 +18,7 @@ the shape of Pydantic AI's ``run_stream``::
     async with loop.astream("go") as stream:
         async for item in stream:          # item: AgentEvent | ModelStreamChunk
             ...
-    result = stream.result                 # AgentTurnResult, after the stream drains
+    result = stream.result                 # AgentTurnResult, or None when it parked
     await loop.aclose()
 """
 
@@ -95,8 +95,8 @@ class RunStream:
 
     Yields ``AgentEvent`` (orchestration) interleaved with ``ModelStreamChunk`` (token
     deltas); discriminate with ``isinstance``. After the stream drains, ``result`` holds the
-    settled :class:`AgentTurnResult`, or ``suspension`` holds the park when the run stopped on
-    an external hosted task. Single-consumer: a second ``async for`` raises.
+    settled :class:`AgentTurnResult`, or ``suspension`` holds any non-settled park such as an
+    external task or user interruption. Single-consumer: a second ``async for`` raises.
     """
 
     def __init__(
@@ -144,7 +144,11 @@ class RunStream:
         self._sink.deactivate()
         # Surface a genuine driver bug only when the block itself exited cleanly; a
         # cancellation we induced is expected and swallowed.
-        if exc_type is None and self._error is not None and not isinstance(self._error, asyncio.CancelledError):
+        if (
+            exc_type is None
+            and self._error is not None
+            and not isinstance(self._error, asyncio.CancelledError)
+        ):
             raise self._error
         return False
 
@@ -194,8 +198,10 @@ class RunStream:
 
     @property
     def result(self) -> AgentTurnResult | None:
-        """The settled turn, or ``None`` when the run parked on an external task (see
-        :attr:`suspension`). Raises if read before the stream is fully drained."""
+        """The settled turn, or ``None`` when the run parked (see :attr:`suspension`).
+
+        Raises if read before the stream is fully drained.
+        """
         self._require_settled()
         if isinstance(self._outcome, Suspension):
             return None
@@ -203,6 +209,6 @@ class RunStream:
 
     @property
     def suspension(self) -> Suspension | None:
-        """The park when the run stopped awaiting an external hosted task, else ``None``."""
+        """The non-settled park returned by the loop, else ``None``."""
         self._require_settled()
         return self._outcome if isinstance(self._outcome, Suspension) else None

@@ -21,8 +21,28 @@
     appendOptimisticUserMessage,
     hydrateTranscript,
     initialRunState,
+    isInitialReplayEvent,
+    preserveHistoricalRecoveryState,
     reduceRunEvent,
   } from "./lib/run-state";
+  import {
+    ModelStreamEventSource,
+    decodeModelContentResponse,
+    discardModelStreamAttempt,
+    initialModelStreamState,
+    markModelStreamPartialSuperseded,
+    projectModelContentSnapshot,
+    projectModelStreamFrame,
+    projectSubagentStarted,
+    projectSubagentModelStream,
+    reduceModelStreamFrame,
+    restoreActiveModelContent,
+    seedModelStreamSnapshot,
+    seedSubagentModelContent,
+    sealModelStreamTurn,
+    type ModelContentResponse,
+  } from "./lib/model-stream";
+  import { operationTraceEvents } from "./lib/trace";
   import type {
     ApplyResponse,
     ApprovalRequest,
@@ -39,6 +59,7 @@
     SubagentActivity,
     InspectorMode,
     JobSummary,
+    ChatTranscriptResponse,
     WorkspaceFile,
   } from "./lib/types";
 
@@ -75,6 +96,8 @@
     built_in: true,
   };
 
+  type ModelStreamHydrationMode = "live" | "terminal";
+
   let config = $state<StudioConfig>({ workspace: "studio-workspace", provider: "offline", offline: true });
   let settings = $state<SettingsResponse>({ ...fallbackSettings });
   let profiles = $state<Profile[]>([fallbackProfile]);
@@ -99,6 +122,13 @@
   let wideInspector = $state(false);
   let sessionEpoch = $state(0);
   let stream: RunEventStream | null = null;
+  let modelStream: ModelStreamEventSource | null = null;
+  let modelStreamState = $state(initialModelStreamState());
+  let modelStreamHydrationKey: string | null = null;
+  let modelStreamHydrationFailures = 0;
+  let modelStreamSnapshotPending = false;
+  let modelStreamRunTerminal = false;
+  let modelStreamRecoveryFenced = false;
   let navigationButton = $state<HTMLButtonElement>();
   let navigationDrawer = $state<HTMLElement>();
   let inspectorButton = $state<HTMLButtonElement>();
@@ -109,12 +139,18 @@
     nextSeq: number;
     timer: number | null;
     stopped: boolean;
+    historicalTraceDrain: boolean;
     inFlight: boolean;
     finalDrain: boolean;
     failures: number;
     finalFailures: number;
     seenEventIds: Set<string>;
     controller: AbortController | null;
+  }
+
+  interface SessionSummaryResolution {
+    summary: SessionSummary | undefined;
+    exact: boolean;
   }
 
   const childPollers = new Map<string, ChildPoller>();
@@ -125,6 +161,7 @@
     [...run.events, ...subagentList.flatMap((activity: SubagentActivity) => activity.events)]
       .sort((left: RunEvent, right: RunEvent) => eventTime(left) - eventTime(right)),
   );
+  const traceOperationEvents = $derived(operationTraceEvents(traceEvents));
   const workspaceName = $derived(config.workspace.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || config.workspace);
   const sessionStatus = $derived(run.status);
   const topModes: Array<{ id: StudioMode; label: string; icon: string }> = [
@@ -152,6 +189,7 @@
     void bootstrap();
     return () => {
       stream?.close();
+      modelStream?.close();
       stopChildPollers();
       navigationMedia.removeEventListener("change", syncMedia);
       inspectorMedia.removeEventListener("change", syncMedia);
@@ -387,7 +425,14 @@
           poller.seenEventIds.add(scoped.event_id ?? "");
           additions.push(scoped);
         }
-        handleSubagentLifecycle(event, parentRunId, epoch, childRunId);
+        handleSubagentLifecycle(
+          event,
+          parentRunId,
+          epoch,
+          childRunId,
+          poller.historicalTraceDrain,
+          poller.historicalTraceDrain,
+        );
       }
       if (additions.length) {
         const latest = subagents[childRunId] ?? current;
@@ -432,32 +477,44 @@
     }
   }
 
-  function startSubagent(data: Record<string, unknown>, parentRunId: string, epoch: number): void {
+  function startSubagent(
+    data: Record<string, unknown>,
+    parentRunId: string,
+    epoch: number,
+    historical = false,
+    recoveryFenced = false,
+  ): void {
     const childRunId = String(data.child_run_id ?? "");
     if (!childRunId) return;
     const existing = subagents[childRunId];
-    if (!existing) {
+    const { activity, revive } = projectSubagentStarted(
+      existing,
+      data,
+      parentRunId,
+      historical,
+      recoveryFenced,
+    );
+    const historicalTraceDrain = historical && !revive;
+    if (!existing
+      || existing.subagentType !== activity.subagentType
+      || existing.parentRunId !== activity.parentRunId
+      || existing.taskId !== activity.taskId
+      || existing.depth !== activity.depth
+      || existing.status !== activity.status) {
       subagents = {
         ...subagents,
-        [childRunId]: {
-          childRunId,
-          subagentType: String(data.subagent_type ?? "delegate"),
-          parentRunId: String(data.parent_run_id ?? parentRunId),
-          taskId: String(data.task_id ?? ""),
-          depth: Number.isFinite(Number(data.depth))
-            ? Number(data.depth)
-            : childRunId.split(".sub.").length - 1,
-          status: "running",
-          events: [],
-        },
+        [childRunId]: activity,
       };
     }
-    if (childPollers.has(childRunId) || (existing && existing.status !== "running" && existing.events.length)) return;
+    if ((!revive && !historicalTraceDrain)
+      || childPollers.has(childRunId)
+      || (existing && existing.status !== "running" && existing.events.length)) return;
     childPollers.set(childRunId, {
       epoch,
       nextSeq: 0,
       timer: null,
-      stopped: false,
+      stopped: historicalTraceDrain,
+      historicalTraceDrain,
       inFlight: false,
       finalDrain: false,
       failures: 0,
@@ -495,9 +552,11 @@
     parentRunId: string,
     epoch: number,
     sourceChildRunId = "",
+    historical = false,
+    recoveryFenced = false,
   ): void {
     if (event.type === "subagent.started") {
-      startSubagent(event.data, parentRunId, epoch);
+      startSubagent(event.data, parentRunId, epoch, historical, recoveryFenced);
       return;
     }
     if (event.type === "subagent.finished" || event.type === "subagent.failed") {
@@ -535,8 +594,19 @@
     finishSubagentById(childRunId, failed, parentRunId, epoch);
   }
 
-  function openStream(runId: string, epoch = sessionEpoch): void {
+  function openStream(
+    runId: string,
+    epoch = sessionEpoch,
+    initialReplayThrough?: number,
+  ): void {
     stream?.close();
+    modelStream?.close();
+    const replayedThrough = run.lastSeq;
+    const recoveryReplayFenced = modelStreamRecoveryFenced;
+    const hasAuthoritativeInitialReplayBoundary = initialReplayThrough !== undefined;
+    const initialReplayBoundary = hasAuthoritativeInitialReplayBoundary
+      ? initialReplayThrough
+      : recoveryReplayFenced ? replayedThrough : -1;
     stream = new RunEventStream({
       runId,
       from: 0,
@@ -545,8 +615,111 @@
       },
       onEvent: (event: RunEvent) => {
         if (!isCurrentSession(runId, epoch)) return;
-        run = reduceRunEvent(run, event);
-        handleSubagentLifecycle(event, runId, epoch);
+        const eventAlreadyProjected = typeof event.seq === "number"
+          && event.seq <= Math.max(run.replayCursor, replayedThrough);
+        const initialReplayEvent = isInitialReplayEvent(event, initialReplayBoundary);
+        const priorRun = run;
+        const activeTurnId = modelStreamState.activeRootTurnId;
+        const activeCall = activeTurnId
+          ? Object.values(modelStreamState.calls).find((call) => (
+              call.runId === runId && call.turnId === activeTurnId
+            ))
+          : undefined;
+        const turnTerminal = ["turn.settled", "turn.interrupted", "turn.failed"].includes(event.type);
+        const obsoleteTerminal = turnTerminal
+          && Boolean(activeTurnId)
+          && typeof event.turn_id === "string"
+          && event.turn_id !== activeTurnId;
+        const eventStep = Number(event.data.step);
+        const obsoleteStart = event.type === "model.turn.started"
+          && Boolean(activeTurnId)
+          && event.turn_id !== activeTurnId
+          && Number.isSafeInteger(eventStep)
+          && activeCall !== undefined
+          && eventStep < activeCall.step;
+        const replacesSnapshot = event.type === "model.turn.started"
+          && Boolean(activeTurnId)
+          && event.turn_id !== activeTurnId
+          && !obsoleteStart;
+        const correlatedTerminal = turnTerminal
+          && Boolean(activeTurnId)
+          && event.turn_id === activeTurnId;
+        const runTerminal = event.type === "run.finished" || event.type === "run.failed";
+        // The event high-watermark can expose the terminal record just before the sessions
+        // lifecycle row flips to terminal. Correct that tail race without reviving older failed
+        // attempts or a recoverable crash replay that still requires explicit activation.
+        const terminalAtInitialTail = hasAuthoritativeInitialReplayBoundary
+          && !recoveryReplayFenced
+          && !modelStreamRunTerminal
+          && typeof event.seq === "number"
+          && event.seq >= initialReplayBoundary;
+        const runTerminalNeedsFence = runTerminal
+          && (!eventAlreadyProjected || terminalAtInitialTail);
+        const reducedRun = preserveHistoricalRecoveryState(
+          priorRun,
+          reduceRunEvent(run, event),
+          initialReplayEvent,
+          recoveryReplayFenced,
+        );
+        run = obsoleteTerminal || obsoleteStart
+          ? {
+              ...priorRun,
+              lastSeq: reducedRun.lastSeq,
+              events: reducedRun.events,
+            }
+          : reducedRun;
+        if (event.type === "run.resumed"
+          && event.data.reason === "studio-retry"
+          && typeof event.turn_id === "string") {
+          const retryOfTurnId = event.turn_id;
+          run = discardModelStreamAttempt(run, modelStreamState, runId, retryOfTurnId);
+          modelStreamState = markModelStreamPartialSuperseded(
+            modelStreamState,
+            retryOfTurnId,
+          );
+        }
+        if (((eventAlreadyProjected
+          && !correlatedTerminal
+          && !runTerminal
+          && !replacesSnapshot)
+          || obsoleteTerminal || obsoleteStart
+          || (event.type === "model.turn.started"
+          && !modelStreamState.rootTurnSealed
+          && activeTurnId
+          && event.turn_id === activeTurnId))) {
+          // The passive and durable EventSources are independently scheduled. Preserve content
+          // seeded by hydration or received just before its correlated durable start event.
+          run = restoreActiveModelContent(run, modelStreamState);
+        }
+        if (runTerminalNeedsFence) {
+          modelStreamState = sealModelStreamTurn(modelStreamState);
+          modelStreamRunTerminal = true;
+          modelStreamSnapshotPending = config.model_stream_enabled === true;
+          const terminalHydrationKey = modelStreamHydrationKeyFor(epoch, "terminal");
+          if (modelStreamHydrationKey !== terminalHydrationKey) {
+            modelStreamHydrationKey = null;
+          }
+        } else if (!eventAlreadyProjected
+          && turnTerminal
+          && !(event.type === "turn.failed" && event.data.retryable === true)
+          && typeof event.turn_id === "string") {
+          modelStreamState = sealModelStreamTurn(modelStreamState, event.turn_id);
+        }
+        if (runTerminalNeedsFence) {
+          modelStream?.close();
+          modelStream = null;
+          if (modelStreamSnapshotPending) {
+            void rehydrateModelStream(runId, epoch, "terminal");
+          }
+        }
+        handleSubagentLifecycle(
+          event,
+          runId,
+          epoch,
+          "",
+          initialReplayEvent,
+          recoveryReplayFenced,
+        );
         if (["proposal.ready", "workspace.diff.updated", "workspace.proposal.updated"].includes(event.type)) {
           void refreshProposal(runId);
         }
@@ -557,11 +730,176 @@
       },
     });
     stream.open();
+    openModelStream(runId, epoch);
+    if (modelStreamSnapshotPending) {
+      void rehydrateModelStream(
+        runId,
+        epoch,
+        modelStreamRunTerminal ? "terminal" : "live",
+      );
+    }
+  }
+
+  async function resolveSessionSummary(runId: string): Promise<SessionSummaryResolution> {
+    const cached = sessions.find((session) => session.run_id === runId);
+    try {
+      // Session-open recovery decisions use the unfiltered live inventory. The profile-scoped
+      // sidebar is only a display fallback while the BFF is unavailable.
+      const live = (await studioApi.sessions()).sessions.find(
+        (session) => session.run_id === runId,
+      );
+      return {
+        summary: live ?? cached,
+        exact: live !== undefined,
+      };
+    } catch {
+      return { summary: cached, exact: false };
+    }
+  }
+
+  function openModelStream(runId: string, epoch: number): void {
+    modelStream?.close();
+    modelStream = null;
+    if (!config.model_stream_enabled
+      || modelStreamRunTerminal
+      || modelStreamRecoveryFenced
+      || !isCurrentSession(runId, epoch)) return;
+    if (modelStreamState.rootRunId !== runId) {
+      modelStreamState = initialModelStreamState(runId);
+    }
+    modelStream = new ModelStreamEventSource({
+      rootRunId: runId,
+      cursor: modelStreamState.resumeCursor,
+      onFrame: (frame) => {
+        if (!isCurrentSession(runId, epoch)) return;
+        const before = modelStreamState;
+        const after = reduceModelStreamFrame(before, frame);
+        modelStreamState = after;
+        run = projectModelStreamFrame(run, before, after, frame);
+        if (frame.kind !== "reset" && frame.run_id !== frame.root_run_id) {
+          const activity = projectSubagentModelStream(
+            subagents[frame.run_id],
+            before,
+            after,
+            frame,
+          );
+          if (activity && activity !== subagents[frame.run_id]) {
+            subagents = { ...subagents, [frame.run_id]: activity };
+          }
+        }
+        if (!before.needsHydration && after.needsHydration) {
+          void rehydrateModelStream(runId, epoch);
+        }
+      },
+    });
+    modelStream.open();
+  }
+
+  function modelStreamHydrationKeyFor(
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode,
+    resumeCursor: string | null = null,
+  ): string {
+    return hydrationMode === "terminal"
+      ? `${epoch}:terminal`
+      : `${epoch}:live:${resumeCursor ?? "none"}`;
+  }
+
+  function canRehydrateModelStream(
+    runId: string,
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode,
+  ): boolean {
+    if (!config.model_stream_enabled || !isCurrentSession(runId, epoch)) return false;
+    return hydrationMode === "terminal"
+      ? modelStreamRunTerminal && modelStreamSnapshotPending
+      : !modelStreamRunTerminal && !modelStreamRecoveryFenced;
+  }
+
+  function latestRootSnapshotIsRunning(
+    response: ModelContentResponse,
+    runId: string,
+  ): boolean {
+    for (let index = response.streams.length - 1; index >= 0; index -= 1) {
+      const snapshot = response.streams[index];
+      if (snapshot.run_id === runId) return snapshot.status === "running";
+    }
+    return false;
+  }
+
+  async function rehydrateModelStream(
+    runId: string,
+    epoch: number,
+    hydrationMode: ModelStreamHydrationMode = "live",
+  ): Promise<void> {
+    const resumeCursor = modelStreamState.resumeCursor;
+    const key = modelStreamHydrationKeyFor(epoch, hydrationMode, resumeCursor);
+    if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+      || modelStreamHydrationKey === key) return;
+    const durableCursor = run.lastSeq;
+    modelStreamHydrationKey = key;
+    modelStreamSnapshotPending = true;
+    modelStream?.close();
+    modelStream = null;
+    try {
+      const [transcript, rawModelContent]: [ChatTranscriptResponse, unknown] = await Promise.all([
+        studioApi.transcript(runId),
+        studioApi.modelContent(runId),
+      ]);
+      if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+        || modelStreamHydrationKey !== key) {
+        if (modelStreamHydrationKey === key) modelStreamHydrationKey = null;
+        return;
+      }
+      if (run.lastSeq !== durableCursor) {
+        // Never replace a just-committed durable message or terminal fence with an older pair of
+        // snapshots. Retry once the independently scheduled operation stream is caught up.
+        modelStreamHydrationKey = null;
+        window.setTimeout(() => void rehydrateModelStream(runId, epoch, hydrationMode), 0);
+        return;
+      }
+      const modelContent = decodeModelContentResponse(rawModelContent);
+      if (!modelContent || modelContent.root_run_id !== runId) {
+        throw new Error("Studio returned a malformed model-content snapshot.");
+      }
+      if (hydrationMode === "terminal" && latestRootSnapshotIsRunning(modelContent, runId)) {
+        throw new Error("Studio returned a model-content snapshot that is still running.");
+      }
+      run = hydrateTranscript({ ...run, activeResponse: "", reasoning: "" }, transcript);
+      modelStreamState = seedModelStreamSnapshot(modelStreamState, modelContent);
+      if (hydrationMode === "terminal") {
+        modelStreamState = sealModelStreamTurn(modelStreamState);
+      }
+      run = projectModelContentSnapshot(run, modelStreamState);
+      subagents = seedSubagentModelContent(subagents, modelContent);
+      modelStreamHydrationFailures = 0;
+      modelStreamHydrationKey = null;
+      modelStreamSnapshotPending = false;
+      if (hydrationMode === "live") openModelStream(runId, epoch);
+    } catch {
+      if (!canRehydrateModelStream(runId, epoch, hydrationMode)
+        || modelStreamHydrationKey !== key) {
+        if (modelStreamHydrationKey === key) modelStreamHydrationKey = null;
+        return;
+      }
+      modelStreamHydrationKey = null;
+      modelStreamHydrationFailures += 1;
+      const delay = Math.min(3_000, 400 * 2 ** Math.min(modelStreamHydrationFailures, 3));
+      window.setTimeout(() => void rehydrateModelStream(runId, epoch, hydrationMode), delay);
+    }
   }
 
   async function openSession(runId: string): Promise<void> {
     const epoch = ++sessionEpoch;
     stream?.close();
+    modelStream?.close();
+    modelStream = null;
+    modelStreamState = initialModelStreamState(runId);
+    modelStreamHydrationKey = null;
+    modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
+    modelStreamRunTerminal = false;
+    modelStreamRecoveryFenced = false;
     clearSubagents();
     proposal = null;
     proposalRunId = null;
@@ -571,14 +909,44 @@
     inspectorOpen = false;
     leftOpen = false;
     try {
-      const transcript = await studioApi.transcript(runId);
+      const [transcript, rawModelContent, summaryResolution] = await Promise.all([
+        studioApi.transcript(runId),
+        config.model_stream_enabled
+          ? studioApi.modelContent(runId).catch(() => null)
+          : Promise.resolve(null),
+        resolveSessionSummary(runId),
+      ]);
       if (!isCurrentSession(runId, epoch)) return;
+      const { summary, exact: summaryIsExact } = summaryResolution;
       run = hydrateTranscript(run, transcript);
-      const summary = sessions.find((session) => session.run_id === runId);
-      if (summary?.recoverable || summary?.state === "paused") {
+      const modelContent = decodeModelContentResponse(rawModelContent);
+      const modelContentMatchesRun = modelContent?.root_run_id === runId;
+      if (modelContentMatchesRun) {
+        modelStreamState = seedModelStreamSnapshot(modelStreamState, modelContent);
+        run = projectModelContentSnapshot(run, modelStreamState);
+        subagents = seedSubagentModelContent(subagents, modelContent);
+      }
+      modelStreamRunTerminal = summaryIsExact && summary?.terminal === true;
+      modelStreamSnapshotPending = config.model_stream_enabled === true
+        && (!modelContentMatchesRun
+          || (modelStreamRunTerminal
+            && modelContent !== null
+            && latestRootSnapshotIsRunning(modelContent, runId)));
+      modelStreamRecoveryFenced = !summaryIsExact
+        || summary?.recoverable === true
+        || summary?.state === "paused";
+      if (modelStreamRecoveryFenced) {
         run = { ...run, status: "stopped" };
       }
-      openStream(runId, epoch);
+      openStream(
+        runId,
+        epoch,
+        summaryIsExact ? summary?.last_event_seq ?? -1 : Number.MAX_SAFE_INTEGER,
+      );
+      if (summary && summary.profile_id !== activeProfileId) {
+        activeProfileId = summary.profile_id;
+        void refreshSessions();
+      }
       history.replaceState({}, "", `/?run=${encodeURIComponent(runId)}`);
       await Promise.all([refreshProposal(runId), refreshJobs(runId)]);
     } catch (error) {
@@ -591,8 +959,16 @@
   function newSession(): void {
     sessionEpoch += 1;
     stream?.close();
+    modelStream?.close();
     clearSubagents();
     stream = null;
+    modelStream = null;
+    modelStreamState = initialModelStreamState();
+    modelStreamHydrationKey = null;
+    modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
+    modelStreamRunTerminal = false;
+    modelStreamRecoveryFenced = false;
     streamConnected = false;
     run = initialRunState();
     proposal = null;
@@ -624,9 +1000,16 @@
       if (!isCurrentSession(targetRunId, epoch)) return;
       if (!run.runId && response.run_id) {
         run = { ...run, runId: response.run_id };
+        modelStreamState = initialModelStreamState(response.run_id);
+        modelStreamSnapshotPending = false;
+        modelStreamRunTerminal = response.terminal === true;
+        modelStreamRecoveryFenced = false;
         openStream(response.run_id, epoch);
         history.replaceState({}, "", `/?run=${encodeURIComponent(response.run_id)}`);
         void refreshSessions();
+      } else if (modelStreamRecoveryFenced && targetRunId && response.run_id === targetRunId) {
+        modelStreamRecoveryFenced = false;
+        openModelStream(targetRunId, epoch);
       }
     } catch (error) {
       if (!isCurrentSession(targetRunId, epoch)) return;
@@ -691,6 +1074,20 @@
         status: response.state === "paused" ? "stopped" : response.state === "running" ? "running" : response.resumed ? "queued" : run.status,
         error: null,
       };
+      const reactivated = response.resumed
+        || response.state === "queued"
+        || response.state === "running"
+        || response.state === "paused";
+      if (reactivated) modelStreamRunTerminal = false;
+      if (response.resumed || response.state === "queued" || response.state === "running") {
+        modelStreamRecoveryFenced = false;
+      }
+      if (response.resumed) {
+        modelStreamState = initialModelStreamState(runId);
+        modelStreamHydrationKey = null;
+        modelStreamHydrationFailures = 0;
+        modelStreamSnapshotPending = false;
+      }
       openStream(runId, epoch);
       announce(response.resumed
         ? response.resume_kind === "paused_turn"
@@ -713,6 +1110,12 @@
       const response = await studioApi.retry(runId);
       if (!isCurrentSession(runId, epoch)) return;
       if (response.retried === false) throw new Error("The failed request was not reissued.");
+      const retryOfTurnId = typeof response.retry_of_turn_id === "string"
+        ? response.retry_of_turn_id
+        : "";
+      if (retryOfTurnId) {
+        run = discardModelStreamAttempt(run, modelStreamState, runId, retryOfTurnId);
+      }
       run = {
         ...run,
         status: "queued",
@@ -721,6 +1124,15 @@
         manualRetryCandidate: false,
         manualRetryReady: false,
       };
+      modelStreamRunTerminal = false;
+      modelStreamRecoveryFenced = false;
+      modelStreamState = initialModelStreamState(runId);
+      if (retryOfTurnId) {
+        modelStreamState = markModelStreamPartialSuperseded(modelStreamState, retryOfTurnId);
+      }
+      modelStreamHydrationKey = null;
+      modelStreamHydrationFailures = 0;
+      modelStreamSnapshotPending = false;
       openStream(runId, epoch);
       announce("Request reissued with the current runtime configuration.");
     } catch (error) {
@@ -737,6 +1149,10 @@
     try {
       await studioApi.answerApproval(runId, request.taskId, answer);
       if (!isCurrentSession(runId, epoch)) return;
+      if (modelStreamRecoveryFenced) {
+        modelStreamRecoveryFenced = false;
+        openModelStream(runId, epoch);
+      }
       const denied = /deny|reject|cancel/i.test(answer);
       run = {
         ...run,
@@ -774,7 +1190,15 @@
     activeProfileId = response.profile.id;
     sessionEpoch += 1;
     stream?.close();
+    modelStream?.close();
     clearSubagents();
+    modelStream = null;
+    modelStreamState = initialModelStreamState();
+    modelStreamHydrationKey = null;
+    modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
+    modelStreamRunTerminal = false;
+    modelStreamRecoveryFenced = false;
     run = initialRunState();
     proposal = null;
     proposalRunId = null;
@@ -872,6 +1296,14 @@
     proposalRunId = null;
     jobs = [];
     stream?.close();
+    modelStream?.close();
+    modelStream = null;
+    modelStreamState = initialModelStreamState();
+    modelStreamHydrationKey = null;
+    modelStreamHydrationFailures = 0;
+    modelStreamSnapshotPending = false;
+    modelStreamRunTerminal = false;
+    modelStreamRecoveryFenced = false;
     history.replaceState({}, "", "/");
     void refreshSessions();
   }
@@ -1048,10 +1480,11 @@
           {:else}
             <div class="mini-trace-inspector">
               <header class="inspector-heading"><div><div class="eyebrow">Live events</div><h2>Trace</h2></div><button class="icon-button" title="Open full trace" onclick={openFullTrace}><Icon name="chevron" size={14} /></button></header>
-              {#if traceEvents.length}
-                {#each traceEvents.slice(-30).reverse() as event}
+              {#if traceOperationEvents.length}
+                {#each traceOperationEvents.slice(-30).reverse() as event}
                   <button onclick={openFullTrace}><span class:error={event.level === "error"}></span><div><strong>{event.data.studio_scope === "subagent" ? `subagent · ${event.type}` : event.type}</strong><small>seq {event.seq ?? "—"}</small></div></button>
                 {/each}
+              {:else if traceEvents.length}<div class="inspector-empty large"><Icon name="trace" size={20} />Only token delta events are hidden. Open the full trace to inspect them.</div>
               {:else}<div class="inspector-empty large"><Icon name="trace" size={20} />Trace events appear after the run starts.</div>{/if}
             </div>
           {/if}

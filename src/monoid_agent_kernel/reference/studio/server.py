@@ -43,17 +43,31 @@ from monoid_agent_kernel.core.agents import (
     compile_bound_tool_catalog,
 )
 from monoid_agent_kernel.core.context import TurnContext
-from monoid_agent_kernel.env import getenv
+from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv, getenv_bool
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.content import ContentPart, DocumentPart, ImagePart, TextPart
+from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.core.event_subscription import EventSubscription, SequenceCursor
 from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
 )
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.model_content import (
+    MODEL_CONTENT_FILENAME,
+    ModelContentReadResult,
+    active_model_content_state,
+    flush_active_model_content,
+    model_content_file_identity,
+    model_content_file_is_safe,
+    read_model_content,
+    watch_active_model_content,
+)
 from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
-from monoid_agent_kernel.core.subagent_runtime import root_run_id_from_descendant
+from monoid_agent_kernel.core.subagent_runtime import (
+    is_descendant_run_id,
+    root_run_id_from_descendant,
+)
 from monoid_agent_kernel.core.prompt import compose_system_prompt
 from monoid_agent_kernel.core.tool_surface import (
     DefaultToolSurfaceResolver,
@@ -65,6 +79,10 @@ from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
+from monoid_agent_kernel.reference.backend.model_stream import (
+    LiveModelStreamBroker,
+    LiveModelStreamSubscription,
+)
 from monoid_agent_kernel.reference.outbox import InboxRoutingOutboxSender, OutboxToolProvider
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
@@ -99,6 +117,47 @@ _MAX_BODY_BYTES = _MAX_ATTACH_BYTES + 2 * 1024 * 1024  # room for base64 inflati
 # Studio is a single-user local app; the tenant/user are fixed placeholders.
 _TENANT = "studio"
 _USER = "local"
+STUDIO_MODEL_CONTENT_SCHEMA_VERSION = "studio.model-content.v1"
+STUDIO_TRACE_EXPORT_SCHEMA_VERSION = "studio.trace-export.v1"
+STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION = "studio.trace-export.compact.v1"
+
+
+def _active_model_turn_ids(run_dir: Path) -> frozenset[str]:
+    """Return durably open model turns, failing closed on an unreadable event log.
+
+    An unclosed sidecar stream is ambiguous after process loss.  The Studio recovery DTO may call
+    it ``running`` only while its own run log has a committed start and no committed turn/run
+    boundary.  A corrupt or unreadable log cannot prove that condition, so it promotes nothing.
+    """
+
+    read = read_committed_event_payloads(run_dir / "events.jsonl")
+    if read.corruption:
+        return frozenset()
+
+    run_id = run_dir.name
+    active: set[str] = set()
+    run_terminal = False
+    for event in read.payloads:
+        if event.get("run_id") != run_id:
+            continue
+        event_type = str(event.get("type") or "")
+        turn_id = event.get("turn_id")
+        if event_type in {"run.finished", "run.failed"}:
+            active.clear()
+            run_terminal = True
+            continue
+        if run_terminal or not isinstance(turn_id, str) or not turn_id:
+            continue
+        if event_type == "model.turn.started":
+            active.add(turn_id)
+        elif event_type in {
+            "model.turn.finished",
+            "turn.settled",
+            "turn.interrupted",
+            "turn.failed",
+        }:
+            active.discard(turn_id)
+    return frozenset(active)
 
 
 def _gateway_streaming_available() -> bool:
@@ -474,15 +533,10 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
-    # Publish `model.output.delta` / `model.reasoning.delta` to the run's event log. On by default
-    # because live token rendering is what the UI is for, but it is the widest content route out of
-    # a run: the events are durable, and `EventBus` fans them to every sink with no level filter, so
-    # the assembled answer sits in `events.jsonl`. Turning this off leaves the run result,
-    # `transcript.jsonl` and the settle events untouched, but it costs two things: live rendering,
-    # and mid-turn interruption. The kernel only streams when something consumes deltas, so with
-    # none consumed, Stop lands on the next step boundary instead of aborting inside the call.
-    # Pre-existing coupling -- `emit_output_deltas` is `False` by default in the kernel and this is
-    # what turns it on -- but it is invisible from here, hence the note.
+    # Permit model-authored content to leave the run through Studio's private sidecar and passive
+    # live stream. ``MONOID_OUTPUT_DELTAS`` is the deployment-wide permission gate on top. The
+    # durable operation log stays compact either way, and provider streaming remains selected so
+    # turning content egress off does not weaken token-boundary Stop.
     stream_output_deltas: bool = True
 
 
@@ -504,6 +558,9 @@ class StudioServer:
         self._ui_server: ThreadingHTTPServer | None = None
         self._ui_thread: threading.Thread | None = None
         self._backend: RunnerBackend | None = None
+        self._model_stream_broker: LiveModelStreamBroker | None = None
+        self._model_stream_egress_permitted = False
+        self._model_stream_egress_enabled = False
         # Tool/context providers attached at boot (Skills, MCP, Memory). The MCP server is a
         # bundled fake gateway on a loopback port (see start()); its provider holds a live
         # connection closed on shutdown. Provider instances are shared across runs.
@@ -1063,6 +1120,17 @@ class StudioServer:
     def start(self) -> str:
         """Boot gateway + backend + UI. Returns the UI base URL."""
         load_env_file(self.config.env_file)
+        # Resolve operator policy before opening any sockets. An invalid value is a startup error;
+        # discovering it after the auxiliary gateways are serving would leave their threads alive
+        # because callers have not yet entered the normal ``shutdown`` finally block.
+        self._model_stream_egress_permitted = self.config.stream_output_deltas and getenv_bool(
+            OUTPUT_DELTAS_ENV,
+            default=True,
+        )
+        provider_streaming_enabled = _gateway_streaming_available()
+        self._model_stream_egress_enabled = (
+            self._model_stream_egress_permitted and provider_streaming_enabled
+        )
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.config.run_root.mkdir(parents=True, exist_ok=True)
 
@@ -1118,23 +1186,21 @@ class StudioServer:
         # validation through the same provider seam as Skills/MCP.
         provider_instances = self._tool_providers_for_runtime()
 
-        # Two independent conditions: whether live streaming is *possible* (the optional transport)
-        # and whether the operator *wants* the durable delta events it produces. They were one
-        # value, so the only way to stop publishing model text to `events.jsonl` was to uninstall
-        # httpx. `AgentLoop.__post_init__` still applies `MONOID_OUTPUT_DELTAS` on top of this.
-        stream_gateway_output = _gateway_streaming_available() and self.config.stream_output_deltas
-        if not self.config.stream_output_deltas:
-            # Said separately from the httpx case: reporting "httpx is unavailable" to an operator
-            # who just passed --no-output-deltas sends them to install a package that would not
-            # change anything.
+        # Content permission and provider transport are independent. The env switch is resolved at
+        # the Studio composition boundary because it governs both the live broker and the private
+        # sidecar; AgentLoop's legacy durable-event switch cannot cover those newer channels.
+        self._model_stream_broker = (
+            LiveModelStreamBroker() if self._model_stream_egress_enabled else None
+        )
+        if not self._model_stream_egress_permitted:
             _LOGGER.info(
-                "output deltas are disabled; model text will not be published to events.jsonl "
-                "(the run result and transcript.jsonl are unaffected)"
+                "live/private model content is disabled; provider streaming remains independent "
+                "and keeps token-boundary interruption when the async transport is available"
             )
-        elif not stream_gateway_output:
+        elif not provider_streaming_enabled:
             _LOGGER.info(
-                "httpx is unavailable; Studio will use one-shot gateway turns "
-                "(install monoid-agent-kernel[http-async] for live token deltas)"
+                "httpx is unavailable; Studio will use one-shot gateway turns without the live "
+                "broker or model-content sidecar (install monoid-agent-kernel[http-async])"
             )
 
         self._backend = RunnerBackend(
@@ -1145,9 +1211,13 @@ class StudioServer:
             allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
             web_gateway_url=f"http://127.0.0.1:{web_port}",
-            # Stream tokens live: emit model.output.delta events the UI renders incrementally
-            # (effective for adapters that support astream_turn — the gateway/openai path).
-            emit_output_deltas=stream_gateway_output,
+            # Provider streaming and content egress are separate. Stop stays token-responsive even
+            # when live/private content is denied; entitled Studio runs use the passive broker and
+            # sidecar while the public operation log receives no raw delta mirror.
+            emit_output_deltas=False,
+            stream_model_calls=provider_streaming_enabled,
+            model_content_file=self._model_stream_egress_enabled,
+            model_stream_broker=self._model_stream_broker,
             # Follow-up attachments ride a base64 data: URI through send_message, so the message
             # size limit must clear an inline image (the core normalizes it to a blob downstream).
             max_message_bytes=_MAX_BODY_BYTES,
@@ -1440,6 +1510,10 @@ class StudioServer:
                 self._run_tokens.setdefault(run["run_id"], run["read_token"])
             known = {run["run_id"] for run in listing}
             recents = [s for s in self._sessions if s["run_id"] not in known]
+            recent_tokens = {
+                str(session["run_id"]): self._run_tokens.get(str(session["run_id"]))
+                for session in recents
+            }
         out = []
         for run in listing:
             run_profile = self._profile_for_run(str(run["run_id"]))
@@ -1453,6 +1527,7 @@ class StudioServer:
                     "terminal": bool(run.get("terminal")),
                     "created_at": run["created_at"],
                     "recoverable": run["recoverable"],
+                    "last_event_seq": int(run.get("last_event_seq") or 0),
                     "profile_id": run_profile,
                     "profile_name": profile_names.get(run_profile, run_profile),
                 }
@@ -1461,14 +1536,30 @@ class StudioServer:
             run_profile = _normalize_profile_id(str(s.get("profile_id") or _DEFAULT_PROFILE_ID))
             if selected_profile is not None and run_profile != selected_profile:
                 continue
+            status: dict[str, Any] = {}
+            token = recent_tokens.get(str(s["run_id"]))
+            if token:
+                try:
+                    status = self._backend.status(str(s["run_id"]), token)
+                except (NativeAgentError, OSError, ValueError):
+                    status = {}
+            status_file = status.get("status_file")
+            durable = status_file if isinstance(status_file, dict) else {}
+            raw_last_event_seq = status.get("last_event_seq", durable.get("last_event_seq", 0))
+            last_event_seq = (
+                raw_last_event_seq
+                if type(raw_last_event_seq) is int and raw_last_event_seq >= 0
+                else 0
+            )
             out.append(
                 {
                     "run_id": s["run_id"],
                     "title": s["title"],
-                    "state": "running",
-                    "terminal": False,
+                    "state": str(status.get("state") or "running"),
+                    "terminal": bool(status.get("terminal")),
                     "created_at": s["created_at"],
                     "recoverable": False,
+                    "last_event_seq": last_event_seq,
                     "profile_id": run_profile,
                     "profile_name": profile_names.get(run_profile, run_profile),
                 }
@@ -1596,14 +1687,16 @@ class StudioServer:
             "run.failed",
             "run.finished",
         }
-        latest = next(
+        event_list = events if isinstance(events, list) else []
+        latest_index = next(
             (
-                event
-                for event in reversed(events if isinstance(events, list) else [])
-                if str(event.get("type") or "") in boundaries
+                index
+                for index in range(len(event_list) - 1, -1, -1)
+                if str(event_list[index].get("type") or "") in boundaries
             ),
             None,
         )
+        latest = event_list[latest_index] if latest_index is not None else None
         if latest is None or str(latest.get("type") or "") != "turn.failed":
             raise NativeAgentError(
                 "the latest turn boundary is not a failed turn",
@@ -1617,11 +1710,39 @@ class StudioServer:
             )
 
         failed_seq = int(latest.get("seq", -1))
+        raw_failed_turn_id = latest.get("turn_id")
+        failed_turn_id = (
+            raw_failed_turn_id
+            if isinstance(raw_failed_turn_id, str) and raw_failed_turn_id
+            else ""
+        )
+        if not failed_turn_id and latest_index is not None:
+            # v0.20.0 wrote turn.failed without turn_id. Its immediately preceding durable turn
+            # boundary is the correlated model.turn.started, so retained parked runs can still be
+            # retried after upgrade. If a malformed legacy log cannot prove that relationship,
+            # retry remains available and only the optional partial-suppression identity is absent.
+            previous_boundary = next(
+                (
+                    event_list[index]
+                    for index in range(latest_index - 1, -1, -1)
+                    if str(event_list[index].get("type") or "") in boundaries
+                ),
+                None,
+            )
+            if previous_boundary is not None and str(
+                previous_boundary.get("type") or ""
+            ) == "model.turn.started":
+                raw_previous_turn_id = previous_boundary.get("turn_id")
+                if isinstance(raw_previous_turn_id, str) and raw_previous_turn_id:
+                    failed_turn_id = raw_previous_turn_id
         retry_id = f"studio_retry_{failed_seq}"
+        retry_metadata: dict[str, Any] = {"retry_of_event_seq": failed_seq}
+        if failed_turn_id:
+            retry_metadata["retry_of_turn_id"] = failed_turn_id
         retry_kwargs = {
             "message_id": retry_id,
             "source": "studio-retry",
-            "metadata": {"retry_of_event_seq": failed_seq},
+            "metadata": retry_metadata,
         }
         try:
             queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
@@ -1629,7 +1750,7 @@ class StudioServer:
             self._backend.resume_run(run_id, token)
             queued = self._backend.send_message(run_id, token, "", **retry_kwargs)
         queue_status = str(queued.get("status") or "")
-        return {
+        response = {
             "run_id": run_id,
             "state": str(status.get("state") or ""),
             "terminal": False,
@@ -1644,6 +1765,9 @@ class StudioServer:
             "runtime_config_source": "current",
             "message_snapshot": "existing_by_value_messages",
         }
+        if failed_turn_id:
+            response["retry_of_turn_id"] = failed_turn_id
+        return response
 
     def cancel_chat(self, run_id: str) -> dict[str, Any]:
         assert self._backend is not None
@@ -1678,7 +1802,11 @@ class StudioServer:
             events = payload.get("events", [])
             if isinstance(events, list):
                 with self._lock:
-                    ChatProjection(self._run_dir_for(run_id)).project_events(events)
+                    ChatProjection(self._run_dir_for(run_id)).project_events(
+                        events,
+                        include_model_stream_partials=self.model_stream_enabled,
+                        root_run_id=run_id,
+                    )
             return payload
 
         return EventSubscription(
@@ -1687,9 +1815,212 @@ class StudioServer:
             read_lifecycle=lambda: self._backend.status(run_id, token),
         )
 
+    @property
+    def model_stream_enabled(self) -> bool:
+        """Whether this Studio process may expose model-authored live/private content."""
+
+        return self._model_stream_egress_enabled and self._model_stream_broker is not None
+
+    def model_stream_subscription(
+        self,
+        root_run_id: str,
+        *,
+        after_cursor: str | None = None,
+    ) -> LiveModelStreamSubscription:
+        """Create an authorized passive subscription for a root run and all of its children."""
+
+        if not self.model_stream_enabled:
+            raise NativeAgentError(
+                "live model content is not enabled",
+                error_code="model_stream_unavailable",
+            )
+        assert self._backend is not None
+        token = self._token_for(root_run_id)
+        return self._backend.subscribe_model_stream(
+            root_run_id,
+            token,
+            after_cursor=after_cursor,
+        )
+
     def chat_transcript(self, run_id: str) -> dict[str, Any]:
         with self._lock:
-            return ChatProjection(self._run_dir_for(run_id)).catch_up(run_id)
+            return ChatProjection(self._run_dir_for(run_id)).catch_up(
+                run_id,
+                include_model_stream_partials=self.model_stream_enabled,
+            )
+
+    def model_content_snapshot(self, root_run_id: str) -> dict[str, Any]:
+        """Read one entitled root's private root+descendant stream snapshots.
+
+        Enumeration stays inside the backend-owned run root, rejects linked directories, and
+        verifies every sidecar context against both its directory name and the requested lineage.
+        """
+
+        if not self.model_stream_enabled:
+            raise NativeAgentError(
+                "live model content is not enabled",
+                error_code="model_stream_unavailable",
+            )
+        if (
+            not root_run_id
+            or root_run_id_from_descendant(root_run_id) is not None
+            or not is_descendant_run_id(root_run_id, root_run_id)
+        ):
+            raise NativeAgentError(
+                "model content requires a valid root run id",
+                error_code="invalid_model_content_root",
+            )
+        assert self._backend is not None
+        # Resolve authorization and existence before enumerating or opening any content artifact.
+        authorized_root = self._run_dir_for(root_run_id)
+        run_root = self._backend.run_root.resolve()
+        resolved_root = authorized_root.resolve()
+        if resolved_root.name != root_run_id or resolved_root.parent != run_root:
+            raise NativeAgentError(
+                "authorized run directory is outside the configured run root",
+                error_code="invalid_model_content_root",
+            )
+
+        run_dirs: list[Path] = [resolved_root]
+        try:
+            candidates = sorted(run_root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise NativeAgentError(
+                "model content run root is unavailable",
+                error_code="model_content_unavailable",
+            ) from exc
+        for candidate in candidates:
+            if candidate.name == root_run_id or not is_descendant_run_id(
+                root_run_id, candidate.name
+            ):
+                continue
+            try:
+                if candidate.is_symlink() or not candidate.is_dir():
+                    continue
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.parent != run_root or resolved.name != candidate.name:
+                continue
+            run_dirs.append(resolved)
+
+        # A reset hydrates the active/latest call for each member of the root lineage. Keeping one
+        # per run bounds response growth across a long multi-turn session; completed history comes
+        # from the chat projection rather than this live-repair endpoint.
+        latest: dict[str, tuple[tuple[int, str, str], dict[str, Any]]] = {}
+        for run_dir in run_dirs:
+            # The sidecar batches small provider deltas for up to 250 ms. A broker reset can become
+            # visible inside that window, so commit the in-process writer prefix before accepting
+            # a snapshot that lets the browser advance past the missing live frame.
+            sidecar_path = run_dir / MODEL_CONTENT_FILENAME
+            if not model_content_file_is_safe(sidecar_path):
+                raise NativeAgentError(
+                    "model content snapshot is temporarily unavailable",
+                    error_code="model_content_unavailable",
+                )
+            try:
+                with watch_active_model_content(run_dir) as mutation_watch:
+                    flush_active_model_content(run_dir)
+                    before_read = active_model_content_state(run_dir)
+                    named_identity = model_content_file_identity(sidecar_path)
+                    if (
+                        before_read.file_identity is not None
+                        and named_identity != before_read.file_identity
+                    ):
+                        raise OSError("active sidecar descriptor/path identity mismatch")
+                    if before_read.stream_ids and before_read.file_identity is None:
+                        raise OSError("active streams have no verified sidecar descriptor")
+                    expected_identity = before_read.file_identity or named_identity
+                    content = (
+                        ModelContentReadResult()
+                        if expected_identity is None
+                        else read_model_content(
+                            run_dir,
+                            expected_identity=expected_identity,
+                        )
+                    )
+                    after_read = active_model_content_state(run_dir)
+                    if (
+                        after_read.file_identity is not None
+                        and after_read.file_identity != expected_identity
+                    ):
+                        raise OSError("active sidecar identity changed during snapshot")
+                    active_stream_ids = before_read.stream_ids & after_read.stream_ids
+                    transitioning_stream_ids = before_read.stream_ids ^ after_read.stream_ids
+                    active_turn_ids = _active_model_turn_ids(run_dir)
+                    if mutation_watch.changed:
+                        raise OSError("active model-content lifecycle changed during snapshot")
+            except OSError as exc:
+                # A reset snapshot is a cursor-advancing proof. Serving a stale prefix after an
+                # in-process writer failed to flush, changed identity, or closed during the read
+                # would make the browser permanently skip or revive text.
+                raise NativeAgentError(
+                    "model content snapshot is temporarily unavailable",
+                    error_code="model_content_unavailable",
+                ) from exc
+            for snapshot in content.snapshots:
+                context = snapshot.context
+                if (
+                    context.root_run_id != root_run_id
+                    or context.run_id != run_dir.name
+                    or not is_descendant_run_id(root_run_id, context.run_id)
+                ):
+                    continue
+                if snapshot.status == "abandoned" and context.stream_id in transitioning_stream_ids:
+                    # An open/close crossing the read boundary has no authoritative terminal state
+                    # in this snapshot. Omitting it lets retained live opened/delta/closed frames
+                    # reconstruct the call instead of seeding an abandoned call that rejects them.
+                    continue
+                status = snapshot.status
+                if (
+                    status == "abandoned"
+                    and context.stream_id in active_stream_ids
+                    and context.turn_id in active_turn_ids
+                ):
+                    status = "running"
+                item: dict[str, Any] = {
+                    "root_run_id": context.root_run_id,
+                    "run_id": context.run_id,
+                    "turn_id": context.turn_id,
+                    "stream_id": context.stream_id,
+                    "step": context.step,
+                    "provider": context.provider,
+                    "model": context.model,
+                    "started_at": context.started_at,
+                    "status": status,
+                    "output_text": snapshot.output_text,
+                    "output_end_offset": len(snapshot.output_text.encode("utf-8")),
+                    "reasoning_text": snapshot.reasoning_text,
+                    "reasoning_end_offset": len(snapshot.reasoning_text.encode("utf-8")),
+                    "partial": status != "completed",
+                    "retryable": snapshot.retryable,
+                }
+                if snapshot.final_text is not None:
+                    item["final_text"] = snapshot.final_text
+                if snapshot.usage is not None:
+                    item["usage"] = dict(snapshot.usage)
+                if snapshot.error_code:
+                    item["error_code"] = snapshot.error_code
+                order = (context.step, context.started_at, context.stream_id)
+                previous = latest.get(context.run_id)
+                if previous is None or order >= previous[0]:
+                    latest[context.run_id] = (order, item)
+
+        streams = [entry[1] for entry in latest.values()]
+        streams.sort(
+            key=lambda item: (
+                item["run_id"] != root_run_id,
+                item["run_id"],
+                item["step"],
+                item["started_at"],
+                item["stream_id"],
+            )
+        )
+        return {
+            "schema_version": STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
+            "root_run_id": root_run_id,
+            "streams": streams,
+        }
 
     def subagent_events(self, child_run_id: str, from_seq: int = 0) -> dict[str, Any]:
         """Stream a child subagent run's work for the parent UI.
@@ -2148,6 +2479,7 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                         "workspace": str(studio.workspace),
                         "provider": studio.config.provider,
                         "offline": studio.offline,
+                        "model_stream_enabled": studio.model_stream_enabled,
                     }
                 )
                 return
@@ -2254,8 +2586,37 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 except NativeAgentError as exc:
                     self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            if parsed.path == "/api/model-content":
+                if not studio.model_stream_enabled:
+                    self._write_json(
+                        {"error": "live model content is not enabled"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                root_run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                try:
+                    self._write_json(studio.model_content_snapshot(root_run_id))
+                except NativeAgentError as exc:
+                    status = (
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if exc.error_code == "model_content_unavailable"
+                        else HTTPStatus.BAD_REQUEST
+                    )
+                    self._write_json({"error": str(exc)}, status)
+                except ValueError as exc:
+                    self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             if parsed.path == "/api/events":
                 self._stream_events(parse_qs(parsed.query))
+                return
+            if parsed.path == "/api/model-stream":
+                if not studio.model_stream_enabled:
+                    self._write_json(
+                        {"error": "live model content is not enabled"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                self._stream_model_stream(parse_qs(parsed.query, keep_blank_values=True))
                 return
             if parsed.path == "/api/subagent-events":
                 query = parse_qs(parsed.query)
@@ -2469,6 +2830,41 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
                 return  # client disconnected
             except NativeAgentError:
                 return
+
+        def _stream_model_stream(self, query: dict[str, list[str]]) -> None:
+            root_run_id = (query.get("run_id") or [""])[0]
+            if not root_run_id:
+                self.send_error(HTTPStatus.BAD_REQUEST, "run_id required")
+                return
+            query_cursor = (query.get("cursor") or [None])[0]
+            after_cursor = self.headers.get("Last-Event-ID") or query_cursor
+            try:
+                subscription = studio.model_stream_subscription(
+                    root_run_id,
+                    after_cursor=after_cursor,
+                )
+            except (NativeAgentError, ValueError) as exc:
+                self._write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            # The browser owns only this observer. A disconnect closes the subscription and leaves
+            # the autonomous run, provider stream, and interrupt/cancel controls untouched.
+            self.close_connection = True
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                for frame in subscription.frames():
+                    self.wfile.write(frame.to_sse())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                subscription.close()
 
         def _sse_send(self, event: dict[str, Any], *, event_id: str = "") -> None:
             # Annotate tool activity with a human-readable line for the UI feed (DX-3).

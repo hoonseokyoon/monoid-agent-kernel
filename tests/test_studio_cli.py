@@ -18,9 +18,12 @@ from monoid_agent_kernel.reference.studio.cli import studio
 def _invoke(tmp_path: Path, *extra: str):
     args = [
         "doctor",
-        "--workspace", str(tmp_path / "ws"),
-        "--run-root", str(tmp_path / "runs"),
-        "--port", "0",  # ephemeral → always "free", no busy-port flake
+        "--workspace",
+        str(tmp_path / "ws"),
+        "--run-root",
+        str(tmp_path / "runs"),
+        "--port",
+        "0",  # ephemeral → always "free", no busy-port flake
         *extra,
     ]
     return CliRunner().invoke(studio, args)
@@ -64,10 +67,10 @@ def test_doctor_fails_on_a_typo_in_the_delta_kill_switch(
 @pytest.mark.parametrize(
     ("env_value", "extra", "transport", "expected"),
     [
-        (None, (), True, "will be published"),
+        (None, (), True, "live model content and private model-content.jsonl are enabled"),
         ("0", (), True, "disabled by MONOID_OUTPUT_DELTAS"),
         (None, ("--no-output-deltas",), True, "disabled by --no-output-deltas"),
-        (None, (), False, "async transport is not installed"),
+        (None, (), False, "needs the [http-async] extra"),
     ],
 )
 def test_doctor_reports_the_effective_delta_state(
@@ -214,9 +217,7 @@ def test_openai_sdk_probe_rejects_legacy_sdk_without_responses_api(
 def test_doctor_missing_chromium_is_warning_not_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "monoid_agent_kernel.reference.studio.window.find_chromium", lambda: None
-    )
+    monkeypatch.setattr("monoid_agent_kernel.reference.studio.window.find_chromium", lambda: None)
     result = _invoke(tmp_path)
     # No browser is a WARN, not a hard failure — serve still works headless.
     assert result.exit_code == 0, result.output
@@ -229,9 +230,12 @@ def test_accept_runs_offline_deterministic_checks(tmp_path: Path) -> None:
         studio,
         [
             "accept",
-            "--workspace", str(tmp_path / "ws"),
-            "--run-root", str(tmp_path / "runs"),
-            "--timeout", "10",
+            "--workspace",
+            str(tmp_path / "ws"),
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--timeout",
+            "10",
         ],
     )
     assert result.exit_code == 0, result.output

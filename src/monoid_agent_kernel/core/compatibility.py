@@ -151,6 +151,19 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         accepts_missing_version=True,
         notes="The current client parses the response shape without enforcing protocol.",
     ),
+    CompatibilityArtifact(
+        key="model-stream-live",
+        kind="wire",
+        current_writer="monoid.model-stream.live.v1",
+        supported_readers=("monoid.model-stream.live.v1",),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("reference/backend/model_stream.py:LiveModelStreamFrame.to_json",),
+        notes=(
+            "Passive root-multiplexed Studio SSE transport with generation/sequence resume and "
+            "explicit reset frames. Raw chunks are process-local and never enter the durable log."
+        ),
+    ),
     _monoid_artifact(
         "web-search.v1",
         kind="wire",
@@ -232,6 +245,22 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
             "Private run-dir artifact, listed next to event.v1 because the two are now a pair: a "
             "settle event carries final_text_digest and resolves here. Records are typed by 'kind' "
             "rather than a schema_version field, hence accepts_missing_version."
+        ),
+    ),
+    _monoid_artifact(
+        "model-content.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=(
+            "core/schemas.py:MODEL_CONTENT_RECORD_SCHEMA",
+            "core/model_content.py:MODEL_CONTENT_SCHEMA_VERSION",
+        ),
+        legacy_reader=True,
+        notes=(
+            "Optional private run-dir sidecar for streamed model content. Older run directories "
+            "may omit it. When the sidecar is enabled, settled text is dual-written to "
+            "transcript.v1 during the compatibility window, and entitled readers fall back to "
+            "that transcript when the sidecar cannot resolve a digest."
         ),
     ),
     _monoid_artifact(
@@ -401,6 +430,42 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         notes=(
             "The JSONL reader skips invalid JSON and non-object records without gating by version; "
             "strict transcript readers require the renderable core fields and allow extensions."
+        ),
+    ),
+    CompatibilityArtifact(
+        key="studio-trace-export",
+        kind="reference",
+        current_writer="studio.trace-export.v1",
+        supported_readers=(),
+        namespace_aliases=(),
+        reader_policy="writer-only",
+        source=("reference/studio/server.py:STUDIO_TRACE_EXPORT_SCHEMA_VERSION",),
+        notes="Raw Studio Trace download containing every source event in presentation order.",
+    ),
+    CompatibilityArtifact(
+        key="studio-trace-export-compact",
+        kind="reference",
+        current_writer="studio.trace-export.compact.v1",
+        supported_readers=(),
+        namespace_aliases=(),
+        reader_policy="writer-only",
+        source=("reference/studio/server.py:STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION",),
+        notes=(
+            "Operation-only Studio Trace download with source/omission counts and UTF-8 delta "
+            "text-byte totals."
+        ),
+    ),
+    CompatibilityArtifact(
+        key="studio-model-content",
+        kind="reference",
+        current_writer="studio.model-content.v1",
+        supported_readers=("studio.model-content.v1",),
+        namespace_aliases=(),
+        reader_policy="strict",
+        source=("reference/studio/server.py:STUDIO_MODEL_CONTENT_SCHEMA_VERSION",),
+        notes=(
+            "Entitled Studio snapshot projection for reset hydration and retained final or partial "
+            "model output; source sidecars remain private run-directory artifacts."
         ),
     ),
 )

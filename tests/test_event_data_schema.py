@@ -42,6 +42,12 @@ def test_valid_payload_passes_strict_event() -> None:
     assert list(_validator("model.turn.started").iter_errors(data)) == []
 
 
+def test_studio_retry_resume_marker_uses_existing_v1_data_shape() -> None:
+    assert list(
+        _validator("run.resumed").iter_errors({"reason": "studio-retry"})
+    ) == []
+
+
 def test_missing_required_key_fails() -> None:
     # `step` is required for model.turn.started.
     errors = list(_validator("model.turn.started").iter_errors({"previous_turn_handle": "h"}))

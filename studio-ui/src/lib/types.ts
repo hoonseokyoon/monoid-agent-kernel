@@ -15,6 +15,7 @@ export interface StudioConfig {
   workspace: string;
   provider: string;
   offline: boolean;
+  model_stream_enabled?: boolean;
 }
 
 export interface CapabilityOption {
@@ -96,6 +97,7 @@ export interface SessionSummary {
   terminal: boolean;
   created_at: number;
   recoverable: boolean;
+  last_event_seq: number;
   profile_id: string;
   profile_name: string;
 }
@@ -158,11 +160,13 @@ export interface ResumeResponse extends ChatResponse {
 export interface RetryResponse extends ChatResponse {
   retried?: boolean;
   retry_of_event_seq?: number;
+  retry_of_turn_id?: string;
 }
 
 export interface RunEvent<T extends Record<string, unknown> = Record<string, unknown>> {
   seq?: number;
   run_id?: string;
+  turn_id?: string | null;
   event_id?: string;
   parent_id?: string;
   type: string;
@@ -189,6 +193,11 @@ export interface SubagentActivity {
   status: "running" | "succeeded" | "failed";
   events: RunEvent[];
   liveTraceUnavailable?: boolean;
+  liveStreamId?: string;
+  liveTurnId?: string;
+  liveOutput?: string;
+  liveReasoning?: string;
+  liveStreamStatus?: "running" | "completed" | "interrupted" | "failed" | "cancelled" | "timed_out" | "abandoned";
 }
 
 export interface ApprovalRequest {

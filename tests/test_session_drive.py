@@ -8,6 +8,7 @@ from typing import Any
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
+from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.reference.backend.session_drive import (
     SessionDriveContext,
@@ -117,3 +118,88 @@ def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=2)
 
     assert service.session_should_stop(record, started=started, turns=2) is True
+
+
+def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    record = _Record()
+    record.state = "turn_failed"
+    record.terminal = False
+    record.last_final_output = None
+    retry = InboxMessage(
+        content="",
+        id="studio_retry_7",
+        source="studio-retry",
+        run_id=record.run_id,
+        metadata={
+            "retry_of_event_seq": 7,
+            "retry_of_turn_id": "turn_0001",
+        },
+    ).to_json()
+    record.message_queue.put_nowait(retry)
+
+    class _Request:
+        multi_turn = True
+
+    class _Loop:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any], str | None]] = []
+
+        def snapshot(self) -> None:
+            return None
+
+        def await_user_input(self) -> None:
+            return None
+
+        def emit_external_event(
+            self,
+            event_type: str,
+            *,
+            data: dict[str, Any] | None = None,
+            level: str = "info",
+            turn_id: str | None = None,
+        ) -> bool:
+            assert level == "info"
+            self.events.append((event_type, dict(data or {}), turn_id))
+            return True
+
+        async def arun_until_suspended(self, user_input: Any = None) -> Suspension:
+            assert user_input == ""
+            assert self.events == [
+                (
+                    "run.resumed",
+                    {"reason": "studio-retry"},
+                    "turn_0001",
+                )
+            ]
+            return Suspension(reason="terminal", status="completed")
+
+        async def aclose(self) -> str:
+            return "closed"
+
+    loop = _Loop()
+    record.loop = loop
+
+    result = asyncio.run(
+        service.drive_open_session(
+            record,
+            _Request(),
+            loop,
+            Suspension(
+                reason="turn_failed",
+                status="failed",
+                error="bad config",
+                error_code="model_error",
+                retryable=False,
+            ),
+            started=time.time(),
+            turns=1,
+        )
+    )
+
+    assert result == "closed"
+    assert loop.events[0] == (
+        "run.resumed",
+        {"reason": "studio-retry"},
+        "turn_0001",
+    )

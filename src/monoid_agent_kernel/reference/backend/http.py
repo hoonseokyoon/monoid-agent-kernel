@@ -26,6 +26,7 @@ from monoid_agent_kernel.reference._shared.http_util import (
     read_json_limited,
     redact_internal_error,
 )
+from monoid_agent_kernel.reference.backend.model_stream import LiveModelStreamSubscription
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -108,6 +109,21 @@ def make_backend_handler(
                             limit=None if limit_raw is None else int(limit_raw),
                         )
                     )
+                    return
+                if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "model-stream":
+                    run_id = parts[2]
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    query_cursor = (query.get("cursor") or [None])[0]
+                    # Native EventSource owns Last-Event-ID on reconnect. A query cursor bootstraps
+                    # the first connection; the header is authoritative once the browser has seen
+                    # a frame.
+                    after_cursor = self.headers.get("Last-Event-ID") or query_cursor
+                    subscription = backend.subscribe_model_stream(
+                        run_id,
+                        self._bearer_token(),
+                        after_cursor=after_cursor,
+                    )
+                    self._stream_model_subscription(subscription)
                     return
                 if len(parts) == 4 and parts[:2] == ["v1", "runs"] and parts[3] == "diagnostics":
                     run_id = parts[2]
@@ -480,6 +496,31 @@ def make_backend_handler(
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
+
+        def _stream_model_subscription(
+            self,
+            subscription: LiveModelStreamSubscription,
+        ) -> None:
+            """Write the passive root-multiplex model-content channel as cursor-addressed SSE."""
+
+            self.close_connection = True
+            try:
+                self.send_response(int(HTTPStatus.OK))
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                for frame in subscription.frames():
+                    self.wfile.write(frame.to_sse())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                # This subscription is an observer only. Closing it releases the reader and has no
+                # path to RunnerBackend cancellation or turn interruption.
+                subscription.close()
 
         def _bearer_token(self) -> str:
             header = self.headers.get("Authorization") or ""

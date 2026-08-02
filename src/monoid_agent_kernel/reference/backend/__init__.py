@@ -5,16 +5,30 @@ their own against ``monoid_agent_kernel.contracts`` and ``docs/CONTRACTS.md``. N
 the supported public surface.
 """
 
+from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenManager
+from monoid_agent_kernel.reference.backend.model_stream import (
+    LiveModelStreamBroker,
+    LiveModelStreamBufferStats,
+    LiveModelStreamCursor,
+    LiveModelStreamFrame,
+    LiveModelStreamObserver,
+    LiveModelStreamSubscription,
+)
 from monoid_agent_kernel.reference.backend.service import (
     BackendRunRequest,
     BackendRunSubmission,
     RunnerBackend,
 )
-from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenManager
 
 __all__ = [
     "BackendRunRequest",
     "BackendRunSubmission",
+    "LiveModelStreamBroker",
+    "LiveModelStreamBufferStats",
+    "LiveModelStreamCursor",
+    "LiveModelStreamFrame",
+    "LiveModelStreamObserver",
+    "LiveModelStreamSubscription",
     "RunnerBackend",
     "TokenClaims",
     "TokenManager",

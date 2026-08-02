@@ -44,6 +44,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `external-agent-envelope` | wire | `monoid.external-agent-envelope.v1` | strict | `monoid.external-agent-envelope.v1`<br>`native-agent-runner.external-agent-envelope.v1` |
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
+| `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
 | `web-fetch` | wire | `monoid.web-fetch.v1` | permissive; missing id accepted | `monoid.web-fetch.v1`<br>`native-agent-runner.web-fetch.v1` |
@@ -54,6 +55,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
+| `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
@@ -72,6 +74,9 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `conformance-fixtures` | reference | `monoid.conformance-fixtures.v1` | strict | `monoid.conformance-fixtures.v1` |
 | `studio-chat` | reference | `studio.chat.v2` | strict | `studio.chat.v1`<br>`studio.chat.v2` |
 | `studio-chat-message` | reference | `studio.chat.message.v1` | permissive; missing id accepted | `studio.chat.message.v1` |
+| `studio-trace-export` | reference | `studio.trace-export.v1` | writer-only | None (writer-only) |
+| `studio-trace-export-compact` | reference | `studio.trace-export.compact.v1` | writer-only | None (writer-only) |
+| `studio-model-content` | reference | `studio.model-content.v1` | strict | `studio.model-content.v1` |
 <!-- compatibility-registry:end -->
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
@@ -179,11 +184,17 @@ blobs. Treat both stores as one backup boundary.
 | Artifact class | Required evolution behavior |
 |---|---|
 | Checkpoint and backend run metadata | Register an ordered, pure migration before changing the writer. Preserve unknown fields where possible. Recovery must distinguish corrupt, unsupported, and transient store failures. |
-| Append-only events and Studio chat JSONL | Readers must handle every retained record version. A file can contain records written by different releases. Keep record-level version checks. |
+| Append-only events, model content, and Studio chat JSONL | Readers must handle every retained record version. A file can contain records written by different releases. Keep record-level version checks. |
 | Manifest, workspace snapshots, and indexes | Bump the version when a strict schema changes incompatibly. Existing run directories remain readable through the listed old-version schema or an explicit migration. |
 | Proposal packages, approvals, and apply results | Content participates in hashes and approval identity. Generate a new artifact after a shape change; never mutate an existing signed or hashed artifact. |
 | Hosted task and background-job projections | Recovery state lives in checkpoints. Projection schema changes must preserve operator visibility and must not be treated as checkpoint migrations. |
 | Wire requests and responses | Deploy accepting readers before emitting the new version. Unknown versions fail closed at strict boundaries. |
+
+`model-content.jsonl` is optional for retained run directories. Each new sidecar record carries
+its own `monoid.model-content.v1` identifier, and readers also accept the legacy
+`native-agent-runner.model-content.v1` namespace. When the sidecar is enabled during this
+compatibility window, settled text is written to both it and `transcript.jsonl`; hydration reads
+the sidecar first and falls back to the transcript for any unresolved digest.
 
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,

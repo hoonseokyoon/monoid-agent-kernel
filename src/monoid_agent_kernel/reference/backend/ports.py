@@ -45,6 +45,7 @@ class LoopPort(Protocol):
         *,
         data: dict[str, Any] | None = None,
         level: str = "info",
+        turn_id: str | None = None,
     ) -> bool: ...
 
     async def arun_until_suspended(self, user_input: Any | None = None) -> Suspension: ...

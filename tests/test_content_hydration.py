@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from support.backend_harness import (
     BackendRunRequest,
     RunnerBackend,
@@ -60,6 +62,23 @@ def _write_record(run_dir: Path, text: str, **overrides: Any) -> str:
     return digest
 
 
+def _write_model_content_record(run_dir: Path, text: str, **overrides: Any) -> str:
+    digest = content_digest(text)
+    record = {
+        "schema_version": "monoid.model-content.v1",
+        "kind": "settled_text",
+        "run_id": "run-1",
+        "final_text": text,
+        "final_text_digest": digest,
+        "final_text_len": len(text),
+        "recorded_at": "2026-08-01T00:00:00Z",
+    }
+    record.update(overrides)
+    with (run_dir / "model-content.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(record) + "\n")
+    return digest
+
+
 def _event(**data: Any) -> dict[str, Any]:
     return {"type": "turn.settled", "seq": 1, "data": data}
 
@@ -71,6 +90,130 @@ def test_absent_text_is_filled_from_the_record(tmp_path: Path) -> None:
     hydrate_settled_text(events, tmp_path)
 
     assert events[0]["data"]["final_text"] == "the model wrote this"
+
+
+def test_absent_text_is_filled_from_the_model_content_sidecar(tmp_path: Path) -> None:
+    digest = _write_model_content_record(tmp_path, "the sidecar answer")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "the sidecar answer"
+
+
+def test_model_content_hydration_rejects_a_planted_file_symlink(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    digest = _write_model_content_record(outside_dir, "outside private answer")
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    try:
+        (run_dir / "model-content.jsonl").symlink_to(outside_dir / "model-content.jsonl")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, run_dir)
+
+    assert "final_text" not in events[0]["data"]
+
+
+def test_model_content_hydration_rejects_a_planted_hardlink(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside-hardlink"
+    outside_dir.mkdir()
+    digest = _write_model_content_record(outside_dir, "outside hardlinked answer")
+    run_dir = tmp_path / "run-hardlink"
+    run_dir.mkdir()
+    try:
+        (run_dir / "model-content.jsonl").hardlink_to(outside_dir / "model-content.jsonl")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, run_dir)
+
+    assert "final_text" not in events[0]["data"]
+
+
+def test_invalid_sidecar_version_falls_back_to_the_transcript(tmp_path: Path) -> None:
+    digest = _write_record(tmp_path, "the legacy answer")
+    _write_model_content_record(
+        tmp_path,
+        "the legacy answer",
+        schema_version="monoid.model-content.v999",
+    )
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "the legacy answer"
+
+
+def test_schema_invalid_sidecar_record_falls_back_to_the_transcript(tmp_path: Path) -> None:
+    digest = _write_record(tmp_path, "the valid compatibility copy")
+    _write_model_content_record(
+        tmp_path,
+        "the valid compatibility copy",
+        final_text_len=999,
+    )
+    events = [_event(status="completed", final_text_digest=digest)]
+
+    hydrate_settled_text(events, tmp_path)
+
+    assert events[0]["data"]["final_text"] == "the valid compatibility copy"
+
+
+def test_invalid_utf8_sidecar_is_skipped_then_transcript_fallback_resolves(
+    tmp_path: Path,
+) -> None:
+    replacement_text = "bad\ufffdtext"
+    digest = content_digest(replacement_text)
+    invalid_sidecar_record = (
+        b'{"schema_version":"monoid.model-content.v1","kind":"settled_text",'
+        b'"run_id":"run-1","final_text":"bad\xfftext","final_text_digest":"'
+        + digest.encode("ascii")
+        + b'","final_text_len":8,"recorded_at":"2026-08-01T00:00:00Z"}\n'
+    )
+    (tmp_path / "model-content.jsonl").write_bytes(invalid_sidecar_record)
+
+    unresolved = [_event(status="completed", final_text_digest=digest)]
+    hydrate_settled_text(unresolved, tmp_path)
+    assert "final_text" not in unresolved[0]["data"]
+
+    assert _write_record(tmp_path, replacement_text) == digest
+    resolved = [_event(status="completed", final_text_digest=digest)]
+    hydrate_settled_text(resolved, tmp_path)
+    assert resolved[0]["data"]["final_text"] == replacement_text
+
+
+def test_transcript_scan_receives_only_digests_the_sidecar_did_not_resolve(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from monoid_agent_kernel.reference.backend import content_hydration
+
+    sidecar_digest = content_digest("sidecar")
+    transcript_digest = content_digest("transcript")
+    calls: list[tuple[str, set[str]]] = []
+
+    def fake_resolve(path: Path, wanted: set[str]) -> dict[str, str]:
+        calls.append((path.name, set(wanted)))
+        if path.name == "model-content.jsonl":
+            return {sidecar_digest: "sidecar"}
+        return {transcript_digest: "transcript"}
+
+    monkeypatch.setattr(content_hydration, "_resolve", fake_resolve)
+    events = [
+        _event(status="completed", final_text_digest=sidecar_digest),
+        _event(status="completed", final_text_digest=transcript_digest),
+    ]
+
+    content_hydration.hydrate_settled_text(events, tmp_path)
+
+    assert calls == [
+        ("model-content.jsonl", {sidecar_digest, transcript_digest}),
+        ("transcript.jsonl", {transcript_digest}),
+    ]
+    assert [event["data"]["final_text"] for event in events] == ["sidecar", "transcript"]
 
 
 def test_present_text_is_never_overwritten_on_a_mixed_page(tmp_path: Path) -> None:

@@ -6,13 +6,13 @@
   let { activity } = $props<{ activity: SubagentActivity }>();
 
   const reasoning = $derived(
-    activity.events
+    activity.liveReasoning ?? activity.events
       .filter((event: RunEvent) => event.type === "model.reasoning.delta")
       .map((event: RunEvent) => String(event.data.text ?? ""))
       .join(""),
   );
   const streamedOutput = $derived(
-    activity.events
+    activity.liveOutput ?? activity.events
       .filter((event: RunEvent) => event.type === "model.output.delta")
       .map((event: RunEvent) => String(event.data.text ?? ""))
       .join(""),

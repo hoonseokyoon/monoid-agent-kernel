@@ -39,7 +39,8 @@ Pre-1.0 (`0.x`); breaking changes are noted in commit messages.
   `TaskReporter`); the session lifecycle + control surface (`AgentSession` /
   `LoopSession`, `SessionState`, `ControlCommand` / `ControlResult` /
   `ControlDispatcher`); capability leases; agent-as-tool delegation; Agent Skills;
-  output validation; and multimodal input. `ImagePart` and `DocumentPart` are forwarded
+  output validation; model-stream observation; and multimodal input. `ImagePart` and
+  `DocumentPart` are forwarded
   to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported content
   contracts and round-trip through core JSON/checkpoint paths; provider forwarding is
   adapter-specific.
@@ -270,7 +271,8 @@ Choose one one-shot contract:
 Add `StreamingModelAdapter.astream_turn(request) -> AsyncIterator[ModelStreamChunk]` to either
 one-shot contract for token streaming. `AgentLoop.astream` prefers the streaming method and folds
 its chunks into the same `ModelTurn`, event, error, and checkpoint path. Autonomous runs use the
-stream when `emit_output_deltas=True`.
+stream when `stream_model_calls=True`, `emit_output_deltas=True`, private model-content persistence
+is enabled, or a model-stream observer is configured.
 
 Four further opt-in protocols declare optional capability members:
 
@@ -329,9 +331,10 @@ invalid state after construction, AgentLoop drops those caller-supplied fields a
 authoritative run and turn identity; malformed metadata cannot prevent the adapter call.
 
 The receipt is delivered through subscriptions only. AgentLoop continues to use the provider turn
-for usage/budget accounting and does not add receipt data to `events.jsonl`, `transcript.jsonl`, the
-run result, or checkpoints. A subscription's `CapturePolicy` governs only that model-I/O delivery;
-it does not rewrite the private transcript or the separate event-sink channel.
+for usage/budget accounting. Receipt data stays out of `events.jsonl`, `transcript.jsonl`,
+`model-content.jsonl`, the run result, and checkpoints. A subscription's `CapturePolicy` governs
+that model-I/O delivery; the private content records and separate event-sink channel keep their own
+policies.
 
 Subscriptions passed to AgentLoop are owned by that run activation, like `event_sinks`. The loop
 identity-de-duplicates and closes observers at normal close, successful durable release, discard,
@@ -346,6 +349,46 @@ would share callbacks and a child close could terminate the parent's exporter. T
 and child turn id, and adds root/parent/task/definition/depth attributes. Current in-process child
 calls are therefore not delivered to model-I/O observers. A child-scoped observer composition seam
 is deferred to a later change.
+
+#### AgentLoop model-stream observers
+
+`AgentLoop.model_stream_observer_factories` exposes provider-independent output and reasoning
+fragments during autonomous runs. Each factory returns a `ModelStreamObserver`; the observer opens
+one `ModelStreamWriter` for every provider call using a `ModelStreamContext`. The writer receives
+ordered `ModelStreamDelta` values and one terminal `ModelStreamOutcome`. `TextDelta` maps to the
+`output` channel and `ReasoningDelta` maps to `reasoning`. Tool-call fragments stay inside model
+turn assembly. A failed outcome's `retryable` flag carries the provider's transient-failure signal
+used for automatic retry eligibility; `false` does not prevent an explicit user reissue after a
+configuration change.
+
+Factories materialize a fresh observer set for every activation and every in-process subagent.
+This ownership prevents a restored run or child from closing another activation's live channel.
+Factory, open, push, and close failures are contained; an observer cannot change a paid model
+call's result. `safe_open_model_stream` applies the same failure shield to custom observers.
+
+`AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
+This keeps token-boundary interruption responsive while durable events remain compact.
+`emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
+`model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
+execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes
+precedence over the legacy durable mirror for that call.
+
+`AgentLoop.model_content_file=True` writes the optional private `model-content.jsonl` sidecar.
+Records use `monoid.model-content.v1` and the kinds `stream_opened`, `stream_segment`,
+`stream_closed`, and `settled_text`. Existing run directories may omit the file. While this option
+is enabled during the compatibility window, settled text is written to both the sidecar and
+`transcript.jsonl`. Entitled readers resolve a digest from the sidecar before falling back to the
+transcript. `flush_active_model_content(path)` gives an in-process presentation layer a coordinated
+flush point for currently buffered segments while a stream remains open. Ordinary sidecar reads
+remain side-effect free. A `stream_closed` record carries the boolean `retryable` signal; readers
+treat its absence as `false` for records written before that field was introduced.
+
+The Reference backend can attach one `LiveModelStreamBroker` through
+`RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
+and inherited by in-process descendants, producing one passive root-multiplexed presentation
+channel. This observer does not write durable events and holds no run control handle. The separate
+`RunnerBackend.stream_model_calls` and `model_content_file` switches let a host independently select
+provider streaming, private retention, and live delivery.
 
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
@@ -848,6 +891,53 @@ frame carries `id: <seq>`; reconnects send `Last-Event-ID`, which takes preceden
 `from_seq` query and resumes at the following sequence. Idle streams emit `: keep-alive` comments.
 Terminal streams re-read the event page after observing terminal lifecycle state, verify the
 lifecycle watermark has been drained, then emit one named `end` frame and close.
+
+`GET /v1/runs/{root_run_id}/model-stream` exposes the optional Reference live-content broker as
+SSE after validating the root run token. `Last-Event-ID` takes precedence over the initial
+`cursor` query. Named `model-stream` frames use `monoid.model-stream.live.v1` and carry an
+`id: <generation>:<sequence>` cursor. `opened`, `delta`, and `closed` frames multiplex the root and
+all validated descendant run ids. A delta includes separate output/reasoning-channel UTF-8 byte
+`start_offset` and `end_offset` values; clients use them to merge private snapshots with a replayed
+suffix without duplicating content. A `closed` frame and the corresponding Studio hydration
+snapshot carry the same optional boolean `retryable` signal, with absence interpreted as `false`.
+
+Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
+least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
+oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
+the missing prefix from an entitled private store, then resumes from that baseline. When no ring
+remains, the reset baseline uses a root-bound idle cursor carrying the broker's bounded eviction
+epoch; reconnecting with the current cursor waits without repeating hydration until a new ring
+generation appears. The broker retains acknowledgement epochs for at most the root-ring budget;
+an older forgotten acknowledgement resets conservatively to the current epoch. A cursor-free
+reader resets for a recently evicted root and waits as pre-publication only for an unseen root.
+Closing the SSE subscription removes only that reader. It never interrupts or cancels model
+execution. Backend
+shutdown closes the broker, wakes blocking subscribers, and makes later observer writes inert.
+
+Studio composes this into `/api/model-stream` and exposes a separate authorized
+`/api/model-content?run_id=<root>` snapshot route for reset hydration. The snapshot response uses
+`studio.model-content.v1`, verifies every root/descendant sidecar context against its run directory,
+and returns output/reasoning text with their UTF-8 end offsets. Studio flushes active in-process
+sidecar batches before reading the snapshot, so the snapshot covers the broker prefix represented
+by a reset cursor. Sidecar access requires a regular, single-link file whose path and open file
+descriptor keep the same identity across each read, write, and flush. An unsafe or unavailable
+sidecar, including an active-flush failure, returns HTTP 503; the browser retries hydration without
+advancing its broker cursor. Both routes reject content requests with HTTP 403 when Studio's
+live/private egress gate is disabled. Their frames and snapshots stay out of the durable event
+reducer and Trace.
+
+Studio removes a retryable failed partial only after a newer root stream is accepted. The manual
+retry endpoint returns the exact failed `turn_id`, and the session driver durably emits
+the existing `run.resumed` v1 shape with `reason="studio-retry"` and that envelope-level `turn_id`
+before starting the replacement turn. The chat projection joins a non-retryable `turn.failed` to
+the exact root/run/turn private sidecar snapshot and stores its available output beside the error.
+This keeps an earlier failed prefix after a normal new turn replaces the bounded live-hydration
+snapshot. The projection and browser suppress only the exact turn named by an explicit Studio
+Retry, so a lost HTTP response, reload, retained live frames, or hydration cannot restore that
+abandoned prefix. If recovery reused a turn id and left more than one eligible private stream, the
+projection omits the ambiguous partial rather than attaching content to the wrong terminal event.
+Run-terminal calls stay the latest bounded hydration snapshot because no later turn can replace
+them. Interrupted partials remain visible.
 
 ### Diagnostics
 
@@ -1373,11 +1463,10 @@ durable storage — a mounted volume needs no code change.
 restore is a documented follow-up (the common no-re-baseline case is covered).
 Multimodal message parts (image/document) round-trip through the checkpoint, so a
 resumed run re-forwards the media. The by-value `messages` in the checkpoint remain
-the load-bearing record for *resuming* a run — but `transcript.jsonl` is no longer
-only a debug artifact: since v0.20 the settle events carry a digest instead of the
-model's text, and `transcript.jsonl`'s `settled_text` record is what an entitled
-reader joins back to display it. Deleting it now costs displayed answers, not just
-debuggability.
+the load-bearing record for *resuming* a run. Since v0.20, settle events carry a digest
+instead of the model's text. In v0.20.1, an entitled reader resolves that digest from
+`model-content.jsonl` first and falls back to `transcript.jsonl` for older or partially written
+runs. Deleting both private content artifacts costs displayed answers as well as debuggability.
 
 ## Legacy Reference Production Hardening
 
@@ -1502,7 +1591,7 @@ retried as a connection error. The model adapter's retry is policy-driven by
 
 ## Run Artifacts
 
-Manifest and transcript are binding-aware:
+Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:
 
 - `manifest.json.agent_config`: definition id, config version, config hash
 - `manifest.json.tool_surface`: resolver, tool search settings, bound catalog count
@@ -1510,6 +1599,8 @@ Manifest and transcript are binding-aware:
   authorizations
 - `agent_runtime_config_snapshot`: definition id, config version/hash, binding ids
 - `agent.config.updated`: emitted when the loop observes a new config hash
+- `model-content.jsonl`: optional `monoid.model-content.v1` stream lifecycle, output/reasoning
+  segments, and settled-text records; old run directories remain valid without it
 
 Replay uses recorded snapshots. Current registry state does not reinterpret an
 old turn.

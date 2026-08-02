@@ -22,14 +22,23 @@ from monoid_agent_kernel.core.spec import (
     ReasoningConfig,
     RunLimits,
 )
-from monoid_agent_kernel.core.result import AgentArtifact, AgentRunResult, AgentTurnResult, Suspension
+from monoid_agent_kernel.core.result import (
+    AgentArtifact,
+    AgentRunResult,
+    AgentTurnResult,
+    Suspension,
+)
 from monoid_agent_kernel.core.checkpoint import (
     CheckedCheckpointStore,
     CheckpointRecord,
     CheckpointStore,
     RunCheckpoint,
 )
-from monoid_agent_kernel.core.durable_codec import ArtifactVersion, DurableLoadResult, DurableLoadStatus
+from monoid_agent_kernel.core.durable_codec import (
+    ArtifactVersion,
+    DurableLoadResult,
+    DurableLoadStatus,
+)
 from monoid_agent_kernel.core.compatibility import (
     PUBLIC_ARTIFACT_COMPATIBILITY,
     PUBLIC_COMPATIBILITY_ALIASES,
@@ -109,6 +118,20 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
     RedactionPolicy,
     Redactor,
+)
+
+# Provider-independent live/private model-stream observation. Factories produce activation-owned
+# observers; safe_open_model_stream contains exporter failures outside paid model-call outcomes.
+from monoid_agent_kernel.core.model_stream import (
+    ModelStreamChannel,
+    ModelStreamContext,
+    ModelStreamDelta,
+    ModelStreamObserver,
+    ModelStreamObserverFactory,
+    ModelStreamOutcome,
+    ModelStreamStatus,
+    ModelStreamWriter,
+    safe_open_model_stream,
 )
 
 # Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
@@ -330,6 +353,15 @@ __all__ = [
     "ModelIOObserver",
     "ClosableModelIOObserver",
     "ModelIOSubscription",
+    "ModelStreamChannel",
+    "ModelStreamStatus",
+    "ModelStreamContext",
+    "ModelStreamDelta",
+    "ModelStreamOutcome",
+    "ModelStreamWriter",
+    "ModelStreamObserver",
+    "ModelStreamObserverFactory",
+    "safe_open_model_stream",
     "ModelCallRunner",
     "OutputValidator",
     "OutputValidatorBinding",

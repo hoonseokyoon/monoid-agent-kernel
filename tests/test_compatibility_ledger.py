@@ -29,6 +29,7 @@ from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.external_agent_envelope import EXTERNAL_AGENT_ENVELOPE_VERSION
 from monoid_agent_kernel.core.inbox import INBOX_PROTOCOL_VERSION
 from monoid_agent_kernel.core.manifest import MANIFEST_SCHEMA_VERSION
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.outbox import OUTBOX_REQUEST_VERSION
 from monoid_agent_kernel.core.packages import (
     APPLY_RESULT_SCHEMA_VERSION,
@@ -41,6 +42,7 @@ from monoid_agent_kernel.core.schemas import (
     EVENT_SCHEMA,
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
+    MODEL_CONTENT_RECORD_SCHEMA,
     PACKAGE_SCHEMA,
     PUBLIC_JOB_SCHEMA,
     PUBLIC_JOB_SCHEMA_VERSION,
@@ -50,6 +52,7 @@ from monoid_agent_kernel.core.schemas import (
 )
 from monoid_agent_kernel.core.workspace_index import WORKSPACE_INDEX_SCHEMA_VERSION
 from monoid_agent_kernel.reference.llm_gateway.service import LLM_TURN_PROTOCOL_VERSION
+from monoid_agent_kernel.reference.backend.model_stream import MODEL_STREAM_LIVE_SCHEMA_VERSION
 from monoid_agent_kernel.reference.command_inbox import (
     COMMAND_ENVELOPE_VERSION,
     COMMAND_RECEIPT_VERSION,
@@ -63,6 +66,11 @@ from monoid_agent_kernel.reference.studio.chat_projection import (
     CHAT_MESSAGE_SCHEMA_VERSION,
     CHAT_SCHEMA_VERSION,
     SUPPORTED_CHAT_SCHEMA_VERSIONS,
+)
+from monoid_agent_kernel.reference.studio.server import (
+    STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
+    STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION,
+    STUDIO_TRACE_EXPORT_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
@@ -82,7 +90,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 36
+    assert len(artifacts) == 41
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -114,9 +122,11 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "outbox-request": OUTBOX_REQUEST_VERSION,
         "external-agent-envelope": EXTERNAL_AGENT_ENVELOPE_VERSION,
         "llm-turn": LLM_TURN_PROTOCOL_VERSION,
+        "model-stream-live": MODEL_STREAM_LIVE_SCHEMA_VERSION,
         "checkpoint": CHECKPOINT_SCHEMA_VERSION,
         "backend-run": RUN_METADATA_SCHEMA_VERSION,
         "event": EVENT_SCHEMA_VERSION,
+        "model-content": MODEL_CONTENT_SCHEMA_VERSION,
         "manifest": MANIFEST_SCHEMA_VERSION,
         "workspace-base": WORKSPACE_BASE_SCHEMA_VERSION,
         "workspace-index": WORKSPACE_INDEX_SCHEMA_VERSION,
@@ -131,6 +141,9 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "command-receipt": COMMAND_RECEIPT_VERSION,
         "studio-chat": CHAT_SCHEMA_VERSION,
         "studio-chat-message": CHAT_MESSAGE_SCHEMA_VERSION,
+        "studio-trace-export": STUDIO_TRACE_EXPORT_SCHEMA_VERSION,
+        "studio-trace-export-compact": STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION,
+        "studio-model-content": STUDIO_MODEL_CONTENT_SCHEMA_VERSION,
     }
 
     assert {key: compatibility_artifact(key).current_writer for key in expected} == expected
@@ -139,6 +152,16 @@ def test_registry_matches_source_owned_version_constants() -> None:
     assert studio_chat.current_writer == CHAT_SCHEMA_VERSION
     assert studio_chat.supported_readers == SUPPORTED_CHAT_SCHEMA_VERSIONS
     assert studio_chat.supported_readers[0] == CHAT_SCHEMA_V1
+
+    compiled_assets = sorted(
+        (ROOT / "src" / "monoid_agent_kernel" / "reference" / "studio" / "web" / "dist").glob(
+            "assets/*.js"
+        )
+    )
+    assert compiled_assets
+    compiled_source = "\n".join(path.read_text(encoding="utf-8") for path in compiled_assets)
+    assert STUDIO_TRACE_EXPORT_SCHEMA_VERSION in compiled_source
+    assert STUDIO_TRACE_COMPACT_EXPORT_SCHEMA_VERSION in compiled_source
 
 
 def test_packaged_compatibility_fixture_schema_matches_registry() -> None:
@@ -181,6 +204,13 @@ def test_json_schema_reader_versions_match_registry() -> None:
         registered = compatibility_artifact(key)
         assert registered.reader_policy == "json-schema"
         assert tuple(schema["properties"]["schema_version"]["enum"]) == registered.supported_readers
+
+    model_content = compatibility_artifact("model-content")
+    assert model_content.reader_policy == "json-schema"
+    assert {
+        tuple(variant["properties"]["schema_version"]["enum"])
+        for variant in MODEL_CONTENT_RECORD_SCHEMA["oneOf"]
+    } == {model_content.supported_readers}
 
 
 def test_registry_source_locations_exist() -> None:
@@ -227,7 +257,8 @@ def test_documented_ledger_rows_match_registry_in_order() -> None:
         (
             artifact.key,
             artifact.current_writer,
-            artifact.reader_policy + ("; missing id accepted" if artifact.accepts_missing_version else ""),
+            artifact.reader_policy
+            + ("; missing id accepted" if artifact.accepts_missing_version else ""),
         )
         for artifact in PUBLIC_ARTIFACT_COMPATIBILITY
     ]

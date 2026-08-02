@@ -23,6 +23,7 @@ def test_sdist_excludes_workspace_local_release_data() -> None:
     exclude = set(pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"])
 
     assert "/.tmp" in exclude
+    assert "/.tmp/**" in exclude
     assert "/studio-ui" in exclude
     assert "**/DX_NOTES.md" in exclude
 

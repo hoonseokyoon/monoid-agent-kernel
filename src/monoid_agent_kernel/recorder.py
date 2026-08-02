@@ -34,7 +34,14 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_value,
 )
 from monoid_agent_kernel.core.manifest import RunManifest
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME, ModelContentStore
 from monoid_agent_kernel.core.model_io import content_digest, content_length
+from monoid_agent_kernel.core.model_stream import (
+    NOOP_MODEL_STREAM_WRITER,
+    ModelStreamContext,
+    ModelStreamWriter,
+    safe_open_model_stream,
+)
 from monoid_agent_kernel.core.result import AgentArtifact
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -252,10 +259,20 @@ class AgentRecorder:
     _transcript_file: TextIO = field(init=False, repr=False)
     started_at: float = field(default_factory=time.time)
     artifacts: list[AgentArtifact] = field(default_factory=list)
+    # Private authored-content sidecar. Opt-in keeps the v0.20 run-dir shape and embedders'
+    # retention assumptions unchanged unless the caller explicitly enables the new channel.
+    model_content_file: bool = False
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
     _settled_text_digests: set[str] = field(default_factory=set, init=False, repr=False)
+    _model_content_store: ModelContentStore | None = field(default=None, init=False, repr=False)
+    _model_content_store_failed: bool = field(default=False, init=False, repr=False)
+    _model_content_store_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
@@ -324,6 +341,35 @@ class AgentRecorder:
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
 
+    def open_model_stream(self, context: ModelStreamContext) -> ModelStreamWriter:
+        """Open the opt-in private content writer without exposing failures to the run."""
+
+        store = self._get_model_content_store()
+        if store is None:
+            return NOOP_MODEL_STREAM_WRITER
+        return safe_open_model_stream(store, context)
+
+    def _get_model_content_store(self) -> ModelContentStore | None:
+        if not self.model_content_file or self._model_content_store_failed:
+            return None
+        if self._model_content_store is not None:
+            return self._model_content_store
+        with self._model_content_store_lock:
+            if self._model_content_store is not None:
+                return self._model_content_store
+            if self._model_content_store_failed:
+                return None
+            try:
+                self._model_content_store = ModelContentStore(
+                    self.run_dir / MODEL_CONTENT_FILENAME,
+                    run_id=self.run_id,
+                )
+            except Exception:  # noqa: BLE001 - private content persistence is best-effort
+                self._model_content_store_failed = True
+                _LOGGER.debug("model content store initialization failed", exc_info=True)
+                return None
+        return self._model_content_store
+
     def settled_text(self, text: str) -> str:
         """Record model-authored settled text and return its content digest.
 
@@ -337,23 +383,17 @@ class AgentRecorder:
         same value, so a content-addressed key makes the second write redundant by construction
         rather than by a caller remembering not to repeat itself.
 
-        This lives on the recorder rather than beside the emit sites because it owns the transcript
-        handle. ``transcript.jsonl`` is the private debug/replay artifact
-        (``docs/OBSERVABILITY.md``) and already holds model text per turn, so settled text belongs
-        with it rather than in a new run-dir file.
-
-        This docstring used to add "which is also why no compatibility-ledger entry is involved".
-        That was true when the transcript was only a debug aid, and adding this record is what made
-        it false: the settle events now publish a digest, so an entitled reader joins *here* for the
-        text a UI displays. It is registered as ``monoid.transcript.v1`` — a private artifact with a
-        public join contract, which is exactly the case a ledger exists to pin.
+        This lives on the recorder rather than beside the emit sites because the recorder owns both
+        private content artifacts. ``model-content.jsonl`` is the v0.20.1 primary join source;
+        ``transcript.jsonl`` retains the same record during the compatibility window so older run
+        directories and readers keep working. Their contracts are registered separately as
+        ``monoid.model-content.v1`` and ``monoid.transcript.v1``.
 
         Durability is best-effort and deliberately so: ``_write_jsonl`` flushes but does not fsync,
-        and the transcript's only repair is ``_terminate_torn_transcript_tail``, which stops a torn
-        line eating the *next* record but does not recover the torn one. A crash can leave a
-        committed event whose
-        digest resolves to nothing, so **content-missing is a tolerated read outcome** — hydration
-        fills absent fields and never fails a read.
+        and tail repair only stops a torn line from consuming the *next* record; it does not recover
+        the torn one. A crash can leave a committed event whose digest resolves to nothing, so
+        **content-missing is a tolerated read outcome** — hydration fills absent fields and never
+        fails a read.
         """
         # ``content_digest``, never a bare sha256 of the text: it hashes canonical JSON under a
         # shape key so a text field cannot collide with a structured value's serialization. Once a
@@ -373,6 +413,14 @@ class AgentRecorder:
             # full disk mid-flush) recorded the digest as present with nothing on disk, so a later
             # call for the same text short-circuited and returned a digest resolving to nothing.
             self._settled_text_digests.add(digest)
+        store = self._get_model_content_store()
+        if store is not None:
+            try:
+                text_len = content_length(text)
+                if text_len is not None:
+                    store.settled_text(text, digest, text_len)
+            except Exception:  # noqa: BLE001 - private sidecar failure must not change this method
+                _LOGGER.debug("settled text sidecar write failed", exc_info=True)
         return digest
 
     def emit_artifact_bytes(
@@ -476,9 +524,18 @@ class AgentRecorder:
         try:
             self.event_bus.close()
         finally:
-            # Event-sink failure must not retain the private transcript handle. TextIO close is
-            # idempotent, while EventBus separately guarantees each configured sink is called once.
-            self._transcript_file.close()
+            try:
+                # Event-sink failure must not retain the private transcript handle. TextIO close is
+                # idempotent, while EventBus separately guarantees each configured sink is called
+                # once.
+                self._transcript_file.close()
+            finally:
+                store = self._model_content_store
+                if store is not None:
+                    try:
+                        store.close()
+                    except Exception:  # noqa: BLE001 - private persistence is best-effort
+                        _LOGGER.debug("model content store close failed", exc_info=True)
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
         payload: dict[str, Any] = {

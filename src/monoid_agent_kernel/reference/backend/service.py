@@ -92,6 +92,10 @@ from monoid_agent_kernel.reference.backend.loop_factory import (
     ModelAdapterFactory,
     _GatewayTokenSource,
 )
+from monoid_agent_kernel.reference.backend.model_stream import (
+    LiveModelStreamBroker,
+    LiveModelStreamSubscription,
+)
 from monoid_agent_kernel.reference.backend.outbox_dispatch import (
     OutboxDispatchContext,
     OutboxDispatchService,
@@ -379,10 +383,19 @@ class RunnerBackend:
     # Only auto-retries count toward this cap; user-initiated resends are bounded by max_turns.
     max_consecutive_turn_failures: int = 5
     turn_retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
-    # Opt-in token streaming for the autonomous drive: when set, runs emit model.output.delta
-    # events (for adapters that support astream_turn) so an event-stream consumer renders tokens
-    # live. Off by default; a UI-facing embedder (e.g. studio) turns it on.
+    # Legacy opt-in durable token mirror: when set, runs emit model.output.delta events (for
+    # adapters that support astream_turn). New presentation integrations should leave this off and
+    # attach a passive model-stream observer instead, keeping raw chunks out of events.jsonl.
     emit_output_deltas: bool = False
+    # Select the provider streaming path independently from any content-egress surface. This keeps
+    # turn interruption responsive even when a deployment disables live/private model content.
+    stream_model_calls: bool = False
+    # Optional private model-content sidecar. The embedding application decides the entitlement;
+    # the backend only wires the resulting boolean into every root/recovered activation.
+    model_content_file: bool = False
+    # Process-local, root-multiplexed presentation channel. Its observer receives parent and child
+    # model streams by their authoritative root lineage. Omit it to expose no live content API.
+    model_stream_broker: LiveModelStreamBroker | None = None
     # Agent-as-tool delegation: subagent id -> definition. When non-empty, runs can bind
     # agent.spawn (the loop bootstrap registers it). Child runs write to run_root/<child_id>/.
     subagent_definitions: Mapping[str, SubagentDefinition] = field(default_factory=dict)
@@ -580,6 +593,13 @@ class RunnerBackend:
                 llm_gateway_token_ttl_s_provider=lambda: self.llm_gateway_token_ttl_s,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
                 emit_output_deltas_provider=lambda: self.emit_output_deltas,
+                stream_model_calls_provider=lambda: self.stream_model_calls,
+                model_content_file_provider=lambda: self.model_content_file,
+                model_stream_observer_factories_provider=lambda root_run_id: (
+                    ()
+                    if self.model_stream_broker is None
+                    else (self.model_stream_broker.observer_factory(root_run_id),)
+                ),
                 extra_event_sink_factories_provider=lambda: self.extra_event_sink_factories,
                 model_io_subscription_factories_provider=lambda: (
                     self.model_io_subscription_factories
@@ -1067,6 +1087,8 @@ class RunnerBackend:
         but it is pending")."""
         if drain:
             self.drain(timeout_s=drain_timeout_s)
+        if self.model_stream_broker is not None:
+            self.model_stream_broker.close()
         self.stop_watchdog()
 
     def drain(self, *, timeout_s: float = 5.0) -> list[str]:
@@ -1648,6 +1670,28 @@ class RunnerBackend:
             cursor=cursor,
             read_lifecycle=lambda: self.status(run_id, token),
         )
+
+    def subscribe_model_stream(
+        self,
+        root_run_id: str,
+        token: str,
+        *,
+        after_cursor: str | None = None,
+    ) -> LiveModelStreamSubscription:
+        """Subscribe to entitled live model content without acquiring run ownership.
+
+        The signed root token remains the authorization boundary for every multiplexed child
+        frame. Closing the returned passive subscription only removes that reader; it never
+        interrupts or cancels the run.
+        """
+
+        self._authorized_run_dir(root_run_id, token)
+        if self.model_stream_broker is None:
+            raise NativeAgentError(
+                "live model content is not enabled",
+                error_code="model_stream_unavailable",
+            )
+        return self.model_stream_broker.subscribe(root_run_id, after_cursor=after_cursor)
 
     def diagnostics(self, run_id: str, token: str, *, event_limit: int = 50) -> dict[str, Any]:
         return self._projection.diagnostics(run_id, token, event_limit=event_limit)
