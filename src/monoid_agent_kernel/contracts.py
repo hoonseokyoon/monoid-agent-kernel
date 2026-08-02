@@ -141,8 +141,17 @@ from monoid_agent_kernel.model_call import ModelCallRunner
 
 # One validated model call: dispatch + validate + bounded explicit repair, outside any loop.
 from monoid_agent_kernel.validated_call import (
+    AttemptDeltaConsumer,
     ValidatedCallResult,
     ValidatedCallRunner,
+)
+
+# The fail-closed capability probes: what a transport in front of an adapter may base an
+# applied-parameters proof on. Documented as the contract for third-party gateways, so they
+# are importable from here rather than from a provider module.
+from monoid_agent_kernel.providers.base import (
+    generation_support,
+    structured_output_support,
 )
 
 # Output validation (post-response conformance; checked at the settle points)
@@ -373,6 +382,9 @@ __all__ = [
     "ModelCallRunner",
     "ValidatedCallRunner",
     "ValidatedCallResult",
+    "AttemptDeltaConsumer",
+    "structured_output_support",
+    "generation_support",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

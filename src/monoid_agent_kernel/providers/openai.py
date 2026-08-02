@@ -594,10 +594,15 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     body = getattr(exc, "body", None)
     code = (body.get("code") or body.get("type")) if isinstance(body, dict) else None
     code = str(code) if code else ""
+    # The provider's ``param`` is a field path it authored ("text.format.schema"), not user
+    # content, so it survives the body-free policy -- and it is the only thing that tells a
+    # 400 about an unsupported knob apart from a 400 about a non-strict output_schema.
+    param = body.get("param") if isinstance(body, dict) else None
+    param_detail = f", param={param}" if isinstance(param, str) and param else ""
 
     if isinstance(status, int) and 400 <= status < 500:
         return ModelAdapterError(
-            f"provider rejected the request (HTTP {status})",
+            f"provider rejected the request (HTTP {status}{param_detail})",
             error_code="model_error",
             provider_error_code=code,
             retryable=(status == 429 and code not in {"insufficient_quota"}),

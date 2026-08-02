@@ -314,16 +314,23 @@ Two further capability declarations are plain attributes rather than Protocol me
 `structured_output_support` (the adapter translates `ModelRequest.output_schema` into
 provider-enforced constrained decoding) and `generation_support` (the adapter puts
 `ModelConfig.generation` on its provider request). The exact string `"native"` declares the
-capability; both probes are fail-closed through one shared implementation — absence, any other
-value, and a declaration that raises all read as `"none"` — so a consumer can never over-trust
-an adapter that did not explicitly claim it. These are what a transport in front of an adapter
-is allowed to base an applied-parameters proof on: a gateway can see what it *forwarded*, never
-what the adapter behind it did with it.
+capability; both probes (exported from `contracts` as `structured_output_support(adapter,
+config=None)` / `generation_support(adapter, config=None)`) are fail-closed through one shared
+implementation — absence, any other value, and a declaration that raises (on read **or on
+call**) all read as `"none"` — so a consumer can never over-trust an adapter that did not
+explicitly claim it. These are what a transport in front of an adapter is allowed to base an
+applied-parameters proof on: a gateway can see what it *forwarded*, never what the adapter
+behind it did with it.
 
-The probe reads the **instance**, so the declaration can be a `ClassVar` when the answer is
-fixed or a property when it depends on the adapter's own configuration. `OpenAIModelAdapter`
-applies the parameters itself and declares both unconditionally. `GatewayModelAdapter` only
-*forwards*, so its claim is worth exactly the proof it insists on: it declares `"native"` under
+The probe reads the **instance**: the declaration is a `ClassVar` when the answer is fixed, and
+a **callable taking the effective per-call `ModelConfig`** when it depends on policy — the
+probe passes its `config` argument through to a callable declaration, and `None` probes the
+adapter's standing configuration. The claim and the enforcement must read the same config:
+enforcement runs under `request.model or self.config`, so a claim probed off the standing
+config alone would let a shared adapter mint proof for a call it enforces under a
+wire-supplied `"omit"`. `OpenAIModelAdapter` applies the parameters itself and declares both
+unconditionally. `GatewayModelAdapter` only *forwards*, so its claim is worth exactly the
+proof it insists on: it answers `"native"` when the effective config says
 `on_unsupported="fail"`, where a returned turn is a proven turn, and `"none"` under `"omit"`,
 where it deliberately accepts an unproven one. Without that, a chained gateway would mint a
 fresh positive echo out of a static declaration and report proof for a call whose inner hop
@@ -356,12 +363,22 @@ produces the OpenAI request-body parameters, the gateway wire block, and the gat
 `GenerationConfig.on_unsupported` (`"fail"` default / `"omit"`) governs what happens when a
 transport cannot prove the parameters were applied. It is enforced where proof exists: the
 gateway client compares the `generation_applied` echo (and the `schema_applied` boolean for
-`output_schema`) against what it sent, on both the sync response and the terminal stream frame,
-and refuses an unproven turn with non-retryable `gateway_generation_not_applied` /
-`gateway_schema_not_applied`. An older gateway that silently discards the new keys therefore
-fails closed instead of silently misapplying. A malformed echo (a non-object
-`generation_applied`, a non-boolean `schema_applied`) is a wire-shape error, not a policy
-question: it answers `gateway_bad_response` on both transports regardless of `on_unsupported`.
+`output_schema`) against what it sent, on both the sync response and the terminal stream frame
+— and when a stream ends cleanly **without** a terminal frame, the drain runs the same checks
+with an absent echo, so a frameless stream (the older-gateway shape
+`assemble_streamed_turn` otherwise tolerates by synthesizing `stop_reason="stop"`) is refused
+under `"fail"` exactly like a frameless sync response; plain traffic that configures neither
+knob keeps the pre-W5 tolerance. The refusal is non-retryable `gateway_generation_not_applied`
+/ `gateway_schema_not_applied`, flagged `config_recoverable`: resending the same call cannot
+help, but the remedy is configuration (`"omit"`, or a proving transport), so `AgentLoop`
+classifies it like a 4xx — the turn fails, the session survives — and the reference gateway's
+HTTP layer maps it to 422 rather than 502 so the same classification survives a chained hop.
+One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
+been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
+call sees the unproven text before the error arrives; the sync transport delivers nothing on
+refusal. A malformed echo (a non-object `generation_applied`, a non-boolean `schema_applied`)
+is a wire-shape error, not a policy question: it answers `gateway_bad_response` on both
+transports regardless of `on_unsupported`.
 
 A server may only emit these proofs from what its **upstream adapter declares** (the
 `generation_support` / `structured_output_support` probes), never from what the request asked
@@ -378,8 +395,15 @@ asymmetry surface.
 An adapter declaring `structured_output_support = "native"` translates it into its provider's
 constrained-decoding dialect **verbatim — never adjusted** toward a provider subset — so the
 request digest identifies exactly what the provider was asked to enforce; a schema the provider
-rejects is the provider's own error. Adapters without the declaration ignore the field, and
-post-hoc output validation remains the guarantee on every adapter: native delivery only reduces
+rejects is the provider's own error. Concretely for the shipped adapter: `OpenAIModelAdapter`
+delivers the schema in a strict-mode envelope (`text.format` with `strict: true` — anything
+less is not *enforced* decoding, and `schema_applied: true` would be a false proof), and
+OpenAI's strict mode has subset requirements of its own — every object needs
+`additionalProperties: false`, every listed property must be `required`, and some keywords are
+unsupported. A schema outside that subset is rejected by the provider with an HTTP 400 whose
+classified error names the offending `param` (e.g. `text.format.schema`); the kernel never
+rewrites the schema to fit. Adapters without the declaration ignore the field, and post-hoc
+output validation remains the guarantee on every adapter: native delivery only reduces
 repairs. `AgentLoop` never sets the field; it belongs to standalone `ModelCallRunner` /
 `ValidatedCallRunner` callers.
 
@@ -582,13 +606,22 @@ does not re-grant the budget.
 invoking `ModelCallRunner` directly, with the opposite tool posture — **a repair call never
 carries tools** (there is no executor behind the surface, and a validation failure must not
 escalate into a tool loop). `max_repair_calls` (default 1) bounds explicit repair calls;
-exhaustion is a *result* (`status="unsatisfied"`), refusal/truncation short-circuit before
-validation with the loop's ordering, and `receipts` carries every call made so the audit trail
-is complete whatever the outcome. Repair follows the shape of **how the incoming request
-carried its conversation**, never what the answer came back with (by-value messages append; a
-request that itself arrived on a continuation handle carries the repair as the next
-instruction on the new handle; a one-shot instruction is synthesized into by-value form) and
-preserves `output_schema`. A one-shot call is never promoted to the handle path just because
+exhaustion is a *result* (`status="unsatisfied"`), and three outcomes short-circuit before any
+validator runs, in the loop's ordering: refusal (`"refusal"`), truncation (`"truncated"`), and
+a **tool-call answer** (`status="tool_calls"`, keyed on `turn.tool_calls` as well as the
+stop reason) — this surface has no executor, so a turn that stopped to request tools is handed
+back with its calls rather than having its empty text judged and repaired. `receipts` carries
+every call made on every settled result, and an exception escaping `acall` carries the
+completed calls' receipts as its `receipts` attribute (declared on `OutputValidatorError`,
+stamped best-effort on anything else); the failing call's own receipt exists only on
+`ModelCallRunner.subscriptions`, because the adapter raised instead of returning it. Repair
+follows the shape of **how the incoming request carried its conversation**, never what the
+answer came back with (by-value messages append; a request that itself arrived on a
+continuation handle carries the repair as the next instruction on the new handle; a one-shot
+instruction is synthesized into by-value form), preserves `output_schema`, and **clears the
+carriage fields of the shapes it did not choose** — a repair request carries its conversation
+exactly one way, so its `request_digest` describes a request an adapter actually sends. A
+one-shot call is never promoted to the handle path just because
 the provider returned a response id — `OpenAIModelAdapter` sends `store=False`, so that id was
 never persisted and the repair would 404. A request that
 came in *on* a continuation handle whose turn came back *without* a new handle has no fourth
@@ -1366,6 +1399,11 @@ unchanged. Both `generation` and `reasoning` carry their `on_unsupported` when i
 off-default: the server rebuilds a config object from the block, so a field left off is not
 "unset" there but the *default*, and a caller's `"omit"` would come back as `"fail"` on the
 server's copy — which the next hop then enforces when a gateway's upstream is another gateway.
+For the same reconstruction reason `reasoning` carries `effort` explicitly when it is
+`"default"`: that is the one field whose omission sentinel differs from the codec's
+reconstruction default (`"medium"`), so leaving it off silently asked the server's upstream
+for medium reasoning on a call that asked for the provider default. Every other value keeps
+its pre-existing wire bytes, and digests never read this wire.
 The applied-echo comparison is unaffected: it is built from `build_generation_payload`, which
 carries provider knobs only, never policy. The
 server parses both blocks with the kernel's own fail-closed codecs: an out-of-range or
@@ -1412,14 +1450,19 @@ additionally carry optional priced sub-counts when the provider reports them —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
-**Applied echoes.** When the request carried a `generation` block, the response body and the
+**Applied echoes.** When the request carried a `generation` block **and the upstream adapter
+declared `generation_support = "native"` for this call's config**, the response body and the
 terminal `turn_complete` stream frame echo `generation_applied` — the exact block the gateway
-forwarded upstream. When it carried `output_schema`, they echo `schema_applied` (boolean;
-`true` only when the upstream adapter declared native schema enforcement, so a
-forwarded-but-ignored schema honestly reads `false`). Both echo keys are additive and absent
-for requests that configured neither. The client refuses an unproven turn under the default
-`generation.on_unsupported="fail"` with non-retryable `gateway_generation_not_applied` /
-`gateway_schema_not_applied`, on both the sync response and the streamed terminal frame;
+forwarded upstream; a non-declaring upstream gets **no** generation echo at all, which a
+fail-closed client refuses (emitting one unconditionally is the copied-back-proof defect the
+declaration gate exists to rule out). When the request carried `output_schema`, they echo
+`schema_applied` (boolean; `true` only when the upstream adapter declared native schema
+enforcement, so a forwarded-but-ignored schema honestly reads `false`). Both proofs are probed
+under the **per-call** config the turn runs under, not the adapter's standing one. Both echo
+keys are additive and absent for requests that configured neither. The client refuses an
+unproven turn under the default `generation.on_unsupported="fail"` with non-retryable,
+config-recoverable `gateway_generation_not_applied` / `gateway_schema_not_applied`, on the
+sync response, on the streamed terminal frame, and on a stream that ends without one;
 `"omit"` accepts best-effort transport. An older server that ignores the new request keys
 sends no echo and therefore fails closed at the client rather than silently misapplying.
 

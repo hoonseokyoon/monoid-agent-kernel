@@ -460,6 +460,26 @@ def test_repair_preserves_the_schema_while_stripping_tools() -> None:
     assert repair.tools == ()
 
 
+def test_a_schema_rejection_400_names_the_offending_param() -> None:
+    """OpenAI strict mode rejects ordinary JSON Schemas (missing additionalProperties:false,
+    unlisted required keys) with a 400 whose body names the offending ``param``. The
+    synthetic body-free message deliberately drops the provider's text (PII policy), but the
+    ``param`` field is a provider-authored field path, not user content — without it the
+    caller sees only "provider rejected the request" and cannot tell the schema was the
+    problem."""
+
+    from monoid_agent_kernel.providers.openai import _model_error_from_openai
+
+    class _Fake(Exception):
+        status_code = 400
+        body = {"type": "invalid_request_error", "param": "text.format.schema"}
+
+    error = _model_error_from_openai(_Fake("boom"))
+    assert error.http_status == 400
+    assert error.provider_error_code == "invalid_request_error"
+    assert "text.format.schema" in str(error)
+
+
 # --- an unserializable request is a classified error, not a raw TypeError ---------------
 
 

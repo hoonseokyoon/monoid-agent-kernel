@@ -7,6 +7,60 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
+
+- **A stream that ends without a terminal frame is no longer accepted unproven.** The
+  applied-parameter checks lived only on the `turn_complete` frame — which is exactly the frame
+  an older gateway never sends; its stream ends cleanly, `assemble_streamed_turn` synthesizes
+  `stop_reason="stop"`, and the turn was accepted with every parameter unproven while the sync
+  transport refused the same server. The drain now runs the same shared checks with an absent
+  echo; traffic that configures neither knob keeps the old tolerance for frameless streams.
+- **The capability question is answered per call, not per adapter.** `GatewayModelAdapter`'s
+  `generation_support` / `structured_output_support` declarations are now callables taking the
+  effective per-call config (the probes pass it through; a raising callable still reads
+  `"none"`), and the reference gateway probes them under the same config the upstream call runs
+  under (`_upstream_model_config`, built once for the adapter, the request, and the proof). A
+  shared factory-built adapter could previously mint proof from its standing config for a call
+  it enforced under a wire-supplied `"omit"` — the copied-back-proof defect one config-source
+  hop later.
+- **Direct-Python reasoning configs fail closed.** `validate_reasoning_config` now exists as
+  the one rule source (the codec, `normalize_model_config`, and the runtime-config ingress all
+  consume it; the ingress's hand-copied enum frozensets are deleted). A Python-constructed
+  `ReasoningConfig(effort="turbo")` previously sailed through normalization to die mid-run as a
+  provider 400 while the JSON codec rejected the same value at config time.
+- **`effort="default"` survives the gateway wire.** It is the one reasoning field whose
+  omission sentinel differs from the codec's reconstruction default (`"medium"`), so a client
+  asking for provider-default reasoning silently got medium — only through a gateway. The
+  client payload now carries it explicitly, like the off-default policy beside it; all other
+  values keep their exact wire bytes.
+- **A tool-call answer on the standalone surface is an outcome, not empty text.**
+  `ValidatedCallStatus` gains `"tool_calls"`, short-circuiting before validation like refusal
+  and truncation; previously the validators judged `final_text or ""`, burned a paid repair
+  rewriting an answer the model never gave, and with zero validators the turn read `"ok"` with
+  `final_text=None`.
+- **Receipts survive exceptions.** `OutputValidatorError` (and any exception escaping
+  `ValidatedCallRunner.acall`) now carries the completed calls' receipts as a `receipts`
+  attribute; they were dropped with the raise, contradicting the audit-trail claim.
+- **An unserializable request is a classified error on every path.** The gateway body encode
+  (both transports) now raises non-retryable `gateway_bad_request` instead of leaking a raw
+  `TypeError`, and the OpenAI payload build moved inside its classifier on both paths — one
+  rule covering `output_schema`, `messages`, and observations.
+- **A proof refusal ends the turn, not the run.** `ModelAdapterError` gains
+  `config_recoverable`; `gateway_generation_not_applied` / `gateway_schema_not_applied` set it,
+  `AgentLoop`'s classifier honors it (the error's own remedy is config the user fixes and
+  resends), and the reference gateway's HTTP layer maps such errors to 422 rather than
+  laundering them into a run-killing 502 across a chained hop.
+- **Repair requests carry their conversation exactly one way.** `_repair_request` clears the
+  carriage fields of the shapes it did not choose, so a repair's `request_digest` describes a
+  request an adapter actually sends and a stale `instruction` can never be re-read beside the
+  appended messages.
+- The capability probes (`structured_output_support` / `generation_support`) and
+  `AttemptDeltaConsumer` are exported from `contracts` — all three are documented contract
+  surface a third-party gateway or streaming caller implements against, and previously
+  required importing provider modules. OpenAI 4xx classification now names the provider's
+  `param` (a provider-authored field path, not user content) so a schema-subset rejection is
+  distinguishable from any other bad request.
+
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 
 - `ModelConfig` gains `generation: GenerationConfig` — `temperature` (0–2), `top_p` ((0, 1]),
@@ -50,7 +104,11 @@ out in commit messages and here.
   answer. The OpenAI adapter translates it to the Responses API `text.format` json_schema
   block **verbatim — never adjusted to the provider's strict subset** — so the request digest
   identifies exactly what the provider was asked to enforce (a schema the provider rejects is
-  its own error through the taxonomy). The digest follows the omission rule: schema-free
+  its own error through the taxonomy). The envelope is strict mode (`strict: true` — anything
+  less is not *enforced* decoding and would make `schema_applied: true` a false proof), and
+  OpenAI's strict subset has requirements of its own (`additionalProperties: false` on every
+  object, every property required); a schema outside it 400s with the offending `param` named
+  in the classified error. The digest follows the omission rule: schema-free
   requests keep their pre-existing replay key. `AgentLoop` does not set the field; this is the
   standalone/LLM-only path only.
 - Adapters opt in with a `structured_output_support = "native"` declaration, read through a
@@ -79,10 +137,15 @@ out in commit messages and here.
   gets the same validate-and-re-prompt guarantee `AgentLoop` applies at its settle points:
   dispatch, run the registered `OutputValidator`s, and repair with at most `max_repair_calls`
   (default 1) explicit follow-up calls. Exhaustion is a result (`status="unsatisfied"`), not an
-  exception; refusal and truncation short-circuit **before** validation, in the same order the
-  loop decides them; a validator defect raises `OutputValidatorError` and never re-prompts.
-  `ValidatedCallResult` carries the receipts of every call made, so the audit trail is complete
-  whatever the outcome. A thin sync facade (`call`) covers callers with no event loop and
+  exception; refusal, truncation, and a tool-call answer (`status="tool_calls"` — this surface
+  has no executor, so a turn that stopped to request tools is handed back with its calls
+  rather than having its empty text judged) short-circuit **before** validation, in the same
+  order the loop decides them; a validator defect raises `OutputValidatorError` and never
+  re-prompts. `ValidatedCallResult` carries the receipts of every call made on every settled
+  result, and an exception escaping `acall` carries the completed calls' receipts as its
+  `receipts` attribute — the failing call's own receipt reaches only
+  `ModelCallRunner.subscriptions`, because the adapter raised instead of returning it.
+  A thin sync facade (`call`) covers callers with no event loop and
   refuses to run inside an active one. The runner is **frozen**, and `max_repair_calls` must be
   an exact non-negative `int`, like every other budget control in the kernel — the loop bound is
   `repair_calls >= budget`, which `nan` makes permanently false and `inf` never reaches, so
@@ -157,13 +220,15 @@ out in commit messages and here.
 ### Changed — `ReasoningConfig.from_json` is now fail-closed
 
 - `effort`, `summary`, and `on_unsupported` reject values outside their documented enums with a
-  field-named `ValueError`, matching the 0.20.1 "retained and direct-Python controls fail
-  closed" contract. Previously the codec accepted arbitrary values and the mistake surfaced
-  later (or not at all) depending on which ingress the config travelled through. Payloads that
-  only ever carried documented values are unaffected. The reference gateway's request parser
-  now reuses this codec (and the generation one), so an out-of-enum reasoning value or an
-  out-of-range sampling value answers 400 `gateway_bad_request` at the boundary instead of
-  travelling to the upstream provider.
+  field-named `ValueError`. Previously the codec accepted arbitrary values and the mistake
+  surfaced later (or not at all) depending on which ingress the config travelled through.
+  Payloads that only ever carried documented values are unaffected. The reference gateway's
+  request parser now reuses this codec (and the generation one), so an out-of-enum reasoning
+  value or an out-of-range sampling value answers 400 `gateway_bad_request` at the boundary
+  instead of travelling to the upstream provider. The direct-Python half of the 0.20.1
+  "retained and direct-Python controls fail closed" contract landed with the internal-review
+  pass above (`validate_reasoning_config` consumed by `normalize_model_config`); this entry
+  closed the codec half.
 
 ## [0.20.1] - 2026-08-01
 
