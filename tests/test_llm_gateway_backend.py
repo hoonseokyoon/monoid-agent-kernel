@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -23,7 +24,11 @@ from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
-from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.reference.llm_gateway.service import (
+    LlmGatewayBackend,
+    LlmGatewayTurnRecord,
+)
+from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ReasoningDelta,
@@ -757,3 +762,56 @@ def test_the_clients_own_retry_is_combined_with_the_gateways_not_written_over_it
     response = gateway.handle_turn(token, _payload())
     # The client succeeded on its first HTTP attempt, so its own loop contributes nothing.
     assert _parse_gateway_response(response).provider_retried is True
+
+
+def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None:
+    """Blast radius of the OpenAI adapter's by-reference refusal, end to end over the hop.
+
+    The refusal itself is unit-tested against ``_payload``, and ``_model_error_status`` is
+    tested against the exception -- but those are two halves that only *compose* into the 422
+    a client sees. This drives the whole chain the deployment actually runs: a by-reference
+    continuation request → ``handle_turn`` → the real ``OpenAIModelAdapter`` upstream (the
+    gateway's default) → its boundary refusal → ``handle_turn``'s ``except ModelAdapterError``
+    arm → ``_write_exception`` → the non-200 body. Break any link and this fails.
+
+    The handle→provider-response mapping is seeded directly: recording it the normal way needs
+    a live upstream turn, and the shape under test is selected by the *lookup*, not by how the
+    record got there. No API key is used -- ``_payload`` refuses before any client is built.
+    """
+
+    pytest.importorskip("openai")
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, config: OpenAIModelAdapter(
+            config, api_key="test-key-never-used", allow_direct_provider_api=True
+        ),
+    )
+    gateway._turns["turn_seeded"] = LlmGatewayTurnRecord(
+        turn_handle="turn_seeded",
+        provider_response_id="provider_response_1",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        model="gpt-5.5",
+        created_at=time.time(),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        with pytest.raises(HTTPError) as caught:
+            _json_post(
+                f"{base_url}/internal/llm/turns",
+                _payload(previous_turn_handle="turn_seeded"),
+                token=_llm_token(manager),
+            )
+        body = json.loads(caught.value.read().decode("utf-8"))
+
+    assert caught.value.code == 422
+    assert body["error_code"] == "unsupported_request_shape"
+    assert body["retryable"] is False
+    assert body["http_status"] == 422
+    assert "messages" in body["error"]
+    # The classification survives the hop for the client that has to act on it.
+    reconstructed = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
+    assert reconstructed.provider_error_code == "unsupported_request_shape"
+    assert reconstructed.http_status == 422

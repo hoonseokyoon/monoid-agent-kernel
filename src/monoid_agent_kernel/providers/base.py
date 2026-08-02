@@ -33,8 +33,10 @@ StopReason = Literal["stop", "length", "refusal", "tool_calls"]
 def format_async_result_text(output: dict[str, Any]) -> str:
     """Render a background/hosted (``is_background``) observation as user-message text.
     The injector may pre-format a ``message``; otherwise a generic async-result preamble
-    is used (covers shell background jobs). Shared by the loop's by-value message log and
-    the OpenAI adapter's by-reference fallback so the wording stays identical."""
+    is used (covers shell background jobs). One renderer, so every route that turns a hosted
+    result into a user message words it identically -- today that is the loop's by-value
+    message log (``loop.py``), the only remaining caller: the OpenAI adapter's by-reference
+    fallback was deleted with the shape itself, which that adapter now refuses outright."""
     message = output.get("message") if isinstance(output, dict) else None
     if message:
         return str(message)

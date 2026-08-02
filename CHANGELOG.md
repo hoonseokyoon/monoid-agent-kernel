@@ -36,6 +36,13 @@ out in commit messages and here.
 
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 
+- **The Studio profile preview is a record, and now substitutes like one.** Preserving a tool
+  schema's non-finite values through ingress (above) means the value reaches every surface that
+  embeds the schema, and the preview endpoint serializes with `allow_nan=False` — so looking at
+  the tool surface of a profile carrying such a schema failed the request with an anonymous
+  serialization error, one boundary before the classified refusal a real call gets and for a
+  portability reason rather than a config one. `_gateway_tool_schema` normalizes the embedded
+  schema, the same rule the transcript's `_tool_spec_payload` and the run manifest already apply.
 - **A stream that ends without a terminal frame is no longer accepted unproven.** The
   applied-parameter checks lived only on the `turn_complete` frame — which is exactly the frame
   an older gateway never sends; its stream ends cleanly, `assemble_streamed_turn` synthesizes
@@ -143,7 +150,11 @@ out in commit messages and here.
   leftover handle, exactly as documented. The reference gateway's own by-reference continuation
   inherits it when its upstream is this adapter — as a classified `422` the outer client survives
   rather than an opaque 404 — while gateway by-reference support for upstreams that really do
-  persist responses is untouched.
+  persist responses is untouched. The `422` is the status on both transports but only the
+  non-streamed route *is* a `422` response: `handle_turn_stream` builds the adapter eagerly and
+  raises inside the frame generator, after the SSE `200` is committed, so there the refusal
+  travels as the terminal `error` frame carrying `http_status: 422` — which the client's stream
+  reader reconstructs into the same `ModelAdapterError`.
 - **A tool's `input_schema` is not rewritten by ingress either.** The `output_schema` rule
   below was bound on one of the two schemas this request carries. `normalize_tool_spec`
   substituted non-finite floats with `null`, so `{"enum": [NaN]}` became `{"enum": [null]}` —
