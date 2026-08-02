@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import ModelConfig, validate_generation_config
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -533,6 +533,9 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
         ),
         retry_on=_normalize_retry_codes(config.retry.retry_on),
     )
+    # validate_generation_config enforces the enum, so a passing on_unsupported is already
+    # inside the portable ASCII domain -- no per-field text normalization step is needed.
+    generation = validate_generation_config(config.generation)
     return _copy_with_fields(
         config,
         provider=_normalize_required_text(config.provider, "model.provider"),
@@ -546,6 +549,7 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
         gateway_url=_normalize_optional_text(config.gateway_url, "model.gateway_url"),
         reasoning=reasoning,
         retry=retry,
+        generation=generation,
     )
 
 

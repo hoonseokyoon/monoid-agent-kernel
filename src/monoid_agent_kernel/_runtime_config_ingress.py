@@ -25,7 +25,12 @@ from monoid_agent_kernel.core.runtime_controls import (
     validate_shell_runtime,
     validate_web_runtime,
 )
-from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
+from monoid_agent_kernel.core.spec import (
+    GenerationConfig,
+    ModelConfig,
+    ModelRetryConfig,
+    ReasoningConfig,
+)
 from monoid_agent_kernel.core.tool_surface import ToolGuidance, ToolQuota, ToolScope
 from monoid_agent_kernel.permissions import validate_internal_path_patterns
 from monoid_agent_kernel.providers.base import normalize_model_config
@@ -169,6 +174,8 @@ def _normalize_model(model: ModelConfig | None) -> ModelConfig | None:
         raise ValueError("model.retry must be a ModelRetryConfig")
     if not isinstance(model.retry.retry_on, (list, tuple)):
         raise ValueError("model.retry.retry_on must be an array of strings")
+    if not isinstance(model.generation, GenerationConfig):
+        raise ValueError("model.generation must be a GenerationConfig")
 
     normalized = normalize_model_config(model)
     assert normalized is not None

@@ -7,6 +7,30 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — `GenerationConfig`: per-call sampling controls (kernel types)
+
+- `ModelConfig` gains `generation: GenerationConfig` — `temperature` (0–2), `top_p` ((0, 1]),
+  `max_output_tokens` (≥ 1), and `on_unsupported` (`"fail"` default / `"omit"`). Every value
+  field defaults to `None`, meaning "delegate to the provider". The JSON codec and direct-Python
+  normalization share one fail-closed rule source (`validate_generation_config`), so a range
+  accepted from JSON can never diverge from the range accepted from a constructor. **This
+  release adds the type and its ingress only; provider and gateway threading land next**, so a
+  configured value has no request-body effect yet.
+- **`ModelConfig.to_json` omits the `generation` key entirely when the block was never
+  configured.** That single rule is the compatibility mechanism for three consumers at once: a
+  generation-free config keeps its pre-existing `request_digest` (replay key), its
+  `AgentRuntimeConfig.config_hash` (durable recovery compares this hash across versions), and
+  its wire shape. Setting any generation value changes all three, deliberately — pinned by
+  literal-hash tests captured on v0.20.1.
+
+### Changed — `ReasoningConfig.from_json` is now fail-closed
+
+- `effort`, `summary`, and `on_unsupported` reject values outside their documented enums with a
+  field-named `ValueError`, matching the 0.20.1 "retained and direct-Python controls fail
+  closed" contract. Previously the codec accepted arbitrary values and the mistake surfaced
+  later (or not at all) depending on which ingress the config travelled through. Payloads that
+  only ever carried documented values are unaffected.
+
 ## [0.20.1] - 2026-08-01
 
 ### Fixed — Studio traces tell the operational story
