@@ -552,9 +552,11 @@ The types:
   JSON view when the call carried an `output_schema`; a convenience, never the guarantee).
   `parsed` goes through the kernel's strict JSON ingress, not bare `json.loads`, so Python's
   non-standard `NaN` / `Infinity` constants — which a schema validator would happily call
-  numbers — leave it at `None` like prose does, along with duplicate keys, unbounded integers,
-  and runaway nesting. Every field but `final_text` defaults, so the view is constructible with
-  zero loop context.
+  numbers — leave it unparsed like prose does, along with duplicate keys, unbounded integers,
+  and runaway nesting. **`parsed_ok` is the authority, not `parsed is None`**: a schema
+  permitting a root `null` produces a valid parsed value of `None`, so a validator rejecting on
+  `parsed is None` would fail a conforming answer. Every field but `final_text` defaults
+  (`parsed_ok` to `False`), so the view is constructible with zero loop context.
 - `OutputRetry` — raising it from `validate` equals returning a rejection with feedback.
 - `OutputValidatorBinding` — the per-run opt-out: a registered validator runs by default
   (registration = activation); a binding with `enabled=False` disables it for that run.
@@ -582,9 +584,13 @@ carries tools** (there is no executor behind the surface, and a validation failu
 escalate into a tool loop). `max_repair_calls` (default 1) bounds explicit repair calls;
 exhaustion is a *result* (`status="unsatisfied"`), refusal/truncation short-circuit before
 validation with the loop's ordering, and `receipts` carries every call made so the audit trail
-is complete whatever the outcome. Repair follows the request's own shape (by-value messages
-append; a continuation handle carries the repair as the next instruction; a one-shot
-instruction is synthesized into by-value form) and preserves `output_schema`. A request that
+is complete whatever the outcome. Repair follows the shape of **how the incoming request
+carried its conversation**, never what the answer came back with (by-value messages append; a
+request that itself arrived on a continuation handle carries the repair as the next
+instruction on the new handle; a one-shot instruction is synthesized into by-value form) and
+preserves `output_schema`. A one-shot call is never promoted to the handle path just because
+the provider returned a response id — `OpenAIModelAdapter` sends `store=False`, so that id was
+never persisted and the repair would 404. A request that
 came in *on* a continuation handle whose turn came back *without* a new handle has no fourth
 shape — the conversation lives on the provider's side of that handle — so it settles
 `unsatisfied` without repairing rather than repairing against a prompt the model never saw;

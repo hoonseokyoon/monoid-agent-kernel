@@ -345,9 +345,11 @@ class _SeesParsed:
 
     def __init__(self) -> None:
         self.parsed_seen: list[object] = []
+        self.parsed_ok_seen: list[bool] = []
 
     def validate(self, view: FinalOutputView) -> ValidationOutcome:
         self.parsed_seen.append(view.parsed)
+        self.parsed_ok_seen.append(view.parsed_ok)
         return ValidationOutcome(ok=True, value=view.parsed)
 
 
@@ -397,6 +399,35 @@ def test_parsed_stays_none_without_schema_or_without_json(
     result = asyncio.run(runner.acall(_request(**dict(request_kw))))
     assert result.status == "ok"
     assert validator.parsed_seen == [None]
+    assert validator.parsed_ok_seen == [False]
+
+
+def test_a_valid_root_null_is_distinguishable_from_a_failed_parse() -> None:
+    """``parsed is None`` cannot answer "was there a parse?": a schema permitting a root
+    ``null`` yields a valid parsed value of ``None``, identical to "not JSON" and to "no
+    schema". A validator rejecting on ``parsed is None`` would fail a conforming answer and
+    spend its repair budget on it, so ``parsed_ok`` is the authority."""
+
+    validator = _SeesParsed()
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(
+            adapter=FakeModelAdapter(turns=[ModelTurn(final_text="null", stop_reason="stop")])
+        ),
+        validators=(validator,),
+    )
+    result = asyncio.run(runner.acall(_request(output_schema={"type": ["object", "null"]})))
+
+    assert result.status == "ok"
+    assert validator.parsed_seen == [None]
+    assert validator.parsed_ok_seen == [True]
+
+
+def test_parsed_ok_defaults_false_on_a_bare_view() -> None:
+    """The loop builds its view without a parse, so the flag must default to "no parse" --
+    a validator shared across both surfaces reads the same answer there."""
+
+    assert FinalOutputView(final_text="hi").parsed_ok is False
+    assert FinalOutputView(final_text="hi").parsed is None
 
 
 def test_repair_preserves_the_schema_while_stripping_tools() -> None:

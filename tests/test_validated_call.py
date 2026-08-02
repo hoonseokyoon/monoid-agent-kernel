@@ -126,12 +126,19 @@ def test_repair_call_strips_tools_and_uses_the_loops_repair_text() -> None:
     assert repair.messages[-2] == {"role": "assistant", "content": "prose, not json"}
 
 
-def test_repair_uses_the_provider_handle_when_present() -> None:
+def test_repair_uses_the_provider_handle_when_the_request_itself_was_handle_based() -> None:
+    request = ModelRequest(
+        instruction="answer",
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_0",
+    )
     h = _harness(
         [
             ModelTurn(final_text="nope", stop_reason="stop", response_id="resp_1"),
             ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
-        ]
+        ],
+        request=request,
     )
     result = h.run()
     assert result.status == "ok"
@@ -142,6 +149,29 @@ def test_repair_uses_the_provider_handle_when_present() -> None:
     )
     assert repair.tools == ()
     assert repair.messages is None
+
+
+def test_a_one_shot_repair_never_rides_a_handle_the_request_did_not_have() -> None:
+    """The shape is chosen by how the request carried its conversation, not by what the answer
+    came back with. Providers return a response id for every response, so keying on it put
+    every one-shot call on the handle path -- which is dead on the shipped adapters, because
+    ``OpenAIModelAdapter`` sends ``store=False`` and the id was never persisted."""
+
+    h = _harness(
+        [
+            ModelTurn(final_text="prose", stop_reason="stop", response_id="resp_1"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ]
+    )
+    result = h.run()
+
+    assert result.status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.previous_turn_handle is None
+    assert repair.messages is not None and len(repair.messages) == 3
+    assert repair.messages[0] == {"role": "user", "content": "answer"}
+    assert repair.messages[1] == {"role": "assistant", "content": "prose"}
+    assert repair.tools == ()
 
 
 def test_repair_appends_to_by_value_messages() -> None:
@@ -342,19 +372,24 @@ def test_an_observation_only_continuation_is_never_repaired_into_an_empty_prompt
     assert len(h.adapter.requests) == 1
 
 
-def test_a_one_shot_request_with_no_handle_still_synthesizes_by_value() -> None:
-    """The neighbouring shape must keep working: with no incoming handle there is no context
-    behind the request, so the synthesized form loses nothing."""
+@pytest.mark.parametrize("response_id", [None, "resp_1"])
+def test_a_one_shot_request_with_no_handle_always_synthesizes_by_value(
+    response_id: str | None,
+) -> None:
+    """The neighbouring shape must keep working, and identically whether or not the provider
+    handed back an id: with no incoming handle there is no context behind the request, so the
+    synthesized form loses nothing and the answer's id is irrelevant to the choice."""
 
     h = _harness(
         [
-            ModelTurn(final_text="not json", stop_reason="stop", response_id=None),
+            ModelTurn(final_text="not json", stop_reason="stop", response_id=response_id),
             ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
         ]
     )
     result = h.run()
     assert result.status == "ok"
     repair = h.adapter.requests[1]
+    assert repair.previous_turn_handle is None
     assert repair.messages is not None and len(repair.messages) == 3
     assert repair.messages[0] == {"role": "user", "content": "answer"}
 

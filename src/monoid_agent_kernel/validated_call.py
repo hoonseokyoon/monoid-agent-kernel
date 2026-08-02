@@ -158,9 +158,11 @@ class ValidatedCallRunner:
             if not self.validators:
                 return _result("ok")
 
+            parsed_ok, parsed = _parsed_output(current, turn)
             view = FinalOutputView(
                 final_text=turn.final_text or "",
-                parsed=_parsed_output(current, turn),
+                parsed=parsed,
+                parsed_ok=parsed_ok,
             )
             failures, ok_values, defect = await asyncio.to_thread(
                 run_output_validators, self.validators, view
@@ -226,8 +228,14 @@ class ValidatedCallRunner:
         )
 
 
-def _parsed_output(request: ModelRequest, turn: ModelTurn) -> Any:
-    """Best-effort structured view of the answer for :attr:`FinalOutputView.parsed`.
+def _parsed_output(request: ModelRequest, turn: ModelTurn) -> tuple[bool, Any]:
+    """Best-effort structured view of the answer, as ``(parsed_ok, parsed)``.
+
+    Two return values rather than one, because the value alone cannot say whether there was a
+    parse: an ``output_schema`` permitting a root ``null`` produces a valid parsed value of
+    ``None``, which is exactly what "not JSON" and "no schema" also produce. A validator
+    following the documented contract and rejecting ``parsed is None`` would reject a
+    conforming answer and spend its repair budget on it, so the flag is what a validator reads.
 
     Populated whenever the call carried an ``output_schema`` and the text parses as JSON --
     deliberately NOT gated on the adapter declaring native support, because a best-effort
@@ -244,11 +252,11 @@ def _parsed_output(request: ModelRequest, turn: ModelTurn) -> Any:
     """
 
     if request.output_schema is None or not turn.final_text:
-        return None
+        return False, None
     try:
-        return loads_json_ingress(turn.final_text)
+        return True, loads_json_ingress(turn.final_text)
     except ValueError:
-        return None
+        return False, None
 
 
 def _attempt_scoped(
@@ -276,10 +284,19 @@ def _repair_request(
     exactly the loop-escalation this mode exists to rule out. ``observations`` are cleared for
     the same reason: they answer tool calls a repair turn cannot make.
 
-    Three shapes, mirroring the adapters' own request dispatch:
+    Three shapes, chosen by **how the incoming request carried its conversation** -- never by
+    what the answer happened to come back with:
     - by-value ``messages``: append the assistant's answer and the repair prompt;
-    - a provider continuation handle: repair rides ``instruction`` on ``previous_turn_handle``;
+    - a request that itself arrived on a continuation handle: repair rides ``instruction`` on
+      the new ``previous_turn_handle``;
     - one-shot instruction with no handle: synthesize the by-value form.
+
+    Keying on the answer's ``response_id`` instead put every one-shot call on the handle path,
+    because a provider returns an id for every response it produces. That path is dead on the
+    shipped adapters: ``OpenAIModelAdapter`` sends ``store=False`` on every request, so the
+    response the repair would continue from was never persisted, and the reference gateway
+    inherits it through its opaque handle. A repair that 404s is worse than no repair -- it
+    loses the whole call, receipts included, to an exception.
 
     ``None`` is the fourth outcome, and it is the honest one: a request that came in **on** a
     continuation handle whose turn came back **without** a new handle has nowhere to continue
@@ -290,8 +307,6 @@ def _repair_request(
     question.
     """
 
-    if request.messages is None and not turn.response_id and request.previous_turn_handle:
-        return None
     if request.messages is not None:
         return replace(
             request,
@@ -303,7 +318,9 @@ def _repair_request(
                 {"role": "user", "content": repair_text},
             ),
         )
-    if turn.response_id:
+    if request.previous_turn_handle:
+        if not turn.response_id:
+            return None
         return replace(
             request,
             tools=(),

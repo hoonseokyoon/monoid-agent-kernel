@@ -62,7 +62,10 @@ out in commit messages and here.
   `on_unsupported="fail"` knob that governs the sampling-parameter echo — one policy for "the
   transport cannot prove application", deliberately not two half-settable ones.
 - `FinalOutputView.parsed` gives validators a best-effort structured view of the answer when a
-  schema was requested (`None` for prose). It goes through the kernel's strict JSON ingress
+  schema was requested, with `parsed_ok` saying whether there was a parse at all — `parsed is
+  None` cannot, because a schema permitting a root `null` yields a valid parsed `None`, and a
+  validator rejecting on `parsed is None` would fail a conforming answer and spend its repair
+  budget on it. The parse goes through the kernel's strict JSON ingress
   rather than bare `json.loads`, which accepts Python's non-standard `NaN` / `Infinity`
   constants: a validator reading `parsed` — a schema validator will call `NaN` a number — would
   otherwise accept an answer that is not JSON at all. `ValidatedCallRunner` populates
@@ -87,10 +90,14 @@ out in commit messages and here.
   reusable runner afterwards can authorize unbounded paid model calls.
 - **A repair call never carries tools.** The standalone surface has no tool executor, and a
   validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
-  deliberately a full agent turn; here it is deliberately not. Repair follows the request's own
-  shape: by-value messages append the answer and the repair prompt, a provider continuation
-  handle carries the repair as the next instruction, and a one-shot instruction is synthesized
-  into the by-value form. A request that arrived **on** a continuation handle whose turn came
+  deliberately a full agent turn; here it is deliberately not. Repair follows the shape of how
+  the **incoming request** carried its conversation, never what the answer came back with:
+  by-value messages append the answer and the repair prompt, a request that itself arrived on a
+  continuation handle carries the repair as the next instruction on the new handle, and a
+  one-shot instruction is synthesized into the by-value form. A one-shot call is never promoted
+  onto the handle path because the provider returned a response id — `OpenAIModelAdapter` sends
+  `store=False`, so that id was never persisted and the repair would 404, losing the whole call
+  to an exception. A request that arrived **on** a continuation handle whose turn came
   back **without** a new handle has no repairable shape — the conversation is on the provider's
   side of that handle — so it settles `unsatisfied` without spending a repair call rather than
   repairing against a synthesized prompt that drops every prior message.

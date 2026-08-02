@@ -71,10 +71,16 @@ class FinalOutputView:
     final_outputs: tuple[str, ...] = ()
     read_bytes: Callable[..., bytes] = field(default=lambda path, **_: b"")
     # Best-effort structured view of ``final_text`` when the call carried an
-    # ``output_schema`` (W5 ResponseContract). ``None`` when the text is not valid JSON or
-    # no schema was requested -- a validator must treat it as a convenience, never as the
-    # guarantee; the guarantee is the validator itself.
+    # ``output_schema`` (W5 ResponseContract) -- a validator must treat it as a convenience,
+    # never as the guarantee; the guarantee is the validator itself.
     parsed: Any = None
+    # Whether ``parsed`` is a parse *result* at all. ``parsed is None`` cannot answer that:
+    # a schema permitting a root ``null`` yields a perfectly valid parsed value of ``None``,
+    # indistinguishable from "no schema was requested" and from "the text is not JSON". A
+    # validator that rejects on ``parsed is None`` would fail a conforming answer and burn its
+    # repair budget on it. This flag is the authority; ``parsed`` is only meaningful when it is
+    # ``True``.
+    parsed_ok: bool = False
 
 
 @runtime_checkable
