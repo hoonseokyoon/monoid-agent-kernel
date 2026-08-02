@@ -1176,8 +1176,40 @@ def test_recoverable_turn_error_classifier() -> None:
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=429, retryable=True))
     assert _recoverable_turn_error(ModelAdapterError("x", retryable=True))  # any status
+    assert _recoverable_turn_error(ModelAdapterError("x", config_recoverable=True))  # no status
     assert not _recoverable_turn_error(ModelAdapterError("x", http_status=500))
     assert not _recoverable_turn_error(RuntimeError("x"))
+
+
+def test_a_config_recoverable_refusal_ends_the_turn_not_the_run(tmp_path: Path) -> None:
+    """A client-side proof refusal (gateway_generation_not_applied) carries no HTTP status,
+    so the classifier saw an unflagged non-retryable error and terminalized the run — while
+    the identical condition reported by a gateway server as HTTP 400 ended only the turn.
+    The error's own remedy ('set on_unsupported=\"omit\"') is config the user fixes and
+    resends against, which is this classifier's definition of recoverable."""
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError(
+                "the gateway sent no generation_applied echo",
+                provider_error_code="gateway_generation_not_applied",
+                retryable=False,
+                config_recoverable=True,
+            )
+        ]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hello")
+        assert susp.reason == "turn_failed"
+        assert loop._session is not None and loop._session.terminal is False
+        types = [e.type for e in sink.events]
+        assert "turn.failed" in types
+        assert "run.failed" not in types
+        assert list(run_root.rglob("failure.json")) == []
+    finally:
+        loop.close()
 
 
 def test_turn_failed_suspension_is_non_terminal(tmp_path: Path) -> None:

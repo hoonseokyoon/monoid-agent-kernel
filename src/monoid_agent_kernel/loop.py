@@ -258,12 +258,17 @@ def _recoverable_turn_error(exc: BaseException) -> bool:
 
     Recoverable = a ``ModelAdapterError`` that is gateway-flagged ``retryable`` (transient:
     timeouts, network, 429, exhausted 5xx) OR any 4xx (config/auth/rate-limit the user can fix
-    and resend against). Everything else — a generic exception, or an un-flagged 5xx — stays
-    terminal, matching today's behavior.
+    and resend against) OR flagged ``config_recoverable`` (the client-side statement of the
+    same 4xx fact: an applied-parameters proof refusal carries no HTTP status, but its remedy
+    is config the user fixes and resends — the identical condition reported by a gateway
+    server as HTTP 400 already ended only the turn). Everything else — a generic exception,
+    or an un-flagged 5xx — stays terminal, matching today's behavior.
     """
     if not isinstance(exc, ModelAdapterError):
         return False
     if exc.retryable:
+        return True
+    if getattr(exc, "config_recoverable", False):
         return True
     status = exc.http_status
     return status is not None and 400 <= status < 500

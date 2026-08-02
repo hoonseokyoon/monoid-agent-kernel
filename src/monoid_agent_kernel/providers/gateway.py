@@ -819,6 +819,10 @@ def _check_generation_applied(
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
         retryable=False,
+        # The remedy in the message is configuration: the session survives, the user
+        # switches policy or transport and resends. Without this the run terminalized on a
+        # condition the same server would have reported recoverably as an HTTP 400.
+        config_recoverable=True,
         provider_retried=known_provider_retried,
     )
 
@@ -856,6 +860,7 @@ def _check_schema_applied(
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
         retryable=False,
+        config_recoverable=True,
         provider_retried=known_provider_retried,
     )
 

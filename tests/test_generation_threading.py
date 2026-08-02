@@ -535,6 +535,30 @@ def test_not_applied_error_carries_the_clients_own_retry(
     assert rejected.value.provider_retried is True
 
 
+def test_not_applied_errors_are_config_recoverable_on_both_checks() -> None:
+    """The error's own message instructs the user to set on_unsupported="omit" and resend —
+    config the user can fix, which is exactly the class the loop's classifier keeps the
+    session alive for. Without the flag, a mid-run failover to a non-echoing gateway replica
+    terminalized the whole run while the same condition reported by a server as HTTP 400
+    ended only the turn."""
+
+    from monoid_agent_kernel.providers.gateway import _check_schema_applied
+    from monoid_agent_kernel.reference.llm_gateway.http import _model_error_status
+
+    with pytest.raises(ModelAdapterError) as generation:
+        _check_generation_applied(_SET_WIRE, "fail", None)
+    assert generation.value.config_recoverable is True
+    assert generation.value.retryable is False
+
+    with pytest.raises(ModelAdapterError) as schema:
+        _check_schema_applied(True, "fail", None)
+    assert schema.value.config_recoverable is True
+
+    # Across a reference-gateway hop the property must not be laundered into a 502: the HTTP
+    # mapping turns it into a 4xx so the outer client's classifier reads the same answer.
+    assert 400 <= int(_model_error_status(generation.value)) < 500
+
+
 # --- streaming enforcement without a terminal frame -------------------------------------
 
 

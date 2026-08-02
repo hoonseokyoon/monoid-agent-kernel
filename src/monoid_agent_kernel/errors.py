@@ -33,11 +33,19 @@ class ModelAdapterError(NativeAgentError):
         retryable: bool = False,
         http_status: int | None = None,
         provider_retried: bool = False,
+        config_recoverable: bool = False,
     ) -> None:
         super().__init__(message, error_code=error_code)
         self.provider_error_code = provider_error_code or ""
         self.retryable = retryable
         self.http_status = http_status
+        # A refusal the user resolves by changing configuration and resending -- the
+        # client-side twin of a provider 4xx, which classifiers treat as "end the turn, keep
+        # the session". A client-detected failure (an applied-parameters proof refusal) has no
+        # HTTP status to carry that meaning, and without this flag it was classified like an
+        # unflagged 5xx: terminal for the whole run. Orthogonal to ``retryable``: resending
+        # the same call cannot help (retryable=False), but the session can survive it.
+        self.config_recoverable = config_recoverable
         # Whether the adapter's own retry loop ran before giving up. ``retryable`` is a forecast
         # about a *future* attempt; this is a fact about attempts already made, and the two are
         # independent -- an exhausted retry budget leaves a retryable error that will not be

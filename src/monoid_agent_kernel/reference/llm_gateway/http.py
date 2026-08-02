@@ -260,6 +260,12 @@ def _model_error_status(exc: ModelAdapterError) -> HTTPStatus:
             return HTTPStatus(exc.http_status)
         except ValueError:
             pass
+    if getattr(exc, "config_recoverable", False):
+        # A config-fixable refusal (an applied-parameters proof failure from this gateway's
+        # own upstream) must not be laundered into a 502 across the hop: the outer client's
+        # classifier reads 5xx as terminal, so a condition the direct client survives
+        # recoverably killed the run one hop out. 4xx is the same statement in HTTP.
+        return HTTPStatus.UNPROCESSABLE_ENTITY
     return HTTPStatus.SERVICE_UNAVAILABLE if exc.retryable else HTTPStatus.BAD_GATEWAY
 
 
