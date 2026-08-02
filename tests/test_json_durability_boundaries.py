@@ -624,23 +624,36 @@ def test_sqlite_command_inbox_reader_rejects_invalid_result_fields(
 def test_gateway_http_writer_rejects_nonfinite_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The writer still refuses non-finite values (allow_nan=False is the durability
+    contract); since the W5 internal review the refusal is *classified* — a
+    config-recoverable gateway_bad_request instead of a raw ValueError the loop cannot
+    classify — with the original refusal chained as the cause."""
+
+    from monoid_agent_kernel.errors import ModelAdapterError
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
     adapter = GatewayModelAdapter(
         ModelConfig(gateway_url="https://llm-gateway.example.test/v1/turns"), token="token"
     )
     monkeypatch.setattr(adapter, "_payload", lambda request: {"score": float("nan")})
 
-    with pytest.raises(ValueError, match="Out of range float values"):
+    with pytest.raises(ModelAdapterError, match="Out of range float values") as refused:
         adapter.next_turn(ModelRequest(instruction="test", system_prompt="sys", tools=()))
+    assert refused.value.provider_error_code == GATEWAY_BAD_REQUEST
 
 
 def test_gateway_stream_http_writer_rejects_nonfinite_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from monoid_agent_kernel.errors import ModelAdapterError
+    from monoid_agent_kernel.providers.gateway import GATEWAY_BAD_REQUEST
+
     adapter = GatewayModelAdapter(
         ModelConfig(gateway_url="https://llm-gateway.example.test/v1/turns"), token="token"
     )
     monkeypatch.setattr(adapter, "_payload", lambda request: {"score": float("nan")})
 
     stream = adapter.astream_turn(ModelRequest(instruction="test", system_prompt="sys", tools=()))
-    with pytest.raises(ValueError, match="Out of range float values"):
+    with pytest.raises(ModelAdapterError, match="Out of range float values") as refused:
         asyncio.run(anext(stream))
+    assert refused.value.provider_error_code == GATEWAY_BAD_REQUEST
