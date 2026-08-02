@@ -142,6 +142,7 @@ from monoid_agent_kernel.model_call import ModelCallRunner
 # One validated model call: dispatch + validate + bounded explicit repair, outside any loop.
 from monoid_agent_kernel.validated_call import (
     AttemptDeltaConsumer,
+    AttemptStarted,
     ValidatedCallResult,
     ValidatedCallRunner,
 )
@@ -383,6 +384,7 @@ __all__ = [
     "ValidatedCallRunner",
     "ValidatedCallResult",
     "AttemptDeltaConsumer",
+    "AttemptStarted",
     "structured_output_support",
     "generation_support",
     "OutputValidator",

@@ -99,6 +99,7 @@ EXPECTED_CONTRACTS_ALL = [
     "ValidatedCallRunner",
     "ValidatedCallResult",
     "AttemptDeltaConsumer",
+    "AttemptStarted",
     "structured_output_support",
     "generation_support",
     "OutputValidator",

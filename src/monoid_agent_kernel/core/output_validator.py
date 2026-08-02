@@ -9,10 +9,10 @@ This module defines the integration surface; the orchestration lives in the loop
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.result import AgentArtifact
 from monoid_agent_kernel.errors import NativeAgentError
 
@@ -134,6 +134,26 @@ class OutputValidatorError(NativeAgentError):
     receipts: tuple[Any, ...] = ()
 
 
+def _view_with_own_parsed(view: FinalOutputView) -> FinalOutputView:
+    """``view`` with a private copy of ``parsed``, copied without recursing.
+
+    ``normalize_json_ingress`` is the kernel's iterative JSON copier -- it exists precisely to
+    walk a JSON-domain value "without recursive Python calls" -- and both substitutions are
+    turned off here so this is a copy and nothing else: no surrogate repair, no non-finite
+    rewrite. ``parsed`` is already strict-ingress output, so both would be no-ops anyway; off
+    is what makes that true by construction rather than by coincidence.
+    """
+
+    if view.parsed is None:
+        return view
+    return replace(
+        view,
+        parsed=normalize_json_ingress(
+            view.parsed, substitute_nonfinite=False, normalize_strings=False
+        ),
+    )
+
+
 def run_output_validators(
     validators: tuple[OutputValidator, ...], view: FinalOutputView
 ) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
@@ -153,9 +173,20 @@ def run_output_validators(
         # Each validator gets its own copy of the parsed view. The dataclass is frozen but
         # ``parsed`` is one mutable object; shared, one validator's in-place mutation was
         # judged -- and surfaced as a value -- by the next, defeating the documented
-        # "read-only" contract. ``parsed`` is plain JSON data (strict-ingress output), so the
-        # copy is cheap and total.
-        per_view = view if view.parsed is None else replace(view, parsed=deepcopy(view.parsed))
+        # "read-only" contract.
+        #
+        # In its own ``try``, and never ``deepcopy``. ``deepcopy`` recurses, and the strict
+        # ingress that produced ``parsed`` accepts nesting up to 512 levels -- deep enough to
+        # exhaust an ordinary stack -- so a *conforming* answer raised ``RecursionError`` here,
+        # outside any classification, before a single validator ran. The kernel's own JSON
+        # copier is iterative by construction and cannot, so a legal answer stays validatable
+        # instead of becoming a defect. The separate ``try`` matters: inside the one below, a
+        # copy failure would hit the ``ValueError``-is-a-rejection rule and be fed back to the
+        # model as repair text for a defect it cannot fix.
+        try:
+            per_view = _view_with_own_parsed(view)
+        except Exception as exc:
+            return failures, ok_values, (validator.id, exc)
         try:
             outcome = validate_validation_outcome(validator.validate(per_view))
         except OutputRetry as exc:

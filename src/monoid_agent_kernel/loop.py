@@ -252,6 +252,30 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     )
 
 
+def _unrecovered_turn_failure(
+    last_suspension: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Read a durable park back as ``_Session.unrecovered_turn_failure``, or ``None``.
+
+    Only ``turn_failed`` rehydrates: it is the one park that is a *failure the driver has not
+    yet given up on*, and closing on it is giving up. ``settled``/``limited``/``terminal``
+    already recorded their outcome, and ``interrupted``/``paused``/``awaiting_tasks`` are not
+    failures at all -- promoting any of those would invent a failed run out of an ordinary
+    recovery.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return None
+    if last_suspension.get("reason") != "turn_failed":
+        return None
+    error = last_suspension.get("error")
+    error_code = last_suspension.get("error_code")
+    return (
+        str(error) if isinstance(error, str) else "",
+        str(error_code) if isinstance(error_code, str) else "",
+    )
+
+
 def _recoverable_turn_error(exc: BaseException) -> bool:
     """Whether a model-turn exception is *recoverable* — the session should survive and the
     turn can be re-attempted (after backoff, or after the user fixes config) rather than
@@ -2615,6 +2639,15 @@ class AgentLoop:
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
             last_suspension=(dict(cp.last_suspension) if cp.last_suspension is not None else None),
+            # Rehydrated, because the promotion has to survive the process boundary it exists
+            # for. The live field is deliberately not derived from ``last_suspension`` (a park
+            # whose snapshot failed to commit must still promote), but that argument runs the
+            # other way here: across a restore the checkpoint is the *only* evidence, and it
+            # demonstrably committed -- this code is reading it. Without this, a crash-and-
+            # recover of exactly the run the park preserves checkpoints for closed
+            # ``completed``, wrote no failure record, and let the completed-run cleanup delete
+            # them. A later settle clears it at pump entry, same as in-process.
+            unrecovered_turn_failure=_unrecovered_turn_failure(cp.last_suspension),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={

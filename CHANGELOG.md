@@ -124,6 +124,26 @@ out in commit messages and here.
   escaped raw from the gateway encoder and reached the OpenAI adapter's outer handler as an
   anonymous `unclassified_provider_error`, terminalizing the run either way. Both encoders now
   answer it like any other unsendable request.
+- **The unrecovered-park promotion survives a restart.** `close()` promotes an unrecovered
+  `turn_failed` park from a session field, and `restore()` rebuilt the session without it — so
+  a crash-and-recover of exactly the run the park exists for (a non-retryable configuration
+  failure, recovered, left idle, then closed) finalized `completed`, wrote no `failure.json`,
+  and let the completed-run cleanup delete the checkpoints the park preserves for an operator
+  restore. `restore()` now rehydrates it from the checkpoint's `last_suspension` (only
+  `reason="turn_failed"`; a later settle clears it at pump entry, exactly as in-process).
+- **A conforming deeply-nested answer is still validated.** The per-validator copy of
+  `FinalOutputView.parsed` used `deepcopy`, which recurses: the strict ingress accepts JSON
+  nested to 512 levels — deep enough to exhaust the interpreter's default 1000-frame stack —
+  so an answer the *parser accepted* raised `RecursionError` in the copy, outside any
+  classification, before a single validator ran, and `ValidatedCallRunner.acall` leaked it raw.
+  The copy now goes through the kernel's iterative JSON copier with both substitutions off, so
+  it is isolation and nothing else.
+- **An attempt that streams nothing still announces itself.** `AttemptDeltaConsumer` carried
+  the attempt boundary on chunks alone, so an attempt that produced none delivered nothing at
+  all — a consumer holding a rejected attempt's text was never told to drop it and rendered it
+  beside an `ok` result. Every attempt now opens with an `AttemptStarted(attempt)` event
+  (exported from `contracts`), delivered before that attempt's chunks and whether or not any
+  arrive; the consumer's event type is `AttemptStarted | ModelStreamChunk`.
 
 ### Added — `GenerationConfig`: per-call sampling controls (kernel types)
 

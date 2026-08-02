@@ -10,7 +10,12 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.checkpoint import CheckpointRecord, CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import (
+    CheckpointRecord,
+    CheckpointStore,
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+)
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
@@ -1925,3 +1930,110 @@ def test_tool_result_is_normalized_before_background_event_decision(tmp_path: Pa
     assert len(changed) == 1
     assert changed[0]["data"]["paths"] == ["normalized.txt"]
     assert adapter.requests[1].observations[0].output["result"]["job_id"] is None
+
+
+def _spec_for(tmp_path: Path) -> AgentRunSpec:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+
+def _loop_for(spec: AgentRunSpec, adapter, sink: MemoryEventSink) -> AgentLoop:
+    return AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=_provider("run.finish"),
+        event_sinks=(sink,),
+    )
+
+
+def _restored_loop(spec: AgentRunSpec, adapter, sink: MemoryEventSink) -> AgentLoop:
+    """A fresh loop over the same run, rehydrated from the latest durable checkpoint."""
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    loop = _loop_for(spec, adapter, sink)
+    loop.restore(record.checkpoint, blobs=record.blob)
+    return loop
+
+
+def test_a_restored_turn_failed_park_still_closes_as_the_failure_it_is(tmp_path: Path) -> None:
+    """The promotion must survive the process boundary, or it only exists in memory.
+
+    ``close()`` promotes an unrecovered ``turn_failed`` park from a session field, and
+    ``restore()`` rebuilt the session without it — so a crash-and-recover of exactly the run
+    the park exists for (a non-retryable config failure, recovered, left idle, then closed)
+    finalized ``completed``, wrote no ``failure.json``, and let the completed-run cleanup
+    delete the very checkpoints the park preserves for an operator restore. The durable
+    ``last_suspension`` is the evidence, and on this path it is the only evidence there is —
+    it demonstrably committed, since the restore is reading it."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec,
+        _ScriptedAdapter(
+            [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+        ),
+        MemoryEventSink(),
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    del loop  # process death: no close()
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(spec, _ScriptedAdapter([]), sink)
+    result = restored.close()
+
+    assert result.status == "failed"
+    assert list(spec.run_root.rglob("failure.json"))
+    assert "run.failed" in [e.type for e in sink.events]
+    # The failure detail survives the hop rather than degrading to a generic message.
+    assert "bad config" in (result.error or "")
+
+
+def test_a_restored_park_recovered_by_a_later_turn_still_closes_completed(
+    tmp_path: Path,
+) -> None:
+    """The rehydrated field is a park, not a verdict: a re-attempt that settles clears it,
+    exactly as it does for a park that never left memory."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec,
+        _ScriptedAdapter(
+            [ModelAdapterError("transient", http_status=400, error_code="model_error")]
+        ),
+        MemoryEventSink(),
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "turn_failed"
+    del loop
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(
+        spec, _ScriptedAdapter([ModelTurn(response_id="r2", final_text="recovered")]), sink
+    )
+    assert restored.run_until_suspended(None).reason == "settled"
+    result = restored.close()
+
+    assert result.status == "completed"
+    assert list(spec.run_root.rglob("failure.json")) == []
+    assert "run.failed" not in [e.type for e in sink.events]
+
+
+def test_a_restored_settled_park_is_not_promoted_into_a_failure(tmp_path: Path) -> None:
+    """Only ``turn_failed`` rehydrates. A restore of any other park must close normally, or
+    the fix would invent a failure for every recovered run."""
+
+    spec = _spec_for(tmp_path)
+    loop = _loop_for(
+        spec, _ScriptedAdapter([ModelTurn(response_id="r1", final_text="done")]), MemoryEventSink()
+    )
+    loop.open()
+    assert loop.run_until_suspended("hello").reason == "settled"
+    del loop
+
+    sink = MemoryEventSink()
+    restored = _restored_loop(spec, _ScriptedAdapter([]), sink)
+    assert restored.close().status == "completed"
+    assert list(spec.run_root.rglob("failure.json")) == []

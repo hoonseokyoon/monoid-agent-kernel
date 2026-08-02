@@ -1066,3 +1066,94 @@ def test_decide_settle_is_pure(tmp_path: Path) -> None:
         assert len(sink.events) == before_events  # decide emits nothing
     finally:
         loop.close()
+
+
+# --- the per-validator copy must not recurse ----------------------------------------------
+
+
+def test_a_legal_deeply_nested_answer_is_still_validated() -> None:
+    """The per-validator copy of ``parsed`` used ``deepcopy``, which recurses.
+
+    The kernel's strict ingress accepts JSON nested up to 512 levels, which is deep enough to
+    exhaust the interpreter's default 1000-frame stack — so an answer the parser *accepted*
+    blew up in the copy, outside any classification, before a single validator ran, and the
+    standalone validated call leaked the raw ``RecursionError`` out of ``acall``. (The
+    AgentLoop settle path leaves ``parsed`` unset today, so only the standalone surface could
+    reach it; the routine is shared, so the fix binds both.) The copy is now iterative
+    (``normalize_json_ingress``, which exists to walk JSON without recursing), so a legal
+    answer stays validatable rather than becoming a validator defect.
+
+    The limit is pinned to the interpreter default on purpose: pytest raises it to 3000, which
+    is exactly deep enough to hide this defect from a test that does not say what stack it is
+    testing against. Production runs at 1000.
+    """
+
+    import sys
+
+    from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+    from monoid_agent_kernel.core.output_validator import run_output_validators
+
+    depth = 500
+    text = "[" * depth + "]" * depth
+    parsed = loads_json_ingress(text)  # the parser accepts it; the copy must too
+
+    class _Records:
+        def __init__(self, vid: str) -> None:
+            self.id = vid
+            self.schema = None
+            self.seen: object = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            self.seen = view.parsed
+            return ValidationOutcome(ok=True, value=self.id)
+
+    first, second = _Records("a"), _Records("b")
+    view = FinalOutputView(final_text=text, parsed=parsed, parsed_ok=True)
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        failures, ok_values, defect = run_output_validators((first, second), view)
+    finally:
+        sys.setrecursionlimit(previous_limit)
+
+    assert defect is None
+    assert failures == []
+    assert [vid for vid, _ in ok_values] == ["a", "b"]
+    # Still a copy each, and still equal to what was parsed — the isolation contract holds.
+    assert first.seen is not second.seen
+    assert first.seen is not view.parsed
+    assert first.seen == second.seen == parsed
+
+
+def test_the_per_validator_copy_is_still_isolation_not_transformation() -> None:
+    """The iterative copier can normalize and substitute; both are off here, so the value a
+    validator judges is byte-for-byte what was parsed — including a lone-surrogate string that
+    survived strict ingress inside a JSON string escape."""
+
+    from monoid_agent_kernel.core.output_validator import run_output_validators
+
+    parsed = {"note": "a\ud800b", "n": [1, 2, {"deep": True}]}
+
+    class _Mutates:
+        id = "mutates"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            view.parsed["n"].append("scribble")
+            return ValidationOutcome(ok=True, value=view.parsed["note"])
+
+    class _Reads:
+        id = "reads"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            return ValidationOutcome(ok=True, value=list(view.parsed["n"]))
+
+    view = FinalOutputView(final_text="{}", parsed=parsed, parsed_ok=True)
+    _failures, ok_values, defect = run_output_validators((_Mutates(), _Reads()), view)
+
+    assert defect is None
+    values = dict(ok_values)
+    assert values["mutates"] == "a\ud800b"  # not repaired to U+FFFD
+    assert "scribble" not in values["reads"]  # the mutation did not reach the next validator
+    assert parsed["n"] == [1, 2, {"deep": True}]  # nor the caller's own object

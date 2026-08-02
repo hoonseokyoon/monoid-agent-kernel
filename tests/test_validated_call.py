@@ -408,46 +408,64 @@ def test_streamed_chunks_are_tagged_with_their_attempt() -> None:
             [TextDelta('{"fixed": '), TextDelta("true}")],
         ]
     )
+    from monoid_agent_kernel.validated_call import AttemptStarted
+
     validator = _Validator()
     runner = ValidatedCallRunner(
         runner=ModelCallRunner(adapter=adapter), validators=(validator,), max_repair_calls=1
     )
-    seen: list[tuple[int, str]] = []
+    seen: list[tuple[int, object]] = []
 
     async def _drive() -> ValidatedCallResult:
         return await runner.acall(
             ModelRequest(instruction="answer", system_prompt="sys", tools=()),
-            delta_consumer=lambda attempt, chunk: seen.append(
-                (attempt, getattr(chunk, "text", ""))
-            ),
+            delta_consumer=lambda attempt, event: seen.append((attempt, event)),
         )
 
     result = asyncio.run(_drive())
 
     assert result.status == "ok"
-    assert [attempt for attempt, _ in seen] == [0, 0, 1, 1]
+    # Each attempt opens with its boundary marker, then delivers only its own chunks.
+    assert [
+        (attempt, "start" if isinstance(event, AttemptStarted) else "chunk")
+        for attempt, event in seen
+    ] == [
+        (0, "start"),
+        (0, "chunk"),
+        (0, "chunk"),
+        (1, "start"),
+        (1, "chunk"),
+        (1, "chunk"),
+    ]
     # Everything under attempt 0 is retracted; the answer is exactly the last attempt's text.
-    accepted = "".join(text for attempt, text in seen if attempt == result.repair_calls_used)
+    accepted = "".join(
+        getattr(event, "text", "")
+        for attempt, event in seen
+        if attempt == result.repair_calls_used
+    )
     assert accepted == result.turn.final_text == '{"fixed": true}'
 
 
 def test_a_single_attempt_still_streams_under_attempt_zero() -> None:
+    from monoid_agent_kernel.validated_call import AttemptStarted
+
     adapter = FakeStreamingModelAdapter(chunk_turns=[[TextDelta('{"a": 1}')]])
     runner = ValidatedCallRunner(
         runner=ModelCallRunner(adapter=adapter), validators=(_Validator(),)
     )
-    seen: list[tuple[int, str]] = []
+    seen: list[tuple[int, object]] = []
 
     async def _drive() -> ValidatedCallResult:
         return await runner.acall(
             ModelRequest(instruction="answer", system_prompt="sys", tools=()),
-            delta_consumer=lambda attempt, chunk: seen.append(
-                (attempt, getattr(chunk, "text", ""))
-            ),
+            delta_consumer=lambda attempt, event: seen.append((attempt, event)),
         )
 
     assert asyncio.run(_drive()).status == "ok"
-    assert seen == [(0, '{"a": 1}')]
+    assert seen[0] == (0, AttemptStarted(0))
+    assert [(attempt, getattr(event, "text", "")) for attempt, event in seen[1:]] == [
+        (0, '{"a": 1}')
+    ]
 
 
 # --- a tool-call answer is a distinct outcome, not empty text ---------------------------
@@ -725,3 +743,86 @@ def test_an_instructionless_one_shot_still_synthesizes_a_consistent_repair() -> 
     repair = h.adapter.requests[1]
     assert repair.messages is not None
     assert repair.messages[0] == {"role": "user", "content": ""}
+
+
+# --- the attempt boundary is delivered, not inferred -------------------------------------
+
+
+class _SilentRepairAdapter:
+    """Streams a rejected answer, then produces an accepted one with no chunks at all.
+
+    Not exotic: a stream carrying only its terminal frame, a frameless gateway stream accepted
+    under ``on_unsupported="omit"``, or any adapter whose second turn arrives without text.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def astream_turn(self, request):  # noqa: ANN001, ANN201
+        self.calls += 1
+        if self.calls == 1:
+            yield TextDelta("prose, not json")
+
+
+def test_an_attempt_that_streams_nothing_still_announces_itself() -> None:
+    """The retraction contract cannot ride chunks alone. Attempt 1 here emits none, so a
+    consumer keyed on the index never learned it had advanced and went on rendering attempt
+    0's rejected text beside an ``ok`` result."""
+
+    from monoid_agent_kernel.validated_call import AttemptStarted
+
+    class _AcceptsAnything:
+        id = "accepts-anything"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            if view.final_text.startswith("{"):
+                return ValidationOutcome(ok=True, value=view.final_text)
+            if view.final_text == "":
+                return ValidationOutcome(ok=True, value="")
+            return ValidationOutcome(ok=False, feedback="answer must be a JSON object")
+
+    adapter = _SilentRepairAdapter()
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter),
+        validators=(_AcceptsAnything(),),
+        max_repair_calls=1,
+    )
+    seen: list[tuple[int, object]] = []
+
+    async def _drive() -> ValidatedCallResult:
+        return await runner.acall(
+            ModelRequest(instruction="answer", system_prompt="sys", tools=()),
+            delta_consumer=lambda attempt, event: seen.append((attempt, event)),
+        )
+
+    result = asyncio.run(_drive())
+
+    assert result.status == "ok"
+    assert result.repair_calls_used == 1
+    # Attempt 1 produced no chunk, yet the consumer was told it began — which is the only
+    # signal that attempt 0's text is retracted.
+    boundaries = [attempt for attempt, event in seen if isinstance(event, AttemptStarted)]
+    assert boundaries == [0, 1]
+    # And the marker leads its attempt: nothing of attempt N arrives before N's boundary.
+    assert isinstance(seen[0][1], AttemptStarted)
+    assert seen[-1] == (1, AttemptStarted(1))
+
+
+def test_the_boundary_is_announced_even_for_a_single_non_streaming_attempt() -> None:
+    """A non-streaming adapter emits no chunks for any attempt. The consumer must still be
+    told where attempt 0 begins, or "no events at all" and "one silent attempt" are the same
+    observation."""
+
+    from monoid_agent_kernel.validated_call import AttemptStarted
+
+    h = _harness([ModelTurn(final_text='{"a": 1}', stop_reason="stop")])
+    seen: list[tuple[int, object]] = []
+
+    async def _drive() -> ValidatedCallResult:
+        return await h.runner.acall(
+            h.request, delta_consumer=lambda attempt, event: seen.append((attempt, event))
+        )
+
+    assert asyncio.run(_drive()).status == "ok"
+    assert seen == [(0, AttemptStarted(0))]

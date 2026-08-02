@@ -40,14 +40,34 @@ from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, M
 
 ValidatedCallStatus = Literal["ok", "unsatisfied", "refusal", "truncated", "tool_calls"]
 
+@dataclass(frozen=True)
+class AttemptStarted:
+    """The boundary marker delivered before an attempt's first chunk -- including its zeroth.
+
+    The attempt index alone could not carry the boundary, because it rides *chunks*: an attempt
+    that produces none delivered nothing at all, so a consumer holding the previous attempt's
+    rejected text was never told to drop it and rendered it beside an ``ok`` result. An attempt
+    with no chunks is not exotic -- a stream that ends after its terminal frame carries no text,
+    a frameless gateway stream accepted under ``on_unsupported="omit"`` may carry nothing, and a
+    non-streaming adapter never emits at all. The marker is delivered for every attempt, whether
+    or not a chunk follows, so "the index advanced" is a fact the consumer is *told*, not one it
+    has to infer from data that may never come.
+    """
+
+    attempt: int
+
+
+# What an attempt's stream delivers: the boundary marker, then that attempt's chunks.
+AttemptEvent = AttemptStarted | ModelStreamChunk
+
 # The streaming consumer for a *validated* call, which is not one stream but one per attempt.
-# The attempt index (0 = the original call, 1 = the first repair) rides every chunk because a
+# The attempt index (0 = the original call, 1 = the first repair) rides every event because a
 # rejected attempt's text is discarded output: a consumer that renders or accumulates it must
 # know, when the index advances, that everything it holds from the previous index is retracted.
 # A plain ``DeltaConsumer`` cannot express that -- it would deliver the rejected answer and the
 # corrected answer as one undelimited stream -- so this surface takes the wider callable
 # instead, and a caller cannot ignore the boundary by accident.
-AttemptDeltaConsumer = Callable[[int, ModelStreamChunk], None]
+AttemptDeltaConsumer = Callable[[int, AttemptEvent], None]
 
 
 @dataclass(frozen=True)
@@ -96,8 +116,10 @@ class ValidatedCallRunner:
     repairs run under the same boundary, not a fresh one each.
 
     Streaming is per attempt, not per call: :meth:`acall` takes an
-    :data:`AttemptDeltaConsumer` and tags every chunk with the attempt that produced it, so a
-    rejected attempt's text is never handed to a consumer that cannot tell it was discarded.
+    :data:`AttemptDeltaConsumer`, opens every attempt with an :class:`AttemptStarted` marker,
+    and tags each of that attempt's chunks with the same index -- so a rejected attempt's text
+    is never handed to a consumer that cannot tell it was discarded, and the boundary is
+    delivered even by an attempt that streams nothing.
     """
 
     runner: ModelCallRunner
@@ -160,6 +182,10 @@ class ValidatedCallRunner:
         repair_calls = 0
         current = request
         while True:
+            # Before the call, so the boundary arrives ahead of anything the attempt produces
+            # -- and arrives even when it produces nothing.
+            if delta_consumer is not None:
+                delta_consumer(repair_calls, AttemptStarted(repair_calls))
             turn, receipt = await self.runner.acall(
                 current,
                 context=context,

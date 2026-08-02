@@ -150,7 +150,11 @@ The run lifecycle is:
   `AgentRunResult` is the return value. `close()` performs the same promotion
   for any driver (the explicit form is `fail_recoverable`): a run closed on an
   unrecovered recoverable failure finalizes `failed` with `failure.json`
-  written and its checkpoints kept, never as a clean success.
+  written and its checkpoints kept, never as a clean success. The promotion
+  survives a restart: `restore()` rehydrates the pending failure from the
+  checkpoint's `last_suspension` (only `reason="turn_failed"`; a later settle
+  clears it), so a recovered run left idle and then closed records the failure
+  it parked on rather than a clean success that deletes its own checkpoints.
 
 ### AgentRunSpec
 
@@ -659,10 +663,16 @@ shape — the conversation lives on the provider's side of that handle — so it
 `repair_calls_used < max_repair_calls` on an `unsatisfied` result is that signal.
 
 Streaming is per attempt: `acall` takes an `AttemptDeltaConsumer`
-(`(attempt_index, chunk) -> None`, `0` = the original call) rather than a plain
+(`(attempt_index, event) -> None`, `0` = the original call) rather than a plain
 `DeltaConsumer`, because a rejected attempt's text is discarded output. When the index
 advances, everything the consumer holds from the previous index is retracted; the signature
 carries the boundary so a consumer cannot concatenate a rejected answer onto the accepted one.
+Every attempt opens with an `AttemptStarted(attempt)` event, delivered before any of that
+attempt's chunks and **whether or not any arrive** — the index alone could not carry the
+boundary, since it rides chunks and an attempt may produce none (a non-streaming adapter, a
+stream carrying only its terminal frame, a frameless gateway stream accepted under `"omit"`).
+Without it a consumer went on rendering a rejected attempt's text beside an `ok` result. The
+events a consumer sees are therefore `AttemptStarted | ModelStreamChunk`.
 The sync facade `call` refuses to run inside an active event loop, so it takes no consumer.
 `ValidatedCallRunner` is frozen: `max_repair_calls` must be an exact non-negative `int`, and a
 budget checked once at construction would not be a budget if a reusable runner could be
