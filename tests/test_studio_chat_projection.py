@@ -396,6 +396,52 @@ def test_chat_projection_backfills_failed_partial_beside_an_existing_error(
     ]
 
 
+@pytest.mark.parametrize("prefix_before_crash", ["prefix before crash", ""])
+def test_chat_projection_fails_closed_when_a_recovered_turn_reuses_its_id(
+    tmp_path: Path,
+    prefix_before_crash: str,
+) -> None:
+    for stream_id, text, started_at in (
+        ("stream-before-crash", prefix_before_crash, "2026-08-01T00:00:00Z"),
+        ("stream-after-restore", "prefix after restore", "2026-08-01T00:00:02Z"),
+    ):
+        _write_terminal_model_content(
+            tmp_path,
+            status="failed",
+            turn_id="turn_0001",
+            stream_id=stream_id,
+            text=text,
+            started_at=started_at,
+        )
+    failed_events = [
+        {
+            "type": "turn.failed",
+            "run_id": "run-1",
+            "turn_id": "turn_0001",
+            "event_id": event_id,
+            "seq": seq,
+            "timestamp": timestamp,
+            "data": {"error": error, "retryable": False},
+        }
+        for event_id, seq, timestamp, error in (
+            ("evt-before-crash", 4, "2026-08-01T00:00:01Z", "first failure"),
+            ("evt-after-restore", 8, "2026-08-01T00:00:03Z", "second failure"),
+        )
+    ]
+
+    projection = ChatProjection(tmp_path)
+    projection.project_events(failed_events, root_run_id="run-1")
+    projection.project_events(failed_events, root_run_id="run-1")
+
+    assert [(record["role"], record["content"]) for record in projection.read()] == [
+        ("error", "first failure"),
+        ("error", "second failure"),
+    ]
+    persisted = projection.path.read_text(encoding="utf-8")
+    assert "prefix before crash" not in persisted
+    assert "prefix after restore" not in persisted
+
+
 def test_chat_projection_omits_retryable_and_explicitly_retried_failed_partials(
     tmp_path: Path,
 ) -> None:

@@ -30,6 +30,10 @@ CHAT_FILE_NAME = "studio.chat.jsonl"
 
 _ASSISTANT_EVENT_TYPES = {"turn.settled", "turn.interrupted"}
 _ERROR_EVENT_TYPES = {"turn.failed", "run.failed", "ModelAdapterError"}
+# Run-level terminal boundaries carry no turn identity. When a model call ends the session through
+# one, that call remains the bounded `/api/model-content` latest snapshot for the browser to restore
+# directly. The turn-level boundaries below permit another call, so their available output must
+# enter durable chat history before that newer live snapshot replaces it.
 _TERMINAL_PARTIAL_EVENT_TYPES = {"turn.failed", "turn.interrupted"}
 
 
@@ -490,19 +494,14 @@ class ChatProjection:
         *,
         root_run_id: str | None,
     ) -> dict[tuple[str, str, str, str], ModelContentSnapshot]:
-        """Select the latest displayable terminal prefix for each exact root turn."""
+        """Select an unambiguous displayable terminal prefix for each exact root turn."""
 
-        latest: dict[
-            tuple[str, str, str, str],
-            tuple[tuple[int, str, str], ModelContentSnapshot],
-        ] = {}
+        unique: dict[tuple[str, str, str, str], ModelContentSnapshot | None] = {}
         for snapshot in read_model_content(self.run_dir).snapshots:
             context = snapshot.context
             if snapshot.status not in {"failed", "interrupted"}:
                 continue
             if snapshot.status == "failed" and snapshot.retryable:
-                continue
-            if not snapshot.best_output_text:
                 continue
             if root_run_id is not None and (
                 context.root_run_id != root_run_id or context.run_id != root_run_id
@@ -514,11 +513,16 @@ class ChatProjection:
                 context.turn_id,
                 snapshot.status,
             )
-            order = (context.step, context.started_at, context.stream_id)
-            previous = latest.get(key)
-            if previous is None or order >= previous[0]:
-                latest[key] = (order, snapshot)
-        return {key: value[1] for key, value in latest.items()}
+            # A crash after the terminal event but before its checkpoint can reuse the same
+            # turn_id on recovery. Terminal events do not carry stream_id, so choosing either
+            # sidecar snapshot would attach private content to the wrong event. Keep an existing
+            # already-projected row, but never invent a new ambiguous join during catch-up.
+            unique[key] = snapshot if key not in unique else None
+        return {
+            key: snapshot
+            for key, snapshot in unique.items()
+            if snapshot is not None and snapshot.best_output_text
+        }
 
     def _records_from_event(
         self,

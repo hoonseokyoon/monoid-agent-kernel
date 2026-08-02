@@ -934,7 +934,10 @@ the exact root/run/turn private sidecar snapshot and stores its available output
 This keeps an earlier failed prefix after a normal new turn replaces the bounded live-hydration
 snapshot. The projection and browser suppress only the exact turn named by an explicit Studio
 Retry, so a lost HTTP response, reload, retained live frames, or hydration cannot restore that
-abandoned prefix. Interrupted partials remain visible.
+abandoned prefix. If recovery reused a turn id and left more than one eligible private stream, the
+projection omits the ambiguous partial rather than attaching content to the wrong terminal event.
+Run-terminal calls stay the latest bounded hydration snapshot because no later turn can replace
+them. Interrupted partials remain visible.
 
 ### Diagnostics
 
