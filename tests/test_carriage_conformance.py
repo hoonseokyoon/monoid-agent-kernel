@@ -44,6 +44,17 @@ is not the ideal: many cells are unbound.  Every one of them is registered in
 *exactly* — a pinned key set, an asserted loss.  So fixing a gap **breaks this suite**, and
 that is the mechanism working: the fixer must update the EXPECTED constant and delete the
 registry entry in the same change.  Do not loosen an assertion to accommodate a fix.
+
+**And the families it does not cover are declared too.**  :data:`FUTURE_FAMILIES` names each
+fact family deliberately left uncensused, with the authority a census would take and how many
+hand-written carriers of it exist today.  Without that list the suite's silence is ambiguous —
+a family with no failing cell reads exactly like a family nobody looked at — and given the
+defect shape this repository keeps producing, an uncensused family with a carrier count is a
+prediction rather than a footnote.
+
+Seven families are covered: ``Suspension``, ``ModelAdapterError`` transport, usage counts, the
+W5 applied-echo protocol, the tool catalog, the checkpoint validator's field coverage, and the
+success envelope (the main wire).
 """
 
 from __future__ import annotations
@@ -62,7 +73,9 @@ from typing import Any, get_args, get_type_hints
 
 import pytest
 
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.lifecycle import REASON_TO_STATE
+from monoid_agent_kernel.core.manifest import _tool_spec_payload as _manifest_tool_spec_payload
 from monoid_agent_kernel.core.result import (
     AgentTurnResult,
     Suspension,
@@ -72,12 +85,16 @@ from monoid_agent_kernel.core.result import (
 )
 from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS, TRANSCRIPT_RECORD_SCHEMA
 from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.tool_surface import (
+    _tool_spec_payload as _transcript_tool_spec_payload,
+)
 from monoid_agent_kernel.errors import ModelAdapterError, TurnNotSettled
 from monoid_agent_kernel.model_call import _recordable_usage
 from monoid_agent_kernel.observability.otel import _chat_finish_attrs, _subagent_finish_attrs
 from monoid_agent_kernel.providers import gateway as gateway_client
 from monoid_agent_kernel.providers._common import normalize_usage
 from monoid_agent_kernel.providers.base import ModelTurn, mark_provider_usage, provider_usage_of
+from monoid_agent_kernel.providers.openai import _openai_tool_schema
 from monoid_agent_kernel.reference.llm_gateway.http import (
     _error_body,
     _model_error_status,
@@ -86,10 +103,18 @@ from monoid_agent_kernel.reference.llm_gateway.http import (
 )
 from monoid_agent_kernel.reference.llm_gateway.service import (
     LLM_TURN_PROTOCOL_VERSION,
+    _TOOL_SCHEMA_KEYS,
+    LlmGatewayBackend,
     LlmGatewayTurnRequest,
     LlmGatewayUsage,
     _applied_echoes,
+    _parse_tool,
 )
+from monoid_agent_kernel.reference.studio.server import (
+    _gateway_tool_schema as _studio_gateway_tool_schema,
+)
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.tools.base import ToolSpec
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "monoid_agent_kernel"
@@ -294,6 +319,118 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "all reject, so one stamp reads as three different usages depending on the consumer",
         "burn-down",
     ),
+    # --- config_recoverable: the consumers that were designed for it and ignore it -----
+    CarriageGap(
+        "transportable-error",
+        "config_recoverable",
+        "reference/backend/session_drive.py:drive_open_session",
+        "the designed consumer branches on retryable only, so a config-recoverable park is "
+        "treated exactly like any other non-retryable turn failure: the driver gives up and "
+        "promotes it rather than surfacing the config fix the classification exists to name",
+        "burn-down",
+    ),
+    CarriageGap(
+        "transportable-error",
+        "config_recoverable",
+        "core/model_io.py:ModelCallReceipt",
+        "with_error reads five facts off the exception (error_code, provider_error_code, "
+        "retryable, http_status, provider_retried) and not this one, so the immutable record "
+        "of the call cannot say the failure was config-fixable",
+        "burn-down",
+    ),
+    CarriageGap(
+        "transportable-error",
+        "config_recoverable",
+        "core/model_stream.py:ModelStreamOutcome",
+        "the stream_closed record (core/schemas.py, additionalProperties False) carries "
+        "retryable and no config_recoverable, so the live stream lane classifies a park with "
+        "half the vocabulary the park itself carries — and the closed cap means adding it is a "
+        "schema change, not an oversight to patch",
+        "burn-down",
+    ),
+    # --- turn.failed: written by the kernel, consumed by nobody ------------------------
+    CarriageGap(
+        "suspension",
+        "turn.failed",
+        "reference/backend/run_state.py:record_event",
+        "no status projection consumes turn.failed (neither this one nor core/projections.py), "
+        "so a run parked in TURN_FAILED serves error=\"\" over HTTP: the event carries the whole "
+        "classification and the surface an operator actually reads shows none of it",
+        "burn-down",
+    ),
+    CarriageGap(
+        "suspension",
+        "reason",
+        "loop.py:_apump_turn",
+        "turn.interrupted's data.reason is a *cause* vocabulary (\"user_stop\") while "
+        "Suspension.reason is a *park* vocabulary (\"interrupted\"), one word for two "
+        "vocabularies on one event; and the pause twin emits no turn.paused at all, only a "
+        "session.state.changed, so the two sibling parks are not observable the same way",
+        "burn-down",
+    ),
+    CarriageGap(
+        "suspension",
+        "last_suspension",
+        "core/checkpoint.py:_validate_checkpoint_payload",
+        "the durable park payload is validated as \"an object or null\" and nothing more — it "
+        "has no schema of its own, so every field the census pins on the writer/reader pair is "
+        "unpinned on the durable artifact itself; this suite is currently its only twin",
+        "burn-down",
+    ),
+    # --- the success wire ---------------------------------------------------------------
+    CarriageGap(
+        "success-envelope",
+        "reasoning",
+        "reference/llm_gateway/service.py:LlmGatewayBackend",
+        "ModelTurn.reasoning reaches neither writer (the sync body nor the terminal frame) and "
+        "neither client reader names the key, so the provider-native reasoning round-trip the "
+        "adapters are built around (encrypted_content replay) is dead through the gateway. "
+        "Symmetric across both transports, which is what makes it a missing feature rather than "
+        "a twin that fell out of step: closing it means one wire key on two writers and two "
+        "readers, in one change",
+        "burn-down",
+    ),
+    # --- tool catalog ------------------------------------------------------------------
+    CarriageGap(
+        "tool-spec",
+        "input_schema",
+        "core/manifest.py:_tool_spec_payload",
+        "embeds the schema raw and is portable only because RunManifest.to_json normalizes the "
+        "whole assembled manifest one frame up; its transcript twin (core/tool_surface.py) "
+        "needed the substitution locally, so this projection is one caller away from the same "
+        "anonymous durability failure",
+        "burn-down",
+    ),
+    CarriageGap(
+        "tool-spec",
+        "id",
+        "providers/openai.py:_openai_tool_schema",
+        "the Responses API keys a tool by name, so the kernel id has no slot and the mapping "
+        "back is carried entirely by exported_name being stable: by design, and the reason a "
+        "provider_name change is a wire-compatibility change",
+        "by-design",
+    ),
+    # --- checkpoint validation ---------------------------------------------------------
+    CarriageGap(
+        "checkpoint",
+        "schema_version",
+        "core/checkpoint.py:_validate_checkpoint_payload",
+        "the one RunCheckpoint field no branch of the validator inspects; the codec owns the "
+        "version envelope, so this is the documented exclusion rather than a hole -- pinned so "
+        "a SECOND unvalidated field cannot join it quietly",
+        "by-design",
+    ),
+    # --- by-design provenance splits ---------------------------------------------------
+    CarriageGap(
+        "applied-echo",
+        "provider_retried",
+        "providers/gateway.py:GatewayModelAdapter",
+        "the frameless-stream check reads the client's own attempt>1 while the framed check "
+        "reads chunk.provider_retried: by design, because a stream with no terminal frame "
+        "carries no server-side retry evidence to read, and the client's own attempt count is "
+        "the only true thing left to say",
+        "by-design",
+    ),
     # --- W5 applied-echo protocol ------------------------------------------------------
     CarriageGap(
         "applied-echo",
@@ -384,26 +521,157 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class FutureFamily:
+    """A fact family this census does NOT cover yet, declared so the omission is a decision.
+
+    ``KNOWN_GAPS`` says "this cell is unbound"; this says "this whole family is uncensused".
+    Without it the suite's silence is ambiguous — a family with no failing cell reads exactly
+    like a family nobody looked at — and the shape this repository keeps producing is a fact
+    riding N hand-written carriers, so an uncensused family with a carrier count is a
+    prediction, not a note.
+    """
+
+    family: str
+    # "path:symbol" — the thing a census of this family would take as its authority.
+    authority: str
+    # How many independent hand-written carriers of that authority exist today.
+    carrier_count: int
+    risk: str
+    disposition: str
+
+
+FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
+    FutureFamily(
+        "model-config wire block",
+        "core/spec.py:ModelConfig",
+        4,
+        "the client writes the block (providers/gateway.py:_payload) and the server rebuilds it "
+        "(reference/llm_gateway/service.py:_parse_turn_request), with two special carriages that "
+        "exist because a missing key is the *default* on the rebuild, not 'unset': off-default "
+        "on_unsupported, and effort='default' whose omission sentinel differs from the codec's "
+        "reconstruction default. A third such field would be a silent policy override",
+        "burn-down",
+    ),
+    FutureFamily(
+        "model-config transport policy",
+        "reference/llm_gateway/service.py:_upstream_model_config",
+        1,
+        "the rebuilt upstream config takes default timeout_s/retry rather than the caller's. "
+        "By design: the wire block never carries them (providers/gateway.py:_payload emits only "
+        "model/reasoning/generation), so each hop owns its own transport policy — the client's "
+        "timeout bounds the call to the gateway, the server's bounds the call to the provider. "
+        "The test that separates 'must ride' from 'per-hop' is whether a default silently "
+        "*overrides a caller's stated intent*, which is exactly why on_unsupported was added",
+        "by-design",
+    ),
+    FutureFamily(
+        "run limits",
+        "core/spec.py:RunLimits",
+        1,
+        "core/manifest.py:_run_manifest carries 4 of 15 limits into the run manifest, so the "
+        "durable record of what a run was allowed to do omits every token budget, every "
+        "subagent bound and the message-log caps",
+        "burn-down",
+    ),
+    FutureFamily(
+        "stream frames",
+        "providers/base.py:ModelStreamChunk",
+        2,
+        "reference/llm_gateway/service.py:_chunk_to_frame is a second hand-built frame writer "
+        "beside the four to_json codecs, read back by providers/gateway.py:_chunk_from_event; "
+        "a field added to a chunk type reaches neither unless both are edited",
+        "burn-down",
+    ),
+    FutureFamily(
+        "stream-outcome usage lane",
+        "core/model_stream.py:ModelStreamOutcome",
+        3,
+        "outcome -> the stream_closed record (core/schemas.py, additionalProperties False) -> "
+        "the live frame the studio reads; the record carries retryable but not "
+        "config_recoverable, and a closed cap means a new fact is a schema change",
+        "burn-down",
+    ),
+    FutureFamily(
+        "outbox request codec",
+        "core/outbox.py:OutboxRequest",
+        3,
+        "codec + event subsets + the backend's redrive read; a field added to the request that "
+        "the event subset omits is invisible to an operator watching a stuck outbox",
+        "burn-down",
+    ),
+    FutureFamily(
+        "capability lease",
+        "core/capability.py:CapabilityLease",
+        3,
+        "lease dataclass, checkpoint payload and the control envelope that grants it",
+        "burn-down",
+    ),
+    FutureFamily(
+        "hosted tasks",
+        "tasks.py:HostedTask",
+        3,
+        "task record, checkpoint payload and the run.awaiting_input/backend frames that name "
+        "its ids (already one registered alias: task_ids vs awaiting_task_ids)",
+        "burn-down",
+    ),
+    FutureFamily(
+        "control envelope",
+        "core/control.py:ControlCommand",
+        2,
+        "the control-command.v1 wire shape and its dispatch table; an unknown command field is "
+        "dropped silently at the boundary",
+        "burn-down",
+    ),
+    FutureFamily(
+        "content-part vocabulary",
+        "core/content.py:ContentPart",
+        3,
+        "five part types spelled in the union, the to_json/from_json codec pair and the "
+        "provider-side mappers; a sixth type reaching only the codec drops at the adapters",
+        "burn-down",
+    ),
+    FutureFamily(
+        "status.json projection",
+        "recorder.py:StatusJsonSink",
+        2,
+        "the sink writes a metrics key STATUS_SCHEMA does not declare, so the operator-facing "
+        "status file is already wider than its own schema",
+        "burn-down",
+    ),
+)
+
+
 def test_registry_entries_are_well_formed() -> None:
     assert KNOWN_GAPS
     for gap in KNOWN_GAPS:
         assert gap.disposition in DISPOSITIONS, gap
         assert ":" in gap.carrier, gap
         assert gap.gap.strip(), gap
+    assert FUTURE_FAMILIES
+    for family in FUTURE_FAMILIES:
+        assert family.disposition in DISPOSITIONS, family
+        assert ":" in family.authority, family
+        assert family.carrier_count >= 1, family
+        assert family.risk.strip(), family
+    # A declared future family must not silently overlap a family the census already covers.
+    assert len({family.family for family in FUTURE_FAMILIES}) == len(FUTURE_FAMILIES)
 
 
 def test_registry_carrier_locations_exist() -> None:
     """A renamed carrier must rot its registry entry rather than point at nothing."""
 
     missing: list[str] = []
-    for gap in KNOWN_GAPS:
-        relative_path, symbol = gap.carrier.split(":", 1)
+    for location in [gap.carrier for gap in KNOWN_GAPS] + [
+        family.authority for family in FUTURE_FAMILIES
+    ]:
+        relative_path, symbol = location.split(":", 1)
         path = PACKAGE / relative_path
         if not path.is_file():
-            missing.append(f"{gap.carrier} (no such file)")
+            missing.append(f"{location} (no such file)")
             continue
         if symbol not in path.read_text(encoding="utf-8"):
-            missing.append(f"{gap.carrier} (symbol absent)")
+            missing.append(f"{location} (symbol absent)")
     assert missing == [], {"stale_registry_entries": missing}
 
 
@@ -826,7 +1094,7 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
 )
 
 
-def _literal_wire_keys(function: _FunctionNode) -> frozenset[str]:
+def _literal_wire_keys(function: ast.AST) -> frozenset[str]:
     """Wire keys named literally in ``function``: ``x.get("k")``, ``x["k"]``, ``"k" in x``, and
     the literal key arguments it hands to the module's wire-reading helpers."""
 
@@ -2171,6 +2439,750 @@ def test_4b_the_sync_reader_reads_the_same_echo_keys_the_stream_reader_does() ->
 
 
 # --------------------------------------------------------------------------------------
+# Family 5 — the tool catalog
+# --------------------------------------------------------------------------------------
+#
+# The highest-carrier-count family in the repository and, until now, the least covered: one
+# ``ToolSpec`` is projected by six independent hand-written dict builders (two request writers,
+# one server reader, two record writers, one preview writer), each choosing its own subset. A
+# field added to the dataclass reaches none of them, and nothing says so.
+
+
+def _maximal_tool_spec() -> ToolSpec:
+    """Every ToolSpec field at a distinguishable non-default value."""
+
+    def _handler(_context: Any, _args: dict[str, Any]) -> Any:  # pragma: no cover - never run
+        raise NotImplementedError
+
+    return ToolSpec(
+        id="fs.read",
+        description="Read a file from the workspace.",
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+        capability="fs.read",
+        side_effect="write",
+        handler=_handler,
+        provider_name="workspace_read",
+        path_args=("path",),
+        preview_kind="shell",
+        emits_workspace_diff=True,
+        changed_paths_source="result_content",
+        result_payload_kind="shell_exec",
+        skip_emit_if_background=True,
+        guidance={"when": "reading a file"},
+        examples=({"path": "notes.md"},),
+        annotations={"readOnlyHint": True},
+    )
+
+
+def test_maximal_tool_spec_covers_every_authority_field() -> None:
+    built = _maximal_tool_spec()
+    default_marker = ToolSpec(
+        id="x",
+        description="x",
+        input_schema={},
+        capability="x",
+        side_effect="read",
+        handler=built.handler,
+    )
+    required = {"id", "description", "input_schema", "capability", "side_effect", "handler"}
+    undistinguished = {
+        field.name
+        for field in dataclasses.fields(ToolSpec)
+        if field.name not in required
+        and getattr(built, field.name) == getattr(default_marker, field.name)
+    }
+    assert undistinguished == set(), {
+        "fields_left_at_their_default": sorted(undistinguished),
+        "hint": "extend _maximal_tool_spec so every field is distinguishable from its default",
+    }
+    # ``exported_name`` is a derived property, not a field: it is how ``provider_name`` travels.
+    assert built.exported_name == "workspace_read"
+
+
+TOOL_SPEC_AUTHORITY = frozenset(field.name for field in dataclasses.fields(ToolSpec))
+
+# Shared justifications, so an omission is a stated reason rather than a shrug.
+_NOT_SERIALIZABLE = "a Python callable; nothing to put on a wire or in a record"
+_ENGINE_DISPATCH = (
+    "engine-local dispatch hint: it describes how the kernel runs and previews the call, not "
+    "what the model may send, so a provider/gateway request has no slot for it"
+)
+_MODEL_UNREADABLE = (
+    "prompt-side enrichment the kernel renders into the tool surface itself; a provider tool "
+    "definition has no field for it"
+)
+
+
+@dataclass(frozen=True)
+class ToolSpecCarrier:
+    """One projection of a ToolSpec, its wire keys, and what it does with each authority field."""
+
+    carrier: str
+    build: Any
+    # wire key -> the authority field it carries ("" = a constant this projection adds).
+    key_to_field: dict[str, str]
+    # authority field -> why this projection omits it.
+    omissions: dict[str, str]
+
+
+TOOL_SPEC_CARRIERS: tuple[ToolSpecCarrier, ...] = (
+    ToolSpecCarrier(
+        "providers/gateway.py:_gateway_tool_schema",
+        gateway_client._gateway_tool_schema,
+        {
+            "id": "id",
+            "name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "reference/studio/server.py:_gateway_tool_schema",
+        _studio_gateway_tool_schema,
+        {
+            "id": "id",
+            "name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "providers/openai.py:_openai_tool_schema",
+        _openai_tool_schema,
+        {
+            "type": "",  # the Responses API's own discriminator
+            "name": "provider_name",
+            "description": "description",
+            "parameters": "input_schema",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            # The provider addresses tools by name; the kernel id has no slot in this schema,
+            # which is exactly why ``exported_name`` has to be stable.
+            "id": "not carried: the Responses API keys a tool by name, and the kernel id is "
+            "recovered from the exported name on the way back",
+            "capability": "kernel authorization vocabulary; the provider neither reads nor "
+            "enforces it",
+            "side_effect": "kernel authorization vocabulary; the provider neither reads nor "
+            "enforces it",
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "core/manifest.py:_tool_spec_payload",
+        _manifest_tool_spec_payload,
+        {
+            "id": "id",
+            "exported_name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+            "path_args": "path_args",
+            "guidance": "guidance",
+            "examples": "examples",
+            "annotations": "annotations",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+        },
+    ),
+    ToolSpecCarrier(
+        "core/tool_surface.py:_tool_spec_payload",
+        _transcript_tool_spec_payload,
+        {
+            "id": "id",
+            "exported_name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+            "path_args": "path_args",
+            "guidance": "guidance",
+            "examples": "examples",
+            "annotations": "annotations",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize("carrier", TOOL_SPEC_CARRIERS, ids=lambda item: item.carrier)
+def test_5a_every_tool_spec_projection_accounts_for_every_authority_field(
+    carrier: ToolSpecCarrier,
+) -> None:
+    """Each projection's key set is pinned, and each omitted field carries a stated reason.
+
+    The point is not that the subsets are equal -- they should not be, a provider schema is not
+    a durable record -- but that each difference is a decision someone wrote down. Six builders
+    choosing silently is how a new declarative hint reaches the engine and nothing else.
+    """
+
+    produced = carrier.build(_maximal_tool_spec())
+    assert frozenset(produced) == frozenset(carrier.key_to_field), {
+        "carrier": carrier.carrier,
+        "emitted_but_unregistered": sorted(set(produced) - set(carrier.key_to_field)),
+        "registered_but_not_emitted": sorted(set(carrier.key_to_field) - set(produced)),
+    }
+    accounted = {field for field in carrier.key_to_field.values() if field} | set(
+        carrier.omissions
+    )
+    assert accounted == TOOL_SPEC_AUTHORITY, {
+        "carrier": carrier.carrier,
+        "authority_fields_with_no_verdict": sorted(TOOL_SPEC_AUTHORITY - accounted),
+        "verdicts_for_fields_that_do_not_exist": sorted(accounted - TOOL_SPEC_AUTHORITY),
+        "hint": "a new ToolSpec field: carry it here or justify the omission",
+    }
+    for field_name, reason in carrier.omissions.items():
+        assert reason.strip(), (carrier.carrier, field_name)
+    # Every carried key really carries that field's value (a key set cannot show a mis-wiring).
+    spec = _maximal_tool_spec()
+    for key, field_name in carrier.key_to_field.items():
+        if not field_name:
+            continue
+        expected = spec.exported_name if field_name == "provider_name" else getattr(
+            spec, field_name
+        )
+        if isinstance(expected, tuple):
+            expected = [dict(item) if isinstance(item, dict) else item for item in expected]
+        assert produced[key] == expected, {"carrier": carrier.carrier, "key": key}
+
+
+def test_5b_only_the_record_projections_substitute_a_non_finite_schema() -> None:
+    """The request/record split, censused across all five projections at once.
+
+    A request keeps the value so the provider boundary refuses the call as a classified,
+    config-recoverable bad request; a record substitutes it because portable JSON cannot carry
+    it and a run's durability must not depend on a tool author's schema. Which side each
+    projection is on is a property of the projection, so it is pinned per projection.
+    """
+
+    spec = dataclasses.replace(
+        _maximal_tool_spec(),
+        input_schema={"type": "object", "enum": [float("nan")]},
+    )
+    substituting = set()
+    for carrier in TOOL_SPEC_CARRIERS:
+        produced = carrier.build(spec)
+        schema_key = "parameters" if "parameters" in produced else "input_schema"
+        if produced[schema_key]["enum"] == [None]:
+            substituting.add(carrier.carrier)
+        else:
+            assert produced[schema_key]["enum"][0] != produced[schema_key]["enum"][0]  # NaN
+    assert substituting == {
+        "core/tool_surface.py:_tool_spec_payload",
+        # An HTTP egress *describing* a request is a record of one, and this endpoint
+        # serializes with allow_nan=False.
+        "reference/studio/server.py:_gateway_tool_schema",
+    }, {
+        "substituting_projections": sorted(substituting),
+        "hint": "a projection changed sides: that is a request/record decision, not a refactor",
+    }
+    # The manifest is a record too, and it substitutes -- but one level up, in
+    # ``RunManifest.to_json``, which normalizes the whole assembled manifest. So the projection
+    # itself is on the request side of this rule and is only safe because of its caller
+    # (registered burn-down: the transcript twin needed the substitution *locally*, and
+    # ``_tool_spec_payload`` is not the manifest's only caller-shaped surface).
+    from monoid_agent_kernel.core.manifest import RunManifest
+
+    manifest_payload = _manifest_tool_spec_payload(spec)
+    assert manifest_payload["input_schema"]["enum"][0] != manifest_payload["input_schema"]["enum"][0]
+    assert normalize_json_ingress(manifest_payload)["input_schema"]["enum"] == [None]
+    assert "normalize_json_ingress" in inspect.getsource(RunManifest.to_json)
+
+
+# reference/llm_gateway/service.py:_parse_tool — the server's reader. Its schema spellings come
+# from the shared ``_TOOL_SCHEMA_KEYS`` tuple, so the reader and the server's ingress cannot
+# disagree about which keys hold a schema (bc77022).
+PARSE_TOOL_READ_KEYS = frozenset(
+    {"id", "name", "description", "capability", "side_effect", "input_schema", "parameters"}
+)
+
+
+def test_5c_the_server_reader_reads_exactly_what_the_request_writers_write() -> None:
+    parse_tool = _function_node("reference/llm_gateway/service.py", "_parse_tool")
+    read = {
+        node.args[1].value
+        for node in ast.walk(parse_tool)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "parse_str"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    }
+    # The two schema spellings arrive through the shared tuple, not as literals here.
+    assert any(
+        isinstance(node, ast.Name) and node.id == "_TOOL_SCHEMA_KEYS"
+        for node in ast.walk(parse_tool)
+    ), "the reader stopped using the shared schema-key tuple"
+    read |= set(_TOOL_SCHEMA_KEYS)
+    assert read == PARSE_TOOL_READ_KEYS, {
+        "newly_read": sorted(read - PARSE_TOOL_READ_KEYS),
+        "no_longer_read": sorted(PARSE_TOOL_READ_KEYS - read),
+    }
+    # Every key the gateway request writer emits is read back; the reverse holds through the
+    # ``parameters`` alias, which exists for tool entries written by a non-kernel client.
+    written = frozenset(gateway_client._gateway_tool_schema(_maximal_tool_spec()))
+    assert written <= read
+    assert read - written == {"parameters"}
+
+
+def test_5c_the_server_reader_reconstructs_only_the_fields_the_wire_carries() -> None:
+    """Behavioral twin: what a ToolSpec looks like after a round trip through the gateway."""
+
+    spec = _maximal_tool_spec()
+    restored = _parse_tool(gateway_client._gateway_tool_schema(spec))
+    survived = {
+        field.name
+        for field in dataclasses.fields(ToolSpec)
+        if field.name != "handler" and getattr(restored, field.name) == getattr(spec, field.name)
+    }
+    assert survived == {
+        "id",
+        "description",
+        "input_schema",
+        "capability",
+        "side_effect",
+        "provider_name",
+    }, {
+        "survived_the_hop": sorted(survived),
+        "hint": "the request wire carries six fields; the rest are engine-local by design",
+    }
+    # The server's stand-in handler refuses execution rather than pretending to run the tool.
+    assert restored.handler is not spec.handler
+
+
+# --------------------------------------------------------------------------------------
+# Family 6 — the checkpoint validator's field coverage
+# --------------------------------------------------------------------------------------
+
+# core/checkpoint.py:_validate_checkpoint_payload is driven by five hand-maintained field-name
+# frozensets plus a handful of inline branches. It is the durable-recovery boundary and it fails
+# OPEN: a field nobody listed is simply never type-checked, so a corrupt or hostile payload
+# reaches ``RunCheckpoint(**payload)`` with an arbitrary Python value in it. The names below are
+# the inline branches, listed here so the diff below is total.
+CHECKPOINT_INLINE_VALIDATED = frozenset(
+    {
+        "run_id",
+        "pending_user_input",
+        "previous_runtime_config",
+        "workspace_base",
+        "last_suspension",
+        "tool_call_counts",
+        "total_usage",
+        "revoked_before",
+        "remaining_duration_s",
+        "queued_messages",
+        "active_input",
+        "applied_input_receipts",
+    }
+)
+# The documented exclusion: the codec owns the version envelope (core/durable.py), so the
+# payload validator never sees a checkpoint whose schema_version it did not accept.
+CHECKPOINT_UNVALIDATED = frozenset({"schema_version"})
+
+
+def test_6a_every_checkpoint_field_is_validated_by_exactly_one_mechanism() -> None:
+    from monoid_agent_kernel.core import checkpoint as checkpoint_module
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+
+    frozensets = {
+        name: value
+        for name, value in vars(checkpoint_module).items()
+        if name.startswith("_CHECKPOINT_") and isinstance(value, frozenset)
+    }
+    assert len(frozensets) == 6, {
+        "checkpoint_field_frozensets": sorted(frozensets),
+        "hint": "a new validation bucket must join this census",
+    }
+    listed: set[str] = set()
+    for name, value in frozensets.items():
+        overlap = listed & set(value)
+        assert overlap == set(), {"field_in_two_buckets": sorted(overlap), "bucket": name}
+        listed |= set(value)
+
+    authority = set(RunCheckpoint.__dataclass_fields__)
+    covered = listed | CHECKPOINT_INLINE_VALIDATED
+    assert covered - authority == set(), {
+        "validated_but_not_a_field": sorted(covered - authority),
+        "hint": "a bucket names a field the dataclass dropped: the check is dead",
+    }
+    assert authority - covered == CHECKPOINT_UNVALIDATED, {
+        "unvalidated_fields": sorted(authority - covered),
+        "hint": "a new RunCheckpoint field escapes validation entirely — this validator fails "
+        "open, so an unlisted field is never type-checked at the recovery boundary",
+    }
+
+
+def test_6a_the_inline_branches_named_here_are_the_branches_that_exist() -> None:
+    """The inline half is a hand list too, so it is diffed against the source it describes."""
+
+    validator = _function_node("core/checkpoint.py", "_validate_checkpoint_payload")
+    inline = {
+        node.left.value
+        for node in ast.walk(validator)
+        if isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.In)
+        and isinstance(node.left, ast.Constant)
+        and isinstance(node.left.value, str)
+    }
+    inline |= {
+        element.value
+        for node in ast.walk(validator)
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
+        for element in node.iter.elts
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    # ``run_id`` is read positionally rather than membership-tested, so it is added by hand.
+    inline.add("run_id")
+    assert inline == CHECKPOINT_INLINE_VALIDATED, {
+        "newly_inline": sorted(inline - CHECKPOINT_INLINE_VALIDATED),
+        "no_longer_inline": sorted(CHECKPOINT_INLINE_VALIDATED - inline),
+    }
+
+
+def test_6b_the_park_payload_is_validated_as_an_object_and_nothing_more() -> None:
+    """The registered gap, pinned: ``last_suspension`` has no schema of its own.
+
+    Every field family 1 pins on the writer/reader pair is unpinned on the durable artifact —
+    the validator accepts any object at all, so a park payload with a string ``retryable``
+    reaches the reader, which is where it becomes a ValueError instead of a clear rejection.
+    """
+
+    from monoid_agent_kernel.core.checkpoint import _validate_checkpoint_payload
+
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": {"anything": [1, 2, 3]}})
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": None})
+    with pytest.raises(ValueError):
+        _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": "not an object"})
+
+
+# --------------------------------------------------------------------------------------
+# Family 7 — the success envelope (the main wire)
+# --------------------------------------------------------------------------------------
+#
+# Families 2–4 census the failure wire and the proof wire. The wire that carries every ordinary
+# turn had no census at all: two hand-built server writers (a JSON body and an SSE terminal
+# frame) read back by two hand-written client parsers, with one fact renamed across the hop.
+
+GATEWAY_SUCCESS_BODY_KEYS = frozenset(
+    {
+        "protocol",
+        "turn_handle",
+        "final_text",
+        "tool_calls",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+        "generation_applied",
+        "schema_applied",
+    }
+)
+GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
+    {
+        "type",
+        "turn_handle",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+        "generation_applied",
+        "schema_applied",
+    }
+)
+# The frame is the body minus what the deltas already delivered, minus the protocol tag the
+# stream states once in its content type. Declared, so a *new* omission is not read as one of
+# these.
+TERMINAL_FRAME_DELIBERATE_OMISSIONS = frozenset({"protocol", "final_text", "tool_calls"})
+
+
+class _EverythingAdapter:
+    """A stub upstream that answers one maximal turn and declares native support for both echoes."""
+
+    generation_support = "native"
+    structured_output_support = "native"
+
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        return ModelTurn(
+            response_id="provider_response_secret",
+            final_text="answered",
+            tool_calls=(),
+            usage={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            raw={"anything": True},
+            reasoning=({"type": "reasoning", "id": "rs_1"},),
+            stop_reason="stop",
+            provider_retried=True,
+        )
+
+
+def _gateway_and_token() -> tuple[LlmGatewayBackend, str]:
+    manager = TokenManager.from_secret("c" * 32)
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: _EverythingAdapter(),
+    )
+    token = manager.issue(
+        kind="llm_gateway",
+        audience="csp.llm-gateway",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=600,
+        metadata={"agent_config_hash": "census"},
+    )
+    return gateway, token
+
+
+def _maximal_turn_payload() -> dict[str, Any]:
+    """A request that exercises every optional block, so every echo is emitted."""
+
+    return {
+        "protocol": LLM_TURN_PROTOCOL_VERSION,
+        "model": "gateway-model",
+        "system_prompt": "sys",
+        "instruction": "do the thing",
+        "generation": {"temperature": 0.5},
+        "output_schema": {"type": "object"},
+        "tools": [gateway_client._gateway_tool_schema(_maximal_tool_spec())],
+    }
+
+
+def test_7a_the_sync_success_body_writes_exactly_the_censused_key_set() -> None:
+    gateway, token = _gateway_and_token()
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    assert frozenset(body) == GATEWAY_SUCCESS_BODY_KEYS, {
+        "missing": sorted(GATEWAY_SUCCESS_BODY_KEYS - set(body)),
+        "extra": sorted(set(body) - GATEWAY_SUCCESS_BODY_KEYS),
+    }
+    # The opaque handle is the gateway's own; the provider's response id never leaves.
+    assert body["turn_handle"].startswith("turn_")
+    assert "provider_response_secret" not in json.dumps(body)
+    assert body["provider_retried"] is True
+
+
+def test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered() -> None:
+    gateway, token = _gateway_and_token()
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert frozenset(terminal) == GATEWAY_TERMINAL_FRAME_KEYS, {
+        "missing": sorted(GATEWAY_TERMINAL_FRAME_KEYS - set(terminal)),
+        "extra": sorted(set(terminal) - GATEWAY_TERMINAL_FRAME_KEYS),
+    }
+    dropped = GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_TERMINAL_FRAME_KEYS
+    assert dropped == TERMINAL_FRAME_DELIBERATE_OMISSIONS, {
+        "dropped_on_the_streamed_transport": sorted(dropped),
+        "hint": "a NEW omission here is a fact one transport carries and the other does not",
+    }
+    # The dropped facts really were delivered as deltas, so the omission is a re-encoding.
+    assert any(frame.get("type") == "text_delta" for frame in frames)
+    # Both transports answer the same echoes, built by the same function.
+    assert {key: terminal[key] for key in APPLIED_ECHO_KEYS} == {
+        "generation_applied": {"temperature": 0.5},
+        "schema_applied": True,
+    }
+
+
+def test_7b_reasoning_artifacts_do_not_cross_the_gateway_hop_on_either_transport() -> None:
+    """Registered burn-down, and pinned as *symmetric* so it reads as a gap, not a drift.
+
+    ``ModelTurn.reasoning`` is what the provider-native reasoning round-trip (DX-13a) replays,
+    and the gateway's two writers have no slot for it — so a run routed through the gateway
+    replays nothing, on both transports equally. Symmetry is the point: this is a feature the
+    hop never carried, not a twin that fell out of step, and closing it means adding a wire key
+    to both writers and both readers at once.
+    """
+
+    gateway, token = _gateway_and_token()
+    upstream = _EverythingAdapter().next_turn(None)
+    assert upstream.reasoning, "the stub must actually produce reasoning artifacts"
+
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    assert "reasoning" not in body
+    assert all("reasoning" not in frame for frame in frames)
+    # And the client cannot reconstruct one: neither reader names the key.
+    for reader in GATEWAY_READER_WIRE_KEYS.values():
+        assert "reasoning" not in reader
+
+
+# What each client parser reads on the SUCCESS path, pinned separately from the error path so
+# the two halves of one function cannot cover for each other.
+SUCCESS_READS_R1 = frozenset(
+    {
+        "error",
+        "provider_retried",
+        "retryable",
+        "usage",
+        "tool_calls",
+        "arguments",
+        "id",
+        "call_id",
+        "name",
+        "stop_reason",
+        "response_id",
+        "turn_handle",
+        "final_text",
+    }
+)
+TURN_COMPLETE_READS_R2 = frozenset(
+    {
+        "turn_handle",
+        "response_id",
+        "usage",
+        "stop_reason",
+        "generation_applied",
+        "schema_applied",
+    }
+)
+# Reads with no writer, each one accounted for.
+SUCCESS_DANGLING_READS: dict[str, str] = {
+    "error": "the envelope discriminator: one parser serves both shapes and tests this key "
+    "before branching, so it is read on the success path and written only on the error one",
+    "response_id": "alias: the gateway writes turn_handle, and the same parser also serves a "
+    "non-gateway body that spells it response_id — declared in the reader's key order",
+    "retryable": "defensive: the success path type-checks the key in case an error body arrives "
+    "without its error field, so a malformed envelope is refused rather than half-read",
+    "id": "alias inside a tool_call entry: the gateway writes call_id, the parser accepts either",
+}
+
+
+def _success_branch_reads() -> frozenset[str]:
+    parser = _function_node("providers/gateway.py", "_parse_gateway_response")
+    error_branch = next(
+        node
+        for node in parser.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == "error"
+    )
+    outside = ast.Module(
+        body=[statement for statement in parser.body if statement is not error_branch],
+        type_ignores=[],
+    )
+    return _literal_wire_keys(outside)
+
+
+def _turn_complete_branch_reads() -> frozenset[str]:
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    branch = next(
+        node
+        for node in ast.walk(reader)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and node.test.comparators
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "turn_complete"
+    )
+    return _literal_wire_keys(branch)
+
+
+def test_7c_the_client_reads_the_success_wire_the_server_writes() -> None:
+    read = _success_branch_reads()
+    assert read == SUCCESS_READS_R1, {
+        "newly_read": sorted(read - SUCCESS_READS_R1),
+        "no_longer_read": sorted(SUCCESS_READS_R1 - read),
+    }
+    # Nested tool-call keys are written per entry, not at the top level of the body.
+    nested = {"arguments", "id", "call_id", "name"}
+    top_level_read = read - nested
+    unwritten = top_level_read - GATEWAY_SUCCESS_BODY_KEYS
+    assert unwritten == set(SUCCESS_DANGLING_READS) - nested, {
+        "read_but_never_written": sorted(unwritten),
+        "accounted_for": sorted(SUCCESS_DANGLING_READS),
+    }
+    unread = GATEWAY_SUCCESS_BODY_KEYS - read - set(APPLIED_ECHO_KEYS)
+    assert unread == {"protocol"}, {
+        "written_but_never_read": sorted(unread),
+        "hint": "the client ignores the protocol tag: version negotiation is the server's job",
+    }
+    for reason in SUCCESS_DANGLING_READS.values():
+        assert reason.strip()
+
+
+def test_7c_the_client_reads_the_terminal_frame_the_server_writes() -> None:
+    read = _turn_complete_branch_reads()
+    assert read == TURN_COMPLETE_READS_R2, {
+        "newly_read": sorted(read - TURN_COMPLETE_READS_R2),
+        "no_longer_read": sorted(TURN_COMPLETE_READS_R2 - read),
+    }
+    # ``type`` and ``provider_retried`` are read before the branch, for every frame type.
+    pre_branch = _literal_wire_keys(_function_node("providers/gateway.py", "_chunk_from_event"))
+    assert {"type", "provider_retried"} <= pre_branch
+    unwritten = read - GATEWAY_TERMINAL_FRAME_KEYS
+    assert unwritten == {"response_id"}, {
+        "read_but_never_written": sorted(unwritten),
+        "hint": "the same turn_handle/response_id alias the sync parser carries",
+    }
+    assert GATEWAY_TERMINAL_FRAME_KEYS - read - {"type", "provider_retried"} == set()
+
+
+def test_7d_one_fact_two_spellings_across_the_success_hop() -> None:
+    """The alias is declared here rather than inferred, like the three in the error family."""
+
+    gateway, token = _gateway_and_token()
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    turn = gateway_client._parse_gateway_response(dict(body))
+    # Written as ``turn_handle``, reconstructed as ``ModelTurn.response_id``.
+    assert turn.response_id == body["turn_handle"]
+    assert "response_id" not in body
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    chunk = gateway_client._chunk_from_event(dict(frames[-1]))
+    assert chunk.response_id == frames[-1]["turn_handle"]
+
+
+# --------------------------------------------------------------------------------------
 # New-carrier backstop
 # --------------------------------------------------------------------------------------
 
@@ -2376,6 +3388,27 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
     # ``core/checkpoint.py`` and ``core/spec.py`` carry aliased facts under other names
     # (``provider_http_status``, an omitted ``generation`` block), so no headline-name scan
     # reaches them and they are registered without appearing in one.
-    alias_only = {"core/checkpoint.py", "core/spec.py"}
+    alias_only = {
+        "core/checkpoint.py",
+        "core/spec.py",
+        # Registered for what they DO NOT carry: the driver that branches on retryable
+        # alone, the status projection that never reads turn.failed, and the stream-outcome
+        # lane whose closed schema has no config_recoverable. A headline-name scan cannot
+        # reach a file by the name it fails to mention.
+        "reference/backend/session_drive.py",
+        "reference/backend/run_state.py",
+        "core/model_stream.py",
+        # Registered by the ToolSpec family, whose authority is a dataclass rather than a
+        # headline field name — its census (family 5) is the backstop for these.
+        "core/manifest.py",
+    }
     unaccounted = registered_paths - all_carriers - alias_only
     assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}
+    # Every family the census covers must not also be declared as one it does not.
+    covered_families = {gap.family for gap in KNOWN_GAPS}
+    declared_future = {family.family for family in FUTURE_FAMILIES}
+    assert covered_families.isdisjoint(declared_future), {
+        "declared_uncensused_but_registered_as_covered": sorted(
+            covered_families & declared_future
+        ),
+    }

@@ -15,21 +15,34 @@ out in commit messages and here.
   transcript record — with a change binding N−1 of them; review finds those one at a time. The
   suite takes an authority per fact family (`dataclasses.fields`, the `__init__` signature, the
   normalizer's emitted-key domain) and set-diffs it against each carrier, so a field added to an
-  authority without a carrier fails by construction. Four families are covered: `Suspension`,
-  `ModelAdapterError` transport, usage counts, and the W5 applied-echo protocol.
-- Three properties make the census trustworthy: one hand-written *maximal builder* per authority
+  authority without a carrier fails by construction. Seven families are covered: `Suspension`,
+  `ModelAdapterError` transport, usage counts, the W5 applied-echo protocol, the tool catalog
+  (one `ToolSpec` projected by five hand-written builders, each omission justified in place),
+  the checkpoint validator's field coverage (five hand-maintained frozensets over a validator
+  that fails open), and the success envelope — the main wire, two server writers against two
+  client parsers.
+- Four properties make the census trustworthy: one hand-written *maximal builder* per authority
   with a reflection guard (a generic synthesizer would silently skip a new field); *behavioral*
   reader censuses that diff reconstructed attributes rather than key sets, because a reader that
-  ignores a wire key leaves no trace in any key set; and *declared* alias tables for the three
-  facts that are renamed at a hop (wire `error_code` carries `provider_error_code`, `RunCheckpoint`
-  spells `http_status` as `provider_http_status`, `awaiting_task_ids` is `task_ids` on one event).
-  An AST backstop pins the set of files mentioning each headline field, so a new carrier file
-  appearing without census registration fails.
+  ignores a wire key leaves no trace in any key set; *declared* alias tables for the facts that
+  are renamed at a hop (wire `error_code` carries `provider_error_code`, `RunCheckpoint` spells
+  `http_status` as `provider_http_status`, `awaiting_task_ids` is `task_ids` on one event, the
+  success body's `turn_handle` is read back as `response_id`); and **no hand copies as
+  authorities** — the usage domain is the assignable key set of the live normalizer, the server
+  error body is captured from the shipped `_write_exception` and diffed against its SSE twin,
+  and the gateway's error-reader list is discovered from the module rather than written down.
+  An AST backstop pins the set of files whose *code* names each headline field (substring
+  containment counted a comment as a carrier and so failed open), plus a declared list of
+  non-Python carriers — the shipped Studio bundle, `docs/CONTRACTS.md`, `docs/OBSERVABILITY.md`
+  — so a wire-key rename that breaks the shipped UI fails a test that names the file.
 - **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
   one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
   exist, so a rename rots the entry loudly) and a disposition — `burn-down`, `v0.21-track:B1`, or
   `by-design`. The assertions encode today's reality exactly, so closing a gap *breaks* the suite
   and the fixer must update the expected set and delete the registry entry in the same change.
+  A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
+  each with the authority a census would take, its carrier count, and a one-line risk note — so
+  the suite's silence about a family is a decision on the record rather than an oversight.
 - Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
   CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
   in the parallel shard. No public surface, wire format, or shipped contract changes.
