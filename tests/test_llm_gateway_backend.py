@@ -1166,7 +1166,7 @@ def test_the_reasoning_round_trip_survives_the_gateway_hop_end_to_end(tmp_path: 
     }
 
 
-def test_the_gateway_call_is_attributed_to_the_upstream_it_relays(tmp_path: Path) -> None:
+def test_the_gateway_call_is_attributed_to_the_upstream_it_relays() -> None:
     """The deliberate side effect of naming the upstream, pinned rather than discovered later.
 
     ``provider_name`` is not a private channel to the loop's reasoning tag: three observability
@@ -1178,7 +1178,6 @@ def test_the_gateway_call_is_attributed_to_the_upstream_it_relays(tmp_path: Path
     a second attribute would give the tag and the spans two truths to drift between.
     """
 
-    del tmp_path
     manager = _token_manager()
     upstream = _OneShotReasoningBackend()
     gateway = LlmGatewayBackend(
