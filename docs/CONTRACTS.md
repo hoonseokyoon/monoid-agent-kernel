@@ -339,16 +339,22 @@ Four further opt-in protocols declare optional capability members:
   by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
   `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
   parameterizes the capability rather than declaring it.
-- `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
+- `ProviderNamedModelAdapter.provider_name: str | None` — tags captured `ModelTurn.reasoning` with
   provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
-  Omitting it means "do not tag". A *forwarding* adapter declares the provider whose artifacts it
+  Omitting it means "do not tag", and `None` says the same thing explicitly — which is what a
+  deployment needs when its gateway fronts an upstream with no reasoning artifacts, hence the
+  optional type rather than `str`. A *forwarding* adapter declares the provider whose artifacts it
   relays, not itself: `GatewayModelAdapter.provider_name` names the gateway's **upstream** and
   defaults to `"openai"`, matching the reference gateway's own default upstream. A deployment
-  whose `provider_adapter_factory` routes elsewhere must set it to that upstream, and `None`
-  disables tagging. The same attribute names the provider on the observability surfaces that
-  probe an adapter for one (`ModelCallReceipt.provider_name` and OTel's `gen_ai.provider.name`),
-  so a call routed through the gateway is attributed to the model that served it, with the
-  transport still legible beside it as `ModelConfig.provider`.
+  whose `provider_adapter_factory` routes elsewhere must set it to that upstream, through
+  `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`, or
+  `RunnerBackend(llm_gateway_provider=...)`; those spell `None` as `none`. The same attribute
+  names the provider on every observability surface that probes an adapter for one — via
+  `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`,
+  and feeds `ModelCallReceipt.provider_name`, the model-stream context's `provider`, and
+  `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
+  through the gateway is therefore attributed to the model that served it, with the transport
+  still legible beside it as `ModelConfig.provider` and on the run manifest.
 - `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
   `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
   actually ran under rather than a default the call never used.

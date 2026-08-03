@@ -326,10 +326,17 @@ class ProviderNamedModelAdapter(Protocol):
     a matching adapter and model. Omitting it means "do not tag": reasoning is not replayed,
     which is the correct neutral behavior for an adapter with no provider-native reasoning
     artifacts.
+
+    ``None`` carries that same sense from a *declared* member: ``str | None`` because a
+    forwarding adapter's upstream is a per-deployment setting, and a deployment fronting an
+    upstream with no reasoning artifacts has to be able to say so without dropping the attribute
+    (``GatewayModelAdapter.provider_name`` is exactly that field). Every reader already spells
+    the two the same way -- ``getattr(..., None)`` then a falsy check -- so declaring ``str``
+    only made the shipped adapter fail a type it satisfies behaviorally.
     """
 
     @property
-    def provider_name(self) -> str: ...
+    def provider_name(self) -> str | None: ...
 
 
 def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | None:

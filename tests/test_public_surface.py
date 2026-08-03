@@ -282,6 +282,29 @@ def test_optional_capability_protocols_accept_classvar_implementations() -> None
             assert member.fset is None, f"{protocol.__name__}.{name} must be read-only"
 
 
+def test_the_provider_name_protocol_admits_the_none_its_shipped_adapter_declares() -> None:
+    """The declared type must accept the value the shipped adapter is *documented* to hold.
+
+    ``ProviderNamedModelAdapter.provider_name`` declared ``str`` while its own docstring said
+    omitting it means "do not tag" and ``GatewayModelAdapter.provider_name`` is ``str | None`` --
+    the value a deployment sets when its gateway fronts an upstream with no reasoning artifacts.
+    A protocol that rejects the adapter it was written for checks nothing.
+    """
+    import typing
+
+    from monoid_agent_kernel.core.spec import ModelConfig
+    from monoid_agent_kernel.providers.base import ProviderNamedModelAdapter
+    from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+
+    member = ProviderNamedModelAdapter.__dict__["provider_name"]
+    declared = typing.get_type_hints(member.fget)["return"]
+    assert type(None) in typing.get_args(declared), (
+        f"provider_name is declared {declared!r}, which cannot hold the documented "
+        '"do not tag" value'
+    )
+    assert GatewayModelAdapter(config=ModelConfig(), provider_name=None).provider_name is None
+
+
 def test_a_capability_that_takes_an_argument_is_declared_as_a_method() -> None:
     """``AddressedModelAdapter`` is the one member of the family that is not a property.
 
