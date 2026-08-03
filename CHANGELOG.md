@@ -160,6 +160,46 @@ out in commit messages and here.
   and the closed `stream_closed` schema — now name the field directly, because a pin over an
   empty set proves nothing and both entries are still open.
 
+### Added — the park records the classification the wire already carried
+
+- **`Suspension` gains `provider_error_code` and `provider_retried`, and both ride the
+  checkpoint.** The park a recovery driver reads carried `retryable` / `http_status` /
+  `config_recoverable` and not the two facts the decision usually turns on: `insufficient_quota`
+  (a human fixes the billing) and `rate_limit_exceeded` (back off and re-issue) are the *same*
+  retryable/status pair and opposite answers, and an exhausted adapter retry budget read as an
+  untried call. Both lived only inside the live exception, so a checkpoint restore handed the
+  driver a park with no reason on it. `suspension_checkpoint_payload` writes them and its reader
+  defaults them when absent, so a pre-v0.21 checkpoint restores unchanged. `TurnNotSettled`
+  re-stamps both onto itself as well — that facade hands a driver an exception and nothing else.
+- **`turn.failed` states the retry and the cost.** The event declared the classification and not
+  `provider_retried` or the usage of a call that failed *after* the provider billed for it, while
+  the transcript record written on the very same failure recorded both. Named `provider_usage`
+  after the kernel fact, not after the gateway wire's compat-frozen `usage` alias — the same rule
+  that makes this event spell `provider_error_code` where the wire says `error_code`.
+- **`run.failed` and `failure.json` keep the classification the promotion used to lose.**
+  `fail_recoverable` (and `close()` on an unrecovered park) turns a classified `turn.failed` into
+  the terminal record, and the terminal record could not say a failure was config-fixable — the
+  one thing an operator reading it needs in order to know whether resending is worth anything.
+  The live `RunState` twins are deliberately not new `RunCheckpoint` fields: the durable park
+  observation already carries them, and `restore()` reads them back from it, so the restore path
+  has one authority instead of two that can disagree. The reference backend's second writer of
+  `monoid.failure.v1` carries the same two, read off the failing exception by name and never
+  coerced; its recovery-path callers hold no provider verdict and leave the honest `false`.
+- **The success transcript record states `provider_retried`.** `ModelTurn` carries it and the
+  call receipt records it, so the private replay artifact of a retried-then-successful call read
+  as a clean single attempt — the case where the retry evidence matters most. Its failure twin
+  records it too, so the two halves of one artifact cannot drift apart again.
+- **A billed refusal now publishes the cost it added to the totals.** The `ModelAdapterError` arm
+  accumulated the usage of a call that failed after billing and emitted no `metrics.updated`,
+  while the success path beside it emitted one per turn — so a run whose only model call failed
+  billed never reported its cost at all. Both paths now call one `_emit_metrics_updated` writer
+  (a second inline emit would be a twin to keep in step); the failure-path emission fires only
+  when something was actually billed.
+- Six more `KNOWN_GAPS` entries closed. The affected census pins state the harmonized behaviour;
+  what `run.failed` still does *not* take from `turn.failed` (`provider_usage`,
+  `provider_retried` — per-call facts, not classifications of the run) is pinned as a set, so a
+  new divergence between the two is a failure rather than a silence.
+
 ### Fixed — the status rides every validator and the bundle; records substitute; one predicate
 
 - **`failure.json` carries `http_status`, on both of its writers.** The core's bundle

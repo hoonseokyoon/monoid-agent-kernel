@@ -354,6 +354,8 @@ class RecoveryService:
         exc_type: str,
         overwrite: bool,
         http_status: int | None = None,
+        retryable: bool = False,
+        config_recoverable: bool = False,
     ) -> None:
         failure_path = run_dir / "failure.json"
         if failure_path.exists() and not overwrite:
@@ -376,6 +378,13 @@ class RecoveryService:
             # only record there is. ``None`` for the recovery-path failures that never reached a
             # provider, which is what an absent status means there too.
             "http_status": http_status,
+            # The classification twin of the status above. The defaults are the honest reading of
+            # "nothing classified this": a recovery-path failure (unrecoverable, invalid durable
+            # state) has no provider verdict to report, and the durable readers already treat an
+            # absent flag as False. Only the caller holding the run's own exception
+            # (``run_state.record_run_failure``) passes anything else.
+            "retryable": retryable,
+            "config_recoverable": config_recoverable,
             "type": exc_type,
             "last_good_seq": last_good_seq,
             "restore_hint": (

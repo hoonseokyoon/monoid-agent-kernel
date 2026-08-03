@@ -237,10 +237,19 @@ branch declares the same field, which the writer had always emitted under an ope
 `additionalProperties`; no stored transcript changes and no reader has to migrate.
 
 Both writers of `monoid.failure.v1` — the core's `run_dir/failure.json` and the reference
-backend's — add `http_status`, written as `null` when the failure never reached a provider. The
-artifact's reader policy is permissive and its consumers read keys off the JSON, so an older
-bundle simply has no such key and a reader must treat "absent" and `null` alike. The schema
-identifier is unchanged.
+backend's — add `http_status`, written as `null` when the failure never reached a provider, and
+`retryable` / `config_recoverable`, the classification the `run.failed` event beside them
+carries. The artifact's reader policy is permissive and its consumers read keys off the JSON, so
+an older bundle simply has no such key and a reader must treat "absent" and `null`/`false`
+alike. The schema identifier is unchanged.
+
+The durable park observation inside `monoid.checkpoint.v1` (`last_suspension`) gains
+`provider_error_code` and `provider_retried`, and `turn.failed` / `run.failed` /
+`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch gain the event fields that carry the same facts
+(`provider_retried`, `provider_usage`, `retryable`, `config_recoverable`). All are additive:
+the park reader defaults every absent key, so a pre-v0.21 checkpoint restores exactly as before,
+and the event schemas grow optional properties without changing a `required` list. No checkpoint
+schema version bump, and no reader has to migrate.
 
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the

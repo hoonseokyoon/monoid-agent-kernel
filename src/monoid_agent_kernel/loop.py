@@ -277,6 +277,25 @@ def _unrecovered_turn_failure(
     )
 
 
+def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[bool, bool]:
+    """Read ``(retryable, config_recoverable)`` back off a durable park observation.
+
+    The live ``RunState`` twins of these are not ``RunCheckpoint`` fields — the park payload
+    already carries them, and a second durable spelling of one fact is the drift this census
+    keeps finding. So the restore reads them here, the same way
+    :func:`_unrecovered_turn_failure` reads the promotion it must survive with: across a
+    restore the committed checkpoint is the only evidence there is, and a promotion that
+    forgets the classification records a config-fixable failure as an unclassified one.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return (False, False)
+    return (
+        bool(last_suspension.get("retryable", False)),
+        bool(last_suspension.get("config_recoverable", False)),
+    )
+
+
 def _recoverable_turn_error(exc: BaseException) -> bool:
     """Whether a model-turn exception is *recoverable* — the session should survive and the
     turn can be re-attempted (after backoff, or after the user fixes config) rather than
@@ -818,6 +837,16 @@ class RunState:
     error_code: str = ""
     provider_error_code: str = ""
     provider_http_status: int | None = None
+    # Classification of the failure this state describes, carried for exactly as long as
+    # ``provider_error_code``/``provider_http_status`` beside it: set on a recoverable turn
+    # failure, cleared at the next submit, and read by ``_record_failure`` so the promotion of a
+    # park into the terminal record keeps the two flags the park itself carried.
+    #
+    # Deliberately NOT new ``RunCheckpoint`` fields: the durable park observation
+    # (``last_suspension``) already carries both, and that is what ``_rehydrate`` reads them back
+    # from — so the restore path has one authority rather than two that can disagree.
+    retryable: bool = False
+    config_recoverable: bool = False
     final_text: str = ""
     # Whether ``final_text`` came from the model — its response text, or the ``summary`` argument of
     # a ``run.finish`` tool call — rather than being authored by the kernel. Only model-authored text
@@ -1485,6 +1514,8 @@ class AgentLoop:
             state.error_code = ""
             state.provider_error_code = ""
             state.provider_http_status = None
+            state.retryable = False
+            state.config_recoverable = False
             state.final_text = ""
             state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
@@ -1550,6 +1581,8 @@ class AgentLoop:
             # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
             state.provider_error_code = exc.provider_error_code
             state.provider_http_status = exc.http_status
+            state.retryable = exc.retryable
+            state.config_recoverable = exc.config_recoverable
             res.recorder.emit(
                 "turn.failed",
                 turn_id=session.active_turn_id,
@@ -1561,6 +1594,11 @@ class AgentLoop:
                     "http_status": exc.http_status,
                     "retryable": exc.retryable,
                     "config_recoverable": exc.config_recoverable,
+                    "provider_retried": exc.provider_retried,
+                    # What the refused call already cost. Empty when nothing was billed, which
+                    # is the ordinary case; the transcript twin written on this same failure has
+                    # always carried it, and this event is the copy an operator actually reads.
+                    "provider_usage": _billed_usage(exc),
                 },
                 level="warning",
             )
@@ -1572,6 +1610,8 @@ class AgentLoop:
                 retryable=exc.retryable,
                 http_status=exc.http_status,
                 config_recoverable=exc.config_recoverable,
+                provider_error_code=exc.provider_error_code,
+                provider_retried=exc.provider_retried,
             )
             # Remembered on the session (not just the returned Suspension) so a close() with
             # no later settle can promote this park to the terminal failure record.
@@ -2244,15 +2284,25 @@ class AgentLoop:
                 state.provider_error_code = exc.provider_error_code
             if exc.http_status is not None:
                 state.provider_http_status = exc.http_status
+            # Same rule for the classification: the synthetic promotion wrapper carries the
+            # defaults, so an asserted flag on it wins and silence keeps what the park recorded.
+            if exc.retryable:
+                state.retryable = True
+            if exc.config_recoverable:
+                state.config_recoverable = True
         else:
             # A fresh terminal failure reflects THIS exception — clearing any stale provider detail
             # an earlier, unrelated recoverable turn.failed may have left on the state.
             if isinstance(exc, ModelAdapterError):
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
+                state.retryable = exc.retryable
+                state.config_recoverable = exc.config_recoverable
             else:
                 state.provider_error_code = ""
                 state.provider_http_status = None
+                state.retryable = False
+                state.config_recoverable = False
         state.final_text = ""
         state.final_text_is_model_output = False
         res.recorder.emit(
@@ -2265,6 +2315,11 @@ class AgentLoop:
                 # so the real cause (e.g. insufficient_quota / HTTP 429) reaches logs and the UI.
                 "provider_error_code": state.provider_error_code,
                 "http_status": state.provider_http_status,
+                # The classification the promoted turn.failed carried. Without it the terminal
+                # log of a config-fixable failure could not say it was one, and the driver that
+                # gave up left no record of *what* it gave up on.
+                "retryable": state.retryable,
+                "config_recoverable": state.config_recoverable,
             },
             level="error",
         )
@@ -2284,6 +2339,11 @@ class AgentLoop:
                 # drop the one field the log beside it kept, so diagnosing a failure from the
                 # bundle alone could not tell a 429 from a 400 from a transport error.
                 "http_status": state.provider_http_status,
+                # Read from the same state as the event above, for the same reason: the operator
+                # restoring from this bundle alone must be able to tell "resend after fixing the
+                # config" from "this will fail again the same way".
+                "retryable": state.retryable,
+                "config_recoverable": state.config_recoverable,
                 "type": type(exc).__name__,
                 "last_good_seq": last_good_seq,
                 "restore_hint": (
@@ -2574,12 +2634,15 @@ class AgentLoop:
                 )
             except (AttributeError, TypeError, ValueError) as exc:
                 raise AgentConfigError(f"invalid restored runtime config: {exc}") from exc
+        restored_retryable, restored_config_recoverable = _park_classification(cp.last_suspension)
         state = RunState(
             status=cp.status,
             error=cp.error,
             error_code=cp.error_code,
             provider_error_code=cp.provider_error_code,
             provider_http_status=cp.provider_http_status,
+            retryable=restored_retryable,
+            config_recoverable=restored_config_recoverable,
             final_text=cp.final_text,
             # Fail closed. Provenance is not in the checkpoint, so a restored non-empty final_text is
             # assumed to be the model's: over-digesting a resumed kernel message costs a sentence in
@@ -3209,6 +3272,47 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
+    def _emit_metrics_updated(
+        self,
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> None:
+        """Publish the run's cumulative meters after one model call, settled or refused.
+
+        The ONE writer of ``metrics.updated``. It was inline in the success path, so the
+        ModelAdapterError arm — which accumulates the billed usage of a call that failed *after*
+        the provider charged for it — moved the totals without publishing them, and a run whose
+        only model call failed billed never published its cost at all. A second inline emit
+        would have been a twin to keep in step; one function is the binding.
+        """
+
+        metrics_data: dict[str, Any] = {
+            "step": step,
+            "tool_calls": state.total_tool_calls,
+            "input_tokens": state.total_usage["input_tokens"],
+            "output_tokens": state.total_usage["output_tokens"],
+            "total_tokens": state.total_usage["total_tokens"],
+            "web_search_calls": context.web_service.web_search_calls,
+            "web_fetch_calls": context.web_service.web_fetch_calls,
+            "web_context_calls": context.web_service.web_context_calls,
+            "web_failed_calls": context.web_service.web_failed_calls,
+        }
+        # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
+        # adapter reports them, so the studio meter can show the reasoning share (R10).
+        if state.total_usage.get("reasoning_tokens"):
+            metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
+        recorder.emit(
+            "metrics.updated",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data=metrics_data,
+        )
+
     async def _apump_turn(
         self, state: RunState, res: _RunResources, session: _Session
     ) -> Suspension:
@@ -3588,8 +3692,22 @@ class AgentLoop:
                         "retryable": exc.retryable,
                         "http_status": exc.http_status,
                         "config_recoverable": exc.config_recoverable,
+                        "provider_retried": exc.provider_retried,
                     }
                 )
+                if billed:
+                    # The billed cost of a refused call reached the totals and never reached the
+                    # live stream: this arm accumulated and returned, while the success path
+                    # below published one metrics.updated per turn. A run whose only model call
+                    # failed billed therefore never published its cost at all.
+                    self._emit_metrics_updated(
+                        recorder,
+                        state,
+                        context,
+                        step=step,
+                        turn_id=turn_id,
+                        parent_id=turn_started.event_id,
+                    )
                 raise
             except NativeAgentError:
                 raise
@@ -3629,6 +3747,10 @@ class AgentLoop:
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
                     "usage": turn.usage,
+                    # Carried by ``ModelTurn`` and by the call receipt, and dropped here: the
+                    # replay artifact of a retried-then-successful call read as a clean single
+                    # attempt. Its failure twin above records the same fact.
+                    "provider_retried": turn.provider_retried,
                 }
             )
             recorder.emit(
@@ -3649,26 +3771,13 @@ class AgentLoop:
                     "usage": turn.usage,
                 },
             )
-            metrics_data: dict[str, Any] = {
-                "step": step,
-                "tool_calls": state.total_tool_calls,
-                "input_tokens": state.total_usage["input_tokens"],
-                "output_tokens": state.total_usage["output_tokens"],
-                "total_tokens": state.total_usage["total_tokens"],
-                "web_search_calls": context.web_service.web_search_calls,
-                "web_fetch_calls": context.web_service.web_fetch_calls,
-                "web_context_calls": context.web_service.web_context_calls,
-                "web_failed_calls": context.web_service.web_failed_calls,
-            }
-            # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
-            # adapter reports them, so the studio meter can show the reasoning share (R10).
-            if state.total_usage.get("reasoning_tokens"):
-                metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
-            recorder.emit(
-                "metrics.updated",
+            self._emit_metrics_updated(
+                recorder,
+                state,
+                context,
+                step=step,
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
-                data=metrics_data,
             )
 
             if not turn.tool_calls:

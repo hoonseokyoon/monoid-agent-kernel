@@ -124,6 +124,11 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": _STR,
             "provider_error_code": _STR,
             "http_status": {"type": ["integer", "null"]},
+            # The terminal twin of ``turn.failed`` carries the same classification it does:
+            # ``fail_recoverable`` promotes one into the other, so a config-fixable failure that
+            # a driver gave up on must still say it was config-fixable in the record of giving up.
+            "retryable": _BOOL,
+            "config_recoverable": _BOOL,
         },
         required=("error_code",),
     ),
@@ -191,6 +196,14 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "http_status": {"type": ["integer", "null"]},
             "retryable": _BOOL,
             "config_recoverable": _BOOL,
+            # Whether the adapter's own retry budget was already spent before this park.
+            "provider_retried": _BOOL,
+            # What the refused call already cost. A failure *after* a billed answer is an
+            # ordinary shape (the applied-parameters proof refusals are exactly that), and the
+            # transcript twin written on the same failure has always recorded it. Named for the
+            # kernel fact, not for the gateway wire's compat-frozen ``usage`` alias — the event
+            # spells ``provider_error_code`` for the same reason.
+            "provider_usage": _OBJ,
         },
         required=("error_code",),
     ),
@@ -688,6 +701,10 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
                 # The failure record's writer has always emitted this beside ``retryable``; the
                 # branch only stayed valid because ``additionalProperties`` is True here.
                 "config_recoverable": {"type": "boolean"},
+                # Written by BOTH model_turn records (success and failure): the private replay
+                # artifact of a retried-then-successful call used to read as a clean single
+                # attempt, which is exactly the case where the retry evidence matters most.
+                "provider_retried": {"type": "boolean"},
                 "http_status": {"type": ["integer", "null"]},
             },
             "additionalProperties": True,

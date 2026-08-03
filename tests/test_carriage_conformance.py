@@ -206,63 +206,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "added to withhold",
         "burn-down",
     ),
-    # --- the terminal record: promoted from a turn event that classified the failure ----
-    CarriageGap(
-        "suspension",
-        "retryable/config_recoverable",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "run.failed (the terminal twin of turn.failed) declares neither, although "
-        "loop.py:fail_recoverable promotes a turn.failed carrying both into exactly this "
-        "record — so the terminal log of a config-fixable failure cannot say it was one",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "retryable/config_recoverable",
-        "loop.py:_record_failure",
-        "the run.failed emit site and the write_failure bundle beside it are built from the "
-        "same state and neither writes the classification the promoted turn.failed carried",
-        "burn-down",
-    ),
-    # --- provider_retried / provider_usage: stamped, then unrecorded -------------------
-    CarriageGap(
-        "suspension",
-        "provider_retried",
-        "core/result.py:Suspension",
-        "absent from every kernel record of a failed turn (Suspension, its checkpoint payload, "
-        "and the turn.failed event), so it survives only inside the live exception",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_usage",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "turn.failed declares no usage (nor provider_retried) although the transcript twin "
-        "written on the same failure records both cost and classification. Borderline sibling, "
-        "noted rather than registered separately: the CADENCE of the cumulative meter has the "
-        "same shape. loop.py's ModelAdapterError arm accumulates the billed usage into "
-        "state.total_usage and emits no metrics.updated, while the success path below it emits "
-        "one per turn — so a billed-refused turn's cost is in the totals but not yet on the "
-        "live stream, and a run that only ever fails never publishes it at all",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_retried",
-        "loop.py:_apump_turn",
-        "the SUCCESS model_turn transcript record omits it although ModelTurn carries it and "
-        "the receipt records it, so the private replay artifact of a retried-then-successful "
-        "call reads as a clean single attempt (its failure twin omits it too)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_error_code",
-        "core/result.py:Suspension",
-        "not a Suspension field, so the provider code a driver needs to decide re-attempt vs "
-        "config-fix is lost through checkpoint recovery (it lives only on RunState)",
-        "burn-down",
-    ),
     # --- usage sub-counts: normalized, then flattened ----------------------------------
     CarriageGap(
         "usage",
@@ -842,6 +785,8 @@ def _maximal_suspension() -> Suspension:
         retryable=True,
         http_status=429,
         config_recoverable=True,
+        provider_error_code="insufficient_quota",
+        provider_retried=True,
     )
 
 
@@ -2082,7 +2027,17 @@ def test_1b_one_reason_vocabulary_spelled_in_three_places() -> None:
 # field, so a caller can branch without reaching through ``.suspension``. That copy is a hand
 # list: a new Suspension classification field is not re-stamped unless someone remembers.
 TURN_NOT_SETTLED_RESTAMPED = frozenset(
-    {"reason", "retryable", "http_status", "config_recoverable"}
+    {
+        "reason",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The two the burn-down added to the park and to this copy in one change: the blocking
+        # facade hands a driver an exception and nothing else, and ``insufficient_quota`` vs
+        # ``rate_limit_exceeded`` is the same retryable/http_status pair with opposite answers.
+        "provider_error_code",
+        "provider_retried",
+    }
 )
 
 
@@ -2106,7 +2061,19 @@ def test_1b_the_not_settled_exception_restamps_exactly_the_registered_fields() -
 # core/schemas.py:EVENT_DATA_SCHEMAS["turn.failed"] — additionalProperties is False, so this is
 # the total wire domain of the event, not a lower bound.
 TURN_FAILED_EVENT_KEYS = frozenset(
-    {"error", "error_code", "provider_error_code", "retryable", "http_status", "config_recoverable"}
+    {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The burn-down's two: the attempt already made, and what the refused call already cost.
+        # ``provider_usage`` is the KERNEL spelling — the gateway wire's compat-frozen alias for
+        # the same fact is ``usage``, and this event names facts, not wire keys (see below).
+        "provider_retried",
+        "provider_usage",
+    }
 )
 
 
@@ -2125,7 +2092,7 @@ def test_1c_turn_failed_schema_and_emit_site_agree_on_one_key_set() -> None:
     }
 
 
-def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> None:
+def test_1c_turn_failed_now_names_every_fact_the_wire_carries() -> None:
     """Cross-check against family 2, so the event and the wire cannot drift independently.
 
     The event uses the KERNEL spelling of each fact where the wire uses its alias, so the
@@ -2151,10 +2118,17 @@ def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> No
     # And if a *next* fact joins the uncarried set, this event must still declare it.
     assert TRANSPORTABLE_ERROR_UNCARRIED <= declared
 
-    # ...and drops the two the wire carries. Registered burn-down: the transcript record written
-    # on the very same failure keeps the cost, so this event is the odd one out, not the rule.
-    assert wire_facts - declared == {"provider_retried", "provider_usage"}
+    # ...and the event now names every one of them. It used to drop the retry and the cost, and
+    # the transcript record written on the very same failure kept both -- so the event was the
+    # odd one out rather than the rule, which is what the burn-down closed.
+    assert wire_facts - declared == set(), {
+        "carried_by_the_wire_and_not_by_the_event": sorted(wire_facts - declared),
+    }
+    # The event spells each fact by its KERNEL name. ``usage`` is the wire's compat-frozen alias
+    # for ``provider_usage``, exactly as ``error_code`` is the wire's alias for
+    # ``provider_error_code``, and neither alias has a slot on this event.
     assert "usage" not in declared
+    assert "provider_usage" in declared
 
 
 # core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` was written
@@ -2174,6 +2148,7 @@ TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
         "provider_error_code",
         "retryable",
         "config_recoverable",
+        "provider_retried",
         "http_status",
     }
 )
@@ -2211,14 +2186,14 @@ def test_1d_the_transcript_schema_declares_every_key_the_writer_writes() -> None
 
 # The other ``kind="model_turn"`` record: the one written when the turn SUCCEEDS. It shares a
 # schema branch with the failure record above, so it is the same declared vocabulary minus the
-# error half -- and it drops ``provider_retried``, which ``ModelTurn`` carries and the receipt
-# records (registered burn-down).
+# error half -- ``provider_retried`` included, which is what the burn-down added: the record of a
+# retried-then-successful call used to read as a clean single attempt.
 TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS = frozenset(
-    {"kind", "step", "response_id", "final_text", "tool_calls", "usage"}
+    {"kind", "step", "response_id", "final_text", "tool_calls", "usage", "provider_retried"}
 )
 
 
-def test_1d_the_success_transcript_record_omits_the_retry_its_turn_reports() -> None:
+def test_1d_the_success_transcript_record_states_the_retry_its_turn_reports() -> None:
     written = [
         keys
         for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
@@ -2230,11 +2205,16 @@ def test_1d_the_success_transcript_record_omits_the_retry_its_turn_reports() -> 
         "extra": sorted(written[0] - TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS),
     }
     assert written[0] <= frozenset(_transcript_model_turn_branch()["properties"])
-    # The fact the record cannot state, present on the object it was written from.
+    # The fact is stated by the record and present on the object it was written from -- and its
+    # failure twin states it too, so the two halves of one artifact cannot drift apart again.
     assert "provider_retried" in {field.name for field in dataclasses.fields(ModelTurn)}
-    assert "provider_retried" not in written[0], {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
-    }
+    assert "provider_retried" in written[0]
+    failure = [
+        keys
+        for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
+        if "error" in keys
+    ]
+    assert len(failure) == 1 and "provider_retried" in failure[0]
 
 
 def test_1e_the_checkpoint_alias_is_copied_at_exactly_two_sites() -> None:
@@ -2280,18 +2260,34 @@ def test_1d_the_failure_bundle_and_the_event_beside_it_carry_the_same_status() -
     assert "http_status" in bundles[0], {
         "hint": "the operator's restore aid must keep the status the log kept",
     }
-    shared = {"error", "error_code", "provider_error_code", "http_status", "type"}
+    shared = {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "type",
+    }
     assert shared <= (event_keys & bundles[0]), {
         "carried_by_only_one_of_the_two": sorted(shared - (event_keys & bundles[0])),
     }
 
 
 # The terminal-failure trio, pinned in full rather than probed for one key. ``run.failed`` is
-# ``turn.failed``'s terminal twin -- ``fail_recoverable`` promotes one into the other -- and it
-# declares neither ``retryable`` nor ``config_recoverable``, so the classification a driver used
-# to decide "park for a config fix" is gone from the record of having given up (burn-down).
+# ``turn.failed``'s terminal twin -- ``fail_recoverable`` promotes one into the other -- and the
+# burn-down gave it the classification that promotion used to lose, on the event and on the
+# bundle written from the same state in the same breath.
 RUN_FAILED_EVENT_KEYS = frozenset(
-    {"error", "error_code", "type", "provider_error_code", "http_status"}
+    {
+        "error",
+        "error_code",
+        "type",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+    }
 )
 FAILURE_BUNDLE_KEYS = frozenset(
     {
@@ -2301,6 +2297,8 @@ FAILURE_BUNDLE_KEYS = frozenset(
         "error_code",
         "provider_error_code",
         "http_status",
+        "retryable",
+        "config_recoverable",
         "type",
         "last_good_seq",
         "restore_hint",
@@ -2366,22 +2364,30 @@ def test_1d_the_reference_backend_writes_the_same_bundle_the_core_does() -> None
     assert written - core == {"failed_at"}
 
 
-def test_1d_the_terminal_failure_record_drops_the_classification_its_twin_carries() -> None:
-    """``turn.failed`` -> ``run.failed`` is a real promotion path, and it loses two facts.
+def test_1d_the_terminal_failure_record_keeps_the_classification_its_twin_carries() -> None:
+    """``turn.failed`` -> ``run.failed`` is a real promotion path; what it loses is pinned.
 
     ``AgentLoop.fail_recoverable`` exists to turn an exhausted recoverable turn failure into the
     terminal record, and ``close()`` performs the same promotion for an unrecovered park -- so a
-    config-recoverable terminal failure is an ordinary outcome, not a hypothetical. The terminal
-    record cannot say so: ``retryable`` and ``config_recoverable`` ride the turn event and stop
-    there (registered burn-down).
+    config-recoverable terminal failure is an ordinary outcome, not a hypothetical. The
+    classification now survives the promotion; the remainder is stated as a set rather than
+    tolerated, so a *new* fact that reaches one event and not the other fails here.
+
+    The two that stop at the turn event are per-CALL facts, not classifications of the run:
+    ``provider_usage`` is what one refused call cost (the cumulative lane -- metrics.updated and
+    metrics.json -- is where a run's cost is reported, and it already carries these tokens), and
+    ``provider_retried`` describes attempts inside one adapter call (recorded per call on the
+    transcript record and the receipt). Promoting either onto the terminal record would mean
+    publishing one call's number as the run's.
     """
 
     turn_failed = frozenset(EVENT_DATA_SCHEMAS["turn.failed"]["properties"])
     lost = turn_failed - RUN_FAILED_EVENT_KEYS
-    assert lost == {"retryable", "config_recoverable"}, {
+    assert lost == {"provider_retried", "provider_usage"}, {
         "lost_on_promotion": sorted(lost),
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+        "hint": "a fact reached the turn event and not its terminal twin",
     }
+    assert {"retryable", "config_recoverable"} <= RUN_FAILED_EVENT_KEYS
     # And the durable park payload keeps both, so the fact exists at the moment of promotion.
     payload = suspension_checkpoint_payload(_maximal_suspension())
     assert {"retryable", "config_recoverable"} <= set(payload)
@@ -3233,7 +3239,9 @@ def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
     or a ``{**extra}`` in the literal reached the wire with no schema entry and no failure here.
     """
 
-    pump = _function_node("loop.py", "_apump_turn")
+    # The literal moved out of ``_apump_turn`` when the emission became one writer serving both
+    # the settled and the billed-refused path; the census follows the binding to its function.
+    pump = _function_node("loop.py", "_emit_metrics_updated")
     written = _dict_writes(pump).get("metrics_data")
     assert written is not None and len(written.literals) == 1, {
         "metrics_data_literals": 0 if written is None else len(written.literals),
@@ -5232,6 +5240,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "loop.py",
             "providers/gateway.py",
             "providers/openai.py",
+            # Joined in the burn-down: the terminal failure bundle's second writer, the backend
+            # caller that reads the flag off the exception for it, and the facade between them.
+            "reference/backend/recovery.py",
+            "reference/backend/run_state.py",
+            "reference/backend/service.py",
             "reference/llm_gateway/http.py",
         }
     ),
@@ -5239,7 +5252,12 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
         {
             "contracts.py",
             "core/model_io.py",
+            # Joined in the burn-down: the park type that records the failed turn, its event
+            # schema, and the loop that writes both plus the two transcript records.
+            "core/result.py",
+            "core/schemas.py",
             "errors.py",
+            "loop.py",
             "model_call.py",
             "observability/otel.py",
             "providers/base.py",
@@ -5253,6 +5271,8 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     "provider_usage": frozenset(
         {
             "core/model_io.py",
+            # Joined in the burn-down: turn.failed declares what the refused call cost.
+            "core/schemas.py",
             "loop.py",
             "providers/base.py",
             "providers/gateway.py",

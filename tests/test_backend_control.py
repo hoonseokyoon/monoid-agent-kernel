@@ -216,6 +216,66 @@ def test_record_run_failure_writes_bundle_before_terminal_flip(
         backend._records.pop(run_id, None)
 
 
+def test_the_backend_failure_bundle_states_the_classification_the_exception_carried(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The reference backend writes the same ``monoid.failure.v1`` artifact the core does, and
+    its copy is the one a worker crash leaves behind -- the case where the bundle is the only
+    record there is. An operator restoring from it must be able to tell "resend after fixing the
+    config" from "this will fail again the same way"."""
+
+    from monoid_agent_kernel.errors import ModelAdapterError
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_classification"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(
+        run_id,
+        ModelAdapterError(
+            "the gateway sent no generation_applied echo",
+            provider_error_code="gateway_generation_not_applied",
+            retryable=False,
+            config_recoverable=True,
+        ),
+    )
+
+    bundle = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert bundle["config_recoverable"] is True
+    assert bundle["retryable"] is False
+
+
+def test_the_backend_failure_bundle_claims_no_classification_it_was_not_given(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The other half: a plain worker exception carries no provider verdict, and the guarded
+    read must answer ``False`` rather than promoting a truthy attribute into a claim."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_unclassified"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    boom = RuntimeError("worker boom")
+    boom.retryable = "yes, definitely"  # type: ignore[attr-defined]
+    backend._record_run_failure(run_id, boom)
+
+    bundle = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert bundle["retryable"] is False
+    assert bundle["config_recoverable"] is False
+
+
 def test_usage_comes_from_terminal_result_not_metric_events(
     tmp_path: Path,
     backend_factory: Any,

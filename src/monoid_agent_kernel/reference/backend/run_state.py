@@ -35,6 +35,19 @@ def _provider_http_status(exc: Exception) -> int | None:
     return status if type(status) is int else None
 
 
+def _error_flag(exc: Exception, name: str) -> bool:
+    """A boolean classification an exception carries, or ``False`` if it carries none.
+
+    The guarded twin of :func:`_provider_http_status`, and guarded for the same reason: this arm
+    answers for every exception a run can die of, not only ``ModelAdapterError``. Read by name,
+    and anything that is not a ``bool`` is no classification at all — a truthy string must not
+    become a claim that the failure is retryable.
+    """
+
+    value = getattr(exc, name, None)
+    return value if type(value) is bool else False
+
+
 def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
     value = metrics.get(key, 0)
     if type(value) is not int or value < 0:
@@ -278,6 +291,11 @@ class RunStateMutationService:
             # (this arm answers for every exception type, not only ModelAdapterError) and never
             # coerced: anything that is not an int is no status at all.
             http_status=_provider_http_status(exc),
+            # ...and the classification beside it, so this bundle answers the operator's next
+            # question ("resend after a config fix, or will it fail the same way?") with what the
+            # exception actually said rather than with the writer's default.
+            retryable=_error_flag(exc, "retryable"),
+            config_recoverable=_error_flag(exc, "config_recoverable"),
         )
 
         def _mutate() -> None:

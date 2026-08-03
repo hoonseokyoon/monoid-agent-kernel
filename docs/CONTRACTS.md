@@ -135,7 +135,12 @@ The run lifecycle is:
   (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
   (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
   `suspension` carries the reason plus the `retryable` / `http_status` /
-  `config_recoverable` classification. The non-blocking pump
+  `config_recoverable` / `provider_error_code` / `provider_retried`
+  classification — all five re-stamped onto the exception itself, because a
+  driver on this facade holds an exception and nothing else. The last two are
+  what separates an `insufficient_quota` (a human fixes the billing) from a
+  `rate_limit_exceeded` (back off and re-issue) and an exhausted adapter retry
+  budget from an untried call. The non-blocking pump
   (`run_until_suspended`) returns the same park as a `Suspension` with
   `turn=None` instead of raising; `astream` ends the stream with it as
   `stream.suspension`.
@@ -1733,7 +1738,14 @@ competing input.
   conversation** (`messages` — provider-neutral user/assistant/tool log, vendor-
   independent), and the **latest `runtime_config`**. It returns `None` — refusing —
   while a live in-process shell job is still running (a subprocess cannot cross a
-  process boundary).
+  process boundary). The park itself is recorded as `last_suspension`, the durable
+  observation of one `Suspension`: `reason`, `status`, `final_text`, `error`,
+  `error_code`, `awaiting_task_ids`, `has_external`, and the full failure
+  classification (`retryable`, `http_status`, `config_recoverable`,
+  `provider_error_code`, `provider_retried`). `turn` is excluded by design — it is a
+  projection artifact of local paths and metrics, and a recovery driver needs only the
+  boundary facts to return the same park. Every key is optional on read: an absent one
+  takes the default, which is what a checkpoint written before that key existed meant.
 - `CheckpointStore` (protocol): `put(checkpoint, blobs)` commits **atomically** and
   flips a `LATEST` pointer last (a half-written checkpoint is never returned);
   `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
@@ -1765,10 +1777,15 @@ competing input.
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
   process. Terminal artifact finalization remains the caller's responsibility.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
-  (`{error, error_code, provider_error_code, http_status, type, last_good_seq, restore_hint}`) —
+  (`{error, error_code, provider_error_code, http_status, retryable, config_recoverable, type,
+  last_good_seq, restore_hint}`) —
   fail loud, name the checkpoint to restore from. `http_status` is the provider status the
   `run.failed` event beside it carries, written as `null` when the failure never reached a
-  provider. No auto-recovery.
+  provider. `retryable` / `config_recoverable` are that same event's classification, read from
+  the same run state: `fail_recoverable` (and `close()` on an unrecovered park) promotes a
+  classified `turn.failed` into this record, and the promotion keeps the classification —
+  including across a restart, where the checkpoint's `last_suspension` is where it is read back
+  from. No auto-recovery.
 
 #### Reference operational scopes
 
@@ -1830,10 +1847,13 @@ requires explicit host orchestration.
 
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
-  (`monoid.failure.v1`: `error, error_code, http_status, type, last_good_seq, restore_hint,
-  failed_at`) — the durable mark is written *before* the in-memory terminal state, so a
-  worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
-  resumes a crashed run into a loop.
+  (`monoid.failure.v1`: `error, error_code, http_status, retryable, config_recoverable, type,
+  last_good_seq, restore_hint, failed_at`) — the durable mark is written *before* the in-memory
+  terminal state, so a worker crash that bypassed the loop's own bundle still leaves a mark and
+  a restart never resumes a crashed run into a loop. The status and the two classification flags
+  are read off the failing exception by name and never coerced; the recovery-path writers
+  (unrecoverable, invalid durable state) hold no provider verdict and leave them at
+  `null` / `false`.
 - **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks
   attempts in `run_dir/recover_attempts.json` (`{count}`); after the cap it writes a
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
