@@ -52,6 +52,15 @@ def _token_manager() -> TokenManager:
     return TokenManager.from_secret("y" * 32)
 
 
+def _eventually(predicate, *, timeout_s: float = 20.0) -> bool:  # noqa: ANN001
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str = "tenant_a") -> str:
     return manager.issue(
         kind="llm_gateway",
@@ -1315,8 +1324,14 @@ def test_the_gateway_call_is_attributed_to_the_upstream_it_relays() -> None:
     assert (receipt.provider_name or receipt.model.provider) == "openai"
 
 
-def test_the_relayed_provider_is_configurable_and_can_be_switched_off() -> None:
-    """Default, override, and the documented "do not tag" — one deployment shape each.
+def test_the_relayed_provider_is_configurable_through_the_cli_builder(tmp_path: Path) -> None:
+    """Default, override, and the documented "do not tag" — through the *shipped* builder.
+
+    The predecessor of this test constructed ``GatewayModelAdapter(provider_name=...)`` by hand
+    and passed while no shipped construction site could reach the field: the CLI's
+    ``_model_adapter`` and the backend's ``build_model_adapter`` both took the default and had no
+    knob. A field configurable only from a test is not configurable. So every deployment shape
+    below is asserted on the adapter a *builder* returns.
 
     The default matches the reference gateway's hardcoded upstream. A deployment whose
     ``provider_adapter_factory`` routes somewhere else must say so, because a tag naming the
@@ -1324,7 +1339,275 @@ def test_the_relayed_provider_is_configurable_and_can_be_switched_off() -> None:
     another, one turn later, as an unreadable request.
     """
 
-    plain = GatewayModelAdapter(ModelConfig(provider="gateway"))
-    assert plain.provider_name == "openai"
-    assert GatewayModelAdapter(ModelConfig(), provider_name="anthropic").provider_name == "anthropic"
-    assert GatewayModelAdapter(ModelConfig(), provider_name=None).provider_name is None
+    from monoid_agent_kernel.cli import _model_adapter
+
+    del tmp_path
+    gateway_config = ModelConfig(provider="gateway")
+
+    def build(provider: str | None) -> GatewayModelAdapter:
+        adapter = _model_adapter(
+            gateway_config,
+            llm_gateway_url="http://gateway.local/internal/llm/turns",
+            llm_gateway_token_env="MONOID_LLM_GATEWAY_TOKEN",
+            llm_gateway_token_file=None,
+            llm_gateway_provider=provider,
+            allow_direct_provider_api=False,
+        )
+        assert isinstance(adapter, GatewayModelAdapter)
+        return adapter
+
+    assert build("openai").provider_name == "openai"
+    assert build("anthropic").provider_name == "anthropic"
+    # The flag is a string on the command line, so "do not tag" needs a spelling. Case-insensitive
+    # because an operator typing NONE means the same thing.
+    assert build("none").provider_name is None
+    assert build("NoNe").provider_name is None
+    assert build(None).provider_name is None
+
+
+def test_the_cli_run_command_threads_the_relayed_provider_into_the_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The flag reaches the adapter through the real ``run`` callback, not just the helper.
+
+    ``_model_adapter`` growing a parameter proves nothing on its own: the gap this closes was a
+    *threading* gap, and ``run`` is the only caller that can thread it. Patched at the adapter
+    class so the builder itself runs.
+    """
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seen: list[dict] = []
+
+    def recording_gateway_adapter(config, **kwargs):  # noqa: ANN001, ANN202
+        seen.append(dict(kwargs))
+        return FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+    monkeypatch.setattr(cli_module, "GatewayModelAdapter", recording_gateway_adapter)
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config("run.finish", model=ModelConfig(provider="gateway")).to_json()),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--runtime-config-file",
+            str(config_file),
+            "--llm-gateway-provider",
+            "anthropic",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen and seen[0]["provider_name"] == "anthropic"
+
+
+def test_the_cli_run_command_defaults_the_relayed_provider_to_the_reference_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No flag = the reference gateway's own upstream, matching the adapter's dataclass default."""
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seen: list[dict] = []
+
+    def recording_gateway_adapter(config, **kwargs):  # noqa: ANN001, ANN202
+        seen.append(dict(kwargs))
+        return FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+    monkeypatch.setattr(cli_module, "GatewayModelAdapter", recording_gateway_adapter)
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config("run.finish", model=ModelConfig(provider="gateway")).to_json()),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--runtime-config-file",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen and seen[0]["provider_name"] == "openai"
+
+
+def test_the_backend_builder_carries_the_configured_relayed_provider(tmp_path: Path) -> None:
+    """The backend's twin of the CLI knob, asserted at ``build_model_adapter``.
+
+    This is the function *recovery* rebuilds through as well (recovery.py resume ->
+    ``BackendLoopFactory.build`` -> ``build_model_adapter``), so the restore path inherits
+    whatever this one carries; the restore pin below asserts that inheritance end to end.
+    """
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    def adapter_for(**kwargs) -> GatewayModelAdapter:  # noqa: ANN003
+        backend = RunnerBackend(
+            run_root=tmp_path / "runs",
+            token_manager=_token_manager(),
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url="http://llm-gateway.internal/internal/llm/turns",
+            **kwargs,
+        )
+        try:
+            built = backend._loop_factory.build_model_adapter(spec, "token", ModelConfig())
+        finally:
+            backend.shutdown()
+        assert isinstance(built, GatewayModelAdapter)
+        return built
+
+    assert adapter_for().provider_name == "openai"
+    assert adapter_for(llm_gateway_provider="anthropic").provider_name == "anthropic"
+    assert adapter_for(llm_gateway_provider=None).provider_name is None
+
+
+def test_the_backend_serve_command_threads_the_relayed_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The backend's field needs a shipped way to be set, exactly as the CLI's does.
+
+    ``backend serve`` is the process that owns ``RunnerBackend`` in a deployment; a field only an
+    in-process embedder could reach would leave the out-of-process one on the default forever.
+    """
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    seen: dict = {}
+
+    class _Server:
+        def serve_forever(self) -> None:
+            raise KeyboardInterrupt
+
+        def server_close(self) -> None:
+            return None
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            seen.update(kwargs)
+
+        def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "RunnerBackend", _Backend)
+    monkeypatch.setattr(cli_module, "create_backend_server", lambda *a, **k: _Server())
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def serve(*extra: str):  # noqa: ANN202
+        seen.clear()
+        return CliRunner().invoke(
+            cli_module.main,
+            [
+                "backend",
+                "serve",
+                "--run-root",
+                str(tmp_path / "runs"),
+                "--workspace-root",
+                str(workspace),
+                "--llm-gateway-url",
+                "http://gateway.local/internal/llm/turns",
+                "--ephemeral-token-secret",
+                *extra,
+            ],
+        )
+
+    result = serve("--llm-gateway-provider", "anthropic")
+    assert result.exit_code == 0, result.output
+    assert seen["llm_gateway_provider"] == "anthropic"
+
+    result = serve()
+    assert result.exit_code == 0, result.output
+    assert seen["llm_gateway_provider"] == "openai"
+
+
+def test_a_restored_run_rebuilds_the_adapter_with_the_configured_relayed_provider(
+    tmp_path: Path,
+) -> None:
+    """The restore path is the one that silently reverts a per-deployment setting.
+
+    A recovered activation rebuilds its adapter from the *new* process's configuration, so a
+    setting carried only by the submit path would come back as the default one restart later —
+    and the reasoning tag would then name a provider the gateway does not front. Asserted on the
+    adapter the resumed loop actually holds.
+    """
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager, provider_adapter_factory=offline_provider_factory
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    with serving(server) as gateway_url:
+        submitter = RunnerBackend(
+            run_root=run_root,
+            token_manager=manager,
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url=f"{gateway_url}/internal/llm/turns",
+        )
+        try:
+            submission = submitter.submit_run(
+                BackendRunRequest(
+                    tenant_id="tenant_a",
+                    user_id="user_a",
+                    workspace_root=workspace,
+                    instruction="hello",
+                    runtime_config=runtime_config("run.finish"),
+                    multi_turn=True,
+                )
+            )
+            run_id, token = submission.run_id, submission.run_token
+            assert _eventually(lambda: submitter.checkpoint_store.latest(run_id) is not None)
+        finally:
+            submitter.shutdown()
+
+        restorer = RunnerBackend(
+            run_root=run_root,
+            token_manager=manager,
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url=f"{gateway_url}/internal/llm/turns",
+            llm_gateway_provider="anthropic",
+        )
+        restorer.max_recover_attempts = 10_000
+        try:
+            assert restorer.resume_run(run_id, token)["resumed"] is True
+            rebuilt = restorer._record(run_id).loop.model_adapter
+            assert isinstance(rebuilt, GatewayModelAdapter)
+            assert rebuilt.provider_name == "anthropic"
+        finally:
+            restorer.cancel_run(run_id, token)
+            restorer.wait_for_run(run_id, timeout_s=20)
+            restorer.shutdown()

@@ -49,6 +49,32 @@ from monoid_agent_kernel.tools.base import ToolSpec
 DEFAULT_GATEWAY_URL_ENV = "MONOID_LLM_GATEWAY_URL"
 DEFAULT_GATEWAY_TOKEN_ENV = "MONOID_LLM_GATEWAY_TOKEN"
 
+# The upstream the *reference* gateway fronts when no ``provider_adapter_factory`` overrides it
+# (``_upstream_model_config`` builds ``provider="openai"``; ``_build_adapter`` falls back to
+# ``OpenAIModelAdapter``). It is the dataclass default of ``GatewayModelAdapter.provider_name``
+# and the default of every shipped builder's knob, defined once so those cannot drift apart.
+DEFAULT_RELAYED_PROVIDER = "openai"
+# How a *string-typed* configuration surface -- a CLI flag, an env var, a JSON field -- spells the
+# protocol's ``None`` ("do not tag"). Case-insensitive: an operator typing NONE means this.
+RELAYED_PROVIDER_NONE = "none"
+
+
+def resolve_relayed_provider(value: str | None) -> str | None:
+    """Read a configured upstream name into ``GatewayModelAdapter.provider_name``.
+
+    Shared by every string-typed surface that configures the relayed provider (the CLI's
+    ``--llm-gateway-provider``, the backend service field) so the sentinel and the trimming
+    behave identically on all of them. ``None``, blank, and the ``"none"`` sentinel all mean the
+    protocol's documented "do not tag"; anything else is the upstream's name, stripped.
+    """
+
+    if value is None:
+        return None
+    text = value.strip()
+    if not text or text.lower() == RELAYED_PROVIDER_NONE:
+        return None
+    return text
+
 GATEWAY_TIMEOUT = "gateway_timeout"
 GATEWAY_NETWORK_ERROR = "gateway_network_error"
 GATEWAY_RATE_LIMITED = "gateway_rate_limited"
@@ -138,7 +164,7 @@ class GatewayModelAdapter:
     # which is the correct attribution for all three: those spans describe the call the *model*
     # served, and "gateway" is the transport it arrived over. ``ModelConfig.provider`` still
     # carries that transport string beside it.
-    provider_name: str | None = "openai"
+    provider_name: str | None = DEFAULT_RELAYED_PROVIDER
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True

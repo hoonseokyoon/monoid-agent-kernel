@@ -58,7 +58,11 @@ from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
-from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+from monoid_agent_kernel.providers.gateway import (
+    DEFAULT_RELAYED_PROVIDER as _DEFAULT_RELAYED_PROVIDER,
+    GatewayModelAdapter,
+    resolve_relayed_provider,
+)
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.recorder import StdoutJsonlSink, append_event_to_run
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
@@ -123,6 +127,19 @@ main.add_command(builder_group)
     type=click.Path(path_type=Path),
     default=None,
     help="File containing a short-lived gateway token.",
+)
+@click.option(
+    "--llm-gateway-provider",
+    type=str,
+    default=_DEFAULT_RELAYED_PROVIDER,
+    show_default=True,
+    help=(
+        "Names the UPSTREAM provider the gateway relays, never the gateway hop itself. "
+        "It tags the provider-native reasoning artifacts the gateway carries back (they only "
+        "replay to a matching provider) and it is the provider attributed on the observability "
+        'surfaces: the model-call receipt and OTel\'s gen_ai.provider.name. Pass "none" to '
+        "disable tagging, which is right for a gateway whose upstream has no reasoning artifacts."
+    ),
 )
 @click.option(
     "--allow-direct-provider-api",
@@ -212,6 +229,7 @@ def run(
     llm_gateway_url: str | None,
     llm_gateway_token_env: str,
     llm_gateway_token_file: Path | None,
+    llm_gateway_provider: str | None,
     allow_direct_provider_api: bool,
     mode: str,
     workspace_backend: str,
@@ -340,6 +358,7 @@ def run(
         or (runtime_config.model.gateway_url if runtime_config.model else None),
         llm_gateway_token_env=llm_gateway_token_env,
         llm_gateway_token_file=llm_gateway_token_file,
+        llm_gateway_provider=llm_gateway_provider,
         allow_direct_provider_api=allow_direct_provider_api,
     )
     # One adapter serves every turn of this run, so an adapter that can hold its provider client
@@ -968,6 +987,18 @@ def backend() -> None:
     help="Allowed local reference apply root. Repeat for multiple roots.",
 )
 @click.option("--llm-gateway-url", type=str, required=True, help="Internal LLM gateway URL.")
+@click.option(
+    "--llm-gateway-provider",
+    type=str,
+    default=_DEFAULT_RELAYED_PROVIDER,
+    show_default=True,
+    help=(
+        "Names the UPSTREAM provider that gateway relays, never the gateway hop itself. It tags "
+        "the provider-native reasoning artifacts the gateway carries back (they only replay to a "
+        "matching provider) and it is the provider attributed on the model-call receipt and "
+        'OTel\'s gen_ai.provider.name. Pass "none" to disable tagging.'
+    ),
+)
 @click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
     "--admin-token-env",
@@ -996,6 +1027,7 @@ def backend_serve(
     workspace_root: tuple[Path, ...],
     apply_root: tuple[Path, ...],
     llm_gateway_url: str,
+    llm_gateway_provider: str | None,
     web_gateway_url: str | None,
     admin_token_env: str,
     token_secret_env: str,
@@ -1021,6 +1053,7 @@ def backend_serve(
         allowed_workspace_roots=workspace_root,
         allowed_apply_roots=apply_root,
         llm_gateway_url=llm_gateway_url,
+        llm_gateway_provider=llm_gateway_provider,
         web_gateway_url=web_gateway_url,
     )
     server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
@@ -1324,6 +1357,7 @@ def _model_adapter(
     llm_gateway_url: str | None,
     llm_gateway_token_env: str,
     llm_gateway_token_file: Path | None,
+    llm_gateway_provider: str | None = _DEFAULT_RELAYED_PROVIDER,
     allow_direct_provider_api: bool,
 ) -> ModelAdapter:
     if config.provider == "gateway":
@@ -1332,6 +1366,7 @@ def _model_adapter(
             gateway_url=llm_gateway_url,
             token_env=llm_gateway_token_env,
             token_file=llm_gateway_token_file,
+            provider_name=resolve_relayed_provider(llm_gateway_provider),
         )
     if config.provider == "openai":
         if not allow_direct_provider_api:

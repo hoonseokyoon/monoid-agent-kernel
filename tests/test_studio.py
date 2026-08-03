@@ -504,6 +504,86 @@ def test_studio_without_async_transport_uses_one_shot_and_completes(
         server.shutdown()
 
 
+def test_studio_does_not_attribute_an_offline_run_to_openai(tmp_path: Path) -> None:
+    """An offline Studio never contacts OpenAI, so its receipts and spans must not say so.
+
+    The gateway adapter defaults its relayed-provider name to the reference gateway's default
+    upstream, which is right only when the gateway *has* that upstream. Studio's bundled gateway
+    is handed an ``offline_provider_factory`` (echo, no key, no egress), so the default would have
+    every offline run's ``ModelCallReceipt.provider_name`` and ``gen_ai.provider.name`` claim a
+    provider the process never called. The honest answer is the protocol's "do not tag".
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+        )
+    )
+    server.start()
+    try:
+        assert server.offline is True
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider is None
+    finally:
+        server.shutdown()
+
+
+def test_studio_does_not_attribute_an_injected_provider_to_openai(tmp_path: Path) -> None:
+    """The same rule for the embedder seam: an injected factory is not the reference upstream.
+
+    ``provider_factory`` replaces the gateway's whole upstream, so Studio cannot know whose
+    artifacts come back. Naming one anyway is the mislabelling this pair exists to prevent.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+        ),
+        provider_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(final_text="injected")]
+        ),
+    )
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider is None
+    finally:
+        server.shutdown()
+
+
+def test_studio_attributes_its_openai_deployment_to_openai(tmp_path: Path) -> None:
+    """The complement: with no factory the bundled gateway *is* fronting OpenAI, so it says so."""
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            provider="openai",
+            run_root=tmp_path / "runs",
+        )
+    )
+    server.start()
+    try:
+        assert server.offline is False
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider == "openai"
+    finally:
+        server.shutdown()
+
+
 def test_studio_rejects_invalid_content_egress_env_before_opening_servers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -16,6 +16,15 @@ monoid run \
   --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns
 ```
 
+`--llm-gateway-provider` names the **upstream** provider that gateway relays (default
+`openai`, matching the reference gateway's own upstream). It is not the transport: it
+tags the provider-native reasoning artifacts the gateway carries back, so they only
+replay to a matching provider, and it is the provider attributed on the model-call
+receipt and OTel's `gen_ai.provider.name`. Pass `--llm-gateway-provider none` for a
+gateway whose upstream has no reasoning artifacts — that disables tagging. A deployment
+whose gateway fronts something other than OpenAI must set this, or the tag names a
+provider that cannot read the items back.
+
 Run spec and runtime config are separate. `AgentRunSpec` carries workspace,
 limits, and permission boundary values — it no longer carries the instruction,
 which is delivered as the first user turn (CLI `--instruction`, or

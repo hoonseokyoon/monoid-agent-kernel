@@ -44,6 +44,14 @@ monoid backend serve \
   --web-gateway-url http://127.0.0.1:8090
 ```
 
+`--llm-gateway-provider` (default `openai`, `none` to disable) names the **upstream**
+provider behind `--llm-gateway-url`, not the hop. It becomes
+`GatewayModelAdapter.provider_name` on every adapter the backend builds — including the
+ones recovery rebuilds after a restart — which tags relayed reasoning artifacts so they
+only replay to a matching provider, and attributes the model-call receipt and its OTel
+`gen_ai.provider.name`. In-process embedders set the same value with the
+`RunnerBackend(llm_gateway_provider=...)` field.
+
 ## Start the Web gateway
 
 For local contract testing, start the reference fake WebGateway:

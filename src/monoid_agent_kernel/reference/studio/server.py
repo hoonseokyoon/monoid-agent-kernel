@@ -85,6 +85,7 @@ from monoid_agent_kernel.reference.backend.model_stream import (
 )
 from monoid_agent_kernel.reference.outbox import InboxRoutingOutboxSender, OutboxToolProvider
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.providers.gateway import DEFAULT_RELAYED_PROVIDER
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
@@ -1148,6 +1149,13 @@ class StudioServer:
         provider_factory = self._provider_factory_override or (
             offline_provider_factory if self.offline else None
         )
+        # Whose reasoning artifacts this gateway relays, decided at the same site that decides
+        # its upstream. Only the no-factory case actually fronts OpenAI (the gateway falls back
+        # to OpenAIModelAdapter); the offline echo model and any injected factory front something
+        # else entirely, and the adapter's "openai" default would have those runs' receipts and
+        # OTel spans name a provider this process never called. ``None`` is the protocol's
+        # documented "do not tag" and the honest answer for both.
+        relayed_provider = DEFAULT_RELAYED_PROVIDER if provider_factory is None else None
         gateway = LlmGatewayBackend(
             token_manager=self._token_manager,
             provider_adapter_factory=provider_factory,
@@ -1221,6 +1229,7 @@ class StudioServer:
             # Allow applying an approved proposal back into the workspace (R2).
             allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
+            llm_gateway_provider=relayed_provider,
             web_gateway_url=f"http://127.0.0.1:{web_port}",
             # Provider streaming and content egress are separate. Stop stays token-responsive even
             # when live/private content is denied; entitled Studio runs use the passive broker and
