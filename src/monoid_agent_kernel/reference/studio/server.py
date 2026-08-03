@@ -85,7 +85,10 @@ from monoid_agent_kernel.reference.backend.model_stream import (
 )
 from monoid_agent_kernel.reference.outbox import InboxRoutingOutboxSender, OutboxToolProvider
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
-from monoid_agent_kernel.providers.gateway import DEFAULT_RELAYED_PROVIDER
+from monoid_agent_kernel.providers.gateway import (
+    DEFAULT_RELAYED_PROVIDER,
+    resolve_relayed_provider,
+)
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
@@ -545,6 +548,14 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
+    # Whose reasoning artifacts the bundled gateway relays, when the deployment knows and Studio
+    # cannot derive it. ``None`` means "derive" (see ``start``); a string wins and is read through
+    # the same ``resolve_relayed_provider`` every other string-typed surface uses, so ``"none"``
+    # spells the protocol's "do not tag" here exactly as it does on the CLI flag. This exists for
+    # the embedder seam: a ``provider_factory`` replaces the gateway's whole upstream, so the
+    # derivation can only answer "do not tag" for it -- correct as a guess, and no way to be told
+    # otherwise, which left an OpenAI-backed factory's reasoning round-trip silently dead.
+    llm_gateway_provider: str | None = None
     # Permit model-authored content to leave the run through Studio's private sidecar and passive
     # live stream. ``MONOID_OUTPUT_DELTAS`` is the deployment-wide permission gate on top. The
     # durable operation log stays compact either way, and provider streaming remains selected so
@@ -1155,7 +1166,16 @@ class StudioServer:
         # else entirely, and the adapter's "openai" default would have those runs' receipts and
         # OTel spans name a provider this process never called. ``None`` is the protocol's
         # documented "do not tag" and the honest answer for both.
-        relayed_provider = DEFAULT_RELAYED_PROVIDER if provider_factory is None else None
+        #
+        # That derivation is a *guess*, and a correct one only while nobody knows better. An
+        # embedder does: it supplied the factory. So the config's explicit setting wins, read
+        # through the shared resolver so "none" spells "do not tag" here as on every other
+        # string-typed surface. Unset (``None``) still means derive, which is why the override
+        # is tested for presence rather than for truth.
+        if self.config.llm_gateway_provider is not None:
+            relayed_provider = resolve_relayed_provider(self.config.llm_gateway_provider)
+        else:
+            relayed_provider = DEFAULT_RELAYED_PROVIDER if provider_factory is None else None
         gateway = LlmGatewayBackend(
             token_manager=self._token_manager,
             provider_adapter_factory=provider_factory,

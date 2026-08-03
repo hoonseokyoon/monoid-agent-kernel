@@ -274,8 +274,12 @@ class LoopBootstrapper:
                     # lost: ``manifest.json`` (written three lines up) records the configured
                     # ``model_provider`` verbatim, and it is the run's configuration record.
                     #
-                    # ``or`` the config's string so an adapter that declares nothing -- the
-                    # neutral case -- keeps exactly the value this line always emitted.
+                    # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
+                    # reaches the config itself, on the tolerance path too, and its docstring
+                    # says so. What is left is this event's schema obligation: ``model_provider``
+                    # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
+                    # (outside the declared Literal, but constructible) would resolve to ``None``
+                    # and emit null. Kept as that guarantee, not as a second resolution rule.
                     "model_provider": resolved_provider_name(
                         loop.model_adapter, initial_runtime_config.model or ModelConfig()
                     )

@@ -291,6 +291,13 @@ is where the *event-driven* sink — the zero-argument quickstart above, with no
 stated as a mechanism rather than as a list: while `run.started` carried the raw config, one
 `OtelEventSink` class produced two different answers for one call depending on how it was wired.
 
+The agreement between those four is scoped to activations that emit `run.started`. An
+event-only sink attached to a **restored** run joins after that event was written, so it has no
+`model_provider` to read and reports no provider or model for the resumed turns; the
+receipt-driven configuration (`model_io_subscriptions`) has no such gap, because every call
+publishes its own receipt. This predates the provider-attribution change and is unaffected by
+it — a sink that needs provider attribution across a restore should be wired with subscriptions.
+
 The transport is not lost — `receipt.model.provider` still carries `"gateway"`, and `manifest.json`
 records the configured `model_provider` verbatim — so a dashboard that wants to group by hop groups
 by those. Deployments whose gateway fronts a different upstream should set the flag accordingly;

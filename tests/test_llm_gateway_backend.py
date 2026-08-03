@@ -1662,3 +1662,78 @@ def test_a_restored_run_rebuilds_the_adapter_with_the_configured_relayed_provide
             restorer.cancel_run(run_id, token)
             restorer.wait_for_run(run_id, timeout_s=20)
             restorer.shutdown()
+
+
+def test_the_provider_resolution_survives_a_hostile_declaration_on_every_surface() -> None:
+    """The tolerance path used to short-circuit the fallback, so the surfaces disagreed.
+
+    ``resolved_provider_name`` is documented as ONE expression precisely so the model-stream
+    context, ``run.started``'s ``model_provider`` and the receipt-derived span cannot answer
+    differently about one call. A third-party ``provider_name`` that raises -- or whose ``str()``
+    does -- must not take a run down over a field nothing branches on, and that much held; but
+    the guard returned ``None`` instead of falling through, so on exactly that path the
+    model-stream context reported *no provider* while every other surface reported the configured
+    transport. Tolerance is "keep going", not "answer nothing".
+
+    The declared value is normalized the way ``ModelCallRunner`` normalizes its own read, which
+    is what makes the receipt and these two surfaces byte-identical rather than merely equal in
+    the easy case.
+    """
+
+    from monoid_agent_kernel.providers.base import ModelTurn, resolved_provider_name
+
+    config = ModelConfig(provider="gateway", model="gpt-5.5")
+
+    class _Answering:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="ok", usage={}, stop_reason="stop")
+
+    class _RaisingProperty(_Answering):
+        @property
+        def provider_name(self) -> str:
+            raise RuntimeError("third-party adapter property blew up")
+
+    class _RaisingStr(_Answering):
+        class _Unprintable:
+            def __str__(self) -> str:
+                raise RuntimeError("__str__ blew up")
+
+            def __bool__(self) -> bool:
+                return True
+
+        provider_name = _Unprintable()
+
+    for adapter in (_RaisingProperty(), _RaisingStr()):
+        resolved = resolved_provider_name(adapter, config)
+        assert resolved == "gateway", type(adapter).__name__
+        # The three surfaces, spelled as the three call sites spell them.
+        assert (resolved or config.provider) == "gateway"
+        runner = ModelCallRunner(adapter=adapter)
+        _turn, receipt = asyncio.run(
+            runner.acall(ModelRequest(instruction="hi", system_prompt="", tools=(), model=config))
+        )
+        assert (receipt.provider_name or receipt.model.provider) == "gateway"
+
+    # A declaration that IS readable still wins, and arrives normalized on both reads.
+    class _Surrogate(_Answering):
+        provider_name = "open\ud800ai"
+
+    runner = ModelCallRunner(adapter=_Surrogate())
+    _turn, receipt = asyncio.run(
+        runner.acall(ModelRequest(instruction="hi", system_prompt="", tools=(), model=config))
+    )
+    assert resolved_provider_name(_Surrogate(), config) == "open\ufffdai"
+    assert receipt.provider_name == resolved_provider_name(_Surrogate(), config)
+
+
+def test_a_declaration_free_adapter_still_resolves_to_the_configured_provider() -> None:
+    """The neutral case the tolerance path was accidentally imitating."""
+
+    from monoid_agent_kernel.providers.base import resolved_provider_name
+
+    class _Plain:
+        pass
+
+    assert resolved_provider_name(_Plain(), ModelConfig(provider="openai")) == "openai"
+    assert resolved_provider_name(_Plain(), None) is None

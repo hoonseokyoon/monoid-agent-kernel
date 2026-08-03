@@ -584,6 +584,87 @@ def test_studio_attributes_its_openai_deployment_to_openai(tmp_path: Path) -> No
         server.shutdown()
 
 
+def test_studio_lets_an_embedder_declare_the_upstream_its_factory_fronts(
+    tmp_path: Path,
+) -> None:
+    """The third case the derivation cannot express, and the one an embedder actually has.
+
+    ``provider_factory`` is Studio's seam for an embedder that supplies its own upstream -- and
+    the pair above answers "do not tag" for it, correctly, because Studio cannot *guess* whose
+    artifacts come back. What it could not do is be TOLD: an embedder whose factory is
+    OpenAI-backed had no way to say so, so the reasoning round-trip through its own gateway was
+    silently dead (the loop only replays a tagged block to a matching adapter). The override says
+    it; unset keeps the derivation exactly as it was.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def _serve(**config_extra: object) -> StudioServer:
+        return StudioServer(
+            StudioConfig(
+                workspace=workspace,
+                host="127.0.0.1",
+                port=0,
+                run_root=tmp_path / "runs",
+                **config_extra,  # type: ignore[arg-type]
+            ),
+            provider_factory=lambda _claims, _config: FakeModelAdapter(
+                turns=[ModelTurn(final_text="injected")]
+            ),
+        )
+
+    server = _serve(llm_gateway_provider="openai")
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider == "openai"
+    finally:
+        server.shutdown()
+
+    # The same sentinel every other string-typed surface spells, through the same resolver.
+    server = _serve(llm_gateway_provider="NoNe")
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider is None
+    finally:
+        server.shutdown()
+
+    # Unset is not "none": it is "derive", and the derivation is untouched.
+    server = _serve()
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider is None
+    finally:
+        server.shutdown()
+
+
+def test_studio_override_wins_over_the_no_factory_derivation(tmp_path: Path) -> None:
+    """The other half of "set wins": a deployment fronting something else through the bundled
+    gateway must be able to say so too, not only one that injected a factory."""
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    server = StudioServer(
+        StudioConfig(
+            workspace=workspace,
+            host="127.0.0.1",
+            port=0,
+            provider="openai",
+            run_root=tmp_path / "runs",
+            llm_gateway_provider="anthropic",
+        )
+    )
+    server.start()
+    try:
+        assert server._backend is not None
+        assert server._backend.llm_gateway_provider == "anthropic"
+    finally:
+        server.shutdown()
+
+
 def test_studio_rejects_invalid_content_egress_env_before_opening_servers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

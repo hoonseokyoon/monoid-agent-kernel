@@ -347,10 +347,14 @@ Four further opt-in protocols declare optional capability members:
   relays, not itself: `GatewayModelAdapter.provider_name` names the gateway's **upstream** and
   defaults to `"openai"`, matching the reference gateway's own default upstream. A deployment
   whose `provider_adapter_factory` routes elsewhere must set it to that upstream, through
-  `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`, or
-  `RunnerBackend(llm_gateway_provider=...)`; those spell `None` as `none`. The same attribute
+  `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`,
+  `RunnerBackend(llm_gateway_provider=...)`, or — for the reference Studio, whose embedder seam
+  is exactly such a factory — `StudioConfig(llm_gateway_provider=...)`; those spell `None` as
+  `none`, and leaving them unset means "derive". The same attribute
   names the provider on every observability surface that probes an adapter for one — via
-  `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`,
+  `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`
+  (including when the declaration is unreadable — the tolerance path still falls back rather
+  than answering nothing),
   and feeds `ModelCallReceipt.provider_name`, the model-stream context's `provider`, and
   `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
   through the gateway is therefore attributed to the model that served it, with the transport
@@ -675,10 +679,19 @@ replays none.
 **Replay is guaranteed only for the active window, and requests are pruned to it.** The active
 window is everything after the last `user` message — the in-flight tool loop. A captured
 reasoning block is replayable while it sits inside that window, and once a new user message
-lands it is outside forever, because the window only moves forward. The kernel therefore builds
-each request from a wire copy with the `reasoning` key removed from every message before the
-window start. What the provider sees is unchanged: outside the window the adapter already
-reconstructed those turns from `content`/`tool_calls` and never read the block. What changes is
+lands it is outside forever, because the window only moves forward. "Last `user` message" means
+the last message *with role `user`*, whoever wrote it — the end user's next turn, and equally a
+user-role message the **kernel itself** authors: the `OutputValidator`'s repair prompt, and the
+observation messages a background or HITL result arrives on. An operator reading "a new user
+turn" would guess those do not count; they always have, because the adapter's replay filter
+reads the same role. So they are window boundaries, and everything before them is dead.
+
+The kernel therefore builds each request from a wire copy with the `reasoning` key removed from
+every message before the window start. Both of its request builders do — the loop's per-turn
+wire copy and the standalone validated call's repair request, which appends an assistant turn
+and a user-role repair prompt and so kills every block it was carrying. What the provider sees is
+unchanged in both — verified byte-identical on the repair path: outside the window the adapter
+already reconstructed those turns from `content`/`tool_calls` and never read the block. What changes is
 size — the un-pruned request re-sent one dead block per user turn on every later request, which
 grows with the conversation and is paid to the provider, to the gateway in between (twice on
 that route), and to the resolved-wire guard that `max_message_log_bytes` bounds. Note that on a

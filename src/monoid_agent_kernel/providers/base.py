@@ -358,18 +358,26 @@ def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | No
 
     Tolerant by construction: this feeds telemetry, and a third-party ``provider_name`` property
     that raises -- or whose ``str()`` does -- must not take a run down over an attribute nothing
-    branches on. Mirrors the defensive probe in ``ModelCallRunner``.
+    branches on. Mirrors the defensive probe in ``ModelCallRunner``, including its
+    ``normalize_unicode_scalars``, so the receipt's own read of a declaration and this one are
+    byte-identical rather than merely equal on well-behaved strings.
+
+    Tolerance means "keep going", not "answer nothing": the declaration guard FALLS THROUGH to
+    the config fallback rather than returning. It used to return ``None`` there, which made the
+    one documented expression give two answers on exactly the path it exists for -- the
+    model-stream context reported no provider at all while ``run.started``, the receipt and the
+    OTel span beside them all reported the configured transport for the same call.
     """
 
     try:
         declared = getattr(adapter, "provider_name", None)
         if declared:
-            return str(declared)
+            return normalize_unicode_scalars(str(declared))
     except Exception:
-        return None
+        pass  # unreadable declaration: fall through to the config, do not answer nothing
     try:
         fallback = config.provider if config is not None else None
-        return str(fallback) if fallback else None
+        return normalize_unicode_scalars(str(fallback)) if fallback else None
     except Exception:
         return None
 
