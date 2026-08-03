@@ -7,6 +7,25 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a success the SDK re-sent stops reading as a clean first attempt
+
+- **`OpenAIModelAdapter` reports the SDK's own retries on its success paths too.** The retry
+  probe added in the burn-down (`_provider_retried_by_the_sdk`) ran only on exceptions, so a
+  call the OpenAI client's internal retry loop re-sent before *succeeding* was written to
+  `transcript.jsonl`, the `ModelCallReceipt` and the gateway success body/frames as
+  `provider_retried: false` — contrary to the field's audit semantics, while the identical
+  call one failure later reported its retries. Both success lanes now read the same stamped
+  `x-stainless-retry-count` header through the same one parser as the failure path: the
+  non-streaming turn goes through `with_raw_response` (the parsed model keeps no reference to
+  the HTTP exchange; the wrapper's `.parse()` yields the same object, and its
+  `.http_response.request` carries the header — verified empirically on openai 2.41.1,
+  including that the wrapper has no `.request` of its own), and the streaming path reads
+  `stream.response.request`, stamping the verdict on EVERY chunk rather than only
+  `TurnComplete`, so a stream abandoned mid-flight still reports it. The probe's guard policy
+  is unchanged on all lanes: anything unreadable means "no retry", never a raise. No wire or
+  schema change — the turn/chunk carriers, transcript success record, receipt and gateway
+  bodies already had the field and now receive the true value.
+
 ### Fixed — every failure quarantine speaks, and a resume refusal says why
 
 - **`record_run_failure` — the third `failure.json` writer — makes the terminal statement the

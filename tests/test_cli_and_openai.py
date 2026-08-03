@@ -693,9 +693,14 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
             self.status_code = 400
             self.body = {"code": "unsupported_value"}
 
-    class _FakeResponses:
+    class _FakeRawCalls:
         def create(self, **kwargs):  # noqa: ANN003
             raise _FakeBadRequest()
+
+    class _FakeResponses:
+        # The surface ``next_turn`` drives: the raw-response wrapper (it keeps the final request
+        # the success-path retry probe reads), which raises exactly as the plain call would.
+        with_raw_response = _FakeRawCalls()
 
     built = _stub_openai(monkeypatch, "OpenAI", _FakeResponses())
     adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
@@ -789,17 +794,34 @@ class _ResponsesStandIn(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        if self.server.status != 200:
+        if self.server.take_failure():
+            # A transient 500 the SDK's own retry loop absorbs. ``retry-after-ms`` keeps the
+            # SDK's backoff out of the test clock (its schedule honours the header).
+            self._respond(
+                500,
+                _STANDIN_ERROR,
+                "application/json",
+                extra_headers={"retry-after-ms": "1"},
+            )
+        elif self.server.status != 200:
             self._respond(self.server.status, _STANDIN_ERROR, "application/json")
         elif json.loads(body).get("stream"):
             self._respond(200, _STANDIN_SSE, "text/event-stream")
         else:
             self._respond(200, json.dumps(_STANDIN_RESPONSE).encode("utf-8"), "application/json")
 
-    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+    def _respond(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -814,9 +836,10 @@ class _StandInServer(ThreadingHTTPServer):
     sockets actually went away, observed from outside the code under test.
     """
 
-    def __init__(self, status: int = 200) -> None:
+    def __init__(self, status: int = 200, fail_first: int = 0) -> None:
         super().__init__(("127.0.0.1", 0), _ResponsesStandIn)
         self.status = status
+        self.fail_first = fail_first
         self.live = 0
         self._live_lock = threading.Lock()
 
@@ -824,11 +847,21 @@ class _StandInServer(ThreadingHTTPServer):
         with self._live_lock:
             self.live += delta
 
+    def take_failure(self) -> bool:
+        """Consume one budgeted transient failure, if any remain."""
+        with self._live_lock:
+            if self.fail_first <= 0:
+                return False
+            self.fail_first -= 1
+            return True
+
 
 @contextlib.contextmanager
-def _responses_stand_in(monkeypatch: pytest.MonkeyPatch, *, status: int = 200) -> Iterator[_StandInServer]:
+def _responses_stand_in(
+    monkeypatch: pytest.MonkeyPatch, *, status: int = 200, fail_first: int = 0
+) -> Iterator[_StandInServer]:
     """Serve the stand-in and point the SDK at it via ``OPENAI_BASE_URL``."""
-    server = _StandInServer(status)
+    server = _StandInServer(status, fail_first)
     with serving(server) as base_url:
         monkeypatch.setenv("OPENAI_BASE_URL", f"{base_url}/v1")
         yield server
@@ -1011,6 +1044,51 @@ def test_openai_next_turn_closes_its_client(monkeypatch: pytest.MonkeyPatch) -> 
     assert still_open == 0, f"{still_open} connection(s) still open server-side"
 
 
+def test_openai_next_turn_reports_the_sdk_retry_behind_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empirical, against the real SDK: a 500 its retry loop absorbs still marks the success.
+
+    The stand-in refuses the first POST and answers the second, which is invisible to the
+    adapter's own control flow -- the SDK hands back a parsed model either way. The evidence
+    is the ``x-stainless-retry-count`` header the SDK stamps on its final request, read off the
+    raw-response wrapper; without it this call was written to the transcript, the receipt and
+    the gateway wire as a clean first attempt. The follow-up call on the now-healthy server
+    proves the flag is per-call evidence, not adapter state.
+    """
+    pytest.importorskip("openai")
+    with _responses_stand_in(monkeypatch, fail_first=1):
+        retried = _standin_adapter().next_turn(_standin_request())
+        clean = _standin_adapter().next_turn(_standin_request())
+
+    assert retried.final_text == "Hi"
+    assert retried.provider_retried is True
+    assert clean.final_text == "Hi"
+    assert clean.provider_retried is False
+
+
+def test_openai_astream_reports_the_sdk_retry_on_every_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming twin, and on every chunk: an abandoned stream never yields the terminal
+    one, so evidence riding only ``TurnComplete`` is evidence a cancelled call cannot report."""
+    pytest.importorskip("openai")
+    with _responses_stand_in(monkeypatch, fail_first=1):
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def drain_twice() -> tuple[list[Any], list[Any]]:
+            first = [chunk async for chunk in adapter.astream_turn(request)]
+            second = [chunk async for chunk in adapter.astream_turn(request)]
+            return first, second
+
+        retried, clean = asyncio.run(drain_twice())
+
+    assert [type(chunk) for chunk in retried] == [TextDelta, TurnComplete]
+    assert [chunk.provider_retried for chunk in retried] == [True, True]
+    assert [type(chunk) for chunk in clean] == [TextDelta, TurnComplete]
+    assert [chunk.provider_retried for chunk in clean] == [False, False]
+
+
 def test_openai_astream_classifies_a_failure_from_the_clients_own_teardown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1051,9 +1129,18 @@ def test_openai_next_turn_classifies_a_failure_from_the_clients_own_teardown(
     """The sync twin: ``__exit__`` sits inside the classified region too."""
     pytest.importorskip("openai")
 
-    class _Responses:
-        def create(self, **_kwargs: Any) -> Any:
+    class _RawTurn:
+        # The ``LegacyAPIResponse`` shape: ``parse()`` yields the model, and no ``request``
+        # attribute at all -- which the retry probe must read as "no retry", not crash on.
+        def parse(self) -> Any:
             return _StreamResp()
+
+    class _RawCalls:
+        def create(self, **_kwargs: Any) -> Any:
+            return _RawTurn()
+
+    class _Responses:
+        with_raw_response = _RawCalls()
 
     built = _stub_openai(
         monkeypatch, "OpenAI", _Responses(), close_error=RuntimeError("pool teardown failed")

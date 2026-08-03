@@ -7,13 +7,24 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import _recoverable_turn_error
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallDelta,
+    TurnComplete,
+)
 from monoid_agent_kernel.providers.openai import (
+    OpenAIModelAdapter,
     _model_error_from_openai,
     _stream_output_index,
 )
@@ -316,3 +327,242 @@ def test_the_connection_branch_still_reports_the_sdk_retries() -> None:
     first_try = httpx.Request("POST", "https://api.openai.com/v1/responses")
     fresh = _model_error_from_openai(openai.APIConnectionError(request=first_try))
     assert fresh.provider_retried is False
+
+
+# --- The success half of the same fact -------------------------------------------------
+#
+# The SDK's retry loop runs on successes too, and a call it re-sent before *succeeding* has the
+# same audit obligation as one it re-sent before failing. The evidence surfaces differ by path:
+# the non-streaming call must go through ``with_raw_response`` (the parsed model keeps no
+# reference to the HTTP exchange), and the stream object keeps its ``httpx.Response`` — both end
+# at the same stamped ``x-stainless-retry-count`` header the exception probe reads.
+
+
+_SUCCESS_DATA: dict[str, Any] = {
+    "id": "resp_1",
+    "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+    "usage": {},
+}
+
+
+class _FakeRawTurn:
+    """The ``LegacyAPIResponse`` shape ``with_raw_response.create`` returns.
+
+    ``parse()`` yields what the plain call used to return, and ``http_response`` is the final
+    ``httpx.Response`` whose ``.request`` carries the same header the exception probe reads.
+    The wrapper itself has NO ``.request`` — verified empirically on openai 2.41.1, and the
+    reason the adapter hops to ``.http_response`` before handing it to the one parser.
+    """
+
+    def __init__(self, data: dict[str, Any], http_response: object | None = None) -> None:
+        self._data = data
+        if http_response is not None:
+            self.http_response = http_response
+
+    def parse(self) -> dict[str, Any]:
+        return self._data
+
+
+class _UnsetRequestResponse:
+    """httpx spells "no request recorded" as a property that *raises* ``RuntimeError``."""
+
+    @property
+    def request(self) -> object:
+        raise RuntimeError("The request instance has not been set on this response.")
+
+
+def _stub_sync_openai(monkeypatch: pytest.MonkeyPatch, raw: object) -> None:
+    """Patch ``openai.OpenAI`` with a client offering both call surfaces, like the SDK."""
+
+    pytest.importorskip("openai")
+
+    class _WithRaw:
+        def create(self, **_kwargs: Any) -> object:
+            return raw
+
+    class _Responses:
+        with_raw_response = _WithRaw()
+
+        def create(self, **_kwargs: Any) -> dict[str, Any]:
+            return _SUCCESS_DATA
+
+    class _Client:
+        responses = _Responses()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: _Client())
+
+
+class _FakeAsyncStream:
+    """The SDK's ``AsyncStream``: async-iterable events plus ``response`` (an ``httpx.Response``)."""
+
+    def __init__(self, events: list[Any], response: object | None = None) -> None:
+        self._events = events
+        if response is not None:
+            self.response = response
+
+    def __aiter__(self) -> _FakeAsyncStream:
+        self._it = iter(self._events)
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+def _stub_async_openai(monkeypatch: pytest.MonkeyPatch, stream: _FakeAsyncStream) -> None:
+    pytest.importorskip("openai")
+
+    class _Responses:
+        async def create(self, **_kwargs: Any) -> _FakeAsyncStream:
+            return stream
+
+    class _Client:
+        responses = _Responses()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("openai.AsyncOpenAI", lambda **_kwargs: _Client())
+
+
+def _adapter() -> OpenAIModelAdapter:
+    return OpenAIModelAdapter(
+        ModelConfig(model="gpt-5.5"), api_key="test", allow_direct_provider_api=True
+    )
+
+
+def _stream_events() -> list[Any]:
+    """One event per chunk type, so the stamp is proven on every shape the stream yields."""
+
+    return [
+        SimpleNamespace(type="response.reasoning_summary_text.delta", delta="think"),
+        SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=0,
+            item=SimpleNamespace(type="function_call", call_id="c1", id=None, name="fs_read"),
+        ),
+        SimpleNamespace(type="response.function_call_arguments.delta", output_index=0, delta="{}"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(
+                model_dump=lambda: {
+                    "id": "r1",
+                    "usage": {},
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "c1",
+                            "name": "fs_read",
+                            "arguments": "{}",
+                        }
+                    ],
+                }
+            ),
+        ),
+    ]
+
+
+def _drain(adapter: OpenAIModelAdapter) -> list[Any]:
+    async def _go() -> list[Any]:
+        request = ModelRequest(instruction="hi", system_prompt="", tools=())
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    return asyncio.run(_go())
+
+
+def test_a_retried_then_successful_sync_turn_reports_the_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure probe's twin: a call the SDK re-sent and then landed must say so too.
+
+    The parsed model the plain call returns keeps no reference to the HTTP exchange, so the
+    adapter reads the raw-response wrapper, whose ``http_response.request`` carries the same
+    stamped header the exception path reads — one parser, both verdicts.
+    """
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    turn = _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert turn.final_text == "ok"
+    assert turn.provider_retried is True
+
+
+def test_b_a_retried_then_successful_stream_stamps_every_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming twin — and on every chunk, not only the terminal one.
+
+    A stream abandoned mid-flight never yields ``TurnComplete``, and evidence riding only that
+    chunk is evidence a cancelled call can never report (the rule ``providers/base.py`` states
+    over the chunk vocabulary).
+    """
+
+    stream = _FakeAsyncStream(
+        _stream_events(), response=SimpleNamespace(request=_RequestWithRetryCount("1"))
+    )
+    _stub_async_openai(monkeypatch, stream)
+    chunks = _drain(_adapter())
+
+    assert [type(chunk) for chunk in chunks] == [
+        ReasoningDelta,
+        TextDelta,
+        ToolCallDelta,
+        ToolCallDelta,
+        TurnComplete,
+    ]
+    assert [chunk.provider_retried for chunk in chunks] == [True] * 5
+
+
+def test_c_an_unretried_success_stays_a_clean_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The header the SDK stamps on a first attempt is ``0``, and 0 means no retry — both paths."""
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("0"))),
+    )
+    turn = _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+    assert turn.provider_retried is False
+
+    stream = _FakeAsyncStream(
+        _stream_events(), response=SimpleNamespace(request=_RequestWithRetryCount("0"))
+    )
+    _stub_async_openai(monkeypatch, stream)
+    assert [chunk.provider_retried for chunk in _drain(_adapter())] == [False] * 5
+
+
+def test_d_unreadable_success_evidence_reads_as_no_retry_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's policy holds on the success path: anything unreadable means "no retry".
+
+    Three shapes that cannot answer: a raw wrapper with no ``http_response`` at all, one whose
+    response's ``request`` property raises the way httpx's does when unset, and a stream with no
+    ``response`` attribute. All three must produce a successful, un-flagged turn — a probe that
+    raised here would destroy an answer the provider already delivered and billed.
+    """
+
+    _stub_sync_openai(monkeypatch, _FakeRawTurn(_SUCCESS_DATA))
+    request = ModelRequest(instruction="hi", system_prompt="", tools=())
+    turn = _adapter().next_turn(request)
+    assert turn.final_text == "ok"
+    assert turn.provider_retried is False
+
+    _stub_sync_openai(monkeypatch, _FakeRawTurn(_SUCCESS_DATA, _UnsetRequestResponse()))
+    turn = _adapter().next_turn(request)
+    assert turn.final_text == "ok"
+    assert turn.provider_retried is False
+
+    _stub_async_openai(monkeypatch, _FakeAsyncStream(_stream_events()))
+    chunks = _drain(_adapter())
+    assert [chunk.provider_retried for chunk in chunks] == [False] * 5

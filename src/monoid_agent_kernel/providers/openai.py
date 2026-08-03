@@ -344,10 +344,24 @@ class OpenAIModelAdapter:
             payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
             try:
+                # ``with_raw_response`` rather than the plain call, because the parsed model the
+                # plain call returns keeps no reference to the HTTP exchange at all -- so a call
+                # the SDK's own retry loop re-sent before *succeeding* had no readable evidence
+                # left, and the transcript, the receipt and the gateway wire all recorded a clean
+                # first attempt while the failure twin (``_model_error_from_openai``) reported its
+                # retries. The wrapper's ``.parse()`` yields the same model object the plain call
+                # returned, and it keeps the exchange at ``.http_response`` (verified empirically
+                # on openai 2.41.1: the wrapper has NO ``.request`` of its own), whose ``.request``
+                # is the same final ``httpx.Request`` the exception probe reads -- one parser,
+                # both verdicts. ``getattr`` with a default for the hop the probe cannot make
+                # itself, exactly as the streaming path hops ``stream.response``.
+                raw_calls = client.responses.with_raw_response
                 try:
-                    response = client.responses.create(**payload, timeout=config.timeout_s)
+                    raw = raw_calls.create(**payload, timeout=config.timeout_s)
                 except TypeError:
-                    response = client.responses.create(**payload)
+                    raw = raw_calls.create(**payload)
+                retried = _provider_retried_by_the_sdk(getattr(raw, "http_response", None))
+                response = raw.parse()
                 data = (
                     response.model_dump()
                     if hasattr(response, "model_dump")
@@ -363,7 +377,7 @@ class OpenAIModelAdapter:
             # classified ModelAdapterError so the gateway returns the real status (4xx, not a
             # generic 500) and the kernel can treat it as recoverable. Never echo the raw body.
             raise _model_error_from_openai(exc) from exc
-        return _parse_response(data)
+        return _parse_response(data, provider_retried=retried)
 
     async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
         """Stream a turn from the OpenAI Responses API as neutral ``ModelStreamChunk``s (text
@@ -386,6 +400,11 @@ class OpenAIModelAdapter:
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}
+        # Bound before the request for the reason ``stream`` is: the terminal chunk below is
+        # built outside the classified block, and it must read a defined name however early the
+        # block exited. False until the stream commits, which is exactly true of a call that
+        # never reached the provider.
+        provider_retried = False
         # An unscoped call owns its client for the same reason ``next_turn``'s does -- the pool --
         # but it has an exit path ``next_turn`` does not: a consumer that abandons the stream
         # throws ``GeneratorExit`` at one of the yields below, which no close placed after the
@@ -414,6 +433,17 @@ class OpenAIModelAdapter:
                 except TypeError:
                     stream = await client.responses.create(**payload, stream=True)
 
+                # The SDK's retry loop runs entirely before the stream object exists -- a stream
+                # is only handed back once a response committed -- so the evidence is complete
+                # here: the stream's ``httpx.Response`` keeps the final request the probe reads.
+                # Read once and stamped on EVERY chunk below, not only the terminal one, because
+                # a stream abandoned mid-flight never yields ``TurnComplete`` and evidence riding
+                # only that chunk is evidence a cancelled call can never report (the rule the
+                # chunk vocabulary states in ``providers/base.py``). ``getattr`` with a default
+                # for the hop the probe cannot make itself: a stand-in stream with no
+                # ``response`` truthfully answers "no retry".
+                provider_retried = _provider_retried_by_the_sdk(getattr(stream, "response", None))
+
                 async for event in stream:
                     etype = getattr(event, "type", "")
                     if etype == "response.output_text.delta":
@@ -422,7 +452,7 @@ class OpenAIModelAdapter:
                             or ""
                         )
                         if text:
-                            yield TextDelta(text)
+                            yield TextDelta(text, provider_retried=provider_retried)
                     elif etype == "response.reasoning_summary_text.delta":
                         # Display-only reasoning summary fragment (DX-13b). Only present when the
                         # request asked for a summary (reasoning.summary != "off").
@@ -433,7 +463,7 @@ class OpenAIModelAdapter:
                             or ""
                         )
                         if text:
-                            yield ReasoningDelta(text)
+                            yield ReasoningDelta(text, provider_retried=provider_retried)
                     elif etype == "response.output_item.added":
                         item = getattr(event, "item", None)
                         if item is not None and getattr(item, "type", "") == "function_call":
@@ -450,6 +480,7 @@ class OpenAIModelAdapter:
                                     "function-call name",
                                     required=True,
                                 ),
+                                provider_retried=provider_retried,
                             )
                     elif etype == "response.function_call_arguments.delta":
                         frag = (
@@ -463,6 +494,7 @@ class OpenAIModelAdapter:
                             yield ToolCallDelta(
                                 index=_stream_output_index(event),
                                 arguments_fragment=frag,
+                                provider_retried=provider_retried,
                             )
                     elif etype in ("response.completed", "response.incomplete"):
                         # Capture the terminal response for BOTH outcomes: ``response.incomplete``
@@ -502,6 +534,7 @@ class OpenAIModelAdapter:
             # are captured here (from response.completed) rather than the per-token deltas.
             reasoning=_capture_reasoning_items(output_items),
             stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
+            provider_retried=provider_retried,
         )
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
@@ -655,31 +688,37 @@ def _config_shaped_refusal(status: int | None, *, retryable: bool) -> bool:
     )
 
 
-def _provider_retried_by_the_sdk(exc: Exception) -> bool:
+def _provider_retried_by_the_sdk(source: Any) -> bool:
     """Whether the OpenAI client's own retry loop had already re-sent this request.
 
     The kernel counts one adapter call per turn however many attempts happen inside it, so a call
-    the SDK re-sent twice before failing was recorded as a clean single attempt on the receipt,
-    the failure record and the wire.
+    the SDK re-sent twice -- before failing OR before succeeding -- was recorded as a clean single
+    attempt on the receipt, the transcript record and the wire.
 
-    The SDK does not put ``retries_taken`` on an exception -- it passes the count only into
-    ``_process_response``, i.e. the success path -- but every request it builds stamps the count
-    into the ``x-stainless-retry-count`` header it sends, and every ``APIError`` keeps the final
-    ``httpx.Request`` that carried it (openai 2.41.1, ``_base_client._build_headers``). So the
-    evidence survives on the failure too, one attribute hop away.
+    ``source`` is any carrier of the final ``httpx.Request``: every request the SDK builds stamps
+    its attempt count into the ``x-stainless-retry-count`` header it sends (openai 2.41.1,
+    ``_base_client._build_headers``), and each outcome keeps that request at ``.request``. Every
+    ``APIError`` carries it directly; the two success lanes each hand this probe an
+    ``httpx.Response`` -- ``raw.http_response`` off the non-streaming raw-response wrapper
+    (which, verified empirically on 2.41.1, has no ``.request`` of its own), and
+    ``stream.response`` off the streaming path. One parser for all three lanes, so the success
+    paths cannot answer differently from the failure path they are the twin of. (The SDK's
+    ``retries_taken`` is not an alternative for the failure half: it is passed only into
+    ``_process_response``, the success path -- the header is the one carrier every lane shares.)
 
-    Read defensively in both directions: this classifier also answers for exceptions that never
-    came from the SDK at all (a client constructor failure, a payload ``TypeError``), and a
-    *claimed* retry is worse than an unknown one -- anything unreadable means "no retry". The
-    whole read is one guard, in the fully-covered style of ``provider_usage_of``: ``getattr``
-    swallows only ``AttributeError``, and ``httpx.HTTPError.request`` is a *property that
-    raises* ``RuntimeError`` when unset -- exactly what a mid-stream ``ReadError`` carries into
+    Read defensively in both directions: this probe also answers for exceptions that never came
+    from the SDK at all (a client constructor failure, a payload ``TypeError``) and for stand-in
+    responses with no HTTP exchange behind them, and a *claimed* retry is worse than an unknown
+    one -- anything unreadable means "no retry". The whole read is one guard, in the
+    fully-covered style of ``provider_usage_of``: ``getattr`` swallows only ``AttributeError``,
+    and both ``httpx.HTTPError.request`` and ``httpx.Response.request`` are *properties that
+    raise* ``RuntimeError`` when unset -- exactly what a mid-stream ``ReadError`` carries into
     this probe -- so a guard that enumerated the expected exceptions replaced the classified
-    failure with the probe's own crash.
+    outcome with the probe's own crash.
     """
 
     try:
-        headers = getattr(getattr(exc, "request", None), "headers", None)
+        headers = getattr(getattr(source, "request", None), "headers", None)
         if headers is None:
             return False
         return int(headers.get("x-stainless-retry-count") or 0) > 0
@@ -994,7 +1033,14 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
     return "stop"
 
 
-def _parse_response(data: dict[str, Any]) -> ModelTurn:
+def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
+    """Map one Responses-API body to a :class:`ModelTurn`.
+
+    ``provider_retried`` is the caller's evidence about the HTTP exchange that produced ``data``
+    -- the body itself carries no such fact -- and defaults to False, which is exactly true of
+    every caller with no exchange to report on (the tests that parse a bare dict).
+    """
+
     output = data.get("output", [])
     if output is None:
         output = []
@@ -1066,6 +1112,7 @@ def _parse_response(data: dict[str, Any]) -> ModelTurn:
         raw=data,
         reasoning=_capture_reasoning_items(output),
         stop_reason=_stop_reason_from_response(data, tool_calls_present=bool(tool_calls)),
+        provider_retried=provider_retried,
     )
 
 
