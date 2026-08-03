@@ -15,6 +15,18 @@ from monoid_agent_kernel.public_view import public_path
 from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
 
 
+# The two non-terminal parks this projection can be sitting in when a model turn starts. Named
+# once so the offline projection and ``recorder.py:StatusJsonSink`` clear the same set: the sink
+# used to clear only ``AWAITING_INPUT``, which left a task-parked run reading as parked after the
+# turn that unparked it had already begun.
+_PARKED_STATES = frozenset(
+    {
+        session_state_value(SessionState.AWAITING_INPUT),
+        session_state_value(SessionState.AWAITING_TASKS),
+    }
+)
+
+
 def project_run_status(run_dir: Path) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     status_payload = _read_json_if_exists(run_dir / "status.json")
@@ -43,6 +55,11 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "state": state,
         "terminal": terminal,
         "error_code": status_payload.get("error_code") or metrics.get("error_code") or "",
+        # Declared here rather than created by the one branch that writes it, so the projection's
+        # shape does not depend on which events a run happened to emit. Every source of this
+        # string is already filtered through ``public_view.py:public_error_message`` by its
+        # writer (status.json, metrics.json, and the ``turn.failed`` event data below).
+        "error": status_payload.get("error") or metrics.get("error") or "",
         "workspace_backend": (
             status_payload.get("workspace_backend")
             or metrics.get("workspace_backend")
@@ -128,10 +145,24 @@ def _apply_event_projection(
             projection["state"] = session_state_value(SessionState.AWAITING_TASKS)
             projection["terminal"] = False
             projection["waiting_for_background_jobs"] = True
+        elif event_type == "run.awaiting_input":
+            # The other park on this same stream. Handling only ``run.waiting`` here left a run
+            # parked for a hosted task or for user input reading as *running* to `monoid status`,
+            # while ``recorder.py:StatusJsonSink`` — the other consumer of the same events —
+            # handled both. Both parks now, on both readers.
+            projection["state"] = session_state_value(SessionState.AWAITING_INPUT)
+            projection["terminal"] = False
         elif event_type == "run.resumed":
             projection["state"] = session_state_value(SessionState.RUNNING)
             projection["terminal"] = False
             projection["waiting_for_background_jobs"] = False
+        elif event_type == "turn.failed":
+            # A recoverable model-turn park. The event carries the whole classification and this
+            # projection used to show none of it, so an offline `monoid status` on a parked run
+            # reported error_code="". State is left alone on purpose: ``turn.failed`` is not
+            # terminal and the park that follows it (``run.awaiting_input``) names the state.
+            projection["error"] = data.get("error") or projection["error"]
+            projection["error_code"] = data.get("error_code") or projection["error_code"]
         elif event_type == "agent.config.updated":
             projection["agent_config"] = {
                 "definition_id": data.get("definition_id"),
@@ -140,6 +171,13 @@ def _apply_event_projection(
             }
         elif event_type == "model.turn.started":
             projection["current_step"] = data.get("step")
+            # A model turn starting means the run is no longer parked, whichever park it was in.
+            # ``run.resumed`` clears the job wait explicitly, but nothing emits it after a
+            # user-input park, so without this a resumed session read as parked forever.
+            if projection["state"] in _PARKED_STATES:
+                projection["state"] = session_state_value(SessionState.RUNNING)
+                projection["terminal"] = False
+                projection["waiting_for_background_jobs"] = False
         elif event_type == "tool.call.started":
             projection["current_tool"] = data.get("tool")
         elif event_type in {"tool.call.finished", "tool.call.failed"}:

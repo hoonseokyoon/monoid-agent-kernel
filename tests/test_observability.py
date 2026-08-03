@@ -908,6 +908,133 @@ def test_status_projection_reports_no_error_when_there_is_no_log(tmp_path: Path)
     assert project_run_status(run_dir)["event_log_error"] == ""
 
 
+def _event(event_type: str, data: dict[str, object]) -> AgentEvent:
+    return AgentEvent(
+        schema_version="monoid.event.v1",
+        event_id="evt_1",
+        seq=1,
+        run_id="run-1",
+        timestamp="2026-08-03T00:00:00Z",
+        type=event_type,
+        data=data,
+    )
+
+
+def _write_events(run_dir: Path, *events: dict[str, object]) -> None:
+    run_dir.joinpath("events.jsonl").write_text(
+        "".join(
+            json.dumps({"seq": index + 1, **event}) + "\n" for index, event in enumerate(events)
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_the_offline_projection_sees_the_user_input_park_not_only_the_job_wait(
+    tmp_path: Path,
+) -> None:
+    """Two parks travel this stream and this reader handled one of them.
+
+    `run.waiting` (background jobs) was projected; `run.awaiting_input` — the park a hosted task
+    or a multi-turn session sits in — was not, so `monoid status` reported a parked run as still
+    running. The live sink (`StatusJsonSink`) had always handled both.
+    """
+    run_dir = tmp_path / "run_awaiting"
+    run_dir.mkdir()
+    _write_events(
+        run_dir,
+        {"type": "run.started", "data": {}},
+        {"type": "run.awaiting_input", "data": {"reason": "task", "task_ids": ["t-1"]}},
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "awaiting_input"
+    assert projection["terminal"] is False
+
+
+def test_the_offline_projection_reports_the_classification_a_parked_turn_carries(
+    tmp_path: Path,
+) -> None:
+    """`turn.failed` carries the whole taxonomy and no status reader consumed any of it.
+
+    State is deliberately untouched by this branch: `turn.failed` is not terminal, and the park
+    that follows it names the state. What the event uniquely carries is *why*.
+    """
+    run_dir = tmp_path / "run_turn_failed"
+    run_dir.mkdir()
+    _write_events(
+        run_dir,
+        {"type": "run.started", "data": {}},
+        {
+            "type": "turn.failed",
+            "data": {
+                "error": "model rejected the key",
+                "error_code": "model_error",
+                "config_recoverable": True,
+            },
+        },
+        {"type": "run.awaiting_input", "data": {"reason": "turn_failed"}},
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["error"] == "model rejected the key"
+    assert projection["error_code"] == "model_error"
+    # The park that follows still owns the state.
+    assert projection["state"] == "awaiting_input"
+
+
+def test_a_model_turn_starting_clears_both_parks_on_both_readers(tmp_path: Path) -> None:
+    """The clear was bound on one park and one reader each; it is one rule on two readers now.
+
+    The sink cleared `AWAITING_INPUT` only, so a run that had parked on background jobs read as
+    parked while the turn that unparked it was already running; the offline projection cleared
+    neither and depended entirely on `run.resumed`, which nothing emits after a user-input park.
+    """
+    run_dir = tmp_path / "run_unpark"
+    run_dir.mkdir()
+    _write_events(
+        run_dir,
+        {"type": "run.started", "data": {}},
+        {"type": "run.waiting", "data": {"jobs": []}},
+        {"type": "model.turn.started", "data": {"step": 2}},
+    )
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "running"
+    assert projection["waiting_for_background_jobs"] is False
+
+    # The live twin, driven through the same two events.
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for state in ("awaiting_tasks", "awaiting_input"):
+        sink.state["state"] = state
+        sink.emit(
+            _event("model.turn.started", {"step": 2})
+        )
+        assert sink.state["state"] == "running", state
+        assert sink.state["terminal"] is False
+
+
+def test_the_status_sink_records_the_classification_of_a_recoverable_turn_failure(
+    tmp_path: Path,
+) -> None:
+    """The sink's half of the same convergence: `turn.failed` was unread here too."""
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    sink.emit(
+        _event(
+            "turn.failed",
+            {"error": "model rejected the key", "error_code": "model_error"},
+        )
+    )
+
+    assert sink.state["error"] == "model rejected the key"
+    assert sink.state["error_code"] == "model_error"
+    # Not a lifecycle change: the park that follows owns the state.
+    assert "state" not in sink.state
+
+
 def test_cli_status_json_prints_the_projection_then_fails(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_cli_corrupt"
     run_dir.mkdir()

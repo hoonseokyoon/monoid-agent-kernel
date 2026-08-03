@@ -8,8 +8,14 @@ from typing import Any
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
-from monoid_agent_kernel.core.result import Suspension
+from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
+from monoid_agent_kernel.reference.backend.projection import (
+    RunProjectionContext,
+    RunProjectionService,
+)
+from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.reference.backend.session_drive import (
     SessionDriveContext,
     SessionDriveLimits,
@@ -203,3 +209,117 @@ def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: P
         {"reason": "studio-retry"},
         "turn_0001",
     )
+
+
+def test_a_config_recoverable_park_reaches_the_surfaces_an_operator_reads(
+    tmp_path: Path,
+) -> None:
+    """The classification is promoted onto the record, and it does NOT change control flow.
+
+    `config_recoverable` existed on the Suspension, on the event and on the wire, and the driver
+    the classification was added for never named it: a config-fixable turn failure was driven
+    exactly like any other non-retryable one, and the surfaces an operator reads (`GET /status`,
+    `GET /result`) had no slot for it at all.
+
+    The decision to make here was park-vs-expose. Parking would have changed a single-shot run
+    from terminal to hung; exposing costs nothing and is what the classification is *for* — the
+    fix is the caller's, not the driver's. So the terminal behaviour below is asserted in the
+    same test as the surfaced flag.
+    """
+    service = _service(tmp_path)
+    record = BackendRunRecord(
+        run_id="run_config",
+        tenant_id="tenant-1",
+        user_id="user-1",
+        workspace_root=tmp_path,
+        run_dir=tmp_path,
+        state=SessionState.RUNNING,
+        terminal=False,
+        created_at=0.0,
+        run_token_sha256="",
+        llm_gateway_token_sha256="",
+    )
+    assert record.config_recoverable is False
+
+    class _Request:
+        multi_turn = False
+
+    class _Loop:
+        def __init__(self) -> None:
+            self.failed: list[tuple[str, str]] = []
+
+        def snapshot(self) -> None:
+            return None
+
+        def fail_recoverable(self, error: str, *, error_code: str) -> None:
+            self.failed.append((error, error_code))
+
+        async def aclose(self) -> str:
+            return "closed"
+
+    loop = _Loop()
+    record.loop = loop
+    park = Suspension(
+        reason="turn_failed",
+        status="failed",
+        error="the configured model is not available to this account",
+        error_code="model_error",
+        retryable=False,
+        config_recoverable=True,
+    )
+
+    result = asyncio.run(
+        service.drive_open_session(
+            record, _Request(), loop, park, started=time.time(), turns=1
+        )
+    )
+
+    assert result == "closed"
+    # Control flow unchanged: a single-shot run whose turn failed is still promoted, terminally.
+    assert loop.failed == [
+        ("the configured model is not available to this account", "model_error")
+    ]
+    # ...and the classification the park carried is now on the record the projections read.
+    assert record.config_recoverable is True
+
+    projection = RunProjectionService(
+        RunProjectionContext(
+            authorized_run_dir=lambda run_id, token: tmp_path,
+            authorize_run=lambda run_id, token: None,
+            record=lambda run_id: record,
+            active_record=lambda run_id: record,
+            read_recover_attempts=lambda run_dir: 0,
+            run_root_provider=lambda: tmp_path,
+            checkpoint_store_provider=lambda: None,
+            max_recover_attempts_provider=lambda: 0,
+            issue_read_token=lambda *args: "",
+            read_event_page=lambda events_path, *, from_seq, limit: {"events": []},
+        )
+    )
+
+    assert projection.status("run_config", "token")["config_recoverable"] is True
+    # Both branches of result(): the run has no AgentRunResult yet, and once it does.
+    assert projection.result("run_config", "token")["config_recoverable"] is True
+    record.result = AgentRunResult(
+        run_id="run_config",
+        status="failed",
+        final_text="",
+        run_dir=tmp_path,
+        diff_path=tmp_path / "diff.patch",
+        proposal_path=tmp_path / "proposal.json",
+    )
+    assert projection.result("run_config", "token")["config_recoverable"] is True
+
+    # A later clean park clears it rather than leaving a stale classification behind.
+    record.config_recoverable = True
+    asyncio.run(
+        service.drive_open_session(
+            record,
+            _Request(),
+            loop,
+            Suspension(reason="terminal", status="completed"),
+            started=time.time(),
+            turns=1,
+        )
+    )
+    assert record.config_recoverable is False

@@ -191,60 +191,6 @@ class CarriageGap:
 DISPOSITIONS = frozenset({"burn-down", "v0.21-track:B1", "by-design"})
 
 KNOWN_GAPS: tuple[CarriageGap, ...] = (
-    # --- the public-error filter: applied on three of four paths out of one payload ----
-    CarriageGap(
-        "public-error-filter",
-        "error",
-        "reference/backend/projection.py:result",
-        "the ready branch serves the RAW AgentRunResult.error at the top level while the "
-        "not-ready branch of the same method serves record.error and the metrics block of the "
-        "same payload serves metrics[\"error\"] — both of which went through "
-        "public_view.py:public_error_message (run_state.py:record_run_result and "
-        "loop_phases.py:build_metrics). AgentRunResult.error is deliberately raw because the "
-        "embedding application is inside the trust boundary; this response is not, so the one "
-        "branch that omits the filter publishes over HTTP exactly what the filter beside it was "
-        "added to withhold",
-        "burn-down",
-    ),
-    # --- config_recoverable: the consumers that were designed for it and ignore it -----
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "reference/backend/session_drive.py:drive_open_session",
-        "the designed consumer branches on retryable only, so a config-recoverable park is "
-        "treated exactly like any other non-retryable turn failure: the driver gives up and "
-        "promotes it rather than surfacing the config fix the classification exists to name",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "core/model_io.py:ModelCallReceipt",
-        "with_error reads five facts off the exception (error_code, provider_error_code, "
-        "retryable, http_status, provider_retried) and not this one, so the immutable record "
-        "of the call cannot say the failure was config-fixable",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "core/model_stream.py:ModelStreamOutcome",
-        "the stream_closed record (core/schemas.py, additionalProperties False) carries "
-        "retryable and no config_recoverable, so the live stream lane classifies a park with "
-        "half the vocabulary the park itself carries — and the closed cap means adding it is a "
-        "schema change, not an oversight to patch",
-        "burn-down",
-    ),
-    # --- turn.failed: written by the kernel, consumed by nobody ------------------------
-    CarriageGap(
-        "suspension",
-        "turn.failed",
-        "reference/backend/run_state.py:record_event",
-        "no status projection consumes turn.failed (neither this one nor core/projections.py), "
-        "so a run parked in TURN_FAILED serves error=\"\" over HTTP: the event carries the whole "
-        "classification and the surface an operator actually reads shows none of it",
-        "burn-down",
-    ),
     CarriageGap(
         "suspension",
         "reason",
@@ -253,26 +199,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "Suspension.reason is a *park* vocabulary (\"interrupted\"), one word for two "
         "vocabularies on one event; and the pause twin emits no turn.paused at all, only a "
         "session.state.changed, so the two sibling parks are not observable the same way",
-        "burn-down",
-    ),
-    # --- one event vocabulary, three projections that each drop a different cell --------
-    CarriageGap(
-        "run-status projection",
-        "run.awaiting_input",
-        "core/projections.py:_apply_event_projection",
-        "the offline projection handles run.waiting and not run.awaiting_input, so a run parked "
-        "for a hosted task or user input still reads as running to `monoid status` — while "
-        "recorder.py:StatusJsonSink, which consumes the same stream, handles both",
-        "burn-down",
-    ),
-    CarriageGap(
-        "run-status projection",
-        "run.waiting",
-        "reference/backend/run_state.py:record_event",
-        "the exact mirror image of the offline projection's hole: this consumer handles "
-        "run.awaiting_input and not run.waiting, so the two readers of one event stream are "
-        "each blind to the park the other sees. StatusJsonSink is the control — it handles "
-        "both, and clears the wait on model.turn.started",
         "burn-down",
     ),
     CarriageGap(
@@ -4586,21 +4512,38 @@ def _attribute_reads_on(function: ast.AST, name: str) -> frozenset[str]:
     )
 
 
-def test_gap_the_designed_consumer_of_config_recoverable_never_names_it() -> None:
-    """Registered: reference/backend/session_drive.py:drive_open_session branches on retryable.
+def test_the_driver_records_config_recoverable_without_branching_on_it() -> None:
+    """Was registered: the driver the classification was added for never named it.
 
-    The driver is the consumer the classification was added for — it is the code that decides
-    retry-vs-give-up on a parked turn — and ``config_recoverable`` does not appear in it at all.
-    Pinned by absence, so the first branch that reads the fact fails here and the registry entry
-    has to go with it.
+    Closed by *recording* rather than by parking. The decision the driver makes is
+    retry-vs-give-up, and a config-fixable failure is not fixable by the driver — it is fixable by
+    whoever reads the surface the driver feeds. So the fact is promoted onto the record (which
+    ``status()``/``result()`` serve) and control flow is unchanged, and both halves are pinned:
+    the read exists, and ``retryable`` is still the only thing the retry branch tests.
     """
 
     driver = _function_node("reference/backend/session_drive.py", "drive_open_session")
     names = _names_in(driver)
     assert "retryable" in names, "the driver stopped branching on retryable — recheck this pin"
-    assert "config_recoverable" not in names, {
-        "hint": "the driver reads it now: drop the registry entry and pin the new behaviour",
+    assert "config_recoverable" in names, {
+        "hint": "the driver stopped reading the classification it promotes onto the record",
     }
+    # The read is off the suspension and the write is onto the record — not the reverse, and not
+    # a second control-flow input smuggled in beside the first.
+    assert "config_recoverable" in _attribute_reads_on(driver, "suspension")
+    assert "config_recoverable" in _attribute_reads_on(driver, "record")
+    branched_on = {
+        ast.unparse(node.test)
+        for node in ast.walk(driver)
+        if isinstance(node, ast.If)
+    }
+    assert not [test for test in branched_on if "config_recoverable" in test], {
+        "branches_testing_the_classification": sorted(
+            test for test in branched_on if "config_recoverable" in test
+        ),
+        "hint": "D2 was 'expose it, do not park on it' — a branch here is a control-flow change",
+    }
+    assert "suspension.retryable" in branched_on
 
 
 # core/model_io.py:ModelCallReceipt.with_error — every fact it lifts off the exception, by name.
@@ -4609,6 +4552,9 @@ RECEIPT_ERROR_FACTS = frozenset(
         "error_code",
         "provider_error_code",
         "retryable",
+        # The sixth: waiting-may-help and configuration-will-help are two facts, and the receipt
+        # used to record only the first.
+        "config_recoverable",
         "http_status",
         "provider_retried",
         # Read too, and for the same reason the wire carries it: a failure after a billed answer.
@@ -4617,13 +4563,13 @@ RECEIPT_ERROR_FACTS = frozenset(
 )
 
 
-def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_sixth() -> None:
-    """Registered: the immutable record of a call cannot say the failure was config-fixable.
+def test_the_call_receipt_reads_every_fact_the_exception_transports() -> None:
+    """Was registered as "five facts and not the sixth"; the sixth is read now.
 
-    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so today it
-    reaches every fact through ``getattr(exc, ..., default)`` — but the fix that closes this gap
-    is a one-line ``exc.config_recoverable`` on the ``ModelAdapterError`` branch, and a pin that
-    censuses the getattr form alone would stay green through it.
+    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so it reaches
+    every fact through ``getattr(exc, ..., default)`` — but a plain ``exc.config_recoverable`` on
+    a narrowed branch is the other natural spelling, and a pin that censused the getattr form
+    alone would have stayed green through the fix that closed the gap.
     """
 
     with_error = _function_node("core/model_io.py", "with_error", within="ModelCallReceipt")
@@ -4635,11 +4581,13 @@ def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_six
         "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
         "hint": "the receipt's read set is the record's whole vocabulary",
     }
-    # Named rather than derived from ``TRANSPORTABLE_ERROR_UNCARRIED``, which used to hold this
-    # fact and is empty now that the wire carries it: a pin over an empty set proves nothing,
-    # and this entry is still open.
-    assert "config_recoverable" not in read, {
-        "hint": "the receipt reads it now: drop the registry entry and pin the new behaviour",
+    # ...and every fact it reads reaches the durable record, rather than being read and dropped.
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    written = set(ModelCallReceipt().to_json())
+    assert read - written == {"provider_usage"}, {
+        "read_but_never_written": sorted(read - written),
+        "hint": "provider_usage is folded into ``usage``; anything else here is a dropped fact",
     }
     # Every fact it does read is a real attribute of the exception it reads them from.
     maximal = _maximal_adapter_error()
@@ -4659,6 +4607,9 @@ STREAM_CLOSED_RECORD_KEYS = frozenset(
         "usage",
         "error_code",
         "retryable",
+        # Joined in the burn-down, schema and writer in one change because the cap below is
+        # closed: the live lane now classifies with the same two words the park carries.
+        "config_recoverable",
         "finished_at",
     }
 )
@@ -4673,8 +4624,15 @@ def _stream_closed_branch() -> dict[str, Any]:
     raise AssertionError("MODEL_CONTENT_RECORD_SCHEMA has no stream_closed branch")
 
 
-def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> None:
-    """Registered: the live stream lane carries retryable and no config_recoverable."""
+def test_the_stream_closed_record_classifies_with_the_whole_vocabulary() -> None:
+    """Was registered: the live stream lane carried retryable and no config_recoverable.
+
+    Pinned on all three carriers of one record, because ``additionalProperties`` is False: the
+    outcome type, the writer's literal, and the schema branch have to move together or the record
+    fails its own validation.
+    """
+
+    from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 
     branch = _stream_closed_branch()
     declared = frozenset(branch["properties"])
@@ -4683,20 +4641,32 @@ def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> N
         "extra": sorted(declared - STREAM_CLOSED_RECORD_KEYS),
     }
     assert branch["additionalProperties"] is False, {
-        "hint": "the closed cap is why adding the fact is a schema change, not a patch",
+        "hint": "the closed cap is why adding a fact here is a schema change, not a patch",
     }
-    assert "retryable" in declared
-    # Named rather than derived from ``TRANSPORTABLE_ERROR_UNCARRIED``: that set is empty now
-    # that the gateway wire carries the fact, and a vacuous pin is not a pin. This lane still
-    # does not, which is what the registry entry says.
-    assert "config_recoverable" not in declared, {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+    assert {"retryable", "config_recoverable"} <= declared
+    # The writer's literal: what ``close()`` actually puts on the record.
+    written = _literal_dict_keys_where("core/model_content.py", "kind", "stream_closed")
+    assert len(written) == 1, {"stream_closed_writers": len(written)}
+    assert written[0] == STREAM_CLOSED_RECORD_KEYS, {
+        "written": sorted(written[0]),
+        "hint": "the writer and the closed schema must name the same keys",
     }
+    # ...and the outcome the writer reads them off carries both classifications.
+    outcome_fields = {field.name for field in dataclasses.fields(ModelStreamOutcome)}
+    assert {"retryable", "config_recoverable"} <= outcome_fields
+    # Optional on the record, so a sidecar written before the key existed still validates.
+    assert "config_recoverable" not in branch["required"]
 
 
 # The three consumers of one event stream, and the event types each one dispatches on. Pinned
-# per consumer, because the defect here is not a missing branch anywhere in particular — it is
-# that no two of them handle the same set and nothing said so.
+# per consumer, because the defect here was not a missing branch anywhere in particular — it was
+# that no two of them handled the same set and nothing said so.
+#
+# Converged in the burn-down: the two parks (``run.waiting``, ``run.awaiting_input``) and the
+# classification (``turn.failed``) are now handled by all three, so the sets differ only by the
+# events a consumer's *surface* has no slot for. Those differences are named in
+# ``EVENT_CONSUMER_SINK_ONLY`` / ``EVENT_CONSUMER_OFFLINE_ONLY`` below and asserted as the whole
+# remaining diff, so a fourth divergence cannot appear quietly.
 EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
     # name -> (module, enclosing class, the expression it switches on)
     "core/projections.py:_apply_event_projection": (
@@ -4711,21 +4681,39 @@ EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
     ),
     "recorder.py:StatusJsonSink.emit": ("recorder.py", "StatusJsonSink", "event.type"),
 }
+# What every status consumer must handle: the lifecycle edges, both parks, and the recoverable
+# turn failure whose classification is the only thing a parked run has to show.
+EVENT_CONSUMER_CORE = frozenset(
+    {
+        "run.started",
+        "run.finished",
+        "run.failed",
+        "run.waiting",
+        "run.awaiting_input",
+        "run.resumed",
+        "turn.failed",
+        "model.turn.started",
+    }
+)
+# The progress detail two of the three project. The backend record has no slot for any of it —
+# it carries lifecycle + classification and the run dir carries the rest — so this is a surface
+# difference, not a hole.
+EVENT_CONSUMER_PROGRESS = frozenset(
+    {
+        "agent.config.updated",
+        "tool.call.started",
+        "tool.call.finished",
+        "tool.call.failed",
+        "workspace.proposal.updated",
+    }
+)
 EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
-    # No ``run.awaiting_input``: an offline ``monoid status`` reports a parked run as running.
-    "core/projections.py:_apply_event_projection": frozenset(
+    # The offline projection reads the *committed log*, so it can also fold the durable proposal
+    # lifecycle that the two live sinks never see (they fire before the artifacts are written).
+    "core/projections.py:_apply_event_projection": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | frozenset(
         {
-            "run.started",
-            "run.finished",
-            "run.failed",
-            "run.waiting",
-            "run.resumed",
-            "agent.config.updated",
-            "model.turn.started",
-            "tool.call.started",
-            "tool.call.finished",
-            "tool.call.failed",
-            "workspace.proposal.updated",
             "proposal.package.exported",
             "proposal.approved",
             "proposal.rejected",
@@ -4733,45 +4721,22 @@ EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
             "proposal.conflict",
         }
     ),
-    # The mirror image: ``run.awaiting_input`` and no ``run.waiting``.
-    "reference/backend/run_state.py:record_event": frozenset(
-        {
-            "run.started",
-            "run.awaiting_input",
-            "run.resumed",
-            "model.turn.started",
-            "run.finished",
-            "run.failed",
-        }
-    ),
-    # The control: both parks, and it clears the wait on model.turn.started. (``job.*`` is
-    # matched by prefix rather than equality, so it is outside this census by construction.)
-    "recorder.py:StatusJsonSink.emit": frozenset(
-        {
-            "run.started",
-            "run.finished",
-            "run.failed",
-            "run.waiting",
-            "run.resumed",
-            "run.awaiting_input",
-            "agent.config.updated",
-            "model.turn.started",
-            "tool.call.started",
-            "tool.call.finished",
-            "tool.call.failed",
-            "plan.updated",
-            "metrics.updated",
-            "workspace.proposal.updated",
-        }
-    ),
+    # The narrowest surface: an in-memory lifecycle record. No progress detail by design.
+    "reference/backend/run_state.py:record_event": EVENT_CONSUMER_CORE,
+    # The fan-out sink. Its two extras are the live-only projections nothing durable carries.
+    # (``job.*`` is matched by prefix rather than equality, so it is outside this census by
+    # construction.)
+    "recorder.py:StatusJsonSink.emit": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | frozenset({"plan.updated", "metrics.updated"}),
 }
 
 
 @pytest.mark.parametrize("consumer", sorted(EVENT_CONSUMERS))
-def test_gap_each_status_consumer_handles_its_own_subset_of_one_event_stream(
+def test_each_status_consumer_handles_the_whole_core_of_one_event_stream(
     consumer: str,
 ) -> None:
-    """Registered (three entries): two projections, each blind to the park the other sees."""
+    """Was registered (three entries): two projections, each blind to the park the other saw."""
 
     relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
     name = consumer.split(":", 1)[1].split(".")[-1]
@@ -4783,27 +4748,39 @@ def test_gap_each_status_consumer_handles_its_own_subset_of_one_event_stream(
         "consumer": consumer,
         "newly_handled": sorted(handled - expected),
         "no_longer_handled": sorted(expected - handled),
-        "hint": "a consumer that gained a branch closes a registered gap: drop its entry",
+        "hint": "a consumer that gained or lost a branch changes what an operator can read",
     }
-    # Registered burn-down, stated once per consumer: nothing projects the terminal
-    # classification a parked run carries, so the surface an operator reads shows none of it.
-    assert "turn.failed" not in handled, {
+    # The convergence itself, restated per consumer so no single one can drift back out of it.
+    assert EVENT_CONSUMER_CORE <= handled, {
         "consumer": consumer,
-        "hint": "a status projection consumes turn.failed now — drop the registry entry",
+        "core_events_not_handled": sorted(EVENT_CONSUMER_CORE - handled),
+        "hint": "the three readers of one stream agreed on this core; this one no longer does",
     }
 
 
-def test_gap_the_two_run_status_projections_are_each_blind_to_the_others_park() -> None:
-    """The diff itself, so the asymmetry is the assertion rather than an inference."""
+def test_the_three_run_status_projections_differ_only_by_what_their_surface_carries() -> None:
+    """The diff itself, so the convergence is the assertion rather than an inference."""
 
     offline = EVENT_CONSUMER_HANDLED["core/projections.py:_apply_event_projection"]
     backend = EVENT_CONSUMER_HANDLED["reference/backend/run_state.py:record_event"]
     control = EVENT_CONSUMER_HANDLED["recorder.py:StatusJsonSink.emit"]
-    assert "run.waiting" in offline and "run.awaiting_input" not in offline
-    assert "run.awaiting_input" in backend and "run.waiting" not in backend
-    assert {"run.waiting", "run.awaiting_input"} <= control, {
-        "hint": "the sink is the control: it proves both parks are observable from this stream",
+    # Both parks and the classification, on all three.
+    for handled in (offline, backend, control):
+        assert {"run.waiting", "run.awaiting_input", "turn.failed"} <= handled
+    # The whole remaining difference, named. Nothing is handled by one reader alone except the
+    # durable proposal lifecycle (only the log reader sees it) and the two live-only projections
+    # (only the fan-out sink can build them).
+    assert offline - control == {
+        "proposal.package.exported",
+        "proposal.approved",
+        "proposal.rejected",
+        "proposal.applied",
+        "proposal.conflict",
     }
+    assert control - offline == {"plan.updated", "metrics.updated"}
+    # The backend record is a strict subset of both: it carries lifecycle + classification only.
+    assert backend < offline and backend < control
+    assert backend == EVENT_CONSUMER_CORE
 
 
 def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
@@ -4836,19 +4813,19 @@ def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -
     ], {"hint": "turn.paused exists now: the two parks are symmetric — drop the entry"}
 
 
-def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> None:
-    """Registered (round 2, leak-adjacent): three of four paths out of one payload filter.
+def test_every_error_expression_the_result_payload_serves_is_filtered() -> None:
+    """Was registered (round 2, leak-adjacent): three of four paths out of one payload filtered.
 
-    ``record.error`` and ``metrics["error"]`` are written through
-    ``public_view.py:public_error_message``; the ready branch of ``result()`` serves
-    ``result.error`` — the deliberately raw ``AgentRunResult.error`` — straight to an HTTP
-    response. Pinned statically, because a value-level probe would need a whole finished run and
-    the fact is which expression the branch names.
+    ``record.error`` and ``metrics["error"]`` come pre-filtered from their writers
+    (``public_view.py:public_error_message`` in ``run_state.py``/``loop_phases.py``); the ready
+    branch of ``result()`` served ``result.error`` — the deliberately raw ``AgentRunResult.error``
+    — straight to an HTTP response. The filter landed in the projection, so the route stays a
+    dumb serializer.
 
-    Pinned at *both* ends. The projection is one of the two places a filter could land: the HTTP
-    route hands what ``result()`` returns to ``_write_json`` unchanged, so a fix applied there
-    instead — filtering on the way out, or calling the projection through a wrapper — would
-    close the gap while a projection-only pin stayed green and the registry entry stayed.
+    Pinned at *both* ends, and that is still the point: the route hands what ``result()`` returns
+    to ``_write_json`` unchanged, so the wire's contents are decided by these two functions
+    together. A filter that moved to the route, or a route that stopped writing the dict whole,
+    is a change to where the boundary is and has to be re-argued.
     """
 
     projection = _function_node("reference/backend/projection.py", "result")
@@ -4859,15 +4836,16 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
         for key, value in zip(node.keys, node.values):
             if isinstance(key, ast.Constant) and key.value == "error":
                 served.append(ast.unparse(value))
-    assert sorted(served) == ["record.error", "result.error"], {
+    assert sorted(served) == [
+        "public_error_message(result.error)",
+        "record.error",
+    ], {
         "error_expressions_served": sorted(served),
-        "hint": "the raw one is the ready branch; a filter here closes the gap",
+        "hint": "``record.error`` arrives pre-filtered from record_run_result; the raw "
+        "AgentRunResult.error is filtered here. A third expression is an unproven one",
     }
-    assert "public_error_message" not in _names_in(projection), {
-        "hint": "the projection filters now: drop the registry entry",
-    }
-    # The caller-side half: the route writes the projection's dict wholesale, so a filter added
-    # between ``result()`` and the wire flips this pin too rather than only the one above.
+    # The route is the dumb serializer this arrangement depends on: it writes the projection's
+    # dict wholesale and applies no filter of its own.
     route = _function_node("reference/backend/http.py", "do_GET", within="make_backend_handler")
     served_wholesale = [
         ast.unparse(node.args[0])
@@ -4880,13 +4858,13 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
     ]
     assert served_wholesale == ["backend.result(run_id, self._bearer_token())"], {
         "how_the_route_writes_the_projection": served_wholesale,
-        "hint": "the route stopped writing result() unchanged: if that is the filter, drop the "
-        "registry entry; if it is not, the raw error still reaches the wire",
+        "hint": "the route stopped writing result() unchanged — the filter's placement assumed "
+        "it did",
     }
     assert "public_error_message" not in _names_in(route), {
-        "hint": "the route filters now: drop the registry entry and pin the new behaviour",
+        "hint": "two filters on one value: decide which one owns it",
     }
-    # The two writers this branch disagrees with, so the asymmetry is asserted and not assumed.
+    # The two sibling writers this branch now agrees with, asserted and not assumed.
     assert "public_error_message" in _names_in(
         _function_node("reference/backend/run_state.py", "record_run_result")
     )
@@ -5239,17 +5217,28 @@ def test_future_family_status_json_is_already_wider_than_its_own_schema() -> Non
 CARRIER_FILES: dict[str, frozenset[str]] = {
     "config_recoverable": frozenset(
         {
+            # Joined in the burn-down: the immutable record of one call, the live stream lane
+            # (outcome type, sidecar writer/reader) that used to classify with half the
+            # vocabulary.
+            "core/model_content.py",
+            "core/model_io.py",
+            "core/model_stream.py",
             "core/result.py",
             "core/schemas.py",
             "errors.py",
             "loop.py",
             "providers/gateway.py",
             "providers/openai.py",
-            # Joined in the burn-down: the terminal failure bundle's second writer, the backend
-            # caller that reads the flag off the exception for it, and the facade between them.
+            # Joined in the burn-down: the backend record that carries the classification to the
+            # surfaces an operator reads (type, protocol, the driver that promotes it, and the
+            # projection that serves it).
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
             "reference/backend/recovery.py",
             "reference/backend/run_state.py",
+            "reference/backend/run_types.py",
             "reference/backend/service.py",
+            "reference/backend/session_drive.py",
             "reference/llm_gateway/http.py",
         }
     ),
@@ -5450,21 +5439,13 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
     alias_only = {
         "core/checkpoint.py",
         "core/spec.py",
-        # Registered for what they DO NOT carry: the driver that branches on retryable
-        # alone, the status projection that never reads turn.failed, and the stream-outcome
-        # lane whose closed schema has no config_recoverable. A headline-name scan cannot
-        # reach a file by the name it fails to mention.
-        "reference/backend/session_drive.py",
-        "reference/backend/run_state.py",
-        "core/model_stream.py",
-        # Round-2 registrations whose fact is not a headline wire field either: the raw/filtered
-        # error asymmetry, the two half-blind run-status projections, the three disagreeing
-        # terminal-state mappers, and a Suspension built outside the durable status vocabulary.
-        # Each is pinned by its own assertion below; no name scan can reach them.
-        "reference/backend/projection.py",
-        "core/projections.py",
+        # Registrations whose fact is not a headline wire field: the three disagreeing
+        # terminal-state mappers, a Suspension built outside the durable status vocabulary, and
+        # the cause-vs-park vocabulary collision on one event name. Each is pinned by its own
+        # assertion below; no name scan can reach them.
         "core/lifecycle.py",
         "reference/backend/recovery.py",
+        "loop.py",
     }
     unaccounted = registered_paths - all_carriers - alias_only
     assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}

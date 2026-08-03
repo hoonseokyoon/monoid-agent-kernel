@@ -2161,6 +2161,7 @@ class AgentLoop:
         outcome_usage: Mapping[str, Any] | None = None
         outcome_error_code: str | None = None
         outcome_retryable = False
+        outcome_config_recoverable = False
         try:
             turn, _receipt = await runner.acall(
                 request,
@@ -2200,6 +2201,14 @@ class AgentLoop:
                 outcome_retryable = isinstance(exc, ModelAdapterError) and exc.retryable is True
             except Exception:
                 outcome_retryable = False
+            # Read off the same exception, on the same terms: the live lane classifies the park
+            # with the same two words the park itself carries.
+            try:
+                outcome_config_recoverable = (
+                    isinstance(exc, ModelAdapterError) and exc.config_recoverable is True
+                )
+            except Exception:
+                outcome_config_recoverable = False
             raise
         else:
             outcome_status = "completed"
@@ -2214,6 +2223,7 @@ class AgentLoop:
                         usage=outcome_usage,
                         error_code=outcome_error_code,
                         retryable=outcome_retryable,
+                        config_recoverable=outcome_config_recoverable,
                     )
                 except Exception:
                     # Outcome capture is diagnostic too. Preserve the terminal status even if a

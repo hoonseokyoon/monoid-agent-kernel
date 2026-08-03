@@ -142,6 +142,30 @@ def test_with_error_takes_the_taxonomy_a_model_error_already_classified() -> Non
     assert receipt.http_status == 429
 
 
+def test_with_error_records_that_a_failure_was_config_fixable() -> None:
+    """The sixth fact. ``retryable`` says waiting may help; this one says a config change will.
+
+    A receipt that carried only ``retryable`` could not tell an auditor why an exhausted retry
+    budget was never going to succeed — the two are independent, and a config-fixable failure is
+    usually the one that is NOT retryable.
+    """
+    receipt = ModelCallReceipt().with_error(
+        ModelAdapterError(
+            "the configured model is not available to this account",
+            provider_error_code="model_not_found",
+            retryable=False,
+            config_recoverable=True,
+            http_status=404,
+        )
+    )
+
+    assert receipt.retryable is False
+    assert receipt.config_recoverable is True
+    assert receipt.to_json()["config_recoverable"] is True
+    # An exception that does not classify itself reads as False rather than raising.
+    assert ModelCallReceipt().with_error(ValueError("boom")).config_recoverable is False
+
+
 def test_with_error_records_an_unclassified_exception_by_type_not_message() -> None:
     """An arbitrary exception's message can carry request content, and the receipt holds none."""
     receipt = ModelCallReceipt().with_error(ValueError("prompt was: my social security number is"))
@@ -192,6 +216,7 @@ def test_json_round_trip_preserves_every_field() -> None:
         error_code="model_error",
         provider_error_code="rate_limit_exceeded",
         retryable=True,
+        config_recoverable=True,
         http_status=429,
         redaction_digest="sha-policy",
         capture_downgrades=1,
@@ -292,3 +317,14 @@ def test_from_json_rejects_a_non_object_and_a_mistyped_field() -> None:
         ModelCallReceipt.from_json({"usage": "not-an-object"})
     with pytest.raises(WireValidationError):
         ModelCallReceipt.from_json({"provider_retried": "yes"})
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json({"config_recoverable": "yes"})
+
+
+def test_from_json_tolerates_a_receipt_written_before_config_recoverable_existed() -> None:
+    """Absence is legal and reads False; present-but-mistyped is refused above."""
+
+    payload = ModelCallReceipt(config_recoverable=True).to_json()
+    del payload["config_recoverable"]
+
+    assert ModelCallReceipt.from_json(payload).config_recoverable is False

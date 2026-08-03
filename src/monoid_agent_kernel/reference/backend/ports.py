@@ -125,6 +125,7 @@ class RunRecordPort(Protocol):
     last_event_type: str
     error: str
     error_code: str
+    config_recoverable: bool
     result: AgentRunResult | None
     last_final_output: Any
     runtime_config: AgentRuntimeConfig | None

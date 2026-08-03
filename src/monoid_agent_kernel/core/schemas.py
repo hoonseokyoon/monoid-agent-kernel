@@ -884,6 +884,11 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "usage": {"type": ["object", "null"]},
                 "error_code": {"type": ["string", "null"]},
                 "retryable": {"type": "boolean"},
+                # Additive and optional: a sidecar written before this key existed still
+                # validates, and the reader defaults it to False. Declared in the same change as
+                # the writer because ``additionalProperties`` is False here — a record key with
+                # no schema slot is a validation failure, not a forward-compatible extra.
+                "config_recoverable": {"type": "boolean"},
                 "finished_at": {"type": "string", "pattern": "Z$"},
             },
             "additionalProperties": False,

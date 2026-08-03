@@ -206,6 +206,12 @@ class BackendRunRecord:
     finished_at: float | None = None
     error: str = ""
     error_code: str = ""
+    # Whether the last observed park said the failure was fixable by changing configuration
+    # (a bad key, a model the account cannot reach) rather than by waiting. Read off the
+    # Suspension by the session driver at every park; it does NOT change control flow — a
+    # single-shot run whose turn fails is still terminal — it only lets status()/result() say
+    # what the park already knew, which is the whole reason the classification exists.
+    config_recoverable: bool = False
     result: AgentRunResult | None = None
     # Latest settled turn's validated output (AgentTurnResult.final_output), captured per park so a
     # live multi-turn run can expose it via status() before the run closes (result() carries the

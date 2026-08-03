@@ -19,10 +19,16 @@ from typing import Any
 
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.reference.backend.projection import (
+    RunProjectionContext,
+    RunProjectionService,
+)
+from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -503,10 +509,51 @@ def test_a_provider_supplied_response_id_is_bounded(tmp_path: Path) -> None:
         assert sentinel not in text, f"{name} carries the whole response_id"
 
 
-def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_four(
+def _result_projection_for(result: Any) -> dict[str, Any]:
+    """``RunProjectionService.result`` over a finished run, with the thinnest real record.
+
+    The HTTP surface is the fifth artifact of the test below: the route hands what ``result()``
+    returns to ``_write_json`` unchanged, so whatever this dict carries is what a run-token bearer
+    reads. Built from the real ``BackendRunRecord`` and the real projection rather than a stub, so
+    a filter added to either one is what this exercises.
+    """
+
+    record = BackendRunRecord(
+        run_id="run-1",
+        tenant_id="tenant-1",
+        user_id="user-1",
+        workspace_root=result.run_dir,
+        run_dir=result.run_dir,
+        state=SessionState.FAILED,
+        terminal=True,
+        created_at=0.0,
+        run_token_sha256="",
+        llm_gateway_token_sha256="",
+        result=result,
+        error=result.error,
+        error_code=result.error_code,
+    )
+    projection = RunProjectionService(
+        RunProjectionContext(
+            authorized_run_dir=lambda run_id, token: result.run_dir,
+            authorize_run=lambda run_id, token: None,
+            record=lambda run_id: record,
+            active_record=lambda run_id: record,
+            read_recover_attempts=lambda run_dir: 0,
+            run_root_provider=lambda: result.run_dir.parent,
+            checkpoint_store_provider=lambda: None,
+            max_recover_attempts_provider=lambda: 0,
+            issue_read_token=lambda *args: "",
+            read_event_page=lambda events_path, *, from_seq, limit: {"events": []},
+        )
+    )
+    return projection.result("run-1", "token")
+
+
+def test_the_terminal_error_is_filtered_on_every_public_artifact_not_four_of_five(
     tmp_path: Path,
 ) -> None:
-    """`public_error_message` was bound on three surfaces and missed on the fourth.
+    """`public_error_message` was bound on three surfaces and missed on the fourth — and a fifth.
 
     `events.jsonl`, `status.json` and `failure.json` rendered `[redacted-sensitive-error]` while
     `metrics.json` carried the message whole — and `_error_from_status_body` embeds the *entire* LLM
@@ -516,6 +563,11 @@ def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_fo
     The `changed_paths` list in the same function had been routed through `public_path` one commit
     earlier, under a comment calling `metrics.json` "the only one of the three that never redacted".
     The list got bound; the error string twenty-six lines below it did not.
+
+    The fifth surface is the reference backend's `GET /result`. Three of its four error expressions
+    (`record.error` on the not-ready branch, `metrics["error"]`) came pre-filtered from their
+    writers; the ready branch served `AgentRunResult.error` — the deliberately raw one — straight to
+    an HTTP response.
 
     `AgentRunResult.error` stays raw on purpose: the embedding application is inside the trust
     boundary and needs the whole message. The reference backend filters it again before serving it
@@ -539,6 +591,12 @@ def test_the_terminal_error_is_filtered_on_every_public_artifact_not_three_of_fo
         path = result.run_dir / name
         if path.exists():
             assert secret not in path.read_text(encoding="utf-8"), f"{name} carries the raw error"
+
+    # The fifth: the HTTP result payload, served whole to any run-token bearer.
+    served = _result_projection_for(result)
+    assert served["ready"] is True
+    assert served["error"] == "[redacted-sensitive-error]", "GET /result carries the raw error"
+    assert secret not in json.dumps(served, default=str), "the served payload carries the raw error"
 
     assert secret in str(result.error), "the in-process caller must still get the whole message"
     # The only test here that drives a *failing* run, so the only one covering `failure.json` and

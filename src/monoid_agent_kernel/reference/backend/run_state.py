@@ -217,6 +217,20 @@ class RunStateMutationService:
             elif event.type == "run.awaiting_input":
                 if not record_terminal(record):
                     set_record_state(record, SessionState.AWAITING_INPUT, terminal=False)
+            elif event.type == "run.waiting":
+                # The other park on this same stream, reachable here through the SSE path. This
+                # consumer handled ``run.awaiting_input`` and not ``run.waiting`` while the
+                # offline projection had exactly the mirror-image hole; both readers now see
+                # both parks.
+                if not record_terminal(record):
+                    set_record_state(record, SessionState.AWAITING_TASKS, terminal=False)
+            elif event.type == "turn.failed":
+                # Classification only — the state is NOT touched. ``session_drive`` owns this
+                # record's lifecycle and drives TURN_FAILED itself; writing a state here would
+                # race it. What was missing is the classification: a run parked in TURN_FAILED
+                # served error="" over HTTP while the event carried the whole taxonomy.
+                record.error = str(event.data.get("error") or "")
+                record.error_code = str(event.data.get("error_code") or "")
             elif event.type in {"run.resumed", "model.turn.started"}:
                 if record.state in {SessionState.AWAITING_INPUT, SessionState.AWAITING_TASKS}:
                     set_record_state(record, SessionState.RUNNING, terminal=False)

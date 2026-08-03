@@ -105,6 +105,12 @@ class SessionDriveService:
                 state_from_suspension(suspension),
                 terminal=suspension.reason in {"terminal", "limited"},
             )
+            # The classification the park carries, promoted onto the record so status()/result()
+            # can say it. Deliberately NOT a control-flow input: the branch below still decides
+            # retry-vs-give-up on ``retryable`` alone, because a config-fixable failure is not
+            # fixable by this driver — it is fixable by whoever reads the surface this feeds.
+            # Assigned on every park (not or-ed) so a later clean turn clears a stale flag.
+            record.config_recoverable = bool(suspension.config_recoverable)
             if suspension.turn is not None:
                 record.last_final_output = suspension.turn.final_output
             if suspension.reason in {"terminal", "limited"}:

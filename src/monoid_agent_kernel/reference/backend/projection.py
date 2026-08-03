@@ -33,6 +33,7 @@ from monoid_agent_kernel.core.subagent_runtime import (
 )
 from monoid_agent_kernel.core.trace_context import trace_id_of
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
@@ -182,6 +183,10 @@ class RunProjectionService:
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
+            # What the park knew: whether the failure is fixable by changing configuration.
+            # The driver records it and does not act on it, so this surface is the only place
+            # the classification becomes useful to anyone.
+            "config_recoverable": record.config_recoverable,
             "final_output": _json_safe(
                 record.last_final_output
                 if record.last_final_output is not None
@@ -201,6 +206,7 @@ class RunProjectionService:
                 "ready": False,
                 "error": record.error,
                 "error_code": record.error_code,
+                "config_recoverable": record.config_recoverable,
             }
         result = record.result
         diff_text = (
@@ -215,8 +221,16 @@ class RunProjectionService:
             "ready": True,
             "final_text": result.final_text,
             "final_output": _json_safe(result.final_output),
-            "error": result.error,
+            # ``AgentRunResult.error`` is deliberately raw: the embedding application is inside
+            # the trust boundary. This response is not — the route hands this dict to
+            # ``_write_json`` unchanged — so the filter lands here, on the one error expression
+            # that did not already come pre-filtered from its writer (``record.error`` on the
+            # not-ready branch above, and ``metrics["error"]`` below, both go through
+            # ``public_error_message`` in ``run_state.py``/``loop_phases.py``). The in-process
+            # result object keeps the whole message.
+            "error": public_error_message(result.error),
             "error_code": result.error_code,
+            "config_recoverable": record.config_recoverable,
             "run_dir": str(result.run_dir),
             "manifest_path": str(result.run_dir / "manifest.json"),
             "diff_path": str(result.diff_path),

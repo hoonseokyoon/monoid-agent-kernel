@@ -96,6 +96,13 @@ class StdoutJsonlSink:
         self.handle.flush()
 
 
+# The parks a model turn starting must clear. The offline twin
+# (``core/projections.py:_PARKED_STATES``) names the same pair.
+_PARKED_STATE_VALUES = frozenset(
+    {SessionState.AWAITING_INPUT.value, SessionState.AWAITING_TASKS.value}
+)
+
+
 @dataclass
 class StatusJsonSink:
     path: Path
@@ -180,10 +187,22 @@ class StatusJsonSink:
         elif event.type == "model.turn.started":
             self.state["current_turn_id"] = event.turn_id
             self.state["current_step"] = data.get("step")
-            if self.state.get("state") == SessionState.AWAITING_INPUT.value:
+            # Both parks, not one. Clearing only ``AWAITING_INPUT`` here left a run that had
+            # parked on background jobs reading as parked while the turn that unparked it was
+            # already running — ``run.resumed`` is emitted for the job case but not for every
+            # path out of a task wait. The offline twin (``core/projections.py``) clears the
+            # same pair.
+            if self.state.get("state") in _PARKED_STATE_VALUES:
                 self.state["state"] = session_state_value(SessionState.RUNNING)
                 self.state["terminal"] = False
+                self.state["waiting_for_background_jobs"] = False
                 self.state.pop("awaiting_input", None)
+        elif event.type == "turn.failed":
+            # A recoverable model-turn park. The event carries the whole classification; without
+            # this the status file an operator reads showed error="" for a run parked in
+            # TURN_FAILED. State is untouched: the park that follows names it.
+            self.state["error"] = data.get("error", "")
+            self.state["error_code"] = data.get("error_code", "")
         elif event.type == "tool.call.started":
             self.state["current_tool"] = data.get("tool")
             self.state["current_tool_call_id"] = data.get("call_id")
