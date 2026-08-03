@@ -1051,9 +1051,12 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
     # A refusal off a payload that reported spending tokens carries that cost, whichever key of
     # it turned out to be malformed: the upstream generated and billed the turn before this
     # reader ever looked at it, and the refusal is the only carrier left for a call nothing
-    # downstream will assemble. The error envelope below stamps its own; the two guarded regions
-    # here are every other refusal this reader can raise, and they were all escaping empty --
-    # the rule was bound to the echo pair on the streamed twin and to nothing else.
+    # downstream will assemble. THREE guarded regions cover this reader -- the pre-branch read
+    # here, the error branch, and the success branch -- because a refusal can escape from any of
+    # them and the rule is about the payload, not about which branch was reading it. The error
+    # branch stamps the failure it *builds*, but only after reading five keys of its own; the
+    # first version of this rule said the branch "builds and stamps its own failure" and treated
+    # that as covering it, which is true only when none of those five reads is the malformed one.
     try:
         provider_retried = _exact_gateway_bool(
             data,
@@ -1066,61 +1069,72 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
         mark_provider_usage(malformed, _reported_error_usage(data))
         raise
     if "error" in data:
-        error_http_status = _exact_gateway_int(
-            data,
-            "http_status",
-            default=None,
-            context="error response",
-            minimum=100,
-            maximum=599,
-            allow_none=True,
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        )
-        retryable = _exact_gateway_bool(
-            data,
-            "retryable",
-            default=False,
-            context="error response",
-            http_status=error_http_status,
-            known_provider_retried=provider_retried,
-        )
-        # The remedy the failure names, read back rather than inferred from the status. Absent
-        # reads as False -- an older gateway that never mentions the key, and a failure that
-        # really is not config-fixable, mean the same thing to a driver.
-        config_recoverable = _exact_gateway_bool(
-            data,
-            "config_recoverable",
-            default=False,
-            context="error response",
-            http_status=error_http_status,
-            known_provider_retried=provider_retried,
-        )
-        envelope_error = ModelAdapterError(
-            _gateway_string(
+        # The whole construction is inside the guard, not just the stamp that ends it: an
+        # envelope whose ``http_status``/``retryable``/``config_recoverable``/``error``/
+        # ``error_code`` is malformed is refused HERE, before the failure it describes can be
+        # built, and that refusal was leaving with an empty ``provider_usage`` off a payload
+        # that had already reported what the turn burned. A malformed error envelope stays a
+        # non-retryable ``gateway_bad_response`` -- one rule with the success readers, because a
+        # broken envelope is a broken gateway whatever failure it was trying to report.
+        try:
+            error_http_status = _exact_gateway_int(
                 data,
-                "error",
+                "http_status",
+                default=None,
                 context="error response",
-                required=True,
+                minimum=100,
+                maximum=599,
+                allow_none=True,
+                http_status=status_hint,
                 known_provider_retried=provider_retried,
-                http_status=error_http_status,
             )
-            or "",
-            provider_error_code=(
+            retryable = _exact_gateway_bool(
+                data,
+                "retryable",
+                default=False,
+                context="error response",
+                http_status=error_http_status,
+                known_provider_retried=provider_retried,
+            )
+            # The remedy the failure names, read back rather than inferred from the status.
+            # Absent reads as False -- an older gateway that never mentions the key, and a
+            # failure that really is not config-fixable, mean the same thing to a driver.
+            config_recoverable = _exact_gateway_bool(
+                data,
+                "config_recoverable",
+                default=False,
+                context="error response",
+                http_status=error_http_status,
+                known_provider_retried=provider_retried,
+            )
+            envelope_error = ModelAdapterError(
                 _gateway_string(
                     data,
-                    "error_code",
+                    "error",
                     context="error response",
+                    required=True,
                     known_provider_retried=provider_retried,
                     http_status=error_http_status,
                 )
-                or GATEWAY_BAD_RESPONSE
-            ),
-            retryable=retryable,
-            config_recoverable=config_recoverable,
-            http_status=error_http_status,
-            provider_retried=provider_retried,
-        )
+                or "",
+                provider_error_code=(
+                    _gateway_string(
+                        data,
+                        "error_code",
+                        context="error response",
+                        known_provider_retried=provider_retried,
+                        http_status=error_http_status,
+                    )
+                    or GATEWAY_BAD_RESPONSE
+                ),
+                retryable=retryable,
+                config_recoverable=config_recoverable,
+                http_status=error_http_status,
+                provider_retried=provider_retried,
+            )
+        except ModelAdapterError as malformed:
+            mark_provider_usage(malformed, _reported_error_usage(data))
+            raise
         # Third error reader on this wire, and the rule is the same on all three: a failure
         # that reports what it cost is recorded as having cost it.
         mark_provider_usage(envelope_error, _reported_error_usage(data))
@@ -1451,60 +1465,74 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             mark_provider_usage(malformed, _reported_error_usage(event))
             raise
     if event_type == "error":
-        error_http_status = _exact_gateway_int(
-            event,
-            "http_status",
-            default=None,
-            context="stream error",
-            minimum=100,
-            maximum=599,
-            allow_none=True,
-            http_status=status_hint,
-            known_provider_retried=retried,
-        )
-        retryable = _exact_gateway_bool(
-            event,
-            "retryable",
-            default=False,
-            context="stream error",
-            http_status=error_http_status,
-            known_provider_retried=retried,
-        )
-        # The sync twin's rule, on the transport that reports the same failure as a frame.
-        config_recoverable = _exact_gateway_bool(
-            event,
-            "config_recoverable",
-            default=False,
-            context="stream error",
-            http_status=error_http_status,
-            known_provider_retried=retried,
-        )
-        stream_error = ModelAdapterError(
-            _gateway_string(
+        # Guarded like the terminal frame above and like the body reader's error branch: these
+        # five reads run before the stamp that ends the branch, so a malformed key on an error
+        # frame that reported a cost refused for free on this transport too.
+        try:
+            error_http_status = _exact_gateway_int(
                 event,
-                "error",
+                "http_status",
+                default=None,
                 context="stream error",
+                minimum=100,
+                maximum=599,
+                allow_none=True,
+                http_status=status_hint,
                 known_provider_retried=retried,
-                http_status=error_http_status,
             )
-            or "LLM gateway stream error",
-            provider_error_code=(
+            retryable = _exact_gateway_bool(
+                event,
+                "retryable",
+                default=False,
+                context="stream error",
+                http_status=error_http_status,
+                known_provider_retried=retried,
+            )
+            # The sync twin's rule, on the transport that reports the same failure as a frame.
+            config_recoverable = _exact_gateway_bool(
+                event,
+                "config_recoverable",
+                default=False,
+                context="stream error",
+                http_status=error_http_status,
+                known_provider_retried=retried,
+            )
+            stream_error = ModelAdapterError(
                 _gateway_string(
                     event,
-                    "error_code",
+                    "error",
                     context="stream error",
                     known_provider_retried=retried,
                     http_status=error_http_status,
                 )
-                or GATEWAY_BAD_RESPONSE
-            ),
-            retryable=retryable,
-            config_recoverable=config_recoverable,
-            http_status=error_http_status,
-            provider_retried=retried,
-        )
+                or "LLM gateway stream error",
+                provider_error_code=(
+                    _gateway_string(
+                        event,
+                        "error_code",
+                        context="stream error",
+                        known_provider_retried=retried,
+                        http_status=error_http_status,
+                    )
+                    or GATEWAY_BAD_RESPONSE
+                ),
+                retryable=retryable,
+                config_recoverable=config_recoverable,
+                http_status=error_http_status,
+                provider_retried=retried,
+            )
+        except ModelAdapterError as malformed:
+            mark_provider_usage(malformed, _reported_error_usage(event))
+            raise
         mark_provider_usage(stream_error, _reported_error_usage(event))
         raise stream_error
+    # The ``*_delta`` branches above are deliberately unguarded, and that is a registered
+    # exclusion rather than an omission: a delta is the content channel and the shipped server
+    # never writes ``usage`` onto one (end-of-turn metadata rides the terminal frame, pinned by
+    # test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered). A guard there
+    # would read a key that is never present -- dead code standing in for a rule.
+    # tests/test_carriage_conformance.py registers the excluded reads and asserts the wire fact
+    # they rest on, so a server that started billing on a delta fails there.
     return None  # unknown frame type: forward-compatible, ignore
 
 
@@ -1564,50 +1592,65 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
                 http_status=status,
                 provider_retried=False,
             )
-    provider_retried = _exact_gateway_bool(
-        error_payload,
-        "provider_retried",
-        default=False,
-        context="HTTP error response",
-        http_status=status,
-    )
-    provider_error_code = _gateway_string(
-        error_payload,
-        "error_code",
-        context="HTTP error response",
-        known_provider_retried=provider_retried,
-        http_status=status,
-    ) or _error_code_for_http_status(status)
-    retryable = _exact_gateway_bool(
-        error_payload,
-        "retryable",
-        default=_retryable_for_http_status(status),
-        context="HTTP error response",
-        http_status=status,
-        known_provider_retried=provider_retried,
-    )
-    # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the status
-    # line: a 4xx is a hint that the request was at fault, not a statement that configuration
-    # fixes it, so an unstated key is False here rather than status-shaped.
-    config_recoverable = _exact_gateway_bool(
-        error_payload,
-        "config_recoverable",
-        default=False,
-        context="HTTP error response",
-        http_status=status,
-        known_provider_retried=provider_retried,
-    )
-    message = (
-        _gateway_string(
+    # Every per-key read is inside the guard, for the reason the two envelope readers give: this
+    # function BUILDS the failure and stamps it at the end, so a malformed key refuses before the
+    # stamp is reached -- and this reader is the one both transports land in for a non-200, which
+    # is the shape most likely to be carrying a cost at all.
+    #
+    # It keeps *raising* on a malformed key rather than degrading to the status-derived defaults,
+    # and that raise escapes past the caller's ``_should_retry`` (``next_turn``'s ``HTTPError``
+    # arm builds this error before deciding to retry, and the streamed path builds it inline).
+    # So a 429 whose body is malformed is refused rather than retried: the body, not the status
+    # line, is the authority. A gateway that answers 429 with a body this reader cannot parse is
+    # broken, not busy, and retrying it burns the run's budget against a wall.
+    try:
+        provider_retried = _exact_gateway_bool(
             error_payload,
-            "error",
+            "provider_retried",
+            default=False,
+            context="HTTP error response",
+            http_status=status,
+        )
+        provider_error_code = _gateway_string(
+            error_payload,
+            "error_code",
             context="HTTP error response",
             known_provider_retried=provider_retried,
             http_status=status,
+        ) or _error_code_for_http_status(status)
+        retryable = _exact_gateway_bool(
+            error_payload,
+            "retryable",
+            default=_retryable_for_http_status(status),
+            context="HTTP error response",
+            http_status=status,
+            known_provider_retried=provider_retried,
         )
-        or detail
-        or f"HTTP {status}"
-    )
+        # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the
+        # status line: a 4xx is a hint that the request was at fault, not a statement that
+        # configuration fixes it, so an unstated key is False here rather than status-shaped.
+        config_recoverable = _exact_gateway_bool(
+            error_payload,
+            "config_recoverable",
+            default=False,
+            context="HTTP error response",
+            http_status=status,
+            known_provider_retried=provider_retried,
+        )
+        message = (
+            _gateway_string(
+                error_payload,
+                "error",
+                context="HTTP error response",
+                known_provider_retried=provider_retried,
+                http_status=status,
+            )
+            or detail
+            or f"HTTP {status}"
+        )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, _reported_error_usage(error_payload))
+        raise
     error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,

@@ -4661,10 +4661,11 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
 # Reads with no probe, each one accounted for, like ``SUCCESS_DANGLING_READS`` above.
 UNPROBED_SUCCESS_ENVELOPE_READS: dict[str, dict[str, str]] = {
     "providers/gateway.py:_parse_gateway_response": {
-        "error": "the discriminator: a body carrying it is an ERROR envelope, and that branch "
-        "builds and stamps its own failure (pinned by "
-        "test_a_two_hundred_error_envelope_carries_the_cost_too in "
-        "tests/test_generation_threading.py)",
+        "error": "the discriminator: a body carrying it selects the ERROR branch, whose own "
+        "reads are censused by family 7f below. The first version of this entry said that "
+        "branch 'builds and stamps its own failure' and treated that as covering it -- true "
+        "only when none of the five keys it reads on the way to building it is the malformed "
+        "one, which is exactly the hole 7f closes",
         "usage": "the stamp's own source: when IT is the malformed key there is nothing "
         "trustworthy left to stamp, and the lenient read is the declared behavior "
         "(test_a_refusal_off_a_malformed_usage_invents_no_tokens, same file)",
@@ -4764,6 +4765,287 @@ def test_7e_a_refusal_off_a_billed_success_envelope_carries_the_cost(
         "carried_by_the_refusal": provider_usage_of(refused),
         "hint": "a refused turn was still generated and billed; the refusal is the only "
         "carrier left for its cost",
+    }
+
+
+# --- family 7, the cost half on the ERROR envelope -------------------------------------
+#
+# 7e censuses the two SUCCESS envelopes, and it could only ever see them: ``_success_branch_reads``
+# DELETES the error branch from the AST before counting, so the five keys that branch reads were
+# invisible to the derivation, and ``_error_from_status_body`` -- the reader BOTH transports land
+# in for a non-200 -- appeared in no 7e table at all. Each of those readers reads its own per-key
+# block *before* the stamp that ends it, so a malformed key on an error envelope carrying valid
+# billed usage refused for free, on the shape most likely to be reporting a cost in the first
+# place: an error envelope exists because a call failed, and a call that failed after the upstream
+# generated is what the whole rule is for.
+#
+# Same mechanism as 7e, over the other half of the same two functions plus the third reader: the
+# probe table is diffed against an AST-fed read set, so a NEW key on the error wire has to answer
+# here before it can repeat the miss.
+
+
+def _error_branch_reads() -> frozenset[str]:
+    """The body reader's ERROR branch: exactly what ``_success_branch_reads`` throws away."""
+
+    parser = _function_node("providers/gateway.py", "_parse_gateway_response")
+    branch = next(
+        node
+        for node in parser.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == "error"
+    )
+    return _wire_keys_read_in(branch)  # type: ignore[arg-type]
+
+
+def _error_frame_branch_reads() -> frozenset[str]:
+    """The streamed twin: ``_chunk_from_event``'s ``error`` frame branch."""
+
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    branch = next(
+        node
+        for node in ast.walk(reader)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and node.test.comparators
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "error"
+    )
+    return _wire_keys_read_in(branch)  # type: ignore[arg-type]
+
+
+def _delta_frame_branch_reads() -> frozenset[str]:
+    """Every read inside ``_chunk_from_event``'s ``*_delta`` branches, derived the same way."""
+
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    keys: set[str] = set()
+    for node in ast.walk(reader):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and node.test.comparators
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and isinstance(node.test.comparators[0].value, str)
+            and node.test.comparators[0].value.endswith("_delta")
+        ):
+            keys |= _wire_keys_read_in(node)  # type: ignore[arg-type]
+    return frozenset(keys)
+
+
+# One malformed value per key each ERROR reader validates, patched over the body the shipped
+# server writes. ``error`` is corrupted to a non-string rather than removed, so the body reader's
+# discriminator still selects the error branch and the probe measures that branch's read.
+ERROR_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "providers/gateway.py:_error_from_status_body": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "provider_retried": {"provider_retried": "yes"},
+    },
+}
+# Reads with no probe, each one accounted for, exactly like the 7e table above.
+UNPROBED_ERROR_ENVELOPE_READS: dict[str, dict[str, str]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "usage": "the stamp's own source: when IT is the malformed key there is nothing "
+        "trustworthy left to stamp, and the lenient read is the declared behavior",
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "usage": "same as the body reader's",
+    },
+    "providers/gateway.py:_error_from_status_body": {
+        "usage": "same as the body reader's; this reader names the key only through "
+        "``_reported_error_usage``, which is the stamp itself",
+    },
+}
+
+# The ``*_delta`` branches of ``_chunk_from_event`` raise UNSTAMPED, and that is a registered
+# exclusion rather than a fourth hole. A delta is the content channel; end-of-turn metadata
+# (``usage``, the turn handle, the echoes) rides the terminal frame, which
+# ``test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered`` pins as the
+# re-encoding boundary. So the shipped server never puts a cost on a delta, and a stamp there
+# would read a key that is never present: dead code standing in for a rule, and dead code that
+# would then have to be kept in step with the real one. The wire fact it rests on is asserted
+# below, so a server that started billing on a delta fails here rather than losing the money.
+UNGUARDED_DELTA_FRAME_READS: dict[str, str] = {
+    "text": "text_delta / reasoning_delta content fragment",
+    "index": "tool-call delta slot",
+    "arguments_fragment": "tool-call delta argument text",
+    "id": "tool-call delta call id",
+    "name": "tool-call delta tool name",
+}
+
+
+def _refused_error_status_body(body: dict[str, Any]) -> ModelAdapterError:
+    """R3 RETURNS its failure on the well-formed path; a malformed key makes it raise.
+
+    The status handed in is the envelope's own, so this also exercises the documented retry
+    decision: the raise escapes past ``_should_retry`` at both call sites, which is why a 429
+    with an unparseable body is refused rather than retried.
+    """
+
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._error_from_status_body(
+            int(_maximal_wire_body()["http_status"]), json.dumps(body)
+        )
+    return caught.value
+
+
+ERROR_ENVELOPE_REFUSAL_READERS: dict[str, Any] = {
+    "providers/gateway.py:_parse_gateway_response": _read_r1,
+    "providers/gateway.py:_chunk_from_event": _read_r2,
+    "providers/gateway.py:_error_from_status_body": _refused_error_status_body,
+}
+
+
+def test_7f_every_error_envelope_read_is_probed_for_the_cost_it_carries() -> None:
+    """The derivation, so a NEW key cannot join an error reader without answering the rule."""
+
+    derived = {
+        "providers/gateway.py:_parse_gateway_response": _error_branch_reads(),
+        "providers/gateway.py:_chunk_from_event": _error_frame_branch_reads(),
+        "providers/gateway.py:_error_from_status_body": _wire_keys_read_in(
+            _function_node("providers/gateway.py", "_error_from_status_body")
+        ),
+    }
+    assert set(derived) == set(GATEWAY_ERROR_READERS), {
+        "hint": "the error-envelope cost census covers exactly the registered error readers",
+    }
+    for reader, reads in derived.items():
+        probed = frozenset(ERROR_ENVELOPE_REFUSAL_PROBES[reader])
+        unprobed = frozenset(UNPROBED_ERROR_ENVELOPE_READS[reader])
+        assert probed.isdisjoint(unprobed), {"reader": reader}
+        assert probed | unprobed == reads, {
+            "reader": reader,
+            "read_but_never_probed": sorted(reads - probed - unprobed),
+            "probed_but_no_longer_read": sorted((probed | unprobed) - reads),
+            "hint": "a new read on the error wire: give it a malformed-value probe, or "
+            "register why the refusal it raises cannot carry the cost",
+        }
+        for reason in UNPROBED_ERROR_ENVELOPE_READS[reader].values():
+            assert reason.strip()
+
+    # The reads that run BEFORE either branch are guarded once, for every payload shape, and 7e
+    # probes them there. Stated rather than assumed, because "covered by the other family" is
+    # exactly the kind of claim that stops being true silently.
+    assert TERMINAL_FRAME_PRE_BRANCH_READS <= frozenset(
+        SUCCESS_ENVELOPE_REFUSAL_PROBES["providers/gateway.py:_chunk_from_event"]
+    )
+    assert "provider_retried" in (
+        SUCCESS_ENVELOPE_REFUSAL_PROBES["providers/gateway.py:_parse_gateway_response"]
+    )
+
+
+def test_7f_the_two_dual_shape_readers_have_no_read_outside_the_two_censuses() -> None:
+    """The closure: every key either reader reads is probed by 7e, by 7f, or registered here.
+
+    Both families derive from one branch each, so both could be complete while a third branch
+    read a key neither had ever heard of -- which is precisely what the error branch was to 7e.
+    Diffed against the full per-reader read census (family 2b), which is the authority.
+    """
+
+    body_reader = "providers/gateway.py:_parse_gateway_response"
+    frame_reader = "providers/gateway.py:_chunk_from_event"
+    assert _success_branch_reads() | _error_branch_reads() == GATEWAY_READER_WIRE_KEYS[
+        body_reader
+    ], {
+        "unaccounted": sorted(
+            GATEWAY_READER_WIRE_KEYS[body_reader]
+            - _success_branch_reads()
+            - _error_branch_reads()
+        ),
+    }
+    frame_covered = (
+        _turn_complete_branch_reads()
+        | TERMINAL_FRAME_PRE_BRANCH_READS
+        | _error_frame_branch_reads()
+        | _delta_frame_branch_reads()
+    )
+    assert frame_covered == GATEWAY_READER_WIRE_KEYS[frame_reader], {
+        "unaccounted": sorted(GATEWAY_READER_WIRE_KEYS[frame_reader] - frame_covered),
+        "hint": "a new frame branch: census its reads or register them like the deltas",
+    }
+
+
+@pytest.mark.parametrize(
+    "reader, key",
+    sorted(
+        (reader, key)
+        for reader, probes in ERROR_ENVELOPE_REFUSAL_PROBES.items()
+        for key in probes
+    ),
+)
+def test_7f_a_refusal_off_a_billed_error_envelope_carries_the_cost(
+    reader: str, key: str
+) -> None:
+    envelope = _maximal_wire_body()
+    billed = dict(envelope["usage"])
+    assert billed, "the server probe must report a cost, or this pin proves nothing"
+    assert envelope["error_code"] != gateway_client.GATEWAY_BAD_RESPONSE, (
+        "the envelope must classify itself differently, or the assertion below cannot tell "
+        "'this key was refused' from 'the envelope's own error came back'"
+    )
+    # Read before the probe patches it: the ``retryable`` probe is one of the corruptions.
+    assert envelope["retryable"] is True and envelope["http_status"] == 429
+    envelope.update(ERROR_ENVELOPE_REFUSAL_PROBES[reader][key])
+
+    refused = ERROR_ENVELOPE_REFUSAL_READERS[reader](envelope)
+    assert refused.provider_error_code == gateway_client.GATEWAY_BAD_RESPONSE, {
+        "reader": reader,
+        "malformed_key": key,
+        "hint": "the probe must make THIS key the refusal, not the envelope's own error",
+    }
+    # One rule with the success readers: a malformed envelope is a broken gateway, so the
+    # refusal is non-retryable however retryable the envelope claimed to be (this one says
+    # retryable=True on a 429, so both halves of that sentence bite).
+    assert refused.retryable is False
+    assert provider_usage_of(refused) == billed, {
+        "reader": reader,
+        "malformed_key": key,
+        "reported_by_the_envelope": billed,
+        "carried_by_the_refusal": provider_usage_of(refused),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
+def test_7f_the_delta_frames_the_server_writes_carry_no_cost_to_lose() -> None:
+    """The assertion behind the delta exclusion -- a registry entry with none is prose."""
+
+    assert set(UNGUARDED_DELTA_FRAME_READS) == set(_delta_frame_branch_reads()), {
+        "newly_read_in_a_delta_branch": sorted(
+            _delta_frame_branch_reads() - set(UNGUARDED_DELTA_FRAME_READS)
+        ),
+        "registered_but_no_longer_read": sorted(
+            set(UNGUARDED_DELTA_FRAME_READS) - _delta_frame_branch_reads()
+        ),
+    }
+    for reason in UNGUARDED_DELTA_FRAME_READS.values():
+        assert reason.strip()
+
+    gateway, token = _gateway_and_token()
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    deltas = frames[:-1]
+    assert deltas and any(frame.get("type") == "text_delta" for frame in deltas)
+    assert all("usage" not in frame for frame in deltas), {
+        "billed_delta_frames": [frame for frame in deltas if "usage" in frame],
+        "hint": "a delta now reports a cost: the *_delta branches need the stamp the error and "
+        "terminal branches carry, and this exclusion has to go",
     }
 
 
