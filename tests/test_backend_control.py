@@ -571,6 +571,84 @@ def test_failure_metering_takes_the_fresher_reading_per_key(
     assert usage["total_tokens"] == 450
 
 
+def test_record_run_failure_writes_the_terminal_status_artifact(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The THIRD failure.json writer makes the same terminal statement the give-up sites make.
+
+    ``record_run_failure`` wrote failure.json and flipped the in-memory record FAILED but never
+    touched ``status.json`` — so after a restart every status surface served the run's old park
+    (``awaiting_input, terminal=false``) forever, while ``recover_runs`` skipped the dir on
+    failure.json: byte-for-byte the symptom the recovery give-up sites already fixed. The
+    statement now goes through the ONE shared writer, with this lane's own honest marker and
+    the failure's own error_code (not ``unrecoverable``)."""
+
+    from monoid_agent_kernel.core.schemas import STATUS_SCHEMA, _validate_json_file
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_status_artifact"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # The park-shaped artifact a crashed driver leaves behind, with identity + metrics riding.
+    write_json_atomic(
+        run_dir / "status.json",
+        {
+            "run_id": run_id,
+            "state": "awaiting_input",
+            "terminal": False,
+            "last_event_seq": 7,
+            "last_event_type": "run.awaiting_input",
+            "updated_at": "2026-08-03T00:00:00Z",
+            "metrics": {"input_tokens": 25, "total_tokens": 25},
+            "provider_retried": True,
+        },
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.AWAITING_INPUT
+    # What a prior turn.failed park recorded — the four facts a FAILED terminal keeps.
+    record.retryable = True
+    record.http_status = 429
+    record.config_recoverable = True
+    record.provider_error_code = "rate_limit"
+    record.provider_retried = True
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    artifact = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    assert (artifact["state"], artifact["terminal"]) == ("failed", True)
+    assert "worker boom" in artifact["error"]
+    # The failure's own error code — not the recovery lane's "unrecoverable".
+    assert artifact["error_code"] == "internal_error"
+    assert artifact["error_type"] == "RuntimeError"
+    # This lane's own honest marker — recovery did not give this run up; its driver died.
+    assert artifact["recorded_by_run_failure"] is True
+    assert "given_up_by_recovery" not in artifact
+    # The terminal vocabulary drops the per-call fact, exactly as run.failed does.
+    assert "provider_retried" not in artifact
+    # Merged over the prior payload: identity and metrics survive.
+    assert artifact["metrics"] == {"input_tokens": 25, "total_tokens": 25}
+    assert artifact["last_event_seq"] == 7
+    issues: list = []
+    _validate_json_file(run_dir / "status.json", STATUS_SCHEMA, issues)
+    assert issues == [], issues
+    # The offline projection honors the quarantine marker over the stale (park-ending) log.
+    projection = project_run_status(run_dir)
+    assert (projection["state"], projection["terminal"]) == ("failed", True)
+    # And the record gets the FAILED-terminal heal record_run_result applies: the four facts
+    # stay (they say what the run died of); only provider_retried is dropped.
+    assert record.state is SessionState.FAILED
+    assert record.terminal is True
+    assert record.provider_retried is False
+    assert record.retryable is True
+    assert record.http_status == 429
+    assert record.config_recoverable is True
+    assert record.provider_error_code == "rate_limit"
+
+
 def _giveup_recovery_meta(run_id: str, workspace: Path) -> dict[str, Any]:
     config = _config()
     return {

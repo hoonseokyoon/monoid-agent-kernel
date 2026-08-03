@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core._util import read_text_resilient, utc_timestamp, write_json_atomic
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.event_sequencing import RunEventSequencer
 from monoid_agent_kernel.core.events import AgentEvent
@@ -16,6 +17,7 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
+from monoid_agent_kernel.core.projections import FAILURE_QUARANTINE_MARKERS
 from monoid_agent_kernel.core.result import AgentRunResult
 from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.reference.backend.ports import (
@@ -23,6 +25,8 @@ from monoid_agent_kernel.reference.backend.ports import (
     MutableRunRecordPort,
     RunRecordPort,
 )
+
+_LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 
 
 def _provider_http_status(exc: Exception) -> int | None:
@@ -48,6 +52,91 @@ def _error_flag(exc: Exception, name: str) -> bool:
 
     value = getattr(exc, name, None)
     return value if type(value) is bool else False
+
+
+def _error_text(exc: Exception, name: str) -> str:
+    """The string twin of :func:`_error_flag`, guarded for the same reason: this arm answers
+    for every exception a run can die of, and only a real string is a provider code."""
+
+    value = getattr(exc, name, None)
+    return value if type(value) is str else ""
+
+
+def write_failure_status_artifact(
+    run_dir: Path,
+    run_id: str,
+    *,
+    error: str,
+    error_code: str,
+    exc_type: str,
+    marker: str,
+    provider_error_code: str = "",
+    http_status: int | None = None,
+    retryable: bool = False,
+    config_recoverable: bool = False,
+) -> None:
+    """Write the terminal status artifact beside a failure quarantine — the ONE shared writer.
+
+    A failure quarantine ends a run without a live recorder: ``failure.json`` makes every
+    later recovery pass skip the dir, but ``status.json`` used to keep saying whatever the
+    run last parked as, so ``status()``, ``list_runs`` and the offline projection all
+    answered ``state=awaiting_input, terminal=False`` for a permanently dead run. All three
+    quarantine lanes — recovery's two give-up sites and the backend's
+    ``record_run_failure`` — make the same statement through this writer (the pairing is
+    bound by the writer census in ``tests/test_carriage_conformance.py``): ``state="failed"``
+    + ``terminal=true`` with the error pair, ``error_type``, and the four classification
+    facts (the recovery lanes have no provider verdict, so theirs carry the honest empty
+    defaults; ``record_run_failure`` passes what its exception carried) — and
+    ``provider_retried`` dropped, exactly as the sink's ``run.failed`` branch drops it.
+
+    ``marker`` names the lane (one of :data:`FAILURE_QUARANTINE_MARKERS`) so the two readers
+    of the quarantine bit — the closed-run guard and the offline replay override — can tell
+    this statement from a genuine close: while the bundle stands every resume path refuses
+    the dir on failure.json anyway, and once an operator lifts the quarantine (the
+    restore-hint flow) the closed-run guard must not keep refusing the resume.
+
+    Merged over the existing payload (read with the resilient reader, so the atomic-replace
+    race cannot drop it) — run identity and metrics survive. STATUS_SCHEMA's required
+    watermark pair is seeded (``last_event_seq: 0`` / ``last_event_type: ""`` — "no committed
+    event known to this writer") when the base payload lacks it, so the artifact minted over
+    a run that never wrote status.json still validates; if the prior payload is genuinely
+    unreadable the seeded minimum is what remains. Best-effort like every status.json write —
+    a failed write must not mask the recorded failure."""
+
+    if marker not in FAILURE_QUARANTINE_MARKERS:
+        raise ValueError(f"unknown failure-quarantine marker: {marker!r}")
+    status_path = run_dir / "status.json"
+    try:
+        payload = loads_json_ingress(read_text_resilient(status_path))
+    except (OSError, ValueError):
+        payload = None
+    state: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+    state.setdefault("run_id", run_id)
+    state.setdefault("last_event_seq", 0)
+    state.setdefault("last_event_type", "")
+    state.update(
+        {
+            "state": session_state_value(SessionState.FAILED),
+            "terminal": True,
+            "error": error,
+            "error_code": error_code,
+            "error_type": exc_type,
+            "provider_error_code": provider_error_code,
+            "http_status": http_status,
+            "retryable": retryable,
+            "config_recoverable": config_recoverable,
+            # The artifact's own freshness key, in the sink's own format (STATUS_SCHEMA
+            # declares it a string); the failure instant lives in failure.json's
+            # ``failed_at``.
+            "updated_at": utc_timestamp(),
+            marker: True,
+        }
+    )
+    state.pop("provider_retried", None)
+    try:
+        write_json_atomic(status_path, state)
+    except OSError:
+        _LOGGER.debug("failure status artifact write skipped", exc_info=True)
 
 
 def _event_flag(data: Mapping[str, Any], name: str) -> bool:
@@ -462,9 +551,10 @@ class RunStateMutationService:
         self._context.with_record_lock(lambda: self._meter_run(tenant_id, run_id, spent))
 
     def record_run_failure(self, run_id: str, exc: Exception) -> None:
+        run_dir = self._context.run_root_provider() / run_id
         self._context.write_failure_bundle(
             run_id,
-            self._context.run_root_provider() / run_id,
+            run_dir,
             # Filtered, like `record.error` below. `diagnostics()` returns the whole `failure.json`,
             # so writing it raw put the message back on the same response the filter two lines
             # down was added to clean. The kernel's own writer (`loop.py`) already filters here.
@@ -482,6 +572,24 @@ class RunStateMutationService:
             retryable=_error_flag(exc, "retryable"),
             config_recoverable=_error_flag(exc, "config_recoverable"),
         )
+        # The terminal statement beside the bundle, through the one shared writer — this was
+        # the third failure.json writer and the only one that left status.json parked, so a
+        # restart served ``awaiting_input, terminal=false`` forever for a run whose dir every
+        # recovery pass skips on failure.json. The lane's own marker and the failure's own
+        # error_code (not the recovery lanes' "unrecoverable"), and the classification the
+        # exception itself carried — the same guarded reads the bundle above uses.
+        write_failure_status_artifact(
+            run_dir,
+            run_id,
+            error=public_error_message(str(exc)),
+            error_code=getattr(exc, "error_code", "internal_error"),
+            exc_type=type(exc).__name__,
+            marker="recorded_by_run_failure",
+            provider_error_code=_error_text(exc, "provider_error_code"),
+            http_status=_provider_http_status(exc),
+            retryable=_error_flag(exc, "retryable"),
+            config_recoverable=_error_flag(exc, "config_recoverable"),
+        )
         # Read outside the record lock: this reaches the checkpoint store and the run directory,
         # exactly like the bundle write above it.
         spent = self._spent_before_failure(run_id)
@@ -491,6 +599,10 @@ class RunStateMutationService:
             set_record_state(record, SessionState.FAILED, terminal=True)
             record.error = public_error_message(str(exc))
             record.error_code = getattr(exc, "error_code", "internal_error")
+            # The FAILED-terminal heal, same rule as ``record_run_result``'s FAILED branch:
+            # the four facts stay (they say what the run died of) and only the per-call
+            # ``provider_retried`` is dropped — the terminal vocabulary drops it everywhere.
+            record.provider_retried = False
             record.finished_at = self._context.now()
             # A run that dies of a driver exception after N billed turns used to leave the
             # ledger reporting zero for every one of them -- not even the run count -- while

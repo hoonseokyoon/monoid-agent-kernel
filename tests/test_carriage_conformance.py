@@ -5673,11 +5673,12 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # that serve them) — provider_retried while parked, dropped at terminal.
             "reference/backend/ports.py",
             "reference/backend/projection.py",
-            # Joined with the give-up status artifact: recovery writes the terminal
-            # ``run.failed`` statement into status.json when it quarantines a run, and
-            # names ``provider_retried`` only to POP it — the same drop the sink's
-            # ``run.failed`` branch makes.
-            "reference/backend/recovery.py",
+            # ``reference/backend/recovery.py`` LEFT this set in the round-3 fix: the give-up
+            # status artifact's ``provider_retried`` POP (the same drop the sink's
+            # ``run.failed`` branch makes) moved into the ONE shared quarantine writer,
+            # ``run_state.write_failure_status_artifact`` — run_state.py below already
+            # carries it, and recovery now calls the shared writer instead of naming the
+            # fact itself.
             "reference/backend/run_state.py",
             "reference/backend/run_types.py",
             "reference/backend/session_drive.py",
@@ -5879,4 +5880,219 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
         "declared_uncensused_but_registered_as_covered": sorted(
             covered_families & declared_future
         ),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Failure-quarantine writer census — every failure.json writer ends the run out loud
+# --------------------------------------------------------------------------------------
+#
+# Finding shape (PR #94 round 3): ``record_run_failure`` was the THIRD ``failure.json``
+# writer and the only one with no terminal statement — no status artifact, no ``run.failed``
+# — so after a restart every artifact-backed status surface served the run's old park
+# (``awaiting_input, terminal=false``) forever while ``recover_runs`` skipped the dir on
+# failure.json.  The rule is structural, so it is bound structurally: every function in src
+# that writes ``failure.json`` (directly, or through one of the two primitive writers) must,
+# in its own control flow, either write the terminal status artifact through the ONE shared
+# writer (``run_state.write_failure_status_artifact``) or emit ``run.failed`` (the loop's
+# lane — its ``StatusJsonSink`` consumes that event into the same artifact).  A fourth
+# writer that does neither fails HERE, not at an operator's console.
+
+_FAILURE_BUNDLE_PRIMITIVE_NAMES = frozenset({"write_failure", "write_failure_bundle"})
+_TERMINAL_STATUS_WRITER = "write_failure_status_artifact"
+
+#: The two functions that construct ``failure.json`` and write it themselves.  Their CALLERS
+#: are what the pairing census below binds; the primitives are data movement.
+FAILURE_JSON_PRIMITIVE_WRITERS = frozenset(
+    {
+        ("recorder.py", "AgentRecorder.write_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.write_failure_bundle"),
+    }
+)
+
+#: Every function that invokes a failure-bundle primitive, pinned exactly.  A new caller
+#: fails the pin (and then the pairing assertion says what it owes).
+FAILURE_QUARANTINE_WRITERS = frozenset(
+    {
+        ("loop.py", "AgentLoop._record_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+        ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+        ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        ("reference/backend/service.py", "RunnerBackend._write_failure_bundle"),
+    }
+)
+
+#: Delegating seams with no decision of their own.  Verified structurally below (a
+#: non-docstring body of exactly one delegating call) so logic cannot hide behind the
+#: exemption; their callers reach the primitives through injected callables named
+#: ``write_failure_bundle`` and are censused as callers themselves.
+_FAILURE_BUNDLE_PASS_THROUGHS = frozenset(
+    {("reference/backend/service.py", "RunnerBackend._write_failure_bundle")}
+)
+
+
+def _iter_src_functions():
+    """Every function definition under src, as ``(module, dotted qualname, node)``."""
+
+    def walk(node: ast.AST, prefix: str, rel: str):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qual = prefix + child.name
+                yield rel, qual, child
+                yield from walk(child, qual + ".", rel)
+            elif isinstance(child, ast.ClassDef):
+                yield from walk(child, prefix + child.name + ".", rel)
+            else:
+                yield from walk(child, prefix, rel)
+
+    for path in sorted(PACKAGE.rglob("*.py")):
+        rel = path.relative_to(PACKAGE).as_posix()
+        yield from walk(_module_tree(rel), "", rel)
+
+
+def _own_nodes(func: ast.AST):
+    """A function's own control flow: nested defs/lambdas excluded (they run when called,
+    not when the writer runs), so a terminal statement inside a closure cannot satisfy the
+    pairing and a nested def's writer call is attributed to the nested def."""
+
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _own_calls(func: ast.AST) -> list[tuple[str, ast.Call]]:
+    calls: list[tuple[str, ast.Call]] = []
+    for node in _own_nodes(func):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name):
+            calls.append((target.id, node))
+        elif isinstance(target, ast.Attribute):
+            calls.append((target.attr, node))
+    return calls
+
+
+def _emits_run_failed(func: ast.AST) -> bool:
+    for name, call in _own_calls(func):
+        if name != "emit" or not call.args:
+            continue
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and first.value == "run.failed":
+            return True
+    return False
+
+
+def test_the_failure_json_primitive_writers_are_exactly_the_censused_two() -> None:
+    """A third function that constructs failure.json itself bypasses the caller census below,
+    so the primitives are pinned first: mentioning the filename and writing json atomically in
+    one function is the shape both writers have and no reader has."""
+
+    found = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if any(
+            isinstance(node, ast.Constant) and node.value == "failure.json"
+            for node in _own_nodes(func)
+        )
+        and any(name == "write_json_atomic" for name, _ in _own_calls(func))
+    )
+    assert found == FAILURE_JSON_PRIMITIVE_WRITERS, {
+        "new_primitives": sorted(str(site) for site in found - FAILURE_JSON_PRIMITIVE_WRITERS),
+        "gone_primitives": sorted(str(site) for site in FAILURE_JSON_PRIMITIVE_WRITERS - found),
+        "hint": "a new direct failure.json writer: census it here and bind its callers below",
+    }
+
+
+def test_every_failure_json_writer_is_paired_with_a_terminal_statement() -> None:
+    """The census: each discovered caller of a failure-bundle primitive must, in the same
+    control flow, write the shared terminal status artifact or emit ``run.failed``."""
+
+    sites: dict[tuple[str, str], ast.AST] = {}
+    for module, qual, func in _iter_src_functions():
+        if (module, qual) in FAILURE_JSON_PRIMITIVE_WRITERS:
+            continue
+        if any(name in _FAILURE_BUNDLE_PRIMITIVE_NAMES for name, _ in _own_calls(func)):
+            sites[(module, qual)] = func
+
+    assert frozenset(sites) == FAILURE_QUARANTINE_WRITERS, {
+        "new_writers": sorted(
+            str(site) for site in frozenset(sites) - FAILURE_QUARANTINE_WRITERS
+        ),
+        "gone_writers": sorted(
+            str(site) for site in FAILURE_QUARANTINE_WRITERS - frozenset(sites)
+        ),
+        "hint": "a failure.json writer appeared or moved: census it here AND pair it with a "
+        "terminal statement (the shared status-artifact writer, or a run.failed emit)",
+    }
+
+    unbound: list[str] = []
+    for (module, qual), func in sorted(sites.items()):
+        if (module, qual) in _FAILURE_BUNDLE_PASS_THROUGHS:
+            # The exemption is earned structurally, not granted: a pass-through has no body
+            # beyond its docstring and the one delegating call.
+            body = [
+                stmt
+                for stmt in func.body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                )
+            ]
+            delegates = (
+                len(body) == 1
+                and isinstance(body[0], (ast.Expr, ast.Return))
+                and isinstance(body[0].value, ast.Call)
+                and isinstance(body[0].value.func, ast.Attribute)
+                and body[0].value.func.attr in _FAILURE_BUNDLE_PRIMITIVE_NAMES
+            )
+            assert delegates, {
+                "pass_through": f"{module}:{qual}",
+                "hint": "no longer a pure delegation -- it now owes the pairing itself",
+            }
+            continue
+        writes_artifact = any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+        if not (writes_artifact or _emits_run_failed(func)):
+            unbound.append(f"{module}:{qual}")
+
+    assert unbound == [], {
+        "writers_with_no_terminal_statement": unbound,
+        "hint": "a failure.json write that leaves status.json parked: after a restart every "
+        "status surface reports the dead run as a healthy park forever",
+    }
+
+
+def test_the_terminal_quarantine_artifact_has_one_writer_and_three_callers() -> None:
+    """One shared writer, all three quarantine lanes through it — the fix that replaced two
+    hand-rolled artifact writes.  A fourth lane must appear here (and in the census above)."""
+
+    definitions = frozenset(
+        (module, qual)
+        for module, qual, _func in _iter_src_functions()
+        if qual.split(".")[-1] == _TERMINAL_STATUS_WRITER
+    )
+    assert definitions == frozenset(
+        {("reference/backend/run_state.py", _TERMINAL_STATUS_WRITER)}
+    ), {"definitions": sorted(str(site) for site in definitions)}
+
+    callers = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if qual.split(".")[-1] != _TERMINAL_STATUS_WRITER
+        and any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+    )
+    assert callers == frozenset(
+        {
+            ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+            ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+            ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        }
+    ), {
+        "callers": sorted(str(site) for site in callers),
+        "hint": "the quarantine artifact rides all three failure lanes through ONE writer",
     }

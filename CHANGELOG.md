@@ -7,6 +7,47 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — every failure quarantine speaks, and a resume refusal says why
+
+- **`record_run_failure` — the third `failure.json` writer — makes the terminal statement the
+  give-up sites make.** A run whose driver died (a build failure, a drive exception, a
+  recovered run's re-drive failing) got `failure.json` and a FAILED in-memory record but its
+  `status.json` kept the old park, so after a restart `status()`/`list_runs` reported
+  `awaiting_input, terminal=false` forever while `recover_runs` skipped the dir — byte-for-byte
+  the symptom the give-up sites had just been cured of. All three quarantine lanes now write
+  the artifact through ONE shared writer (`run_state.write_failure_status_artifact`), each with
+  an honest marker (`given_up_by_recovery`; `recorded_by_run_failure`) and its own
+  `error_code` — and the pairing is bound structurally: a writer census in
+  `tests/test_carriage_conformance.py` discovers every `failure.json` writer in src and fails
+  any that neither writes the terminal artifact nor emits `run.failed`. Reader-side backstop
+  for pre-fix dirs: `lifecycle_from_status_artifact` now reads a failure bundle beside a
+  NON-terminal parked artifact as `failed`/terminal (a terminal artifact — a genuine close —
+  still wins, and deleting the bundle restores the park, so the restore-hint flow is intact).
+  The record also gets the FAILED-terminal heal `record_run_result` applies (keep the four
+  classification facts, drop `provider_retried`).
+- **The minted quarantine artifact is schema-valid over a run that never wrote status.json.**
+  The give-up writer over a missing/unreadable `status.json` omitted `STATUS_SCHEMA`'s
+  required watermark keys, so `monoid validate` rejected the very file the fix mints. The
+  shared writer seeds `last_event_seq: 0` / `last_event_type: ""` ("no committed event known
+  to this writer"; the schema's floor moves to 0 — every reader already accepted it and
+  reconciles against the committed log tail), reads the prior payload with the resilient
+  reader so an atomic-replace race cannot drop identity/metrics, and merges over whatever it
+  preserved.
+- **A closed-limited run is no longer advertised `recoverable: true` beside
+  `terminal: true`.** `list_runs` computed `recoverable` from {no failure.json, non-terminal
+  checkpoint} only, and a run that CLOSED limited keeps a non-terminal park checkpoint by
+  design — so the listing advertised a dead run resumable and `resume_run` then 400'd with
+  "inspect failure.json" over a bundle that does not exist. The projection now consults the
+  same close-recording artifact fact recovery's guard consults — one function
+  (`core.projections.status_artifact_records_close`), both callers, read off the payload the
+  row already loads.
+- **Resume refusals are typed.** `attempt_resume` answers `ResumeOutcome`
+  (resumed/closed/already_live/failed) instead of a bare bool, and `resume_run` maps it:
+  closed → `NativeAgentError(error_code="run_terminal")`; a lost register-record claim race
+  (the studio double-click shape) → the already-live success shape (`resumed: false`, like
+  the record-exists branch) instead of a 400 for a resume that in fact succeeded; only a
+  genuine non-resume keeps the inspect-logs/failure.json hint.
+
 ### Fixed — the close boundary tells the truth, and a dead run reads dead everywhere
 
 - **The terminal heal reaches the backend record.** Terminals minted at the close boundary

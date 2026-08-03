@@ -862,6 +862,46 @@ def test_lifecycle_from_status_artifact_uses_failure_fallback() -> None:
     assert lifecycle_from_status_artifact(None, failure_present=True) == (SessionState.FAILED, True)
 
 
+def test_a_failure_bundle_outranks_a_non_terminal_parked_artifact() -> None:
+    """A parked artifact + a failure bundle = the run is dead. ``failure_present`` used to
+    fire only when the payload had NO state at all, so a quarantined run whose artifact still
+    said ``awaiting_input`` read as a healthy park on every artifact-backed surface. A
+    TERMINAL artifact still wins over ``failure_present`` (the close is the stronger, later
+    statement), and without the bundle the park reads exactly as before — which is what keeps
+    the restore-hint flow (delete failure.json, then resume) working."""
+
+    parked = {"state": "awaiting_input", "terminal": False}
+    assert lifecycle_from_status_artifact(parked, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    assert lifecycle_from_status_artifact(parked, failure_present=False) == (
+        SessionState.AWAITING_INPUT,
+        False,
+    )
+    # Non-terminal in every spelling: a live-limited park and a mid-turn RUNNING crash both
+    # read dead beside a bundle.
+    assert lifecycle_from_status_artifact({"state": "limited"}, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    assert lifecycle_from_status_artifact({"state": "running"}, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    # A terminal artifact still wins — explicit and legacy-inferred alike.
+    assert lifecycle_from_status_artifact(
+        {"state": "limited", "terminal": True}, failure_present=True
+    ) == (SessionState.LIMITED, True)
+    assert lifecycle_from_status_artifact(
+        {"state": "completed"}, failure_present=True
+    ) == (SessionState.COMPLETED, True)
+    assert lifecycle_from_status_artifact({"status": "limited"}, failure_present=True) == (
+        SessionState.LIMITED,
+        True,
+    )
+
+
 def test_cancelled_is_terminal() -> None:
     assert SessionState.CANCELLED in TERMINAL_STATES
     assert LEGAL_TRANSITIONS[SessionState.CANCELLED] == frozenset()

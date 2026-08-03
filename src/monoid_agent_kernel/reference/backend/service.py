@@ -108,7 +108,11 @@ from monoid_agent_kernel.reference.backend.projection import (
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
-from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
+from monoid_agent_kernel.reference.backend.recovery import (
+    RecoveryContext,
+    RecoveryService,
+    ResumeOutcome,
+)
 from monoid_agent_kernel.reference.backend.runtime_config import (
     RuntimeConfigContext,
     RuntimeConfigService,
@@ -2023,11 +2027,13 @@ class RunnerBackend:
         tracked in-memory, terminal checkpoints, and runs missing run.json are skipped."""
         return self._recovery.recover_runs()
 
-    def _attempt_resume(self, run_dir: Path, run_id: str) -> bool:
-        """Resume one run from its latest checkpoint. Returns True on success. Skips runs
-        with no resumable checkpoint or missing run.json. On a resume exception, bumps the
-        durable attempt counter and, once ``max_recover_attempts`` is reached, marks the run
-        unrecoverable (durable failure.json) so it is never retried into a crash loop."""
+    def _attempt_resume(self, run_dir: Path, run_id: str) -> ResumeOutcome:
+        """Resume one run from its latest checkpoint, answering a typed ``ResumeOutcome``
+        (resumed / closed / already-live / failed) rather than a bare bool, so the session
+        boundary can refuse a dead run as dead and a lost claim race as already-live. On a
+        resume exception, bumps the durable attempt counter and, once
+        ``max_recover_attempts`` is reached, marks the run unrecoverable (durable
+        failure.json) so it is never retried into a crash loop."""
         return self._recovery.attempt_resume(run_dir, run_id)
 
     def resume_run(self, run_id: str, token: str) -> dict[str, Any]:

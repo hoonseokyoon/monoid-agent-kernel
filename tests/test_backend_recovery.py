@@ -31,6 +31,10 @@ from support.backend_harness import (
     tool_binding,
     write_json_atomic,
 )
+import dataclasses
+
+from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.reference.backend.recovery import ResumeOutcome
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
 from monoid_agent_kernel.core._event_log import inspect_event_log_tail
 from monoid_agent_kernel.core.lifecycle import SessionState
@@ -607,8 +611,10 @@ def test_transient_checkpoint_read_failure_does_not_quarantine_run(tmp_path: Pat
         "monoid_agent_kernel.reference.backend.recovery.load_latest_checked", unavailable
     )
 
-    assert backend._recovery.attempt_resume(run_dir, run_id) is False
-    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    # Pin moved with the round-3 typed-refusal change: a transient deferral is a genuine
+    # non-resume (FAILED), never a close and never a quarantine.
+    assert backend._recovery.attempt_resume(run_dir, run_id) is ResumeOutcome.FAILED
+    assert backend._recovery.attempt_resume(run_dir, run_id) is ResumeOutcome.FAILED
     assert calls == 2
     assert not (run_dir / "failure.json").exists()
 
@@ -633,8 +639,9 @@ def test_transient_metadata_read_failure_does_not_quarantine_run(tmp_path: Path,
 
     monkeypatch.setattr(backend._recovery, "read_recovery_meta_checked", unavailable)
 
-    assert backend._recovery.attempt_resume(run_dir, run_id) is False
-    assert backend._recovery.attempt_resume(run_dir, run_id) is False
+    # Same typed pin as the checkpoint twin above.
+    assert backend._recovery.attempt_resume(run_dir, run_id) is ResumeOutcome.FAILED
+    assert backend._recovery.attempt_resume(run_dir, run_id) is ResumeOutcome.FAILED
     assert calls == 2
     assert not (run_dir / "failure.json").exists()
 
@@ -853,6 +860,266 @@ def test_the_restore_hint_flow_actually_recovers_the_run(tmp_path: Path, monkeyp
     }
 
 
+def test_a_recovered_run_whose_drive_fails_reads_dead_after_restart(tmp_path: Path) -> None:
+    """The THIRD failure.json writer (``record_run_failure``, reached here through
+    ``run_recovered``'s except) binds the same rule as the two give-up sites: the terminal
+    statement reaches ``status.json``, so a fresh process's ``status()``/``list_runs`` answer
+    dead — not the old park — while ``recover_runs`` skips the quarantined dir."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = _recoverable_backend(
+        run_root,
+        _token_manager(),
+        workspace,
+        [],
+        turns=[ModelTurn(response_id="r1", final_text="answer")],
+    )
+    backend1.idle_timeout_s = 300.0
+    submission = _submit_multi_turn(backend1, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    backend1.stop_watchdog()  # "crash": the park checkpoint + park-shaped status.json remain
+
+    backend2 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+
+    async def _drive_boom(record, request, loop, suspension, *, started, turns):  # noqa: ANN001
+        del record, request, loop, suspension, started, turns
+        raise RuntimeError("drive died after restore")
+
+    backend2._recovery._context = dataclasses.replace(
+        backend2._recovery._context, drive_open_session=_drive_boom
+    )
+    assert backend2.recover_runs() == [run_id]
+    run_dir = run_root / run_id
+    assert eventually(lambda: (run_dir / "failure.json").exists())
+    assert eventually(
+        lambda: json.loads((run_dir / "status.json").read_text(encoding="utf-8")).get("terminal")
+        is True
+    ), "the failure never reached the durable status artifact"
+    artifact = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    assert artifact["state"] == "failed"
+    assert artifact["error_code"] == "internal_error"  # the failure's own code
+    assert artifact["recorded_by_run_failure"] is True
+
+    # A fresh operator process, all readers, one answer.
+    backend3 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    status = backend3.status(run_id, token)
+    assert (status["state"], status["terminal"]) == ("failed", True)
+    row = next(
+        entry for entry in backend3.list_runs("tenant_a")["runs"] if entry["run_id"] == run_id
+    )
+    assert (row["state"], row["terminal"], row["recoverable"]) == ("failed", True, False)
+    assert backend3.recover_runs() == []
+
+
+def test_a_parked_artifact_beside_a_failure_bundle_reads_dead(tmp_path: Path) -> None:
+    """The reader-side backstop for pre-fix dirs: a failure bundle outranks a NON-terminal
+    parked artifact (the run is dead), while lifting the quarantine — the restore_hint's
+    prescribed flow — makes the park readable again."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_prefix_quarantine"
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True)
+    write_json_atomic(run_dir / "run.json", _recovery_metadata(run_id, workspace))
+    write_json_atomic(
+        run_dir / "status.json",
+        {
+            "run_id": run_id,
+            "state": "awaiting_input",
+            "terminal": False,
+            "last_event_seq": 3,
+            "last_event_type": "run.awaiting_input",
+            "updated_at": "2026-08-03T00:00:00Z",
+        },
+    )
+    write_json_atomic(
+        run_dir / "failure.json",
+        {
+            "schema_version": "monoid.failure.v1",
+            "run_id": run_id,
+            "error": "boom",
+            "error_code": "internal_error",
+            "type": "RuntimeError",
+            "last_good_seq": 0,
+        },
+    )
+    token = backend.token_manager.issue(
+        kind="run_access",
+        audience="monoid.backend",
+        run_id=run_id,
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=600,
+    )
+
+    status = backend.status(run_id, token)
+    assert (status["state"], status["terminal"]) == ("failed", True)
+    row = next(
+        entry for entry in backend.list_runs("tenant_a")["runs"] if entry["run_id"] == run_id
+    )
+    assert (row["state"], row["terminal"]) == ("failed", True)
+
+    # Delete failure.json -> the park is readable again, so the hinted resume can proceed.
+    (run_dir / "failure.json").unlink()
+    status = backend.status(run_id, token)
+    assert (status["state"], status["terminal"]) == ("awaiting_input", False)
+
+
+def test_the_giveup_artifact_is_schema_valid_with_no_prior_status_json(tmp_path: Path) -> None:
+    """A quarantine over a run that never wrote status.json (bootstrap-shaped dirs) must still
+    mint a STATUS_SCHEMA-valid artifact: the required watermark keys are seeded (``0`` /
+    ``""`` = "no committed event known to this writer"), so ``monoid validate`` accepts the
+    very file the fix writes."""
+
+    from monoid_agent_kernel.core.schemas import STATUS_SCHEMA, _validate_json_file
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_schema_valid_giveup"
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    manifest = run_root / run_id / "checkpoints" / "1" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["terminal"] = "no"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert backend.recover_runs() == []
+
+    status_path = run_root / run_id / "status.json"
+    artifact = json.loads(status_path.read_text(encoding="utf-8"))
+    assert (artifact["state"], artifact["terminal"]) == ("failed", True)
+    assert artifact["last_event_seq"] == 0
+    assert artifact["last_event_type"] == ""
+    issues: list = []
+    _validate_json_file(status_path, STATUS_SCHEMA, issues)
+    assert issues == [], issues
+
+
+def test_a_closed_limited_run_is_not_advertised_recoverable(tmp_path: Path) -> None:
+    """A run that CLOSED limited (terminal status artifact, non-terminal park checkpoint) was
+    advertised ``recoverable: true`` beside ``terminal: true`` in ``list_runs``, and
+    ``resume_run`` then 400'd pointing at a failure.json that does not exist. The projection
+    now consults the same close-recording artifact fact recovery consults, and the refusal is
+    typed: ``run_terminal``, with no attempt bumped and no bundle minted."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = _recoverable_backend(
+        run_root,
+        _token_manager(),
+        workspace,
+        [],
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c1"),),
+            ),
+            ModelTurn(
+                response_id="r2",
+                tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "c2"),),
+            ),
+            ModelTurn(response_id="r3", final_text="never reached"),
+        ],
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="steps",
+            runtime_config=runtime_config("fs.read"),
+            multi_turn=False,
+            max_steps=1,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend1._record(run_id).terminal)
+    stored = backend1.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.terminal is False  # the closed-limited shape
+    backend1.stop_watchdog()
+
+    # The restart view: dead runs must not be advertised resumable.
+    backend2 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    row = next(
+        entry for entry in backend2.list_runs("tenant_a")["runs"] if entry["run_id"] == run_id
+    )
+    assert row["terminal"] is True
+    assert row["recoverable"] is False
+    with pytest.raises(NativeAgentError) as excinfo:
+        backend2.resume_run(run_id, token)
+    assert excinfo.value.error_code == "run_terminal"
+    # A refusal is not an attempt: nothing bumped, nothing quarantined.
+    assert not (run_root / run_id / "recover_attempts.json").exists()
+    assert not (run_root / run_id / "failure.json").exists()
+    assert backend2.recover_runs() == []
+
+
+def test_a_concurrent_resume_loser_answers_the_already_live_shape(tmp_path: Path) -> None:
+    """The register-record CAS loser used to answer the same misleading 400 (studio
+    double-click shape). Losing the claim race means the run IS being resumed — the loser
+    answers the already-live success shape (``resumed: false``), like the record-exists
+    branch. Deterministic: ``register_record`` is patched to register (the winner) and then
+    report the loss."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = _recoverable_backend(
+        run_root,
+        _token_manager(),
+        workspace,
+        [],
+        turns=[ModelTurn(response_id="r1", final_text="parked answer")],
+    )
+    backend1.idle_timeout_s = 300.0
+    submission = _submit_multi_turn(backend1, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    backend1.stop_watchdog()
+
+    backend2 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="resumed")]
+    )
+    original_register = backend2._recovery._context.register_record
+    lost = {"count": 0}
+
+    def _lose_once(record):  # noqa: ANN001
+        if lost["count"] == 0:
+            lost["count"] += 1
+            assert original_register(record) is True  # the "winner" holds the live record
+            return False  # ...and this caller lost the claim race
+        return original_register(record)
+
+    backend2._recovery._context = dataclasses.replace(
+        backend2._recovery._context, register_record=_lose_once
+    )
+
+    out = backend2.resume_run(run_id, token)
+    assert out["run_id"] == run_id
+    assert out["resumed"] is False
+    assert out["terminal"] is False
+    # The loss is not a failure: nothing bumped, nothing quarantined.
+    assert not (run_root / run_id / "recover_attempts.json").exists()
+    assert not (run_root / run_id / "failure.json").exists()
+    # The injected "winner" record has no driver behind it; drop it so cleanup does not
+    # wait on a run nothing is driving.
+    with backend2._lock:
+        backend2._records.pop(run_id, None)
+
+
 def test_recover_runs_rejects_runtime_config_hash_mismatch(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"
@@ -990,7 +1257,10 @@ def test_multinode_reclaim_over_shared_sqlite(tmp_path: Path, monkeypatch) -> No
     )
     resumed: list = []
     monkeypatch.setattr(
-        backend_b._recovery, "attempt_resume", lambda run_dir, rid: (resumed.append(rid) or True)
+        backend_b._recovery,
+        "attempt_resume",
+        # Pin moved with the typed-refusal change: reclaim counts only RESUMED.
+        lambda run_dir, rid: (resumed.append(rid) or ResumeOutcome.RESUMED),
     )
 
     reclaimed = backend_b._reclaim_stale_runs()

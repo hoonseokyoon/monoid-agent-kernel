@@ -1955,20 +1955,41 @@ requires explicit host orchestration.
   a restart never resumes a crashed run into a loop. The status and the two classification flags
   are read off the failing exception by name and never coerced; the recovery-path writers
   (unrecoverable, invalid durable state) hold no provider verdict and leave them at
-  `null` / `false`.
+  `null` / `false`. It writes the terminal statement into `status.json` in the same breath —
+  through the one shared quarantine writer, with this lane's `recorded_by_run_failure` marker
+  and the failure's *own* `error_code` — because a driver failure has no live recorder and
+  therefore no terminal event: without the artifact, every status surface kept serving the
+  run's last park after a restart while `recover_runs` skipped its dir on `failure.json`. A
+  failure bundle beside a non-terminal artifact is also honored reader-side
+  (`lifecycle_from_status_artifact`): the pair reads `failed`/terminal even for dirs
+  quarantined before this writer existed, while a *terminal* artifact (a genuine close) still
+  wins over the bundle.
 - **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks
   attempts in `run_dir/recover_attempts.json` (`{count}`); after the cap it writes a
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
   skipped instead of retried forever. Both give-up paths (unrecoverable after the cap;
   corrupt/unsupported durable state) also write the terminal statement into `status.json`
-  (`state="failed"`, `terminal=true`, the bundle's error pair, an empty classification, and
-  a `given_up_by_recovery` marker) — without it, `status()`, `list_runs` and the offline
-  projection kept answering the run's last park (`awaiting_input`, `terminal=false`) for a
-  permanently dead run while `resume_run` refused it as unrecoverable. The bundle's
-  `restore_hint` names the actual operator flow: delete `failure.json` to lift the
-  quarantine, then `recover_runs` (or `resume_run`) restores the last good checkpoint —
-  the `given_up_by_recovery` marker is what keeps the closed-run status guard from
-  mistaking the give-up statement for a close once the quarantine is lifted.
+  through the same shared writer (`state="failed"`, `terminal=true`, the bundle's error pair,
+  an empty classification, and a `given_up_by_recovery` marker) — without it, `status()`,
+  `list_runs` and the offline projection kept answering the run's last park
+  (`awaiting_input`, `terminal=false`) for a permanently dead run while `resume_run` refused
+  it as unrecoverable. The bundle's `restore_hint` names the actual operator flow: delete
+  `failure.json` to lift the quarantine, then `recover_runs` (or `resume_run`) restores the
+  last good checkpoint — the quarantine markers (`given_up_by_recovery`,
+  `recorded_by_run_failure`) are what keep the closed-run status guard from mistaking a
+  quarantine statement for a close once the quarantine is lifted.
+- **Typed resume refusals.** `attempt_resume` answers a `ResumeOutcome`, not a bool, and
+  `resume_run` maps it: `resumed` — the caller now owns a live run; `closed` (the durable
+  status artifact or a terminal checkpoint records the run's own end — e.g. a close while
+  budget-limited, whose park checkpoint is non-terminal by design) refuses with the loop's
+  own terminal vocabulary, `NativeAgentError(error_code="run_terminal")`, instead of a hint
+  at a `failure.json` that does not exist; `already_live` (a concurrent resume won the
+  atomic record claim — the double-click shape) answers the same already-live success shape
+  as the record-exists branch, `resumed: false`, because the run *is* being resumed; only
+  `failed` — a genuine non-resume — keeps the inspect-logs/failure.json error. `list_runs`'
+  `recoverable` consults the same close-recording artifact fact through the same function
+  (`core.projections.status_artifact_records_close`), so the listing never advertises a run
+  `resume_run` will refuse as closed.
 
 ### Active watchdog / lease (legacy backend only)
 

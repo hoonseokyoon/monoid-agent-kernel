@@ -7,6 +7,7 @@ from monoid_agent_kernel.core._event_log import read_committed_event_payloads
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
+    lifecycle_from_status_artifact,
     session_state_from_run_status,
     session_state_value,
 )
@@ -39,6 +40,53 @@ _FAILURE_CLASSIFICATION_DEFAULTS: dict[str, Any] = {
     "config_recoverable": False,
     "provider_retried": False,
 }
+
+
+#: Marker keys a failure-quarantine writer stamps on the terminal ``status.json`` statement
+#: it mints beside ``failure.json`` — one per quarantine lane, honest about who wrote it:
+#: recovery's give-up sites, and the backend's ``record_run_failure``. Declared in core so
+#: the two readers of the one bit ("this terminal statement is a quarantine, not a close")
+#: — this module's replay override and the backend's closed-run guard — cannot drift from
+#: the writer (``reference/backend/run_state.py:write_failure_status_artifact``), which
+#: validates its marker against this same tuple.
+FAILURE_QUARANTINE_MARKERS: tuple[str, ...] = (
+    "given_up_by_recovery",
+    "recorded_by_run_failure",
+)
+
+
+def status_artifact_failure_quarantined(payload: Any) -> bool:
+    """Whether a durable status payload carries a failure-quarantine marker.
+
+    Guarded ``is True`` per key: a hand-edited truthy string must not activate the override.
+    A later genuine recovery rewrites the artifact without the marker, so the answer dies
+    with the quarantine."""
+    if not isinstance(payload, dict):
+        return False
+    return any(payload.get(key) is True for key in FAILURE_QUARANTINE_MARKERS)
+
+
+def status_artifact_records_close(payload: Any) -> bool:
+    """Whether a durable status payload records a CLOSE — a terminal outcome the run's own
+    close path wrote — as opposed to a failure-quarantine statement or a live park.
+
+    The one reader behind the recovery closed-run guard AND ``list_runs``' ``recoverable``
+    fact: a run that closed limited keeps a non-terminal park checkpoint by design, so this
+    artifact fact is the only durable marker that the run already ended — recovery must not
+    re-drive it, and the projection must not advertise it resumable. A quarantine statement
+    answers False on purpose: while its ``failure.json`` stands every resume path refuses the
+    dir on the bundle, and once an operator lifts the quarantine (the restore-hint flow) this
+    guard must not keep refusing the resume the hint prescribes. Unreadable or malformed
+    payloads answer False — a best-effort projection must not block a genuine recovery."""
+    if not isinstance(payload, dict):
+        return False
+    if status_artifact_failure_quarantined(payload):
+        return False
+    try:
+        _state, terminal = lifecycle_from_status_artifact(payload)
+    except ValueError:
+        return False
+    return terminal
 
 
 def _event_text(data: dict[str, Any], key: str) -> str:
@@ -149,16 +197,17 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "event_log_error": "",
     }
     _apply_event_projection(run_dir / "events.jsonl", projection, permission_policy)
-    if status_payload.get("given_up_by_recovery") is True:
-        # Recovery's give-up ends a run WITHOUT a live recorder, so no terminal event ever
-        # reaches events.jsonl — the log honestly ends at the park the run died in, and the
-        # replay above just resurrected that park. The give-up's terminal statement exists
-        # only in the status artifact (written beside failure.json), so it is re-applied
-        # over the replayed park here: without this, the offline reader answered a healthy
+    if status_artifact_failure_quarantined(status_payload):
+        # A failure quarantine ends a run WITHOUT a live recorder — recovery's give-up, and
+        # the backend's ``record_run_failure`` alike — so no terminal event ever reaches
+        # events.jsonl: the log honestly ends at the park the run died in, and the replay
+        # above just resurrected that park. The quarantine's terminal statement exists only
+        # in the status artifact (written beside failure.json), so it is re-applied over the
+        # replayed park here: without this, the offline reader answered a healthy
         # ``awaiting_input`` for a quarantined run while ``status()``/``list_runs`` (which
-        # read the artifact) answered ``failed``. Guarded ``is True``: a hand-edited truthy
-        # string must not activate the override. A later genuine recovery rewrites the
-        # artifact without the marker, so the override dies with the quarantine.
+        # read the artifact) answered ``failed``. One marker helper for every lane, guarded
+        # against hand-edited truthy strings; a later genuine recovery rewrites the artifact
+        # without the marker, so the override dies with the quarantine.
         projection["state"] = _payload_state(status_payload, metrics)
         projection["terminal"] = _payload_terminal(status_payload, projection["state"])
         projection["error"] = status_payload.get("error") or ""

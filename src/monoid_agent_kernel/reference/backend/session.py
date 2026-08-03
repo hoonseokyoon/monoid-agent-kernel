@@ -21,6 +21,7 @@ from monoid_agent_kernel.reference.backend.ports import (
     MutableRunRecordPort,
     TokenClaimsPort,
 )
+from monoid_agent_kernel.reference.backend.recovery import ResumeOutcome
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
 )
@@ -74,7 +75,7 @@ class BackendSessionContext:
     persist_checkpoint_from_any_thread: Callable[[MutableRunRecordPort], None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
     read_recovery_meta: Callable[[Path, str], dict[str, Any] | None]
-    attempt_resume: Callable[[Path, str], bool]
+    attempt_resume: Callable[[Path, str], ResumeOutcome]
     max_message_bytes_provider: Callable[[], int]
     max_message_queue_depth_provider: Callable[[], int]
     record_terminal: Callable[[MutableRunRecordPort], bool]
@@ -331,8 +332,30 @@ class BackendSessionService:
         stored = checkpoint_store.latest(run_id)
         if stored is None or stored.checkpoint.terminal:
             raise ValueError("run has no resumable checkpoint")
-        if not self._context.attempt_resume(run_dir, run_id):
-            raise ValueError("resume failed; inspect run logs / failure.json")
+        outcome = self._context.attempt_resume(run_dir, run_id)
+        if outcome is ResumeOutcome.ALREADY_LIVE:
+            # The atomic record claim lost to a concurrent resume (the studio double-click
+            # shape): the run IS live — the winner owns the activation — so the loser
+            # answers the same already-live shape the record-exists branch above answers,
+            # not an error. The subject was already verified against the durable metadata
+            # the winner's record is built from. The record can be momentarily invisible
+            # between the CAS and this read; the honest minimum is still "not resumed by
+            # this call".
+            live = self._context.active_record(run_id)
+            payload = _record_lifecycle_payload(live) if live is not None else {}
+            return {"run_id": run_id, **payload, "resumed": False}
+        if outcome is ResumeOutcome.CLOSED:
+            # The run already ended — a terminal status artifact (e.g. a close while
+            # budget-limited keeps a NON-terminal park checkpoint by design, so the
+            # checkpoint guard above cannot see it). Refused in the loop's own terminal
+            # vocabulary instead of pointing at a failure.json that does not exist.
+            raise NativeAgentError(
+                "run is already closed; its durable status artifact records a terminal "
+                "outcome, so there is nothing to resume",
+                error_code="run_terminal",
+            )
+        if outcome is not ResumeOutcome.RESUMED:
+            raise ValueError("resume failed; inspect run logs and failure.json (if present)")
         record = self._context.record(run_id)
         return {"run_id": run_id, **_record_lifecycle_payload(record), "resumed": True}
 

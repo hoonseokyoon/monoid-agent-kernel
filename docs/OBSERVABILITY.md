@@ -27,13 +27,20 @@ The run-directory artifact set is:
   `run.failed` classification remains (minus `provider_retried`, a per-call fact the terminal
   vocabulary drops). Absent keys mean "no live failure to classify" — which is also what their
   absence on a pre-v0.21 artifact meant. The offline projection (`monoid status`, reading
-  `events.jsonl`) answers with the same fields under the same rules. When the reference
-  backend's recovery gives a run up for good (unrecoverable after `max_recover_attempts`, or
-  corrupt durable state), it writes the terminal statement here too — `state: "failed"`,
-  `terminal: true`, the failure bundle's error pair, plus a `given_up_by_recovery` marker —
-  because the give-up has no live recorder and therefore no terminal event: without the
-  artifact, every status reader kept reporting the dead run's last park. The offline
-  projection honors that marker over the (necessarily park-ending) event log.
+  `events.jsonl`) answers with the same fields under the same rules. When a run dies without a
+  live recorder — the reference backend's recovery gives it up for good (unrecoverable after
+  `max_recover_attempts`, or corrupt durable state), or the backend records a driver failure
+  (`record_run_failure`) — the terminal statement is written here too, by one shared writer:
+  `state: "failed"`, `terminal: true`, the failure bundle's error pair, plus a quarantine
+  marker naming the lane (`given_up_by_recovery` for recovery's give-ups,
+  `recorded_by_run_failure` for the driver-failure lane) — because none of these paths emit a
+  terminal event: without the artifact, every status reader kept reporting the dead run's
+  last park. All three writers go through `run_state.write_failure_status_artifact` (a writer
+  census in `tests/test_carriage_conformance.py` binds every `failure.json` writer to a
+  terminal statement), which also seeds the schema-required watermark keys
+  (`last_event_seq: 0`, `last_event_type: ""`) when it mints the artifact over a run that
+  never wrote one, so the minted file stays `STATUS_SCHEMA`-valid. The offline projection
+  honors the markers over the (necessarily park-ending) event log.
 - `metrics.json`: final counters and timing. On a failed run it also records the failure's
   verdict beside the provider detail it already carried: `retryable` and `config_recoverable`
   join `provider_error_code` / `provider_http_status`, so an operator holding only this

@@ -1009,7 +1009,12 @@ STATUS_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "state": {"type": "string"},
         "terminal": {"type": "boolean"},
-        "last_event_seq": {"type": "integer", "minimum": 1},
+        # ``minimum: 0``, not 1: the event sink always writes >= 1, but the failure-quarantine
+        # writer (``run_state.write_failure_status_artifact``) can mint this artifact over a
+        # run that never wrote status.json, and its honest seed is 0 — "no committed event
+        # known to this writer". Every reader already accepts 0 (and reconciles against the
+        # committed log tail).
+        "last_event_seq": {"type": "integer", "minimum": 0},
         "last_event_type": {"type": "string"},
         "updated_at": {"type": "string"},
         # The classification a parked ``turn.failed`` writes into this artifact (declared

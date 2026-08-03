@@ -226,6 +226,15 @@ def lifecycle_from_status_artifact(
     New artifacts carry ``state`` plus an explicit ``terminal`` flag. Legacy artifacts carry
     ``status`` only, so terminal result statuses are inferred there, including bare
     ``status="limited"`` from pre-``state`` terminal-limited runs.
+
+    ``failure_present`` (a ``failure.json`` beside the artifact) outranks any NON-terminal
+    reading: a parked artifact + a failure bundle means the run is dead — the failure paths
+    that mint the bundle without a live recorder leave the artifact saying whatever the run
+    last parked as, and this reader-side backstop also covers run dirs quarantined before the
+    writers learned to make the terminal statement themselves. A TERMINAL artifact still wins
+    over ``failure_present``: the close is the later, stronger statement (a run can close
+    limited or cancelled with an older bundle still on disk). Deleting the bundle — the
+    restore-hint flow — restores the parked reading exactly as before.
     """
     status_payload = payload or {}
     state_value = status_payload.get("state")
@@ -256,6 +265,10 @@ def lifecycle_from_status_artifact(
                 not state_text and status_text in {"completed", "failed", "limited", "cancelled"}
             ):
                 terminal = True
+        if failure_present and not terminal:
+            # After the legacy inference on purpose, so an inferred terminal (a real close)
+            # still outranks the bundle and only a genuinely parked reading is overridden.
+            return SessionState.FAILED, True
         return state, terminal
     if failure_present:
         return SessionState.FAILED, True

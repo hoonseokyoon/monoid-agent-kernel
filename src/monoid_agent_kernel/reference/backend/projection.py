@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
 )
+from monoid_agent_kernel.core.projections import status_artifact_records_close
 from monoid_agent_kernel.core.subagent_runtime import (
     subagent_diagnostics_from_events,
     validate_descendant_run_id,
@@ -420,6 +421,7 @@ class RunProjectionService:
                 continue
             run_id = meta.get("run_id") or run_dir.name
             record = self._context.active_record(run_id)
+            status_payload: dict[str, Any] | None = None
             if record is not None:
                 lifecycle = {
                     **_record_lifecycle_payload(record),
@@ -429,7 +431,6 @@ class RunProjectionService:
                     ),
                 }
             else:
-                status_payload: dict[str, Any] | None = None
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
@@ -449,6 +450,13 @@ class RunProjectionService:
                 record is None
                 and not (run_dir / "failure.json").exists()
                 and checkpoint_store is not None
+                # The same artifact fact ``attempt_resume``'s closed-run guard consults —
+                # one function, both callers. A run that CLOSED limited keeps a
+                # NON-terminal park checkpoint by design, so without this the row said
+                # ``recoverable: true`` beside ``terminal: true`` and resume_run refused
+                # what the listing advertised. No extra I/O: the payload above is the same
+                # small JSON this row already read.
+                and not status_artifact_records_close(status_payload)
             ):
                 stored = checkpoint_store.latest(run_id)
                 recoverable = stored is not None and not stored.checkpoint.terminal
