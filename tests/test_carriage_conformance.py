@@ -67,6 +67,16 @@ writer was invisible to every probe.  And two registered-gap pins censused one s
 (``getattr``, not ``exc.attr``) and one end of a two-ended path (the projection, not the route
 that serves it), either of which would have stayed green through the very fix it exists to catch.
 
+*And the repair that answers for every name still only watched what is written through it.*  A
+dict leaves a name two other ways — handed to a call, and aliased — and neither was a
+contribution the census refused, so ``_fold_web_counters(metrics_data, ctx)`` (the idiom this
+package already uses in ``_accumulate_usage_mapping(state.total_usage, billed)``) and
+``alias = result; alias["k"] = v`` each put a key on the wire that the census reported as
+nonexistent.  An argument position is refused now unless the callee provably cannot reach a
+mapping's mutators.  The same rule had a fourth resolution path that never got it: the extractors
+that pull a *pinned* literal out of an argument dropped a ``**`` splat silently, so a merge into
+the failure bundle or a transcript record widened the artifact while its equality pin stayed green.
+
 *A registry entry with no assertion is prose.*  The registry's contract is "closing a gap breaks
 this suite", which holds only for entries something actually asserts.  Five round-1 entries had
 no pin at all — the drivers and consumers designed for a fact that ignore it, a closed schema,
@@ -1139,14 +1149,6 @@ def _module_tree(relative_path: str) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
-def _dict_keys(node: ast.Dict) -> frozenset[str]:
-    return frozenset(
-        key.value
-        for key in node.keys
-        if isinstance(key, ast.Constant) and isinstance(key.value, str)
-    )
-
-
 def _dict_literal_keys(node: ast.Dict) -> tuple[frozenset[str], tuple[str, ...]]:
     """A dict literal's constant string keys, *and the parts of it that are not that*.
 
@@ -1167,6 +1169,29 @@ def _dict_literal_keys(node: ast.Dict) -> tuple[frozenset[str], tuple[str, ...]]
         else:
             refusals.append(f"{ast.unparse(key)}: ...")
     return frozenset(keys), tuple(refusals)
+
+
+def _pinned_dict_keys(node: ast.Dict, context: str) -> frozenset[str]:
+    """A literal's keys, where the caller pins that key set as *the* thing the literal carries.
+
+    The fourth resolution path onto the rule :func:`_dict_literal_keys` states, and the last one
+    still reading the weak half of it: the two literal-argument extractors below (and the manifest
+    census that spells one out inline) fed their matches through a helper that returned the
+    constant string keys and dropped everything else. Every one of them hands its result to an
+    equality pin, so adding ``**_error_fields(exc)`` to a pinned literal widened the artifact
+    while the pin stayed green — the same fail-open :func:`_dict_writes` and
+    :func:`_emit_data_keys` had already closed on the assignment side of the file.
+    """
+
+    keys, merged = _dict_literal_keys(node)
+    assert merged == (), {
+        "literal": context,
+        "line": node.lineno,
+        "merges_the_census_cannot_read": list(merged),
+        "hint": "the pinned key set is no longer the whole literal — resolve the merge here "
+        "rather than dropping it, or the pin passes while the artifact widens",
+    }
+    return keys
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1230,40 @@ class _DictWrites:
 # mutator, it is that an unknown one must never pass as "no keys were added".
 _DICT_READ_METHODS = frozenset({"copy", "get", "items", "keys", "values"})
 
+# The same rule on the other side of the call, which is where round 3's version of it broke.
+# ``result.mutate()`` was refused and ``mutate(result)`` was not, so a tracked name *handed to* a
+# function wrote keys through a callee this census cannot see into and passed as "no keys were
+# added" — and that idiom is native to the censused code itself:
+# ``_accumulate_usage_mapping(state.total_usage, billed)`` in ``loop.py:_apump_turn`` folds one
+# mapping into another through exactly this shape. So a tracked name in an argument position is a
+# refusal unless the callee is listed here.
+#
+# Every entry is a *builtin that cannot reach a mapping's mutators*: it reads keys and returns a
+# new object. That keeps the list a proof rather than a per-callee audit — the alternative,
+# "these particular helpers looked harmless when I read them", is the hand transcription this
+# suite exists to stop trusting. Today's censused functions hand their dicts to exactly ONE call
+# between them (the emit below); a future ``len(metrics_data)`` is meant to pass here, and a
+# future ``_fold_web_counters(metrics_data, ctx)`` is meant to fail.
+_DICT_READ_CALLS = frozenset(
+    {
+        "bool",  # emptiness test
+        "dict",  # copies; writes into the copy are not writes into this name
+        "frozenset",  # iterates keys into a new frozenset
+        "len",  # reads the size
+        "list",  # iterates keys into a new list
+        "set",  # iterates keys into a new set
+        "sorted",  # iterates keys into a new list
+        "tuple",  # iterates keys into a new tuple
+    }
+)
+
+# The one non-builtin call a censused function hands a tracked dict to today, and the reason it
+# cannot simply be refused: it *is* the site :func:`_emit_data_keys` resolves the binding for
+# (``recorder.emit("metrics.updated", turn_id=..., data=metrics_data)`` in ``_apump_turn``).
+# Refusing it would refuse the census's own read. Narrow on purpose — the method name AND the
+# keyword — so ``emit(data=x)`` stays readable while ``enrich(data=x)`` does not.
+_CENSUSED_EMIT_ARGUMENT = ("emit", "data")
+
 
 @functools.lru_cache(maxsize=None)
 def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
@@ -1221,6 +1280,21 @@ def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
     tracked name every later contribution is either folded in (constant keys) or refused; the
     one shape left to the caller is a computed subscript key, because only the caller knows
     whether the expression is a loop variable it can resolve.
+
+    Round 3 read "contribution" as *what is written through this name here*, and both ways a dict
+    leaves a name unwritten-through walked past it:
+
+    * **handed to a call.** ``result.mutate()`` was refused and ``mutate(result)`` was not, so
+      ``enrich(result)`` or ``_fold_sub_counts(metrics_data, ...)`` wrote keys through a callee
+      this census cannot see into while the name reported a clean key set. An argument position is
+      a refusal now unless the callee is a proven-read-only builtin (:data:`_DICT_READ_CALLS`) or
+      the emit whose binding the census is there to read (:data:`_CENSUSED_EMIT_ARGUMENT`). A
+      ``*name`` / ``**name`` splat is *not* refused: the callee receives a fresh tuple/mapping and
+      cannot write back through it, which is the same reason ``.items()`` is a read.
+    * **aliased.** ``alias = result`` gives the same object a second name, and ``alias["k"] = v``
+      then makes ``alias`` tracked in its own right — with its own entry, which the consumer
+      (asking about *one* name) never reads. Tracking the alias is therefore not enough without
+      the flow analysis to merge the two entries, so the *source* refuses.
     """
 
     tracked: set[str] = set()
@@ -1248,9 +1322,27 @@ def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
         refusals.setdefault(name, []).extend(f"{context} merges {item}" for item in merged)
         return keys
 
+    def _handed_to(argument: ast.Name, position: str, call: ast.Call) -> None:
+        """A tracked name in an argument position of ``call`` — read, or written through?"""
+
+        if argument.id not in tracked:
+            return
+        if isinstance(call.func, ast.Name) and call.func.id in _DICT_READ_CALLS:
+            return
+        refusals.setdefault(argument.id, []).append(
+            f"{argument.id} handed to {ast.unparse(call.func)}(...) as {position}"
+        )
+
     for node in ast.walk(scope):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             written = node.targets if isinstance(node, ast.Assign) else [node.target]
+            # ``alias = tracked`` (or ``self.x = tracked``, or ``payload["k"] = tracked``): the
+            # object escapes this name, and a write through the second handle is a write into
+            # this dict that this name's own census never sees.
+            if isinstance(node.value, ast.Name) and node.value.id in tracked:
+                refusals.setdefault(node.value.id, []).extend(
+                    f"{node.value.id} aliased to {ast.unparse(assigned)}" for assigned in written
+                )
             for assigned in written:
                 if isinstance(assigned, ast.Name) and assigned.id in tracked:
                     if isinstance(node.value, ast.Dict):
@@ -1297,13 +1389,26 @@ def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
                     f"{ast.unparse(mutated)} {type(node.op).__name__}= ..."
                 )
             continue
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in tracked
-        ):
+        if not isinstance(node, ast.Call):
+            continue
+        # (1) the name is what the call was HANDED.
+        for position, argument in enumerate(node.args):
+            if isinstance(argument, ast.Name):
+                _handed_to(argument, f"positional {position}", node)
+        for keyword in node.keywords:
+            if keyword.arg is None or not isinstance(keyword.value, ast.Name):
+                continue  # ``f(**name)``: the callee gets a fresh mapping, so it is a read
+            if (
+                isinstance(node.func, ast.Attribute)
+                and (node.func.attr, keyword.arg) == _CENSUSED_EMIT_ARGUMENT
+            ):
+                continue  # the emit site whose binding _emit_data_keys resolves
+            _handed_to(keyword.value, f"{keyword.arg}=", node)
+        # (2) the name is what the call was made ON.
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             name, attribute = node.func.value.id, node.func.attr
+            if name not in tracked:
+                continue
             if (
                 attribute == "update"
                 and len(node.args) == 1
@@ -1404,7 +1509,11 @@ def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
 
 
 def _literal_dict_keys_where(relative_path: str, key: str, value: str) -> list[frozenset[str]]:
-    """Key sets of every dict literal in a module whose ``key`` is the constant ``value``."""
+    """Key sets of every dict literal in a module whose ``key`` is the constant ``value``.
+
+    Resolved through :func:`_pinned_dict_keys`, so a ``**`` splat or a computed key in one of the
+    matched literals is a failure here rather than a key set silently narrower than the record.
+    """
 
     matches: list[frozenset[str]] = []
     for node in ast.walk(_module_tree(relative_path)):
@@ -1414,12 +1523,18 @@ def _literal_dict_keys_where(relative_path: str, key: str, value: str) -> list[f
             if not (isinstance(dict_key, ast.Constant) and dict_key.value == key):
                 continue
             if isinstance(dict_value, ast.Constant) and dict_value.value == value:
-                matches.append(_dict_keys(node))
+                matches.append(
+                    _pinned_dict_keys(node, f"{relative_path}: {{{key!r}: {value!r}, ...}}")
+                )
     return matches
 
 
 def _call_dict_arg_keys(relative_path: str, method: str) -> list[frozenset[str]]:
-    """Key sets of the single dict literal passed positionally to ``obj.<method>({...})``."""
+    """Key sets of the single dict literal passed positionally to ``obj.<method>({...})``.
+
+    Strict like :func:`_literal_dict_keys_where` above, and for the same reason: the callers pin
+    the result as the whole artifact, so a merge into the literal must fail rather than vanish.
+    """
 
     matches: list[frozenset[str]] = []
     for node in ast.walk(_module_tree(relative_path)):
@@ -1428,7 +1543,9 @@ def _call_dict_arg_keys(relative_path: str, method: str) -> list[frozenset[str]]
         if node.func.attr != method or not node.args:
             continue
         if isinstance(node.args[0], ast.Dict):
-            matches.append(_dict_keys(node.args[0]))
+            matches.append(
+                _pinned_dict_keys(node.args[0], f"{relative_path}: .{method}({{...}})")
+            )
     return matches
 
 
@@ -1824,6 +1941,35 @@ _UNREADABLE_RESULT_SOURCES: dict[str, str] = {
                 return {**result, "tool_tokens": value}
             return result
     """,
+    # Round 4. Every entry above is a *write through the name*; the two shapes below are the two
+    # ways the dict leaves the name, and round 3 refused neither. The first is the realistic one —
+    # the censused package folds one mapping into another exactly this way
+    # (``_accumulate_usage_mapping(state.total_usage, billed)``), so the drift needs no new idiom.
+    "the result handed to a call that can mutate it": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            enrich(result, payload)
+            return result
+    """,
+    "the result aliased to a second name written through": """
+        def build(value):
+            result = {"input_tokens": 1}
+            alias = result
+            alias["tool_tokens"] = value
+            return result
+    """,
+    # ...and the twin of the first, on the other name this census answers for: refusing the
+    # argument position only where the *returned* dict is handed over would reproduce the
+    # one-of-two-halves shape the round-3 repair was built to end.
+    "the copy loop's source handed to a call": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            enrich(details, payload)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
 }
 
 
@@ -1868,6 +2014,19 @@ _READABLE_RESULT_SOURCES: dict[str, tuple[str, frozenset[str]]] = {
         """,
         frozenset({"input_tokens", "tool_tokens"}),
     ),
+    # The read-only half of round 4's call-argument rule: a builtin that cannot reach a mapping's
+    # mutators is a read, so refusing it would make the census answer "unreadable" about code that
+    # is perfectly readable — a refusal and a subset are both failures of the same census.
+    "the result handed to read-only builtins": (
+        """
+        def build():
+            result = {"input_tokens": 1}
+            if len(result) and sorted(result) and dict(result):
+                result["tool_tokens"] = 2
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
 }
 
 
@@ -1891,6 +2050,11 @@ _UNREADABLE_BINDING_SOURCES: dict[str, str] = {
     "a splat inside the literal": 'data = {"error": 1, **extra}\n',
     "a mutator this census does not model": 'data = {"error": 1}\ndata.setdefault("k", 2)\n',
     "a rebinding to something unreadable": 'data = {"error": 1}\ndata = enrich(data)\n',
+    # Round 4, and the pair the round-3 rebinding entry above just misses: ``data = enrich(data)``
+    # refused because the NAME was rebound, while the same call one character shorter left the
+    # name bound to a dict this census had stopped being able to read.
+    "a call that can mutate what it was handed": 'data = {"error": 1}\nenrich(data)\n',
+    "an alias written through": 'data = {"error": 1}\nalias = data\nalias["attempt"] = 2\n',
 }
 
 
@@ -1905,6 +2069,41 @@ def test_the_emit_binding_resolver_refuses_and_folds_like_the_result_census() ->
         }
     folded = _dict_writes(ast.parse('data = {"error": 1}\ndata.update({"attempt": 2})\n'))["data"]
     assert folded.unreadable == () and folded.keys == {"error", "attempt"}
+    # The two argument positions the call rule must *not* refuse, or it refuses the census's own
+    # read: the emit site whose binding ``_emit_data_keys`` resolves, and a read-only builtin.
+    emitted = _dict_writes(
+        ast.parse('data = {"error": 1}\nrecorder.emit("run.failed", data=data)\nlen(data)\n')
+    )["data"]
+    assert emitted.unreadable == () and emitted.keys == {"error"}, {
+        "resolved_to": sorted(emitted.keys),
+        "refused": sorted(emitted.unreadable),
+        "hint": "refusing the emit binding would make every data=<name> site unresolvable",
+    }
+
+
+# The fourth resolution path onto the same rule, and the last one still reading the weak half of
+# it: the extractors that pull a literal out of an *argument* (the transcript records matched by
+# ``kind="model_turn"``, the ``write_failure`` bundle, the manifest's ``limits=``). Each hands its
+# answer to an equality pin, so a splat added to one of those literals used to widen the artifact
+# while the pin stayed green.
+_UNPINNABLE_LITERALS: dict[str, str] = {
+    "a splat merging a mapping of unknown width": '{"kind": "model_turn", **_error_fields(exc)}',
+    "a computed key": '{"kind": "model_turn", name: value}',
+}
+
+
+def _parsed_literal(source: str) -> ast.Dict:
+    expression = ast.parse(source).body[0]
+    assert isinstance(expression, ast.Expr) and isinstance(expression.value, ast.Dict)
+    return expression.value
+
+
+def test_the_pinned_literal_extractor_refuses_what_it_cannot_read_in_full() -> None:
+    for shape, source in sorted(_UNPINNABLE_LITERALS.items()):
+        with pytest.raises(AssertionError):
+            _pinned_dict_keys(_parsed_literal(source), shape)
+    readable = _parsed_literal('{"kind": "model_turn", "step": step}')
+    assert _pinned_dict_keys(readable, "readable") == {"kind", "step"}
 
 
 # --------------------------------------------------------------------------------------
@@ -4851,7 +5050,10 @@ def test_future_family_run_limits_carries_four_of_fifteen() -> None:
     }
     builder = _function_node("core/manifest.py", "build_run_manifest")
     carried = [
-        _dict_keys(keyword.value)
+        # Strict, like the two literal-argument extractors above: this list is diffed for
+        # equality against MANIFEST_LIMIT_KEYS, so a ``**`` merge into the literal must fail
+        # rather than leave the pin green while the manifest carries more than four limits.
+        _pinned_dict_keys(keyword.value, "core/manifest.py: limits={...}")
         for node in ast.walk(builder)
         if isinstance(node, ast.Call)
         for keyword in node.keywords

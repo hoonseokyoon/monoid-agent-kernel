@@ -95,6 +95,17 @@ out in commit messages and here.
   route writes that dict wholesale. A registry entry's "eleven web counters" is eight. Seven new
   tests drive synthetic sources through the refusal and folding rules themselves, because
   today's readable code returns the same key set whether those rules exist or not.
+- **Round-4 hardening: the write census refused what is written *through* a name and missed both
+  ways the dict leaves it** (suite: 120 → 124). `result.mutate()` was refused and `mutate(result)`
+  was not, so a tracked dict handed to a plain call — `_fold_web_counters(metrics_data, ctx)`, the
+  idiom the censused package itself uses in `_accumulate_usage_mapping(state.total_usage, billed)`
+  — was mutated invisibly, and `alias = result; alias["k"] = v` wrote through a second handle the
+  consumer never asks about; an argument position outside a whitelist of provably read-only
+  builtins (plus the emit binding the census exists to read) and an alias are refusals now. The
+  three literal-*argument* extractors — the `kind="model_turn"` transcript records, the
+  `write_failure` bundle, the manifest's `limits=` — were the fourth resolution path onto that
+  rule and still read the weak half of it, dropping a `**` splat silently while their equality
+  pins stayed green; all three resolve through the strict extractor, and the weak one is gone.
 - **Every registry entry now has an assertion behind it.** Five round-1 entries were prose: the
   driver and the call receipt that were designed for `config_recoverable` and never name it, the
   closed `stream_closed` schema, the `turn.failed` event that no status projection consumes, and
