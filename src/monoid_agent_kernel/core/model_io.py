@@ -644,7 +644,7 @@ class ModelCallReceipt:
         for key, value in self.usage.items():
             # ``type(value) is not int`` rather than ``isinstance``: the same "what is a
             # countable int" its four sibling readers spell (``provider_usage_of``,
-            # ``_reported_error_usage``, ``with_error``, ``_recordable_usage``). ``isinstance``
+            # ``usage_reported_by``, ``with_error``, ``_recordable_usage``). ``isinstance``
             # here accepted every ``int`` subclass -- an ``IntEnum`` a provider SDK hands back
             # as a token count is the real shape -- so this constructor admitted a count that
             # every reader of the stamp had just refused. Excluding ``bool`` is now implied.

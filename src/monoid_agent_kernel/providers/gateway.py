@@ -30,6 +30,11 @@ from monoid_agent_kernel.providers._common import (
     build_reasoning_payload,
     normalize_usage,
     project_message_to_text,
+    # The lenient refusal-usage reader every stamp on this wire is fed from. It began as this
+    # module's ``_reported_error_usage``; the OpenAI adapter -- the SOURCE reader, the one that
+    # sees the provider's own billed body first -- had no equivalent at all, which is how a
+    # refusal there reached this hop already reporting zero. One function, both adapters.
+    usage_reported_by,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -1066,7 +1071,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=status_hint,
         )
     except ModelAdapterError as malformed:
-        mark_provider_usage(malformed, _reported_error_usage(data))
+        mark_provider_usage(malformed, usage_reported_by(data))
         raise
     if "error" in data:
         # The whole construction is inside the guard, not just the stamp that ends it: an
@@ -1133,11 +1138,11 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
                 provider_retried=provider_retried,
             )
         except ModelAdapterError as malformed:
-            mark_provider_usage(malformed, _reported_error_usage(data))
+            mark_provider_usage(malformed, usage_reported_by(data))
             raise
         # Third error reader on this wire, and the rule is the same on all three: a failure
         # that reports what it cost is recorded as having cost it.
-        mark_provider_usage(envelope_error, _reported_error_usage(data))
+        mark_provider_usage(envelope_error, usage_reported_by(data))
         raise envelope_error
     try:
         _exact_gateway_bool(
@@ -1266,7 +1271,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             provider_retried=provider_retried,
         )
     except ModelAdapterError as malformed:
-        mark_provider_usage(malformed, _reported_error_usage(data))
+        mark_provider_usage(malformed, usage_reported_by(data))
         raise
 
 
@@ -1347,7 +1352,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             known_provider_retried=retried,
         )
     except ModelAdapterError as malformed:
-        mark_provider_usage(malformed, _reported_error_usage(event))
+        mark_provider_usage(malformed, usage_reported_by(event))
         raise
     if event_type == "text_delta":
         return TextDelta(
@@ -1462,7 +1467,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             # time, before any stamp, lost the same money on one of two transports. Read
             # leniently -- a second malformation in ``usage`` must not replace the failure
             # being reported.
-            mark_provider_usage(malformed, _reported_error_usage(event))
+            mark_provider_usage(malformed, usage_reported_by(event))
             raise
     if event_type == "error":
         # Guarded like the terminal frame above and like the body reader's error branch: these
@@ -1522,9 +1527,9 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 provider_retried=retried,
             )
         except ModelAdapterError as malformed:
-            mark_provider_usage(malformed, _reported_error_usage(event))
+            mark_provider_usage(malformed, usage_reported_by(event))
             raise
-        mark_provider_usage(stream_error, _reported_error_usage(event))
+        mark_provider_usage(stream_error, usage_reported_by(event))
         raise stream_error
     # The ``*_delta`` branches above are deliberately unguarded, and that is a registered
     # exclusion rather than an omission: a delta is the content channel and the shipped server
@@ -1534,32 +1539,6 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
     # tests/test_carriage_conformance.py registers the excluded reads and asserts the wire fact
     # they rest on, so a server that started billing on a delta fails there.
     return None  # unknown frame type: forward-compatible, ignore
-
-
-def _reported_error_usage(payload: dict[str, Any]) -> dict[str, int]:
-    """Tokens a gateway call that ends in a refusal reported spending, read leniently.
-
-    The twin of the client-side stamp, for the hop: a gateway whose own upstream refused a
-    billed turn carries the cost in its error envelope, and without reading it back the outer
-    client reports zero for a call the provider charged for. Lenient on purpose -- a malformed
-    ``usage`` on an error path must not replace the failure being reported with a different
-    one, so anything unreadable simply reads as "not reported".
-
-    Named for the error envelope it was written for, and it serves the refused *success*
-    payloads too: a 200 body or a terminal frame the reader rejects for a malformed key was
-    generated and billed exactly like the error envelope's turn, and the same leniency is what
-    lets a body whose ``usage`` is itself the malformed key stamp nothing rather than raise a
-    second failure over the first.
-    """
-
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return {}
-    return {
-        str(key): value
-        for key, value in usage.items()
-        if type(value) is int and value >= 0
-    }
 
 
 def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
@@ -1649,7 +1628,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
             or f"HTTP {status}"
         )
     except ModelAdapterError as malformed:
-        mark_provider_usage(malformed, _reported_error_usage(error_payload))
+        mark_provider_usage(malformed, usage_reported_by(error_payload))
         raise
     error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
@@ -1662,7 +1641,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
         provider_retried=provider_retried,
     )
-    mark_provider_usage(error, _reported_error_usage(error_payload))
+    mark_provider_usage(error, usage_reported_by(error_payload))
     return error
 
 

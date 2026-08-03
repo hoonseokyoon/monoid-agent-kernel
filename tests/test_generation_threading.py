@@ -1445,3 +1445,58 @@ def test_a_malformed_error_envelope_from_an_inner_hop_reaches_the_tenant_meter(
     assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
     assert provider_usage_of(refused.value) == _BILLED
     assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_meter() -> None:
+    """The SOURCE reader's end of the same chain, driven through the shipped gateway.
+
+    An upstream that hands its provider's billed body to the OpenAI reader and has it refused --
+    a model emitting non-JSON function-call arguments, which is ordinary. Every carrier behind
+    that refusal reads the same stamp: ``_error_body`` writes ``usage=provider_usage_of(exc)``
+    and the gateway's failure meter charges the tenant off it, so an unstamped refusal made a
+    paid turn free on both at once.
+    """
+
+    from monoid_agent_kernel.providers.openai import _parse_response
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body, _model_error_status
+
+    billed_body = {
+        "id": "resp_1",
+        "status": "completed",
+        "usage": dict(_BILLED),
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "fs_read",
+                "arguments": "{not json",
+            }
+        ],
+    }
+
+    class _RefusingUpstream:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return _parse_response(dict(billed_body))
+
+    manager = _token_manager()
+    backend = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: _RefusingUpstream(),
+    )
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+    assert provider_usage_of(refused.value) == _BILLED
+
+    envelope = _error_body(
+        _model_error_status(refused.value),
+        str(refused.value),
+        error_code=refused.value.provider_error_code,
+        retryable=refused.value.retryable,
+        config_recoverable=refused.value.config_recoverable,
+        provider_retried=refused.value.provider_retried,
+        usage=provider_usage_of(refused.value),
+    )
+    assert envelope["usage"] == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460

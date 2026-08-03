@@ -136,6 +136,44 @@ NORMALIZED_USAGE_KEYS: frozenset[str] = frozenset(
 )
 
 
+def usage_reported_by(payload: Any) -> dict[str, int]:
+    """Tokens a call that ends in a REFUSAL reported spending, read leniently.
+
+    The stamp's source on every refusal path an adapter has. A payload the reader rejects for a
+    malformed key was generated and BILLED before the reader ever looked at it, so the refusal is
+    the only carrier left for its cost -- and without this the receipt, the run's token budget
+    and (across a hop) the tenant ledger all record zero for a turn the provider charged for.
+
+    Lenient on purpose, and that is the whole reason it is not :func:`normalize_usage`. This runs
+    on a failure path, so a second malformation must not replace the failure being reported with
+    a different one: anything unreadable simply reads as "not reported", including a ``usage``
+    that is itself the malformed key. Values are judged, names are not -- an unknown counter a
+    newer gateway reports rides through rather than being silently dropped.
+
+    One function for both adapters. It began as the gateway client's ``_reported_error_usage``
+    and the OpenAI adapter had no equivalent at all, which is exactly how the *source* reader --
+    the one that sees the provider's own billed body first -- came to refuse it for free. Two
+    copies of "what counts as a reported cost" is two copies that can disagree, and the census
+    holds this one to the same verdict as the four other readers of the same stamp.
+    """
+
+    # The outer guard is the one the shared version needed: the gateway client only ever handed
+    # this a decoded JSON object, while the OpenAI adapter hands it whatever the SDK returned, and
+    # an ``AttributeError`` raised *inside* an except-handler would replace the failure being
+    # reported -- the exact thing this function exists to avoid. The ``usage`` test stays ``dict``,
+    # byte-identical to the verdict the gateway wire has always given.
+    if not isinstance(payload, Mapping):
+        return {}
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
+
+
 def _usage_object(value: Any, field_name: str) -> dict[str, Any]:
     if value is None:
         return {}

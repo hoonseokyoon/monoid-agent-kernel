@@ -19,6 +19,7 @@ from monoid_agent_kernel.providers._common import (
     build_reasoning_payload,
     normalize_usage,
     reasoning_replay_window_start,
+    usage_reported_by,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -30,6 +31,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_usage,
 )
 
 
@@ -525,18 +527,10 @@ class OpenAIModelAdapter:
         # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
         # needs nothing from the client, and a consumer that stops at it holds a suspended
         # generator -- ``break`` does not close one -- which would pin the pool open for as long as
-        # it keeps the reference.
-        output_items = final_data.get("output") or []
-        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
-        yield TurnComplete(
-            response_id=final_data.get("id"),
-            usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
-            # encrypted_content lives only on the final response object, so reasoning items
-            # are captured here (from response.completed) rather than the per-token deltas.
-            reasoning=_capture_reasoning_items(output_items),
-            stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
-            provider_retried=provider_retried,
-        )
+        # it keeps the reference. The build is a named seam so its refusals carry their cost the
+        # way the one-shot reader's do; the ``yield`` stays out of it, so a consumer throwing into
+        # this generator is not mistaken for the payload being refused.
+        yield _terminal_chunk(final_data, provider_retried=provider_retried)
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
         """Build the request body **and prove it serializes**, naming a failure what it is.
@@ -1043,12 +1037,39 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
 
 
 def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
-    """Map one Responses-API body to a :class:`ModelTurn`.
+    """Map one Responses-API body to a :class:`ModelTurn`, stamping what a refusal cost.
 
     ``provider_retried`` is the caller's evidence about the HTTP exchange that produced ``data``
     -- the body itself carries no such fact -- and defaults to False, which is exactly true of
     every caller with no exchange to report on (the tests that parse a bare dict).
+
+    This is the SOURCE reader: every carrier downstream of it -- the receipt, the run's token
+    budget, the gateway's error envelope and the tenant ledger a hop away -- can only report a
+    cost this function recorded. It recorded none. A dozen malformed shapes are refused here on
+    bodies that carry a valid ``usage`` (a model emitting non-JSON function-call arguments is
+    ordinary), and every one of those refusals escaped empty, so a turn OpenAI generated and
+    billed was metered at zero everywhere behind it.
+
+    One seam around the whole mapping rather than a stamp per raise site: the rule is about the
+    payload, not about which key of it turned out to be malformed, and twelve stamps is twelve
+    chances to miss the thirteenth. ``Exception`` rather than ``ModelAdapterError`` because the
+    mapping refuses in more than one type -- ``normalize_usage`` says "malformed usage" with a
+    ``ValueError`` -- and a rule bound to one of two ways the same act is spelled is the shape
+    this codebase keeps re-earning. The stamp reads leniently (:func:`usage_reported_by`), so a
+    body whose ``usage`` is *itself* the malformed key records nothing rather than raising a
+    second failure over the first; well-formed bodies still normalize through the adapter's own
+    parser below and are untouched by this.
     """
+
+    try:
+        return _response_to_turn(data, provider_retried=provider_retried)
+    except Exception as refused:
+        mark_provider_usage(refused, usage_reported_by(data))
+        raise
+
+
+def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelTurn:
+    """The mapping itself. Called only through :func:`_parse_response`, which owns the stamp."""
 
     output = data.get("output", [])
     if output is None:
@@ -1123,6 +1144,42 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
         stop_reason=_stop_reason_from_response(data, tool_calls_present=bool(tool_calls)),
         provider_retried=provider_retried,
     )
+
+
+def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> TurnComplete:
+    """The streamed twin of :func:`_parse_response`: end-of-turn metadata, and its cost.
+
+    The stream never runs the one-shot mapping -- it folds deltas as they arrive and reads the
+    turn's metadata off ``response.completed``/``response.incomplete`` here -- so the rule the
+    body reader states had to be bound to this construction separately or it held on one of two
+    transports. Enumerated rather than assumed: ``normalize_usage`` refuses a malformed
+    ``usage``, and ``_stop_reason_from_response`` walks ``incomplete_details``, ``output`` and
+    each message's ``content``, so a final payload malformed in any of those is refused here on
+    a turn the provider already billed.
+
+    The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
+    ``ModelAdapterError``, which is why the guard catches ``Exception``. That is a narrower
+    carry than the body reader's: the receipt and the run budget read the stamp off any
+    exception, while the reference gateway's failure meter and error envelope only inspect a
+    ``ModelAdapterError``. Stamping is still the whole of the fix here -- classifying these
+    would change how the loop treats them, which is a separate decision.
+    """
+
+    try:
+        output_items = final_data.get("output") or []
+        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
+        return TurnComplete(
+            response_id=final_data.get("id"),
+            usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+            # encrypted_content lives only on the final response object, so reasoning items
+            # are captured here (from response.completed) rather than the per-token deltas.
+            reasoning=_capture_reasoning_items(output_items),
+            stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
+            provider_retried=provider_retried,
+        )
+    except Exception as refused:
+        mark_provider_usage(refused, usage_reported_by(final_data))
+        raise
 
 
 def _coerce_response(response: object) -> dict[str, Any]:

@@ -142,7 +142,7 @@ from monoid_agent_kernel.errors import ModelAdapterError, TurnNotSettled
 from monoid_agent_kernel.model_call import _recordable_usage
 from monoid_agent_kernel.observability.otel import _chat_finish_attrs, _subagent_finish_attrs
 from monoid_agent_kernel.providers import gateway as gateway_client
-from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ToolCall,
@@ -344,7 +344,7 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     CarriageGap(
         "usage",
         "provider_usage",
-        "providers/gateway.py:_reported_error_usage",
+        "providers/_common.py:usage_reported_by",
         "lenient by design: arbitrary keys pass, because a malformed usage on an error path "
         "must not replace the failure being reported with a validation error",
         "by-design",
@@ -1421,11 +1421,25 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_exact_gateway_int",
         "_gateway_usage",
         "_gateway_http_status_hint",
-        "_reported_error_usage",
+        "usage_reported_by",
         "_portable_gateway_payload",
         "_gateway_reasoning_items",
     }
 )
+
+# Where each registered helper is DEFINED. Everything the gateway client wrote for itself lives
+# in its own module; ``usage_reported_by`` is the lenient refusal-usage reader now SHARED with
+# the OpenAI adapter (it began here as ``_reported_error_usage``, and the source reader having
+# no equivalent is how a refusal reached this hop already reporting zero), so it lives in
+# ``providers/_common.py``. The census follows it across that boundary rather than losing the
+# key it carries: a helper this map cannot place resolves nowhere, and every read-key census
+# below would silently stop counting ``usage``.
+GATEWAY_WIRE_READ_HELPER_HOMES: dict[str, str] = {"usage_reported_by": "providers/_common.py"}
+
+
+def _helper_home(name: str) -> str:
+    return GATEWAY_WIRE_READ_HELPER_HOMES.get(name, "providers/gateway.py")
+
 
 # The helpers a derived scan can find: they take the wire mapping itself and read a key off it
 # (a literal one, or the ``key`` parameter their callers pass). Pinned in full, so a new
@@ -1437,7 +1451,7 @@ GATEWAY_MAPPING_READ_HELPERS = frozenset(
         "_gateway_fragment_string",
         "_gateway_http_status_hint",
         "_gateway_string",
-        "_reported_error_usage",
+        "usage_reported_by",
     }
 )
 # The registered helpers no mapping scan can reach: they validate an already-extracted
@@ -1490,10 +1504,11 @@ _HELPER_INTERNAL_READS: dict[str, frozenset[str]] = {}
 def _wire_keys_read_in(function: _FunctionNode) -> frozenset[str]:
     """Every wire key ``function`` reads, including the ones a helper reads on its behalf.
 
-    ``_reported_error_usage(payload)`` names no key at the call site -- the ``"usage"`` literal
+    ``usage_reported_by(payload)`` names no key at the call site -- the ``"usage"`` literal
     lives inside the helper -- so a purely local scan reported the caller as never reading a key
     it does read. One level of delegation is resolved, which is exactly as far as this module
-    delegates.
+    delegates, and the helper is looked up through :func:`_helper_home` so a shared one living
+    outside the gateway module is still followed.
     """
 
     keys = set(_literal_wire_keys(function))
@@ -1506,7 +1521,7 @@ def _wire_keys_read_in(function: _FunctionNode) -> frozenset[str]:
             helper = node.func.id
             if helper not in _HELPER_INTERNAL_READS:
                 _HELPER_INTERNAL_READS[helper] = _literal_wire_keys(
-                    _function_node("providers/gateway.py", helper)
+                    _function_node(_helper_home(helper), helper)
                 )
             keys |= _HELPER_INTERNAL_READS[helper]
     return frozenset(keys)
@@ -2776,7 +2791,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
         }
     ),
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
-    # ``usage`` is read for it by ``_reported_error_usage``, not named at the call site.
+    # ``usage`` is read for it by ``usage_reported_by``, not named at the call site.
     "providers/gateway.py:_error_from_status_body": frozenset(
         {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
     ),
@@ -2857,11 +2872,19 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
     for reader in GATEWAY_ERROR_READERS:
         for node in functions[reader.split(":", 1)[1]]:
             called_by_readers |= _called_local_names(node)
+    # A helper the readers call is a wire reader wherever it is defined. ``usage_reported_by``
+    # is shared with the OpenAI adapter and lives in ``providers/_common.py``, so a scan of this
+    # module alone stopped discovering it -- and a helper that is not discovered is one whose
+    # keys every census below quietly stops counting. Only the registered homes are merged in,
+    # so this does not drag the whole shared module into the gateway's reader census.
+    reachable = dict(functions)
+    for helper, home in GATEWAY_WIRE_READ_HELPER_HOMES.items():
+        reachable.setdefault(helper, _all_functions(home)[helper])
     discovered = {
         name
         for name in called_by_readers
-        if name in functions
-        and any(_reads_a_mapping_parameter(node) for node in functions[name])
+        if name in reachable
+        and any(_reads_a_mapping_parameter(node) for node in reachable[name])
     }
     assert discovered == GATEWAY_MAPPING_READ_HELPERS, {
         "newly_reading_the_wire_mapping": sorted(discovered - GATEWAY_MAPPING_READ_HELPERS),
@@ -3219,11 +3242,11 @@ def test_3e_the_lenient_error_usage_reader_passes_a_key_no_normalizer_emits() ->
     gateway already reports), so it fails here first.
     """
 
-    passed = gateway_client._reported_error_usage({"usage": {"foo_tokens": 5, **_MAXIMAL_USAGE}})
+    passed = usage_reported_by({"usage": {"foo_tokens": 5, **_MAXIMAL_USAGE}})
     assert passed == {"foo_tokens": 5, **_MAXIMAL_USAGE}
     assert set(passed) - NORMALIZED_USAGE_KEYS == {"foo_tokens"}
     # Values are still judged: a bool is not a count, on this reader like on the other three.
-    assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
+    assert usage_reported_by({"usage": {"input_tokens": True}}) == {}
 
 
 def test_3c_the_subagent_rollup_filters_through_the_usage_authority() -> None:
@@ -3307,8 +3330,8 @@ def test_3d_the_five_siblings_of_one_stamp_agree_about_what_a_count_is() -> None
 
     verdicts = {
         "providers/base.py:provider_usage_of": bool(provider_usage_of(stamped)),
-        "providers/gateway.py:_reported_error_usage": bool(
-            gateway_client._reported_error_usage({"usage": dict(subclassed)})
+        "providers/_common.py:usage_reported_by": bool(
+            usage_reported_by({"usage": dict(subclassed)})
         ),
         "core/model_io.py:ModelCallReceipt.with_error": bool(
             dict(ModelCallReceipt().with_error(stamped).usage)
@@ -3320,7 +3343,7 @@ def test_3d_the_five_siblings_of_one_stamp_agree_about_what_a_count_is() -> None
     }
     assert verdicts == {
         "providers/base.py:provider_usage_of": False,
-        "providers/gateway.py:_reported_error_usage": False,
+        "providers/_common.py:usage_reported_by": False,
         "core/model_io.py:ModelCallReceipt.with_error": False,
         "model_call.py:_recordable_usage": False,
         "core/model_io.py:ModelCallReceipt.__post_init__": False,
@@ -3339,7 +3362,7 @@ def test_3d_a_bool_is_not_a_count_on_any_sibling() -> None:
     stamped = ModelAdapterError("boolean count")
     mark_provider_usage(stamped, {"input_tokens": True})
     assert provider_usage_of(stamped) == {}
-    assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
+    assert usage_reported_by({"usage": {"input_tokens": True}}) == {}
     assert dict(ModelCallReceipt().with_error(stamped).usage) == {}
     assert _recordable_usage({"input_tokens": True}) == {}
     with pytest.raises(WireValidationError, match="mapping of str to int"):
@@ -4870,7 +4893,7 @@ UNPROBED_ERROR_ENVELOPE_READS: dict[str, dict[str, str]] = {
     },
     "providers/gateway.py:_error_from_status_body": {
         "usage": "same as the body reader's; this reader names the key only through "
-        "``_reported_error_usage``, which is the stamp itself",
+        "``usage_reported_by``, which is the stamp itself",
     },
 }
 
@@ -6223,6 +6246,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "loop.py",
             "providers/base.py",
             "providers/gateway.py",
+            # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in
+            # this set could only report a cost the adapter that first saw the provider's
+            # billed body had recorded, and this one recorded none -- a refusal off a billed
+            # Responses body escaped unstamped, so the whole chain metered zero.
+            "providers/openai.py",
             "reference/llm_gateway/http.py",
             "reference/llm_gateway/service.py",
         }
