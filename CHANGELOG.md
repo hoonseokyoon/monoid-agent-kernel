@@ -7,6 +7,36 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the facade answers for the loop it wraps
+
+- **The blocking settle twin shares the pump's terminal precedence.** A `LoopSession.submit()`
+  that spends the session tool-call budget hands back `status="limited"` with the session
+  terminal, and `_derive_after_settle` read only the terminal flag: FAILED, where
+  `run_until_suspended` answered LIMITED for the identical run — and a cancelled submit
+  answered FAILED where the pump said CANCELLED. The divergence then escalated: `close()`
+  computed LIMITED (or CANCELLED) through the shared mapper and crashed the FSM
+  (`illegal_session_transition 'failed' -> 'limited'`) *after* the loop had already finalized,
+  so the embedder lost the `AgentRunResult` it was owed. The precedence — cancelled first,
+  then a terminal `status="limited"` to LIMITED, else FAILED — now lives in one
+  `_terminal_outcome_state` that `state_from_suspension` and `_derive_after_settle` both call,
+  and the census pin that proved three mappers agree seats the fourth mapper it had missed.
+- **`health()` and `inspect()` bind to actual loop liveness.** A closed limited run — facade
+  in LIMITED (a park state), `loop._session` gone — reported `alive=True,
+  can_accept_input=True`, while a live-but-terminal session reported the self-contradictory
+  `alive=False, can_accept_input=True`. One predicate (session terminal, or activation torn
+  down after leaving CREATED) now answers for `alive`, for `can_accept_input`, and for the
+  no-session `inspect().terminal` that hardcoded `False` — so a closed run no longer reads
+  as live. Pre-open (CREATED, no session yet) still reads as alive-but-not-accepting.
+- **A refused pump never moves the facade.** `submit()` / `resume()` /
+  `run_until_suspended()` wrote RUNNING *before* asking the loop, so the loop's `run_not_open`
+  / `run_terminal` refusal left the facade wedged in RUNNING — permanently, post-close, since
+  RUNNING accepts no input and a dead loop can never settle it back out. The pumps check loop
+  openness and terminality first and refuse with the loop's own typed error codes from the
+  truthful state (a never-opened facade now refuses `run_not_open` instead of
+  `illegal_session_transition`). And a `close()` that raises lands the facade on FAILED when
+  the loop is dead — `AgentLoop.close` discards the activation before re-raising — rather
+  than leaving an input-accepting park state over it.
+
 ### Added — a field-carriage conformance suite (repo-internal drift tooling)
 
 - **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier

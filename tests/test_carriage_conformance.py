@@ -5153,14 +5153,18 @@ def test_both_terminal_paths_meter_the_run_through_one_seam() -> None:
         }
 
 
-def test_three_mappers_answer_a_terminal_limited_run_one_way() -> None:
-    """Was registered (round 2): one run, three surfaces, three states.
+def test_the_settle_mappers_answer_a_terminal_limited_run_one_way() -> None:
+    """Was registered (round 2): one run, three surfaces, three states — then a fourth.
 
     ``state_from_suspension`` said FAILED, ``session_state_from_run_status("limited")`` said
     LIMITED, and ``LoopSession.close`` said COMPLETED — for one budget- or validator-limited run.
-    LIMITED is canonical. Still pinned value-level on all three, because a *divergence* is what
-    this census exists to catch and the three are independent functions; and the cancel case is
-    pinned beside it, because the harmonization runs through the same branch cancel does.
+    LIMITED is canonical. The v0.21 burn-down then found the mapper this census had NOT seated at
+    the table diverging the same way: ``LoopSession._derive_after_settle`` (the blocking
+    ``submit()`` twin of the pump) read only the terminal flag and said FAILED where
+    ``run_until_suspended`` said LIMITED — and ``close()`` then crashed the FSM on the
+    ``'failed' -> 'limited'`` edge. All four are pinned value-level, because a *divergence* is
+    what this census exists to catch; the cancel case is pinned beside each, because the
+    harmonization runs through the same branch cancel does.
     """
 
     from monoid_agent_kernel.core.lifecycle import (
@@ -5189,18 +5193,33 @@ def test_three_mappers_answer_a_terminal_limited_run_one_way() -> None:
         session.close()
         return session.state
 
+    class _TerminalSettledLoop:
+        # The shape _derive_after_settle reads: a live session object whose terminal flag the
+        # loop raised at the settle boundary (max_tool_calls, cancel, a non-recoverable error).
+        class _Session:
+            terminal = True
+
+        _session = _Session()
+
+    def _derived(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_TerminalSettledLoop())  # type: ignore[arg-type]
+        return session._derive_after_settle(
+            dataclasses.replace(_maximal_turn(), status=status, error_code=error_code)
+        )
+
     verdicts = {
         "core/lifecycle.py:state_from_suspension": state_from_suspension(parked),
         "core/lifecycle.py:session_state_from_run_status": session_state_from_run_status(
             "limited", terminal=True
         ),
         "core/lifecycle.py:LoopSession.close": _closed("limited"),
+        "core/lifecycle.py:LoopSession._derive_after_settle": _derived("limited"),
     }
     assert set(verdicts.values()) == {SessionState.LIMITED}, {
         "verdicts": {name: value.value for name, value in verdicts.items()},
-        "hint": "three mappers over one run must not answer three ways again",
+        "hint": "the settle mappers over one run must not answer two ways again",
     }
-    # Cancel still escapes to its own terminal state on all three, and a real failure to FAILED.
+    # Cancel still escapes to its own terminal state on all four, and a real failure to FAILED.
     cancelled = Suspension(reason="terminal", status="limited", error_code="cancelled")
     assert state_from_suspension(cancelled) is SessionState.CANCELLED
     assert (
@@ -5208,15 +5227,22 @@ def test_three_mappers_answer_a_terminal_limited_run_one_way() -> None:
         is SessionState.CANCELLED
     )
     assert _closed("limited", "cancelled") is SessionState.CANCELLED
+    assert _derived("limited", "cancelled") is SessionState.CANCELLED
     assert state_from_suspension(Suspension(reason="terminal", status="failed")) is (
         SessionState.FAILED
     )
     assert _closed("failed") is SessionState.FAILED
+    assert _derived("failed") is SessionState.FAILED
     assert _closed("completed") is SessionState.COMPLETED
-    # ...and ``close`` reaches them through the shared mapper rather than its own == test.
+    # ...and ``close`` reaches them through the shared mapper rather than its own == test,
+    # while the pump and blocking settle halves share the terminal precedence literally.
     close_source = _live_source(LoopSession.close)
     assert "session_state_from_run_status" in close_source, {
         "hint": "a fourth hand-rolled terminal mapping is how the first three diverged",
+    }
+    assert "_terminal_outcome_state" in _live_source(state_from_suspension)
+    assert "_terminal_outcome_state" in _live_source(LoopSession._derive_after_settle), {
+        "hint": "the blocking settle twin re-rolling the precedence is how the fourth diverged",
     }
     assert REASON_TO_STATE["limited"] is SessionState.LIMITED
 

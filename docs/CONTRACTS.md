@@ -993,8 +993,17 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `session_state_from_run_status(status, error_code=..., terminal=...)` is the tolerant reader for
   older `status.json` payloads.
 - `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
-  re-derive `state` at each boundary. `inspect() -> SessionInspection` and `health() ->
-  SessionHealth` are recomputed from live loop state on every call (never stale).
+  re-derive `state` at each boundary. The blocking and pump halves share one terminal settle
+  precedence (cancelled first, then a terminal `status="limited"` to `limited`, else `failed`),
+  so a budget-terminal or cancelled `submit()` answers exactly what `run_until_suspended` answers
+  for the identical run. `inspect() -> SessionInspection` and `health() -> SessionHealth` are
+  recomputed from live loop state on every call (never stale), and both bind to actual loop
+  liveness: `can_accept_input` is `false` (and `alive` is `false`) whenever the loop can no
+  longer pump — its session is terminal, or the activation was torn down by `close()` /
+  `release_parked()` / `discard_uncommitted()`. A `submit()`/`resume()` over a dead loop is
+  refused with the loop's own typed error (`run_not_open` / `run_terminal`) *before* any FSM
+  write, so a refused pump never moves the facade; a `close()` that raises lands the facade on
+  `failed` rather than leaving an input-accepting park state over the dead loop.
 - `pause()` / `resume()` / `cancel(reason)`: pause freezes the turn at the *next start-of-step*
   boundary (its in-flight `pending_observations` are kept), suspends with `reason="paused"`, and
   persists a checkpoint — so resume (a `run_until_suspended(None)` re-pump) continues the same
