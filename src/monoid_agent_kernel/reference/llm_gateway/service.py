@@ -186,6 +186,7 @@ class LlmGatewayBackend:
             "provider_retried": turn.provider_retried,
         }
         result.update(_applied_echoes(request, adapter, config))
+        result.update(_reasoning_payload(turn))
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -285,6 +286,13 @@ class LlmGatewayBackend:
                     TurnComplete(
                         response_id=turn.response_id,
                         usage=turn.usage,
+                        # The reasoning artifacts ride the synthesized terminal chunk for the same
+                        # reason the retry evidence does: this chunk stands in for a stream the
+                        # provider could not produce, and ``assemble_streamed_turn`` reads
+                        # ``reasoning`` off ``TurnComplete`` and nowhere else -- so dropping it
+                        # here emptied the terminal frame on this branch alone, while the branch
+                        # that forwards the provider's own ``TurnComplete`` stayed correct.
+                        reasoning=turn.reasoning,
                         stop_reason=turn.stop_reason,
                         provider_retried=turn.provider_retried,
                     )
@@ -316,6 +324,7 @@ class LlmGatewayBackend:
         # streaming client can read it from, and it is built by the same function so the two
         # transports cannot answer differently.
         frame.update(_applied_echoes(request, adapter, model_request.model))
+        frame.update(_reasoning_payload(turn))
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -492,6 +501,31 @@ def _applied_echoes(
     if request.output_schema is not None:
         echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
     return echoes
+
+
+def _reasoning_payload(turn: ModelTurn) -> dict[str, Any]:
+    """The turn's provider-native reasoning artifacts, for whichever transport is writing.
+
+    The kernel captures these opaque items (OpenAI's ``reasoning`` output items, carrying their
+    ``encrypted_content``) and replays them verbatim on the next by-value turn, which is what
+    makes a ZDR reasoning round-trip possible at all. The request half of that loop already
+    crossed this hop -- ``messages`` ride by value and are forwarded untouched -- but the
+    response half did not, so a run routed through the gateway captured nothing and replayed
+    nothing. Relayed verbatim: the items are already provider-encrypted and this hop has no
+    business interpreting them.
+
+    Built by one function and used by both writers, exactly like :func:`_applied_echoes`, so the
+    two transports cannot come to disagree about a fact neither of them authored.
+
+    Omit-when-empty, and the conditionality is a property of the *answer* rather than of the
+    request: traffic whose upstream produced no reasoning keeps its exact previous wire shape,
+    and a client that never hears the key reads it as "no artifacts", which is the only thing an
+    absent key can honestly mean.
+    """
+
+    if not turn.reasoning:
+        return {}
+    return {"reasoning": [dict(item) for item in turn.reasoning]}
 
 
 def _pump_astream(

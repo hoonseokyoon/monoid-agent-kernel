@@ -143,7 +143,12 @@ from monoid_agent_kernel.model_call import _recordable_usage
 from monoid_agent_kernel.observability.otel import _chat_finish_attrs, _subagent_finish_attrs
 from monoid_agent_kernel.providers import gateway as gateway_client
 from monoid_agent_kernel.providers._common import normalize_usage
-from monoid_agent_kernel.providers.base import ModelTurn, mark_provider_usage, provider_usage_of
+from monoid_agent_kernel.providers.base import (
+    ModelTurn,
+    ToolCall,
+    mark_provider_usage,
+    provider_usage_of,
+)
 from monoid_agent_kernel.providers.openai import _openai_tool_schema
 from monoid_agent_kernel.reference.llm_gateway.http import (
     _error_body,
@@ -211,15 +216,20 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     # --- the success wire ---------------------------------------------------------------
     CarriageGap(
         "success-envelope",
-        "reasoning",
-        "reference/llm_gateway/service.py:LlmGatewayBackend",
-        "ModelTurn.reasoning reaches neither writer (the sync body nor the terminal frame) and "
-        "neither client reader names the key, so the provider-native reasoning round-trip the "
-        "adapters are built around (encrypted_content replay) is dead through the gateway. "
-        "Symmetric across both transports, which is what makes it a missing feature rather than "
-        "a twin that fell out of step: closing it means one wire key on two writers and two "
-        "readers, in one change",
-        "burn-down",
+        "reasoning (frameless stream)",
+        "providers/gateway.py:_chunk_from_event",
+        "BY DESIGN, and the residue of the burn-down entry X-3 closed. The artifacts now ride "
+        "both transports, but a stream that ends without a terminal frame has nowhere to put "
+        "them: assemble_streamed_turn reads reasoning off TurnComplete and nowhere else, the "
+        "deltas are a content channel with no end-of-turn metadata slot "
+        "(reference/llm_gateway/http.py:_write_sse), and the SSE body simply ends on connection "
+        "close. Exactly the wire status usage and turn_handle already have on that shape, and "
+        "tolerated the same way: the reader reads () and raises nothing. A run continuing over a "
+        "frameless hop re-derives nothing to replay, which is the loop's neutral case -- it "
+        "appends no reasoning block for an empty tuple. Deliberately NOT enforced as an absence: "
+        "a fail-closed proof for reasoning is the separate v0.21-track:B1 echo, and inventing a "
+        "metadata channel here would be a second protocol for one field",
+        "by-design",
     ),
     # --- tool catalog ------------------------------------------------------------------
     CarriageGap(
@@ -1402,6 +1412,7 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_gateway_http_status_hint",
         "_reported_error_usage",
         "_portable_gateway_payload",
+        "_gateway_reasoning_items",
     }
 )
 
@@ -1418,9 +1429,11 @@ GATEWAY_MAPPING_READ_HELPERS = frozenset(
         "_reported_error_usage",
     }
 )
-# The two registered helpers no mapping scan can reach: they validate an already-extracted
+# The registered helpers no mapping scan can reach: they validate an already-extracted
 # ``value: Any``, so they carry no wire key of their own and the caller names the key.
-GATEWAY_WIRE_VALUE_VALIDATORS = frozenset({"_gateway_usage", "_portable_gateway_payload"})
+GATEWAY_WIRE_VALUE_VALIDATORS = frozenset(
+    {"_gateway_usage", "_portable_gateway_payload", "_gateway_reasoning_items"}
+)
 
 
 def _literal_wire_keys(function: ast.AST) -> frozenset[str]:
@@ -2723,6 +2736,8 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "response_id",
             "turn_handle",
             "final_text",
+            # X-3: the provider-native reasoning artifacts the hop now relays.
+            "reasoning",
         }
     ),
     "providers/gateway.py:_chunk_from_event": frozenset(
@@ -2745,6 +2760,8 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "turn_handle",
             "generation_applied",
             "schema_applied",
+            # X-3's streamed twin: the terminal frame is the only frame that carries them.
+            "reasoning",
         }
     ),
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
@@ -4164,6 +4181,10 @@ GATEWAY_SUCCESS_BODY_KEYS = frozenset(
         "provider_retried",
         "generation_applied",
         "schema_applied",
+        # X-3: the opaque provider-native reasoning items, present only when the upstream
+        # produced some. Conditional on the ANSWER rather than on the request, which is what
+        # separates it from the two echoes beside it.
+        "reasoning",
     }
 )
 GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
@@ -4175,6 +4196,7 @@ GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
         "provider_retried",
         "generation_applied",
         "schema_applied",
+        "reasoning",
     }
 )
 # The frame is the body minus what the deltas already delivered, minus the protocol tag the
@@ -4184,7 +4206,14 @@ TERMINAL_FRAME_DELIBERATE_OMISSIONS = frozenset({"protocol", "final_text", "tool
 
 
 class _EverythingAdapter:
-    """A stub upstream that answers one maximal turn and declares native support for both echoes."""
+    """A stub upstream that answers one maximal turn and declares native support for both echoes.
+
+    Maximal means *every* ``ModelTurn`` field set to a distinguishable non-default value, which
+    ``test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default`` holds it to.
+    ``tool_calls`` was the field this class left empty, and the omission is exactly how the
+    ``reasoning`` gap survived: a wire census driven by a builder that never sets a field cannot
+    tell a writer that drops it from a writer that never had it to write.
+    """
 
     generation_support = "native"
     structured_output_support = "native"
@@ -4194,7 +4223,7 @@ class _EverythingAdapter:
         return ModelTurn(
             response_id="provider_response_secret",
             final_text="answered",
-            tool_calls=(),
+            tool_calls=(ToolCall(id="call_1", name="fs_read", arguments={"path": "a.md"}),),
             usage={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
             raw={"anything": True},
             reasoning=({"type": "reasoning", "id": "rs_1"},),
@@ -4287,9 +4316,15 @@ GATEWAY_MINIMAL_BODY_KEYS = frozenset(
 GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
     {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
 )
-# The keys that appear only when the request asked for the feature (registered by-design on
-# ``_applied_echoes``: traffic that configures neither keeps its exact pre-W5 wire shape).
-GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS)
+# The keys that ride the wire only sometimes. Two conditionalities, deliberately unified into
+# one set because the *wire* property is the same one: the two echoes appear only when the
+# request asked for the feature (registered by-design on ``_applied_echoes``: traffic that
+# configures neither keeps its exact pre-W5 wire shape), and ``reasoning`` appears only when the
+# upstream produced artifacts. Widened by union rather than by editing ``APPLIED_ECHO_KEYS``:
+# that constant is the echo protocol's own domain (family 4 diffs ``_applied_echoes`` against
+# it), and folding a non-echo key into it would report reasoning as a third applied-parameters
+# proof — which is the separate v0.21-track:B1 gap, still open.
+GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS) | {"reasoning"}
 
 
 def test_7a_the_minimal_request_pins_which_body_keys_are_conditional() -> None:
@@ -4373,27 +4408,72 @@ def test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered() -> 
     }
 
 
-def test_7b_reasoning_artifacts_do_not_cross_the_gateway_hop_on_either_transport() -> None:
-    """Registered burn-down, and pinned as *symmetric* so it reads as a gap, not a drift.
+def test_7b_reasoning_artifacts_cross_the_gateway_hop_on_both_transports() -> None:
+    """X-3, and pinned as *symmetric* for the same reason the gap was: one wire key, four sites.
 
     ``ModelTurn.reasoning`` is what the provider-native reasoning round-trip (DX-13a) replays,
-    and the gateway's two writers have no slot for it — so a run routed through the gateway
-    replays nothing, on both transports equally. Symmetry is the point: this is a feature the
-    hop never carried, not a twin that fell out of step, and closing it means adding a wire key
-    to both writers and both readers at once.
+    and the gateway carried it on neither transport — so a run routed through the gateway
+    captured nothing and replayed nothing. Both halves are asserted here, wire and reader: a
+    body key nobody reads back is the same dead feature wearing a key name, which is precisely
+    the state the two readers were in while ``TurnComplete.to_json`` had already declared the
+    shape (providers/base.py).
     """
 
     gateway, token = _gateway_and_token()
     upstream = _EverythingAdapter().next_turn(None)
     assert upstream.reasoning, "the stub must actually produce reasoning artifacts"
+    expected = [dict(item) for item in upstream.reasoning]
 
     body = gateway.handle_turn(token, _maximal_turn_payload())
+    assert body["reasoning"] == expected
     frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
-    assert "reasoning" not in body
-    assert all("reasoning" not in frame for frame in frames)
-    # And the client cannot reconstruct one: neither reader names the key.
-    for reader in GATEWAY_READER_WIRE_KEYS.values():
-        assert "reasoning" not in reader
+    assert frames[-1]["reasoning"] == expected
+    # Only the terminal frame. The deltas are the content channel and these are end-of-turn
+    # metadata; putting them on a delta would mean a cancelled stream half-delivers an artifact
+    # set that is only meaningful whole.
+    assert all("reasoning" not in frame for frame in frames[:-1])
+
+    # The behavioral half: the real readers, not a key-set diff. A reader that ignored the key
+    # would drop it without leaving a trace in any pinned set.
+    assert gateway_client._parse_gateway_response(dict(body)).reasoning == upstream.reasoning
+    assert gateway_client._chunk_from_event(dict(frames[-1])).reasoning == upstream.reasoning
+    for reader in ("_parse_gateway_response", "_chunk_from_event"):
+        assert "reasoning" in GATEWAY_READER_WIRE_KEYS[f"providers/gateway.py:{reader}"]
+
+
+def test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default() -> None:
+    """The reflection guard this family did not have, and the reason the gap above survived.
+
+    Every other family in this suite pairs its maximal builder with a diff against the authority
+    (``_maximal_suspension`` against ``Suspension``'s fields, ``_MAXIMAL_USAGE`` against
+    ``normalize_usage``'s domain), because a builder that leaves a field at its default makes
+    that field invisible to every wire census driven by it — a writer that drops it and a writer
+    that never had it produce the identical body. ``ModelTurn.reasoning`` was such a field for
+    the whole life of family 7. The authority is ``dataclasses.fields(ModelTurn)`` and the
+    exclusion set is empty: a ninth field must be answered by the builder, not by this list.
+    """
+
+    turn = _EverythingAdapter().next_turn(None)
+    defaulted = sorted(
+        field.name
+        for field in dataclasses.fields(ModelTurn)
+        if getattr(turn, field.name) == _field_default(field)
+    )
+    assert defaulted == [], {
+        "left_at_its_default_by_the_maximal_builder": defaulted,
+        "hint": "set it to a distinguishable value in _EverythingAdapter — a field the maximal "
+        "probe never sets cannot be seen to be missing from either writer",
+    }
+
+
+def _field_default(field: dataclasses.Field) -> Any:
+    """The declared default of one dataclass field, factory or not."""
+
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+        return field.default_factory()  # type: ignore[misc]
+    return object()  # no default: nothing can equal it, so the field is never "defaulted"
 
 
 # What each client parser reads on the SUCCESS path, pinned separately from the error path so
@@ -4413,6 +4493,7 @@ SUCCESS_READS_R1 = frozenset(
         "response_id",
         "turn_handle",
         "final_text",
+        "reasoning",
     }
 )
 TURN_COMPLETE_READS_R2 = frozenset(
@@ -4423,6 +4504,7 @@ TURN_COMPLETE_READS_R2 = frozenset(
         "stop_reason",
         "generation_applied",
         "schema_applied",
+        "reasoning",
     }
 )
 # Reads with no writer, each one accounted for.
@@ -5822,6 +5904,9 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         "retryable",
         "turn.failed",
         "http_status",
+        # X-3: the success envelope's reasoning key, bound to the paragraph that documents it
+        # for the third-party clients this document is the contract for.
+        "reasoning",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

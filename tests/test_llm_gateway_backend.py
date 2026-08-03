@@ -36,6 +36,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    assemble_streamed_turn,
 )
 from monoid_agent_kernel.providers.gateway import _chunk_from_event, _parse_gateway_response
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -922,3 +923,158 @@ def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_
     assert reconstructed.http_status == 422
     assert reconstructed.retryable is False
     assert reconstructed.config_recoverable is True
+
+
+# --- X-3: the provider-native reasoning round-trip across the gateway hop ----------------
+#
+# The kernel captures opaque provider reasoning items into ``ModelTurn.reasoning`` and replays
+# them on the next by-value turn (DX-13a). The REQUEST half already survived the hop -- messages
+# ride by value, verbatim -- but the RESPONSE half did not: the gateway wrote the items to
+# neither transport, so a run routed through the gateway re-derived nothing to replay. These
+# four bind the wire; the loop-level acceptance test below binds capture -> wire -> tag -> replay.
+
+_REASONING_ITEMS: tuple[dict, ...] = (
+    {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc_1"},
+    {"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "enc_2"},
+)
+
+
+class _OneShotReasoningBackend:
+    """An upstream producing provider-native reasoning artifacts that CANNOT stream.
+
+    The non-streaming half is the point of keeping this class separate: the gateway synthesizes
+    a ``TurnComplete`` for it, and a synthesized terminal chunk that drops the turn's reasoning
+    empties the terminal frame on exactly one of the two streaming sub-branches.
+    """
+
+    def __init__(self, items: tuple[dict, ...] = _REASONING_ITEMS) -> None:
+        self.items = tuple(dict(item) for item in items)
+        self.requests: list = []
+
+    def next_turn(self, request):
+        self.requests.append(request)
+        return ModelTurn(
+            response_id="provider_response_secret_r",
+            final_text="answered",
+            usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            reasoning=self.items,
+            stop_reason="stop",
+        )
+
+
+class _StreamingReasoningBackend(_OneShotReasoningBackend):
+    """The same upstream, able to stream — so its own ``TurnComplete`` carries the items."""
+
+    async def astream_turn(self, request):
+        self.requests.append(request)
+        yield TextDelta(text="answered")
+        yield TurnComplete(
+            response_id="provider_response_secret_r",
+            usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            reasoning=self.items,
+            stop_reason="stop",
+        )
+
+
+def _reasoning_gateway(*, streams: bool = True):
+    manager = _token_manager()
+    upstream = (_StreamingReasoningBackend if streams else _OneShotReasoningBackend)()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    return gateway, _llm_token(manager), upstream
+
+
+def test_reasoning_artifacts_cross_the_sync_gateway_hop() -> None:
+    """Wire and reader together: a body key nobody reads back is the same dead feature."""
+
+    gateway, token, upstream = _reasoning_gateway(streams=False)
+    body = gateway.handle_turn(token, _payload())
+    assert body["reasoning"] == [dict(item) for item in upstream.items]
+    assert _parse_gateway_response(dict(body)).reasoning == upstream.items
+    # The opacity rule the rest of this wire keeps: the provider's response id never leaves.
+    assert "provider_response_secret_r" not in json.dumps(body)
+
+
+def test_reasoning_artifacts_cross_the_streamed_gateway_hop() -> None:
+    """The streamed twin. The terminal frame is the only frame that may carry the items."""
+
+    gateway, token, upstream = _reasoning_gateway()
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning"] == [dict(item) for item in upstream.items]
+    # Not on the deltas: the items are end-of-turn metadata, not content a consumer renders.
+    assert all("reasoning" not in frame for frame in frames[:-1])
+    chunks = [_chunk_from_event(frame) for frame in frames]
+    assert chunks[-1].reasoning == upstream.items
+    assert assemble_streamed_turn([c for c in chunks if c is not None]).reasoning == upstream.items
+
+
+def test_a_backend_that_cannot_stream_still_carries_its_reasoning() -> None:
+    """The third writer, and the one no key-set census sees.
+
+    When the upstream cannot stream, the gateway synthesizes the terminal chunk itself out of a
+    one-shot turn. The synthesized ``TurnComplete`` is what the assembled turn reads reasoning
+    off, so an omission there empties the terminal frame on this branch alone -- while the
+    branch that forwards the provider's own ``TurnComplete`` stays green.
+    """
+
+    gateway, token, upstream = _reasoning_gateway(streams=False)
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning"] == [dict(item) for item in upstream.items]
+    assert _chunk_from_event(terminal).reasoning == upstream.items
+
+
+def test_a_frameless_stream_reads_no_reasoning_and_does_not_fail() -> None:
+    """Registered by-design: a stream with no terminal frame has nowhere to carry the items.
+
+    Tolerated as ``()``, exactly like ``usage`` and the turn handle on the same shape. A run
+    continuing over such a hop simply re-derives nothing to replay, which the loop already
+    treats as the neutral case (no reasoning block is appended for an empty tuple).
+    """
+
+    gateway, token, _upstream = _reasoning_gateway()
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    deltas = [frame for frame in frames if frame["type"] != "turn_complete"]
+    assert deltas, "the fixture must produce frames before the terminal one"
+    chunks = [_chunk_from_event(frame) for frame in deltas]
+    assert assemble_streamed_turn([c for c in chunks if c is not None]).reasoning == ()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["not-a-list", {"type": "reasoning"}, ["not-a-dict"], [{"ok": True}, 7]],
+    ids=["string", "object", "list-of-strings", "list-with-a-scalar"],
+)
+def test_a_malformed_reasoning_value_is_refused_by_both_readers(malformed) -> None:
+    """One validator, so the two transports cannot come to disagree about strictness."""
+
+    body = {
+        "protocol": "monoid.llm-turn.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": malformed,
+    }
+    sync = pytest.raises(ModelAdapterError, _parse_gateway_response, dict(body)).value
+    assert sync.provider_error_code == "gateway_bad_response"
+    assert sync.retryable is False
+
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": malformed,
+    }
+    framed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(frame)).value
+    assert framed.provider_error_code == "gateway_bad_response"
+    assert framed.retryable is False

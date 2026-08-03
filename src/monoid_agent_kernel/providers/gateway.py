@@ -791,6 +791,43 @@ def _portable_gateway_payload(
         ) from exc
 
 
+def _gateway_reasoning_items(
+    value: Any,
+    *,
+    context: str,
+    http_status: int | None = None,
+    known_provider_retried: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    """Shape-check the provider-native reasoning artifacts one response carries.
+
+    Absent or ``None`` reads as "no artifacts" -- an older gateway that never mentions the key
+    and an upstream that produced none say the same thing to a client, and both leave the next
+    turn with nothing to replay, which is the neutral behavior the loop already has.
+
+    Anything present must be a list of objects, because that is the only shape the replay path
+    can hand back to a provider: the items travel into the by-value ``messages`` log and out
+    again to the upstream adapter verbatim, so a scalar or a half-list would be discovered by
+    the *provider*, one hop and one turn later, as an unclassifiable request. Contents are not
+    inspected past that -- they are opaque and provider-encrypted by construction.
+
+    Written once for both transports, like :func:`_validated_generation_echo` beside it: the
+    sync response and the streamed terminal frame read the same key out of different envelopes,
+    and a reader that is stricter than its twin is the shape this file keeps producing.
+    """
+
+    if value is None:
+        return ()
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return tuple(dict(item) for item in value)
+    raise ModelAdapterError(
+        f"LLM gateway returned invalid {context} reasoning: expected an array of objects",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        http_status=http_status,
+        provider_retried=known_provider_retried,
+    )
+
+
 def _validated_generation_echo(
     applied: Any, *, provider_retried: bool = False
 ) -> dict[str, Any] | None:
@@ -1124,6 +1161,15 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=status_hint,
             known_provider_retried=provider_retried,
         ),
+        # The opaque provider-native reasoning artifacts the upstream produced, relayed by the
+        # gateway. Absent from an older gateway, which reads as "none" -- the same thing an
+        # adapter with no reasoning says, and all a wire that never mentions the key can mean.
+        reasoning=_gateway_reasoning_items(
+            data.get("reasoning"),
+            context="response",
+            http_status=status_hint,
+            known_provider_retried=provider_retried,
+        ),
         stop_reason=stop_reason,
         # A retry the gateway's own backend made. Absent from an older gateway, which reads as
         # "did not retry" -- the same default an adapter with no retry loop carries, and the only
@@ -1296,6 +1342,15 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             ),
             usage=_gateway_usage(
                 event.get("usage"),
+                context="turn-complete frame",
+                http_status=status_hint,
+                known_provider_retried=retried,
+            ),
+            # The terminal frame is the only frame that may carry the artifacts, and the only
+            # one ``assemble_streamed_turn`` reads them off. Same validator as the sync reader:
+            # a shape one transport accepts and the other refuses is the defect, not the fix.
+            reasoning=_gateway_reasoning_items(
+                event.get("reasoning"),
                 context="turn-complete frame",
                 http_status=status_hint,
                 known_provider_retried=retried,
