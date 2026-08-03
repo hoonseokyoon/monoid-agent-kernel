@@ -65,6 +65,36 @@ out in commit messages and here.
   resolves one level of delegation. The gateway's wire-reading helper list, the other closed hand
   list in the family, is derived from the module and diffed against it, and the emit-site census
   counts every emit for an event type instead of only those with a literal `data={...}`.
+- **Round-3 hardening: each round-2 repair was attacked on its own twin, and five broke there.**
+  Same method as above — every drift below was run against the suite as it stood, passed all 111
+  tests, and now fails with a diagnostic naming the shape (suite: 111 → 120). *The write census
+  was bound on one name.* The assignable-domain reader refused what it could not read about the
+  dict it *returns* and looked at no other name, so `details["tool_tokens"] = ...` written ahead
+  of `for key, value in details.items(): result[key] = value` reached the wire through the copy
+  loop's source — and a source with no dict literal bound to it resolved to the empty set instead
+  of refusing. One mechanism (`_dict_writes`) now answers for every name in a scope: constant
+  contributions (subscript writes, analyzable `update({...})` and `|=` merges) are folded in, and
+  a `**` splat, a computed key, a merge from a name, a rebinding, an unmodelled mutator, or a
+  `return` of anything but the counted name is refused by name. *Its resolver twin had no refusal
+  in it at all.* The `data=<name>` emit-site resolver and the bespoke `metrics.updated` census
+  each read dict literals plus constant-key subscript writes and silently dropped everything
+  else, so a `data.update({...})` put a key on the wire that the schema diff reported as
+  nonexistent; both now resolve through the same mechanism and fail closed. *Family-2 discovery
+  still spelled two predicates.* "Reads the wire" meant *calling a registered helper*, so a
+  reader doing its own `payload.get("error")` was not a reader; "takes a mapping" meant the
+  annotation said so, so a `payload: Any` helper carrying a wire key was invisible to every
+  read-key census. Both are read off the body now, with the registered helpers excluded by name
+  because the sibling census already derives them. *Family 2 had no minimal probe.* Family 7 grew
+  minimal-input twins in round 2 and the error family did not, so an omit-when-falsy filter added
+  on either shipped writer's side of the shared `_error_body` call was invisible to probes that
+  only ever fed a maximal exception; both writers are now driven with a minimal one, pinning that
+  `usage` is the single conditional key. *Two registered-gap pins censused a spelling and an
+  end.* The call-receipt pin collected `getattr(exc, …)` reads only, so the one-line
+  `exc.config_recoverable` that would close the gap left it green; the ready-result pin flipped
+  only for a filter landing inside `projection.py:result`, so it now also pins that the HTTP
+  route writes that dict wholesale. A registry entry's "eleven web counters" is eight. Seven new
+  tests drive synthetic sources through the refusal and folding rules themselves, because
+  today's readable code returns the same key set whether those rules exist or not.
 - **Every registry entry now has an assertion behind it.** Five round-1 entries were prose: the
   driver and the call receipt that were designed for `config_recoverable` and never name it, the
   closed `stream_closed` schema, the `turn.failed` event that no status projection consumes, and

@@ -53,6 +53,20 @@ reader discovery was a predicate on where a function was *written* (module level
 *spelled* its raise (a literal constructor), so a reader in a class body or one delegating to a
 factory was not a reader.
 
+*And each of those fixes was then attacked on its own twin, which is where they broke.*  A rule
+proven on one of two parallel halves is this repository's dominant defect shape, and the census
+was reproducing it five ways.  The write census that refuses what it cannot read was applied to
+the *result* dict and to no other name, so a key written into the dict a copy loop reads
+(``details["tool_tokens"] = ...``) reached the wire through a name nobody watched — and the
+resolver twin beside it, the one that answers ``data=<name>`` at an emit site, had no refusal in
+it at all.  Reader discovery still carried two spelled predicates: "reads the wire" meant
+*calling a registered helper*, and "takes a mapping" meant the annotation said so, so an inline
+``payload.get("error")`` and a ``payload: Any`` each walked past.  Family 7 had a minimal-input
+twin for its two writers and family 2 had none, so an omit-when-falsy filter on either error
+writer was invisible to every probe.  And two registered-gap pins censused one spelling of a read
+(``getattr``, not ``exc.attr``) and one end of a two-ended path (the projection, not the route
+that serves it), either of which would have stayed green through the very fix it exists to catch.
+
 *A registry entry with no assertion is prose.*  The registry's contract is "closing a gap breaks
 this suite", which holds only for entries something actually asserts.  Five round-1 entries had
 no pin at all — the drivers and consumers designed for a fact that ignore it, a closed schema,
@@ -361,7 +375,7 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
         "reference/backend/run_state.py:TenantUsage",
         "the unregistered twin of the gateway meter above: add_metrics sums input/output/total "
-        "and eleven web counters and drops the four priced sub-counts, so the BACKEND tenant "
+        "and eight web counters and drops the four priced sub-counts, so the BACKEND tenant "
         "ledger under-reports a cache-heavy or reasoning-heavy run exactly like the gateway's. "
         "Two meters, one omission, and fixing one of them leaves the other",
         "burn-down",
@@ -1133,12 +1147,84 @@ def _dict_keys(node: ast.Dict) -> frozenset[str]:
     )
 
 
-def _literal_dict_bindings(tree: ast.AST) -> dict[str, list[frozenset[str]]]:
-    """``name -> the key sets of every dict literal assigned to it``, plus its constant-key
-    subscript writes. This is how a ``data=<name>`` emit site is resolved back to a key set."""
+def _dict_literal_keys(node: ast.Dict) -> tuple[frozenset[str], tuple[str, ...]]:
+    """A dict literal's constant string keys, *and the parts of it that are not that*.
 
-    bindings: dict[str, list[set[str]]] = {}
-    for node in ast.walk(tree):
+    ``_dict_keys`` returns only the first half. A ``**splat`` entry has a ``None`` key and a
+    computed key is not a ``Constant``, and both simply vanish from the set it returns — so a
+    literal that merges a mapping of unknown width was censused as the two keys spelled beside
+    it, and every census that treats a literal as *the* key set inherited that silence. The
+    second half is what a caller has to refuse on.
+    """
+
+    keys: set[str] = set()
+    refusals: list[str] = []
+    for key, value in zip(node.keys, node.values):
+        if key is None:
+            refusals.append(f"**{ast.unparse(value)}")
+        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+        else:
+            refusals.append(f"{ast.unparse(key)}: ...")
+    return frozenset(keys), tuple(refusals)
+
+
+@dataclass(frozen=True)
+class _DictWrites:
+    """Everything written into one name-bound dict inside one scope.
+
+    ``literals`` is what the name was *assigned*; ``added`` is every constant key written into it
+    afterwards (a subscript write, an analyzable ``update({...})`` or ``|= {...}`` merge);
+    ``dynamic`` is the subscript writes whose key is an expression, which only a caller that
+    knows the surrounding loop can resolve; ``refusals`` is every contribution that cannot be
+    read as a closed set of constant keys at all.
+
+    So ``keys`` is a *lower bound* and is the answer only when nothing was refused — which is why
+    every consumer below asserts ``unreadable`` empty rather than filtering it away.
+    """
+
+    name: str
+    literals: tuple[frozenset[str], ...]
+    added: frozenset[str]
+    dynamic: tuple[ast.expr, ...]
+    refusals: tuple[str, ...]
+
+    @property
+    def keys(self) -> frozenset[str]:
+        return frozenset().union(self.added, *self.literals)
+
+    @property
+    def unreadable(self) -> tuple[str, ...]:
+        return self.refusals + tuple(
+            f"{self.name}[{ast.unparse(index)}] = ..." for index in self.dynamic
+        )
+
+
+# Dict methods that only read. Anything else called on a tracked name is a mutation this census
+# cannot read, so it is refused by name rather than enumerated: the point is not to know every
+# mutator, it is that an unknown one must never pass as "no keys were added".
+_DICT_READ_METHODS = frozenset({"copy", "get", "items", "keys", "values"})
+
+
+@functools.lru_cache(maxsize=None)
+def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
+    """Every dict-shaped name in ``scope``, with everything written into it.
+
+    One walk, **every** name — not just the one name a caller happens to care about. That
+    asymmetry is the round-3 defect this replaces: the write census was applied to the result
+    dict and to nothing else, so a key written into the dict a copy loop *reads*
+    (``details["tool_tokens"] = ...`` ahead of ``for key, value in details.items():
+    result[key] = value``) reached the result through a name nobody was watching, and the census
+    reported the loop as carrying the source literal's keys alone.
+
+    A name is tracked if a dict literal is bound to it or a subscript is written into it. For a
+    tracked name every later contribution is either folded in (constant keys) or refused; the
+    one shape left to the caller is a computed subscript key, because only the caller knows
+    whether the expression is a loop variable it can resolve.
+    """
+
+    tracked: set[str] = set()
+    for node in ast.walk(scope):
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -1146,21 +1232,103 @@ def _literal_dict_bindings(tree: ast.AST) -> dict[str, list[frozenset[str]]]:
         elif isinstance(node, ast.AnnAssign):
             target, value = node.target, node.value
         if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
-            bindings.setdefault(target.id, []).append(set(_dict_keys(value)))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            tracked.add(target.id)
+        if isinstance(node, ast.Assign):
+            for assigned in node.targets:
+                if isinstance(assigned, ast.Subscript) and isinstance(assigned.value, ast.Name):
+                    tracked.add(assigned.value.id)
+
+    literals: dict[str, list[frozenset[str]]] = {}
+    added: dict[str, set[str]] = {}
+    dynamic: dict[str, list[ast.expr]] = {}
+    refusals: dict[str, list[str]] = {}
+
+    def _fold(name: str, node: ast.Dict, context: str) -> frozenset[str]:
+        keys, merged = _dict_literal_keys(node)
+        refusals.setdefault(name, []).extend(f"{context} merges {item}" for item in merged)
+        return keys
+
+    for node in ast.walk(scope):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            written = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for assigned in written:
+                if isinstance(assigned, ast.Name) and assigned.id in tracked:
+                    if isinstance(node.value, ast.Dict):
+                        literals.setdefault(assigned.id, []).append(
+                            _fold(assigned.id, node.value, f"{assigned.id} = {{...}}")
+                        )
+                    elif node.value is not None:
+                        # A rebinding to something this census cannot read is a key set of
+                        # unknown width standing where the literal's used to be.
+                        refusals.setdefault(assigned.id, []).append(
+                            f"{assigned.id} = {ast.unparse(node.value)}"
+                        )
+                elif (
+                    isinstance(assigned, ast.Subscript)
+                    and isinstance(assigned.value, ast.Name)
+                    and assigned.value.id in tracked
+                ):
+                    index = assigned.slice
+                    if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                        added.setdefault(assigned.value.id, set()).add(index.value)
+                    else:
+                        dynamic.setdefault(assigned.value.id, []).append(index)
             continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+        if isinstance(node, ast.AugAssign):
+            mutated = node.target
+            if isinstance(mutated, ast.Name):
+                name = mutated.id
+            elif isinstance(mutated, ast.Subscript) and isinstance(mutated.value, ast.Name):
+                name = mutated.value.id
+            else:
+                continue
+            if name not in tracked:
+                continue
+            if (
+                isinstance(mutated, ast.Name)
+                and isinstance(node.op, ast.BitOr)
+                and isinstance(node.value, ast.Dict)
+            ):
+                added.setdefault(name, set()).update(
+                    _fold(name, node.value, f"{name} |= {{...}}")
+                )
+            else:
+                refusals.setdefault(name, []).append(
+                    f"{ast.unparse(mutated)} {type(node.op).__name__}= ..."
+                )
             continue
-        index = target.slice
-        if not (isinstance(index, ast.Constant) and isinstance(index.value, str)):
-            continue
-        for keys in bindings.get(target.value.id, []):
-            keys.add(index.value)
-    return {name: [frozenset(keys) for keys in sets] for name, sets in bindings.items()}
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in tracked
+        ):
+            name, attribute = node.func.value.id, node.func.attr
+            if (
+                attribute == "update"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Dict)
+            ):
+                added.setdefault(name, set()).update(
+                    _fold(name, node.args[0], f"{name}.update({{...}})")
+                )
+            elif attribute not in _DICT_READ_METHODS:
+                refusals.setdefault(name, []).append(f"{name}.{attribute}(...)")
+
+    return {
+        name: _DictWrites(
+            name,
+            tuple(literals.get(name, ())),
+            frozenset(added.get(name, ())),
+            tuple(dynamic.get(name, ())),
+            tuple(refusals.get(name, ())),
+        )
+        for name in tracked
+    }
 
 
+@functools.lru_cache(maxsize=None)
 def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
     """Keys the module can put on ``recorder.emit("<event_type>", ..., data=...)``.
 
@@ -1172,10 +1340,18 @@ def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
     described as a twin check: a second emit passing ``data=some_name`` (the shape
     ``metrics.updated`` already uses) left the count at one and the twin went uncensused. A site
     this function cannot resolve is now a failure naming the shape, not a site it skips.
+
+    "Cannot resolve" then had to mean what it says. ``data=fn()`` refused, but the *resolver*
+    behind ``data=<name>`` had no refusal in it at all: it read dict literals and constant-key
+    subscript writes and dropped everything else, so ``data.update({...})``, ``data |= {...}``
+    and a ``{**extra}`` splat inside the literal each put a key on the wire that this function
+    reported as nonexistent — the same fail-open :func:`_emitted_result_keys` had closed on its
+    own side of the file and never bound on its twin. :func:`_dict_writes` now folds in what it
+    can read and refuses what it cannot, and an unreadable contribution fails the site.
     """
 
     tree = _module_tree(relative_path)
-    bindings = _literal_dict_bindings(tree)
+    bound = _dict_writes(tree)
     resolved: list[frozenset[str]] = []
     unresolved: list[str] = []
     for node in ast.walk(tree):
@@ -1188,9 +1364,25 @@ def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
             continue
         data = next((keyword.value for keyword in node.keywords if keyword.arg == "data"), None)
         if isinstance(data, ast.Dict):
-            resolved.append(_dict_keys(data))
-        elif isinstance(data, ast.Name) and len(bindings.get(data.id, ())) == 1:
-            resolved.append(bindings[data.id][0])
+            keys, merged = _dict_literal_keys(data)
+            if merged:
+                unresolved.append(f"line {node.lineno}: data={{...}} merges {list(merged)}")
+            else:
+                resolved.append(keys)
+        elif isinstance(data, ast.Name):
+            written = bound.get(data.id)
+            if written is None or len(written.literals) != 1:
+                bindings = 0 if written is None else len(written.literals)
+                unresolved.append(
+                    f"line {node.lineno}: data={data.id}, bound to {bindings} dict literals"
+                )
+            elif written.unreadable:
+                unresolved.append(
+                    f"line {node.lineno}: data={data.id}, written by "
+                    f"{sorted(written.unreadable)}"
+                )
+            else:
+                resolved.append(written.keys)
         else:
             unresolved.append(
                 f"line {node.lineno}: data="
@@ -1293,29 +1485,30 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
     key — and the docstring claimed it in general. Three other ways to write a key into a dict
     were simply not looked at, so ``result.update({"tool_tokens": ...})``, ``result |= {...}``
     and any augmented assignment onto it were each an eighth emitted key this census reported as
-    nonexistent. They are now unanalyzable-by-construction: a *method call* on the result name is
-    refused whatever it is called, because the point is not to enumerate the mutators but to
-    refuse the ones this function cannot read.
+    nonexistent.
+
+    Then the write census itself turned out to be bound on *one name*. The result dict was
+    watched; the dict a copy loop reads was not, so ``details["tool_tokens"] = ...`` written
+    ahead of ``for key, value in details.items(): result[key] = value`` put an eighth key on the
+    wire through a name nobody censused — and worse, a loop source with no dict literal bound to
+    it resolved to the empty set instead of refusing. :func:`_dict_writes` now answers for every
+    name, so a loop source resolves to *its* literal keys plus *its* constant writes, and a
+    contribution to either dict that cannot be read as constant keys — a splat inside the
+    literal, a computed key, a merge from a name, a rebinding, a mutator this census does not
+    model — is refused. So is a ``return`` of anything but the counted name: ``return {**result,
+    "tool_tokens": n}`` beside it is an emitted key no assignment ever spelled.
     """
 
-    returns = [
-        node.value
-        for node in ast.walk(function)
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
-    ]
-    assert len(returns) == 1, {"returns_of_a_named_dict": len(returns)}
-    result_name = returns[0].id  # type: ignore[union-attr]
+    returned = [node.value for node in ast.walk(function) if isinstance(node, ast.Return)]
+    named = [node for node in returned if isinstance(node, ast.Name)]
+    assert len(named) == 1, {"returns_of_a_named_dict": len(named)}
+    result_name = named[0].id
 
-    literals: dict[str, set[str]] = {}
-    for node in ast.walk(function):
-        target: ast.expr | None = None
-        value: ast.expr | None = None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target, value = node.targets[0], node.value
-        elif isinstance(node, ast.AnnAssign):
-            target, value = node.target, node.value
-        if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
-            literals.setdefault(target.id, set()).update(_dict_keys(value))
+    unanalyzable: list[str] = [
+        f"return {ast.unparse(node)}"
+        for node in returned
+        if node is not None and not isinstance(node, ast.Name)
+    ]
 
     # ``for key, value in <name>.items(): result[key] = value`` -> key is bound to <name>'s keys.
     loop_sources: dict[str, str] = {}
@@ -1333,42 +1526,32 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
         ):
             loop_sources[names[0]] = iterated.func.value.id
 
-    def _is_result(node: ast.expr | None) -> bool:
-        return isinstance(node, ast.Name) and node.id == result_name
+    writes = _dict_writes(function)
+    nothing = _DictWrites("", (), frozenset(), (), ())
 
-    keys = set(literals.get(result_name, set()))
-    unanalyzable: list[str] = []
-    for node in ast.walk(function):
-        # ``result.update({...})``, ``result.setdefault(...)`` — any method call on the result.
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and _is_result(node.func.value)
-        ):
-            unanalyzable.append(f"{result_name}.{node.func.attr}(...)")
-            continue
-        # ``result |= {...}`` / ``result["k"] += ...`` — an augmented assignment onto it.
-        if isinstance(node, ast.AugAssign) and (
-            _is_result(node.target)
-            or (isinstance(node.target, ast.Subscript) and _is_result(node.target.value))
-        ):
-            unanalyzable.append(f"{ast.unparse(node.target)} {type(node.op).__name__} ...")
-            continue
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if not isinstance(target, ast.Subscript) or not _is_result(target.value):
-                continue
-            index = target.slice
-            if isinstance(index, ast.Constant) and isinstance(index.value, str):
-                keys.add(index.value)
-            elif isinstance(index, ast.Name) and index.id in loop_sources:
-                keys |= literals.get(loop_sources[index.id], set())
-            else:
-                unanalyzable.append(f"{result_name}[{ast.unparse(index)}] = ...")
+    def _source_keys(source: str) -> frozenset[str]:
+        """The keys a ``<source>.items()`` copy loop can carry into the result."""
+
+        written = writes.get(source, nothing)
+        if not written.literals:
+            unanalyzable.append(
+                f"for key, value in {source}.items(): no dict literal is bound to {source}"
+            )
+            return frozenset()
+        unanalyzable.extend(written.unreadable)
+        return written.keys
+
+    result = writes.get(result_name, nothing)
+    unanalyzable.extend(result.refusals)
+    keys = set(result.keys)
+    for index in result.dynamic:
+        if isinstance(index, ast.Name) and index.id in loop_sources:
+            keys |= _source_keys(loop_sources[index.id])
+        else:
+            unanalyzable.append(f"{result_name}[{ast.unparse(index)}] = ...")
     assert unanalyzable == [], {
         "writes_the_census_cannot_read": sorted(set(unanalyzable)),
-        "hint": "a new emit shape: teach _emitted_result_keys about it rather than dropping it — "
+        "hint": "a new emit shape: teach _dict_writes about it rather than dropping it — "
         "an unread write is an emitted key the whole usage census below never hears about",
     }
     return frozenset(keys)
@@ -1510,8 +1693,23 @@ def _constructs_directly(function: ast.AST, class_name: str) -> bool:
     )
 
 
+def _parameters(function: _FunctionNode) -> frozenset[str]:
+    arguments = function.args
+    return frozenset(
+        argument.arg
+        for argument in (
+            list(arguments.posonlyargs) + list(arguments.args) + list(arguments.kwonlyargs)
+        )
+    )
+
+
 def _mapping_parameters(function: _FunctionNode) -> frozenset[str]:
-    """Parameters annotated as a mapping — the wire payload a helper reads keys off."""
+    """Parameters *annotated* as a mapping.
+
+    Kept annotation-based on purpose, and used for one thing only: asserting that the two
+    registered value validators still take an already-extracted value. What a function *does*
+    is :func:`_reads_a_mapping_parameter`'s question, and it is a different one.
+    """
 
     arguments = function.args
     return frozenset(
@@ -1528,13 +1726,19 @@ def _mapping_parameters(function: _FunctionNode) -> frozenset[str]:
 
 
 def _reads_a_mapping_parameter(function: _FunctionNode) -> bool:
-    """``payload[k]`` / ``payload.get(k)`` / ``k in payload`` on a mapping parameter.
+    """``payload[k]`` / ``payload.get(k)`` / ``k in payload`` on *any* parameter.
 
     The key may be a literal or the ``key`` parameter the caller passes: both make the function
     the place a wire key is actually read, which is what the helper list is for.
+
+    It used to require the parameter's *annotation* to name a mapping type, which made this a
+    predicate on how a helper was spelled rather than on what it does: ``payload: Any`` — the
+    annotation the two registered value validators already carry — read a wire key without ever
+    being a wire reader. A parameter that is subscripted, ``.get``-ed or ``in``-tested is being
+    used as a mapping whatever it was annotated as, and that is the whole test.
     """
 
-    parameters = _mapping_parameters(function)
+    parameters = _parameters(function)
     if not parameters:
         return False
     for node in ast.walk(function):
@@ -1561,6 +1765,146 @@ def _reads_a_mapping_parameter(function: _FunctionNode) -> bool:
         ):
             return True
     return False
+
+
+# --------------------------------------------------------------------------------------
+# The write census, censused
+# --------------------------------------------------------------------------------------
+
+# Synthetic on purpose, and the only tests in this file that are. Every mechanism above answers
+# a question about code that does not exist yet -- the drift a future commit writes -- and the
+# failure this suite keeps re-earning is a census that *answers* where it should refuse. Pinning
+# the refusal on today's normalizer alone cannot show that: today's normalizer is readable, so
+# the reader returns the same seven keys whether or not the refusals exist at all.
+
+
+def _parsed_function(source: str) -> _FunctionNode:
+    node = ast.parse(textwrap.dedent(source).strip()).body[0]
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)), type(node)
+    return node
+
+
+# Each of these was answered — silently, with a subset — before round 3.
+_UNREADABLE_RESULT_SOURCES: dict[str, str] = {
+    "a copy loop over a source with no dict literal bound to it": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            details = collect(payload)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a computed subscript key written into the copy loop's source": """
+        def build(name):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details[name] = 3
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a merge into the copy loop's source from a name": """
+        def build(extra):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details.update(extra)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a splat inside the result literal": """
+        def build(extra):
+            result = {"input_tokens": 1, **extra}
+            return result
+    """,
+    "a second return that is not the counted name": """
+        def build(flag, value):
+            result = {"input_tokens": 1}
+            if flag:
+                return {**result, "tool_tokens": value}
+            return result
+    """,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNREADABLE_RESULT_SOURCES))
+def test_the_assignable_domain_reader_refuses_the_writes_it_cannot_read(shape: str) -> None:
+    with pytest.raises(AssertionError):
+        _emitted_result_keys(_parsed_function(_UNREADABLE_RESULT_SOURCES[shape]))
+
+
+# The other half, and the one that matters more: a shape it *can* read must be read in full,
+# because a refusal and a subset are both failures of the same census. The first entry is the
+# round-3 drift itself -- a key written into the dict the copy loop reads -- and it has to come
+# back as an emitted key so the usage diff downstream fails on it, not as a refusal here.
+_READABLE_RESULT_SOURCES: dict[str, tuple[str, frozenset[str]]] = {
+    "a constant key written into the copy loop's source": (
+        """
+        def build():
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details["tool_tokens"] = 3
+            for key, value in details.items():
+                result[key] = value
+            return result
+        """,
+        frozenset({"input_tokens", "audio_tokens", "tool_tokens"}),
+    ),
+    "an analyzable update() merge into the result": (
+        """
+        def build(value):
+            result = {"input_tokens": 1}
+            result.update({"tool_tokens": value})
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
+    "an analyzable |= merge into the result": (
+        """
+        def build(value):
+            result = {"input_tokens": 1}
+            result |= {"tool_tokens": value}
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
+}
+
+
+def test_the_assignable_domain_reader_reads_the_writes_it_can() -> None:
+    for shape, (source, expected) in sorted(_READABLE_RESULT_SOURCES.items()):
+        assigned = _emitted_result_keys(_parsed_function(source))
+        assert assigned == expected, {
+            "shape": shape,
+            "missing": sorted(expected - assigned),
+            "extra": sorted(assigned - expected),
+        }
+
+
+# R2's twin: the ``data=<name>`` emit-site resolver reads bindings through the same mechanism,
+# and used to have no refusal in it at all — it collected dict literals and constant-key
+# subscript writes and dropped every other contribution, so a merge put a key on the wire that
+# the schema diff below never saw.
+_UNREADABLE_BINDING_SOURCES: dict[str, str] = {
+    "a merge from a name": 'data = {"error": 1}\ndata.update(extra)\n',
+    "an |= merge from a name": 'data = {"error": 1}\ndata |= extra\n',
+    "a splat inside the literal": 'data = {"error": 1, **extra}\n',
+    "a mutator this census does not model": 'data = {"error": 1}\ndata.setdefault("k", 2)\n',
+    "a rebinding to something unreadable": 'data = {"error": 1}\ndata = enrich(data)\n',
+}
+
+
+def test_the_emit_binding_resolver_refuses_and_folds_like_the_result_census() -> None:
+    for shape, source in sorted(_UNREADABLE_BINDING_SOURCES.items()):
+        written = _dict_writes(ast.parse(source))["data"]
+        assert written.unreadable, {
+            "shape": shape,
+            "resolved_to": sorted(written.keys),
+            "hint": "an emit site resolving through this binding would report a subset of the "
+            "keys it puts on the wire",
+        }
+    folded = _dict_writes(ast.parse('data = {"error": 1}\ndata.update({"attempt": 2})\n'))["data"]
+    assert folded.unreadable == () and folded.keys == {"error", "attempt"}
 
 
 # --------------------------------------------------------------------------------------
@@ -2061,6 +2405,79 @@ def test_2a_usage_is_omitted_when_the_failure_cost_nothing() -> None:
     assert frozenset(body) == SERVER_ERROR_BODY_KEYS - {"usage"}
 
 
+# --- the minimal twin of the two maximal writer probes ---------------------------------
+
+# What each shipped writer emits for a failure that carries nothing and cost nothing. The
+# maximal probes above are the union of the wire; the difference between the two probes is the
+# conditional half, which on this family is exactly ``usage`` (the registered omit-when-empty
+# rule, and the only key ``_error_body`` makes conditional).
+#
+# Family 7 grew this twin in round 2 and family 2 did not, which left a hole with a name: every
+# family-2 probe feeds a *maximal* exception, so every fact on it is non-default, so a writer
+# that omitted a key whenever its value was falsy was indistinguishable from one that always
+# writes it. ``_error_body`` is shared and could not drift that way -- but ``_write_exception``
+# and ``_stream_error_frame`` each build their own argument list around it, and an
+# omit-when-falsy filter added on *their* side of that call (dropping ``provider_retried=False``,
+# say, which the client's default would silently absorb) is exactly the half-threaded-field shape
+# this family exists to catch. Both writers are driven, because they are separate code.
+GATEWAY_MINIMAL_ERROR_BODY_KEYS = SERVER_ERROR_BODY_KEYS - {"usage"}
+
+
+def _minimal_adapter_error() -> ModelAdapterError:
+    """The other end of ``_maximal_adapter_error``: every transportable fact at its default."""
+
+    return ModelAdapterError("upstream refused before the call cost anything")
+
+
+def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> None:
+    """The non-streamed writer, driven through the shipped handler like its maximal twin."""
+
+    exc = _minimal_adapter_error()
+    # The probe is only minimal if the exception really is: every fact at its default.
+    assert provider_usage_of(exc) == {}
+    assert (exc.retryable, exc.provider_retried, exc.provider_error_code) == (False, False, "")
+
+    written, status = _write_exception_body(exc)
+    assert frozenset(written) == GATEWAY_MINIMAL_ERROR_BODY_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_ERROR_BODY_KEYS - set(written)),
+        "extra": sorted(set(written) - GATEWAY_MINIMAL_ERROR_BODY_KEYS),
+        "hint": "a key that vanished when its value was the default: that is an omit-when-empty "
+        "contract, and ``usage`` is the only one this wire has declared",
+    }
+    assert SERVER_ERROR_BODY_KEYS - GATEWAY_MINIMAL_ERROR_BODY_KEYS == {"usage"}
+    # Each surviving key carries the default itself, not an absence the client re-defaults.
+    assert status == HTTPStatus.BAD_GATEWAY
+    assert written["http_status"] == 502
+    assert written["retryable"] is False
+    assert written["provider_retried"] is False
+    assert written["error_code"] == gateway_client.GATEWAY_BAD_RESPONSE
+    assert written["error"] == str(exc)
+
+
+def test_2a_the_minimal_failure_reaches_the_stream_writer_identically() -> None:
+    """The streamed twin, and the two writers diffed against each other on the minimal input.
+
+    ``test_2a_the_two_server_writers_answer_one_exception_identically`` does this for a maximal
+    exception; a filter that only fires on a falsy value needs the minimal one to show.
+    """
+
+    exc = _minimal_adapter_error()
+    framed = _stream_error_frame(_StreamFrameHandler(), exc)
+    expected = GATEWAY_MINIMAL_ERROR_BODY_KEYS | {"type"}
+    assert frozenset(framed) == expected, {
+        "missing": sorted(expected - set(framed)),
+        "extra": sorted(set(framed) - expected),
+        "hint": "the frame writer and the body writer must be conditional about the same keys",
+    }
+    assert framed["type"] == "error"
+    written, _ = _write_exception_body(exc)
+    assert written == {key: value for key, value in framed.items() if key != "type"}, {
+        "non_streamed_body": written,
+        "stream_error_frame": framed,
+        "hint": "a default reached one server writer and not its twin",
+    }
+
+
 def _maximal_wire_body() -> dict[str, Any]:
     """The server body plus ``config_recoverable`` — present so a reader that reads it would."""
 
@@ -2296,6 +2713,16 @@ def _discovered_gateway_error_readers() -> set[str]:
     call in the function's own body, so a reader that hands the job to a one-line local factory
     evaded by moving the constructor one frame away. One level of delegation is resolved, which
     is as far as this module delegates anywhere else (see ``_wire_keys_read_in``).
+
+    *How it reads.* "Reads the wire" meant *calling one of the registered helpers* — a spelled
+    predicate, and the last one left in this discovery. A reader that does its own
+    ``payload.get("error")`` and raises on it reads the wire by any definition and called no
+    helper, so it was not a reader; it is now, because reading a key off a parameter used as a
+    mapping is the same act whether a helper or the reader itself performs it. The registered
+    helpers are excluded by name: every one of them reads a key and raises, and a helper is what
+    the *other* census in this family is for
+    (``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``), so counting them
+    here would only move the hand list, not derive it.
     """
 
     functions = _all_functions("providers/gateway.py")
@@ -2306,11 +2733,15 @@ def _discovered_gateway_error_readers() -> set[str]:
     }
     discovered: set[str] = set()
     for name, nodes in functions.items():
+        if name in GATEWAY_WIRE_READ_HELPERS:
+            continue
         for node in nodes:
             raises_a_model_error = _constructs_directly(node, "ModelAdapterError") or bool(
                 (_called_local_names(node) & constructing) - {name}
             )
-            reads_the_wire = bool(_called_local_names(node) & GATEWAY_WIRE_READ_HELPERS)
+            reads_the_wire = bool(
+                _called_local_names(node) & GATEWAY_WIRE_READ_HELPERS
+            ) or _reads_a_mapping_parameter(node)
             if raises_a_model_error and reads_the_wire:
                 discovered.add(f"providers/gateway.py:{name}")
     return discovered
@@ -2366,9 +2797,17 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
         ),
     }
     for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        # Both halves: the annotation still says "already-extracted value", and the body still
+        # does not read a key off it. The second is the load-bearing one — ``value: Any`` is
+        # exactly the annotation a helper that started subscripting its argument would keep.
         assert _mapping_parameters(functions[name][0]) == frozenset(), {
             "value_validator_now_takes_a_mapping": name,
             "hint": "it reads its own key now: move it to GATEWAY_MAPPING_READ_HELPERS",
+        }
+        assert not _reads_a_mapping_parameter(functions[name][0]), {
+            "value_validator_now_reads_a_key_off_its_argument": name,
+            "hint": "it carries a wire key of its own now: move it to "
+            "GATEWAY_MAPPING_READ_HELPERS and account for the key it reads",
         }
 
 
@@ -2545,37 +2984,36 @@ METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - {"reasoning_tokens"}
 
 
 def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
+    """Read through :func:`_dict_writes`, so this census fails closed like the two beside it.
+
+    It used to be bespoke: the ``AnnAssign`` literal plus constant-key subscript writes, and
+    *nothing else looked at*. That is the same fail-open shape :func:`_emitted_result_keys` had
+    already closed and :func:`_emit_data_keys` closed with it — a ``metrics_data.update({...})``
+    or a ``{**extra}`` in the literal reached the wire with no schema entry and no failure here.
+    """
+
     pump = _function_node("loop.py", "_apump_turn")
-    literals = [
-        _dict_keys(node.value)
-        for node in ast.walk(pump)
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "metrics_data"
-        and isinstance(node.value, ast.Dict)
-    ]
-    assert len(literals) == 1, {"metrics_data_literals": len(literals)}
-    conditional = {
-        node.targets[0].slice.value
-        for node in ast.walk(pump)
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Subscript)
-        and isinstance(node.targets[0].value, ast.Name)
-        and node.targets[0].value.id == "metrics_data"
-        and isinstance(node.targets[0].slice, ast.Constant)
+    written = _dict_writes(pump).get("metrics_data")
+    assert written is not None and len(written.literals) == 1, {
+        "metrics_data_literals": 0 if written is None else len(written.literals),
     }
-    assert literals[0] == METRICS_UPDATED_UNCONDITIONAL_KEYS, {
-        "emitted_always": sorted(literals[0]),
+    assert written.unreadable == (), {
+        "writes_the_census_cannot_read": sorted(written.unreadable),
+        "hint": "a contribution to metrics_data this census cannot resolve is a wire key with "
+        "no schema diff — teach _dict_writes about it rather than reporting the literal alone",
+    }
+    conditional = set(written.added)
+    assert written.literals[0] == METRICS_UPDATED_UNCONDITIONAL_KEYS, {
+        "emitted_always": sorted(written.literals[0]),
         "expected": sorted(METRICS_UPDATED_UNCONDITIONAL_KEYS),
     }
     # ``reasoning_tokens`` is added only when the adapter reported one, which is why it is the
     # single sub-count on this event and why it cannot be censused off the literal alone.
     assert conditional == {"reasoning_tokens"}, {"emitted_conditionally": sorted(conditional)}
     declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
-    assert (literals[0] | conditional) == declared, {
-        "emitted_not_declared": sorted((literals[0] | conditional) - declared),
-        "declared_not_emitted": sorted(declared - (literals[0] | conditional)),
+    assert written.keys == declared, {
+        "emitted_not_declared": sorted(written.keys - declared),
+        "declared_not_emitted": sorted(declared - written.keys),
     }
 
 
@@ -3884,6 +4322,25 @@ def _getattr_names(function: ast.AST) -> frozenset[str]:
     )
 
 
+def _attribute_reads_on(function: ast.AST, name: str) -> frozenset[str]:
+    """The attributes ``function`` reads straight off the local ``name`` — ``exc.retryable``.
+
+    The twin of :func:`_getattr_names`, and the reason a pin needs both. A census that collects
+    only the ``getattr(exc, "x", default)`` spelling pins the spelling and not the read: the
+    natural way to close a "this consumer never names the fact" gap is a plain
+    ``exc.config_recoverable``, which would leave a getattr-only pin green while the gap it
+    registers no longer exists.
+    """
+
+    return frozenset(
+        node.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+    )
+
+
 def test_gap_the_designed_consumer_of_config_recoverable_never_names_it() -> None:
     """Registered: reference/backend/session_drive.py:drive_open_session branches on retryable.
 
@@ -3916,10 +4373,18 @@ RECEIPT_ERROR_FACTS = frozenset(
 
 
 def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_sixth() -> None:
-    """Registered: the immutable record of a call cannot say the failure was config-fixable."""
+    """Registered: the immutable record of a call cannot say the failure was config-fixable.
+
+    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so today it
+    reaches every fact through ``getattr(exc, ..., default)`` — but the fix that closes this gap
+    is a one-line ``exc.config_recoverable`` on the ``ModelAdapterError`` branch, and a pin that
+    censuses the getattr form alone would stay green through it.
+    """
 
     with_error = _function_node("core/model_io.py", "with_error", within="ModelCallReceipt")
-    read = _getattr_names(with_error)
+    positional = [argument.arg for argument in with_error.args.args if argument.arg != "self"]
+    assert positional == ["exc"], {"with_error_parameters": positional}
+    read = _getattr_names(with_error) | _attribute_reads_on(with_error, "exc")
     assert read == RECEIPT_ERROR_FACTS, {
         "newly_read": sorted(read - RECEIPT_ERROR_FACTS),
         "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
@@ -4126,6 +4591,11 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
     ``result.error`` — the deliberately raw ``AgentRunResult.error`` — straight to an HTTP
     response. Pinned statically, because a value-level probe would need a whole finished run and
     the fact is which expression the branch names.
+
+    Pinned at *both* ends. The projection is one of the two places a filter could land: the HTTP
+    route hands what ``result()`` returns to ``_write_json`` unchanged, so a fix applied there
+    instead — filtering on the way out, or calling the projection through a wrapper — would
+    close the gap while a projection-only pin stayed green and the registry entry stayed.
     """
 
     projection = _function_node("reference/backend/projection.py", "result")
@@ -4142,6 +4612,26 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
     }
     assert "public_error_message" not in _names_in(projection), {
         "hint": "the projection filters now: drop the registry entry",
+    }
+    # The caller-side half: the route writes the projection's dict wholesale, so a filter added
+    # between ``result()`` and the wire flips this pin too rather than only the one above.
+    route = _function_node("reference/backend/http.py", "do_GET", within="make_backend_handler")
+    served_wholesale = [
+        ast.unparse(node.args[0])
+        for node in ast.walk(route)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_write_json"
+        and node.args
+        and "backend.result(" in ast.unparse(node.args[0])
+    ]
+    assert served_wholesale == ["backend.result(run_id, self._bearer_token())"], {
+        "how_the_route_writes_the_projection": served_wholesale,
+        "hint": "the route stopped writing result() unchanged: if that is the filter, drop the "
+        "registry entry; if it is not, the raw error still reaches the wire",
+    }
+    assert "public_error_message" not in _names_in(route), {
+        "hint": "the route filters now: drop the registry entry and pin the new behaviour",
     }
     # The two writers this branch disagrees with, so the asymmetry is asserted and not assumed.
     assert "public_error_message" in _names_in(
