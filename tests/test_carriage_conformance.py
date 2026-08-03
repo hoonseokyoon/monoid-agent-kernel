@@ -217,18 +217,29 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     CarriageGap(
         "success-envelope",
         "reasoning (frameless stream)",
-        "providers/gateway.py:_chunk_from_event",
+        # The carrier is the assembler, not the frame reader: ``_chunk_from_event`` is never
+        # called on this shape at all (there is no frame), so naming it pointed the entry at
+        # code the gap cannot reach. ``assemble_streamed_turn`` is where the tolerance lives --
+        # it reads reasoning off ``TurnComplete`` and nowhere else, so an absent terminal frame
+        # produces ``()`` there and the adapter's frameless drain
+        # (providers/gateway.py:astream_turn) returns without raising.
+        "providers/base.py:assemble_streamed_turn",
         "BY DESIGN, and the residue of the burn-down entry X-3 closed. The artifacts now ride "
         "both transports, but a stream that ends without a terminal frame has nowhere to put "
         "them: assemble_streamed_turn reads reasoning off TurnComplete and nowhere else, the "
         "deltas are a content channel with no end-of-turn metadata slot "
         "(reference/llm_gateway/http.py:_write_sse), and the SSE body simply ends on connection "
         "close. Exactly the wire status usage and turn_handle already have on that shape, and "
-        "tolerated the same way: the reader reads () and raises nothing. A run continuing over a "
-        "frameless hop re-derives nothing to replay, which is the loop's neutral case -- it "
-        "appends no reasoning block for an empty tuple. Deliberately NOT enforced as an absence: "
-        "a fail-closed proof for reasoning is the separate v0.21-track:B1 echo, and inventing a "
-        "metadata channel here would be a second protocol for one field",
+        "tolerated the same way: the assembler reads () and raises nothing. A run continuing "
+        "over a frameless hop re-derives nothing to replay, which is the loop's neutral case -- "
+        "it appends no reasoning block for an empty tuple. Deliberately NOT enforced as an "
+        "absence: a fail-closed proof for reasoning is the separate v0.21-track:B1 echo, and "
+        "inventing a metadata channel here would be a second protocol for one field. Asserted "
+        "by test_a_frameless_stream_reads_no_reasoning_and_does_not_fail "
+        "(tests/test_llm_gateway_backend.py), which drives a real frameless SSE body through "
+        "GatewayModelAdapter.astream_turn -- filtering the terminal frame out of a complete "
+        "stream and calling the assembler by hand skips the drain that decides what a frameless "
+        "body means, so it proved nothing about this gap",
         "by-design",
     ),
     # --- tool catalog ------------------------------------------------------------------
@@ -6058,7 +6069,16 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         "http_status",
         # X-3: the success envelope's reasoning key, bound to the paragraph that documents it
         # for the third-party clients this document is the contract for.
-        "reasoning",
+        #
+        # NOT the bare word "reasoning": this check is a whole-file substring scan, and the
+        # document already said "reasoning" fifteen times before X-3 added anything (the
+        # request-side reasoning block, the delta channels, the ZDR round-trip). A pin that is
+        # satisfied by prose the change did not write is not a pin -- deleting the entire new
+        # paragraph left it green. These two anchors exist nowhere in the document at
+        # release/v0.21.0 and exactly once in it now: the sentence that states the relay
+        # contract, and the response-envelope example that shows its shape.
+        "relayed verbatim",
+        '"reasoning": [{"type": "reasoning"',
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

@@ -1035,20 +1035,89 @@ def test_a_backend_that_cannot_stream_still_carries_its_reasoning() -> None:
     assert _chunk_from_event(terminal).reasoning == upstream.items
 
 
-def test_a_frameless_stream_reads_no_reasoning_and_does_not_fail() -> None:
+def _frameless_sse_adapter(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str]
+) -> GatewayModelAdapter:
+    """A gateway whose SSE body ends cleanly after its deltas -- no ``turn_complete`` frame.
+
+    The fake server is at the transport, not at the parser, because that is the only way to
+    reach the adapter's own frameless drain: filtering the terminal frame out of a complete
+    stream and calling ``assemble_streamed_turn`` by hand exercises the assembler and skips
+    every line of ``astream_turn`` that decides what a frameless body means.
+    """
+
+    httpx = pytest.importorskip("httpx")
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def aiter_lines(self):
+            for line in lines:
+                yield line
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> object:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return GatewayModelAdapter(config=ModelConfig(gateway_url="http://gateway.test"))
+
+
+def test_a_frameless_stream_reads_no_reasoning_and_does_not_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Registered by-design: a stream with no terminal frame has nowhere to carry the items.
 
     Tolerated as ``()``, exactly like ``usage`` and the turn handle on the same shape. A run
     continuing over such a hop simply re-derives nothing to replay, which the loop already
     treats as the neutral case (no reasoning block is appended for an empty tuple).
+
+    Driven through the real ``astream_turn`` drain, which is the code the registered gap names.
+    The reasoning *deltas* in the body are the point of the second assertion: a stream can
+    narrate its thinking and still hand back no replayable artifact, because the text channel
+    and the opaque items are two different things and only the terminal frame carries the
+    second one.
     """
 
-    gateway, token, _upstream = _reasoning_gateway()
-    frames = list(gateway.handle_turn_stream(token, _payload()))
-    deltas = [frame for frame in frames if frame["type"] != "turn_complete"]
-    assert deltas, "the fixture must produce frames before the terminal one"
-    chunks = [_chunk_from_event(frame) for frame in deltas]
-    assert assemble_streamed_turn([c for c in chunks if c is not None]).reasoning == ()
+    adapter = _frameless_sse_adapter(
+        monkeypatch,
+        [
+            'data: {"type":"reasoning_delta","text":"thinking"}',
+            "",
+            'data: {"type":"text_delta","text":"answered"}',
+            "",
+        ],
+    )
+    request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=adapter.config
+    )
+
+    async def _collect() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    chunks = asyncio.run(_collect())
+    assert chunks and not any(isinstance(chunk, TurnComplete) for chunk in chunks)
+    turn = assemble_streamed_turn(chunks)
+    assert turn.reasoning == ()
+    assert turn.final_text == "answered"
+    # The rest of the frameless tolerance, stated beside it: the same shape loses the handle
+    # and the usage too, and synthesizes the stop reason.
+    assert (turn.response_id, turn.usage, turn.stop_reason) == (None, {}, "stop")
 
 
 @pytest.mark.parametrize(
@@ -1084,6 +1153,45 @@ def test_a_malformed_reasoning_value_is_refused_by_both_readers(malformed) -> No
     framed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(frame)).value
     assert framed.provider_error_code == "gateway_bad_response"
     assert framed.retryable is False
+
+
+def test_a_reasoning_tuple_is_accepted_by_both_readers() -> None:
+    """The half of the validator's tolerance nothing owned, so narrowing it stayed green.
+
+    ``_gateway_reasoning_items`` accepts a tuple beside a list for the reason ``tool_calls``
+    two dozen lines below it does: JSON only ever produces a list, but these readers also
+    serve in-process Python callers, and a sequence one array-valued key refuses while its
+    neighbour accepts it is a difference with no rule behind it. Every existing case fed a
+    list or a malformed value, so ``(list, tuple)`` -> ``list`` was an invisible change.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _gateway_reasoning_items
+
+    items = ({"type": "reasoning", "id": "rs_1"}, {"type": "reasoning", "id": "rs_2"})
+    accepted = _gateway_reasoning_items(items, context="response")
+    assert accepted == items and isinstance(accepted, tuple)
+
+    body = {
+        "protocol": "monoid.llm-turn.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": items,
+    }
+    assert _parse_gateway_response(dict(body)).reasoning == items
+
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": items,
+    }
+    assert _chunk_from_event(dict(frame)).reasoning == items
 
 
 class _CapturingReasoningUpstream(_OneShotReasoningBackend):
