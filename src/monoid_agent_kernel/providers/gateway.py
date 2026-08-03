@@ -830,6 +830,11 @@ def _gateway_reasoning_items(
     the *provider*, one hop and one turn later, as an unclassifiable request. Contents are not
     inspected past that -- they are opaque and provider-encrypted by construction.
 
+    A tuple is accepted beside a list for the same reason ``tool_calls`` accepts one two dozen
+    lines below: JSON only ever produces a list, but this reader also serves in-process Python
+    callers, and a sequence refused by one array-valued key of a body while its neighbour
+    accepts it is a difference with no rule behind it.
+
     Written once for both transports, like :func:`_validated_generation_echo` beside it: the
     sync response and the streamed terminal frame read the same key out of different envelopes,
     and a reader that is stricter than its twin is the shape this file keeps producing.
@@ -837,7 +842,7 @@ def _gateway_reasoning_items(
 
     if value is None:
         return ()
-    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+    if isinstance(value, (list, tuple)) and all(isinstance(item, dict) for item in value):
         return tuple(dict(item) for item in value)
     raise ModelAdapterError(
         f"LLM gateway returned invalid {context} reasoning: expected an array of objects",
