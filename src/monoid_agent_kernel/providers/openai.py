@@ -628,6 +628,11 @@ _PROVIDER_CODE_STATUS: dict[str, int] = {
 # Of the mapped codes, the ones a retry could actually clear (a true transient rate limit). A
 # quota/billing failure (``insufficient_quota``) is NOT here — retrying it is futile.
 _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded", "rate_limited"})
+# The 4xx statuses that are transient conditions rather than statements about the request:
+# 408 (request timeout) and 409 (conflict) clear on another attempt, so they are retryable and
+# never config-shaped — parking them told the operator to change configuration when waiting
+# was the remedy.
+_TRANSIENT_4XX_STATUSES = frozenset({408, 409})
 
 
 def _config_shaped_refusal(status: int | None, *, retryable: bool) -> bool:
@@ -640,7 +645,14 @@ def _config_shaped_refusal(status: int | None, *, retryable: bool) -> bool:
     re-derived from a status a later hop may no longer have.
     """
 
-    return not retryable and status is not None and 400 <= status < 500
+    # Excluded here as well as at the retryable assignment above it, so no caller of this
+    # predicate — present or future — can stamp a transient timeout/conflict as config-shaped.
+    return (
+        not retryable
+        and status is not None
+        and 400 <= status < 500
+        and status not in _TRANSIENT_4XX_STATUSES
+    )
 
 
 def _provider_retried_by_the_sdk(exc: Exception) -> bool:
@@ -739,7 +751,9 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     retried = _provider_retried_by_the_sdk(exc)
 
     if isinstance(status, int) and 400 <= status < 500:
-        retryable = status == 429 and code not in {"insufficient_quota"}
+        retryable = (
+            status == 429 and code not in {"insufficient_quota"}
+        ) or status in _TRANSIENT_4XX_STATUSES
         return ModelAdapterError(
             f"provider rejected the request (HTTP {status}{param_detail})",
             error_code="model_error",

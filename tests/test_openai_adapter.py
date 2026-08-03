@@ -72,6 +72,18 @@ def test_4xx_with_status_is_preserved_with_body_code() -> None:
     assert me.retryable is True  # a true rate limit can clear on retry
 
 
+@pytest.mark.parametrize("status", [408, 409])
+def test_transient_4xx_statuses_are_retryable_not_config_shaped(status: int) -> None:
+    """408/409 are timeout/conflict conditions a retry clears; classifying them non-retryable
+    sent the kernel to a park that tells the operator to change configuration, when backoff
+    is the remedy. The retryable flag and the config predicate must agree they are transient."""
+    me = _model_error_from_openai(_FakeApiError(status_code=status))
+    assert me.http_status == status
+    assert me.retryable is True
+    assert me.config_recoverable is False
+    assert _recoverable_turn_error(me) is True
+
+
 def test_unclassifiable_error_still_carries_a_nonempty_code() -> None:
     me = _model_error_from_openai(_FakeApiError())  # no status, no body
     assert me.provider_error_code == "unclassified_provider_error"
@@ -87,6 +99,10 @@ def test_unclassifiable_error_still_carries_a_nonempty_code() -> None:
         (_FakeApiError(status_code=404, body={"code": "model_not_found"}), True),
         # A 4xx a retry CAN clear is transient, not config-shaped — the two are exclusive.
         (_FakeApiError(status_code=429, body={"code": "rate_limit_exceeded"}), False),
+        # 408 (request timeout) and 409 (conflict) are transient server-side conditions:
+        # waiting is the remedy, so neither is a configuration defect to park on.
+        (_FakeApiError(status_code=408), False),
+        (_FakeApiError(status_code=409, body={"code": "conflict"}), False),
         # Quota is a 429 no retry clears, and fixing it is an account/config change.
         (_FakeApiError(status_code=429, body=_QUOTA_BODY), True),
         # 5xx is the upstream's problem, not the caller's request.

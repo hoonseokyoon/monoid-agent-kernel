@@ -260,6 +260,13 @@ out in commit messages and here.
   with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
   `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
   connection that dropped, and the status branches above already classify it).
+- **A 408/409 from the provider is transient, not a configuration defect.** The 4xx branch
+  recognized only 429 as retryable, so a request timeout (408) or conflict (409) came out
+  retryable=False — and the one config predicate then stamped `config_recoverable=True`,
+  parking the turn with a "change your configuration" answer for a condition that clears on
+  backoff. Both statuses are now retryable, and the predicate itself excludes them
+  (`_TRANSIENT_4XX_STATUSES`), so no present or future caller can claim config for a
+  transient 4xx.
 - **The SDK-retry probe classifies a request-less httpx error instead of crashing on it.**
   `httpx.HTTPError.request` is a *property that raises* `RuntimeError` when unset, and the one
   probe read outside a `try` swallowed only `AttributeError` — so a mid-stream network drop
