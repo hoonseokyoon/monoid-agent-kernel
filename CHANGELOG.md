@@ -139,15 +139,24 @@ out in commit messages and here.
   to backoff-retry. The classifier now has a connection-family branch — `openai_timeout` /
   `openai_network_error`, the direct adapter's spelling of the `*_timeout` / `*_network_error`
   pair every other transport uses — retryable, no claimed status, and still carrying the
-  retries the SDK itself spent on the family it retries most.
+  retries the SDK itself spent on the family it retries most. The family binds both spellings
+  of the drop: the SDK wraps transport failures into `APIConnectionError` only up to the
+  response headers (`_base_client._request`), and its streaming iterator has no translation at
+  all — so the identical drop mid-body raises the *raw* `httpx.ReadError` / `ReadTimeout` /
+  `RemoteProtocolError` into the classifier, where it fell past the new branch to the
+  unclassified tail and terminalized the flagship streaming lane. The raw families now answer
+  with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
+  `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
+  connection that dropped, and the status branches above already classify it).
 - **The SDK-retry probe classifies a request-less httpx error instead of crashing on it.**
   `httpx.HTTPError.request` is a *property that raises* `RuntimeError` when unset, and the one
   probe read outside a `try` swallowed only `AttributeError` — so a mid-stream network drop
-  (`ReadError` while consuming the body) reached the classifier and came out as a raw
-  `RuntimeError` in place of the classified error, which the gateway route then mapped to a
-  retryable 500: an unreadable probe *flipped a non-retryable failure to retryable*. The whole
-  read now sits in one guard with the probe's own stated policy — anything unreadable means
-  "no retry" — in the fully-covered style of `provider_usage_of`.
+  (`ReadError` while consuming the body, retryable connection family per the bullet above)
+  reached the classifier and came out as a raw `RuntimeError` in place of the classified
+  error, which the gateway route then mapped to an anonymous 500: the verdict was decided by
+  the probe's crash, not by the classification. The whole read now sits in one guard with the
+  probe's own stated policy — anything unreadable means "no retry" — in the fully-covered
+  style of `provider_usage_of`.
 - **The receipt constructor joins the four readers of the countable-int predicate.**
   `ModelCallReceipt.__post_init__` answered `isinstance(value, int)` where the four readers of
   one usage stamp (`provider_usage_of`, `_reported_error_usage`, `with_error`,

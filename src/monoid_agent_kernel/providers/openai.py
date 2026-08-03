@@ -685,15 +685,35 @@ def _connection_error_code(exc: Exception) -> str | None:
     this adapter the way ``openai_bad_response`` already is. Imported lazily like every other
     SDK touch in this module: an exception that could be one of these classes can only exist
     when the package is importable, so an absent SDK truthfully answers "not this family".
+
+    The raw ``httpx`` families are the same condition in its unwrapped spelling. The SDK
+    translates transport failures into ``APIConnectionError`` / ``APITimeoutError`` only up to
+    the response headers (``_base_client._request``, around ``client.send``); its streaming
+    iterator has no such translation, so a connection drop while the body streams raises the
+    raw ``httpx.ReadError`` / ``ReadTimeout`` / ``RemoteProtocolError`` into this classifier.
+    ``TimeoutException`` is itself a ``TransportError`` subclass (httpx 0.28), so the timeout
+    check must run first or every timeout would answer with the network code. Deliberately
+    ``TransportError`` and not all of ``HTTPError``: an ``httpx.HTTPStatusError`` sits outside
+    ``TransportError``, carries a real response, and a provider that answered is not a
+    connection that dropped — the status branches above already classify it by that response.
     """
 
     try:
         import openai
     except ImportError:  # pragma: no cover - an SDK exception implies the SDK
+        pass
+    else:
+        if isinstance(exc, openai.APITimeoutError):
+            return "openai_timeout"
+        if isinstance(exc, openai.APIConnectionError):
+            return "openai_network_error"
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - an httpx exception implies httpx
         return None
-    if isinstance(exc, openai.APITimeoutError):
+    if isinstance(exc, httpx.TimeoutException):
         return "openai_timeout"
-    if isinstance(exc, openai.APIConnectionError):
+    if isinstance(exc, httpx.TransportError):
         return "openai_network_error"
     return None
 

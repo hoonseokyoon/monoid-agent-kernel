@@ -174,15 +174,75 @@ def test_a_requestless_transport_error_is_classified_not_replaced() -> None:
     replaced a classified mid-stream failure (a ``ReadError`` while consuming the body) with a
     raw ``RuntimeError`` the loop cannot classify at all. A real request-less httpx error, not a
     fake: the fake cannot raise from a property the way the real class does.
+
+    The classification itself is the connection family: this is the same connection drop the
+    SDK spells ``APIConnectionError`` when it lands before the response headers, so it carries
+    the same code and the same remedy (another attempt), request or no request.
     """
 
     httpx = pytest.importorskip("httpx")
     dropped = httpx.ReadError("connection dropped while reading the body")
     me = _model_error_from_openai(dropped)
-    assert me.provider_error_code == "unclassified_provider_error"
-    assert me.retryable is False
+    assert me.provider_error_code == "openai_network_error"
+    assert me.retryable is True
     assert me.provider_retried is False
     assert me.http_status is None
+
+
+def test_a_raw_mid_stream_transport_drop_joins_the_connection_family() -> None:
+    """The SDK wraps transport failures only up to the response headers — not during the body.
+
+    openai 2.41.1 translates ``httpx`` transport errors into ``APIConnectionError`` /
+    ``APITimeoutError`` around ``client.send`` (``_base_client._request``); ``_streaming.py``
+    has no such translation, so a connection drop while iterating the stream raises the *raw*
+    ``httpx`` exception into the classifier boundary. The identical drop one moment earlier —
+    before headers — arrived wrapped and parked recoverably; mid-stream it fell to the
+    unclassified tail and terminalized the run. Same condition, same verdict, both spellings:
+    ``httpx.TimeoutException`` is itself a ``TransportError`` subclass, so the timeout check
+    must run first or every timeout would classify as the network code.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    for raw, expected_code in [
+        (httpx.ReadError("connection dropped mid-body"), "openai_network_error"),
+        (httpx.RemoteProtocolError("peer closed connection"), "openai_network_error"),
+        (httpx.ReadTimeout("no bytes before the read timeout"), "openai_timeout"),
+    ]:
+        me = _model_error_from_openai(raw)
+        assert me.provider_error_code == expected_code, type(raw).__name__
+        assert me.retryable is True, type(raw).__name__
+        assert me.http_status is None, type(raw).__name__
+        assert me.config_recoverable is False, type(raw).__name__
+        # The flag the classification exists to reach: the loop keeps the session alive.
+        assert _recoverable_turn_error(me) is True, type(raw).__name__
+
+
+def test_an_exception_carrying_a_status_outranks_the_connection_family() -> None:
+    """Branch order: a real response always outranks the exception's class.
+
+    ``openai.APIStatusError`` carries ``status_code`` and must keep hitting the status
+    branches above the connection branch. And the one raw ``httpx`` exception that carries a
+    response — ``HTTPStatusError``, which is *not* a ``TransportError`` — classifies by that
+    response's status too (the ``.response`` fallback read), never as a transport drop: a
+    provider that answered 502 is not a connection that dropped.
+    """
+
+    openai = pytest.importorskip("openai")
+    httpx = pytest.importorskip("httpx")
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(502, request=request)
+
+    sdk = _model_error_from_openai(openai.APIStatusError("boom", response=response, body=None))
+    assert sdk.http_status == 502
+    assert sdk.retryable is True  # the 5xx branch, not the connection branch
+    assert sdk.provider_error_code not in {"openai_network_error", "openai_timeout"}
+
+    raw = _model_error_from_openai(
+        httpx.HTTPStatusError("bad gateway", request=request, response=response)
+    )
+    assert raw.http_status == 502
+    assert raw.retryable is True
+    assert raw.provider_error_code not in {"openai_network_error", "openai_timeout"}
 
 
 def test_the_connection_family_parks_recoverably_like_the_gateway_twin() -> None:
