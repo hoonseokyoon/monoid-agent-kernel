@@ -7,6 +7,39 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — round three: the stamp is read wherever it lands, and the frame stops splitting
+
+- **A refused call's cost reaches the ledger whatever type the refusal is.** The receipt and the
+  run's budget read the stamp off *any* exception; the reference gateway's tenant meter and both
+  of its error writers inspected only a `ModelAdapterError` — and on that route the refusals
+  that matter are not one. The OpenAI stream never runs the mapping that classifies, so every
+  refusal in its terminal region is a raw `ValueError`/`AttributeError`, and the sync reader has
+  one raw shape too (`normalize_usage` says "malformed usage" with a `ValueError`). An upstream
+  whose final payload was malformed therefore charged the tenant nothing, answered with an
+  envelope saying the call was free, and came back `gateway_server_error` with `retryable: true`
+  — an invitation to buy the same tokens again. The meter now charges off any escaping
+  `Exception` through one writer (meter-then-reraise: nothing swallowed, nothing reclassified,
+  `GeneratorExit` deliberately not caught), and `usage` rides *every* arm of `_write_exception`
+  and `_stream_error_frame` rather than the classified arm alone. Omit-when-empty is unchanged,
+  so a failure raised before a provider keeps its exact wire shape.
+- **The SSE frame writer escapes the three characters its readers call line breaks.** Frames
+  were serialized with `ensure_ascii=False`, so U+2028, U+2029 and U+0085 reached the wire as
+  themselves — and the line-splitting readers clients use (httpx's `aiter_lines`, which this
+  project's own `GatewayModelAdapter` reads a stream with) break on all three. The frame arrived
+  truncated mid-string and the client reported `gateway_bad_response` with no usage for a turn
+  the server had produced, framed and already metered. `final_text` could always carry one; the
+  relayed `reasoning` array made it reachable from plaintext that need never appear in the
+  answer. `ensure_ascii=True` on the SSE writer only — the length-delimited body is framed by
+  `Content-Length`, cannot be split by a character, and keeps its smaller encoding. Same JSON,
+  spelled so a line protocol can carry it.
+- **(tests) The gateway helper-home registry fails loudly for the next shared helper.** A
+  wire-reading helper defined in another module and left unregistered was dropped from discovery
+  as unreachable, so the keys it reads stopped being counted on both sides of every pinned
+  read-set. Homes are derived from the module's own imports now and diffed against the hand map.
+- **`docs/OBSERVABILITY.md` names the fourth surface that sets the relayed provider.** It listed
+  three where `docs/CONTRACTS.md` lists four; `StudioConfig(llm_gateway_provider=...)` is the
+  one a reader of that section is most likely to be holding.
+
 ### Fixed — round two: the cost rule reaches the readers it was written for
 
 - **Every per-key refusal off a billed *error* envelope now carries its cost, on all three
@@ -31,7 +64,10 @@ out in commit messages and here.
   not exotic), so the gateway wrote `usage: {}` and metered zero for a turn OpenAI billed. The
   streamed twin is a separate construction — the stream folds deltas and reads end-of-turn
   metadata off `response.completed`, never running the one-shot mapping — and now carries the
-  same rule at its own seam. The lenient reader is one function for both adapters
+  same rule at its own seam. Its refusals are raw `ValueError`/`AttributeError`, which is why
+  that seam catches `Exception`; the consumers one hop out were widened to match in the same
+  release (above), so the stamp is read wherever it lands rather than only where the failure had
+  already been classified. The lenient reader is one function for both adapters
   (`providers/_common.usage_reported_by`); well-formed paths are unchanged.
 - **`resolved_provider_name` no longer answers nothing on its tolerance path.** It is documented
   as one expression so the model-stream context, `run.started` and the receipt-derived span
