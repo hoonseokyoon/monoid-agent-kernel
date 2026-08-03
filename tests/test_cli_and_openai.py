@@ -29,6 +29,10 @@ from monoid_agent_kernel.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
+from monoid_agent_kernel.providers._common import (
+    prune_dead_reasoning,
+    reasoning_replay_window_start,
+)
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
@@ -667,6 +671,113 @@ def test_openai_reasoning_all_or_nothing_on_mixed_active_window() -> None:
         {"role": "tool", "call_id": "c_b", "content": {"ok": True}},
     )
     assert _reasoning_replay_flags(messages, "gpt-5.5") == [False, False, False, False, False]
+
+
+# --- the active window as ONE rule, and the prune the kernel builds on it ---------------------
+
+
+@pytest.mark.parametrize(
+    ("roles", "expected_start"),
+    (
+        ((), 0),
+        # No user message at all: the whole log is the window (what the flag rule always said).
+        (("assistant", "tool"), 0),
+        (("user", "assistant", "tool"), 1),
+        (("user", "assistant", "tool", "user", "assistant", "tool"), 4),
+        # A trailing user message opens an empty window -- nothing after it yet.
+        (("user", "assistant", "user"), 3),
+    ),
+)
+def test_the_replay_window_start_is_the_rule_the_flags_are_built_from(
+    roles: tuple[str, ...], expected_start: int
+) -> None:
+    """One definition of "active window", read by both halves that depend on it.
+
+    The adapter decides what to REPLAY from it and the kernel decides what to SEND into it; two
+    copies of the same index arithmetic is exactly the twin-drift this repo keeps paying for, so
+    the rule lives in one function and this pins the flags to it rather than to a hand-copy.
+    """
+
+    messages = tuple({"role": role, "content": ""} for role in roles)
+    assert reasoning_replay_window_start(messages) == expected_start
+    assert _reasoning_replay_flags(messages, "gpt-5.5") == [
+        index >= expected_start for index in range(len(messages))
+    ]
+
+
+def _two_window_conversation(historical_model: str = "gpt-5.5") -> tuple[dict, ...]:
+    """Two user turns: an assistant block outside the window, and one inside it."""
+    return (
+        {"role": "user", "content": "u1"},
+        _assistant_with_reasoning(
+            historical_model, [_RS_A, _FC_A], [{"id": "c_a", "name": "fs_read", "arguments": {}}]
+        ),
+        {"role": "tool", "call_id": "c_a", "content": {"ok": True}},
+        {"role": "user", "content": "u2"},
+        _assistant_with_reasoning(
+            "gpt-5.5", [_RS_B, _FC_B], [{"id": "c_b", "name": "text_search", "arguments": {}}]
+        ),
+        {"role": "tool", "call_id": "c_b", "content": {"ok": True}},
+    )
+
+
+def test_pruning_a_dead_reasoning_block_drops_it_only_outside_the_window() -> None:
+    messages = _two_window_conversation()
+    pruned = prune_dead_reasoning(messages)
+
+    assert "reasoning" not in pruned[1], "the historical block is unreachable — drop it"
+    assert pruned[4]["reasoning"] == messages[4]["reasoning"], "the live one must survive"
+    # Nothing else about the log may change: only that one key leaves.
+    assert pruned[1] == {k: v for k, v in messages[1].items() if k != "reasoning"}
+    assert [pruned[i] for i in (0, 2, 3, 5)] == [messages[i] for i in (0, 2, 3, 5)]
+    # The caller's log is untouched — the prune builds the wire copy, it does not mutate.
+    assert messages[1]["reasoning"]["items"] == [_RS_A, _FC_A]
+
+
+def test_the_openai_input_is_byte_identical_once_a_block_leaves_the_window() -> None:
+    """The safety proof for the prune: what the provider SEES does not change.
+
+    Outside the window ``_message_to_input_items`` takes the reconstruction branch whether or
+    not the key is there (the replay flag is False, and the flag is all it reads), so removing
+    it can only remove bytes from the request — never items from the input.
+    """
+
+    messages = _two_window_conversation()
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+
+    def payload_for(log: tuple[dict, ...]) -> dict:
+        return adapter._payload(
+            ModelRequest(instruction=None, system_prompt="", tools=(), messages=log)
+        )
+
+    assert payload_for(prune_dead_reasoning(messages)) == payload_for(messages)
+    # And the prune really did remove something the un-pruned request was still paying for.
+    assert "enc_a" in json.dumps(messages)
+    assert "enc_a" not in json.dumps(prune_dead_reasoning(messages))
+    assert "enc_b" in json.dumps(prune_dead_reasoning(messages))
+
+
+def test_a_dead_block_cannot_poison_the_window_before_or_after_the_prune() -> None:
+    """The one way this could have gone wrong: the all-or-nothing rule reads only the window.
+
+    A historical block tagged with a *different* model is already ignored, so pruning it must
+    not flip the live window's decision either way. If the model-identity scan ever widened to
+    the whole log, the prune would silently start changing what is replayed — this fails first.
+    """
+
+    messages = _two_window_conversation(historical_model="gpt-4o")
+    pruned = prune_dead_reasoning(messages)
+
+    assert _reasoning_replay_flags(pruned, "gpt-5.5") == _reasoning_replay_flags(messages, "gpt-5.5")
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    replayed = [
+        item
+        for item in adapter._payload(
+            ModelRequest(instruction=None, system_prompt="", tools=(), messages=pruned)
+        )["input"]
+        if item.get("type") == "reasoning"
+    ]
+    assert replayed == [_RS_B]
 
 
 @pytest.mark.skipif(

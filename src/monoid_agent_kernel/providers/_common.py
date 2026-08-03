@@ -7,6 +7,7 @@ common pieces here so the two adapters cannot drift.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
@@ -39,6 +40,47 @@ def build_generation_payload(generation: GenerationConfig) -> dict[str, Any]:
     if generation.max_output_tokens is not None:
         payload["max_output_tokens"] = generation.max_output_tokens
     return payload
+
+
+def reasoning_replay_window_start(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Index of the first message in the ACTIVE REPLAY WINDOW: one past the last ``user`` entry.
+
+    Captured provider reasoning can only be replayed while it sits inside this window — the
+    in-flight tool loop. Once a new user message lands, every earlier block is outside the
+    window, and it stays outside forever because the window only ever moves forward.
+
+    Two halves depend on that one fact and they must not drift: the OpenAI adapter decides what
+    to REPLAY out of the window (``_reasoning_replay_flags``), and the kernel decides what is
+    still worth SENDING into it (:func:`prune_dead_reasoning`). A log with no user message at
+    all is entirely window (start ``0``), which is what the replay rule always did.
+    """
+    start = 0
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            start = index + 1
+    return start
+
+
+def prune_dead_reasoning(messages: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Drop the ``reasoning`` key from every message BEFORE the active replay window.
+
+    Outside the window the block is unreachable: the adapter reconstructs those turns from
+    ``content``/``tool_calls`` and never reads it. Sending it anyway is pure cost, and cost that
+    grows with the conversation — one dead block per user turn, re-sent on every later request,
+    counted against the wire-byte cap and the receiving server's body limit.
+
+    This builds the ephemeral wire copy; the caller's messages are never mutated and the durable
+    log keeps every block verbatim (see ``docs/CONTRACTS.md``). Messages that keep their block
+    are passed through by identity, so the copy is cheap on the common short conversation.
+    """
+    start = reasoning_replay_window_start(messages)
+    pruned: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index < start and "reasoning" in message:
+            pruned.append({key: value for key, value in message.items() if key != "reasoning"})
+        else:
+            pruned.append(message)
+    return tuple(pruned)
 
 
 def text_from_message_content(content: Any) -> str:

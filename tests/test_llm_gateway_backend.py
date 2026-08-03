@@ -1209,6 +1209,12 @@ class _CapturingReasoningUpstream(_OneShotReasoningBackend):
     The recording is the whole point: the round-trip is only real if the items the gateway
     relayed come back *up* the same hop, tagged, inside the by-value message log the upstream
     adapter reads.
+
+    The first turn asks for a tool rather than settling, so the second call the loop makes is
+    still inside the SAME active window (no new user message between them). That is the shape
+    the round-trip exists for -- the in-flight tool loop -- and the only shape in which a
+    replayed block is reachable at all: past a fresh user message the upstream's own replay rule
+    ignores it, and the kernel now prunes it off the wire for that reason.
     """
 
     def next_turn(self, request):
@@ -1216,10 +1222,12 @@ class _CapturingReasoningUpstream(_OneShotReasoningBackend):
         if len(self.requests) == 1:
             return ModelTurn(
                 response_id="provider_response_1",
-                final_text="thought about it",
+                tool_calls=(
+                    ToolCall(id="c1", name="fs_write", arguments={"path": "A.md", "content": "x"}),
+                ),
                 usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
                 reasoning=self.items,
-                stop_reason="stop",
+                stop_reason="tool_calls",
             )
         return ModelTurn(
             response_id="provider_response_2",
@@ -1263,7 +1271,6 @@ def test_the_reasoning_round_trip_survives_the_gateway_hop_end_to_end(tmp_path: 
         )
         loop.open()
         loop.submit("first")
-        loop.submit("second")
         loop.close()
 
     assert len(upstream.requests) == 2, "the loop must have driven two turns over the hop"
@@ -1281,6 +1288,50 @@ def test_the_reasoning_round_trip_survives_the_gateway_hop_end_to_end(tmp_path: 
         "model": "gpt-5.5",
         "items": [dict(item) for item in upstream.items],
     }
+
+
+def test_the_gateway_wire_stops_carrying_reasoning_a_new_user_turn_killed(tmp_path: Path) -> None:
+    """The other side of the same window, over the same real hop.
+
+    Once a user message lands, everything before it is outside the replay window forever — the
+    upstream reconstructs those turns from ``content``/``tool_calls`` and never looks at their
+    captured block. Sending them anyway is pure cost, and it is cost that grows with the length
+    of the conversation and crosses TWO hops here (loop → gateway → upstream). The relayed
+    request must carry the assistant turn and none of its dead reasoning.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    manager = _token_manager()
+    upstream = _CapturingReasoningUpstream()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        loop = AgentLoop(
+            spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config("fs.write", model=config)),
+        )
+        loop.open()
+        loop.submit("first")  # two upstream calls: the tool loop, still one window
+        loop.submit("second")  # a new window — the first turn's block is now unreachable
+        loop.close()
+
+    assert len(upstream.requests) == 3
+    third = upstream.requests[2].messages or ()
+    assistants = [message for message in third if message.get("role") == "assistant"]
+    assert assistants, "the assistant turns themselves still ride by value"
+    assert all("reasoning" not in message for message in assistants)
+    assert "enc_1" not in json.dumps(list(third))
 
 
 def test_the_gateway_call_is_attributed_to_the_upstream_it_relays() -> None:

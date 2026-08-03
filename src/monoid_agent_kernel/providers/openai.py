@@ -18,6 +18,7 @@ from monoid_agent_kernel.providers._common import (
     build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
+    reasoning_replay_window_start,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -971,23 +972,25 @@ def _reasoning_replay_flags(messages: tuple[dict[str, Any], ...], current_model:
     Two rules (see the DX-13a plan):
     - **Active window only**: reasoning is mandatory to round-trip only since the last ``user``
       message (the in-flight tool loop). Earlier reasoning is historical and droppable — OpenAI
-      tolerates historical function_call pairs without their reasoning.
+      tolerates historical function_call pairs without their reasoning. The window itself is
+      :func:`reasoning_replay_window_start`, shared with the kernel's wire prune so the rule
+      that decides what may be REPLAYED and the rule that decides what is worth SENDING are one
+      definition rather than two copies of the same index arithmetic.
     - **All-or-nothing model identity**: ``config.model`` is re-read every step, so a hot-swap
       can land mid-loop. If any active-window reasoning block isn't ``openai`` at the current
       model, drop reasoning for the whole window so we never send a half-paired set (→ no 400).
+      Deliberately scoped to the window: a block the window does not contain cannot influence
+      it, which is what lets the kernel prune historical blocks without changing this answer.
     """
-    last_user = -1
-    for index, message in enumerate(messages):
-        if message.get("role") == "user":
-            last_user = index
+    window_start = reasoning_replay_window_start(messages)
     window_ok = True
-    for message in messages[last_user + 1 :]:
+    for message in messages[window_start:]:
         reasoning = message.get("reasoning")
         if isinstance(reasoning, dict) and reasoning.get("items"):
             if reasoning.get("provider") != "openai" or reasoning.get("model") != current_model:
                 window_ok = False
                 break
-    return [index > last_user and window_ok for index in range(len(messages))]
+    return [index >= window_start and window_ok for index in range(len(messages))]
 
 
 def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
@@ -998,10 +1001,16 @@ def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
     by-value request; dropping or reordering them yields a ``required following item`` 400.
     Capturing the exact subsequence verbatim — rather than reconstructing items from the parsed
     ``tool_calls``/``final_text`` — is the only construction that survives parallel/interleaved
-    tool calls and reasoning→message pairings. The opaque payload (``encrypted_content`` etc.)
+    tool calls and reasoning→message pairings. The encrypted payload (``encrypted_content`` etc.)
     is preserved; only the output-only ``status`` field is dropped, since the Responses *input*
     schema rejects it (``Unknown parameter: input[..].status``). Returns ``()`` when the turn
     carried no reasoning (non-reasoning models are untouched).
+
+    Only the ``reasoning`` entries are ciphertext. The pairing requirement means a ``message``
+    entry (the model's plaintext answer) and a ``function_call`` entry (plaintext arguments)
+    come along with them, so the captured tuple duplicates content that also reaches
+    ``final_text``/``tool_calls`` — it is model content for redaction and logging purposes, not
+    an opaque blob, wherever it is written (wire, ledger, event, checkpoint).
     """
     captured: list[dict[str, Any]] = []
     has_reasoning = False
