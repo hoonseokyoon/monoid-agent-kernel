@@ -471,6 +471,14 @@ def _closed_limited_run(run_root: Path, workspace: Path, adapters: list) -> tupl
     )
     run_id = submission.run_id
     assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
+    # ``wait_for_run`` answers off the record, which the drive marks LIMITED at the park
+    # promotion — BEFORE ``aclose()`` appends ``run.finished`` to events.jsonl. Reading the
+    # event log immediately after it lost that race once on a coverage-slowed CI box, so wait
+    # for the close's durable statement too before handing the dir to the caller.
+    deadline = time.monotonic() + 20
+    while _finished_count(run_root, run_id) < 1:
+        assert time.monotonic() < deadline, "run.finished never reached events.jsonl"
+        time.sleep(0.05)
     stored = backend.checkpoint_store.latest(run_id)
     assert stored is not None and stored.checkpoint.terminal is False  # the resurrection bait
     assert not (run_root / run_id / "failure.json").exists()
