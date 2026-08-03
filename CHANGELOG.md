@@ -7,18 +7,99 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a refused gateway turn still reports what it cost
+
+- **Every per-key refusal off a *validated success* envelope now carries the usage the envelope
+  reported.** The contract says it plainly — "A refused turn was still generated and billed, so
+  the refusal carries the usage the provider reported … on both transports" — and the rule was
+  bound to two of the places that raise it: the 200 *error* envelope, and the terminal frame's
+  `generation_applied`/`schema_applied` echo pair. Every other key of the same two envelopes
+  escaped unstamped, so a body or a `turn_complete` frame that reported spending tokens and was
+  then refused for a malformed `stop_reason`, `final_text`, `turn_handle`/`response_id`,
+  `tool_calls`, `retryable`, `provider_retried` — or the newly added `reasoning`, which
+  inherited the miss the day it shipped — left the run's cumulative token budget and its
+  `metrics.updated` at zero for a call the provider charged for. A budget that skips refused
+  calls is not a bound. Bound at the seam rather than per key, so the next wire key added to
+  either reader cannot repeat it; the lenient read is unchanged, so a body whose `usage` is
+  *itself* the malformed key stamps nothing rather than replacing the failure being reported.
+  No wire, schema or protocol change — the stamp already existed and now covers the payloads it
+  was written for.
+
+### Fixed — the upstream a gateway relays is configurable, and attribution agrees with itself
+
+- **`GatewayModelAdapter.provider_name` is reachable from the builders that ship.** It landed
+  configurable only by hand-constructing the adapter: neither `monoid run`'s `_model_adapter` nor
+  the backend's `build_model_adapter` could set it, so every deployment took the reference default
+  and a gateway fronting a different upstream mislabelled its reasoning tag and its spans with no
+  way to say otherwise. Adds `monoid run --llm-gateway-provider`, `monoid backend serve
+  --llm-gateway-provider`, and the `RunnerBackend(llm_gateway_provider=...)` field, all reading one
+  sentinel (`none` = the protocol's "do not tag"). The backend's value is applied inside
+  `build_model_adapter`, so the adapter recovery rebuilds after a restart inherits it instead of
+  reverting to the default. Deliberately not a `ModelConfig` field: it describes the deployment's
+  transport, not the agent, and that dataclass feeds `config_hash`.
+- **Agent Studio no longer attributes offline runs to OpenAI.** The relayed provider is decided at
+  the same site that decides the bundled gateway's upstream, so the offline echo model and any
+  injected provider factory tag nothing, while the `openai` deployment still reports `"openai"`.
+- **`OtelEventSink` stopped giving two answers for one call.** Its receipt-derived span read the
+  answering adapter's `provider_name`; its event-driven chat span read `run.started`'s
+  `model_provider`, filled from the raw `ModelConfig.provider` — so through the gateway the same
+  class reported the upstream in one configuration and the transport in another, and the
+  zero-argument form the docs teach was the disagreeing one. `run.started` now reports the provider
+  that actually serves the run (resolved by `resolved_provider_name(adapter, config)`, shared with
+  the model-stream context). No schema change; the transport stays recorded verbatim on
+  `manifest.json`.
+- **`ProviderNamedModelAdapter.provider_name` is typed `str | None`**, matching the shipped
+  `GatewayModelAdapter` field and the protocol's own documented "do not tag" sense.
+
+### Fixed — the request stops paying for reasoning the provider already discards
+
+- **Historical reasoning blocks are pruned from the wire.** The loop appended a captured
+  reasoning block to every assistant message and pruned none, while the rule that decides
+  whether a block is *replayable* lives in the OpenAI adapter: replay only inside the active
+  window — the messages after the last `user` message. A block outside that window is outside
+  forever, because the window only moves forward. Every user turn therefore added one dead
+  block and every later request re-sent all of them: on a four-user-turn conversation, ~97% of
+  the request's message bytes were payload the upstream provably throws away, growing
+  O(user_turns × payload) and paid twice on the gateway route. Requests are now built from a
+  wire copy with the key dropped from every message before the window start. What the provider
+  sees is unchanged and pinned as such — outside the window the adapter already reconstructed
+  those turns from `content`/`tool_calls`, and the model-identity scan reads only the window, so
+  a pruned log yields a byte-identical payload. `state.messages` and the checkpoint are
+  untouched: the durable record keeps every block verbatim. The window rule now exists once, in
+  `providers/_common.reasoning_replay_window_start`, read by both the adapter that decides what
+  to replay and the kernel that decides what to send. `prompt_digest` identifies the
+  conversation the model actually saw and so is taken over the pruned request.
+
+### Changed — the reasoning artifact array is documented as what it is
+
+- **Not opaque, and the redaction policy has to know.** The `reasoning` array was documented as
+  "already provider-encrypted, never interpreted". That holds for one of the three item types it
+  carries: the capture is the provider's verbatim output subsequence — reasoning items **plus**
+  the `message`/`function_call` items paired with them, because the provider validates that
+  adjacency on replay. A `message` entry is the model's plaintext answer and a `function_call`
+  entry is plaintext arguments, duplicating what `final_text`/`tool_calls` carry on the same
+  envelope. Anything that logs, previews, or truncates this value **must treat it as model
+  content**, or a surface that bounds `final_text` and dumps `reasoning` raw has bounded
+  nothing. It also roughly doubles a small body when populated. Docs and docstrings only.
+- **`reasoning` skew fails open on *absence*, not on malformed values.** A present value must be
+  an array of objects; a malformed one is refused non-retryably as `gateway_bad_response` by
+  both readers. One skew case worth naming: the same protocol uses `reasoning` on the *request*
+  body for the reasoning *config object*, so a third-party gateway echoing request keys back
+  answers an array-valued key with an object and trips that refusal.
+
 ### Added — the provider-native reasoning round-trip survives the gateway hop
 
 - **`reasoning` joins the LLM gateway success envelope, on both transports.** The kernel captures
-  a provider's opaque reasoning artifacts off a turn (`ModelTurn.reasoning`, carrying OpenAI's
+  a provider's native reasoning artifacts off a turn (`ModelTurn.reasoning`, carrying OpenAI's
   `encrypted_content`) and replays them verbatim on the next by-value turn — the ZDR reasoning
   round-trip DX-13a is built on. Through the gateway that loop was dead in the response
   direction: the server wrote the items to neither the sync body nor the terminal
   `turn_complete` frame, and neither client reader named the key, so a run routed through the
   gateway captured nothing and therefore replayed nothing. (The request direction always worked:
   `messages` ride by value and are forwarded verbatim to the upstream adapter.) The key is a
-  JSON array of the provider's own item objects, relayed untouched — they are already
-  provider-encrypted and this hop has no business interpreting them — written by one shared
+  JSON array of the provider's own item objects, relayed untouched — this hop has no business
+  interpreting them, though only the reasoning-type entries are encrypted (see the redaction
+  note above) — written by one shared
   server helper and read by one shared strict validator, so the two transports cannot come to
   disagree about the shape or about how strictly they refuse a malformed one. It is
   omit-when-empty and **response**-conditional: present only when the upstream produced
