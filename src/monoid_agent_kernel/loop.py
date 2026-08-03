@@ -1025,6 +1025,15 @@ class AgentLoop:
     capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
+    # Monotonic "this activation was torn down" fact. Set at exactly the sites that null
+    # ``_session`` on a teardown path — ``close()``, ``release_parked()``,
+    # ``discard_uncommitted()`` (the async facades all route through these) — and never by a
+    # successful ``open()``/``restore()``. It exists so an observer (``LoopSession._loop_is_dead``)
+    # can distinguish "not/not-yet opened" (``_session is None`` because bootstrap has not
+    # assigned it — including the backend's aopen window, where the loop is already findable)
+    # from "finalized" (``_session is None`` because teardown ran), instead of guessing from
+    # its own FSM state.
+    _finalized: bool = field(default=False, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
     _model_io_subscriptions_closed: bool = field(default=False, init=False, repr=False)
     # Core-owned per-run event loop for sync callers. Runs continuously on a dedicated
@@ -1838,6 +1847,7 @@ class AgentLoop:
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.
+            self._finalized = True
             self._session = None
             self._bootstrap_resources = None
             self._stream_sink = None
@@ -1879,6 +1889,9 @@ class AgentLoop:
             except BaseException:
                 pass
             raise
+        # The RUN stays durably resumable (a NEW loop restores the committed boundary); THIS
+        # activation is torn down, and deadness is a per-activation fact.
+        self._finalized = True
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1921,6 +1934,7 @@ class AgentLoop:
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
         self._close_model_io_subscriptions(resources)
+        self._finalized = True
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None

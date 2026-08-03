@@ -997,14 +997,23 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `session_state_from_run_status(status, error_code=..., terminal=...)` is the tolerant reader for
   older `status.json` payloads.
 - `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
-  re-derive `state` at each boundary. The blocking and pump halves share one terminal settle
+  re-derive `state` at each boundary. A fresh facade constructed over a loop that already has a
+  live session — a restored loop, or one opened before it was wrapped — seeds its state from
+  that session at construction (the terminal outcome for a terminal session, the last committed
+  park for a parked one, `idle` for an open-but-unpumped one), so `resume()`/`submit()` continue
+  a restored run where it parked; a fresh un-opened loop still yields `created`, and an
+  explicitly passed `_state` always wins over derivation. The blocking and pump halves share one
+  terminal settle
   precedence (cancelled first, then a terminal `status="limited"` to `limited`, else `failed`),
   so a budget-terminal or cancelled `submit()` answers exactly what `run_until_suspended` answers
   for the identical run. `inspect() -> SessionInspection` and `health() -> SessionHealth` are
   recomputed from live loop state on every call (never stale), and both bind to actual loop
   liveness: `can_accept_input` is `false` (and `alive` is `false`) whenever the loop can no
   longer pump — its session is terminal, or the activation was torn down by `close()` /
-  `release_parked()` / `discard_uncommitted()`. A `submit()`/`resume()` over a dead loop is
+  `release_parked()` / `discard_uncommitted()` (each records a loop-side finalization fact at
+  the same site where it drops the session). Deadness is that recorded fact, never a guess from
+  the facade's own state: a findable loop whose `open()` has not yet assigned its session — the
+  backend's `aopen` window — answers alive, not dead. A `submit()`/`resume()` over a dead loop is
   refused with the loop's own typed error (`run_not_open` / `run_terminal`) *before* any FSM
   write, so a refused pump never moves the facade; a `close()` that raises lands the facade on
   `failed` rather than leaving an input-accepting park state over the dead loop.

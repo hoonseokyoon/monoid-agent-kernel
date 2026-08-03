@@ -601,6 +601,11 @@ def test_a_close_that_raises_does_not_leave_an_accepting_park_over_a_dead_loop()
 
     class _ExplodingClosedLoop:
         _session = None
+        # Models AgentLoop.close's failure path faithfully: it runs discard_uncommitted()
+        # before re-raising, and that teardown sets the loop-side finalization fact deadness
+        # now derives from (a bare `_session is None` no longer means dead — the backend's
+        # aopen window looks exactly like that, milliseconds before the first pump).
+        _finalized = True
 
         def close(self) -> None:
             raise NativeAgentError("finalize failed", error_code="checkpoint_persist_failed")
@@ -626,6 +631,181 @@ def test_submit_before_open_raises_run_not_open_without_moving_the_fsm(tmp_path:
         session.submit("go")
     assert exc_info.value.error_code == "run_not_open"
     assert session.state is SessionState.CREATED
+
+
+# --- fresh-facade derivation + loop-side deadness (v0.21 burn-down, round 2) --------------
+
+
+def test_fresh_facade_over_a_restored_parked_loop_derives_its_state(tmp_path: Path) -> None:
+    """The facade's own restore story, which its docstring promised and its constructor broke:
+    a fresh ``LoopSession(loop2)`` over a restored paused loop reported CREATED, ``open()``
+    raised ``run_already_open``, and any pump raised ``illegal_session_transition``
+    created->running — the facade could not wrap the one loop shape restore produces. It now
+    derives its initial state from the restored session's last committed park."""
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    assert session.run_until_suspended("go").reason == "paused"
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    base2 = tmp_path / "workspace2"
+    base2.mkdir()
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=tmp_path / "runs", run_id=spec.run_id)
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop2.restore(record.checkpoint, blobs=record.blob)
+
+    resumed = LoopSession(loop2)  # no explicit _state: the state comes from the loop
+
+    assert resumed.state is SessionState.PAUSED
+    assert resumed.inspect().last_suspension_reason == "paused"
+    assert resumed.health().alive is True
+    settled = resumed.resume()  # PAUSED -> RUNNING -> AWAITING_INPUT, same as in-process
+    assert settled.reason == "settled"
+    assert resumed.state is SessionState.AWAITING_INPUT
+    result = resumed.close()
+    assert result.status == "completed"
+    assert resumed.state is SessionState.COMPLETED
+
+
+def test_fresh_facade_over_a_restored_terminal_loop_derives_the_terminal_state(
+    tmp_path: Path,
+) -> None:
+    """The terminal cell of the same derivation: a restored terminal-limited loop must come up
+    LIMITED (through the shared terminal precedence — a cancel would come up CANCELLED, a real
+    failure FAILED), report dead, and refuse a pump without moving the FSM."""
+    session = _terminal_limited_session(tmp_path)
+    session.open()
+    suspension = session.run_until_suspended("go")
+    # The session-cumulative budget parks reason="limited" and raises the terminal flag at the
+    # same boundary — the checkpoint carries terminal=True beside the limited park.
+    assert suspension.reason == "limited" and suspension.status == "limited"
+    live = session.loop._session
+    assert live is not None and live.terminal is True
+    spec = session.loop.spec
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    base2 = tmp_path / "workspace2"
+    base2.mkdir()
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=spec.run_root, run_id=spec.run_id)
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop2.restore(record.checkpoint, blobs=record.blob)
+
+    restored = LoopSession(loop2)
+
+    assert restored.state is SessionState.LIMITED
+    health = restored.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+    with pytest.raises(NativeAgentError) as exc_info:
+        restored.resume()
+    assert exc_info.value.error_code == "run_terminal"
+    assert restored.state is SessionState.LIMITED, "a refused pump must not move the facade"
+
+
+def test_fresh_facade_over_an_open_unpumped_loop_derives_idle(tmp_path: Path) -> None:
+    """A loop opened before it was wrapped (session present, no park yet) is IDLE, and the
+    normal flow continues from there byte-identically."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+
+    session = LoopSession(loop)
+
+    assert session.state is SessionState.IDLE
+    turn = session.submit("go")
+    assert turn.final_text == "hi"
+    assert session.state is SessionState.AWAITING_INPUT
+    result = session.close()
+    assert result.status == "completed"
+
+
+def test_a_fresh_unopened_loop_still_yields_created(tmp_path: Path) -> None:
+    """The constraint on the derivation: the normal path is untouched — no session, no
+    derivation, CREATED exactly as before."""
+    session = LoopSession(_loop(tmp_path, FakeModelAdapter(turns=[])))
+    assert session.state is SessionState.CREATED
+    session.open()
+    assert session.state is SessionState.IDLE
+
+
+def test_an_explicitly_seeded_state_is_not_overridden_by_derivation(tmp_path: Path) -> None:
+    """commands.py builds ``LoopSession(loop, _state=record.state)`` for inspect/health — an
+    explicitly passed state is the caller's (backend's) knowledge and derivation must not
+    fight it."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+    seeded = LoopSession(loop, _state=SessionState.RUNNING)
+    assert seeded.state is SessionState.RUNNING
+
+
+def test_health_during_the_backend_aopen_window_answers_alive(tmp_path: Path) -> None:
+    """The false-dead window: the backend attaches the loop (findable) before ``aopen``
+    finishes on its worker thread, and ``run.started`` sets record.state=RUNNING before
+    ``open()`` returns and assigns ``loop._session``. An HTTP-thread inspect/health facade
+    (``LoopSession(loop, _state=RUNNING)``) read ``_session is None`` + state != CREATED as
+    dead — alive=False/terminal=True for a run milliseconds from its first pump. Deadness is
+    now a loop-side finalization fact, and the window answers not-dead."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)  # never opened: _session is None, nothing finalized
+    window = LoopSession(loop, _state=SessionState.RUNNING)
+
+    health = window.health()
+    assert health.alive is True
+    assert health.can_accept_input is False  # RUNNING accepts no input — but it is not dead
+    assert window.inspect().terminal is False
+
+
+def test_a_closed_loop_is_dead_to_any_fresh_facade(tmp_path: Path) -> None:
+    """The other side of the same predicate: after ``close()`` nulls ``_session`` the loop is
+    finalized, and ANY facade over it — including a fresh one seeded with a live park state —
+    answers dead."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    session = LoopSession(loop)
+    session.open()
+    session.submit("go")
+    session.close()
+
+    fresh = LoopSession(loop, _state=SessionState.AWAITING_INPUT)
+    health = fresh.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+    assert fresh.inspect().terminal is True
+
+
+def test_discard_uncommitted_marks_the_loop_dead(tmp_path: Path) -> None:
+    """The second ``_session``-nulling teardown site carries the same finalization fact."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+    loop.discard_uncommitted()
+
+    fresh = LoopSession(loop, _state=SessionState.RUNNING)
+    assert fresh.health().alive is False
+    assert fresh.inspect().terminal is True
+
+
+def test_release_parked_marks_this_activation_dead(tmp_path: Path) -> None:
+    """The third site: ``release_parked`` leaves the RUN durably resumable (by a NEW loop via
+    restore), but THIS activation is torn down — a facade over it must answer dead."""
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    assert session.run_until_suspended("go").reason == "paused"
+    session.loop.release_parked()
+
+    fresh = LoopSession(session.loop, _state=SessionState.PAUSED)
+    assert fresh.health().alive is False
+    assert fresh.inspect().terminal is True
 
 
 # --- Step 5: status-vocabulary reconciliation ---------------------------------------------

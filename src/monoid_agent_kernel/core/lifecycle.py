@@ -25,7 +25,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.result import AgentTurnResult, Suspension
+from monoid_agent_kernel.core.result import (
+    AgentTurnResult,
+    Suspension,
+    suspension_from_checkpoint_payload,
+)
 from monoid_agent_kernel.errors import NativeAgentError, TurnNotSettled
 
 if TYPE_CHECKING:
@@ -371,13 +375,62 @@ class LoopSession:
     produces (a returned ``Suspension`` + the live ``_Session.terminal`` flag). ``_state``
     is a convenience cache for synchronous callers; ``inspect()`` always recomputes from
     live loop state. Nothing new is persisted — on restore a fresh facade derives its
-    state from the restored loop, never from a stored facade field.
+    state from the restored loop, never from a stored facade field: construction over a
+    loop that already has a live session (``restore()`` ran, or ``open()`` preceded the
+    wrap) seeds the FSM from that session — the terminal outcome for a terminal session,
+    the last committed park (``last_suspension``) for a parked one, ``IDLE`` for an
+    open-but-unpumped one — so ``resume()``/``submit()`` continue exactly where the pump
+    would. A fresh un-opened loop still yields ``CREATED``, and an explicitly passed
+    ``_state`` (the backend's ``LoopSession(loop, _state=record.state)``) always wins over
+    derivation.
     """
 
     loop: AgentLoop
     _state: SessionState = SessionState.CREATED
     _last_suspension: Suspension | None = None
     _cancel_reason: str = ""
+
+    def __post_init__(self) -> None:
+        # Seeding, not a transition: there is no prior state to validate an edge from (a
+        # restored park like AWAITING_INPUT has no legal CREATED-> edge, by design). Gated on
+        # the CREATED default so a caller-supplied state is never fought — and a loop with a
+        # live session is not CREATED in any truthful reading, so deriving in that one
+        # remaining case is strictly more honest than keeping the default.
+        if self._state is SessionState.CREATED:
+            derived = self._derive_initial_state()
+            if derived is not None:
+                self._state = derived
+
+    def _derive_initial_state(self) -> SessionState | None:
+        """The initial state of an already-activated loop, from what the loop exposes.
+
+        ``None`` — no live session — means "not opened here": stay CREATED. A terminal
+        session maps through the one shared terminal precedence (its ``RunState`` carries
+        the restored ``status``/``error_code``, which is also what a bootstrap-failure
+        session carries). A parked session maps its last committed park payload through the
+        same reader/projector the pump half uses — ``restore()`` rehydrates
+        ``last_suspension`` from the checkpoint, so this is precisely the boundary the run
+        parked at. A session with no park yet is open-but-unpumped: IDLE. (``getattr``
+        throughout: the facade also wraps test doubles that model only the slice they
+        exercise.)
+        """
+        session = getattr(self.loop, "_session", None)
+        if session is None:
+            return None
+        if getattr(session, "terminal", False):
+            state = getattr(session, "state", None)
+            return _terminal_outcome_state(
+                getattr(state, "status", "failed") or "failed",
+                getattr(state, "error_code", "") or "",
+            )
+        last = getattr(session, "last_suspension", None)
+        if isinstance(last, Mapping):
+            suspension = suspension_from_checkpoint_payload(last)
+            # Seed the facade's park cache too, so inspect() reports the restored
+            # last_suspension_reason / awaiting_task_ids instead of None over a parked run.
+            self._last_suspension = suspension
+            return state_from_suspension(suspension)
+        return SessionState.IDLE
 
     @property
     def state(self) -> SessionState:
@@ -404,16 +457,21 @@ class LoopSession:
     def _loop_is_dead(self) -> bool:
         """Whether the wrapped loop can no longer pump this run.
 
-        True when the live session is terminal, or when the activation was torn down
-        (``close()`` / ``discard_uncommitted()`` / ``release_parked()`` all null ``_session``)
-        after the facade left ``CREATED``. A ``CREATED`` facade with no session yet is
-        "not started", not dead. The one predicate behind ``health()``, ``inspect()``, the
-        pre-pump guard, and the close-failure landing — liveness answered per-call-site is how
-        the facade came to report alive-and-accepting over a dead loop.
+        True when the live session is terminal, or when the loop finalized this activation:
+        ``close()`` / ``discard_uncommitted()`` / ``release_parked()`` each set the loop's
+        monotonic ``_finalized`` flag at the same site where they null ``_session``. A loop
+        with no session that never finalized is "not started yet", not dead — regardless of
+        the facade's own state: the previous ``state is not CREATED`` heuristic read the
+        backend's aopen window (loop attached and findable, ``run.started`` already recorded
+        RUNNING, ``open()`` yet to assign ``_session`` on its worker thread) as dead, and a
+        health probe answered alive=False/terminal=True for a run milliseconds from its
+        first pump. The one predicate behind ``health()``, ``inspect()``, and the
+        close-failure landing — liveness answered per-call-site is how the facade came to
+        report alive-and-accepting over a dead loop.
         """
         session = self.loop._session
         if session is None:
-            return self._state is not SessionState.CREATED
+            return bool(getattr(self.loop, "_finalized", False))
         return bool(session.terminal)
 
     def _require_pumpable(self) -> None:

@@ -7,6 +7,30 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the facade wraps what restore produces, and deadness is a recorded fact
+
+- **`LoopSession` can wrap a restored loop, as its docstring always promised.** A fresh
+  `LoopSession(loop)` over a restored parked loop reported `created`; `open()` raised
+  `run_already_open`, and any pump crashed the FSM (`illegal_session_transition`
+  created->running) — the facade's own embedder contract had no restore story (the backend
+  drives loops directly, so only the facade lane was broken). Construction now derives the
+  initial state from the wrapped loop when no explicit `_state` is passed: a terminal session
+  maps through the shared terminal precedence, a parked session maps its rehydrated
+  `last_suspension` through the same checkpoint reader + pump projector (also seeding
+  `inspect()`'s last-park view), and an open-but-unpumped session is `idle`. A fresh un-opened
+  loop still yields `created`, and the backend's explicit `LoopSession(loop, _state=record.state)`
+  seeding is untouched.
+- **`health()` no longer answers dead during the backend's `aopen` window.** Between
+  `attach_loop` (loop findable, `run.started` already recorded RUNNING) and `open()` assigning
+  `loop._session` on its worker thread, an HTTP-thread inspect/health facade read
+  `_session is None` + state != `created` as dead — alive=False/terminal=True for a run
+  milliseconds from its first pump. `AgentLoop` now records a monotonic finalization fact
+  (`_finalized`) at exactly the sites that tear the activation down — `close()`,
+  `release_parked()`, `discard_uncommitted()` (the async facades and every failure path route
+  through these; `restore()` never sets it) — and `_loop_is_dead()` is `session.terminal` OR
+  (no session AND finalized). The window answers alive; every previously closed cell (post-close
+  park facade, close-that-raises, pre-close terminal-limited) still answers dead.
+
 ### Fixed — a closed run stays closed, a cancel is a cancel, and every abandoned run reaches the ledger
 
 - **Recovery no longer resurrects a closed LIMITED run.** A run that closed limited (e.g.
