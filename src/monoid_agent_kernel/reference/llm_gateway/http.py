@@ -94,12 +94,22 @@ def make_llm_gateway_handler(
                 raise PermissionDenied("invalid admin token")
 
         def _write_exception(self, exc: Exception) -> None:
+            # What the failing call already cost, read once and carried by EVERY arm rather than
+            # by the classified one alone. The stamp does not belong to a type: the adapter that
+            # sees the provider's billed body first refuses in raw ``ValueError``/``AttributeError``
+            # as readily as in ``ModelAdapterError`` (``normalize_usage``, and the whole terminal
+            # region of the OpenAI stream), and those land on the ``ValueError`` and the generic
+            # arms below -- which wrote no ``usage`` at all, so the client one hop out recorded
+            # zero for a turn the upstream generated and billed. ``_error_body`` omits the key
+            # when it is empty, so the arms that never carry a cost keep their exact wire shape.
+            usage = provider_usage_of(exc)
             if isinstance(exc, PermissionDenied):
                 self._write_error(
                     HTTPStatus.UNAUTHORIZED,
                     str(exc),
                     error_code=GATEWAY_AUTH_ERROR,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, ModelAdapterError):
                 status = _model_error_status(exc)
@@ -110,7 +120,7 @@ def make_llm_gateway_handler(
                     retryable=exc.retryable,
                     config_recoverable=exc.config_recoverable,
                     provider_retried=exc.provider_retried,
-                    usage=provider_usage_of(exc),
+                    usage=usage,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -118,6 +128,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, ValueError):
                 self._write_error(
@@ -125,6 +136,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, NativeAgentError):
                 self._write_error(
@@ -132,6 +144,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=getattr(exc, "error_code", GATEWAY_BAD_REQUEST),
                     retryable=False,
+                    usage=usage,
                 )
             else:
                 self._write_error(
@@ -139,6 +152,7 @@ def make_llm_gateway_handler(
                     redact_internal_error(_LOGGER, self, exc),
                     error_code=GATEWAY_SERVER_ERROR,
                     retryable=True,
+                    usage=usage,
                 )
 
         def _write_error(
@@ -277,11 +291,18 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
         }
     return {
         "type": "error",
+        # The unclassified arm carries the cost too, exactly like its twin above and like
+        # ``_write_exception``'s. A stream that folds provider deltas and then refuses its own
+        # end-of-turn payload fails with a RAW ``ValueError``/``AttributeError`` -- the one shape
+        # this arm exists for -- and that is a refusal of a turn the upstream already generated
+        # and billed. Without the key, the only carrier a streaming client has says the call was
+        # free, and ``retryable=True`` below then invites it to buy the same tokens again.
         **_error_body(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             redact_internal_error(_LOGGER, handler, exc),
             error_code=GATEWAY_SERVER_ERROR,
             retryable=True,
+            usage=provider_usage_of(exc),
         ),
     }
 

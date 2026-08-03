@@ -634,6 +634,21 @@ _BILLED_BODY_REFUSALS: dict[str, dict[str, Any]] = {
     "message-content-item-not-an-object": _message(["nope"]),
     "output-text-not-a-string": _message([{"type": "output_text", "text": 7}]),
     "response-id-not-a-string": {"id": 7},
+    # The one raise site in this region that is NOT a ``ModelAdapterError``: the counts
+    # themselves are readable (the lenient reader takes them) and the nested detail block is
+    # what ``normalize_usage`` rejects, with a raw ``ValueError``. It is why the stamp's seam
+    # catches ``Exception``, and -- until the gateway's meter and error writers were widened to
+    # match -- it was the shape whose stamp no consumer on that route would read.
+    "usage-details-not-an-object": {
+        "usage": {**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    },
+}
+
+# The refusals above are ``ModelAdapterError`` unless named here. Recorded per shape rather
+# than widened for all of them: "the reader refuses in the classified type" is a pin worth
+# keeping on the twelve that do, and the exception to it is worth naming.
+_BILLED_BODY_REFUSAL_TYPES: dict[str, type[BaseException]] = {
+    "usage-details-not-an-object": ValueError,
 }
 
 
@@ -643,7 +658,7 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
     from monoid_agent_kernel.providers.openai import _parse_response
 
     body = _billed_response_body(**_BILLED_BODY_REFUSALS[shape])
-    with pytest.raises(ModelAdapterError) as refused:
+    with pytest.raises(_BILLED_BODY_REFUSAL_TYPES.get(shape, ModelAdapterError)) as refused:
         _parse_response(body)
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "malformed_shape": shape,
@@ -721,6 +736,26 @@ def test_a_refused_billed_terminal_payload_still_reports_the_tokens_it_burned(
         "malformed_shape": shape,
         "hint": "the stream's end-of-turn payload is billed exactly like the one-shot body",
     }
+
+
+def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_counts() -> None:
+    """The streamed twin of ``usage-details-not-an-object``, kept out of the table above.
+
+    Every probe in that table drops the ``function_call`` so the stop-reason walk is reached;
+    this shape refuses earlier -- ``normalize_usage`` runs while the ``TurnComplete`` arguments
+    are being evaluated -- so it does not share the table's precondition and is spelled here
+    instead of quietly making that comment false.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(
+        usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    )
+    with pytest.raises(ValueError) as refused:
+        _terminal_chunk(payload, provider_retried=False)
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
 
 
 def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -> None:

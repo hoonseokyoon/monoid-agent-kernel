@@ -1158,11 +1158,13 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     a turn the provider already billed.
 
     The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
-    ``ModelAdapterError``, which is why the guard catches ``Exception``. That is a narrower
-    carry than the body reader's: the receipt and the run budget read the stamp off any
-    exception, while the reference gateway's failure meter and error envelope only inspect a
-    ``ModelAdapterError``. Stamping is still the whole of the fix here -- classifying these
-    would change how the loop treats them, which is a separate decision.
+    ``ModelAdapterError``, which is why the guard catches ``Exception``. Every consumer of the
+    stamp reads it off the escaping exception whatever its type -- the receipt
+    (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the reference
+    gateway's tenant meter and both of its error writers, which used to inspect only a
+    ``ModelAdapterError`` and so skipped precisely this region. Stamping is still the whole of
+    the fix here: classifying these would change how the loop treats them, which is a separate
+    decision, and the carry no longer depends on making it.
     """
 
     try:

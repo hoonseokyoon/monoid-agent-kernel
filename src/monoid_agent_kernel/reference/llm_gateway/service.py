@@ -165,8 +165,8 @@ class LlmGatewayBackend:
                     )
                 )
             )
-        except ModelAdapterError as failed:
-            self._meter(claims.tenant_id, provider_usage_of(failed))
+        except Exception as failed:
+            self._meter_failure(claims.tenant_id, failed)
             raise
         turn_handle = self._record_turn(claims, request, turn)
         self._meter(claims.tenant_id, turn.usage)
@@ -300,16 +300,19 @@ class LlmGatewayBackend:
             # Assemble once: the same usage drives both the meter and the outgoing frame, and the
             # assembled response id is what the opaque turn_handle maps to for continuation.
             turn = normalize_model_turn(assemble_streamed_turn(collected))
-        except ModelAdapterError as failed:
+        except Exception as failed:
             # The streaming twin of handle_turn's failure meter: a refusal can arrive *after*
             # the upstream produced and billed an answer (a chained hop's proof refusal is
             # exactly that), and this generator exits on the raise before the success-path
             # meter below -- so the billed tokens left the tenant ledger entirely on this
             # transport while the sync twin metered them. One handler around both sub-branches
-            # (the astream drive and the non-streaming fallback); ``provider_usage_of`` reads
-            # {} for an unbilled failure and ``_meter`` skips empty usage, so it stays a no-op
-            # there.
-            self._meter(claims.tenant_id, provider_usage_of(failed))
+            # (the astream drive and the non-streaming fallback), and ``Exception`` rather than
+            # ``ModelAdapterError`` for the reason ``_meter_failure`` states -- the OpenAI
+            # stream's terminal refusals, the ones this transport is most likely to meet, are
+            # raw types. ``BaseException`` is deliberately NOT caught: a consumer closing this
+            # generator raises ``GeneratorExit`` at the yields above, which is a cancelled read
+            # rather than a failed call.
+            self._meter_failure(claims.tenant_id, failed)
             raise
         turn_handle = self._record_turn(claims, request, turn)
         self._meter(claims.tenant_id, turn.usage)
@@ -385,6 +388,28 @@ class LlmGatewayBackend:
             return
         with self._lock:
             self._usage.setdefault(tenant_id, LlmGatewayUsage(tenant_id)).add(usage)
+
+    def _meter_failure(self, tenant_id: str, failed: BaseException) -> None:
+        """Charge the tenant for what an ESCAPING failure already cost, then let it escape.
+
+        Both transports' failure arms come through here instead of reading the stamp for
+        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The adapter
+        that first sees the provider's billed body stamps refusals of more than one type:
+        ``normalize_usage`` says "malformed usage" with a raw ``ValueError``, and *every* refusal
+        in the OpenAI stream's terminal region is a raw ``ValueError``/``AttributeError``, because
+        that path folds deltas and reads end-of-turn metadata directly rather than running the
+        one-shot mapping that classifies. Gated on ``ModelAdapterError``, this meter read the
+        stamp on exactly the failures that had already been classified and skipped the ones that
+        had not -- so an upstream whose final payload is malformed charged the tenant nothing for
+        a turn it had generated and billed, on the transport where that shape actually occurs.
+
+        Meter and re-raise: nothing is swallowed and nothing is reclassified here, so what
+        escapes is what arrived. ``provider_usage_of`` reads ``{}`` for an unbilled failure and
+        :meth:`_meter` skips empty usage, which is what keeps a failure raised before the
+        provider free.
+        """
+
+        self._meter(tenant_id, provider_usage_of(failed))
 
     def _record_turn(
         self,
