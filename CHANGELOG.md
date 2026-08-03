@@ -260,6 +260,18 @@ out in commit messages and here.
   with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
   `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
   connection that dropped, and the status branches above already classify it).
+- **The live stream broker carries both halves of the failure classification.** The closed
+  frame forwarded only `retryable`, so a live consumer of the reference backend's model
+  stream read a config-fixable failure as merely non-retryable while the model-content
+  sidecar beside the lane recorded both facts. `LiveModelStreamFrame` gains an optional
+  `config_recoverable` (validated, serialized, forwarded by the writer's close), registered
+  as a carrier file in the conformance census.
+- **A driver death answers the same on the live record and the durable artifact.**
+  `record_run_failure` wrote the exception's provider code, HTTP status and recovery flags
+  into status.json but mutated only the error pair on the live record — `status()`/`result()`
+  prefer the active record, so they served the last park's stale classification (or defaults)
+  against the just-written artifact until the record was released. The record now takes the
+  same guarded exception reads the artifact takes.
 - **A 408/409 from the provider is transient, not a configuration defect.** The 4xx branch
   recognized only 429 as retryable, so a request timeout (408) or conflict (409) came out
   retryable=False — and the one config predicate then stamped `config_recoverable=True`,

@@ -121,6 +121,31 @@ def test_failed_close_carries_retryability_to_live_consumers() -> None:
     assert closed.to_json()["retryable"] is True
 
 
+def test_failed_close_carries_config_recoverability_to_live_consumers() -> None:
+    """The other half of the park's vocabulary: the model-content sidecar receives the full
+    classification, so the live broker frame must not tell the same consumer half of it —
+    a config-fixable failure read as merely non-retryable hides that a reissue will succeed."""
+    broker = LiveModelStreamBroker(generation="config")
+    writer = broker.observer("root-1").open(_context())
+    writer.push(ModelStreamDelta(channel="output", text="partial"))
+    writer.close(
+        ModelStreamOutcome(
+            status="failed",
+            final_text="partial",
+            error_code="model_error",
+            retryable=False,
+            config_recoverable=True,
+        )
+    )
+
+    closed = broker.subscribe("root-1", after_cursor="config:0").poll()[-1]
+
+    assert closed.kind == "closed"
+    assert closed.retryable is False
+    assert closed.config_recoverable is True
+    assert closed.to_json()["config_recoverable"] is True
+
+
 def test_broker_isolates_root_rings() -> None:
     broker = LiveModelStreamBroker(generation="roots")
     first = broker.observer("root-a").open(_context(root_run_id="root-a", run_id="root-a"))
@@ -970,6 +995,13 @@ def test_delta_frame_validates_offsets_and_non_delta_frames_reject_them() -> Non
             cursor=cursor,
             root_run_id="root",
             retryable=1,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="config_recoverable must be a boolean"):
+        LiveModelStreamFrame(
+            kind="closed",
+            cursor=cursor,
+            root_run_id="root",
+            config_recoverable=1,  # type: ignore[arg-type]
         )
 
 

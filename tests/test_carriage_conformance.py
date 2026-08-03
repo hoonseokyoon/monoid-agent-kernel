@@ -5640,6 +5640,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "reference/backend/projection.py",
             "reference/backend/recovery.py",
             "reference/backend/run_state.py",
+            # Joined in the Codex review cycle: the live stream broker frame carries the same
+            # classification pair its model-content sidecar records — retryable alone told a
+            # live consumer half the park's vocabulary.
+            "reference/backend/model_stream.py",
             "reference/backend/run_types.py",
             "reference/backend/service.py",
             "reference/backend/session_drive.py",

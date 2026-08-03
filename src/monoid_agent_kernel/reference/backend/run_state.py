@@ -599,9 +599,17 @@ class RunStateMutationService:
             set_record_state(record, SessionState.FAILED, terminal=True)
             record.error = public_error_message(str(exc))
             record.error_code = getattr(exc, "error_code", "internal_error")
-            # The FAILED-terminal heal, same rule as ``record_run_result``'s FAILED branch:
-            # the four facts stay (they say what the run died of) and only the per-call
-            # ``provider_retried`` is dropped — the terminal vocabulary drops it everywhere.
+            # The record states what the artifact above states: the EXCEPTION's own
+            # classification, through the same guarded reads. The run died of this driver
+            # exception, not of its last park — keeping the park's four facts here left the
+            # live ``status()``/``result()`` (which prefer the active record) disagreeing
+            # with the just-written status.json until the record was released. Only the
+            # per-call ``provider_retried`` is dropped — the terminal vocabulary drops it
+            # everywhere.
+            record.retryable = _error_flag(exc, "retryable")
+            record.config_recoverable = _error_flag(exc, "config_recoverable")
+            record.http_status = _provider_http_status(exc)
+            record.provider_error_code = _error_text(exc, "provider_error_code")
             record.provider_retried = False
             record.finished_at = self._context.now()
             # A run that dies of a driver exception after N billed turns used to leave the

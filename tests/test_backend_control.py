@@ -638,15 +638,71 @@ def test_record_run_failure_writes_the_terminal_status_artifact(
     # The offline projection honors the quarantine marker over the stale (park-ending) log.
     projection = project_run_status(run_dir)
     assert (projection["state"], projection["terminal"]) == ("failed", True)
-    # And the record gets the FAILED-terminal heal record_run_result applies: the four facts
-    # stay (they say what the run died of); only provider_retried is dropped.
+    # And the record states what the artifact states: the EXCEPTION's own classification,
+    # through the same guarded reads — not the last park's. The run died of this driver
+    # exception, and a bare RuntimeError claims nothing, so the park's stale 429/rate_limit
+    # facts must not survive on the live record while status.json beside it says otherwise.
+    # (Pin flipped from "the four park facts stay": that kept live status()/result()
+    # disagreeing with the just-written artifact until the record was released.)
     assert record.state is SessionState.FAILED
     assert record.terminal is True
     assert record.provider_retried is False
-    assert record.retryable is True
-    assert record.http_status == 429
+    assert record.retryable is False
+    assert record.http_status is None
+    assert record.config_recoverable is False
+    assert record.provider_error_code == ""
+
+
+def test_record_run_failure_copies_a_classified_exception_onto_the_record(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """A classified driver death answers the same on the live record and the artifact.
+
+    ``record_run_failure`` wrote the exception's provider code, HTTP status and recovery flags
+    into status.json but mutated only the error pair on the live record — so ``status()`` /
+    ``result()``, which prefer the active record, served default or stale classification while
+    the durable artifact beside them carried the truth."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_classified_record"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(
+        run_id,
+        ModelAdapterError(
+            "provider rejected the request (HTTP 422)",
+            error_code="model_error",
+            provider_error_code="insufficient_quota",
+            retryable=False,
+            config_recoverable=True,
+            http_status=422,
+            provider_retried=True,
+        ),
+    )
+
+    artifact = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    # One answer on both surfaces, from the same guarded reads.
+    for surface_value, artifact_key in (
+        (record.retryable, "retryable"),
+        (record.config_recoverable, "config_recoverable"),
+        (record.http_status, "http_status"),
+        (record.provider_error_code, "provider_error_code"),
+    ):
+        assert surface_value == artifact[artifact_key]
     assert record.config_recoverable is True
-    assert record.provider_error_code == "rate_limit"
+    assert record.http_status == 422
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.retryable is False
+    # The terminal vocabulary still drops the per-call fact on both.
+    assert record.provider_retried is False
+    assert "provider_retried" not in artifact
 
 
 def _giveup_recovery_meta(run_id: str, workspace: Path) -> dict[str, Any]:
