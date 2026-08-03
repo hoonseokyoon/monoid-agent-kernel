@@ -1948,6 +1948,7 @@ class RunnerBackend:
         error_code: str,
         exc_type: str,
         overwrite: bool,
+        http_status: int | None = None,
     ) -> None:
         """Write ``run_dir/failure.json`` (the operator-facing failure bundle, same schema
         as the core's). ``overwrite=False`` preserves a bundle the loop already wrote
@@ -1959,6 +1960,7 @@ class RunnerBackend:
             error_code=error_code,
             exc_type=exc_type,
             overwrite=overwrite,
+            http_status=http_status,
         )
 
     def _read_recover_attempts(self, run_dir: Path) -> int:

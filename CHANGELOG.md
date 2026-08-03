@@ -160,6 +160,42 @@ out in commit messages and here.
   and the closed `stream_closed` schema — now name the field directly, because a pin over an
   empty set proves nothing and both entries are still open.
 
+### Fixed — the status rides every validator and the bundle; records substitute; one predicate
+
+- **`failure.json` carries `http_status`, on both of its writers.** The core's bundle
+  (`loop.py`) emitted the `run.failed` event and the operator's restore aid from the same run
+  state and gave the status to only one of them, so diagnosing a failure from the bundle alone
+  could not tell a 429 from a 400 from a transport error. The reference backend
+  (`recovery.py:write_failure_bundle`) is the second writer of the same `monoid.failure.v1`
+  artifact — the one a worker crash leaves behind, where the bundle is the only record there is —
+  and it carries the field too, read off the failing exception by name and never coerced. Written
+  as `null` when the failure reached no provider, so "no status" and "an older writer" stay
+  distinguishable. A new census pin diffs the two writers' key sets against each other, because
+  one artifact with two hand-written writers is how the field could have landed on one half.
+- **The four gateway validators that could not name a status now can.**
+  `_exact_gateway_int`, `_gateway_fragment_string`, `_gateway_usage` and
+  `_portable_gateway_payload` gained the `http_status` parameter their `_exact_gateway_bool` /
+  `_gateway_string` siblings already forwarded into the `ModelAdapterError` they raise, so one
+  malformed payload no longer classifies two ways depending on which of its fields was malformed.
+  All six are driven directly in a test that reads the status back off the raise — a parameter
+  can be accepted and dropped.
+- **The run manifest's tool projection substitutes a non-portable schema locally.**
+  `core/manifest.py:_tool_spec_payload` embedded `input_schema` raw and was portable only
+  because `RunManifest.to_json` normalizes the whole assembled manifest one frame up — a property
+  of its caller, not of itself, and its transcript twin had already needed the substitution
+  locally. Manifest output is byte-identical (`to_json` normalizes an already-normalized payload
+  to itself); what changes is that a second caller no longer inherits an anonymous
+  `allow_nan=False` durability failure.
+- **One predicate for one stamp.** `model_call.py:_recordable_usage` asked
+  `isinstance(value, int)` where its three siblings (`provider_usage_of`,
+  `_reported_error_usage`, `ModelCallReceipt.with_error`) ask `type(value) is int`, so an
+  `IntEnum` token count — the shape a provider SDK plausibly returns — was a recordable usage on
+  one path and no usage at all on the three that consume it, and the receipt this function feeds
+  would then reject what it had just accepted.
+- Seven more `KNOWN_GAPS` entries closed; the affected census pins now state the harmonized
+  behaviour (all six validators forward, all four readers agree, three record projections
+  substitute) rather than the old divergence.
+
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 
 - **The Studio profile preview is a record, and now substitutes like one.** Preserving a tool

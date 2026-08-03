@@ -206,44 +206,7 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "added to withhold",
         "burn-down",
     ),
-    # --- http_status: carried by some siblings, dropped by the others ------------------
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "loop.py:_record_failure",
-        "the failure bundle (write_failure) omits http_status while the run.failed event beside "
-        "it carries it, so the operator's restore aid loses the status the log kept",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_exact_gateway_int",
-        "validator has no http_status parameter, so a malformed-payload error it raises loses "
-        "the status its _exact_gateway_bool/_gateway_string siblings forward",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_gateway_fragment_string",
-        "same missing parameter as _exact_gateway_int",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_gateway_usage",
-        "same missing parameter as _exact_gateway_int",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_portable_gateway_payload",
-        "fourth sibling with the same missing parameter",
-        "burn-down",
-    ),
+    # --- the terminal record: promoted from a turn event that classified the failure ----
     CarriageGap(
         "suspension",
         "retryable/config_recoverable",
@@ -343,15 +306,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "meters nothing at all, while record_run_result beside it feeds result.metrics into the "
         "tenant ledger — so a run that dies of a driver exception after N billed turns leaves "
         "the ledger reporting zero for every one of them (not even the run count)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "provider_usage",
-        "model_call.py:_recordable_usage",
-        "accepts int subclasses (IntEnum) that providers/base.py:provider_usage_of, "
-        "providers/gateway.py:_reported_error_usage and core/model_io.py:ModelCallReceipt "
-        "all reject, so one stamp reads as three different usages depending on the consumer",
         "burn-down",
     ),
     # --- config_recoverable: the consumers that were designed for it and ignore it -----
@@ -468,16 +422,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "burn-down",
     ),
     # --- tool catalog ------------------------------------------------------------------
-    CarriageGap(
-        "tool-spec",
-        "input_schema",
-        "core/manifest.py:_tool_spec_payload",
-        "embeds the schema raw and is portable only because RunManifest.to_json normalizes the "
-        "whole assembled manifest one frame up; its transcript twin (core/tool_surface.py) "
-        "needed the substitution locally, so this projection is one caller away from the same "
-        "anonymous durability failure",
-        "burn-down",
-    ),
     CarriageGap(
         "tool-spec",
         "id",
@@ -2321,17 +2265,25 @@ def test_1e_the_checkpoint_alias_is_copied_at_exactly_two_sites() -> None:
     }, {"copy_sites": copies, "hint": "a third copy of the alias, or a lost one"}
 
 
-def test_1d_failure_bundle_drops_the_status_the_event_beside_it_keeps() -> None:
-    """loop.py:_record_failure emits run.failed and writes failure.json from the same state."""
+def test_1d_the_failure_bundle_and_the_event_beside_it_carry_the_same_status() -> None:
+    """loop.py:_record_failure emits run.failed and writes failure.json from the same state.
+
+    The bundle used to drop ``http_status`` while the event kept it, which is the same fact
+    written twice from one place and bound once -- so the pin is now an intersection rather than
+    an absence, and a key that reaches one of the two and not the other fails here.
+    """
 
     event_keys = _emit_data_keys("loop.py", "run.failed")
     bundles = _call_dict_arg_keys("loop.py", "write_failure")
     assert len(bundles) == 1, {"write_failure_sites": len(bundles)}
     assert "http_status" in event_keys
-    assert "http_status" not in bundles[0], {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+    assert "http_status" in bundles[0], {
+        "hint": "the operator's restore aid must keep the status the log kept",
     }
-    assert {"error", "error_code", "provider_error_code"} <= (event_keys & bundles[0])
+    shared = {"error", "error_code", "provider_error_code", "http_status", "type"}
+    assert shared <= (event_keys & bundles[0]), {
+        "carried_by_only_one_of_the_two": sorted(shared - (event_keys & bundles[0])),
+    }
 
 
 # The terminal-failure trio, pinned in full rather than probed for one key. ``run.failed`` is
@@ -2348,11 +2300,20 @@ FAILURE_BUNDLE_KEYS = frozenset(
         "error",
         "error_code",
         "provider_error_code",
+        "http_status",
         "type",
         "last_good_seq",
         "restore_hint",
     }
 )
+
+# The SECOND writer of ``failure.json``, and the reason it is pinned beside the first: the two
+# are separate code writing one artifact under one schema id (``monoid.failure.v1``), and the
+# reference backend's is the one a worker crash leaves behind -- the case where the bundle is the
+# only record there is. It carries no ``provider_error_code`` (its callers hold an exception, not
+# the loop's classified run state) and adds ``failed_at``; every other key must match, so a field
+# added to one writer and not the other fails here rather than at an operator's console.
+REFERENCE_FAILURE_BUNDLE_KEYS = (FAILURE_BUNDLE_KEYS - {"provider_error_code"}) | {"failed_at"}
 
 
 def test_1d_run_failed_pins_its_schema_its_emit_site_and_its_bundle() -> None:
@@ -2373,6 +2334,36 @@ def test_1d_run_failed_pins_its_schema_its_emit_site_and_its_bundle() -> None:
         "missing": sorted(FAILURE_BUNDLE_KEYS - bundles[0]),
         "extra": sorted(bundles[0] - FAILURE_BUNDLE_KEYS),
     }
+
+
+def test_1d_the_reference_backend_writes_the_same_bundle_the_core_does() -> None:
+    """The twin writer of one durable artifact, diffed against the core's key set.
+
+    ``monoid.failure.v1`` has two independent writers and a permissive reader policy, so a field
+    that reaches one of them is invisible to the other's consumers and to every schema check --
+    which is exactly how the status this commit adds could have landed on one half. The
+    difference between them is pinned as a set, not tolerated as "roughly the same".
+    """
+
+    writer = _function_node(
+        "reference/backend/recovery.py", "write_failure_bundle", within="RecoveryService"
+    )
+    literals = [node for node in ast.walk(writer) if isinstance(node, ast.Dict)]
+    assert len(literals) == 1, {"dict_literals_in_the_writer": len(literals)}
+    written = _pinned_dict_keys(
+        literals[0], "reference/backend/recovery.py:write_failure_bundle"
+    )
+    assert written == REFERENCE_FAILURE_BUNDLE_KEYS, {
+        "missing": sorted(REFERENCE_FAILURE_BUNDLE_KEYS - written),
+        "extra": sorted(written - REFERENCE_FAILURE_BUNDLE_KEYS),
+        "hint": "a key reached one failure-bundle writer and not its twin",
+    }
+    assert "http_status" in written
+    # Stated as a difference so a *new* divergence between the two writers is a failure, not a
+    # silence: the reference writer holds an exception rather than the loop's classified state.
+    core = _call_dict_arg_keys("loop.py", "write_failure")[0]
+    assert core - written == {"provider_error_code"}
+    assert written - core == {"failed_at"}
 
 
 def test_1d_the_terminal_failure_record_drops_the_classification_its_twin_carries() -> None:
@@ -3048,25 +3039,64 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
     }
 
 
-def test_2c_only_two_of_five_gateway_validators_forward_the_status_they_know() -> None:
-    """Sibling census: the same defect shape as a missing wire key, one call frame in."""
+GATEWAY_STATUS_FORWARDING_VALIDATORS = (
+    "_exact_gateway_bool",
+    "_gateway_string",
+    "_exact_gateway_int",
+    "_gateway_fragment_string",
+    "_gateway_usage",
+    "_portable_gateway_payload",
+)
 
-    forwarding = set()
-    for name in (
-        "_exact_gateway_bool",
-        "_gateway_string",
-        "_exact_gateway_int",
-        "_gateway_fragment_string",
-        "_gateway_usage",
-        "_portable_gateway_payload",
-    ):
-        parameters = _live_signature(getattr(gateway_client, name)).parameters
-        if "http_status" in parameters:
-            forwarding.add(name)
-    assert forwarding == {"_exact_gateway_bool", "_gateway_string"}, {
-        "forwarding_http_status": sorted(forwarding),
-        "hint": "a validator gained the parameter: update EXPECTED and drop its registry entry",
+
+def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
+    """Sibling census: the same defect shape as a missing wire key, one call frame in.
+
+    Two of six carried the parameter, so the *same* malformed payload produced a classified
+    failure naming HTTP 400 or one naming nothing at all, decided by which field of it happened
+    to be malformed. Pinned as "all six", so a seventh validator that arrives without it fails
+    rather than joining a majority.
+
+    A signature pin is the right shape here and an incomplete proof on its own, because a
+    parameter can be accepted and dropped:
+    ``test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises``
+    (tests/test_gateway_provider.py) drives all six and reads the status back off the raise. Note
+    what today's *callers* can supply: the status a reader knows is the error-envelope hint, and
+    the four newly-parameterized validators run on the non-error branches, so they are threaded
+    the same expression their siblings use and receive ``None`` from it. The asymmetry is what is
+    fixed -- a validator that cannot name a status its caller holds -- not a live loss at these
+    four call sites.
+    """
+
+    forwarding = {
+        name
+        for name in GATEWAY_STATUS_FORWARDING_VALIDATORS
+        if "http_status" in _live_signature(getattr(gateway_client, name)).parameters
     }
+    assert forwarding == set(GATEWAY_STATUS_FORWARDING_VALIDATORS), {
+        "not_forwarding_http_status": sorted(
+            set(GATEWAY_STATUS_FORWARDING_VALIDATORS) - forwarding
+        ),
+        "hint": "a validator that cannot name the status its caller already read",
+    }
+
+
+def test_2c_the_four_new_status_parameters_did_not_make_a_value_validator_read_a_key() -> None:
+    """The helper-census corollary of the fix above, stated where the fix could break it.
+
+    ``_gateway_usage`` and ``_portable_gateway_payload`` are registered as *value* validators:
+    they take an already-extracted value, name no wire key of their own, and are excluded from
+    the mapping-reader discovery on exactly that basis. Adding a scalar parameter must not change
+    that -- and a scalar named ``http_status`` is one edit away from being read off the payload
+    instead of passed in.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        node = functions[name][0]
+        assert "http_status" in {argument.arg for argument in node.args.kwonlyargs}
+        assert _mapping_parameters(node) == frozenset(), {"now_takes_a_mapping": name}
+        assert not _reads_a_mapping_parameter(node), {"now_reads_a_key": name}
 
 
 def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
@@ -3299,8 +3329,14 @@ class _SubclassedCount(IntEnum):
     SEVEN = 7
 
 
-def test_3d_the_four_readers_of_one_stamp_disagree_about_what_a_count_is() -> None:
-    """Same stamp, four predicates, two verdicts — pinned so harmonizing them fails here."""
+def test_3d_the_four_readers_of_one_stamp_agree_about_what_a_count_is() -> None:
+    """Same stamp, four predicates, one verdict — pinned so a fifth spelling fails here.
+
+    ``_recordable_usage`` used to answer ``isinstance(value, int)`` where its three siblings
+    answer ``type(value) is int``, so an ``IntEnum`` a provider SDK hands back as a token count
+    was a recordable usage on one path and no usage at all on the three that consume it — and
+    the receipt this one feeds would then reject what it had just accepted.
+    """
 
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
 
@@ -3323,10 +3359,10 @@ def test_3d_the_four_readers_of_one_stamp_disagree_about_what_a_count_is() -> No
         "providers/base.py:provider_usage_of": False,
         "providers/gateway.py:_reported_error_usage": False,
         "core/model_io.py:ModelCallReceipt.with_error": False,
-        "model_call.py:_recordable_usage": True,
+        "model_call.py:_recordable_usage": False,
     }, {
         "verdicts": verdicts,
-        "hint": "harmonized? make them agree, update EXPECTED and drop the registry entry",
+        "hint": "one stamp, one verdict: a reader that disagrees reclassifies a billed call",
     }
 
 
@@ -3829,20 +3865,22 @@ def test_5b_only_the_record_projections_substitute_a_non_finite_schema() -> None
         # An HTTP egress *describing* a request is a record of one, and this endpoint
         # serializes with allow_nan=False.
         "reference/studio/server.py:_gateway_tool_schema",
+        # The third record projection. It used to be portable only because ``RunManifest.to_json``
+        # normalizes the whole assembled manifest one frame up -- a property of its caller, not of
+        # itself -- and the transcript twin beside it had already needed the substitution locally.
+        "core/manifest.py:_tool_spec_payload",
     }, {
         "substituting_projections": sorted(substituting),
         "hint": "a projection changed sides: that is a request/record decision, not a refactor",
     }
-    # The manifest is a record too, and it substitutes -- but one level up, in
-    # ``RunManifest.to_json``, which normalizes the whole assembled manifest. So the projection
-    # itself is on the request side of this rule and is only safe because of its caller
-    # (registered burn-down: the transcript twin needed the substitution *locally*, and
-    # ``_tool_spec_payload`` is not the manifest's only caller-shaped surface).
+    # And the manifest's own output is unchanged, because ``to_json`` normalizes an
+    # already-normalized payload to itself: this closed a latent second-caller hazard without
+    # rewriting a byte of any manifest a run has already written.
     from monoid_agent_kernel.core.manifest import RunManifest
 
     manifest_payload = _manifest_tool_spec_payload(spec)
-    assert manifest_payload["input_schema"]["enum"][0] != manifest_payload["input_schema"]["enum"][0]
-    assert normalize_json_ingress(manifest_payload)["input_schema"]["enum"] == [None]
+    assert manifest_payload["input_schema"]["enum"] == [None]
+    assert normalize_json_ingress(manifest_payload) == manifest_payload
     assert "normalize_json_ingress" in _live_source(RunManifest.to_json)
 
 
@@ -5390,9 +5428,6 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
         "reference/backend/session_drive.py",
         "reference/backend/run_state.py",
         "core/model_stream.py",
-        # Registered by the ToolSpec family, whose authority is a dataclass rather than a
-        # headline field name — its census (family 5) is the backstop for these.
-        "core/manifest.py",
         # Round-2 registrations whose fact is not a headline wire field either: the raw/filtered
         # error asymmetry, the two half-blind run-status projections, the three disagreeing
         # terminal-state mappers, and a Suspension built outside the durable status vocabulary.

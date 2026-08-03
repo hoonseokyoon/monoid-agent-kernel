@@ -1040,6 +1040,63 @@ def test_a_non_200_body_carries_the_backend_retry_end_to_end() -> None:
     assert _error_from_status_body(400, json.dumps(plain)).provider_retried is False
 
 
+def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises() -> None:
+    """Four of the six validators could not name the status their caller already knew.
+
+    ``_exact_gateway_bool`` and ``_gateway_string`` forward it and the other four did not, so the
+    *same* malformed error envelope produced a classified failure carrying HTTP 400 or one
+    carrying nothing at all, decided by which field of it was malformed. Each is driven directly:
+    accepting the parameter and dropping it on the floor would satisfy a signature census and
+    fix nothing.
+    """
+    from monoid_agent_kernel.providers.gateway import (
+        _exact_gateway_bool,
+        _exact_gateway_int,
+        _gateway_fragment_string,
+        _gateway_string,
+        _gateway_usage,
+        _portable_gateway_payload,
+    )
+
+    raisers = {
+        "_exact_gateway_bool": lambda: _exact_gateway_bool(
+            {"retryable": "false"}, "retryable", default=False, context="c", http_status=400
+        ),
+        "_gateway_string": lambda: _gateway_string(
+            {"error": 42}, "error", context="c", http_status=400
+        ),
+        "_exact_gateway_int": lambda: _exact_gateway_int(
+            {"index": "1"}, "index", default=0, context="c", minimum=0, http_status=400
+        ),
+        "_gateway_fragment_string": lambda: _gateway_fragment_string(
+            {"text": 42},
+            "text",
+            context="c",
+            http_status=400,
+            known_provider_retried=False,
+        ),
+        "_gateway_usage": lambda: _gateway_usage(
+            {"input_tokens": "many"}, context="c", http_status=400
+        ),
+        # A non-string object key is what portable JSON cannot carry at all (a non-finite number
+        # is substituted, not refused).
+        "_portable_gateway_payload": lambda: _portable_gateway_payload(
+            {1: "one"}, context="c", http_status=400
+        ),
+    }
+
+    for name, raiser in raisers.items():
+        with pytest.raises(ModelAdapterError) as caught:
+            raiser()
+        assert caught.value.http_status == 400, name
+        assert caught.value.provider_error_code == "gateway_bad_response", name
+
+    # And an unstated status stays unstated rather than being invented from the failure class.
+    with pytest.raises(ModelAdapterError) as unstated:
+        _gateway_usage({"input_tokens": "many"}, context="c")
+    assert unstated.value.http_status is None
+
+
 def test_every_error_constructor_reads_the_config_recoverability() -> None:
     """The `provider_retried` twin above, for the classification that had no wire slot at all.
 

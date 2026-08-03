@@ -236,6 +236,12 @@ the value that server's failures already carried. `TRANSCRIPT_RECORD_SCHEMA`'s `
 branch declares the same field, which the writer had always emitted under an open
 `additionalProperties`; no stored transcript changes and no reader has to migrate.
 
+Both writers of `monoid.failure.v1` — the core's `run_dir/failure.json` and the reference
+backend's — add `http_status`, written as `null` when the failure never reached a provider. The
+artifact's reader policy is permissive and its consumers read keys off the JSON, so an older
+bundle simply has no such key and a reader must treat "absent" and `null` alike. The schema
+identifier is unchanged.
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other

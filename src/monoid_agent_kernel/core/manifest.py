@@ -79,7 +79,16 @@ def _tool_spec_payload(tool: ToolSpec) -> dict[str, Any]:
         "id": tool.id,
         "exported_name": tool.exported_name,
         "description": tool.description,
-        "input_schema": tool.input_schema,
+        # The manifest is a *record*, and a record substitutes what portable JSON cannot carry --
+        # the same rule its transcript twin (``core/tool_surface.py:_tool_spec_payload``) applies
+        # locally, and for the same reason: ``normalize_tool_spec`` deliberately keeps a schema's
+        # non-finite values so the provider boundary refuses the call as a classified,
+        # config-recoverable bad request. This projection was portable only because
+        # ``RunManifest.to_json`` normalizes the whole assembled manifest one frame up, so any
+        # second caller -- and the transcript twin already was one -- inherited an anonymous
+        # ``allow_nan=False`` durability failure instead. Byte-identical output through
+        # ``to_json``, which normalizes an already-normalized payload to itself.
+        "input_schema": normalize_json_ingress(tool.input_schema),
         "capability": tool.capability,
         "side_effect": tool.side_effect,
         "path_args": list(tool.path_args),

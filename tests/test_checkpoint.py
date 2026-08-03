@@ -992,7 +992,12 @@ def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -
         def next_turn(self, request):  # noqa: ANN001, ANN201
             from monoid_agent_kernel.errors import ModelAdapterError
 
-            raise ModelAdapterError("boom", error_code="provider_unavailable")
+            raise ModelAdapterError(
+                "boom",
+                error_code="provider_unavailable",
+                provider_error_code="insufficient_quota",
+                http_status=429,
+            )
 
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
     loop = AgentLoop(
@@ -1008,9 +1013,40 @@ def test_failed_run_writes_failure_bundle_and_keeps_checkpoint(tmp_path: Path) -
     assert failure["type"] == "ModelAdapterError"
     assert failure["error_code"] and "restore" in failure["restore_hint"].lower()
     assert "last_good_seq" in failure
+    # The provider detail the run.failed event beside it carries. Diagnosing from the bundle
+    # alone could not tell a 429 from a 400 from a transport failure while this was missing.
+    assert failure["provider_error_code"] == "insufficient_quota"
+    assert failure["http_status"] == 429
     # A failed run KEEPS its checkpoints (terminal -> the restart scanner still skips it).
     record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert record is not None and record.checkpoint.terminal is True
+
+
+def test_a_failure_with_no_provider_status_still_states_that_it_has_none(tmp_path: Path) -> None:
+    """The other half of the field: an absent status is written as null, not omitted.
+
+    The bundle's reader policy is permissive and its consumers read keys straight off the JSON,
+    so "no status" and "an older writer" must not be the same observation.
+    """
+
+    class _RaisingAdapter:
+        def next_turn(self, request):  # noqa: ANN001, ANN201
+            from monoid_agent_kernel.errors import ModelAdapterError
+
+            # A transport failure: it never reached a provider, so it carries no status.
+            raise ModelAdapterError("connection reset", error_code="provider_unavailable")
+
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=_RaisingAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    assert loop.run_once("do it").status == "failed"
+
+    failure = json.loads((spec.run_root / spec.run_id / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "provider_unavailable"
+    assert "http_status" in failure and failure["http_status"] is None
 
 
 def test_time_machine_restores_workspace_conversation_and_task_together(tmp_path: Path) -> None:

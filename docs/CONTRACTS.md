@@ -1765,8 +1765,10 @@ competing input.
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
   process. Terminal artifact finalization remains the caller's responsibility.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
-  (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
-  checkpoint to restore from. No auto-recovery.
+  (`{error, error_code, provider_error_code, http_status, type, last_good_seq, restore_hint}`) —
+  fail loud, name the checkpoint to restore from. `http_status` is the provider status the
+  `run.failed` event beside it carries, written as `null` when the failure never reached a
+  provider. No auto-recovery.
 
 #### Reference operational scopes
 
@@ -1828,7 +1830,7 @@ requires explicit host orchestration.
 
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
-  (`monoid.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
+  (`monoid.failure.v1`: `error, error_code, http_status, type, last_good_seq, restore_hint,
   failed_at`) — the durable mark is written *before* the in-memory terminal state, so a
   worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
   resumes a crashed run into a loop.

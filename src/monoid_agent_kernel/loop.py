@@ -2280,6 +2280,10 @@ class AgentLoop:
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
                 "provider_error_code": state.provider_error_code,
+                # Same state the run.failed emit above reads. The operator's restore aid used to
+                # drop the one field the log beside it kept, so diagnosing a failure from the
+                # bundle alone could not tell a 429 from a 400 from a transport error.
+                "http_status": state.provider_http_status,
                 "type": type(exc).__name__,
                 "last_good_seq": last_good_seq,
                 "restore_hint": (

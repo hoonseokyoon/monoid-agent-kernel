@@ -353,6 +353,7 @@ class RecoveryService:
         error_code: str,
         exc_type: str,
         overwrite: bool,
+        http_status: int | None = None,
     ) -> None:
         failure_path = run_dir / "failure.json"
         if failure_path.exists() and not overwrite:
@@ -370,6 +371,11 @@ class RecoveryService:
             "run_id": run_id,
             "error": error,
             "error_code": error_code,
+            # The core's twin of this bundle (``loop.py``) carries the provider status, and this
+            # writer is the one a worker crash leaves behind -- the case where the bundle is the
+            # only record there is. ``None`` for the recovery-path failures that never reached a
+            # provider, which is what an absent status means there too.
+            "http_status": http_status,
             "type": exc_type,
             "last_good_seq": last_good_seq,
             "restore_hint": (

@@ -23,6 +23,18 @@ from monoid_agent_kernel.reference.backend.ports import (
 )
 
 
+def _provider_http_status(exc: Exception) -> int | None:
+    """The provider HTTP status an exception carries, or ``None`` if it carries none.
+
+    ``ModelAdapterError`` is the only exception here that has one, and this arm answers for every
+    exception a run can die of -- so the read is by name rather than by isinstance, and anything
+    that is not an ``int`` is no status. ``bool`` is an ``int`` subclass and is not a status.
+    """
+
+    status = getattr(exc, "http_status", None)
+    return status if type(status) is int else None
+
+
 def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
     value = metrics.get(key, 0)
     if type(value) is not int or value < 0:
@@ -262,6 +274,10 @@ class RunStateMutationService:
             error_code=getattr(exc, "error_code", "internal_error"),
             exc_type=type(exc).__name__,
             overwrite=False,
+            # The same fact the core's bundle carries, off the same exception. Read defensively
+            # (this arm answers for every exception type, not only ModelAdapterError) and never
+            # coerced: anything that is not an int is no status at all.
+            http_status=_provider_http_status(exc),
         )
 
         def _mutate() -> None:
