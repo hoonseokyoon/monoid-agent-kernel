@@ -642,7 +642,13 @@ class ModelCallReceipt:
         if self.capture_downgrades < 0:
             raise ValueError("model call capture_downgrades must not be negative")
         for key, value in self.usage.items():
-            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+            # ``type(value) is not int`` rather than ``isinstance``: the same "what is a
+            # countable int" its four sibling readers spell (``provider_usage_of``,
+            # ``_reported_error_usage``, ``with_error``, ``_recordable_usage``). ``isinstance``
+            # here accepted every ``int`` subclass -- an ``IntEnum`` a provider SDK hands back
+            # as a token count is the real shape -- so this constructor admitted a count that
+            # every reader of the stamp had just refused. Excluding ``bool`` is now implied.
+            if not isinstance(key, str) or type(value) is not int:
                 raise WireValidationError("model call usage must be a mapping of str to int")
             # Every other counter on this receipt refuses a negative, and usage is the one that gets
             # summed: a single ``{"input_tokens": -100}`` in an audit payload silently subtracts from

@@ -3002,7 +3002,9 @@ def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "ModelAdapterError"
     ]
-    assert len(branches) == 4, {"classification_branches": len(branches)}
+    # Five: 4xx, 5xx, the connection family (retryable like its gateway twin), the body-code
+    # recovery, and the unclassified tail.
+    assert len(branches) == 5, {"classification_branches": len(branches)}
     flagged = [
         {
             keyword.arg
@@ -3011,7 +3013,7 @@ def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
         }
         for branch in branches
     ]
-    assert flagged == [{"provider_retried", "config_recoverable"}] * 4, {
+    assert flagged == [{"provider_retried", "config_recoverable"}] * 5, {
         "flags_per_branch": [sorted(names) for names in flagged],
         "hint": "a branch stopped stating one of the two: bind it, do not narrow this pin",
     }
@@ -3244,21 +3246,36 @@ class _SubclassedCount(IntEnum):
     SEVEN = 7
 
 
-def test_3d_the_four_readers_of_one_stamp_agree_about_what_a_count_is() -> None:
-    """Same stamp, four predicates, one verdict — pinned so a fifth spelling fails here.
+def test_3d_the_five_siblings_of_one_stamp_agree_about_what_a_count_is() -> None:
+    """Same stamp, five predicates, one verdict — pinned so a sixth spelling fails here.
 
     ``_recordable_usage`` used to answer ``isinstance(value, int)`` where its three siblings
     answer ``type(value) is int``, so an ``IntEnum`` a provider SDK hands back as a token count
     was a recordable usage on one path and no usage at all on the three that consume it — and
     the receipt this one feeds would then reject what it had just accepted.
+
+    The receipt *constructor* was the fifth spelling of the same predicate:
+    ``ModelCallReceipt.__post_init__`` answered ``isinstance`` too, so it accepted the
+    ``IntEnum`` every reader beside it refuses — a receipt could carry a count no consumer of
+    the stamp would count. It differs from the four in failure mode, deliberately: the readers
+    sit on failure paths and filter silently (a malformed count must not replace the failure
+    being reported), the constructor sits on the success path and refuses loudly.
     """
 
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
 
     subclassed = {"input_tokens": _SubclassedCount.SEVEN}
     stamped = ModelAdapterError("billed then refused")
     mark_provider_usage(stamped, dict(subclassed))
     assert vars(stamped)["provider_usage"] == subclassed
+
+    def constructor_counts_it(usage: dict[str, Any]) -> bool:
+        try:
+            ModelCallReceipt(usage=usage)
+        except WireValidationError:
+            return False
+        return True
 
     verdicts = {
         "providers/base.py:provider_usage_of": bool(provider_usage_of(stamped)),
@@ -3269,22 +3286,27 @@ def test_3d_the_four_readers_of_one_stamp_agree_about_what_a_count_is() -> None:
             dict(ModelCallReceipt().with_error(stamped).usage)
         ),
         "model_call.py:_recordable_usage": bool(_recordable_usage(dict(subclassed))),
+        "core/model_io.py:ModelCallReceipt.__post_init__": constructor_counts_it(
+            dict(subclassed)
+        ),
     }
     assert verdicts == {
         "providers/base.py:provider_usage_of": False,
         "providers/gateway.py:_reported_error_usage": False,
         "core/model_io.py:ModelCallReceipt.with_error": False,
         "model_call.py:_recordable_usage": False,
+        "core/model_io.py:ModelCallReceipt.__post_init__": False,
     }, {
         "verdicts": verdicts,
-        "hint": "one stamp, one verdict: a reader that disagrees reclassifies a billed call",
+        "hint": "one stamp, one verdict: a sibling that disagrees reclassifies a billed call",
     }
 
 
-def test_3d_a_bool_is_not_a_count_on_any_reader() -> None:
-    """The one thing all four agree on, so the divergence above is about subclasses only."""
+def test_3d_a_bool_is_not_a_count_on_any_sibling() -> None:
+    """The one thing all five agree on, so the divergence above is about subclasses only."""
 
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
 
     stamped = ModelAdapterError("boolean count")
     mark_provider_usage(stamped, {"input_tokens": True})
@@ -3292,6 +3314,8 @@ def test_3d_a_bool_is_not_a_count_on_any_reader() -> None:
     assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
     assert dict(ModelCallReceipt().with_error(stamped).usage) == {}
     assert _recordable_usage({"input_tokens": True}) == {}
+    with pytest.raises(WireValidationError, match="mapping of str to int"):
+        ModelCallReceipt(usage={"input_tokens": True})
 
 
 # --------------------------------------------------------------------------------------

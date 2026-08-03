@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.loop import _recoverable_turn_error
 from monoid_agent_kernel.providers.openai import (
     _model_error_from_openai,
     _stream_output_index,
@@ -163,3 +164,79 @@ def test_the_retry_evidence_reaches_every_classification_branch(exc: Exception) 
 
     exc.request = _RequestWithRetryCount("1")
     assert _model_error_from_openai(exc).provider_retried is True
+
+
+def test_a_requestless_transport_error_is_classified_not_replaced() -> None:
+    """The retry probe's own policy — anything unreadable means "no retry" — must hold on httpx.
+
+    ``httpx.HTTPError.request`` is a *property that raises* ``RuntimeError`` when unset, and
+    ``getattr`` swallows only ``AttributeError`` — so the one probe that ran outside a ``try``
+    replaced a classified mid-stream failure (a ``ReadError`` while consuming the body) with a
+    raw ``RuntimeError`` the loop cannot classify at all. A real request-less httpx error, not a
+    fake: the fake cannot raise from a property the way the real class does.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    dropped = httpx.ReadError("connection dropped while reading the body")
+    me = _model_error_from_openai(dropped)
+    assert me.provider_error_code == "unclassified_provider_error"
+    assert me.retryable is False
+    assert me.provider_retried is False
+    assert me.http_status is None
+
+
+def test_the_connection_family_parks_recoverably_like_the_gateway_twin() -> None:
+    """A transient connection failure ends the turn, not the session — on BOTH adapters.
+
+    The gateway twin classifies its transport failures (``URLError`` / ``TimeoutError`` /
+    ``OSError``) retryable, so the loop parks ``turn_failed`` and the backend backoff-retries.
+    The direct adapter's same condition — ``openai.APIConnectionError``, which
+    ``APITimeoutError`` subclasses — fell to the unclassified tail: retryable=False,
+    config_recoverable=False, terminal for the whole run. One condition, two verdicts, is the
+    dispatch-shape asymmetry this suite exists to close.
+    """
+
+    openai = pytest.importorskip("openai")
+    httpx = pytest.importorskip("httpx")
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+
+    network = _model_error_from_openai(openai.APIConnectionError(request=request))
+    assert network.provider_error_code == "openai_network_error"
+    assert network.retryable is True
+    assert network.http_status is None
+    assert network.config_recoverable is False
+    # The flag the classification exists to reach: the loop keeps the session alive.
+    assert _recoverable_turn_error(network) is True
+
+    timeout = _model_error_from_openai(openai.APITimeoutError(request=request))
+    assert timeout.provider_error_code == "openai_timeout"
+    assert timeout.retryable is True
+    assert timeout.http_status is None
+    assert timeout.config_recoverable is False
+    assert _recoverable_turn_error(timeout) is True
+
+    # The connection branch must not leak the SDK's message prose.
+    assert "Connection error" not in str(network)
+
+
+def test_the_connection_branch_still_reports_the_sdk_retries() -> None:
+    """The SDK retries connection failures *before* raising, and the evidence must survive.
+
+    An ``APIConnectionError`` always carries the final ``httpx.Request``, so the retry-count
+    header is readable on exactly this family — the interplay the classification change must
+    keep working.
+    """
+
+    openai = pytest.importorskip("openai")
+    httpx = pytest.importorskip("httpx")
+    retried = httpx.Request(
+        "POST",
+        "https://api.openai.com/v1/responses",
+        headers={"x-stainless-retry-count": "2"},
+    )
+    resent = _model_error_from_openai(openai.APIConnectionError(request=retried))
+    assert resent.provider_retried is True
+
+    first_try = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    fresh = _model_error_from_openai(openai.APIConnectionError(request=first_try))
+    assert fresh.provider_retried is False

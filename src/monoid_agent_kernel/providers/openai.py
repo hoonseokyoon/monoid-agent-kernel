@@ -658,16 +658,44 @@ def _provider_retried_by_the_sdk(exc: Exception) -> bool:
 
     Read defensively in both directions: this classifier also answers for exceptions that never
     came from the SDK at all (a client constructor failure, a payload ``TypeError``), and a
-    *claimed* retry is worse than an unknown one -- anything unreadable means "no retry".
+    *claimed* retry is worse than an unknown one -- anything unreadable means "no retry". The
+    whole read is one guard, in the fully-covered style of ``provider_usage_of``: ``getattr``
+    swallows only ``AttributeError``, and ``httpx.HTTPError.request`` is a *property that
+    raises* ``RuntimeError`` when unset -- exactly what a mid-stream ``ReadError`` carries into
+    this probe -- so a guard that enumerated the expected exceptions replaced the classified
+    failure with the probe's own crash.
     """
 
-    headers = getattr(getattr(exc, "request", None), "headers", None)
-    if headers is None:
-        return False
     try:
+        headers = getattr(getattr(exc, "request", None), "headers", None)
+        if headers is None:
+            return False
         return int(headers.get("x-stainless-retry-count") or 0) > 0
-    except (AttributeError, TypeError, ValueError):
+    except Exception:
         return False
+
+
+def _connection_error_code(exc: Exception) -> str | None:
+    """The transport-failure family this exception belongs to, or None.
+
+    ``openai.APIConnectionError`` (which ``APITimeoutError`` subclasses) is the SDK's spelling
+    of the condition the gateway adapter classifies from ``URLError`` / ``TimeoutError`` /
+    ``OSError``: the provider was never reached, or stopped answering. Named with the same
+    ``*_timeout`` / ``*_network_error`` pair the gateway and web transports use, prefixed by
+    this adapter the way ``openai_bad_response`` already is. Imported lazily like every other
+    SDK touch in this module: an exception that could be one of these classes can only exist
+    when the package is importable, so an absent SDK truthfully answers "not this family".
+    """
+
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - an SDK exception implies the SDK
+        return None
+    if isinstance(exc, openai.APITimeoutError):
+        return "openai_timeout"
+    if isinstance(exc, openai.APIConnectionError):
+        return "openai_network_error"
+    return None
 
 
 def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
@@ -709,6 +737,26 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
             retryable=True,
             config_recoverable=_config_shaped_refusal(status, retryable=True),
             http_status=status,
+            provider_retried=retried,
+        )
+    # A transient connection failure: the provider was never reached or stopped answering, so
+    # there is no status and no body to reason from -- which is why this branch sits below the
+    # two status branches (a real response always outranks the class) and cannot shadow them:
+    # the SDK constructs this family with neither a ``status_code`` nor a ``body``. Retryable,
+    # because waiting is the remedy, exactly as the gateway twin classifies the same condition
+    # (its ``URLError`` / ``TimeoutError`` / ``OSError`` handlers); left to the tail below it
+    # was retryable=False and the one adapter difference terminalized the run the other adapter
+    # parks recoverably. The SDK's own retry loop runs on this family *before* raising, so the
+    # ``retried`` evidence above matters here most.
+    connection_code = _connection_error_code(exc)
+    if connection_code is not None:
+        return ModelAdapterError(
+            f"provider connection failed ({type(exc).__name__})",
+            error_code="model_error",
+            provider_error_code=connection_code,
+            retryable=True,
+            config_recoverable=_config_shaped_refusal(None, retryable=True),
+            http_status=None,
             provider_retried=retried,
         )
     # No usable HTTP status. Recover what we can from the body code so the failure isn't masked as

@@ -37,6 +37,34 @@ out in commit messages and here.
   the loop is dead — `AgentLoop.close` discards the activation before re-raising — rather
   than leaving an input-accepting park state over it.
 
+### Fixed — the transport failures one adapter parked, the other terminalized
+
+- **A transient connection failure on the direct OpenAI adapter ends the turn, not the run.**
+  `openai.APIConnectionError` (and the `APITimeoutError` that subclasses it) carries no status
+  and no body, so it fell to the classifier's unclassified tail: retryable=False, terminal for
+  the whole session — while the gateway adapter classifies the identical condition (`URLError`
+  / `TimeoutError` / `OSError`) retryable=True and the loop parks `turn_failed` for the backend
+  to backoff-retry. The classifier now has a connection-family branch — `openai_timeout` /
+  `openai_network_error`, the direct adapter's spelling of the `*_timeout` / `*_network_error`
+  pair every other transport uses — retryable, no claimed status, and still carrying the
+  retries the SDK itself spent on the family it retries most.
+- **The SDK-retry probe classifies a request-less httpx error instead of crashing on it.**
+  `httpx.HTTPError.request` is a *property that raises* `RuntimeError` when unset, and the one
+  probe read outside a `try` swallowed only `AttributeError` — so a mid-stream network drop
+  (`ReadError` while consuming the body) reached the classifier and came out as a raw
+  `RuntimeError` in place of the classified error, which the gateway route then mapped to a
+  retryable 500: an unreadable probe *flipped a non-retryable failure to retryable*. The whole
+  read now sits in one guard with the probe's own stated policy — anything unreadable means
+  "no retry" — in the fully-covered style of `provider_usage_of`.
+- **The receipt constructor joins the four readers of the countable-int predicate.**
+  `ModelCallReceipt.__post_init__` answered `isinstance(value, int)` where the four readers of
+  one usage stamp (`provider_usage_of`, `_reported_error_usage`, `with_error`,
+  `_recordable_usage`) all answer `type(value) is int`, so the constructor accepted the
+  `IntEnum` every reader beside it refuses — a receipt could carry a count no consumer would
+  count. The five-sibling agreement is pinned in the census (the four-readers pin now seats
+  the fifth), with the deliberate asymmetry stated: failure-path readers filter silently, the
+  success-path constructor refuses loudly.
+
 ### Added — a field-carriage conformance suite (repo-internal drift tooling)
 
 - **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier
