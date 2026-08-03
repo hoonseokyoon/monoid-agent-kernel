@@ -449,6 +449,15 @@ would silently change `{"enum": [NaN]}` into a different constraint), so the val
 strict serializer both adapters run over the assembled request body and is refused there as a
 non-retryable, `config_recoverable` bad request (`gateway_bad_request` /
 `unserializable_request`) — the same answer either adapter gives any value that cannot be sent.
+**The same rule governs a tool's `input_schema`** (`normalize_tool_spec`, and the reference
+gateway's server-side ingress over the `tools` it forwards): that schema is both the constraint
+the registry validates calls against and the definition the provider is sent, so it is delivered
+as its author wrote it or refused — never quietly changed. Strings and containers are still
+normalized on both schemas; only the substitution is dropped. A **record** of a schema is a
+different boundary and keeps the substitution, because portable JSON cannot carry the value at
+all: the run manifest, the transcript's tool-surface snapshot, and the event log store `null`
+there, so a schema no provider will accept fails the calls it rides on rather than the run's
+durability.
 Adapters without the declaration ignore the field, and post-hoc
 output validation remains the guarantee on every adapter: native delivery only reduces
 repairs. `AgentLoop` never sets the field; it belongs to standalone `ModelCallRunner` /
@@ -602,6 +611,16 @@ the dispatch helper, and are tracked for a later release.
 Adapters must use `request.model` for turn-level model selection when present.
 `GatewayModelAdapter` and `OpenAIModelAdapter` follow that rule.
 
+**By-value is the only continuation route on `OpenAIModelAdapter`.** It sends `store=False` on
+every request (zero data retention, paired with `include=["reasoning.encrypted_content"]` so the
+reasoning round-trip travels by value), which means no response is ever persisted for a handle
+to name. A request carrying `previous_turn_handle` — with `messages` unset, so the by-reference
+shape is the one selected — is therefore refused at the adapter boundary with a non-retryable,
+`config_recoverable` `ModelAdapterError` (`unsupported_request_shape`) naming `messages` as the
+supported route. It is a fail-closed refusal of a shape that cannot work here, not a claim about
+the shape in general: an adapter whose provider does persist responses is free to support it, and
+a stale handle riding *beside* `messages` is unaffected, since `messages` selects the shape.
+
 ### Output Validation
 
 A developer-supplied `OutputValidator` guarantees the final response conforms to a shape the
@@ -670,7 +689,8 @@ carriage fields of the shapes it did not choose** — a repair request carries i
 exactly one way, so its `request_digest` describes a request an adapter actually sends. A
 one-shot call is never promoted to the handle path just because
 the provider returned a response id — `OpenAIModelAdapter` sends `store=False`, so that id was
-never persisted and the repair would 404. A request that
+never persisted and the repair would 404 (today it never leaves: that adapter refuses the
+by-reference shape outright, so a promoted repair would fail before the call). A request that
 came in *on* a continuation handle whose turn came back *without* a new handle has no fourth
 shape — the conversation lives on the provider's side of that handle — so it settles
 `unsatisfied` without repairing rather than repairing against a prompt the model never saw;
@@ -1482,6 +1502,14 @@ carries no `messages`. It has three shapes, selected by `previous_turn_handle` a
 Either style lets one run accept multiple user turns: with `messages` the new user message
 is appended to the log; with a handle the kernel threads the last `turn_handle` into the
 next user message.
+
+The handle-based style only works when the gateway's **upstream** persists its responses, since
+the server translates the opaque `turn_handle` into the upstream's own response id. The reference
+gateway's default upstream is `OpenAIModelAdapter`, which does not (`store=False`), so against
+that default a handle-based continuation is refused upstream and answered as `422` with
+`unsupported_request_shape` — a classified bad request the client survives, where it previously
+travelled on to become an opaque provider 404. Configure a `provider_adapter_factory` whose
+upstream keeps responses to use this style, or send `messages`.
 
 Successful response:
 

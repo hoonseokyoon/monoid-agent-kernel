@@ -52,7 +52,7 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
 )
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, normalize_json_ingress
 from monoid_agent_kernel.core.model_content import (
     MODEL_CONTENT_FILENAME,
     ModelContentReadResult,
@@ -499,11 +499,22 @@ def _runtime_config_for(
 
 
 def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
+    """One tool entry of the profile preview -- a *record* of the request, not the request.
+
+    The record half of the schema rule keeps the substitution, exactly as the transcript's
+    ``core/tool_surface.py:_tool_spec_payload`` and the run manifest do. The request half does
+    not: ``normalize_tool_spec`` preserves a schema's non-finite values so the provider boundary
+    refuses the call as a classified, config-recoverable bad request. Embedding the preserved
+    value in this HTTP egress instead killed the endpoint at ``_write_json``'s ``allow_nan=False``
+    -- an anonymous serialization failure describing a request the operator was only trying to
+    look at, one boundary before the classified refusal and for a portability reason.
+    """
+
     return {
         "id": tool.id,
         "name": tool.exported_name,
         "description": tool.description,
-        "input_schema": tool.input_schema,
+        "input_schema": normalize_json_ingress(tool.input_schema),
         "capability": tool.capability,
         "side_effect": tool.side_effect,
     }

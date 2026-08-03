@@ -391,8 +391,10 @@ def _repair_request(
     because a provider returns an id for every response it produces. That path is dead on the
     shipped adapters: ``OpenAIModelAdapter`` sends ``store=False`` on every request, so the
     response the repair would continue from was never persisted, and the reference gateway
-    inherits it through its opaque handle. A repair that 404s is worse than no repair -- it
-    loses the whole call, receipts included, to an exception.
+    inherits it through its opaque handle. Today such a repair never leaves at all -- that
+    adapter refuses the by-reference shape outright at its boundary, so a promoted repair fails
+    before the call rather than as an opaque provider 404. Either way it is worse than no
+    repair: the whole call is lost, receipts included, to an exception.
 
     ``None`` is the fourth outcome, and it is the honest one: a request that came in **on** a
     continuation handle whose turn came back **without** a new handle has nowhere to continue

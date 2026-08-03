@@ -5,7 +5,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -374,23 +374,49 @@ class LlmGatewayBackend:
         return turn_handle
 
 
+# The wire spellings one tool entry may carry its argument schema under, in the order
+# ``_parse_tool`` prefers them. Shared with the ingress above so the two cannot come to
+# disagree about which keys hold a schema -- a key kept verbatim by one and rewritten by the
+# other is the same defect wearing a second name.
+_TOOL_SCHEMA_KEYS: tuple[str, ...] = ("input_schema", "parameters")
+
+
 def _normalized_turn_payload(payload: dict[str, Any]) -> Any:
     """The server-side ingress rule, matching the client's exactly.
 
-    The blanket normalize substitutes non-finite *content* values; ``output_schema`` is
-    config, not content -- the client ingress keeps it verbatim
-    (``normalize_model_request``, ``substitute_nonfinite=False``) so a non-finite value is
+    The blanket normalize substitutes non-finite *content* values; a **schema** is config, not
+    content -- the client ingress keeps one verbatim (``normalize_model_request`` and
+    ``normalize_tool_spec``, both ``substitute_nonfinite=False``) so a non-finite value is
     *refused* downstream rather than silently rewritten into a different constraint. Riding
     the blanket normalize here turned the caller's ``NaN`` into ``null`` before the upstream
     adapter ever saw it -- the exact rewrite the rule exists to rule out, on the one route
     (in-process Python callers) the JSON parsers don't guard. One function, both handlers.
+
+    This request carries schemas in two places, and the rule is about schemas, not about the
+    field it was first noticed on: ``output_schema`` for the answer, and one per entry of
+    ``tools`` for its arguments (under either wire spelling ``_parse_tool`` accepts). Each is
+    re-normalized from the **original** payload, since the blanket copy above has already lost
+    the value.
     """
 
     normalized = normalize_json_ingress(payload)
-    if isinstance(normalized, dict) and normalized.get("output_schema") is not None:
+    if not isinstance(normalized, dict):
+        return normalized
+    if normalized.get("output_schema") is not None:
         normalized["output_schema"] = normalize_json_ingress(
             payload.get("output_schema"), substitute_nonfinite=False
         )
+    original_tools = payload.get("tools")
+    normalized_tools = normalized.get("tools")
+    if isinstance(normalized_tools, list) and isinstance(original_tools, (list, tuple)):
+        for normalized_tool, original_tool in zip(normalized_tools, original_tools):
+            if not isinstance(normalized_tool, dict) or not isinstance(original_tool, Mapping):
+                continue
+            for key in _TOOL_SCHEMA_KEYS:
+                if key in original_tool and normalized_tool.get(key) is not None:
+                    normalized_tool[key] = normalize_json_ingress(
+                        original_tool[key], substitute_nonfinite=False
+                    )
     return normalized
 
 
@@ -562,13 +588,11 @@ def _parse_tool(raw: dict[str, Any]) -> ToolSpec:
 
     raw = require_object(raw, "tool")
     tool_id = parse_str(raw, "id") or parse_str(raw, "name")
-    input_schema = (
-        require_object(raw["input_schema"], "input_schema")
-        if "input_schema" in raw
-        else require_object(raw["parameters"], "parameters")
-        if "parameters" in raw
-        else {}
-    )
+    input_schema: dict[str, Any] = {}
+    for key in _TOOL_SCHEMA_KEYS:
+        if key in raw:
+            input_schema = require_object(raw[key], key)
+            break
     return ToolSpec(
         id=tool_id,
         provider_name=parse_str(raw, "name") or tool_id.replace(".", "_"),

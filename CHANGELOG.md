@@ -7,8 +7,136 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — a field-carriage conformance suite (repo-internal drift tooling)
+
+- **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier
+  obliged to repeat it.** The dominant defect shape here is a fact that rides N parallel carriers
+  — dataclass, checkpoint payload, event data, event schema, wire body, SSE frame, client reader,
+  transcript record — with a change binding N−1 of them; review finds those one at a time. The
+  suite takes an authority per fact family (`dataclasses.fields`, the `__init__` signature, the
+  normalizer's emitted-key domain) and set-diffs it against each carrier, so a field added to an
+  authority without a carrier fails by construction. Seven families are covered: `Suspension`,
+  `ModelAdapterError` transport, usage counts, the W5 applied-echo protocol, the tool catalog
+  (one `ToolSpec` projected by five hand-written builders, each omission justified in place),
+  the checkpoint validator's field coverage (six hand-maintained frozensets over a validator
+  that fails open), and the success envelope — the main wire, two server writers against two
+  client parsers.
+- Four properties make the census trustworthy: one hand-written *maximal builder* per authority
+  with a reflection guard (a generic synthesizer would silently skip a new field); *behavioral*
+  reader censuses that diff reconstructed attributes rather than key sets, because a reader that
+  ignores a wire key leaves no trace in any key set; *declared* alias tables for the facts that
+  are renamed at a hop (wire `error_code` carries `provider_error_code`, `RunCheckpoint` spells
+  `http_status` as `provider_http_status`, `awaiting_task_ids` is `task_ids` on one event, the
+  success body's `turn_handle` is read back as `response_id`); and **no hand copies as
+  authorities** — the usage domain is the assignable key set of the live normalizer, the server
+  error body is captured from the shipped `_write_exception` and diffed against its SSE twin,
+  and the gateway's error-reader list is discovered from the module rather than written down.
+  An AST backstop pins the set of files whose *code* names each headline field (substring
+  containment counted a comment as a carrier and so failed open), plus a declared list of
+  non-Python carriers — the shipped Studio bundle, `docs/CONTRACTS.md`, `docs/OBSERVABILITY.md`
+  — so a wire-key rename that breaks the shipped UI fails a test that names the file.
+- **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
+  one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
+  exist, so a rename rots the entry loudly) and a disposition — `burn-down`, `v0.21-track:B1`, or
+  `by-design`. The assertions encode today's reality exactly, so closing a gap *breaks* the suite
+  and the fixer must update the expected set and delete the registry entry in the same change.
+  A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
+  each with the authority a census would take, its carrier count, and a one-line risk note — so
+  the suite's silence about a family is a decision on the record rather than an oversight.
+- **Round-2 hardening: the census mechanisms were attacked, and the ones that failed open are
+  repaired here.** Each repair is a mechanism, not a patched assertion. Every drift below was run
+  against the suite as it stood and passed all 89 tests; each now fails with a diagnostic naming
+  the shape. *Wrapper transparency* — `inspect.getsource`
+  and `inspect.signature` both follow `__wrapped__`, so a `functools.wraps` wrapper adding an
+  eighth usage key passed the whole suite; every live-callable census now refuses a wrapped
+  object rather than reading the function underneath it. *Fail-closed emit reading* — the
+  assignable-domain reader documented itself as fail-closed and looked at one of the four ways to
+  write a key into a dict, so `result.update({...})`, `|=` and augmented assignment were each an
+  emitted key it reported as nonexistent; any method call or augmented assignment on the result
+  is now an unanalyzable shape that fails by name. *Bucket membership and consumption* — moving a
+  field between two checkpoint validation buckets changes the rule it is validated under at the
+  recovery boundary and left the union, the disjointness and the count untouched; membership is
+  pinned per bucket, and every bucket must be read by the validator, so a declared-but-unused one
+  fails. *Minimal-probe twins* — the wire censuses pinned only the maximal request, so a writer
+  that omitted a key whenever it held its default value was invisible; each family-7 census has a
+  minimal twin, and the difference between the two probes is the conditional half of the wire.
+  *Widened discovery* — reader discovery was a predicate on where a function was written (module
+  level) and how it spelled its raise (a literal constructor); it now walks class bodies and
+  resolves one level of delegation. The gateway's wire-reading helper list, the other closed hand
+  list in the family, is derived from the module and diffed against it, and the emit-site census
+  counts every emit for an event type instead of only those with a literal `data={...}`.
+- **Round-3 hardening: each round-2 repair was attacked on its own twin, and five broke there.**
+  Same method as above — every drift below was run against the suite as it stood, passed all 111
+  tests, and now fails with a diagnostic naming the shape (suite: 111 → 120). *The write census
+  was bound on one name.* The assignable-domain reader refused what it could not read about the
+  dict it *returns* and looked at no other name, so `details["tool_tokens"] = ...` written ahead
+  of `for key, value in details.items(): result[key] = value` reached the wire through the copy
+  loop's source — and a source with no dict literal bound to it resolved to the empty set instead
+  of refusing. One mechanism (`_dict_writes`) now answers for every name in a scope: constant
+  contributions (subscript writes, analyzable `update({...})` and `|=` merges) are folded in, and
+  a `**` splat, a computed key, a merge from a name, a rebinding, an unmodelled mutator, or a
+  `return` of anything but the counted name is refused by name. *Its resolver twin had no refusal
+  in it at all.* The `data=<name>` emit-site resolver and the bespoke `metrics.updated` census
+  each read dict literals plus constant-key subscript writes and silently dropped everything
+  else, so a `data.update({...})` put a key on the wire that the schema diff reported as
+  nonexistent; both now resolve through the same mechanism and fail closed. *Family-2 discovery
+  still spelled two predicates.* "Reads the wire" meant *calling a registered helper*, so a
+  reader doing its own `payload.get("error")` was not a reader; "takes a mapping" meant the
+  annotation said so, so a `payload: Any` helper carrying a wire key was invisible to every
+  read-key census. Both are read off the body now, with the registered helpers excluded by name
+  because the sibling census already derives them. *Family 2 had no minimal probe.* Family 7 grew
+  minimal-input twins in round 2 and the error family did not, so an omit-when-falsy filter added
+  on either shipped writer's side of the shared `_error_body` call was invisible to probes that
+  only ever fed a maximal exception; both writers are now driven with a minimal one, pinning that
+  `usage` is the single conditional key. *Two registered-gap pins censused a spelling and an
+  end.* The call-receipt pin collected `getattr(exc, …)` reads only, so the one-line
+  `exc.config_recoverable` that would close the gap left it green; the ready-result pin flipped
+  only for a filter landing inside `projection.py:result`, so it now also pins that the HTTP
+  route writes that dict wholesale. A registry entry's "eleven web counters" is eight. Seven new
+  tests drive synthetic sources through the refusal and folding rules themselves, because
+  today's readable code returns the same key set whether those rules exist or not.
+- **Round-4 hardening: the write census refused what is written *through* a name and missed both
+  ways the dict leaves it** (suite: 120 → 124). `result.mutate()` was refused and `mutate(result)`
+  was not, so a tracked dict handed to a plain call — `_fold_web_counters(metrics_data, ctx)`, the
+  idiom the censused package itself uses in `_accumulate_usage_mapping(state.total_usage, billed)`
+  — was mutated invisibly, and `alias = result; alias["k"] = v` wrote through a second handle the
+  consumer never asks about; an argument position outside a whitelist of provably read-only
+  builtins (plus the emit binding the census exists to read) and an alias are refusals now. The
+  three literal-*argument* extractors — the `kind="model_turn"` transcript records, the
+  `write_failure` bundle, the manifest's `limits=` — were the fourth resolution path onto that
+  rule and still read the weak half of it, dropping a `**` splat silently while their equality
+  pins stayed green; all three resolve through the strict extractor, and the weak one is gone.
+- **Every registry entry now has an assertion behind it.** Five round-1 entries were prose: the
+  driver and the call receipt that were designed for `config_recoverable` and never name it, the
+  closed `stream_closed` schema, the `turn.failed` event that no status projection consumes, and
+  the `turn.interrupted` cause-vs-park vocabulary collision. Ten further gaps found by the round-2
+  black-box pass are registered and pinned — among them the `result()` ready branch serving the
+  raw error its two siblings filter, three checkpoint-carriage cells (`output_failure_history`,
+  the context-owned subagent/skill counters, and a cancellation flag written unconditionally and
+  applied conditionally), the backend tenant meter dropping the same four priced sub-counts the
+  gateway meter does, a failed run metering nothing at all, two run-status projections each blind
+  to the park the other sees, three lifecycle mappers answering one terminal-limited run three
+  ways, and a recovery-path `Suspension` built outside the durable status vocabulary. Two new
+  `FUTURE_FAMILIES` entries (run-state → checkpoint carriage; the settled-text digest family with
+  six hand carriers), and the numeric claims in that registry are pinned so a stale prediction
+  rots loudly.
+- An end-to-end streamed twin of the by-reference 422 (`tests/test_llm_gateway_backend.py`): the
+  refusal is raised after the HTTP layer has committed to a 200 SSE body, so it travels as a
+  terminal `type: "error"` frame rather than a non-200 response — a materially different route
+  whose composition the sync test could not prove.
+- Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
+  CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
+  in the parallel shard. No public surface, wire format, or shipped contract changes.
+
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 
+- **The Studio profile preview is a record, and now substitutes like one.** Preserving a tool
+  schema's non-finite values through ingress (above) means the value reaches every surface that
+  embeds the schema, and the preview endpoint serializes with `allow_nan=False` — so looking at
+  the tool surface of a profile carrying such a schema failed the request with an anonymous
+  serialization error, one boundary before the classified refusal a real call gets and for a
+  portability reason rather than a config one. `_gateway_tool_schema` normalizes the embedded
+  schema, the same rule the transcript's `_tool_spec_payload` and the run manifest already apply.
 - **A stream that ends without a terminal frame is no longer accepted unproven.** The
   applied-parameter checks lived only on the `turn_complete` frame — which is exactly the frame
   an older gateway never sends; its stream ends cleanly, `assemble_streamed_turn` synthesizes
@@ -103,6 +231,37 @@ out in commit messages and here.
   through the same `is_finite_json_number` rule the rest of this wire reads with), while
   still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
   `1.0` is not falsely refused.
+- **The OpenAI adapter refuses the by-reference shape instead of sending an unusable one.**
+  `OpenAIModelAdapter` sets `store=False` on every request (zero data retention, paired with
+  `include=["reasoning.encrypted_content"]`) and still emitted `previous_response_id` when a
+  request carried `previous_turn_handle` — a handle naming a response the adapter guaranteed was
+  never persisted. One of `ModelRequest`'s three documented shapes was therefore dead on this
+  adapter, and said so only as an opaque provider 404 at call time, on the original call and not
+  merely on a validation repair. It is now refused at the adapter boundary with a non-retryable,
+  `config_recoverable` `unsupported_request_shape` naming `messages` as the supported route, on
+  `next_turn` and `astream_turn` alike; the unreachable branch (and its observation-item helper)
+  is deleted. The refusal is bound to the *shape*, not to the field: `messages` still overrides a
+  leftover handle, exactly as documented. The reference gateway's own by-reference continuation
+  inherits it when its upstream is this adapter — as a classified `422` the outer client survives
+  rather than an opaque 404 — while gateway by-reference support for upstreams that really do
+  persist responses is untouched. The `422` is the status on both transports but only the
+  non-streamed route *is* a `422` response: `handle_turn_stream` builds the adapter eagerly and
+  raises inside the frame generator, after the SSE `200` is committed, so there the refusal
+  travels as the terminal `error` frame carrying `http_status: 422` — which the client's stream
+  reader reconstructs into the same `ModelAdapterError`.
+- **A tool's `input_schema` is not rewritten by ingress either.** The `output_schema` rule
+  below was bound on one of the two schemas this request carries. `normalize_tool_spec`
+  substituted non-finite floats with `null`, so `{"enum": [NaN]}` became `{"enum": [null]}` —
+  the constraint the registry's `Draft202012Validator` then judged every call against and the
+  definition the provider was then sent, neither being what the tool author wrote. The value
+  now survives ingress (strings and containers are still normalized) and is refused at the
+  serialization boundary as a non-retryable, `config_recoverable` bad request, on both
+  adapters and both transports. The reference gateway's server-side ingress carried the same
+  defect for the `tools` it forwards (under either wire spelling, `input_schema` or
+  `parameters`) and is bound the same way, on `handle_turn` and `handle_turn_stream` alike.
+  A *record* of a schema keeps the substitution — the manifest, the transcript's tool-surface
+  snapshot and the event log cannot carry a non-finite value at all — so such a schema fails
+  the call it rides on, classified, instead of killing the run at a durability writer.
 - **`output_schema` is not rewritten by ingress.** `normalize_model_request` substituted
   non-finite floats with `null` — right for model content, wrong for a control document
   promised verbatim: `{"enum": [NaN]}` became `{"enum": [null]}`, a different constraint the

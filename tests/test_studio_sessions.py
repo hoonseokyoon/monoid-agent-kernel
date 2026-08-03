@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1366,6 +1367,59 @@ def test_studio_profile_preview_resolves_model_request_surface(studio: StudioSer
     assert bound["model_request"]["messages"] == [
         {"role": "user", "content": "Inspect the workspace."}
     ]
+
+
+def test_studio_profile_preview_substitutes_a_preserved_non_finite_tool_schema(
+    studio: StudioServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preview is a *record* of a request, so it obeys the record half of the schema rule.
+
+    A tool's ``input_schema`` keeps its non-finite values through ingress (that is what makes the
+    provider boundary refuse the call as a classified, config-recoverable bad request), so the
+    value reaches every surface that embeds the schema. This endpoint serializes with
+    ``allow_nan=False``: embedding the schema raw killed a request whose only purpose is to
+    *look at* the tool surface, with an anonymous serialization error rather than the classified
+    refusal a real call gets. Same substitution the transcript's ``_tool_spec_payload`` and the
+    run manifest make.
+    """
+
+    from monoid_agent_kernel.reference.studio import server as studio_server
+
+    real_builtin_tools = studio_server.builtin_tools
+
+    def _builtin_tools_with_a_non_finite_schema(workspace):
+        return [
+            replace(tool, input_schema={**tool.input_schema, "default": float("nan")})
+            if tool.id == "fs.read"
+            else tool
+            for tool in real_builtin_tools(workspace)
+        ]
+
+    monkeypatch.setattr(studio_server, "builtin_tools", _builtin_tools_with_a_non_finite_schema)
+
+    request = Request(
+        f"{studio.base_url}/api/profile-preview",
+        data=json.dumps(
+            {
+                "name": "Previewer",
+                "instructions": "Preview a non-finite tool schema.",
+                "capabilities": ["read"],
+                "model": "gpt-preview",
+                "effort": "high",
+                "summary": "off",
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=5) as response:
+        assert response.status == 200
+        preview = json.loads(response.read().decode("utf-8"))
+
+    read_tool = next(tool for tool in preview["tools"] if tool["id"] == "fs.read")
+    assert read_tool["input_schema"]["default"] is None
+    # The record is portable JSON end to end, which is the property the endpoint depends on.
+    assert json.loads(json.dumps(preview, allow_nan=False))["tool_count"] == preview["tool_count"]
 
 
 def test_studio_profile_history_survives_restart(tmp_path: Path) -> None:

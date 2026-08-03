@@ -17,6 +17,7 @@ PRIMARY_TIERS = frozenset({"unit", "contract", "integration"})
 
 _CONTRACT_MODULES = frozenset(
     {
+        "test_carriage_conformance.py",
         "test_event_data_schema.py",
         "test_external_agent_envelope_properties.py",
         "test_inbox_outbox_properties.py",

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -22,7 +24,11 @@ from monoid_agent_kernel.reference._shared.tokens import TokenManager
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
-from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
+from monoid_agent_kernel.reference.llm_gateway.service import (
+    LlmGatewayBackend,
+    LlmGatewayTurnRecord,
+)
+from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ReasoningDelta,
@@ -153,10 +159,14 @@ def test_llm_gateway_python_boundary_normalizes_request_and_response_values() ->
     result = gateway.handle_turn(_llm_token(manager), payload)
 
     assert seen_requests[0].instruction == "prompt�"
-    assert seen_requests[0].tools[0].input_schema["example"] == {
-        "text": "�",
-        "number": None,
-    }
+    # The schema's *strings* are repaired like any other; its non-finite number is not
+    # substituted. A tool schema is a control document the request promises to forward
+    # verbatim -- rewriting `-inf` to `null` would hand the upstream provider a different
+    # constraint than the caller wrote -- so the value survives to the strict serializer,
+    # which refuses the request there (see tests/test_tool_schema_delivery.py).
+    forwarded_schema = seen_requests[0].tools[0].input_schema["example"]
+    assert forwarded_schema["text"] == "�"
+    assert math.isinf(forwarded_schema["number"]) and forwarded_schema["number"] < 0
     assert result["final_text"] == "done�"
     assert result["tool_calls"] == [
         {"call_id": "call�", "name": "tool�", "arguments": {"text": "�", "number": None}}
@@ -752,3 +762,119 @@ def test_the_clients_own_retry_is_combined_with_the_gateways_not_written_over_it
     response = gateway.handle_turn(token, _payload())
     # The client succeeded on its first HTTP attempt, so its own loop contributes nothing.
     assert _parse_gateway_response(response).provider_retried is True
+
+
+def _seeded_by_reference_gateway() -> tuple[LlmGatewayBackend, TokenManager]:
+    """A gateway whose upstream is the real OpenAI adapter, with one handle already mapped.
+
+    Shared by the two transport twins below so the request they refuse cannot drift apart: the
+    handle→provider-response mapping is seeded directly because recording it the normal way needs
+    a live upstream turn, and the shape under test is selected by the *lookup*, not by how the
+    record got there.
+    """
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, config: OpenAIModelAdapter(
+            config, api_key="test-key-never-used", allow_direct_provider_api=True
+        ),
+    )
+    gateway._turns["turn_seeded"] = LlmGatewayTurnRecord(
+        turn_handle="turn_seeded",
+        provider_response_id="provider_response_1",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        model="gpt-5.5",
+        created_at=time.time(),
+    )
+    return gateway, manager
+
+
+def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None:
+    """Blast radius of the OpenAI adapter's by-reference refusal, end to end over the hop.
+
+    The refusal itself is unit-tested against ``_payload``, and ``_model_error_status`` is
+    tested against the exception -- but those are two halves that only *compose* into the 422
+    a client sees. This drives the whole chain the deployment actually runs: a by-reference
+    continuation request → ``handle_turn`` → the real ``OpenAIModelAdapter`` upstream (the
+    gateway's default) → its boundary refusal → ``handle_turn``'s ``except ModelAdapterError``
+    arm → ``_write_exception`` → the non-200 body. Break any link and this fails.
+
+    The handle→provider-response mapping is seeded directly: recording it the normal way needs
+    a live upstream turn, and the shape under test is selected by the *lookup*, not by how the
+    record got there. No API key is used -- ``_payload`` refuses before any client is built.
+    """
+
+    pytest.importorskip("openai")
+    gateway, manager = _seeded_by_reference_gateway()
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        with pytest.raises(HTTPError) as caught:
+            _json_post(
+                f"{base_url}/internal/llm/turns",
+                _payload(previous_turn_handle="turn_seeded"),
+                token=_llm_token(manager),
+            )
+        body = json.loads(caught.value.read().decode("utf-8"))
+
+    assert caught.value.code == 422
+    assert body["error_code"] == "unsupported_request_shape"
+    assert body["retryable"] is False
+    assert body["http_status"] == 422
+    assert "messages" in body["error"]
+    # The classification survives the hop for the client that has to act on it.
+    reconstructed = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
+    assert reconstructed.provider_error_code == "unsupported_request_shape"
+    assert reconstructed.http_status == 422
+
+
+def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_frame() -> None:
+    """The streamed twin of the 422 above, and it takes a materially different route.
+
+    The refusal is raised inside the generator, i.e. *after* the HTTP layer has committed to a
+    200 SSE body — so the whole classification has to survive as a terminal `type: "error"` frame
+    instead of a non-200 response. Testing only the sync route left that route's composition
+    unproven end to end: the pieces (`_stream_error_frame`, `_model_error_status`, the adapter's
+    boundary refusal) are each unit-tested and none of them says the stream commits first.
+
+    No API key is used: `_classified_payload` refuses before any client is constructed, on the
+    async path exactly as on the sync one.
+    """
+
+    pytest.importorskip("openai")
+    gateway, manager = _seeded_by_reference_gateway()
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = Request(
+            f"{base_url}/internal/llm/turns/stream",
+            data=json.dumps(_payload(previous_turn_handle="turn_seeded")).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_llm_token(manager)}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=10) as response:
+            # Committed to a 200 stream before the upstream was ever called.
+            assert response.status == 200
+            assert response.headers.get("Content-Type", "").startswith("text/event-stream")
+            raw = response.read().decode("utf-8")
+
+    frames = [
+        json.loads(block.strip()[len("data:") :].strip())
+        for block in raw.split("\n\n")
+        if block.strip().startswith("data:")
+    ]
+    assert [frame["type"] for frame in frames] == ["error"]
+    terminal = frames[0]
+    assert terminal["error_code"] == "unsupported_request_shape"
+    assert terminal["retryable"] is False
+    assert terminal["http_status"] == 422
+    assert "messages" in terminal["error"]
+    # And the client's frame parser reconstructs the same classification the sync reader does.
+    reconstructed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(terminal)).value
+    assert reconstructed.provider_error_code == "unsupported_request_shape"
+    assert reconstructed.http_status == 422
+    assert reconstructed.retryable is False

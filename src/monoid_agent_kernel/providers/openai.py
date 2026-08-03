@@ -29,7 +29,6 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
-    format_async_result_text,
 )
 
 
@@ -587,17 +586,28 @@ class OpenAIModelAdapter:
                 input_items.extend(_message_to_input_items(message, replay_reasoning=replay))
             payload["input"] = input_items
         elif request.previous_turn_handle:
-            # By-reference (non-ZDR): relies on server-side storage and is unsupported for
-            # reasoning round-trip — the engine uses the by-value path above in production.
-            payload["previous_response_id"] = request.previous_turn_handle
-            input_items = []
-            # Third shape: a new user message on top of an existing continuation handle.
-            if request.instruction:
-                input_items.append({"role": "user", "content": request.instruction})
-            input_items.extend(
-                _observation_input_item(observation) for observation in request.observations
+            # By-reference, refused fail-closed. The shape asks the provider to continue from a
+            # response it holds -- and ``store=False`` above means no response of ours is ever
+            # held, so ``previous_response_id`` names a state that cannot exist. Emitting it
+            # anyway made an unusable request whose only symptom was an opaque provider 404 at
+            # call time, on the *original* call and not merely on a validation repair, with the
+            # ZDR pair (the reasoning round-trip this adapter is built around) as the thing that
+            # guarantees it fails. Refused here, at the boundary, and classified like every
+            # other config-shaped refusal: not retryable (resending cannot help), recoverable by
+            # changing the request, and named in the message. Bound to the *shape*, not to the
+            # field: ``messages`` above wins whenever it is set, so a by-value request carrying
+            # a leftover handle is unaffected. The reference gateway's by-reference continuation
+            # inherits this when its upstream is this adapter -- as a classified 422 across the
+            # hop rather than an opaque 404 -- while an upstream that really does persist
+            # responses keeps continuing by handle.
+            raise ModelAdapterError(
+                "OpenAI adapter cannot continue from previous_turn_handle: it sends store=False "
+                "(zero data retention), so no response is persisted for a handle to name. Send "
+                "the conversation by value in ModelRequest.messages instead.",
+                provider_error_code="unsupported_request_shape",
+                retryable=False,
+                config_recoverable=True,
             )
-            payload["input"] = input_items
         else:
             payload["input"] = [{"role": "user", "content": request.instruction or ""}]
         return payload
@@ -676,21 +686,6 @@ def _openai_tool_schema(tool: Any) -> dict[str, Any]:
         "name": tool.exported_name,
         "description": tool.description,
         "parameters": tool.input_schema,
-    }
-
-
-def _observation_input_item(observation: Any) -> dict[str, Any]:
-    if observation.is_background:
-        # A background/hosted task result delivered as a new user message.
-        return {"role": "user", "content": format_async_result_text(observation.output)}
-    return {
-        "type": "function_call_output",
-        "call_id": observation.call_id,
-        "output": json.dumps(
-            observation.output,
-            ensure_ascii=False,
-            allow_nan=False,
-        ),
     }
 
 

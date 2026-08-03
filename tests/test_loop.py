@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -1745,7 +1746,13 @@ def test_from_tools_normalizes_specs_before_binding_and_surface_hashes(tmp_path:
     exposed = next(tool for tool in adapter.requests[0].tools if tool.id == "custom.�")
     assert exposed.provider_name == "custom_�"
     assert exposed.description.startswith("description �")
-    assert exposed.input_schema["default"] is None
+    # ``annotations`` is model-visible content, so a non-finite value is substituted; the
+    # ``input_schema`` is a control document delivered verbatim, so it is not -- the provider
+    # boundary refuses such a request (tests/test_tool_schema_delivery.py) rather than sending
+    # a constraint the author did not write. The run still reaches the adapter: the transcript
+    # record substitutes what portable JSON cannot carry, so the schema does not fail the run
+    # at a durability boundary.
+    assert math.isnan(exposed.input_schema["default"])
     assert exposed.annotations["score"] is None
 
 
