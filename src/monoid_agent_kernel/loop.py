@@ -1744,6 +1744,39 @@ class AgentLoop:
             ),
         )
 
+    def _promote_pending_cancel(self, session: _Session) -> None:
+        """Promote a cancellation acknowledged at a quiescent park to the terminal cancelled
+        outcome — the close-boundary twin of the pump's ``RunCancelled`` handler, in the same
+        vocabulary (``status="limited"``, ``error_code="cancelled"``, a kept terminal park).
+
+        A cancel that lands while a turn is stepping raises at the next boundary check and the
+        pump settles it terminal, so it never reaches here un-terminal. A cancel that lands
+        while the run sits parked has no pump to raise in: ``close()`` then read the per-submit
+        reset state and recorded the cancelled run as a clean success — and the completed-run
+        cleanup below deleted the very checkpoints a cancelled run keeps for restore. A no-op
+        when nothing is pending or the run already settled terminal."""
+        token = self.cancellation_token
+        if session.terminal or token is None or not token.requested:
+            return
+        state = session.state
+        exc = RunCancelled("run cancelled")
+        state.status = "limited"
+        state.error = str(exc)
+        state.error_code = error_code_for_exception(exc)
+        state.final_text = "Stopped because the run was cancelled."
+        state.final_text_is_model_output = False
+        session.terminal = True
+        self._persist_checkpoint(
+            session,
+            Suspension(
+                reason="terminal",
+                status="limited",
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+            ),
+        )
+
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""
         session = self._require_open()
@@ -1769,6 +1802,10 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         try:
+            # Ordered before the turn-failure promotion below: a cancel acknowledged at an
+            # errored park is the operator's later, stronger verdict, and after it the run is
+            # terminal so the failure promotion correctly stands down.
+            self._promote_pending_cancel(session)
             if session.unrecovered_turn_failure is not None and not session.terminal:
                 # Closing on an unrecovered turn_failed park IS the driver giving up — the
                 # same promotion ``fail_recoverable`` performs explicitly. Without it,

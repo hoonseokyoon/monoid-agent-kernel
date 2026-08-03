@@ -7,6 +7,52 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a closed run stays closed, a cancel is a cancel, and every abandoned run reaches the ledger
+
+- **Recovery no longer resurrects a closed LIMITED run.** A run that closed limited (e.g.
+  `max_steps`) was the one terminal outcome with no recovery-visible marker: its park checkpoint
+  is non-terminal (a live-limited park is resumable by design), `close()` keeps checkpoints for
+  every non-completed status, and no failure.json exists — so `recover_runs()` (and the watchdog
+  reclaim) re-drove it on EVERY pass: another terminal `run.finished` appended per restart, and
+  the full cumulative usage re-metered into each fresh tenant ledger, forever. `attempt_resume`
+  now consults the run's durable status artifact (`lifecycle_from_status_artifact`, which also
+  resolves legacy bare `status="limited"` dirs closed before this fix) and recognizes the closed
+  run — a skip, not a quarantine. A run that genuinely crashed at a limited park (non-terminal
+  status artifact) still recovers.
+- **Cancelling a PARKED run records CANCELLED, not a clean COMPLETED.** The cancel was acked,
+  the close signal broke the drive — and `close()` then read the per-submit reset state
+  (`status="completed"`), so `run.finished` said completed, the record overwrote
+  `error_code="cancelled"` with `""`, and the completed-run cleanup deleted the cancelled run's
+  checkpoints. `close()`/`aclose()` now promote a pending cancel through the mid-run
+  `RunCancelled` vocabulary (`status="limited"`, `error_code="cancelled"`, terminal park
+  checkpoint, checkpoints kept), so a park-cancel classifies exactly like a mid-turn cancel.
+- **An acknowledged cancel of a parked run is durable.** The park checkpoint predated the
+  cancel, so a crash before the terminal record restored the run uncancelled despite the ack.
+  `cancel_run` of a quiescent (parked) run now commits a checkpoint carrying
+  `cancellation_requested` before the ack returns; the restore path already honors it. A cancel
+  landing mid-turn keeps its existing path (the pump's own terminal park), with a documented
+  residual crash window.
+- **The recovery give-up paths meter what the run had spent.** The
+  resume-failed-`max_recover_attempts` give-up and the corrupt-durable-state quarantine wrote
+  failure.json and stopped — a run that crashed after N billed turns and could never be resumed
+  was never counted and its checkpointed spend never reached any ledger. Both now route through
+  a record-free metering seam (`meter_abandoned_run`) with the same spend source, high-water
+  semantics, and run count as the failure path.
+- **Failure metering survives a corrupt status.json and reads the fresher source.** One
+  non-count metric (`{"input_tokens": 12.5}`) turned failure-recording into an escaping
+  `ValueError` — after `runs` was incremented, past the failure paths that yield the streaming
+  client's terminal frame. And the all-or-nothing fallback (checkpoint wins if present) dropped
+  everything billed between the last park and a mid-turn death. `_spent_before_failure` now
+  folds BOTH durable sources per key (guarded: non-negative ints only, unreadable keys dropped)
+  and takes the per-key max — strictly closer to "billed once per token", with
+  `record_run_result`'s strictness for kernel-written values untouched.
+- **The DBOS receipt-verifier compat window matches its stated scope.** The pre-v0.21 "failed"
+  spelling was accepted for ANY `status="limited"` suspension — but cancel boundaries and
+  live-limited parks carry that status too, and pre-v0.21 processes already recorded
+  "cancelled"/"limited" there, so a "failed" receipt at those boundaries is corrupt, not
+  compatible. The widening now applies only at a terminal-limited boundary (the one mapping
+  v0.21 actually changed), and both directions are pinned in tests.
+
 ### Fixed — every status surface carries the classification, and the pause is visible on all of them
 
 - **The durable status readers carry the FULL failure classification, one rule, all carriers.**

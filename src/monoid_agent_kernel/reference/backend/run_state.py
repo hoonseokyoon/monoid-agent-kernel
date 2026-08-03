@@ -385,14 +385,33 @@ class RunStateMutationService:
             unmetered, count_run=first_metering
         )
 
-    def _spent_before_failure(self, run_id: str) -> dict[str, Any]:
-        """What a run had already spent when it died, from the most durable source available.
+    def _spent_before_failure(self, run_id: str) -> dict[str, int]:
+        """What a run had already spent when it died, per key, from BOTH durable sources.
 
         A run that dies of a driver exception produces no ``AgentRunResult``, so its usage lives
-        in the last committed checkpoint. The status projection on disk is the fallback (it holds
-        the last ``metrics.updated`` payload), and an empty mapping is the honest answer when
-        neither exists — the run is still counted, which is more than the ledger used to say.
+        in the last committed checkpoint — but checkpoints commit at parks while the status
+        projection updates per billed event, so a run that parks, bills more turns, and then
+        dies mid-turn has a status.json strictly ahead of its checkpoint. Each key rides at the
+        larger of the two readings (both are cumulative totals of the same run, so max — not
+        sum — is "billed once per token"), and the high-water seam in :meth:`_meter_run` keeps
+        the delta semantics intact.
+
+        Guarded per key: a value this ledger cannot read as a count (a corrupt or hand-edited
+        status.json — ``{"input_tokens": 12.5}`` was observed) is dropped rather than passed
+        through, because a raise here escapes the failure paths AFTER ``runs`` was counted and
+        eats the streaming client's terminal frame. ``record_run_result``'s strictness for
+        kernel-written result metrics is untouched. An empty mapping is the honest answer when
+        neither source is readable — the run is still counted.
         """
+
+        readings: dict[str, int] = {}
+
+        def _fold(metrics: Any) -> None:
+            if not isinstance(metrics, Mapping):
+                return
+            for key, value in metrics.items():
+                if type(value) is int and value >= 0:
+                    readings[key] = max(readings.get(key, 0), value)
 
         provider = self._context.checkpoint_store_provider
         store = provider() if provider is not None else None
@@ -402,14 +421,28 @@ class RunStateMutationService:
             except Exception:  # pragma: no cover - a lookup failure must not mask the failure
                 stored = None
             if stored is not None:
-                return dict(stored.checkpoint.total_usage)
+                _fold(stored.checkpoint.total_usage)
         status_path = self._context.run_root_provider() / run_id / "status.json"
         try:
             payload = loads_json_ingress(status_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {}
-        metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        return dict(metrics) if isinstance(metrics, dict) else {}
+            payload = None
+        if isinstance(payload, dict):
+            _fold(payload.get("metrics"))
+        return readings
+
+    def meter_abandoned_run(self, run_id: str, tenant_id: str) -> None:
+        """Meter what a run had spent when recovery gave it up for good — no live record.
+
+        The give-up paths (resume failed ``max_recover_attempts`` times; corrupt durable state)
+        end a run without ever re-registering it, so :meth:`record_run_failure`'s
+        record-mutating half has nothing to mutate — but its metering half still owes the
+        ledger: a run that crashed after N billed turns and can never be resumed was otherwise
+        never counted and its checkpointed spend never reached any tenant. Same spend source,
+        same high-water seam, same run count as the failure path."""
+
+        spent = self._spent_before_failure(run_id)
+        self._context.with_record_lock(lambda: self._meter_run(tenant_id, run_id, spent))
 
     def record_run_failure(self, run_id: str, exc: Exception) -> None:
         self._context.write_failure_bundle(

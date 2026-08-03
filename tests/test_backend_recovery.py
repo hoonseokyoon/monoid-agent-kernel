@@ -436,6 +436,100 @@ def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) ->
     assert backend.recover_runs() == []
 
 
+def _closed_limited_run(run_root: Path, workspace: Path, adapters: list) -> tuple:
+    """Drive one real backend run to a closed LIMITED terminal (max_steps=1), then stop the
+    backend — the run dir this leaves behind is the exact shape finding 1 resurrects: a
+    non-terminal park checkpoint, no failure.json, and a terminal status artifact."""
+    backend = _recoverable_backend(
+        run_root,
+        _token_manager(),
+        workspace,
+        adapters,
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),),
+                usage={"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+            ),
+            ModelTurn(final_text="done"),
+        ],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="spend the budget",
+            runtime_config=runtime_config("fs.list"),
+            max_steps=1,
+        )
+    )
+    run_id = submission.run_id
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.terminal is False  # the resurrection bait
+    assert not (run_root / run_id / "failure.json").exists()
+    return backend, run_id
+
+
+def _finished_count(run_root: Path, run_id: str) -> int:
+    events = (run_root / run_id / "events.jsonl").read_text(encoding="utf-8")
+    return sum(1 for line in events.splitlines() if '"run.finished"' in line)
+
+
+def test_recover_runs_does_not_resurrect_a_closed_limited_run(tmp_path: Path) -> None:
+    """A run that closed LIMITED satisfied none of recovery's filters (non-terminal park
+    checkpoint, no failure.json, checkpoints kept), so EVERY recovery pass re-drove it:
+    another terminal run.finished per restart, and the full cumulative usage re-metered
+    into each fresh tenant ledger, forever. The durable status artifact is the terminal
+    marker recovery must consult."""
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1, run_id = _closed_limited_run(run_root, workspace, [])
+    assert _finished_count(run_root, run_id) == 1
+    backend1.shutdown()
+
+    for _ in range(2):  # every pass, not just the first
+        backend2 = _recoverable_backend(
+            run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+        )
+        assert backend2.recover_runs() == []
+        assert run_id not in backend2._records
+        assert backend2.tenant_usage("tenant_a")["runs"] == 0
+        backend2.shutdown()
+    assert _finished_count(run_root, run_id) == 1
+    # The skip is a recognition of a closed run, not a quarantine.
+    assert not (run_root / run_id / "failure.json").exists()
+
+
+def test_recovery_keys_off_the_durable_status_artifact(tmp_path: Path) -> None:
+    """Both directions of the guard, on one genuinely resumable run dir.
+
+    A pre-v0.21 closed-limited dir carries a bare legacy ``status: "limited"`` (no ``state``,
+    no ``terminal``) beside its non-terminal park checkpoint — it must not resurrect either.
+    The same dir with a NON-terminal status artifact is a run that crashed at the limited park
+    before close, and that one must still recover."""
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1, run_id = _closed_limited_run(run_root, workspace, [])
+    backend1.shutdown()
+    status_path = run_root / run_id / "status.json"
+
+    # Legacy closed dir: bare status="limited" resolves terminal-limited -> never resumed.
+    write_json_atomic(status_path, {"run_id": run_id, "status": "limited"})
+    backend2 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    backend2.max_recover_attempts = 10_000
+    assert backend2.recover_runs() == []
+    assert not (run_root / run_id / "failure.json").exists()
+
+    # Crashed at the park before close: a non-terminal artifact must NOT block recovery.
+    write_json_atomic(status_path, {"run_id": run_id, "state": "running", "terminal": False})
+    assert eventually(lambda: run_id in backend2.recover_runs() or run_id in backend2._records)
+    assert backend2.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
+
+
 def test_recover_runs_records_unsupported_checkpoint_instead_of_skipping(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     run_root = tmp_path / "runs"
@@ -955,7 +1049,9 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     events = backend2.events(run_id, token)["events"]
     assert any(e.get("type") == "turn.settled" for e in events)
     historical_status = backend2.status(run_id, token)
-    assert historical_status["state"] == "completed"
+    # The run above was ended by cancel_run while parked; since the close boundary promotes an
+    # acknowledged cancel, the historical record says so (it used to read "completed").
+    assert historical_status["state"] == "cancelled"
     assert historical_status["terminal"] is True
     assert historical_status["last_event_seq"] == entry["last_event_seq"]
     assert "status" not in historical_status

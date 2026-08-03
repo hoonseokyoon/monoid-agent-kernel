@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.content import content_part_to_json
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.media import normalize_inline_media_dicts
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError
@@ -21,6 +22,21 @@ from monoid_agent_kernel.reference.backend.ports import (
 )
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
+)
+
+
+# The parks at which the drive loop is quiescent (nothing stepping): a checkpoint taken here is
+# a park-point artifact, so an acknowledged cancel can be committed durably at the ack. RUNNING
+# is deliberately absent — mid-turn is not a park point, and a cancel that lands there is made
+# durable by the pump's own terminal park when the turn hits its next boundary check.
+_QUIESCENT_PARK_STATES = frozenset(
+    {
+        SessionState.AWAITING_INPUT,
+        SessionState.AWAITING_TASKS,
+        SessionState.PAUSED,
+        SessionState.INTERRUPTED,
+        SessionState.TURN_FAILED,
+    }
 )
 
 
@@ -74,6 +90,17 @@ class BackendSessionService:
         record = self._context.record(run_id)
         requested = self._context.mark_cancel_requested(record)
         if requested:
+            if record.state in _QUIESCENT_PARK_STATES:
+                # The park checkpoint predates this cancel, so an ack backed only by the
+                # in-memory token was not durable: a crash before the terminal record restored
+                # the run uncancelled. Commit a fresh park checkpoint AFTER the token flip —
+                # ``snapshot()`` serializes ``cancellation_requested`` and the restore path
+                # re-applies it — and BEFORE the close signal below, so the ack the caller
+                # receives is already on disk. Residual window: a cancel that lands while a
+                # turn is stepping (or that races the park->running edge) stays in-memory
+                # until the pump's boundary check writes its own terminal park; a crash inside
+                # that window still loses the ack.
+                self._context.persist_checkpoint_from_any_thread(record)
             self._context.call_soon(record.message_queue.put_nowait, self._context.close_signal)
         return {
             "run_id": record.run_id,

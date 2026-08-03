@@ -251,6 +251,15 @@ the park reader defaults every absent key, so a pre-v0.21 checkpoint restores ex
 and the event schemas grow optional properties without changing a `required` list. No checkpoint
 schema version bump, and no reader has to migrate.
 
+`status.json` additionally becomes a recovery input without any shape change: the Reference
+backend's resume paths now read its terminal projection (via the same tolerant
+`lifecycle_from_status_artifact` reader, so a legacy bare `status: "limited"` keeps its
+pre-`state` terminal-limited meaning) to recognize a run that already closed, where before it
+was observability only. A missing or unreadable artifact changes nothing — recovery proceeds as
+it always did. Relatedly, a run cancelled at a park now commits an ordinary
+`monoid.checkpoint.v1` park snapshot at the ack (`cancellation_requested`, an existing field)
+and a terminal one at close; pre-existing readers need no migration.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

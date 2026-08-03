@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.durable_metadata import (
     DurableMetadataCommitter,
     validate_recovery_metadata,
 )
+from monoid_agent_kernel.core.lifecycle import lifecycle_from_status_artifact
 from monoid_agent_kernel.core.result import (
     AgentRunResult,
     Suspension,
@@ -68,6 +69,9 @@ class RecoveryContext:
     drive_open_session: DriveOpenSessionPort
     record_run_result: Callable[[str, AgentRunResult], None]
     record_run_failure: Callable[[str, Exception], None]
+    # ``(run_id, tenant_id)`` — the record-free metering seam for the give-up paths, which end
+    # a run that was never re-registered (RunStateMutationService.meter_abandoned_run).
+    meter_abandoned_run: Callable[[str, str], None]
     acquire_run_slot: Callable[[], Awaitable[None]]
     release_run_slot: Callable[[], None]
 
@@ -121,6 +125,17 @@ class RecoveryService:
         return reclaimed
 
     def attempt_resume(self, run_dir: Path, run_id: str) -> bool:
+        if self._closed_by_status_artifact(run_dir):
+            # A run that CLOSED limited is the one terminal outcome with no other
+            # recovery-visible marker: its park checkpoint is non-terminal (a live-limited
+            # park is resumable by design), ``close()`` keeps checkpoints for every
+            # non-completed status, and no failure.json exists — so every recovery pass
+            # re-drove it, appending another terminal run.finished and re-metering its full
+            # cumulative usage per restart, forever. The durable status artifact the close
+            # path already writes is the terminal marker, and consulting it on the reader
+            # side covers run dirs closed before this guard existed. Not a quarantine: no
+            # failure bundle, just a recognition that the run already ended.
+            return False
         try:
             checkpoint_result = load_latest_checked(self._checkpoint_store(), run_id)
         except Exception as exc:
@@ -185,6 +200,7 @@ class RecoveryService:
                     exc_type=type(exc).__name__,
                     overwrite=True,
                 )
+                self._meter_giveup(run_dir, run_id, meta)
                 _LOGGER.error("run %s marked unrecoverable", run_id)
             return False
         if resumed is False:
@@ -332,6 +348,51 @@ class RecoveryService:
             exc_type="DurableLoadError",
             overwrite=True,
         )
+        # This quarantine ends the run for good (failure.json makes every later pass skip
+        # it), so what it had spent must reach the ledger now or never.
+        self._meter_giveup(run_dir, run_id, None)
+
+    def _closed_by_status_artifact(self, run_dir: Path) -> bool:
+        """Whether the run's durable status artifact records a terminal outcome.
+
+        ``lifecycle_from_status_artifact`` resolves current artifacts (``state`` + explicit
+        ``terminal``) and legacy pre-``state`` ones, including bare ``status="limited"`` from
+        pre-v0.21 terminal-limited runs. Unreadable or malformed artifacts answer False —
+        the checkpoint/metadata pipeline owns durable-state corruption, and a best-effort
+        projection must not block a genuine recovery."""
+        try:
+            payload = loads_json_ingress((run_dir / "status.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        try:
+            _state, terminal = lifecycle_from_status_artifact(payload)
+        except ValueError:
+            return False
+        return terminal
+
+    def _meter_giveup(self, run_dir: Path, run_id: str, meta: Mapping[str, Any] | None) -> None:
+        """Meter a given-up run's spend through the record-free seam, best-effort tenant.
+
+        The resume-failure give-up already holds validated metadata; the corrupt-state
+        quarantine may not, so the tenant is re-read from the recovery descriptor. A run with
+        no attributable tenant cannot enter a tenant ledger — logged, not invented."""
+        if meta is None:
+            try:
+                meta = self.read_recovery_meta(run_dir, run_id)
+            except Exception:  # noqa: BLE001 - metering must never mask the recorded failure
+                meta = None
+        tenant_id = str((meta or {}).get("tenant_id") or "")
+        if not tenant_id:
+            _LOGGER.warning(
+                "run %s given up with no attributable tenant; its spend is not metered", run_id
+            )
+            return
+        try:
+            self._context.meter_abandoned_run(run_id, tenant_id)
+        except Exception:  # noqa: BLE001 - metering must never mask the recorded failure
+            _LOGGER.exception("metering the abandoned run %s failed", run_id)
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:

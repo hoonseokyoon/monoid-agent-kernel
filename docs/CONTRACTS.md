@@ -147,7 +147,11 @@ The run lifecycle is:
 - `commit_checkpoint()` — opt-in: adopt the current proposed workspace state as
   the new diff baseline, so later proposals report only post-commit changes.
 - `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
-  proposal, emit `run.finished`, close the recorder.
+  proposal, emit `run.finished`, close the recorder. A cancellation acknowledged
+  while the run sat at a quiescent park (no pump stepping to raise in) is
+  promoted here through the mid-run vocabulary — the result carries
+  `status="limited"`, `error_code="cancelled"`, a terminal park checkpoint is
+  committed, and the checkpoints are kept (only a clean completion deletes them).
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
   `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
   park does not raise here: the closing `finally` promotes an unrecovered
@@ -1827,7 +1831,11 @@ competing input.
   check reads it through. A recovery driver that rebuilds an `AgentLoop` without passing a token
   (the ordinary shape) therefore cannot silently un-cancel a run whose cancellation was durable.
   An embedder that deliberately re-runs a cancelled checkpoint clears
-  `checkpoint.cancellation_requested` before restoring.
+  `checkpoint.cancellation_requested` before restoring. On the Reference backend, `cancel_run`
+  of a QUIESCENT (parked) run commits a fresh park checkpoint carrying the flag before the ack
+  returns, so the acknowledged cancel survives a crash that lands before the terminal record; a
+  cancel that arrives while a turn is stepping stays in-memory until the pump's boundary check
+  writes its own terminal park (that residual window is the mid-turn crash exposure).
 - The snapshot also carries the **output-validator repair state** (`output_retries` *and*
   `output_failure_history`, so a restored mid-repair run continues its attempt numbering and
   keeps `failures_by_validator` in `metrics.json`) and the **delegation roll-ups**
@@ -1867,10 +1875,17 @@ competing input.
   authoritative bad state. `recover_runs()`
   writes an actionable failure bundle for corrupt or unsupported durable state. It scans
   `run_root`; the active watchdog discovers cross-instance orphaned
-  runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
+  runs from the shared lease store. Recovery skips terminal checkpoints, failed runs, and runs
+  whose durable status artifact records a terminal outcome — a run that CLOSED limited keeps a
+  non-terminal park checkpoint (a live-limited park is resumable by design) and no failure.json,
+  so `status.json`'s terminal reading (including legacy bare `status="limited"` dirs) is the
+  marker that stops it from being re-driven on every pass. It then rebuilds
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
-  follow-up messages, and resumes.
+  follow-up messages, and resumes. Both give-up paths (unrecoverable after
+  `max_recover_attempts`; corrupt/unsupported durable state) also meter the run's
+  checkpointed/projected spend into the tenant ledger through the same high-water seam the
+  failure path uses — a run recovery abandons is still a run that billed.
 - The experimental v0.19.2 DBOS activation-recovery profile has a narrow operational scope. One
   stable executor slot has one active process; a restart reuses the same executor identity and
   application version after the prior process terminates or is fenced. One private Reference host

@@ -15,6 +15,7 @@ from support.http import http_json, serving
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.control import ControlCommand
@@ -34,6 +35,7 @@ from monoid_agent_kernel.reference.backend.service import (
     BackendRunRequest,
     RunnerBackend,
     _RESUME_SESSION,
+    _RUN_META_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
@@ -475,6 +477,265 @@ def test_a_metered_failure_that_is_recovered_and_completes_is_not_billed_twice(
     assert usage["total_tokens"] == 90
     assert usage["input_tokens"] == 60
     assert usage["output_tokens"] == 30
+
+
+def test_a_corrupt_status_metric_is_dropped_not_raised(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The status.json fallback used to pass values through untouched, so one corrupt
+    metric turned failure-recording into an escaping ValueError — after ``runs`` was
+    already incremented, and past ``run_execution``'s failure paths, eating the streaming
+    client's terminal frame. Unreadable read-keys are dropped per key; the readable ones
+    still reach the ledger, and ``record_run_result``'s strictness for kernel-written
+    values is untouched."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_corrupt_status_metrics"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "metrics": {
+                    "input_tokens": 12.5,  # not a count
+                    "output_tokens": -3,  # not a count either
+                    "total_tokens": 25,
+                    "status": "failed",  # never was a count
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))  # must not raise
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+
+
+def test_failure_metering_takes_the_fresher_reading_per_key(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Checkpoints commit at parks; status.json updates per billed event. A run that parks
+    at T1, bills more turns, then dies mid-turn has status.json ahead of its checkpoint —
+    and the all-or-nothing fallback (checkpoint wins if present) meant T2-T1 never reached
+    the ledger. Per-key max over the validated readings is strictly closer to "billed once
+    per token", and the high-water delta semantics are unchanged."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_stale_checkpoint_fresh_status"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={"input_tokens": 200, "output_tokens": 100, "total_tokens": 300},
+        )
+    )
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "metrics": {"input_tokens": 300, "output_tokens": 150, "total_tokens": 450},
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("died mid-turn after the park"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["input_tokens"] == 300
+    assert usage["output_tokens"] == 150
+    assert usage["total_tokens"] == 450
+
+
+def _giveup_recovery_meta(run_id: str, workspace: Path) -> dict[str, Any]:
+    config = _config()
+    return {
+        "schema_version": _RUN_META_SCHEMA_VERSION,
+        "run_id": run_id,
+        "tenant_id": "tenant_a",
+        "user_id": "user_a",
+        "workspace_root": str(workspace),
+        "runtime_config": config.to_json(),
+        "runtime_config_hash": config.config_hash,
+    }
+
+
+def test_recovery_giveup_after_max_attempts_meters_the_checkpointed_spend(
+    tmp_path: Path,
+    backend_factory: Any,
+    monkeypatch: Any,
+) -> None:
+    """The resume-failed-max-attempts give-up wrote failure.json and stopped: a run that
+    crashed after N billed turns and can never be resumed was never counted and its
+    checkpointed spend never reached any ledger — the exact class the failure path closes.
+    The give-up has no live record, so it goes through the record-free metering seam."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.max_recover_attempts = 1
+    run_id = "run_unrecoverable_spend"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=3,
+            terminal=False,
+            total_usage={"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+        )
+    )
+    write_json_atomic(run_dir / "run.json", _giveup_recovery_meta(run_id, workspace))
+
+    def _boom(stored: Any, meta: Any) -> None:
+        del stored, meta
+        raise RuntimeError("resume boom")
+
+    monkeypatch.setattr(backend._recovery, "resume_from_checkpoint", _boom)
+
+    assert backend.recover_runs() == []
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "unrecoverable"
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 60
+    assert usage["input_tokens"] == 40
+
+
+def test_corrupt_durable_state_giveup_meters_from_the_status_projection(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The other give-up: corrupt durable state quarantines the run without a resume
+    attempt. The checkpoint is unreadable by construction, so the spend comes from the
+    status projection — same source hierarchy as the failure path."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_corrupt_state_spend"
+    run_dir = backend.run_root / run_id
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    manifest = run_dir / "checkpoints" / "1" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["schema_version"] = "monoid.checkpoint.v99"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    write_json_atomic(run_dir / "run.json", _giveup_recovery_meta(run_id, workspace))
+    write_json_atomic(
+        run_dir / "status.json",
+        {"run_id": run_id, "metrics": {"input_tokens": 25, "total_tokens": 25}},
+    )
+
+    assert backend.recover_runs() == []
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "checkpoint_unsupported_version"
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+
+
+def test_cancelling_a_parked_run_records_cancelled_and_keeps_checkpoints(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Cancelling a PARKED run acked ``cancel_requested: true`` and then recorded a clean
+    COMPLETED — the per-submit reset state was "completed", so ``run.finished`` said so,
+    ``record_run_result`` overwrote error_code to "", and close() DELETED the checkpoints.
+    The same cancel mid-turn correctly landed CANCELLED. The close boundary now promotes an
+    acknowledged cancel through the same vocabulary the mid-run handler uses."""
+
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+    record = backend._record(run_id)
+    assert record.error_code == "cancelled"
+    result = record.result
+    assert result is not None
+    assert (result.status, result.error_code) == ("limited", "cancelled")
+    # A cancelled run keeps its checkpoints — only a clean completion has nothing to restore.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+    assert stored.checkpoint.cancellation_requested is True
+    finished = [e for e in _events(backend, run_id) if e["type"] == "run.finished"]
+    assert finished and finished[-1]["data"]["status"] == "limited"
+    assert finished[-1]["data"]["error_code"] == "cancelled"
+
+
+def test_cancel_of_a_parked_run_is_durable_at_the_ack(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The park checkpoint predates the cancel (``cancellation_requested=False``), and
+    cancel_run only cancelled the in-memory token — so a crash between the ack and the
+    terminal record restored the run UNcancelled, despite what the operator was told.
+    A cancel of a quiescent (parked) run now commits a checkpoint carrying the flag before
+    the ack returns; the restore path already honors it (test_cancellation.py)."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(
+        workspace=workspace,
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),),
+            ),
+            ModelTurn(final_text="never reached"),
+        ],
+    )
+    # Wide poll so the parked drive cannot wake and terminalize between the ack and our read.
+    backend.task_wait_poll_s = 2.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="ask the human",
+            runtime_config=runtime_config("hitl.request"),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_TASKS)
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.cancellation_requested is False
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+
+    # Durable BEFORE the drive wakes: the ack checkpoint is a park artifact, not terminal.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.cancellation_requested is True
+    assert stored.checkpoint.terminal is False
+
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
 
 
 def test_the_backend_failure_bundle_claims_no_classification_it_was_not_given(

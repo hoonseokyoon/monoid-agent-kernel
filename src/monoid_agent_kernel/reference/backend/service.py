@@ -700,6 +700,7 @@ class RunnerBackend:
                 drive_open_session=self._drive_open_session,
                 record_run_result=self._record_run_result,
                 record_run_failure=self._record_run_failure,
+                meter_abandoned_run=self._run_state.meter_abandoned_run,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
             )

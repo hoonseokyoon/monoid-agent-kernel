@@ -5,7 +5,7 @@ from pathlib import Path
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -101,3 +101,60 @@ def test_a_restore_into_an_existing_token_still_cancels_it(tmp_path: Path) -> No
 
     assert loop.cancellation_token is token
     assert token.requested is True
+
+
+def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
+    """A cancel that lands while the run sits at a quiescent park has no pump to raise in.
+
+    The mid-run half was always right: a stepping turn hits the boundary check, the pump
+    catches ``RunCancelled`` and settles ``status="limited"`` / ``error_code="cancelled"``
+    with a terminal park. The parked half read the per-submit reset state at close and
+    recorded a clean COMPLETED — and the completed-run cleanup then deleted the very
+    checkpoints a cancelled run keeps. ``close()`` now promotes the acknowledged cancel
+    through the same vocabulary before finalizing, on both loop halves (``aclose``
+    delegates here)."""
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    token = CancellationToken()
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="first")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+        cancellation_token=token,
+    )
+    loop.open()
+    suspension = loop.run_until_suspended("go")
+    assert suspension.reason == "settled"
+
+    token.cancel()  # operator cancel while parked; acknowledged, nothing is stepping
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("limited", "cancelled")
+    stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+    assert stored.checkpoint.cancellation_requested is True
+
+
+def test_close_without_a_pending_cancel_still_completes_and_cleans_up(tmp_path: Path) -> None:
+    """The other half: an uncancelled parked close keeps its clean-completion contract —
+    status "completed" and the completed-run checkpoint cleanup."""
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="first")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+        cancellation_token=CancellationToken(),
+    )
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "settled"
+
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("completed", "")
+    assert LocalFsCheckpointStore(spec.run_root).latest(spec.run_id) is None
