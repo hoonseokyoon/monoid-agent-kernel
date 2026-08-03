@@ -4904,21 +4904,19 @@ STATUS_CONSUMER_BRANCH_READS: dict[tuple[str, str], frozenset[str]] = {
     )
     | {"provider_retried"},
     ("reference/backend/run_state.py:record_event", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
-    # The record's ``run.failed`` branch copies the error pair only, BY DESIGN: its terminal
-    # classification arrives through the driver's park promotion (session_drive assigns all
-    # five off each park's Suspension) PLUS the record-side terminal heal in
-    # ``record_run_result`` — the park promotion alone was NOT sufficient, empirically:
-    # terminals minted at the close boundary (pending-cancel, unrecovered-turn-failure, and
-    # unsettled-close promotions) never pass the driver's top-of-loop, so the record kept a
-    # dead turn's classification beside a cancelled/limited terminal while status.json healed
-    # it. The heal is bound once at ``record_run_result`` (the seam every terminal result
-    # funnels through: non-failed terminals clear all five; a failed terminal keeps four and
-    # drops the per-call ``provider_retried``, mirroring the sink's ``run.failed`` branch).
-    # A second event-data writer here would still be the same fact copied at a different
-    # moment under the same lock.
-    ("reference/backend/run_state.py:record_event", "run.failed"): frozenset(
-        {"error", "error_code"}
-    ),
+    # The record's ``run.failed`` branch copies the event's whole classification, exactly like
+    # its ``turn.failed`` twin. Its previous error-pair-only pin was justified twice and both
+    # justifications proved false on a path: "the driver's park promotion assigns all five"
+    # fails for terminals minted at the close boundary (pending-cancel, unrecovered-turn-
+    # failure, unsettled-close — fixed by the ``record_run_result`` heal), and the heal in turn
+    # KEEPS the record's values at a FAILED terminal — which are defaults for a FRESH terminal
+    # that never parked (a non-recoverable failure on the stream lane, or any first-turn
+    # failure), so live ``status()`` omitted the classification status.json carried. ``type``
+    # is not copied (the record has no ``error_type`` slot — declared surface difference with
+    # the sink); ``provider_retried`` is assigned the terminal vocabulary's constant False,
+    # not read from data (run.failed does not carry it).
+    ("reference/backend/run_state.py:record_event", "run.failed"): RUN_FAILED_EVENT_KEYS
+    - {"type"},
 }
 
 

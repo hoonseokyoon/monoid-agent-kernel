@@ -210,6 +210,55 @@ def test_record_event_captures_the_whole_classification_a_turn_failed_carries(
     record.terminal = True
 
 
+def test_record_event_captures_the_whole_classification_a_run_failed_carries(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The run.failed twin of the turn.failed capture: a fresh terminal has no park to promote.
+
+    A non-recoverable model failure on the stream lane (or a first-turn failure anywhere)
+    reaches its terminal without ever parking, so the driver's park promotion never runs and
+    ``record_run_result``'s FAILED heal keeps whatever the record has — defaults. The event
+    beside the record carries the whole classification; copying only the error pair left live
+    ``status()``/``result()`` omitting the provider classification status.json carries.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_run_failed_classified"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="run.failed",
+            data={
+                "error": "provider rejected the request (HTTP 422)",
+                "error_code": "model_error",
+                "type": "ModelAdapterError",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+            },
+        ),
+    )
+
+    assert record.state is SessionState.FAILED
+    assert record.terminal is True
+    assert record.error_code == "model_error"
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.http_status == 422
+    assert record.retryable is False
+    assert record.config_recoverable is True
+    # The terminal vocabulary drops the per-call fact (run.failed does not even carry it).
+    assert record.provider_retried is False
+
+
 def test_a_model_turn_starting_unparks_a_paused_record_and_clears_the_stale_failure(
     tmp_path: Path,
     backend_factory: Any,

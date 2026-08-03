@@ -372,6 +372,18 @@ class RunStateMutationService:
                 set_record_state(record, SessionState.FAILED, terminal=True)
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
+                # The event's own classification, same guarded reads as the turn.failed twin.
+                # This branch copied the error pair only, justified by the driver's park
+                # promotion — but a FRESH terminal (a non-recoverable failure on the stream
+                # lane, or any first-turn failure) never parks, so nothing promoted and
+                # ``record_run_result``'s FAILED heal kept the record's defaults while
+                # status.json carried the truth. ``provider_retried`` is not on run.failed:
+                # the terminal vocabulary drops the per-call fact, so the record does too.
+                record.provider_error_code = str(event.data.get("provider_error_code") or "")
+                record.http_status = _event_http_status(event.data)
+                record.retryable = _event_flag(event.data, "retryable")
+                record.config_recoverable = _event_flag(event.data, "config_recoverable")
+                record.provider_retried = False
 
         self._context.with_record_lock(_mutate)
 

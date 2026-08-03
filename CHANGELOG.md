@@ -260,6 +260,12 @@ out in commit messages and here.
   with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
   `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
   connection that dropped, and the status branches above already classify it).
+- **A fresh terminal failure classifies the record from its own event.** The record's
+  `run.failed` branch copied the error pair only — justified by the driver's park promotion,
+  which never runs for a terminal that never parked (a non-recoverable failure on the stream
+  lane, or any first-turn failure) — so live `status()`/`result()` served default
+  classification against a status.json that carried the truth. The branch now takes the
+  event's whole classification through the same guarded reads as its `turn.failed` twin.
 - **The live stream broker carries both halves of the failure classification.** The closed
   frame forwarded only `retryable`, so a live consumer of the reference backend's model
   stream read a config-fixable failure as merely non-retryable while the model-content
