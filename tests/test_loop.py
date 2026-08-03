@@ -2452,6 +2452,50 @@ def test_a_refused_turns_tokens_still_reach_the_run_budget(tmp_path: Path) -> No
         loop.close()
 
 
+def test_a_refused_gateway_body_puts_its_billed_tokens_in_the_run_budget(tmp_path: Path) -> None:
+    """The same rule end to end, off a real wire rather than a hand-stamped exception.
+
+    Two halves, and a pin on either one alone passes while the other is missing: the gateway
+    reader reads the cost off the payload it is refusing (``providers/gateway.py``), and the
+    loop adds it to ``total_usage`` (the arm above). The refusal here is produced by driving the
+    shipped parser over a billed 200 body with one malformed key -- the shape a gateway relaying
+    a reasoning-capable upstream actually produces -- so a stamp that stops covering that key
+    shows up as a run whose budget forgot a paid call.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    billed = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(
+            {
+                "protocol": "monoid.llm-turn-result.v1",
+                "turn_handle": "turn_1",
+                "final_text": "answered",
+                "tool_calls": [],
+                "usage": dict(billed),
+                "stop_reason": "stop",
+                "provider_retried": False,
+                "reasoning": "not-an-array",
+            }
+        )
+    assert refused.value.provider_error_code == "gateway_bad_response"
+
+    adapter = _ScriptedAdapter([refused.value])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        # A malformed body carries no HTTP status and no config remedy, so this park is the
+        # terminal one rather than ``turn_failed`` -- and the cost has to survive that arm too,
+        # which is the arm a gateway's own malformed answer actually lands on.
+        assert loop.run_until_suspended("hello").reason == "terminal"
+        assert dict(loop._session.state.total_usage) == billed  # type: ignore[union-attr]
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 460
+    finally:
+        loop.close()
+
+
 def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
     """The counterweight: an ordinary provider failure produced nothing and must cost
     nothing, or every failed call would inflate the budget."""

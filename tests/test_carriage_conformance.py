@@ -4604,6 +4604,158 @@ def test_7d_one_fact_two_spellings_across_the_success_hop() -> None:
     assert chunk.response_id == frames[-1]["turn_handle"]
 
 
+# --- family 7, the cost half: what a refusal off this wire still owes -------------------
+#
+# A turn the reader refuses was generated and billed before the reader ever saw it, so the
+# refusal is the only carrier left for its cost (docs/CONTRACTS.md, "A refused turn was still
+# generated and billed"). That rule was bound to the ERROR envelope and to the terminal frame's
+# echo pair, and to nothing else: every other key of the same two success envelopes refused the
+# same billed payload for free, ``reasoning`` included the day it was added. So this is a
+# *table* diffed against the reader's own read set rather than a handful of cases — the next new
+# wire key has to answer here before it can repeat the miss.
+
+# The pre-branch reads of ``_chunk_from_event``: they run for every frame type, so no branch
+# below them can stamp for them. ``test_7c`` pins that they are read there.
+TERMINAL_FRAME_PRE_BRANCH_READS = frozenset({"type", "provider_retried"})
+
+# One malformed value per read key, keyed by the key it corrupts, patched over a REAL server
+# envelope. ``response_id`` needs its alias nulled on the frame reader (which reads
+# ``turn_handle`` first) and not on the body reader (which reads ``response_id`` first).
+SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "provider_retried": {"provider_retried": "yes"},
+        "retryable": {"retryable": "yes"},
+        "tool_calls": {"tool_calls": {"not": "an array"}},
+        "arguments": {"tool_calls": [{"call_id": "c1", "name": "n", "arguments": 7}]},
+        "id": {"tool_calls": [{"id": 7, "name": "n"}]},
+        "call_id": {"tool_calls": [{"call_id": 7, "name": "n"}]},
+        "name": {"tool_calls": [{"call_id": "c1", "name": 7}]},
+        "stop_reason": {"stop_reason": 7},
+        "final_text": {"final_text": 7},
+        "turn_handle": {"turn_handle": 7},
+        "response_id": {"response_id": 7},
+        "reasoning": {"reasoning": "not-an-array"},
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "type": {"type": 7},
+        "provider_retried": {"provider_retried": "yes"},
+        "turn_handle": {"turn_handle": 7},
+        "response_id": {"turn_handle": None, "response_id": 7},
+        "stop_reason": {"stop_reason": 7},
+        "generation_applied": {"generation_applied": [1, 2]},
+        "schema_applied": {"schema_applied": 7},
+        "reasoning": {"reasoning": "not-an-array"},
+    },
+}
+# Reads with no probe, each one accounted for, like ``SUCCESS_DANGLING_READS`` above.
+UNPROBED_SUCCESS_ENVELOPE_READS: dict[str, dict[str, str]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "error": "the discriminator: a body carrying it is an ERROR envelope, and that branch "
+        "builds and stamps its own failure (pinned by "
+        "test_a_two_hundred_error_envelope_carries_the_cost_too in "
+        "tests/test_generation_threading.py)",
+        "usage": "the stamp's own source: when IT is the malformed key there is nothing "
+        "trustworthy left to stamp, and the lenient read is the declared behavior "
+        "(test_a_refusal_off_a_malformed_usage_invents_no_tokens, same file)",
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "usage": "same as the body reader's: the stamp cannot be read off the key that is "
+        "itself malformed",
+    },
+}
+
+
+def _refused_success_body(body: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._parse_gateway_response(dict(body))
+    return caught.value
+
+
+def _refused_terminal_frame(frame: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._chunk_from_event(dict(frame))
+    return caught.value
+
+
+SUCCESS_ENVELOPE_REFUSAL_READERS: dict[str, Any] = {
+    "providers/gateway.py:_parse_gateway_response": _refused_success_body,
+    "providers/gateway.py:_chunk_from_event": _refused_terminal_frame,
+}
+
+
+def _billed_success_envelopes() -> dict[str, dict[str, Any]]:
+    """The two envelopes the shipped server writes for one billed turn, per reader."""
+
+    gateway, token = _gateway_and_token()
+    return {
+        "providers/gateway.py:_parse_gateway_response": gateway.handle_turn(
+            token, _maximal_turn_payload()
+        ),
+        "providers/gateway.py:_chunk_from_event": list(
+            gateway.handle_turn_stream(token, _maximal_turn_payload())
+        )[-1],
+    }
+
+
+def test_7e_every_success_envelope_read_is_probed_for_the_cost_it_carries() -> None:
+    """The derivation, so a NEW key cannot join either reader without answering the rule."""
+
+    derived = {
+        "providers/gateway.py:_parse_gateway_response": _success_branch_reads(),
+        "providers/gateway.py:_chunk_from_event": (
+            _turn_complete_branch_reads() | TERMINAL_FRAME_PRE_BRANCH_READS
+        ),
+    }
+    assert TERMINAL_FRAME_PRE_BRANCH_READS <= _literal_wire_keys(
+        _function_node("providers/gateway.py", "_chunk_from_event")
+    )
+    for reader, reads in derived.items():
+        probed = frozenset(SUCCESS_ENVELOPE_REFUSAL_PROBES[reader])
+        unprobed = frozenset(UNPROBED_SUCCESS_ENVELOPE_READS[reader])
+        assert probed.isdisjoint(unprobed), {"reader": reader}
+        assert probed | unprobed == reads, {
+            "reader": reader,
+            "read_but_never_probed": sorted(reads - probed - unprobed),
+            "probed_but_no_longer_read": sorted((probed | unprobed) - reads),
+            "hint": "a new read on the success wire: give it a malformed-value probe, or "
+            "register why the refusal it raises cannot carry the cost",
+        }
+        for reason in UNPROBED_SUCCESS_ENVELOPE_READS[reader].values():
+            assert reason.strip()
+
+
+@pytest.mark.parametrize(
+    "reader, key",
+    sorted(
+        (reader, key)
+        for reader, probes in SUCCESS_ENVELOPE_REFUSAL_PROBES.items()
+        for key in probes
+    ),
+)
+def test_7e_a_refusal_off_a_billed_success_envelope_carries_the_cost(
+    reader: str, key: str
+) -> None:
+    envelope = dict(_billed_success_envelopes()[reader])
+    billed = dict(envelope["usage"])
+    assert billed, "the server probe must report a cost, or this pin proves nothing"
+    envelope.update(SUCCESS_ENVELOPE_REFUSAL_PROBES[reader][key])
+
+    refused = SUCCESS_ENVELOPE_REFUSAL_READERS[reader](envelope)
+    assert refused.provider_error_code == gateway_client.GATEWAY_BAD_RESPONSE, {
+        "reader": reader,
+        "malformed_key": key,
+        "hint": "the probe must make THIS key the refusal, not something else",
+    }
+    assert provider_usage_of(refused) == billed, {
+        "reader": reader,
+        "malformed_key": key,
+        "reported_by_the_envelope": billed,
+        "carried_by_the_refusal": provider_usage_of(refused),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
 # --------------------------------------------------------------------------------------
 # Registered-gap pins — a registry entry with no assertion is prose
 # --------------------------------------------------------------------------------------

@@ -23,6 +23,7 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     TurnComplete,
     generation_support,
+    provider_usage_of,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
@@ -1111,3 +1112,138 @@ def test_a_two_hundred_error_envelope_carries_the_cost_too() -> None:
             }
         )
     assert getattr(raised.value, "provider_usage", None) == _BILLED
+
+
+# --- and every OTHER refusal off a billed success envelope --------------------------------
+#
+# The rule the malformed-echo test above states -- "a malformed value on a *billed* frame still
+# cost the tokens the same frame reports" -- was bound to the echo pair and to nothing else. A
+# 200 body or a terminal frame whose ``stop_reason``/``final_text``/``reasoning``/... is
+# malformed is refused by the same readers on the same billed payload, and every one of those
+# refusals escaped with an empty ``provider_usage``: the run's budget lost the call.
+
+
+def _billed_success_body(**overrides: object) -> dict:
+    """A complete, well-formed 200 success body that reports what the turn cost."""
+
+    body: dict = {
+        "protocol": "monoid.llm-turn-result.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": dict(_BILLED),
+        "stop_reason": "stop",
+        "provider_retried": False,
+    }
+    body.update(overrides)
+    return body
+
+
+def _billed_terminal_frame(**overrides: object) -> dict:
+    """The streamed twin of :func:`_billed_success_body`."""
+
+    frame: dict = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": dict(_BILLED),
+        "stop_reason": "stop",
+        "provider_retried": False,
+    }
+    frame.update(overrides)
+    return frame
+
+
+# One malformed value per key each reader validates on its success envelope, keyed by the key
+# it corrupts. The behavioral census in tests/test_carriage_conformance.py diffs the same table
+# against the pinned read sets, so a NEW wire key cannot repeat this miss silently.
+_SYNC_BODY_REFUSALS: dict[str, dict] = {
+    "reasoning": {"reasoning": "not-an-array"},
+    "stop_reason": {"stop_reason": 7},
+    "final_text": {"final_text": 7},
+    "response_id": {"response_id": 7},
+    "turn_handle": {"turn_handle": 7},
+    "tool_calls": {"tool_calls": {"not": "an array"}},
+    "retryable": {"retryable": "yes"},
+    "provider_retried": {"provider_retried": "yes"},
+}
+_TERMINAL_FRAME_REFUSALS: dict[str, dict] = {
+    "reasoning": {"reasoning": "not-an-array"},
+    "stop_reason": {"stop_reason": 7},
+    "turn_handle": {"turn_handle": 7},
+    "generation_applied": {"generation_applied": [1, 2]},
+    "provider_retried": {"provider_retried": "yes"},
+}
+
+
+@pytest.mark.parametrize("key", sorted(_SYNC_BODY_REFUSALS))
+def test_a_refused_success_body_still_reports_the_tokens_it_burned(key: str) -> None:
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(_billed_success_body(**_SYNC_BODY_REFUSALS[key]))
+    assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(refused.value) == _BILLED
+
+
+@pytest.mark.parametrize("key", sorted(_TERMINAL_FRAME_REFUSALS))
+def test_a_refused_terminal_frame_still_reports_the_tokens_it_burned(key: str) -> None:
+    with pytest.raises(ModelAdapterError) as refused:
+        _chunk_from_event(_billed_terminal_frame(**_TERMINAL_FRAME_REFUSALS[key]))
+    assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(refused.value) == _BILLED
+
+
+@pytest.mark.parametrize(
+    "usage, stamped",
+    [
+        ("not-a-mapping", {}),
+        ({"input_tokens": 120, "output_tokens": "many", "total_tokens": 460}, {}),
+    ],
+    ids=["unreadable", "partly-readable"],
+)
+def test_a_refusal_off_a_malformed_usage_invents_no_tokens(usage: object, stamped: dict) -> None:
+    """The counterweight, and the reason the stamp reads leniently rather than validating.
+
+    ``usage`` is the *source* of the stamp, so when it is the malformed key there is nothing
+    trustworthy to stamp: a second malformation must not replace the failure being reported,
+    and a count that cannot be read must not be invented. Whatever counts survive the filter
+    are the ones the payload actually stated.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    expected = dict(stamped)
+    if isinstance(usage, dict):
+        expected = {
+            name: value
+            for name, value in usage.items()
+            if type(value) is int and value >= 0
+        }
+
+    with pytest.raises(ModelAdapterError) as sync:
+        _parse_gateway_response(_billed_success_body(usage=usage))
+    assert sync.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(sync.value) == expected
+
+    with pytest.raises(ModelAdapterError) as streamed:
+        _chunk_from_event(_billed_terminal_frame(usage=usage))
+    assert streamed.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(streamed.value) == expected
+
+
+def test_a_refusal_off_an_envelope_that_cost_nothing_stays_costless() -> None:
+    """The other counterweight: a malformed body that never reported a cost invents none."""
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    body = _billed_success_body(stop_reason=7)
+    body.pop("usage")
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(body)
+    assert provider_usage_of(refused.value) == {}
+
+    frame = _billed_terminal_frame(stop_reason=7)
+    frame.pop("usage")
+    with pytest.raises(ModelAdapterError) as framed:
+        _chunk_from_event(frame)
+    assert provider_usage_of(framed.value) == {}

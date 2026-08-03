@@ -1010,13 +1010,23 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
     # Every validator below is handed it, so a malformed payload raises a classified failure that
     # still names the status the server reported rather than an unclassifiable one.
     status_hint = _gateway_http_status_hint(data) if "error" in data else None
-    provider_retried = _exact_gateway_bool(
-        data,
-        "provider_retried",
-        default=False,
-        context="response",
-        http_status=status_hint,
-    )
+    # A refusal off a payload that reported spending tokens carries that cost, whichever key of
+    # it turned out to be malformed: the upstream generated and billed the turn before this
+    # reader ever looked at it, and the refusal is the only carrier left for a call nothing
+    # downstream will assemble. The error envelope below stamps its own; the two guarded regions
+    # here are every other refusal this reader can raise, and they were all escaping empty --
+    # the rule was bound to the echo pair on the streamed twin and to nothing else.
+    try:
+        provider_retried = _exact_gateway_bool(
+            data,
+            "provider_retried",
+            default=False,
+            context="response",
+            http_status=status_hint,
+        )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, _reported_error_usage(data))
+        raise
     if "error" in data:
         error_http_status = _exact_gateway_int(
             data,
@@ -1077,130 +1087,135 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
         # that reports what it cost is recorded as having cost it.
         mark_provider_usage(envelope_error, _reported_error_usage(data))
         raise envelope_error
-    _exact_gateway_bool(
-        data,
-        "retryable",
-        default=False,
-        context="response",
-        known_provider_retried=provider_retried,
-    )
-    raw_calls = data.get("tool_calls", ())
-    if raw_calls is None:
-        raw_calls = ()
-    if not isinstance(raw_calls, (list, tuple)):
-        raise ModelAdapterError(
-            "LLM gateway returned invalid tool_calls: expected an array",
-            provider_error_code=GATEWAY_BAD_RESPONSE,
-            provider_retried=provider_retried,
+    try:
+        _exact_gateway_bool(
+            data,
+            "retryable",
+            default=False,
+            context="response",
+            known_provider_retried=provider_retried,
         )
-    tool_calls: list[ToolCall] = []
-    for raw in raw_calls:
-        if not isinstance(raw, dict):
+        raw_calls = data.get("tool_calls", ())
+        if raw_calls is None:
+            raw_calls = ()
+        if not isinstance(raw_calls, (list, tuple)):
             raise ModelAdapterError(
-                "LLM gateway returned an invalid tool call",
+                "LLM gateway returned invalid tool_calls: expected an array",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 provider_retried=provider_retried,
             )
-        args = raw.get("arguments")
-        if args is None:
-            args = {}
-        if isinstance(args, str):
-            try:
-                args = loads_model_json_ingress(args)
-            except ValueError as exc:
+        tool_calls: list[ToolCall] = []
+        for raw in raw_calls:
+            if not isinstance(raw, dict):
+                raise ModelAdapterError(
+                    "LLM gateway returned an invalid tool call",
+                    provider_error_code=GATEWAY_BAD_RESPONSE,
+                    provider_retried=provider_retried,
+                )
+            args = raw.get("arguments")
+            if args is None:
+                args = {}
+            if isinstance(args, str):
+                try:
+                    args = loads_model_json_ingress(args)
+                except ValueError as exc:
+                    raise ModelAdapterError(
+                        f"invalid gateway tool call arguments for {raw.get('name')}",
+                        provider_error_code=GATEWAY_BAD_RESPONSE,
+                        provider_retried=provider_retried,
+                    ) from exc
+            else:
+                args = _portable_gateway_payload(
+                    args,
+                    context="tool call arguments",
+                    http_status=status_hint,
+                    known_provider_retried=provider_retried,
+                )
+            if not isinstance(args, dict):
                 raise ModelAdapterError(
                     f"invalid gateway tool call arguments for {raw.get('name')}",
                     provider_error_code=GATEWAY_BAD_RESPONSE,
                     provider_retried=provider_retried,
-                ) from exc
-        else:
-            args = _portable_gateway_payload(
-                args,
-                context="tool call arguments",
+                )
+            tool_calls.append(
+                ToolCall(
+                    id=_gateway_string(
+                        raw,
+                        "id",
+                        "call_id",
+                        context="tool call",
+                        required=True,
+                        known_provider_retried=provider_retried,
+                    )
+                    or "",
+                    name=_gateway_string(
+                        raw,
+                        "name",
+                        context="tool call",
+                        required=True,
+                        known_provider_retried=provider_retried,
+                    )
+                    or "",
+                    arguments=args,
+                )
+            )
+
+        # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
+        # infer the common cases so the loop's branch still works.
+        stop_reason = _gateway_string(
+            data,
+            "stop_reason",
+            context="response",
+            known_provider_retried=provider_retried,
+        )
+        if stop_reason is None:
+            stop_reason = "tool_calls" if tool_calls else "stop"
+        return ModelTurn(
+            response_id=_gateway_string(
+                data,
+                "response_id",
+                "turn_handle",
+                context="response",
+                known_provider_retried=provider_retried,
+            ),
+            final_text=_gateway_string(
+                data,
+                "final_text",
+                context="response",
+                known_provider_retried=provider_retried,
+            ),
+            tool_calls=tuple(tool_calls),
+            usage=_gateway_usage(
+                data.get("usage"),
+                context="response",
                 http_status=status_hint,
                 known_provider_retried=provider_retried,
-            )
-        if not isinstance(args, dict):
-            raise ModelAdapterError(
-                f"invalid gateway tool call arguments for {raw.get('name')}",
-                provider_error_code=GATEWAY_BAD_RESPONSE,
-                provider_retried=provider_retried,
-            )
-        tool_calls.append(
-            ToolCall(
-                id=_gateway_string(
-                    raw,
-                    "id",
-                    "call_id",
-                    context="tool call",
-                    required=True,
-                    known_provider_retried=provider_retried,
-                )
-                or "",
-                name=_gateway_string(
-                    raw,
-                    "name",
-                    context="tool call",
-                    required=True,
-                    known_provider_retried=provider_retried,
-                )
-                or "",
-                arguments=args,
-            )
+            ),
+            raw=_portable_gateway_payload(
+                data,
+                context="response",
+                http_status=status_hint,
+                known_provider_retried=provider_retried,
+            ),
+            # The opaque provider-native reasoning artifacts the upstream produced, relayed
+            # by the gateway. Absent from an older gateway, which reads as "none" -- the same
+            # thing an adapter with no reasoning says, and all a wire that never mentions the
+            # key can mean.
+            reasoning=_gateway_reasoning_items(
+                data.get("reasoning"),
+                context="response",
+                http_status=status_hint,
+                known_provider_retried=provider_retried,
+            ),
+            stop_reason=stop_reason,
+            # A retry the gateway's own backend made. Absent from an older gateway, which
+            # reads as "did not retry" -- the same default an adapter with no retry loop
+            # carries, and the only thing a wire that never mentions it can honestly mean.
+            provider_retried=provider_retried,
         )
-
-    # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
-    # infer the common cases so the loop's branch still works.
-    stop_reason = _gateway_string(
-        data,
-        "stop_reason",
-        context="response",
-        known_provider_retried=provider_retried,
-    )
-    if stop_reason is None:
-        stop_reason = "tool_calls" if tool_calls else "stop"
-    return ModelTurn(
-        response_id=_gateway_string(
-            data,
-            "response_id",
-            "turn_handle",
-            context="response",
-            known_provider_retried=provider_retried,
-        ),
-        final_text=_gateway_string(
-            data,
-            "final_text",
-            context="response",
-            known_provider_retried=provider_retried,
-        ),
-        tool_calls=tuple(tool_calls),
-        usage=_gateway_usage(
-            data.get("usage"),
-            context="response",
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        ),
-        raw=_portable_gateway_payload(
-            data,
-            context="response",
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        ),
-        # The opaque provider-native reasoning artifacts the upstream produced, relayed by the
-        # gateway. Absent from an older gateway, which reads as "none" -- the same thing an
-        # adapter with no reasoning says, and all a wire that never mentions the key can mean.
-        reasoning=_gateway_reasoning_items(
-            data.get("reasoning"),
-            context="response",
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        ),
-        stop_reason=stop_reason,
-        # A retry the gateway's own backend made. Absent from an older gateway, which reads as
-        # "did not retry" -- the same default an adapter with no retry loop carries, and the only
-        # thing a wire that never mentions it can honestly mean.
-        provider_retried=provider_retried,
-    )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, _reported_error_usage(data))
+        raise
 
 
 class _StreamRetry(Exception):
@@ -1263,19 +1278,25 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         if type(raw_event_type) is str and raw_event_type == "error"
         else None
     )
-    retried = _exact_gateway_bool(
-        event,
-        "provider_retried",
-        default=False,
-        context="stream frame",
-        http_status=status_hint,
-    )
-    event_type = _gateway_string(
-        event,
-        "type",
-        context="stream frame",
-        known_provider_retried=retried,
-    )
+    # The sync reader's rule on the frame reader: a refusal off a frame that reported spending
+    # tokens carries that cost, and these two reads run before any branch can stamp for them.
+    try:
+        retried = _exact_gateway_bool(
+            event,
+            "provider_retried",
+            default=False,
+            context="stream frame",
+            http_status=status_hint,
+        )
+        event_type = _gateway_string(
+            event,
+            "type",
+            context="stream frame",
+            known_provider_retried=retried,
+        )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, _reported_error_usage(event))
+        raise
     if event_type == "text_delta":
         return TextDelta(
             text=_gateway_fragment_string(
@@ -1337,7 +1358,9 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         )
     if event_type == "turn_complete":
         # Same shape rule the sync response is held to; the enforcement functions call these
-        # too, so neither transport can be stricter than the other.
+        # too, so neither transport can be stricter than the other. The whole construction is
+        # inside the guard, not just the two echoes: every key read below refuses the same
+        # billed frame the same way, and only the echo pair was carrying the cost out.
         try:
             applied = _validated_generation_echo(
                 event.get("generation_applied"), provider_retried=retried
@@ -1345,8 +1368,43 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             schema_applied = _validated_schema_echo(
                 event.get("schema_applied"), provider_retried=retried
             )
+            # The gateway's opaque turn_handle is the continuation handle the core stores.
+            return TurnComplete(
+                generation_applied=applied,
+                schema_applied=schema_applied,
+                response_id=_gateway_string(
+                    event,
+                    "turn_handle",
+                    "response_id",
+                    context="turn-complete frame",
+                    known_provider_retried=retried,
+                ),
+                usage=_gateway_usage(
+                    event.get("usage"),
+                    context="turn-complete frame",
+                    http_status=status_hint,
+                    known_provider_retried=retried,
+                ),
+                # The terminal frame is the only frame that may carry the artifacts, and the
+                # only one ``assemble_streamed_turn`` reads them off. Same validator as the
+                # sync reader: a shape one transport accepts and the other refuses is the
+                # defect, not the fix.
+                reasoning=_gateway_reasoning_items(
+                    event.get("reasoning"),
+                    context="turn-complete frame",
+                    http_status=status_hint,
+                    known_provider_retried=retried,
+                ),
+                stop_reason=_gateway_string(
+                    event,
+                    "stop_reason",
+                    context="turn-complete frame",
+                    known_provider_retried=retried,
+                ),
+                provider_retried=retried,
+            )
         except ModelAdapterError as malformed:
-            # A malformed echo on a *billed* frame still cost the tokens the same frame
+            # A malformed value on a *billed* frame still cost the tokens the same frame
             # reports. The sync twin validates inside the stamped check block, so its
             # ``gateway_bad_response`` carries ``provider_usage``; raising here at parse
             # time, before any stamp, lost the same money on one of two transports. Read
@@ -1354,40 +1412,6 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             # being reported.
             mark_provider_usage(malformed, _reported_error_usage(event))
             raise
-        # The gateway's opaque turn_handle is the continuation handle the core stores.
-        return TurnComplete(
-            generation_applied=applied,
-            schema_applied=schema_applied,
-            response_id=_gateway_string(
-                event,
-                "turn_handle",
-                "response_id",
-                context="turn-complete frame",
-                known_provider_retried=retried,
-            ),
-            usage=_gateway_usage(
-                event.get("usage"),
-                context="turn-complete frame",
-                http_status=status_hint,
-                known_provider_retried=retried,
-            ),
-            # The terminal frame is the only frame that may carry the artifacts, and the only
-            # one ``assemble_streamed_turn`` reads them off. Same validator as the sync reader:
-            # a shape one transport accepts and the other refuses is the defect, not the fix.
-            reasoning=_gateway_reasoning_items(
-                event.get("reasoning"),
-                context="turn-complete frame",
-                http_status=status_hint,
-                known_provider_retried=retried,
-            ),
-            stop_reason=_gateway_string(
-                event,
-                "stop_reason",
-                context="turn-complete frame",
-                known_provider_retried=retried,
-            ),
-            provider_retried=retried,
-        )
     if event_type == "error":
         error_http_status = _exact_gateway_int(
             event,
@@ -1447,13 +1471,19 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
 
 
 def _reported_error_usage(payload: dict[str, Any]) -> dict[str, int]:
-    """Tokens a *failed* gateway call reported spending, read leniently.
+    """Tokens a gateway call that ends in a refusal reported spending, read leniently.
 
     The twin of the client-side stamp, for the hop: a gateway whose own upstream refused a
     billed turn carries the cost in its error envelope, and without reading it back the outer
     client reports zero for a call the provider charged for. Lenient on purpose -- a malformed
     ``usage`` on an error path must not replace the failure being reported with a different
     one, so anything unreadable simply reads as "not reported".
+
+    Named for the error envelope it was written for, and it serves the refused *success*
+    payloads too: a 200 body or a terminal frame the reader rejects for a malformed key was
+    generated and billed exactly like the error envelope's turn, and the same leniency is what
+    lets a body whose ``usage`` is itself the malformed key stamp nothing rather than raise a
+    second failure over the first.
     """
 
     usage = payload.get("usage")
