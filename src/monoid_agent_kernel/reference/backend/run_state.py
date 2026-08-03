@@ -344,13 +344,10 @@ class RunStateMutationService:
         def _mutate() -> None:
             record = self._context.record(run_id)
             record.result = result
-            set_record_state(
-                record,
-                session_state_from_run_status(
-                    result.status, error_code=result.error_code, terminal=True
-                ),
-                terminal=True,
+            terminal_state = session_state_from_run_status(
+                result.status, error_code=result.error_code, terminal=True
             )
+            set_record_state(record, terminal_state, terminal=True)
             # Through the kernel's own error filter before it becomes an HTTP projection.
             # `AgentRunResult.error` is deliberately raw -- the embedding application is inside
             # the trust boundary and needs the whole message to debug -- but `record.error` is
@@ -358,6 +355,26 @@ class RunStateMutationService:
             # provider response body in it, which is not the run's own data to hand back.
             record.error = public_error_message(result.error)
             record.error_code = result.error_code
+            # The record-side terminal heal — the third consumer of the rule the status sink
+            # and the offline projection already bind at their terminal branches. Terminals
+            # minted at the CLOSE boundary (a pending-cancel promotion, the unrecovered
+            # turn-failure promotion, an unsettled-close promotion) never pass the driver's
+            # top-of-loop park promotion, so without this seam the live record kept the dead
+            # turn's classification beside a cancelled/limited/completed terminal while
+            # status.json healed it — and the two branches of the same status() endpoint
+            # disagreed across a restart. Bound here, on the single seam every terminal
+            # result funnels through, rather than per close path. A FAILED terminal keeps
+            # the four facts (they say what the run died of) and drops only
+            # ``provider_retried`` — the per-call fact the terminal vocabulary drops
+            # everywhere (``run.failed``'s sink branch pops it for the same reason).
+            if terminal_state is SessionState.FAILED:
+                record.provider_retried = False
+            else:
+                record.retryable = False
+                record.http_status = None
+                record.config_recoverable = False
+                record.provider_error_code = ""
+                record.provider_retried = False
             record.finished_at = self._context.now()
             self._meter_run(record.tenant_id, run_id, result.metrics)
 

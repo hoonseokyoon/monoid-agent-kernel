@@ -278,6 +278,25 @@ def _unrecovered_turn_failure(
     )
 
 
+def _midturn_park(last_suspension: Mapping[str, Any] | None) -> str | None:
+    """Read a durable mid-turn park back as ``_Session.midturn_park``, or ``None``.
+
+    Only ``paused`` and ``interrupted`` rehydrate: they are the two parks whose turn never
+    settled, and closing on one is abandoning that turn — the close boundary must record
+    that honestly rather than finalize a clean success (see ``_promote_unsettled_close``).
+    ``settled``/``limited``/``terminal`` recorded an outcome and ``turn_failed`` has its
+    own promotion; promoting any of those would misname an ordinary close. ``awaiting_tasks``
+    is deliberately outside this predicate: a task park is normally ended by cancel/drain
+    (which the pending-cancel promotion already records), and widening this promotion to it
+    is a separate decision.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return None
+    reason = last_suspension.get("reason")
+    return reason if reason in ("paused", "interrupted") else None
+
+
 def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[bool, bool]:
     """Read ``(retryable, config_recoverable)`` back off a durable park observation.
 
@@ -922,6 +941,12 @@ class _Session:
     # updates when the park's checkpoint snapshot committed, and the promotion must not
     # depend on checkpointing having worked.
     unrecovered_turn_failure: tuple[str, str] | None = None
+    # The un-promoted mid-turn park: ``"paused"`` / ``"interrupted"``, or ``None``. Set by the
+    # two park handlers, cleared at every pump entry (a resume that settles leaves it cleared),
+    # read by ``close()`` to refuse finalizing a never-settled turn as a clean success. NOT
+    # derived from ``last_suspension``, for the same reason ``unrecovered_turn_failure`` is not:
+    # the promotion must not depend on the park's checkpoint commit having worked.
+    midturn_park: str | None = None
     # Recovery-driver input identities survive every later snapshot without coupling the loop to
     # a command transport or orchestration implementation.
     applied_input_ids: set[str] = field(default_factory=set)
@@ -1512,8 +1537,10 @@ class AgentLoop:
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
         # A fresh pump supersedes the prior park: if this attempt settles, the failure was
-        # recovered; if it fails again, the branch below re-sets it.
+        # recovered; if it fails again, the branch below re-sets it. The mid-turn park marker
+        # follows the same rule — a resumed pause/interrupt that runs is no longer frozen.
         session.unrecovered_turn_failure = None
+        session.midturn_park = None
         state, res = session.state, session.res
         if user_input is not None:
             session.active_turn_id = None
@@ -1652,6 +1679,9 @@ class AgentLoop:
                 level="info",
             )
             state.pending_observations = ()
+            # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
+            # no later settle refuses to finalize this abandoned turn as a clean success.
+            session.midturn_park = "interrupted"
             result = Suspension(reason="interrupted", status="completed")
             self._persist_checkpoint(session, result)
             return result
@@ -1680,6 +1710,9 @@ class AgentLoop:
                 "session.state.changed",
                 data={"state": "paused", "from": "running", "reason": "pause_requested"},
             )
+            # The frozen turn never settled; a close over this park must not read the
+            # per-submit reset state as a clean success (twin of the interrupt marker above).
+            session.midturn_park = "paused"
             result = Suspension(reason="paused", status="completed")
             self._persist_checkpoint(session, result)
             return result
@@ -1772,8 +1805,52 @@ class AgentLoop:
         state.status = "limited"
         state.error = str(exc)
         state.error_code = error_code_for_exception(exc)
-        state.final_text = "Stopped because the run was cancelled."
-        state.final_text_is_model_output = False
+        # A settled park's final text SURVIVES the cancel: the answer the turn produced is
+        # the run's, and the cancel statement already lives in error/error_code ("cancelled").
+        # v0.20 returned the answer with the wrong COMPLETED status; the status fix must not
+        # silently take the answer with it. Only a park with no text of its own — a mid-turn
+        # cancel, whose per-submit reset cleared it — gets the kernel's stop notice, exactly
+        # like the pump's ``RunCancelled`` handler (where the reset has always run first).
+        # Preserved text keeps its provenance flag, so a model answer stays digested on
+        # ``run.finished`` rather than being republished inline.
+        if not state.final_text:
+            state.final_text = "Stopped because the run was cancelled."
+            state.final_text_is_model_output = False
+        session.terminal = True
+        self._persist_checkpoint(
+            session,
+            Suspension(
+                reason="terminal",
+                status="limited",
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+            ),
+        )
+
+    def _promote_unsettled_close(self, session: _Session) -> None:
+        """Promote a close over a mid-turn park (``paused``/``interrupted``) to an honest
+        limited outcome — the third close-boundary promotion, beside the pending cancel and
+        the unrecovered turn failure.
+
+        A paused turn is frozen at a step boundary with its observations still unsent; an
+        interrupted turn was abandoned before settling. ``close()`` used to read the
+        per-submit reset state for both and finalize a clean COMPLETED with an empty answer
+        — and the completed-run cleanup then deleted the only checkpoints holding the frozen
+        turn. Backend-reachable via ``pause_run`` + idle timeout, so this is not a
+        facade-only corner. ``status="limited"`` / ``error_code="closed_unsettled"`` (one
+        code for both variants; documented in CONTRACTS.md) keeps the checkpoints — the
+        delete gates on ``status == "completed"`` — and the minted park carries an empty
+        classification: nothing here is a provider failure. A settled ``awaiting_input``
+        park is NOT this (its turn completed; close finalizes the success it was), and an
+        acknowledged cancel — the operator's stronger verdict — runs first and stands this
+        promotion down via ``session.terminal``."""
+        if session.terminal or session.midturn_park is None:
+            return
+        state = session.state
+        state.status = "limited"
+        state.error = f"run closed while its turn was {session.midturn_park}; the turn never settled"
+        state.error_code = "closed_unsettled"
         session.terminal = True
         self._persist_checkpoint(
             session,
@@ -1827,6 +1904,9 @@ class AgentLoop:
                 self.fail_recoverable(
                     error or "turn failed", error_code=error_code or "model_error"
                 )
+            # Third and last: a mid-turn park (paused/interrupted) whose turn never settled.
+            # A no-op once either promotion above already terminalized the run.
+            self._promote_unsettled_close(session)
             result = self._finalize(session.state, session.res)
         except BaseException:
             # A failed terminal transition cannot remain submit-capable with already-closed
@@ -2488,6 +2568,25 @@ class AgentLoop:
 
     # --- durable persistence (state snapshots at safe recovery boundaries) ---
 
+    def at_quiescent_park(self) -> bool:
+        """Whether this activation is idle at a committed suspension boundary. Pure read.
+
+        True only for a live (non-terminal) session holding a committed park observation.
+        ``arun_until_suspended`` clears ``last_suspension`` synchronously at pump entry —
+        before its first await — and only the park's own checkpoint commit restores it, so a
+        callable running on the same event loop that drives the pump reads an exact
+        in-flight marker here: either the run is parked (True) or a pump owns the state
+        (False). A terminal or torn-down activation answers False — for a caller deciding
+        whether a park snapshot is safe, those mean "nothing left to snapshot". The backend's
+        cancel ack uses this to refuse re-committing a park checkpoint over a turn that has
+        already resumed (same-seq ``put`` would replace the committed park's content)."""
+        session = self._session
+        return (
+            session is not None
+            and not session.terminal
+            and session.last_suspension is not None
+        )
+
     def snapshot(self) -> RunCheckpoint | None:
         """Capture the run's current safe state as a ``RunCheckpoint``, or ``None`` when
         a durable snapshot is unsafe right now. Pure read — never mutates state or jobs.
@@ -2838,6 +2937,9 @@ class AgentLoop:
             # ``completed``, wrote no failure record, and let the completed-run cleanup delete
             # them. A later settle clears it at pump entry, same as in-process.
             unrecovered_turn_failure=_unrecovered_turn_failure(cp.last_suspension),
+            # Same argument, same boundary: a restored paused/interrupted park that is then
+            # closed without a resume must promote exactly as the in-process park would.
+            midturn_park=_midturn_park(cp.last_suspension),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={

@@ -7,6 +7,53 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the close boundary tells the truth, and a dead run reads dead everywhere
+
+- **The terminal heal reaches the backend record.** Terminals minted at the close boundary
+  (a pending-cancel promotion, the unrecovered turn-failure promotion, the new unsettled-close
+  promotion) never pass the driver's top-of-loop park promotion — so at a CANCELLED terminal
+  reached by cancelling a `turn_failed` park, live `GET /status` served the dead turn's five
+  classification facts beside `error_code="cancelled"` while `status.json` healed them, and the
+  two branches of the same endpoint disagreed across a restart. `record_run_result` — the one
+  seam every terminal result funnels through — now binds the same rule the status sink and the
+  offline projection already bind: a non-failed terminal (completed/limited/cancelled) clears
+  the five facts on the record; a failed terminal keeps the four what-it-died-of facts and drops
+  the per-call `provider_retried`, exactly as `run.failed`'s vocabulary does. All three readers
+  are pinned to one answer per close-boundary terminal kind.
+- **Closing a mid-turn PAUSED (or interrupted) run no longer finalizes a clean success and
+  deletes its only restore point.** A turn frozen at a step boundary (pause) or abandoned before
+  settling (interrupt) read the per-submit reset state at close: `run.finished` said
+  `completed` with an empty answer and the completed-run cleanup deleted the checkpoints holding
+  the frozen turn — backend-reachable via `pause_run` + idle timeout. `close()` now promotes a
+  mid-turn park to `status="limited"` / `error_code="closed_unsettled"` (one new code, both
+  variants, documented in CONTRACTS.md) with an empty classification and its checkpoints kept;
+  the marker rides the checkpoint's `last_suspension`, so a restored park closes the same way.
+  A resumed pause that settles keeps the clean-completion contract.
+- **Cancelling a settled park keeps the settled answer.** `cancel_run` + close (and `drain()`
+  at deploy) replaced the parked turn's settled `final_text` with "Stopped because the run was
+  cancelled." on the result, `run.finished`, and every readable surface — v0.20 returned the
+  answer with the wrong COMPLETED status, and the status fix silently took the answer. The
+  pending-cancel promotion now preserves the park's settled text (the cancel statement lives in
+  `error`/`error_code`); a mid-turn cancel, which has no settled text, keeps the stop notice.
+- **A given-up run reads terminal on every status surface.** The recovery give-up paths
+  (unrecoverable after `max_recover_attempts`; corrupt durable state) wrote `failure.json` and
+  metered — but no terminal status artifact, so `status()`, `list_runs` and the offline
+  projection all answered `state=awaiting_input, terminal=False, error=""` forever while
+  `resume_run` refused the run as unrecoverable. Both sites now write the terminal statement
+  into `status.json` (the sink's `run.failed` shape, plus a `given_up_by_recovery` marker the
+  closed-run recovery guard and the offline projection honor), and `restore_hint` now names the
+  actual operator flow — delete `failure.json` to lift the quarantine, then
+  `recover_runs`/`resume_run` — which previously pointed at a path that skips quarantined dirs.
+- **The cancel-ack checkpoint no longer races the drive.** `cancel_run` read `record.state` on
+  the HTTP thread and persisted later on the shared loop: a park state read just before the
+  drive resumed let a mid-turn snapshot overwrite the committed park checkpoint's content at the
+  same seq, and an idle-timeout close landing between ack and persist made `snapshot()` raise
+  `run_not_open` — a 500 after acknowledging the cancel. The quiescence check + ack checkpoint +
+  wake signal now run as one callable on the drive's own loop, double-gated on the record's park
+  state and the loop's committed-park marker (`AgentLoop.at_quiescent_park()`), and a persist
+  refused with `run_not_open`/`run_terminal` is treated as the successful cancel it is. The
+  remaining mid-turn/mid-close window is documented as honestly non-durable.
+
 ### Fixed — the facade wraps what restore produces, and deadness is a recorded fact
 
 - **`LoopSession` can wrap a restored loop, as its docstring always promised.** A fresh

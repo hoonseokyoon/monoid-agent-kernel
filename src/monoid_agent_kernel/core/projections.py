@@ -149,6 +149,25 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "event_log_error": "",
     }
     _apply_event_projection(run_dir / "events.jsonl", projection, permission_policy)
+    if status_payload.get("given_up_by_recovery") is True:
+        # Recovery's give-up ends a run WITHOUT a live recorder, so no terminal event ever
+        # reaches events.jsonl — the log honestly ends at the park the run died in, and the
+        # replay above just resurrected that park. The give-up's terminal statement exists
+        # only in the status artifact (written beside failure.json), so it is re-applied
+        # over the replayed park here: without this, the offline reader answered a healthy
+        # ``awaiting_input`` for a quarantined run while ``status()``/``list_runs`` (which
+        # read the artifact) answered ``failed``. Guarded ``is True``: a hand-edited truthy
+        # string must not activate the override. A later genuine recovery rewrites the
+        # artifact without the marker, so the override dies with the quarantine.
+        projection["state"] = _payload_state(status_payload, metrics)
+        projection["terminal"] = _payload_terminal(status_payload, projection["state"])
+        projection["error"] = status_payload.get("error") or ""
+        projection["error_code"] = status_payload.get("error_code") or ""
+        projection["provider_error_code"] = _event_text(status_payload, "provider_error_code")
+        projection["http_status"] = _event_http_status(status_payload)
+        projection["retryable"] = _event_flag(status_payload, "retryable")
+        projection["config_recoverable"] = _event_flag(status_payload, "config_recoverable")
+        projection["provider_retried"] = _event_flag(status_payload, "provider_retried")
     return projection
 
 

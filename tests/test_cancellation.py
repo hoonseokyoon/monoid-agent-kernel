@@ -9,7 +9,51 @@ from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheck
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+
+
+class _ParkingAdapter(FakeModelAdapter):
+    """Requests a pause or an interrupt DURING the first model call — after step 1's
+    start-of-step check already passed — so the signal lands at the start of step 2 while
+    step 1's tool observation is pending: a genuinely mid-turn park, never a settle."""
+
+    loop_ref: AgentLoop | None = None
+    signal: str = "pause"
+
+    def next_turn(self, request):  # noqa: ANN001
+        turn = super().next_turn(request)
+        if self.loop_ref is not None:
+            if self.signal == "pause":
+                self.loop_ref.pause_turn()
+            else:
+                self.loop_ref.interrupt_turn()
+        return turn
+
+
+def _midturn_parked_loop(tmp_path: Path, signal: str) -> tuple[AgentLoop, AgentRunSpec]:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "a.md").write_text("hi\n", encoding="utf-8")
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+    adapter = _ParkingAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("fs_list", {"path": "."}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="the real answer"),
+        ]
+    )
+    adapter.signal = signal
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("fs.list", "run.finish")),
+        cancellation_token=CancellationToken(),
+    )
+    adapter.loop_ref = loop
+    loop.open()
+    return loop, spec
 
 
 def test_cancel_callbacks_are_one_shot_and_removable() -> None:
@@ -132,10 +176,111 @@ def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
     result = loop.close()
 
     assert (result.status, result.error_code) == ("limited", "cancelled")
+    # The settled answer SURVIVES the cancel. v0.20 returned it beside the wrong COMPLETED
+    # status; fixing the status must not silently replace the answer with the stop notice —
+    # the cancel statement lives in error/error_code. (A mid-turn cancel still gets the
+    # notice: its per-submit reset left no settled text to preserve.)
+    assert result.final_text == "first"
     stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert stored is not None
     assert stored.checkpoint.terminal is True
     assert stored.checkpoint.cancellation_requested is True
+
+
+def test_cancel_acknowledged_at_a_midturn_park_keeps_the_stop_notice(tmp_path: Path) -> None:
+    """The other half of the answer-preservation rule: a mid-turn park has no settled text
+    (the per-submit reset cleared it), so the promotion still explains the stop."""
+
+    loop, _spec = _midturn_parked_loop(tmp_path, "pause")
+    assert loop.run_until_suspended("go").reason == "paused"
+
+    loop.cancellation_token.cancel()
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("limited", "cancelled")
+    assert result.final_text == "Stopped because the run was cancelled."
+
+
+def test_close_of_a_paused_midturn_run_promotes_limited_and_keeps_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """close() of a PAUSED mid-turn run finalized a clean COMPLETED with an empty answer and
+    DELETED the checkpoints holding the frozen turn — backend-reachable via pause_run + an
+    idle timeout. The close boundary now refuses to record a never-settled turn as a
+    success: ``status="limited"`` / ``error_code="closed_unsettled"``, checkpoints kept
+    (the delete gates on status=="completed"), classification-empty terminal park."""
+
+    loop, spec = _midturn_parked_loop(tmp_path, "pause")
+    suspension = loop.run_until_suspended("go")
+    assert suspension.reason == "paused"
+
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+    # This is not a provider failure: the minted terminal park carries no classification.
+    last = stored.checkpoint.last_suspension
+    assert last is not None and last.get("error_code") == "closed_unsettled"
+    assert not last.get("retryable") and not last.get("config_recoverable")
+    assert not last.get("provider_error_code") and last.get("http_status") is None
+
+
+def test_close_of_an_interrupted_park_promotes_limited_and_keeps_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """The interrupted twin: the same close-boundary trace holds (empirically — a stopped
+    turn also never settled), so the same promotion binds it."""
+
+    loop, spec = _midturn_parked_loop(tmp_path, "interrupt")
+    assert loop.run_until_suspended("go").reason == "interrupted"
+
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+
+
+def test_a_restored_midturn_park_still_closes_unsettled(tmp_path: Path) -> None:
+    """The promotion survives a restart: a restored paused park that is closed without a
+    resume promotes exactly as the in-process park would (rehydrated off
+    ``last_suspension``, like the turn-failed promotion)."""
+
+    loop, spec = _midturn_parked_loop(tmp_path, "pause")
+    assert loop.run_until_suspended("go").reason == "paused"
+    loop.release_parked()
+
+    stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert stored is not None
+    restored = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.list", "run.finish")),
+    )
+    restored.restore(stored.checkpoint, blobs=stored.blob)
+
+    result = restored.close()
+
+    assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    assert LocalFsCheckpointStore(spec.run_root).latest(spec.run_id) is not None
+
+
+def test_a_resumed_pause_that_settles_still_closes_completed(tmp_path: Path) -> None:
+    """The counterweight: the marker clears at pump entry, so a pause that is RESUMED and
+    settles keeps the clean-completion contract (and its checkpoint cleanup)."""
+
+    loop, spec = _midturn_parked_loop(tmp_path, "pause")
+    assert loop.run_until_suspended("go").reason == "paused"
+    assert loop.run_until_suspended(None).reason == "settled"
+
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("completed", "")
+    assert result.final_text == "the real answer"
+    assert LocalFsCheckpointStore(spec.run_root).latest(spec.run_id) is None
 
 
 def test_close_without_a_pending_cancel_still_completes_and_cleans_up(tmp_path: Path) -> None:

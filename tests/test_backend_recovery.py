@@ -34,6 +34,7 @@ from support.backend_harness import (
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
 from monoid_agent_kernel.core._event_log import inspect_event_log_tail
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.projections import project_run_status
 
 pytestmark = pytest.mark.integration
 
@@ -715,6 +716,141 @@ def test_recover_runs_marks_unrecoverable_after_max_attempts(tmp_path: Path, mon
 
     # Now permanently skipped: failure.json is the terminal mark.
     assert backend.recover_runs() == []
+
+
+def test_a_given_up_run_reads_terminal_failed_on_every_status_surface(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The give-up path wrote failure.json + metered, but no terminal status artifact — so
+    ``status()``, ``list_runs`` and the offline projection all answered a healthy
+    ``state=awaiting_input, terminal=False, error=""`` for a permanently dead run, while
+    ``resume_run`` simultaneously refused it as "marked unrecoverable". Both give-up sites
+    now write the terminal artifact beside the bundle, and the offline projection honors it
+    over the stale (necessarily park-ending) event log."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend1 = _recoverable_backend(
+        run_root,
+        _token_manager(),
+        workspace,
+        [],
+        turns=[ModelTurn(response_id="r1", final_text="answer")],
+    )
+    backend1.idle_timeout_s = 300.0
+    submission = _submit_multi_turn(backend1, workspace)
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    backend1.stop_watchdog()  # "crash": the park checkpoint + park-shaped status.json remain
+
+    backend2 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    backend2.max_recover_attempts = 1
+
+    def _boom(stored, meta):
+        del stored, meta
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(backend2._recovery, "resume_from_checkpoint", _boom)
+    assert backend2.recover_runs() == []
+    run_dir = run_root / run_id
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "unrecoverable"
+    # The corrected hint names the actual operator flow: the quarantine must be lifted
+    # first, because recover_runs/resume_run refuse a dir carrying failure.json.
+    assert "delete failure.json" in failure["restore_hint"]
+
+    # A fresh operator process, all three readers, one answer.
+    backend3 = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    status = backend3.status(run_id, token)
+    assert (status["state"], status["terminal"]) == ("failed", True)
+    assert status["error_code"] == "unrecoverable"
+    assert "recovery failed" in status["error"]
+    row = next(
+        entry
+        for entry in backend3.list_runs("tenant_a")["runs"]
+        if entry["run_id"] == run_id
+    )
+    assert (row["state"], row["terminal"], row["recoverable"]) == ("failed", True, False)
+    projection = project_run_status(run_dir)
+    assert (projection["state"], projection["terminal"]) == ("failed", True)
+    assert projection["error_code"] == "unrecoverable"
+    # ...and resume_run still refuses, now consistently with what status() says.
+    with pytest.raises(ValueError, match="unrecoverable"):
+        backend3.resume_run(run_id, token)
+
+
+def test_corrupt_state_giveup_also_writes_the_terminal_status_artifact(tmp_path: Path) -> None:
+    """The second give-up site (``_record_checked_load_failure``) binds the same rule."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    run_id = "run_string_terminal_artifact"
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    manifest = run_root / run_id / "checkpoints" / "1" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["terminal"] = "no"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert backend.recover_runs() == []
+
+    artifact = json.loads((run_root / run_id / "status.json").read_text(encoding="utf-8"))
+    assert (artifact["state"], artifact["terminal"]) == ("failed", True)
+    assert artifact["error_code"] == "checkpoint_corrupt"
+    assert artifact["given_up_by_recovery"] is True
+    # The terminal statement mirrors the sink's run.failed vocabulary: the four facts are
+    # assigned (honest empties — no provider verdict exists) and provider_retried is absent.
+    assert artifact["retryable"] is False
+    assert artifact["config_recoverable"] is False
+    assert artifact["http_status"] is None
+    assert artifact["provider_error_code"] == ""
+    assert "provider_retried" not in artifact
+
+
+def test_the_restore_hint_flow_actually_recovers_the_run(tmp_path: Path, monkeypatch) -> None:
+    """The hint's prescribed flow — delete failure.json, then recover_runs — must work with
+    the terminal give-up artifact in place: ``_closed_by_status_artifact`` reads the
+    ``given_up_by_recovery`` marker and does not mistake the give-up statement for a close."""
+
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    backend = _recoverable_backend(
+        run_root, _token_manager(), workspace, [], turns=[ModelTurn(final_text="x")]
+    )
+    backend.max_recover_attempts = 1
+    run_id = "run_quarantine_lifted"
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True)
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    write_json_atomic(run_dir / "run.json", _recovery_metadata(run_id, workspace))
+
+    original = type(backend._recovery).resume_from_checkpoint
+
+    def _boom(stored, meta):
+        del stored, meta
+        raise RuntimeError("resume boom")
+
+    monkeypatch.setattr(backend._recovery, "resume_from_checkpoint", _boom)
+    assert backend.recover_runs() == []
+    assert (run_dir / "failure.json").exists()
+    assert json.loads((run_dir / "status.json").read_text(encoding="utf-8"))["terminal"] is True
+
+    # The operator flow the hint prescribes.
+    (run_dir / "failure.json").unlink()
+    monkeypatch.setattr(
+        backend._recovery, "resume_from_checkpoint", original.__get__(backend._recovery)
+    )
+    assert backend.recover_runs() == [run_id]
+    assert backend.wait_for_run(run_id, timeout_s=20) in {
+        SessionState.COMPLETED,
+        SessionState.AWAITING_INPUT,
+    }
 
 
 def test_recover_runs_rejects_runtime_config_hash_mismatch(tmp_path: Path) -> None:

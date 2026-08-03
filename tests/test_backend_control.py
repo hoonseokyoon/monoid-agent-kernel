@@ -22,9 +22,10 @@ from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.events import make_agent_event
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
-from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError, PermissionDenied
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -34,6 +35,7 @@ from monoid_agent_kernel.reference.backend.service import (
     BackendRunRecord,
     BackendRunRequest,
     RunnerBackend,
+    _CLOSE_SESSION,
     _RESUME_SESSION,
     _RUN_META_SCHEMA_VERSION,
 )
@@ -735,6 +737,358 @@ def test_cancel_of_a_parked_run_is_durable_at_the_ack(
     assert stored.checkpoint.cancellation_requested is True
     assert stored.checkpoint.terminal is False
 
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+
+class _ErrorScriptAdapter:
+    """Drives a script of turns/exceptions: a ModelTurn is returned, an exception raised."""
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.requests: list[Any] = []
+
+    def next_turn(self, request: Any) -> Any:
+        self.requests.append(request)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _classified_error() -> ModelAdapterError:
+    return ModelAdapterError(
+        "quota exhausted",
+        http_status=422,
+        retryable=False,
+        config_recoverable=True,
+        provider_error_code="insufficient_quota",
+        provider_retried=True,
+    )
+
+
+def _error_script_backend(
+    backend_factory: Any, workspace: Path, script: list[Any]
+) -> RunnerBackend:
+    def factory(spec: Any, llm_gateway_token: str) -> _ErrorScriptAdapter:
+        del spec, llm_gateway_token
+        return _ErrorScriptAdapter(script)
+
+    backend = backend_factory.create(workspace=workspace, model_adapter_factory=factory)
+    backend.idle_timeout_s = 30.0
+    return backend
+
+
+_TERMINAL_CLASSIFICATION_KEYS = (
+    "retryable",
+    "http_status",
+    "config_recoverable",
+    "provider_error_code",
+    "provider_retried",
+)
+
+_EMPTY_TERMINAL_CLASSIFICATION = {
+    "retryable": False,
+    "http_status": None,
+    "config_recoverable": False,
+    "provider_error_code": "",
+    "provider_retried": False,
+}
+
+
+def _assert_one_terminal_answer(
+    backend: RunnerBackend,
+    run_id: str,
+    token: str,
+    *,
+    state: str,
+    error_code: str,
+    classification: dict[str, Any],
+) -> None:
+    """The cell that caught the terminal-heal twin-miss: the live record, the durable
+    status.json, and the offline projection must serve ONE answer at a terminal — the same
+    state/terminal pair, the same error_code, the same five classification facts."""
+
+    live = backend.status(run_id, token)
+    run_dir = backend._record(run_id).run_dir
+    status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    projection = project_run_status(run_dir)
+
+    views = {
+        "live record": {
+            "state": live["state"],
+            "terminal": live["terminal"],
+            "error_code": live["error_code"],
+            **{key: live.get(key) for key in _TERMINAL_CLASSIFICATION_KEYS},
+        },
+        "status.json": {
+            "state": status_payload.get("state"),
+            "terminal": status_payload.get("terminal"),
+            "error_code": status_payload.get("error_code", ""),
+            # Absent keys carry their reader defaults, matching _status_payload_classification.
+            "retryable": status_payload.get("retryable", False),
+            "http_status": status_payload.get("http_status"),
+            "config_recoverable": status_payload.get("config_recoverable", False),
+            "provider_error_code": status_payload.get("provider_error_code", ""),
+            "provider_retried": status_payload.get("provider_retried", False),
+        },
+        "offline projection": {
+            "state": projection["state"],
+            "terminal": projection["terminal"],
+            "error_code": projection["error_code"],
+            **{key: projection.get(key) for key in _TERMINAL_CLASSIFICATION_KEYS},
+        },
+    }
+    expected = {"state": state, "terminal": True, "error_code": error_code, **classification}
+    for reader, view in views.items():
+        assert view == expected, {"reader": reader, "view": view, "expected": expected}
+
+
+def _close_session(backend: RunnerBackend, run_id: str) -> None:
+    """Deterministic idle-close: the same signal the idle timeout's park wait resolves to."""
+    backend._call_soon(backend._record(run_id).message_queue.put_nowait, _CLOSE_SESSION)
+
+
+def test_cancelled_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """Empirically traced: cancel of a turn_failed park healed status.json but the live
+    record kept the dead turn's five facts beside error_code="cancelled" — the two branches
+    of the same status() endpoint disagreed across a restart. The record-side terminal heal
+    in record_run_result closes the third consumer of the one rule."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(backend_factory, workspace, [_classified_error()])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+    # The park carried the classification onto the record (the park promotion's job).
+    assert backend._record(run_id).config_recoverable is True
+
+    backend.cancel_run(run_id, token)
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="cancelled",
+        error_code="cancelled",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+
+
+def test_failed_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The FAILED cell: the give-up promotion keeps the four what-it-died-of facts on every
+    reader and drops the per-call provider_retried on every reader — the record used to
+    keep provider_retried=True while the terminal vocabulary dropped it everywhere else."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(backend_factory, workspace, [_classified_error()])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+    assert backend._record(run_id).provider_retried is True
+
+    _close_session(backend, run_id)  # closing on the unrecovered park IS the give-up
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.FAILED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="failed",
+        error_code="model_error",
+        classification={
+            "retryable": False,
+            "http_status": 422,
+            "config_recoverable": True,
+            "provider_error_code": "insufficient_quota",
+            "provider_retried": False,
+        },
+    )
+
+
+def test_completed_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The COMPLETED cell: a run that failed a turn, recovered on a resend, settled, and
+    closed clean must read clean on all three readers."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(
+        backend_factory,
+        workspace,
+        [_classified_error(), ModelTurn(response_id="r2", final_text="fixed")],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+
+    backend.send_message(run_id, token, "resend after config fix")
+    assert eventually(
+        lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT
+        and backend._record(run_id).error_code == ""
+    )
+    _close_session(backend, run_id)
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.COMPLETED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="completed",
+        error_code="",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+
+
+def test_limited_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The LIMITED cell — a paused mid-turn run whose session is closed (pause_run + idle
+    timeout, the finding-2 trace, driven end-to-end through the backend): the run must not
+    finalize a clean COMPLETED with deleted checkpoints, and all three readers must agree
+    on the closed_unsettled outcome."""
+
+    workspace = _workspace(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
+        del spec, llm_gateway_token
+        return FakeModelAdapter(
+            turns=[
+                ModelTurn(response_id="r1", tool_calls=(fake_tool_call("test_gate", {}, "c1"),)),
+                ModelTurn(response_id="r2", final_text="never reached"),
+            ]
+        )
+
+    backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=factory,
+        tool_providers=(_GateToolProvider(entered, release),),
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=runtime_config("test.gate"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert entered.wait(timeout=10)
+    assert backend.pause_run(run_id, token)["pause_requested"] is True
+    release.set()
+    assert eventually(lambda: backend._record(run_id).state is SessionState.PAUSED)
+
+    _close_session(backend, run_id)  # the user never resumes; the session idles out
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="limited",
+        error_code="closed_unsettled",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+    # ...and the checkpoints holding the frozen turn survive the close.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+
+
+def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """TOCTOU half (a): the old cancel path read record.state on the HTTP thread and
+    persisted later on the shared loop — a park state read just before the drive resumed
+    let a mid-turn snapshot land at the SAME seq as the committed park checkpoint,
+    replacing its content (LocalFsCheckpointStore.put overwrites same-seq). The check and
+    the snapshot now run as one callable on the drive's own loop, gated on the loop-level
+    quiescence marker (``at_quiescent_park``), so a mid-pump cancel skips the park
+    re-commit entirely (the pump's own boundary check owns durability there — the
+    documented honest window)."""
+
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+    record = backend._record(run_id)
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.last_suspension is not None
+    park_seq = stored.seq
+
+    # The exact marker the pump clears synchronously at entry, before its first await —
+    # from any shared-loop callable's view this IS "a pump owns the state now".
+    record.loop._session.last_suspension = None
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+
+    # The committed park checkpoint's content is untouched (no same-seq overwrite): the
+    # ack is honestly non-durable in this window rather than durably corrupting the park.
+    manifest = json.loads(
+        (record.run_dir / "checkpoints" / str(park_seq) / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["last_suspension"] is not None
+    assert manifest["cancellation_requested"] is False
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+
+def test_cancel_ack_racing_a_close_is_still_a_successful_cancel(
+    tmp_path: Path, backend_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU half (b): an idle-timeout close landing between the ack and the persist made
+    ``snapshot()`` raise run_not_open — and cancel_run 500'd AFTER acknowledging the
+    cancel. A run that just ended is exactly what the caller asked for: the persist's
+    run_not_open/run_terminal is swallowed (debug-logged) and the ack stands."""
+
+    def _closed(self: RunnerBackend, record: Any) -> None:
+        del self, record
+        raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
+
+    monkeypatch.setattr(RunnerBackend, "_persist_run_checkpoint_from_any_thread", _closed)
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    ack = backend.cancel_run(run_id, token)
+
+    assert ack["cancel_requested"] is True
     assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
 
 

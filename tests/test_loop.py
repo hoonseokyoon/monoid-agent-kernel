@@ -2363,12 +2363,12 @@ def test_a_restored_settled_park_is_not_promoted_into_a_failure(tmp_path: Path) 
 
 def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path) -> None:
     """``run_once`` absorbs a non-settling park because ``close()`` turns it into the record
-    that IS the call's result — but ``close()`` promotes only ``turn_failed``. An interrupt
-    (and a pause) produced no record at all, so the run finalized ``completed`` with no
-    settled answer: a one-shot caller told to stop was told it had succeeded, and the
-    completed-run cleanup deleted the checkpoints the park had preserved. Only the park
-    ``close()`` can honestly promote is absorbed; the others surface typed, after the same
-    cleanup."""
+    that IS the call's result — but only ``turn_failed`` is absorbed. An interrupt (and a
+    pause) still surfaces as ``TurnNotSettled`` after the same close, and that close now
+    records the honest outcome underneath the raise: ``close()``'s unsettled-close
+    promotion finalizes ``limited``/``closed_unsettled`` (the turn never settled) and keeps
+    the checkpoints — it used to finalize a clean ``completed`` with an empty answer and
+    delete them."""
 
     from monoid_agent_kernel.errors import TurnNotSettled
 
@@ -2387,6 +2387,20 @@ def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path
     with pytest.raises(TurnNotSettled) as parked:
         loop.run_once("go")
     assert parked.value.reason == "interrupted"
+
+    # The record beneath the typed raise is honest now (deliberate pin move: this used to
+    # finalize completed and delete the checkpoints the park preserved).
+    events_path = spec.run_root / spec.run_id / "events.jsonl"
+    finished = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "run.finished"
+    ]
+    assert finished and finished[-1]["data"]["status"] == "limited"
+    assert finished[-1]["data"]["error_code"] == "closed_unsettled"
+    from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+    assert LocalFsCheckpointStore(spec.run_root).latest(spec.run_id) is not None
 
 
 def test_run_once_still_returns_the_promoted_failure_for_a_turn_failure(

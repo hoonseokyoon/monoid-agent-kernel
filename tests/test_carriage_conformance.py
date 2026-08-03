@@ -4906,9 +4906,16 @@ STATUS_CONSUMER_BRANCH_READS: dict[tuple[str, str], frozenset[str]] = {
     ("reference/backend/run_state.py:record_event", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
     # The record's ``run.failed`` branch copies the error pair only, BY DESIGN: its terminal
     # classification arrives through the driver's park promotion (session_drive assigns all
-    # five off the terminal Suspension, which loop.py populates from the same state the
-    # run.failed emit reads), and a second writer here would just be the same fact copied at a
-    # different moment under the same lock.
+    # five off each park's Suspension) PLUS the record-side terminal heal in
+    # ``record_run_result`` — the park promotion alone was NOT sufficient, empirically:
+    # terminals minted at the close boundary (pending-cancel, unrecovered-turn-failure, and
+    # unsettled-close promotions) never pass the driver's top-of-loop, so the record kept a
+    # dead turn's classification beside a cancelled/limited terminal while status.json healed
+    # it. The heal is bound once at ``record_run_result`` (the seam every terminal result
+    # funnels through: non-failed terminals clear all five; a failed terminal keeps four and
+    # drops the per-call ``provider_retried``, mirroring the sink's ``run.failed`` branch).
+    # A second event-data writer here would still be the same fact copied at a different
+    # moment under the same lock.
     ("reference/backend/run_state.py:record_event", "run.failed"): frozenset(
         {"error", "error_code"}
     ),
@@ -5666,6 +5673,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # that serve them) — provider_retried while parked, dropped at terminal.
             "reference/backend/ports.py",
             "reference/backend/projection.py",
+            # Joined with the give-up status artifact: recovery writes the terminal
+            # ``run.failed`` statement into status.json when it quarantines a run, and
+            # names ``provider_retried`` only to POP it — the same drop the sink's
+            # ``run.failed`` branch makes.
+            "reference/backend/recovery.py",
             "reference/backend/run_state.py",
             "reference/backend/run_types.py",
             "reference/backend/session_drive.py",

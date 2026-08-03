@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.media import normalize_inline_media_dicts
-from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.reference._shared.tokens import TokenError
 from monoid_agent_kernel.reference.backend.ports import (
     LoopPort,
@@ -23,6 +24,8 @@ from monoid_agent_kernel.reference.backend.ports import (
 from monoid_agent_kernel.reference.backend.run_state import (
     record_lifecycle_payload as _record_lifecycle_payload,
 )
+
+_LOGGER = logging.getLogger("monoid_agent_kernel.backend")
 
 
 # The parks at which the drive loop is quiescent (nothing stepping): a checkpoint taken here is
@@ -64,6 +67,9 @@ class BackendSessionContext:
     active_record: Callable[[str], MutableRunRecordPort | None]
     run_dir_for: Callable[[str], Path]
     call_soon: Callable[..., None]
+    # Run one callable on the shared drive loop and wait for it — the ordering seam for a
+    # read-then-write that must not interleave with the drive's own loop iterations.
+    run_on_shared_loop: Callable[[Callable[[], None]], None]
     enqueue_message_and_checkpoint: Callable[[MutableRunRecordPort, Any], None]
     persist_checkpoint_from_any_thread: Callable[[MutableRunRecordPort], None]
     checkpoint_store_provider: Callable[[], CheckpointStore | None]
@@ -90,18 +96,14 @@ class BackendSessionService:
         record = self._context.record(run_id)
         requested = self._context.mark_cancel_requested(record)
         if requested:
-            if record.state in _QUIESCENT_PARK_STATES:
-                # The park checkpoint predates this cancel, so an ack backed only by the
-                # in-memory token was not durable: a crash before the terminal record restored
-                # the run uncancelled. Commit a fresh park checkpoint AFTER the token flip —
-                # ``snapshot()`` serializes ``cancellation_requested`` and the restore path
-                # re-applies it — and BEFORE the close signal below, so the ack the caller
-                # receives is already on disk. Residual window: a cancel that lands while a
-                # turn is stepping (or that races the park->running edge) stays in-memory
-                # until the pump's boundary check writes its own terminal park; a crash inside
-                # that window still loses the ack.
-                self._context.persist_checkpoint_from_any_thread(record)
-            self._context.call_soon(record.message_queue.put_nowait, self._context.close_signal)
+            # The whole read-then-write — quiescence check, ack checkpoint, wake signal —
+            # runs as ONE callable on the shared drive loop, so it is ordered against the
+            # drive's own iterations rather than reading ``record.state`` on this HTTP
+            # thread and persisting later (the state could flip in between, and a same-seq
+            # ``put`` from here would then replace the committed park checkpoint's content
+            # with a mid-turn snapshot). The call blocks until the callable ran, so the ack
+            # the caller receives is already on disk when the park case applies.
+            self._context.run_on_shared_loop(lambda: self._ack_cancel_on_drive_loop(record))
         return {
             "run_id": record.run_id,
             "tenant_id": record.tenant_id,
@@ -110,6 +112,47 @@ class BackendSessionService:
             "error": record.error,
             "error_code": record.error_code,
         }
+
+    def _ack_cancel_on_drive_loop(self, record: MutableRunRecordPort) -> None:
+        """Durable cancel ack + drive wakeup, run as one callable on the shared drive loop.
+
+        The park checkpoint predates the cancel, so an ack backed only by the in-memory
+        token was not durable: a crash before the terminal record restored the run
+        uncancelled. When the run sits at a quiescent park, commit a fresh park checkpoint
+        AFTER the token flip — ``snapshot()`` serializes ``cancellation_requested`` and the
+        restore path re-applies it — and BEFORE the close signal, so the drive wakes only
+        once the ack is on disk. The park test is two-sided on purpose: the record state
+        says where the DRIVE parked it, and ``loop.at_quiescent_park()`` says no pump is in
+        flight — the drive resumes a park and enters the pump synchronously on this same
+        loop, so inside this callable the pair cannot change under us. A persist refused
+        with ``run_not_open``/``run_terminal`` is a SUCCESSFUL cancel: the one path that
+        raises it here is a close (idle timeout / drain) that won the race on its lifecycle
+        thread, and a run that just ended is exactly what the caller asked for — swallow and
+        log rather than 500 after the ack.
+
+        Remaining honest window, by design: a cancel that lands while a turn is stepping
+        (or during a close already in flight on its lifecycle worker thread — ``aclose``
+        offloads, so it can interleave with this callable) stays in-memory until the pump's
+        boundary check or the close promotion writes its own terminal park; a crash inside
+        that window still loses the ack."""
+        loop = record.loop
+        if (
+            loop is not None
+            and not self._context.record_terminal(record)
+            and record.state in _QUIESCENT_PARK_STATES
+            and loop.at_quiescent_park()
+        ):
+            try:
+                self._context.persist_checkpoint_from_any_thread(record)
+            except NativeAgentError as exc:
+                if exc.error_code not in {"run_not_open", "run_terminal"}:
+                    raise
+                _LOGGER.debug(
+                    "cancel ack checkpoint skipped for %s: run already closed (%s)",
+                    record.run_id,
+                    exc.error_code,
+                )
+        record.message_queue.put_nowait(self._context.close_signal)
 
     def interrupt_turn(self, run_id: str, token: str) -> dict[str, Any]:
         self._context.authorize_run(run_id, token)

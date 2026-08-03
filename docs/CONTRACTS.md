@@ -152,25 +152,40 @@ The run lifecycle is:
   promoted here through the mid-run vocabulary — the result carries
   `status="limited"`, `error_code="cancelled"`, a terminal park checkpoint is
   committed, and the checkpoints are kept (only a clean completion deletes them).
+  A cancel does not take the answer with it: if the park had settled text (the
+  run answered, then sat awaiting input), `result.final_text` keeps that answer —
+  the cancel statement lives in `error`/`error_code` — and only a park with no
+  text of its own (a mid-turn cancel) carries the kernel's
+  "Stopped because the run was cancelled." notice. A close over a **mid-turn park**
+  (`paused`/`interrupted` — a turn that never settled) must not finalize a clean
+  success either: it promotes to `status="limited"`,
+  `error_code="closed_unsettled"` (one code for both variants), with an empty
+  failure classification (nothing here is a provider failure) and its checkpoints
+  kept, so the frozen turn's only restore point survives the close. A settled
+  `awaiting_input` park is not this — its turn completed and close finalizes the
+  success it was; an acknowledged cancel is the operator's stronger verdict and
+  wins over the unsettled promotion.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
   `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
   park does not raise here: the closing `finally` promotes an unrecovered
   `turn_failed` park to the terminal failure record, and that failed
   `AgentRunResult` is the return value — for `turn_failed` only, the one park
-  `close()` can promote; an `interrupted` or `paused` park has no record to
-  return as, so it surfaces as `TurnNotSettled` after the same close. That
-  raise is the *only* signal for those two parks: the run record still
-  finalizes `completed` (a user stop is not a failure) and the completed-run
-  cleanup deletes its checkpoints — a caller that wants to resume an
-  interrupted turn uses the multi-turn facades, where the session stays alive.
-  `close()` performs the same promotion
+  absorbed; an `interrupted` or `paused` park still surfaces as
+  `TurnNotSettled` after the same close, and that close records the honest
+  outcome underneath the raise: `run.finished` carries `status="limited"`,
+  `error_code="closed_unsettled"` (the turn never settled — a user stop is not
+  a success either) and the checkpoints are kept — a caller that wants to
+  resume an interrupted turn uses the multi-turn facades, where the session
+  stays alive. `close()` performs the same promotion
   for any driver (the explicit form is `fail_recoverable`): a run closed on an
   unrecovered recoverable failure finalizes `failed` with `failure.json`
-  written and its checkpoints kept, never as a clean success. The promotion
-  survives a restart: `restore()` rehydrates the pending failure from the
-  checkpoint's `last_suspension` (only `reason="turn_failed"`; a later settle
-  clears it), so a recovered run left idle and then closed records the failure
-  it parked on rather than a clean success that deletes its own checkpoints.
+  written and its checkpoints kept, never as a clean success. Both promotions
+  survive a restart: `restore()` rehydrates the pending failure and the
+  mid-turn park marker from the checkpoint's `last_suspension`
+  (`reason="turn_failed"` and `reason="paused"`/`"interrupted"` respectively; a
+  later settle clears both), so a recovered run left idle and then closed
+  records the park it died in rather than a clean success that deletes its own
+  checkpoints.
 
 ### AgentRunSpec
 
@@ -1944,7 +1959,16 @@ requires explicit host orchestration.
 - **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks
   attempts in `run_dir/recover_attempts.json` (`{count}`); after the cap it writes a
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
-  skipped instead of retried forever.
+  skipped instead of retried forever. Both give-up paths (unrecoverable after the cap;
+  corrupt/unsupported durable state) also write the terminal statement into `status.json`
+  (`state="failed"`, `terminal=true`, the bundle's error pair, an empty classification, and
+  a `given_up_by_recovery` marker) — without it, `status()`, `list_runs` and the offline
+  projection kept answering the run's last park (`awaiting_input`, `terminal=false`) for a
+  permanently dead run while `resume_run` refused it as unrecoverable. The bundle's
+  `restore_hint` names the actual operator flow: delete `failure.json` to lift the
+  quarantine, then `recover_runs` (or `resume_run`) restores the last good checkpoint —
+  the `given_up_by_recovery` marker is what keeps the closed-run status guard from
+  mistaking the give-up statement for a close once the quarantine is lifted.
 
 ### Active watchdog / lease (legacy backend only)
 

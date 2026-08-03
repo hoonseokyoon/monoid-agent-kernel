@@ -27,7 +27,13 @@ The run-directory artifact set is:
   `run.failed` classification remains (minus `provider_retried`, a per-call fact the terminal
   vocabulary drops). Absent keys mean "no live failure to classify" — which is also what their
   absence on a pre-v0.21 artifact meant. The offline projection (`monoid status`, reading
-  `events.jsonl`) answers with the same fields under the same rules.
+  `events.jsonl`) answers with the same fields under the same rules. When the reference
+  backend's recovery gives a run up for good (unrecoverable after `max_recover_attempts`, or
+  corrupt durable state), it writes the terminal statement here too — `state: "failed"`,
+  `terminal: true`, the failure bundle's error pair, plus a `given_up_by_recovery` marker —
+  because the give-up has no live recorder and therefore no terminal event: without the
+  artifact, every status reader kept reporting the dead run's last park. The offline
+  projection honors that marker over the (necessarily park-ending) event log.
 - `metrics.json`: final counters and timing. On a failed run it also records the failure's
   verdict beside the provider detail it already carried: `retryable` and `config_recoverable`
   join `provider_error_code` / `provider_http_status`, so an operator holding only this
