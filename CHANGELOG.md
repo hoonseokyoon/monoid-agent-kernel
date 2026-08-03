@@ -7,6 +7,63 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — round two: the cost rule reaches the readers it was written for
+
+- **Every per-key refusal off a billed *error* envelope now carries its cost, on all three
+  readers.** Round one guarded the two success-shaped regions and left a comment claiming they
+  were "every other refusal this reader can raise". The error branch between them refutes it:
+  `_parse_gateway_response`'s `"error" in data` branch, its stream-frame twin, and
+  `_error_from_status_body` — the reader *both* transports land in for a non-200 — each read
+  five keys of their own before the stamp that ends the branch, so a malformed `http_status`,
+  `retryable`, `config_recoverable`, `error` or `error_code` on a payload carrying valid billed
+  usage refused for free. That is the shape most likely to report a cost at all: an error
+  envelope exists because a call failed, and a call that failed *after* the upstream generated is
+  what the rule was written for. One semantic on all three — a malformed error envelope stays a
+  non-retryable `gateway_bad_response`, because a broken envelope is a broken gateway whatever
+  failure it was reporting. In `_error_from_status_body` that raise escapes past the caller's
+  `_should_retry`, so a 429 with an unparseable body is refused rather than retried: the body,
+  not the status line, is the authority. No wire or schema change.
+- **The *source* reader stamps the body OpenAI already billed.** Every carrier of a refused
+  call's cost — the receipt, the run's token budget, the gateway's error envelope, the tenant
+  ledger a hop away — can only report what the adapter that first saw the provider's body
+  recorded, and `_parse_response` recorded nothing. A dozen malformed shapes are refused there on
+  bodies carrying a valid `usage` (a model emitting non-JSON function-call arguments is ordinary,
+  not exotic), so the gateway wrote `usage: {}` and metered zero for a turn OpenAI billed. The
+  streamed twin is a separate construction — the stream folds deltas and reads end-of-turn
+  metadata off `response.completed`, never running the one-shot mapping — and now carries the
+  same rule at its own seam. The lenient reader is one function for both adapters
+  (`providers/_common.usage_reported_by`); well-formed paths are unchanged.
+- **`resolved_provider_name` no longer answers nothing on its tolerance path.** It is documented
+  as one expression so the model-stream context, `run.started` and the receipt-derived span
+  cannot disagree about one call — but its guard *returned* `None` instead of falling through, so
+  on exactly the path it exists for (a third-party `provider_name` that raises, or whose `str()`
+  does) the model-stream context reported no provider while every surface beside it reported the
+  configured transport. Tolerance is "keep going", not "answer nothing". The declaration is now
+  normalized the way `ModelCallRunner` normalizes its own read, so the two are byte-identical
+  rather than equal only on well-behaved strings.
+- **The validated call's repair request stops re-sending dead reasoning.** Its by-value branch
+  appended an assistant turn *and* a user-role repair prompt, then forwarded every prior
+  `reasoning` block behind them — 100% unreachable, since the prompt itself moves the active
+  window past them, and paid again on every repair attempt. Pruned through the same function the
+  loop's seam uses. What the provider sees is byte-identical; what changes is size.
+- **`StudioConfig(llm_gateway_provider=...)`.** Studio derives the relayed provider from whether
+  a `provider_factory` was injected, which can only answer "do not tag" for one — right as a
+  guess, and it left an embedder with an OpenAI-backed factory unable to say otherwise, so its
+  reasoning round-trip was silently dead. Unset still derives; set wins, through the same
+  resolver every other string-typed surface uses (`none` = "do not tag").
+
+### Changed — two sentences an operator would otherwise have to guess
+
+- **"Last `user` message" includes kernel-authored ones.** The replay-window rule counts the
+  `OutputValidator`'s repair prompt and background/HITL observation messages as window
+  boundaries, because the adapter's replay filter reads the role and always has. Someone reading
+  "a new user turn" would guess they do not count. No behavior change — the prune this documents
+  produces a byte-identical provider payload.
+- **The four-surface provider agreement is scoped to activations that emit `run.started`.** An
+  event-only sink attached to a *restored* run joins after that event was written and reports no
+  provider or model for the resumed turns. Pre-existing, and absent from the receipt-driven
+  configuration, where every call publishes its own receipt.
+
 ### Fixed — a refused gateway turn still reports what it cost
 
 - **Every per-key refusal off a *validated success* envelope now carries the usage the envelope
