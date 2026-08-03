@@ -202,6 +202,7 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     format_async_result_text,
     provider_usage_of,
+    resolved_provider_name,
 )
 from monoid_agent_kernel.providers._common import NORMALIZED_USAGE_KEYS
 from monoid_agent_kernel.public_view import (
@@ -2252,13 +2253,7 @@ class AgentLoop:
 
         if wants_stream:
             if wants_content_stream:
-                try:
-                    provider_value = getattr(self.model_adapter, "provider_name", None)
-                    if not provider_value and request.model is not None:
-                        provider_value = request.model.provider
-                    provider = str(provider_value) if provider_value else None
-                except Exception:
-                    provider = None
+                provider = resolved_provider_name(self.model_adapter, request.model)
                 try:
                     model_value = request.model.model if request.model is not None else None
                     model = str(model_value) if model_value else None

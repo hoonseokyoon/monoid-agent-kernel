@@ -9,6 +9,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,58 @@ def test_otel_sink_builds_genai_span_tree(tmp_path: Path) -> None:
     assert any(
         tuple(s.attributes.get("gen_ai.response.finish_reasons") or ()) == ("stop",) for s in chats
     )
+
+
+def test_the_event_only_sink_attributes_the_chat_span_to_the_answering_provider(
+    tmp_path: Path,
+) -> None:
+    """One preset, two configurations, and they used to disagree about one attribute.
+
+    ``OtelEventSink`` writes ``gen_ai.provider.name`` from two places: the receipt-derived model
+    -call spans (``receipt.provider_name or receipt.model.provider``) and this event-driven chat
+    span, which read ``run.started``'s ``model_provider`` -- filled from ``ModelConfig.provider``.
+    Through the gateway that made the receipt say the upstream ("openai") and the event say the
+    transport ("gateway") for the *same call*, and the docs' own quickstart (``OtelEventSink()``
+    with no model-I/O subscription) exercises only the disagreeing half.
+
+    ``run.started`` now reports the provider that actually serves the run. Its only reader in the
+    repo is this sink; the transport is still recorded, on ``manifest.json`` beside it, which is
+    the artifact that documents the run's *configuration*.
+    """
+
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    # Tagged like the gateway adapter relaying an OpenAI upstream: transport "gateway", answers
+    # attributed to "openai".
+    adapter.provider_name = "openai"
+
+    spans, result = _spans_and_run(tmp_path, adapter, "run.finish")
+
+    assert result.status == "completed"
+    chat = next(s for s in spans if s.name.startswith("chat"))
+    assert chat.attributes["gen_ai.provider.name"] == "openai"
+
+    run_dir = result.run_dir
+    started = next(
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "run.started"
+    )
+    assert started["data"]["model_provider"] == "openai"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["model_provider"] == "gateway", "the transport must stay legible on the record"
+
+
+def test_the_event_only_sink_falls_back_to_the_configured_provider(tmp_path: Path) -> None:
+    """An adapter that declares nothing leaves the config's string in place -- the neutral case,
+    and the reason the pin above is about agreement rather than about renaming a field."""
+
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+
+    spans, result = _spans_and_run(tmp_path, adapter, "run.finish")
+
+    assert result.status == "completed"
+    chat = next(s for s in spans if s.name.startswith("chat"))
+    assert chat.attributes["gen_ai.provider.name"] == "gateway"
 
 
 def test_otel_sink_marks_failed_tool_span(tmp_path: Path) -> None:

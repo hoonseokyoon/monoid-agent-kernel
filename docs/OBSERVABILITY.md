@@ -274,18 +274,28 @@ from monoid_agent_kernel.observability.otel import OtelEventSink
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
 
-**Provider attribution through the LLM gateway (v0.21).** `gen_ai.provider.name` is
-`ModelCallReceipt.provider_name` — what the answering adapter declares — falling back to
-`ModelConfig.provider` when the adapter declares nothing. `GatewayModelAdapter` now declares the
-provider it relays (default `"openai"`, configurable per deployment, `None` to disable), so a call
-routed through the gateway is attributed to the **model that served it** rather than to the
-transport it arrived over. Three surfaces change together, deliberately, because they read one
-attribute: `gen_ai.provider.name` on the `chat` span, `ModelCallReceipt.provider_name` (previously
-`""` on this route), and the model-stream context's `provider` (previously the config's string).
-The transport is not lost — `receipt.model.provider` still carries `"gateway"` — so a dashboard
-that wants to group by hop groups by that field. Deployments whose gateway fronts a different
-upstream should set `provider_name` accordingly; leaving the default mislabels the spans in
-exactly the way it would mislabel the reasoning round-trip.
+**Provider attribution through the LLM gateway (v0.21).** Every surface that names a provider
+resolves it the same way — what the answering adapter declares as `provider_name`, falling back to
+`ModelConfig.provider` when it declares nothing (`providers/base.py:resolved_provider_name`).
+`GatewayModelAdapter` declares the provider it relays (default `"openai"`; set it per deployment
+with `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`, or
+`RunnerBackend(llm_gateway_provider=...)`; `none` disables it), so a call routed through the
+gateway is attributed to the **model that served it** rather than to the transport it arrived over.
+
+Four surfaces change together, deliberately, because one expression feeds all of them:
+`ModelCallReceipt.provider_name` (previously `""` on this route); `gen_ai.provider.name` on the
+receipt-derived `chat` span, which reads that receipt; the model-stream context's `provider`
+(previously the config's string); and the `model_provider` field of the `run.started` event, which
+is where the *event-driven* sink — the zero-argument quickstart above, with no
+`model_io_subscriptions` — gets `gen_ai.provider.name` from. That last one is the reason this is
+stated as a mechanism rather than as a list: while `run.started` carried the raw config, one
+`OtelEventSink` class produced two different answers for one call depending on how it was wired.
+
+The transport is not lost — `receipt.model.provider` still carries `"gateway"`, and `manifest.json`
+records the configured `model_provider` verbatim — so a dashboard that wants to group by hop groups
+by those. Deployments whose gateway fronts a different upstream should set the flag accordingly;
+leaving the default mislabels the spans in exactly the way it would mislabel the reasoning
+round-trip.
 
 W9 adds three controls to the same preset:
 

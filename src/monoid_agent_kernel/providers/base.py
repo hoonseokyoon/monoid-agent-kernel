@@ -332,6 +332,38 @@ class ProviderNamedModelAdapter(Protocol):
     def provider_name(self) -> str: ...
 
 
+def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | None:
+    """The provider that ACTUALLY serves a call: what the adapter declares, else the config's.
+
+    One expression, because the answer is written to three surfaces that a reader compares --
+    the model-stream context's ``provider``, ``run.started``'s ``model_provider`` (and through it
+    every ``gen_ai.provider.name`` the event-driven OTel sink writes), and the receipt-derived
+    span's own fallback. They disagreed for one release: through a gateway the receipt named the
+    upstream and the event named the transport, for the same call.
+
+    A *forwarding* adapter declares its upstream, so preferring the declaration is what makes
+    these spans describe the model that answered rather than the hop the answer arrived over.
+    ``ModelConfig.provider`` remains the fallback and stays recorded verbatim on the run manifest,
+    so the transport is never lost.
+
+    Tolerant by construction: this feeds telemetry, and a third-party ``provider_name`` property
+    that raises -- or whose ``str()`` does -- must not take a run down over an attribute nothing
+    branches on. Mirrors the defensive probe in ``ModelCallRunner``.
+    """
+
+    try:
+        declared = getattr(adapter, "provider_name", None)
+        if declared:
+            return str(declared)
+    except Exception:
+        return None
+    try:
+        fallback = config.provider if config is not None else None
+        return str(fallback) if fallback else None
+    except Exception:
+        return None
+
+
 class ConfiguredModelAdapter(Protocol):
     """An adapter that carries its own fallback :class:`ModelConfig`.
 

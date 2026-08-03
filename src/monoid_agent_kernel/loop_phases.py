@@ -35,6 +35,7 @@ from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.providers.base import resolved_provider_name
 from monoid_agent_kernel.public_view import (
     public_error_message,
     public_path,
@@ -265,7 +266,20 @@ class LoopBootstrapper:
                     "mode": loop.spec.mode,
                     "workspace_backend": loop.spec.workspace_backend,
                     "workspace_base_path": "workspace.base.json",
-                    "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
+                    # The provider that will SERVE this run, not the transport it travels over.
+                    # A forwarding adapter (the gateway) declares its upstream, and this event
+                    # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
+                    # so filling it from the raw config made that span disagree with the
+                    # receipt-derived span beside it about the same call. The transport is not
+                    # lost: ``manifest.json`` (written three lines up) records the configured
+                    # ``model_provider`` verbatim, and it is the run's configuration record.
+                    #
+                    # ``or`` the config's string so an adapter that declares nothing -- the
+                    # neutral case -- keeps exactly the value this line always emitted.
+                    "model_provider": resolved_provider_name(
+                        loop.model_adapter, initial_runtime_config.model or ModelConfig()
+                    )
+                    or (initial_runtime_config.model or ModelConfig()).provider,
                     "model": (initial_runtime_config.model or ModelConfig()).model,
                     "reasoning_effort": (
                         initial_runtime_config.model or ModelConfig()
