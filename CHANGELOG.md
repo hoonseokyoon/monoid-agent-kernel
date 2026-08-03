@@ -7,6 +7,47 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the provider-native reasoning round-trip survives the gateway hop
+
+- **`reasoning` joins the LLM gateway success envelope, on both transports.** The kernel captures
+  a provider's opaque reasoning artifacts off a turn (`ModelTurn.reasoning`, carrying OpenAI's
+  `encrypted_content`) and replays them verbatim on the next by-value turn — the ZDR reasoning
+  round-trip DX-13a is built on. Through the gateway that loop was dead in the response
+  direction: the server wrote the items to neither the sync body nor the terminal
+  `turn_complete` frame, and neither client reader named the key, so a run routed through the
+  gateway captured nothing and therefore replayed nothing. (The request direction always worked:
+  `messages` ride by value and are forwarded verbatim to the upstream adapter.) The key is a
+  JSON array of the provider's own item objects, relayed untouched — they are already
+  provider-encrypted and this hop has no business interpreting them — written by one shared
+  server helper and read by one shared strict validator, so the two transports cannot come to
+  disagree about the shape or about how strictly they refuse a malformed one. It is
+  omit-when-empty and **response**-conditional: present only when the upstream produced
+  artifacts, so traffic that produces none keeps its exact previous wire shape, and an absent
+  key reads as "no artifacts" on both an older gateway and a non-reasoning upstream. Additive
+  under `llm-turn-result.v1`; no protocol identifier changed.
+- **`GatewayModelAdapter` declares the upstream provider it relays.** The wire alone did not
+  revive the feature: the loop tags captured artifacts only when the adapter names a provider,
+  and the gateway adapter named none — so the block was dropped one line after the reader
+  reconstructed it. The new `provider_name` field defaults to `"openai"` (the reference
+  gateway's own default upstream), takes the deployment's real upstream when a
+  `provider_adapter_factory` routes elsewhere, and accepts `None` for the protocol's documented
+  "do not tag". It names the *upstream* rather than the hop because a tagged block is replayed
+  only to a matching adapter and model.
+- **Observability through the gateway now attributes to the model, not the transport.** That
+  same attribute is what three surfaces probe an adapter for, so naming the upstream changes all
+  three at once, deliberately: OTel's `gen_ai.provider.name` on the `chat` span,
+  `ModelCallReceipt.provider_name` (previously `""` on this route), and the model-stream
+  context's `provider` (previously the config's string) now report the upstream instead of
+  falling back to `"gateway"`. The transport stays legible beside them as
+  `receipt.model.provider`. Using the existing seam is the point — a second attribute would give
+  the reasoning tag and the spans two truths to drift between.
+- **Known limit, by design: a stream that ends without a terminal frame carries no artifacts.**
+  Such a stream has no end-of-turn metadata channel at all — the same reason it carries no
+  `usage` and no turn handle — so the absence is tolerated as `()` rather than refused, and a run
+  continuing over that hop simply re-derives nothing to replay (the loop appends no reasoning
+  block for an empty tuple). Registered as a by-design carriage gap rather than papered over.
+  A fail-closed *proof* that reasoning was applied remains a separate open track.
+
 ### Fixed — a success the SDK re-sent stops reading as a clean first attempt
 
 - **`OpenAIModelAdapter` reports the SDK's own retries on its success paths too.** The retry

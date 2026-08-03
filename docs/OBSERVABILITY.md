@@ -264,7 +264,8 @@ invoke_agent
 
 `chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
 not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
-`gen_ai.tool.name`, token usage). The zero-argument form preserves this metadata-only behavior:
+`gen_ai.provider.name`, `gen_ai.tool.name`, token usage). The zero-argument form preserves this
+metadata-only behavior:
 
 ```python
 from monoid_agent_kernel import AgentLoop
@@ -272,6 +273,19 @@ from monoid_agent_kernel.observability.otel import OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
+
+**Provider attribution through the LLM gateway (v0.21).** `gen_ai.provider.name` is
+`ModelCallReceipt.provider_name` — what the answering adapter declares — falling back to
+`ModelConfig.provider` when the adapter declares nothing. `GatewayModelAdapter` now declares the
+provider it relays (default `"openai"`, configurable per deployment, `None` to disable), so a call
+routed through the gateway is attributed to the **model that served it** rather than to the
+transport it arrived over. Three surfaces change together, deliberately, because they read one
+attribute: `gen_ai.provider.name` on the `chat` span, `ModelCallReceipt.provider_name` (previously
+`""` on this route), and the model-stream context's `provider` (previously the config's string).
+The transport is not lost — `receipt.model.provider` still carries `"gateway"` — so a dashboard
+that wants to group by hop groups by that field. Deployments whose gateway fronts a different
+upstream should set `provider_name` accordingly; leaving the default mislabels the spans in
+exactly the way it would mislabel the reasoning round-trip.
 
 W9 adds three controls to the same preset:
 

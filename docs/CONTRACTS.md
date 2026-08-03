@@ -341,7 +341,14 @@ Four further opt-in protocols declare optional capability members:
   parameterizes the capability rather than declaring it.
 - `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
   provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
-  Omitting it means "do not tag".
+  Omitting it means "do not tag". A *forwarding* adapter declares the provider whose artifacts it
+  relays, not itself: `GatewayModelAdapter.provider_name` names the gateway's **upstream** and
+  defaults to `"openai"`, matching the reference gateway's own default upstream. A deployment
+  whose `provider_adapter_factory` routes elsewhere must set it to that upstream, and `None`
+  disables tagging. The same attribute names the provider on the observability surfaces that
+  probe an adapter for one (`ModelCallReceipt.provider_name` and OTel's `gen_ai.provider.name`),
+  so a call routed through the gateway is attributed to the model that served it, with the
+  transport still legible beside it as `ModelConfig.provider`.
 - `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
   `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
   actually ran under rather than a default the call never used.
@@ -647,6 +654,17 @@ shape is the one selected — is therefore refused at the adapter boundary with 
 supported route. It is a fail-closed refusal of a shape that cannot work here, not a claim about
 the shape in general: an adapter whose provider does persist responses is free to support it, and
 a stale handle riding *beside* `messages` is unaffected, since `messages` selects the shape.
+
+That by-value round-trip now survives the gateway hop in **both** directions. The request half
+always did — `messages` are forwarded verbatim, so a tagged reasoning block reaches the upstream
+adapter unchanged — but the response half did not, so a run routed through the gateway captured
+nothing to replay. The `reasoning` key on the success envelope (documented with the LLM gateway
+wire below) closes that: the artifacts cross the hop on both transports, are tagged with the
+relaying adapter's upstream `provider_name`, and are replayed to it on the next turn. The one
+shape that cannot carry them is a stream that ends without a terminal frame — it has no
+end-of-turn metadata channel at all, exactly as it has none for `usage` or the turn handle — and
+that absence is tolerated rather than refused: the turn reads no artifacts and the next turn
+replays none.
 
 ### Output Validation
 
@@ -1593,9 +1611,23 @@ Successful response:
   "tool_calls": [
     {"call_id": "call_1", "name": "read_notes", "arguments": {"path": "notes.md"}}
   ],
-  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+  "reasoning": [{"type": "reasoning", "id": "rs_...", "encrypted_content": "..."}]
 }
 ```
+
+`reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim. The items
+are **opaque**: already provider-encrypted, never interpreted or displayed by the gateway or the
+kernel, and meaningful only to the provider that produced them. They ride the response body and
+the terminal `turn_complete` stream frame — the same two writers, built from one function — and
+exist so the provider-native reasoning round-trip survives this hop: the kernel captures them,
+tags them with the relaying adapter's `provider_name` plus the model, carries them in the
+by-value `messages` log, and the upstream adapter replays them on the next turn. The key is
+present **only when the upstream produced artifacts**, which makes it conditional on the *answer*
+rather than on the request (unlike the two applied echoes below). It is additive and ignorable:
+absence reads as "no artifacts", which is what an older gateway, a non-reasoning upstream, and a
+stream that ended without a terminal frame all honestly mean, and a run that reconstructs none
+simply replays none.
 
 `usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
 additionally carry optional priced sub-counts when the provider reports them —

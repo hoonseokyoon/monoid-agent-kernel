@@ -225,6 +225,18 @@ only when configured — a generation-free runtime config keeps its pre-v0.21 `c
 a *configured* one intentionally does not verify across mixed-version backend-run recovery
 (configure generation only on a fully rolled fleet).
 
+The same v0.21 writer adds `reasoning` to the response body and the terminal `turn_complete`
+stream frame, again without changing the protocol identifier. Its conditionality is the mirror
+image of the request keys above: those are *request*-conditional (present when the caller
+configured the feature), while `reasoning` is **response**-conditional — present only when the
+upstream actually produced artifacts — so traffic whose upstream produces none keeps its exact
+previous wire shape either way. Skew is lossless in both directions and, unlike the echoes, fails
+*open* rather than closed, because the key proves nothing: an old client ignores the additive
+array, and a new client reading an old server (or a stream that ends without a terminal frame)
+reads the absence as `()` through the permissive response reader. The only consequence of skew is
+that the provider-native reasoning round-trip does not happen on that hop — the loop appends no
+reasoning block for an empty tuple, and the next turn is an ordinary untagged one.
+
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
 request keys above it is written unconditionally, beside `retryable` and `provider_retried`,
