@@ -364,6 +364,13 @@ def test_pause_lands_at_step_boundary_then_resumes(tmp_path: Path) -> None:
     # The pause park persisted a checkpoint (snapshot serialized pending_observations).
     cp = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert cp is not None
+    # ...and the pause is visible on the durable status surface, not only in the FSM: an
+    # operator polling status.json used to read "running" for the whole park.
+    status = json.loads(
+        (spec.run_root / spec.run_id / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["state"] == "paused"
+    assert status["terminal"] is False
 
     # Resume continues the SAME turn (the kept tool observation is re-sent) to settle.
     settled = session.resume()

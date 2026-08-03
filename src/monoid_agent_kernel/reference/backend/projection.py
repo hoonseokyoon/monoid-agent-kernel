@@ -113,6 +113,37 @@ def _status_last_event_seq(status_payload: Mapping[str, Any] | None) -> int:
     return raw if type(raw) is int and raw >= 0 else 0
 
 
+def _status_payload_classification(status_payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The error + failure classification a durable ``status.json`` carries, guarded.
+
+    The record-is-None branch of ``status()`` serves this so a post-restart operator gets the
+    same answer the live record gave — one vocabulary, both branches. Guarded reads for the
+    same reason ``run_state.py`` guards its event twins: this is disk data, and a truthy
+    string must not become a claim that a failure is retryable.
+    """
+
+    payload = status_payload or {}
+
+    def _text(name: str) -> str:
+        value = payload.get(name)
+        return value if isinstance(value, str) else ""
+
+    def _flag(name: str) -> bool:
+        value = payload.get(name)
+        return value if type(value) is bool else False
+
+    http_status = payload.get("http_status")
+    return {
+        "error": _text("error"),
+        "error_code": _text("error_code"),
+        "retryable": _flag("retryable"),
+        "http_status": http_status if type(http_status) is int else None,
+        "config_recoverable": _flag("config_recoverable"),
+        "provider_error_code": _text("provider_error_code"),
+        "provider_retried": _flag("provider_retried"),
+    }
+
+
 def _committed_event_highwatermark(run_dir: Path, advertised: int) -> int:
     """Reconcile a best-effort status watermark with the authoritative committed JSONL tail."""
 
@@ -163,6 +194,10 @@ class RunProjectionService:
             return {
                 "run_id": run_id,
                 **_status_payload_lifecycle(status_payload, run_dir),
+                # status.json carries the classification a parked failure wrote, so the
+                # operator who restarts the backend gets the same top-level answer the live
+                # record served — not a payload with no error slot at all.
+                **_status_payload_classification(status_payload),
                 "last_event_seq": last_event_seq,
                 "run_dir": str(run_dir),
                 "status_file": status_payload,
@@ -183,10 +218,14 @@ class RunProjectionService:
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
-            # What the park knew: whether the failure is fixable by changing configuration.
-            # The driver records it and does not act on it, so this surface is the only place
-            # the classification becomes useful to anyone.
+            # What the park knew — the whole classification, one vocabulary. The driver
+            # records it and does not act on it, so this surface is the only place it
+            # becomes useful to anyone.
+            "retryable": record.retryable,
+            "http_status": record.http_status,
             "config_recoverable": record.config_recoverable,
+            "provider_error_code": record.provider_error_code,
+            "provider_retried": record.provider_retried,
             "final_output": _json_safe(
                 record.last_final_output
                 if record.last_final_output is not None
@@ -206,7 +245,11 @@ class RunProjectionService:
                 "ready": False,
                 "error": record.error,
                 "error_code": record.error_code,
+                "retryable": record.retryable,
+                "http_status": record.http_status,
                 "config_recoverable": record.config_recoverable,
+                "provider_error_code": record.provider_error_code,
+                "provider_retried": record.provider_retried,
             }
         result = record.result
         diff_text = (
@@ -230,7 +273,11 @@ class RunProjectionService:
             # result object keeps the whole message.
             "error": public_error_message(result.error),
             "error_code": result.error_code,
+            "retryable": record.retryable,
+            "http_status": record.http_status,
             "config_recoverable": record.config_recoverable,
+            "provider_error_code": record.provider_error_code,
+            "provider_retried": record.provider_retried,
             "run_dir": str(result.run_dir),
             "manifest_path": str(result.run_dir / "manifest.json"),
             "diff_path": str(result.diff_path),

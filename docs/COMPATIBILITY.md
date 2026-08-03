@@ -251,6 +251,15 @@ the park reader defaults every absent key, so a pre-v0.21 checkpoint restores ex
 and the event schemas grow optional properties without changing a `required` list. No checkpoint
 schema version bump, and no reader has to migrate.
 
+`status.json` and `metrics.json` grow the failure-classification keys their readers already had
+event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
+`retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and
+`status.json` can now say `state: "paused"` for a cooperatively paused run. All additive under
+each schema's open `additionalProperties`, declared in `STATUS_SCHEMA` / `METRICS_SCHEMA`
+without an identifier change: absent keys on a pre-v0.21 artifact mean what those runs meant —
+no live failure classified, no pause projected — and a reader must treat "absent" and the
+default (`false` / `null` / `""`) alike.
+
 `metrics.updated` grows the three priced sub-counts beside `reasoning_tokens`
 (`cache_read_tokens`, `cache_creation_tokens`, `audio_tokens`), each emitted only when the
 adapter reported one — an absent sub-count means "not reported", not zero. Both tenant-usage

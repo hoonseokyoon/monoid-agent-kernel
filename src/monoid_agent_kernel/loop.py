@@ -1570,6 +1570,16 @@ class AgentLoop:
                     Suspension(reason="terminal", status="failed"),
                     error=state.error,
                     error_code=state.error_code,
+                    # The classification the run.failed emit above read, on the park a driver
+                    # actually holds. The Suspension always had these fields; the terminal
+                    # construction dropped them, so a backend promoting "what the park knew"
+                    # promoted defaults over the truth its own event log carried.
+                    # (``provider_retried`` stays default: a per-call fact the terminal
+                    # vocabulary drops, exactly as ``run.failed`` does.)
+                    retryable=state.retryable,
+                    http_status=state.provider_http_status,
+                    config_recoverable=state.config_recoverable,
+                    provider_error_code=state.provider_error_code,
                     turn=self._checkpoint_on_settle(state, res),
                 )
                 self._persist_checkpoint(session, result)
@@ -1671,6 +1681,12 @@ class AgentLoop:
                 Suspension(reason="terminal", status="failed"),
                 error=state.error,
                 error_code=state.error_code,
+                # The twin of the non-recoverable ModelAdapterError arm above: the same state
+                # the run.failed emit read, on the returned park.
+                retryable=state.retryable,
+                http_status=state.provider_http_status,
+                config_recoverable=state.config_recoverable,
+                provider_error_code=state.provider_error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
             self._persist_checkpoint(session, result)
@@ -1719,6 +1735,12 @@ class AgentLoop:
                 status="failed",
                 error=session.state.error,
                 error_code=session.state.error_code,
+                # The inherited classification the promotion kept — the durable observation of
+                # this park is where a post-restart reader learns what the run died of.
+                retryable=session.state.retryable,
+                http_status=session.state.provider_http_status,
+                config_recoverable=session.state.config_recoverable,
+                provider_error_code=session.state.provider_error_code,
             ),
         )
 

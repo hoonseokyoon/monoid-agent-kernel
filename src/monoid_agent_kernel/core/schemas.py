@@ -989,6 +989,15 @@ METRICS_SCHEMA: dict[str, Any] = {
         "duration_s": {"type": "number", "minimum": 0},
         "error": {"type": "string"},
         "error_code": {"type": "string"},
+        # The failure classification, declared with its writer (the ``stream_closed``
+        # precedent: declare even under ``additionalProperties: True``, because an open cap is
+        # a tolerance, not a declaration). The code/status pair is written whenever the run
+        # recorded provider detail; the two booleans only on a failed run, where the state
+        # they are read from is classified fresh.
+        "provider_error_code": {"type": "string"},
+        "provider_http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
     },
     "additionalProperties": True,
 }
@@ -1003,6 +1012,15 @@ STATUS_SCHEMA: dict[str, Any] = {
         "last_event_seq": {"type": "integer", "minimum": 1},
         "last_event_type": {"type": "string"},
         "updated_at": {"type": "string"},
+        # The classification a parked ``turn.failed`` writes into this artifact (declared
+        # with the writer, the same rule as METRICS_SCHEMA above). Cleared on unpark and
+        # healed at a non-failed terminal, so absence means "no live failure to classify" —
+        # which is also what absence on a pre-v0.21 artifact meant.
+        "provider_error_code": {"type": "string"},
+        "http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
+        "provider_retried": {"type": "boolean"},
     },
     "additionalProperties": True,
 }

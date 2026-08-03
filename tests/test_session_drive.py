@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -265,7 +266,10 @@ def test_a_config_recoverable_park_reaches_the_surfaces_an_operator_reads(
         error="the configured model is not available to this account",
         error_code="model_error",
         retryable=False,
+        http_status=422,
         config_recoverable=True,
+        provider_error_code="model_not_found",
+        provider_retried=True,
     )
 
     result = asyncio.run(
@@ -279,8 +283,16 @@ def test_a_config_recoverable_park_reaches_the_surfaces_an_operator_reads(
     assert loop.failed == [
         ("the configured model is not available to this account", "model_error")
     ]
-    # ...and the classification the park carried is now on the record the projections read.
+    # ...and the WHOLE classification the park carried is now on the record the projections
+    # read — config_recoverable alone cannot separate an insufficient_quota (fix config) from
+    # a rate_limit (wait). One rule, all five, plus the error text the park named.
     assert record.config_recoverable is True
+    assert record.retryable is False
+    assert record.http_status == 422
+    assert record.provider_error_code == "model_not_found"
+    assert record.provider_retried is True
+    assert record.error == "the configured model is not available to this account"
+    assert record.error_code == "model_error"
 
     projection = RunProjectionService(
         RunProjectionContext(
@@ -297,21 +309,38 @@ def test_a_config_recoverable_park_reaches_the_surfaces_an_operator_reads(
         )
     )
 
-    assert projection.status("run_config", "token")["config_recoverable"] is True
+    status_payload = projection.status("run_config", "token")
+    assert status_payload["config_recoverable"] is True
+    assert status_payload["retryable"] is False
+    assert status_payload["http_status"] == 422
+    assert status_payload["provider_error_code"] == "model_not_found"
+    assert status_payload["provider_retried"] is True
     # Both branches of result(): the run has no AgentRunResult yet, and once it does.
-    assert projection.result("run_config", "token")["config_recoverable"] is True
-    record.result = AgentRunResult(
-        run_id="run_config",
-        status="failed",
-        final_text="",
-        run_dir=tmp_path,
-        diff_path=tmp_path / "diff.patch",
-        proposal_path=tmp_path / "proposal.json",
-    )
-    assert projection.result("run_config", "token")["config_recoverable"] is True
+    for _ in range(2):
+        result_payload = projection.result("run_config", "token")
+        assert result_payload["config_recoverable"] is True
+        assert result_payload["retryable"] is False
+        assert result_payload["http_status"] == 422
+        assert result_payload["provider_error_code"] == "model_not_found"
+        assert result_payload["provider_retried"] is True
+        record.result = AgentRunResult(
+            run_id="run_config",
+            status="failed",
+            final_text="",
+            run_dir=tmp_path,
+            diff_path=tmp_path / "diff.patch",
+            proposal_path=tmp_path / "proposal.json",
+        )
 
-    # A later clean park clears it rather than leaving a stale classification behind.
+    # A later clean park clears the classification AND the error text, rather than leaving a
+    # stale answer behind. Assigned on every park, never or-ed.
     record.config_recoverable = True
+    record.retryable = True
+    record.http_status = 422
+    record.provider_error_code = "model_not_found"
+    record.provider_retried = True
+    record.error = "the configured model is not available to this account"
+    record.error_code = "model_error"
     asyncio.run(
         service.drive_open_session(
             record,
@@ -323,3 +352,118 @@ def test_a_config_recoverable_park_reaches_the_surfaces_an_operator_reads(
         )
     )
     assert record.config_recoverable is False
+    assert record.retryable is False
+    assert record.http_status is None
+    assert record.provider_error_code == ""
+    assert record.provider_retried is False
+    assert record.error == ""
+    assert record.error_code == ""
+
+
+def test_a_restarted_backend_answers_status_like_the_live_one_did(tmp_path: Path) -> None:
+    """The record-is-None branch of status() serves the classification status.json carries.
+
+    After a restart the active record is gone and status.json is what remains; the operator
+    polling GET /status must get the same answer the live record gave, not a payload with no
+    error slot at all.
+    """
+    run_dir = tmp_path / "run_restarted"
+    run_dir.mkdir()
+    (run_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run_restarted",
+                "state": "awaiting_input",
+                "terminal": False,
+                "error": "model rejected the key",
+                "error_code": "model_error",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+                "provider_retried": True,
+                "last_event_seq": 3,
+                "last_event_type": "run.awaiting_input",
+                "updated_at": "2026-08-03T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    projection = RunProjectionService(
+        RunProjectionContext(
+            authorized_run_dir=lambda run_id, token: run_dir,
+            authorize_run=lambda run_id, token: None,
+            record=lambda run_id: (_ for _ in ()).throw(KeyError(run_id)),
+            active_record=lambda run_id: None,
+            read_recover_attempts=lambda run_dir: 0,
+            run_root_provider=lambda: tmp_path,
+            checkpoint_store_provider=lambda: None,
+            max_recover_attempts_provider=lambda: 0,
+            issue_read_token=lambda *args: "",
+            read_event_page=lambda events_path, *, from_seq, limit: {"events": []},
+        )
+    )
+
+    payload = projection.status("run_restarted", "token")
+
+    assert payload["state"] == "awaiting_input"
+    assert payload["error"] == "model rejected the key"
+    assert payload["error_code"] == "model_error"
+    assert payload["provider_error_code"] == "insufficient_quota"
+    assert payload["http_status"] == 422
+    assert payload["retryable"] is False
+    assert payload["config_recoverable"] is True
+    assert payload["provider_retried"] is True
+
+
+def test_a_resumed_pause_marks_the_record_running_for_the_whole_turn(tmp_path: Path) -> None:
+    """After resume, the backend record stayed "paused" until the NEXT park.
+
+    The paused branch re-pumps on the resume signal without touching the record, so a
+    resumed multi-minute turn served state="paused" over HTTP the whole way through. The
+    driver marks the record RUNNING when it re-pumps, exactly as `record_event` does when a
+    park's `model.turn.started` arrives.
+    """
+    resume_signal = object()
+    service = _service(tmp_path, resume_signal=resume_signal)
+    record = _Record("run_paused")
+    record.state = SessionState.RUNNING
+    record.terminal = False
+    record.last_final_output = None
+    record.message_queue.put_nowait(resume_signal)
+    observed_states: list[SessionState] = []
+
+    class _Request:
+        multi_turn = True
+
+    class _Loop:
+        def snapshot(self) -> None:
+            return None
+
+        async def arun_until_suspended(self, user_input: Any = None) -> Suspension:
+            assert user_input is None
+            observed_states.append(record.state)
+            return Suspension(reason="terminal", status="completed")
+
+        async def aclose(self) -> str:
+            return "closed"
+
+    loop = _Loop()
+    record.loop = loop
+
+    result = asyncio.run(
+        service.drive_open_session(
+            record,
+            _Request(),
+            loop,
+            Suspension(reason="paused", status="completed"),
+            started=time.time(),
+            turns=1,
+        )
+    )
+
+    assert result == "closed"
+    # The park itself was observable...
+    # (drive_open_session set PAUSED at the top of the loop before waiting on the queue)
+    # ...and the resumed pump ran as RUNNING, not as a phantom pause.
+    assert observed_states == [SessionState.RUNNING]

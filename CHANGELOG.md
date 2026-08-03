@@ -7,6 +7,52 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — every status surface carries the classification, and the pause is visible on all of them
+
+- **The durable status readers carry the FULL failure classification, one rule, all carriers.**
+  `turn.failed` emits seven facts and every consumer copied a different fragment: `status.json`'s
+  sink and the offline projection kept `error`/`error_code`, the backend record the same pair,
+  the park promotion only `config_recoverable` — and `config_recoverable` alone cannot separate
+  an `insufficient_quota` (fix the config) from a `rate_limit` (wait). All three consumers now
+  copy `provider_error_code` / `http_status` / `retryable` / `config_recoverable` /
+  `provider_retried` beside the error pair (`provider_usage` is metering and stays off status
+  surfaces), the session driver promotes all five off every park (assigned, never or-ed, so a
+  clean settle clears stale answers — including the error text, which used to survive a clean
+  settle on the record), `BackendRunRecord` gains the missing fields, and `status()` / `result()`
+  serve them on the live branch **and** on the record-is-None branch, so a post-restart operator
+  gets the same answer from status.json that the live record gave.
+- **Terminal events heal instead of or-falling-back.** The offline projection's terminal
+  branches read `data.get("error_code") or projection["error_code"]`, so
+  `turn.failed -> recovery -> run.finished{completed, error_code:""}` reported the dead turn's
+  `model_error` on a cleanly completed run — and `run.finished` never touched `error` at all.
+  Terminal branches now ASSIGN error/error_code and heal the classification (a failed terminal
+  keeps what `run.failed` carries, minus `provider_retried` — a per-call fact the terminal
+  vocabulary deliberately drops), on the offline projection and the sink twin alike.
+- **A model turn starting clears the dead turn's answer everywhere.** The retry path re-pumps
+  straight from `turn_failed` without passing a parked state, so the parked-state-guarded clears
+  never fired and all three readers showed the previous failure beside `state="running"`. The
+  unpark clear is unconditional on `model.turn.started` now, on both file readers and the record.
+- **The pause is observable on the durable surfaces.** While paused, `status.json` and the
+  offline projection said `state="running"`; after resume, the backend record said `"paused"`
+  through the whole resumed turn. Both file readers project `session.state.changed{state:
+  "paused"}` (the session-lane carrier; `turn.paused` stays a turn-lane cause event), `PAUSED`
+  joins every park-clear set (`_PARKED_STATES`, the sink twin, `record_event`'s), and the
+  driver's paused-resume branch marks the record RUNNING when it re-pumps.
+- **The terminal park carries what its own `run.failed` event says.** The terminal `Suspension`
+  constructions dropped the classification fields the type already declared, so a driver
+  promoting "what the park knew" promoted defaults over the truth its own event log carried —
+  all three terminal constructions (non-recoverable model error, the generic failure arm, and
+  `fail_recoverable`'s persisted park) now populate them from the same state the emit reads.
+- **`metrics.json` states the verdict.** It carried `provider_error_code` /
+  `provider_http_status` and dropped `retryable` / `config_recoverable`; a failed run's metrics
+  now record both, declared in `METRICS_SCHEMA` (and the status.json block in `STATUS_SCHEMA`)
+  under the stream_closed precedent — declare even under `additionalProperties: True`. Absent
+  keys on pre-v0.21 artifacts mean what those runs meant (see COMPATIBILITY.md).
+- The carriage census grows the cells that would have caught this: a per-consumer-branch pin of
+  the classification key-subset each `turn.failed`/`run.failed` branch copies (helper-following,
+  so a read moved into a function stays censused), the pause event on the two file readers'
+  handled-set pins with the record's absence declared, and the new carrier files registered.
+
 ### Fixed — the facade answers for the loop it wraps
 
 - **The blocking settle twin shares the pump's terminal precedence.** A `LoopSession.submit()`

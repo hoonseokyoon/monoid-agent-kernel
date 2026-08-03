@@ -952,34 +952,43 @@ def test_the_offline_projection_sees_the_user_input_park_not_only_the_job_wait(
     assert projection["terminal"] is False
 
 
+# The full classification `turn.failed` emits (loop.py), minus the metering-only
+# `provider_usage`. One literal shared by the park/heal/unpark tests below so they cannot
+# drift onto different subsets of the same fact family.
+_TURN_FAILED_CLASSIFICATION = {
+    "error": "model rejected the key",
+    "error_code": "model_error",
+    "provider_error_code": "insufficient_quota",
+    "http_status": 422,
+    "retryable": False,
+    "config_recoverable": True,
+    "provider_retried": True,
+}
+
+
 def test_the_offline_projection_reports_the_classification_a_parked_turn_carries(
     tmp_path: Path,
 ) -> None:
     """`turn.failed` carries the whole taxonomy and no status reader consumed any of it.
 
     State is deliberately untouched by this branch: `turn.failed` is not terminal, and the park
-    that follows it names the state. What the event uniquely carries is *why*.
+    that follows it names the state. What the event uniquely carries is *why* — and
+    `config_recoverable` alone cannot separate an `insufficient_quota` (fix config) from a
+    `rate_limit` (wait), so the reader carries the full set, not a fragment.
     """
     run_dir = tmp_path / "run_turn_failed"
     run_dir.mkdir()
     _write_events(
         run_dir,
         {"type": "run.started", "data": {}},
-        {
-            "type": "turn.failed",
-            "data": {
-                "error": "model rejected the key",
-                "error_code": "model_error",
-                "config_recoverable": True,
-            },
-        },
+        {"type": "turn.failed", "data": dict(_TURN_FAILED_CLASSIFICATION)},
         {"type": "run.awaiting_input", "data": {"reason": "turn_failed"}},
     )
 
     projection = project_run_status(run_dir)
 
-    assert projection["error"] == "model rejected the key"
-    assert projection["error_code"] == "model_error"
+    for key, value in _TURN_FAILED_CLASSIFICATION.items():
+        assert projection[key] == value, key
     # The park that follows still owns the state.
     assert projection["state"] == "awaiting_input"
 
@@ -1022,17 +1031,231 @@ def test_the_status_sink_records_the_classification_of_a_recoverable_turn_failur
     """The sink's half of the same convergence: `turn.failed` was unread here too."""
 
     sink = StatusJsonSink(tmp_path / "status.json")
-    sink.emit(
-        _event(
-            "turn.failed",
-            {"error": "model rejected the key", "error_code": "model_error"},
-        )
-    )
+    sink.emit(_event("turn.failed", dict(_TURN_FAILED_CLASSIFICATION)))
 
-    assert sink.state["error"] == "model rejected the key"
-    assert sink.state["error_code"] == "model_error"
+    for key, value in _TURN_FAILED_CLASSIFICATION.items():
+        assert sink.state[key] == value, key
     # Not a lifecycle change: the park that follows owns the state.
     assert "state" not in sink.state
+
+
+_CLASSIFICATION_KEYS = (
+    "provider_error_code",
+    "http_status",
+    "retryable",
+    "config_recoverable",
+    "provider_retried",
+)
+
+
+def _assert_no_stale_failure(projection: dict) -> None:
+    assert projection["error"] == ""
+    assert projection["error_code"] == ""
+    assert projection["provider_error_code"] == ""
+    assert projection["http_status"] is None
+    assert projection["retryable"] is False
+    assert projection["config_recoverable"] is False
+    assert projection["provider_retried"] is False
+
+
+def test_a_clean_terminal_settle_heals_the_stale_classification_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    """The empirically traced or-fallback staleness: a completed run kept a dead turn's error.
+
+    `run.started -> turn.failed -> run.awaiting_input -> model.turn.started ->
+    run.finished{completed, error:"", error_code:""}` used to project
+    `error="model rejected the key", error_code="model_error"`, because the terminal branches
+    or-ed event data over the stale value and `run.finished` never touched `error` at all.
+    Terminal branches ASSIGN now, on the offline projection and on its live sink twin.
+    """
+    run_dir = tmp_path / "run_or_fallback"
+    run_dir.mkdir()
+    events = (
+        {"type": "run.started", "data": {}},
+        {"type": "turn.failed", "data": dict(_TURN_FAILED_CLASSIFICATION)},
+        {"type": "run.awaiting_input", "data": {"reason": "turn_failed"}},
+        {"type": "model.turn.started", "data": {"step": 2}},
+        {"type": "run.finished", "data": {"status": "completed", "error": "", "error_code": ""}},
+    )
+    _write_events(run_dir, *events)
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "completed"
+    assert projection["terminal"] is True
+    _assert_no_stale_failure(projection)
+
+    # The live twin, fed the identical stream.
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert sink.state["error"] == ""
+    assert sink.state["error_code"] == ""
+    for key in _CLASSIFICATION_KEYS:
+        assert key not in sink.state, key
+
+
+def test_the_terminal_heal_does_not_wait_for_an_unpark(tmp_path: Path) -> None:
+    """A completed run must not keep `retryable`/`config_recoverable` even with no retry turn.
+
+    The sequence above also rides the unpark clear (`model.turn.started`); this one goes
+    straight from the park to the clean terminal, so only the terminal heal can clear it.
+    """
+    run_dir = tmp_path / "run_terminal_heal"
+    run_dir.mkdir()
+    events = (
+        {"type": "run.started", "data": {}},
+        {"type": "turn.failed", "data": dict(_TURN_FAILED_CLASSIFICATION)},
+        {"type": "run.finished", "data": {"status": "completed", "error": "", "error_code": ""}},
+    )
+    _write_events(run_dir, *events)
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "completed"
+    _assert_no_stale_failure(projection)
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert sink.state["error"] == ""
+    for key in _CLASSIFICATION_KEYS:
+        assert key not in sink.state, key
+
+
+def test_a_failed_run_keeps_the_classification_its_terminal_event_carries(
+    tmp_path: Path,
+) -> None:
+    """The heal must not overshoot: `run.failed` owns the terminal classification.
+
+    `run.finished{status:"failed"}` follows `run.failed` on the same stream, and popping the
+    classification there would undo the terminal record one event after it was written.
+    `provider_retried` is the exception on purpose — it is a per-call fact the terminal
+    vocabulary deliberately drops (see test_carriage_conformance's promotion pin).
+    """
+    run_dir = tmp_path / "run_failed_keeps"
+    run_dir.mkdir()
+    events = (
+        {"type": "run.started", "data": {}},
+        {"type": "turn.failed", "data": dict(_TURN_FAILED_CLASSIFICATION)},
+        {
+            "type": "run.failed",
+            "data": {
+                "error": "model rejected the key",
+                "error_code": "model_error",
+                "type": "ModelAdapterError",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+            },
+        },
+        {
+            "type": "run.finished",
+            "data": {
+                "status": "failed",
+                "error": "model rejected the key",
+                "error_code": "model_error",
+            },
+        },
+    )
+    _write_events(run_dir, *events)
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "failed"
+    assert projection["error"] == "model rejected the key"
+    assert projection["error_code"] == "model_error"
+    assert projection["provider_error_code"] == "insufficient_quota"
+    assert projection["http_status"] == 422
+    assert projection["config_recoverable"] is True
+    assert projection["provider_retried"] is False
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert sink.state["error"] == "model rejected the key"
+    assert sink.state["error_type"] == "ModelAdapterError"
+    assert sink.state["provider_error_code"] == "insufficient_quota"
+    assert sink.state["http_status"] == 422
+    assert sink.state["config_recoverable"] is True
+    assert "provider_retried" not in sink.state
+
+
+def test_a_model_turn_starting_clears_the_parked_failure_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    """`turn.failed -> model.turn.started` (retry/recovery) must not keep the dead turn's error.
+
+    While PARKED the classification must remain — that is the point of carrying it — so the
+    clear rides the unpark, not the park. The retry path never passes through a parked state
+    (the driver re-pumps straight from `turn_failed`), so the clear cannot hide behind the
+    parked-state guard.
+    """
+    run_dir = tmp_path / "run_unpark_clear"
+    run_dir.mkdir()
+    events = (
+        {"type": "run.started", "data": {}},
+        {"type": "turn.failed", "data": dict(_TURN_FAILED_CLASSIFICATION)},
+        {"type": "model.turn.started", "data": {"step": 2}},
+    )
+    _write_events(run_dir, *events)
+
+    projection = project_run_status(run_dir)
+
+    assert projection["state"] == "running"
+    _assert_no_stale_failure(projection)
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert "error" not in sink.state
+    assert "error_code" not in sink.state
+    for key in _CLASSIFICATION_KEYS:
+        assert key not in sink.state, key
+
+
+def test_a_paused_run_is_visible_on_both_durable_readers(tmp_path: Path) -> None:
+    """While paused, status.json and the offline projection said state="running".
+
+    The pause park emits two events; the session-lane `session.state.changed{state:"paused"}`
+    is the carrier here because it names the lifecycle state these readers project
+    (`turn.paused` stays a turn-lane cause event no projection consumes). A model turn
+    starting is the unpark, exactly as for the input/task parks.
+    """
+    run_dir = tmp_path / "run_paused"
+    run_dir.mkdir()
+    paused_events = (
+        {"type": "run.started", "data": {}},
+        {"type": "turn.paused", "data": {"reason": "user_pause"}},
+        {
+            "type": "session.state.changed",
+            "data": {"state": "paused", "from": "running", "reason": "pause_requested"},
+        },
+    )
+    _write_events(run_dir, *paused_events)
+
+    projection = project_run_status(run_dir)
+    assert projection["state"] == "paused"
+    assert projection["terminal"] is False
+
+    # ...and the resumed pump unparks it on the same event the other parks use.
+    _write_events(
+        run_dir,
+        *paused_events,
+        {"type": "model.turn.started", "data": {"step": 2}},
+    )
+    assert project_run_status(run_dir)["state"] == "running"
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in paused_events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert sink.state["state"] == "paused"
+    assert sink.state["terminal"] is False
+    sink.emit(_event("model.turn.started", {"step": 2}))
+    assert sink.state["state"] == "running"
+    assert sink.state["terminal"] is False
 
 
 def test_cli_status_json_prints_the_projection_then_fails(tmp_path: Path) -> None:

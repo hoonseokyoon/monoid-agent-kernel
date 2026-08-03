@@ -1098,7 +1098,23 @@ the durable `last_suspension` payload) it is a **park** — the state the sessio
 name is joining two different questions. The two turn-lane stop events are symmetric — a pause
 emits `turn.paused` exactly as a stop emits `turn.interrupted` — so a consumer watching the turn
 lane sees both parks; the `session.state.changed` event beside them carries the lifecycle
-projection.
+projection, and it is the carrier the status readers consume: `status.json` and the offline
+projection show `state: "paused"` from it (the backend record's pause state is owned by the
+session driver, which observes the `paused` Suspension directly).
+
+**Status readers carry the whole failure classification, under one rule.** The three consumers
+of the run event stream (`status.json`'s live sink, the offline `events.jsonl` projection, and
+the backend record) copy the full set — `provider_error_code`, `http_status`, `retryable`,
+`config_recoverable`, `provider_retried` — beside `error`/`error_code` when a `turn.failed`
+parks the run, because `config_recoverable` alone cannot separate an `insufficient_quota` (fix
+the config) from a `rate_limit` (wait). The classification remains for as long as the park does;
+a `model.turn.started` clears it (the new turn supersedes the dead one, including on the
+no-park retry path), and terminal events assign rather than or-fallback, so a completed run
+never keeps a recovered turn's error. A failed terminal keeps the `run.failed` classification —
+minus `provider_retried`, the per-call fact the terminal vocabulary deliberately drops.
+`GET /v1/runs/{id}/status` and `/result` serve the same five off the record, on the live branch
+and on the post-restart (status.json-backed) branch alike; `provider_usage` on `turn.failed` is
+metering, not classification, and stays off every status surface.
 
 `GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.
 `from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume

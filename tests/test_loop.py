@@ -1477,6 +1477,14 @@ def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
         # logs and the UI can see the real cause.
         assert failed[0].data["provider_error_code"] == "server_error"
         assert failed[0].data["http_status"] == 500
+        # ...and the terminal park a driver reads carries the same classification the event
+        # does. The Suspension had the fields and the terminal construction dropped them, so a
+        # backend promoting "what the park knew" onto its record promoted defaults over the
+        # truth its own event log carried.
+        assert susp.provider_error_code == "server_error"
+        assert susp.http_status == 500
+        assert susp.retryable is False
+        assert susp.config_recoverable is False
         assert list(run_root.rglob("failure.json"))
     finally:
         loop.close()
@@ -1521,7 +1529,9 @@ def test_turn_failed_after_tool_round_clears_observations(tmp_path: Path) -> Non
 
 
 def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
-    adapter = _ScriptedAdapter([ModelAdapterError("bad", http_status=400)])
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad", http_status=400, config_recoverable=True)]
+    )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -1530,8 +1540,49 @@ def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
         assert loop._session is not None and loop._session.terminal is True
         assert "run.failed" in [e.type for e in sink.events]
         assert list(run_root.rglob("failure.json"))
+        # The durable observation of the terminal park keeps the inherited classification the
+        # run.failed event beside it carries — the checkpoint is where a post-restart reader
+        # learns what this run died of.
+        assert loop.checkpoint_store is not None
+        stored = loop.checkpoint_store.latest(loop.spec.run_id)
+        assert stored is not None and stored.checkpoint.last_suspension is not None
+        assert stored.checkpoint.last_suspension["config_recoverable"] is True
+        assert stored.checkpoint.last_suspension["http_status"] == 400
     finally:
         loop.close()
+
+
+def test_metrics_json_reports_the_failure_classification(tmp_path: Path) -> None:
+    """metrics.json carried provider_error_code/provider_http_status and dropped the verdict.
+
+    The pair beside them — retryable / config_recoverable — is what an operator reading only
+    the metrics artifact needs to decide "resend after a config fix" vs "it will fail the same
+    way". Written on failed runs, from the same state the run.failed event reads.
+    """
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError(
+                "quota exhausted",
+                http_status=429,
+                provider_error_code="insufficient_quota",
+                config_recoverable=True,
+            )
+        ]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    assert loop.run_until_suspended("hi").reason == "turn_failed"
+    loop.fail_recoverable("gave up after retries", error_code="model_error")
+    loop.close()
+
+    metrics = json.loads(
+        (run_root / loop.spec.run_id / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert metrics["status"] == "failed"
+    assert metrics["provider_error_code"] == "insufficient_quota"
+    assert metrics["provider_http_status"] == 429
+    assert metrics["retryable"] is False
+    assert metrics["config_recoverable"] is True
 
 
 def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -> None:

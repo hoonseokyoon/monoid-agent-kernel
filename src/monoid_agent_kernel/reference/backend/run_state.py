@@ -50,6 +50,21 @@ def _error_flag(exc: Exception, name: str) -> bool:
     return value if type(value) is bool else False
 
 
+def _event_flag(data: Mapping[str, Any], name: str) -> bool:
+    """The event-data twin of :func:`_error_flag`, guarded for the same reason: this reader
+    answers for whatever a durable log carries, and a truthy string must not become a claim."""
+
+    value = data.get(name)
+    return value if type(value) is bool else False
+
+
+def _event_http_status(data: Mapping[str, Any]) -> int | None:
+    """The event-data twin of :func:`_provider_http_status` (``bool`` is not a status)."""
+
+    value = data.get("http_status")
+    return value if type(value) is int else None
+
+
 def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
     value = metrics.get(key, 0)
     if type(value) is not int or value < 0:
@@ -227,13 +242,37 @@ class RunStateMutationService:
             elif event.type == "turn.failed":
                 # Classification only — the state is NOT touched. ``session_drive`` owns this
                 # record's lifecycle and drives TURN_FAILED itself; writing a state here would
-                # race it. What was missing is the classification: a run parked in TURN_FAILED
-                # served error="" over HTTP while the event carried the whole taxonomy.
+                # race it. What was missing is the classification — ALL of it: this branch
+                # used to keep error/error_code and drop the five facts beside them, so a run
+                # parked in TURN_FAILED served half the taxonomy the event carried. Guarded
+                # reads, same rule as the exception twins above.
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
+                record.provider_error_code = str(event.data.get("provider_error_code") or "")
+                record.http_status = _event_http_status(event.data)
+                record.retryable = _event_flag(event.data, "retryable")
+                record.config_recoverable = _event_flag(event.data, "config_recoverable")
+                record.provider_retried = _event_flag(event.data, "provider_retried")
             elif event.type in {"run.resumed", "model.turn.started"}:
-                if record.state in {SessionState.AWAITING_INPUT, SessionState.AWAITING_TASKS}:
+                if record.state in {
+                    SessionState.AWAITING_INPUT,
+                    SessionState.AWAITING_TASKS,
+                    # The third non-terminal park this stream can wake: without it a resumed
+                    # pause read as paused through the whole resumed turn on this record.
+                    SessionState.PAUSED,
+                }:
                     set_record_state(record, SessionState.RUNNING, terminal=False)
+                if event.type == "model.turn.started" and not record_terminal(record):
+                    # The unpark clear the two status readers already bind: a model turn
+                    # starting supersedes the parked failure, so the record must not serve a
+                    # dead turn's error beside state="running" for the whole retried turn.
+                    record.error = ""
+                    record.error_code = ""
+                    record.provider_error_code = ""
+                    record.http_status = None
+                    record.retryable = False
+                    record.config_recoverable = False
+                    record.provider_retried = False
             elif event.type == "run.finished":
                 # Terminal readiness is owned by record_run_result(), which flips lifecycle and
                 # stores the result under the same lock.

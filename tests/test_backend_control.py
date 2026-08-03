@@ -138,6 +138,118 @@ def test_task_resume_events_promote_awaiting_tasks_to_running(
     record.terminal = True
 
 
+def test_record_event_captures_the_whole_classification_a_turn_failed_carries(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The record captured error/error_code and dropped the five facts beside them.
+
+    The state stays untouched — session_drive owns this record's lifecycle — but the
+    classification must reach the record, or GET /status answers with half the taxonomy the
+    event beside it carries.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_turn_failed_classified"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="turn.failed",
+            data={
+                "error": "model rejected the key",
+                "error_code": "model_error",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+                "provider_retried": True,
+            },
+        ),
+    )
+
+    assert record.error == "model rejected the key"
+    assert record.error_code == "model_error"
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.http_status == 422
+    assert record.retryable is False
+    assert record.config_recoverable is True
+    assert record.provider_retried is True
+    # The state-untouched rule stays: the park that follows names the state.
+    assert record.state is SessionState.RUNNING
+
+    # The guarded-reader rule stays too: a truthy string must not become a claim.
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=2,
+            event_type="turn.failed",
+            data={
+                "error": "boom",
+                "error_code": "model_error",
+                "retryable": "yes, definitely",
+                "http_status": "422",
+            },
+        ),
+    )
+    assert record.retryable is False
+    assert record.http_status is None
+
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
+def test_a_model_turn_starting_unparks_a_paused_record_and_clears_the_stale_failure(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """PAUSED joins the park-clear set, and the unpark clears the dead turn's answer.
+
+    The record's clear set named two of the three non-terminal parks, so a resumed pause
+    served state="paused" through the whole resumed turn — and a retried turn kept the
+    previous failure's error while running.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_paused_unpark"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.PAUSED
+    record.error = "model rejected the key"
+    record.error_code = "model_error"
+    record.provider_error_code = "insufficient_quota"
+    record.http_status = 422
+    record.retryable = True
+    record.config_recoverable = True
+    record.provider_retried = True
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(run_id=run_id, seq=1, event_type="model.turn.started"),
+    )
+
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == ""
+    assert record.error_code == ""
+    assert record.provider_error_code == ""
+    assert record.http_status is None
+    assert record.retryable is False
+    assert record.config_recoverable is False
+    assert record.provider_retried is False
+
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
 def test_run_finished_event_defers_terminal_until_result_is_recorded(
     tmp_path: Path,
     backend_factory: Any,

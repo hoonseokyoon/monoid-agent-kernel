@@ -17,8 +17,21 @@ The run-directory artifact set is:
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
 - `model-content.jsonl`: optional private model-stream sidecar with output/reasoning segments and
   settled text (`monoid.model-content.v1`)
-- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`)
-- `metrics.json`: final counters and timing
+- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
+  non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
+  from the `session.state.changed` event). While a run is parked on a recoverable turn failure
+  the file carries the failure's full classification beside `error`/`error_code` —
+  `provider_error_code`, `http_status`, `retryable`, `config_recoverable`, `provider_retried` —
+  copied off the `turn.failed` event. A model turn starting clears the block (the new turn
+  supersedes the dead one), and a non-failed terminal heals it; on a failed terminal the
+  `run.failed` classification remains (minus `provider_retried`, a per-call fact the terminal
+  vocabulary drops). Absent keys mean "no live failure to classify" — which is also what their
+  absence on a pre-v0.21 artifact meant. The offline projection (`monoid status`, reading
+  `events.jsonl`) answers with the same fields under the same rules.
+- `metrics.json`: final counters and timing. On a failed run it also records the failure's
+  verdict beside the provider detail it already carried: `retryable` and `config_recoverable`
+  join `provider_error_code` / `provider_http_status`, so an operator holding only this
+  artifact can tell "resend after a config fix" from "this will fail the same way".
 - `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
 - `workspace.base.json`: base snapshot used for proposal comparison
 - `workspace.index.json`: context/index artifact

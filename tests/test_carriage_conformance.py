@@ -4792,11 +4792,18 @@ EVENT_CONSUMER_PROGRESS = frozenset(
         "workspace.proposal.updated",
     }
 )
+# The pause park's session-lane projection, handled by the two status-file readers. NOT part of
+# ``EVENT_CONSUMER_CORE``: the backend record's pause state is owned by session_drive (the
+# driver observes the ``paused`` Suspension directly and a ``record_event`` state write would
+# race it — the same reason its ``turn.failed`` branch never touches state), so the record
+# deliberately has no branch for this event.
+EVENT_CONSUMER_PAUSE = frozenset({"session.state.changed"})
 EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
     # The offline projection reads the *committed log*, so it can also fold the durable proposal
     # lifecycle that the two live sinks never see (they fire before the artifacts are written).
     "core/projections.py:_apply_event_projection": EVENT_CONSUMER_CORE
     | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
     | frozenset(
         {
             "proposal.package.exported",
@@ -4813,6 +4820,7 @@ EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
     # construction.)
     "recorder.py:StatusJsonSink.emit": EVENT_CONSUMER_CORE
     | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
     | frozenset({"plan.updated", "metrics.updated"}),
 }
 
@@ -4852,6 +4860,11 @@ def test_the_three_run_status_projections_differ_only_by_what_their_surface_carr
     # Both parks and the classification, on all three.
     for handled in (offline, backend, control):
         assert {"run.waiting", "run.awaiting_input", "turn.failed"} <= handled
+    # The pause projection, on both status-file readers and deliberately NOT on the record:
+    # session_drive owns the record's lifecycle and observes the paused Suspension directly, so
+    # a record_event state write would race it (the reason is on EVENT_CONSUMER_PAUSE).
+    assert EVENT_CONSUMER_PAUSE <= offline and EVENT_CONSUMER_PAUSE <= control
+    assert not (EVENT_CONSUMER_PAUSE & backend)
     # The whole remaining difference, named. Nothing is handled by one reader alone except the
     # durable proposal lifecycle (only the log reader sees it) and the two live-only projections
     # (only the fan-out sink can build them).
@@ -4866,6 +4879,128 @@ def test_the_three_run_status_projections_differ_only_by_what_their_surface_carr
     # The backend record is a strict subset of both: it carries lifecycle + classification only.
     assert backend < offline and backend < control
     assert backend == EVENT_CONSUMER_CORE
+
+
+# The classification key-subset each status-consumer branch copies off its event, pinned per
+# branch. This is the cell the "status.json projection" future family predicted: three
+# consumers each hand-copy keys out of ``turn.failed``/``run.failed`` data, and a fact added to
+# the event reaches N-1 of them unless something diffs the copies. The event-type pins above
+# say each consumer HAS the branch; these say what the branch CARRIES.
+#
+# ``turn.failed``'s carried set is its emit set minus ``provider_usage`` (metering, not
+# classification — it stays off every status surface). ``run.failed``'s is exactly the event's
+# own key set: the terminal vocabulary deliberately drops ``provider_retried``.
+TURN_FAILED_STATUS_CARRIED = TURN_FAILED_EVENT_KEYS - {"provider_usage"}
+STATUS_CONSUMER_BRANCH_READS: dict[tuple[str, str], frozenset[str]] = {
+    ("recorder.py:StatusJsonSink.emit", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    ("recorder.py:StatusJsonSink.emit", "run.failed"): RUN_FAILED_EVENT_KEYS,
+    ("core/projections.py:_apply_event_projection", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The offline projection's terminal branch reads the ``provider_retried`` slot the event
+    # never carries — that IS the heal (the projection declares the key, so clearing it means
+    # assigning the absent-key default) — and has no ``error_type`` slot, so ``type`` is the
+    # one run.failed key it does not copy (a declared surface difference with the sink).
+    ("core/projections.py:_apply_event_projection", "run.failed"): (
+        RUN_FAILED_EVENT_KEYS - {"type"}
+    )
+    | {"provider_retried"},
+    ("reference/backend/run_state.py:record_event", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The record's ``run.failed`` branch copies the error pair only, BY DESIGN: its terminal
+    # classification arrives through the driver's park promotion (session_drive assigns all
+    # five off the terminal Suspension, which loop.py populates from the same state the
+    # run.failed emit reads), and a second writer here would just be the same fact copied at a
+    # different moment under the same lock.
+    ("reference/backend/run_state.py:record_event", "run.failed"): frozenset(
+        {"error", "error_code"}
+    ),
+}
+
+
+def _module_level_functions(relative_path: str) -> dict[str, Any]:
+    return {
+        node.name: node
+        for node in _module_tree(relative_path).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _event_data_reads(relative_path: str, body: list[ast.stmt]) -> frozenset[str]:
+    """Constant keys ``body`` reads off event data, following same-module helper calls.
+
+    Two spellings of a read are collected, for the reason the receipt pin collects both
+    ``getattr`` forms: the inline ``data.get("key")`` and the guarded-helper call
+    ``_event_flag(data, "key")``. Helper calls resolved by name in the same module are
+    followed (``_assign_failure_classification`` reads five keys the call site never spells),
+    so a read moved into a helper stays censused. Attribute calls other than ``.get`` are NOT
+    reads — ``self.state.pop("key")`` is a clear, and counting it as a read would let a
+    dropped copy hide behind its own cleanup.
+    """
+
+    helpers = _module_level_functions(relative_path)
+    read: set[str] = set()
+    visited: set[str] = set()
+
+    def _collect(nodes: list[ast.stmt]) -> None:
+        for node in nodes:
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "get"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                ):
+                    read.add(call.args[0].value)
+                elif isinstance(call.func, ast.Name):
+                    for argument in call.args:
+                        if isinstance(argument, ast.Constant) and isinstance(
+                            argument.value, str
+                        ):
+                            read.add(argument.value)
+                    helper = helpers.get(call.func.id)
+                    if helper is not None and call.func.id not in visited:
+                        visited.add(call.func.id)
+                        _collect(helper.body)
+
+    _collect(body)
+    return frozenset(read)
+
+
+@pytest.mark.parametrize("consumer_branch", sorted(STATUS_CONSUMER_BRANCH_READS))
+def test_each_status_consumer_branch_copies_its_pinned_classification_subset(
+    consumer_branch: tuple[str, str],
+) -> None:
+    consumer, event_type = consumer_branch
+    relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
+    name = consumer.split(":", 1)[1].split(".")[-1]
+    function = _function_node(relative_path, name, within=class_name)
+    branches = [
+        node.body
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Eq)
+        and ast.unparse(node.test.left) == subject
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == event_type
+    ]
+    assert len(branches) == 1, {"consumer": consumer, "branches_for": event_type}
+    read = _event_data_reads(relative_path, branches[0])
+    expected = STATUS_CONSUMER_BRANCH_READS[consumer_branch]
+    assert read == expected, {
+        "consumer": consumer,
+        "event_type": event_type,
+        "newly_read": sorted(read - expected),
+        "no_longer_read": sorted(expected - read),
+        "hint": "a classification fact reached this consumer's branch on one reader and not "
+        "its pinned subset — update every twin in the same change",
+    }
+    assert "provider_usage" not in read, {
+        "consumer": consumer,
+        "hint": "provider_usage is metering, not classification; it stays off status surfaces",
+    }
 
 
 def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
@@ -5403,8 +5538,22 @@ def test_future_family_stream_frames_has_two_hand_built_carriers() -> None:
 
 
 # core/schemas.py:STATUS_SCHEMA — what the operator-facing status file declares about itself.
+# The classification block joined in the burn-down, declared with its writer (the sink's
+# ``turn.failed`` branch) under the stream_closed precedent: declare even under an open cap.
 STATUS_SCHEMA_KEYS = frozenset(
-    {"run_id", "state", "terminal", "last_event_seq", "last_event_type", "updated_at"}
+    {
+        "run_id",
+        "state",
+        "terminal",
+        "last_event_seq",
+        "last_event_type",
+        "updated_at",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "provider_retried",
+    }
 )
 
 
@@ -5463,12 +5612,20 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "core/model_content.py",
             "core/model_io.py",
             "core/model_stream.py",
+            # Joined in the burn-down's carriage sweep: the offline run-status projection
+            # carries the full classification a parked turn.failed emits.
+            "core/projections.py",
             "core/result.py",
             "core/schemas.py",
             "errors.py",
             "loop.py",
+            # Joined in the carriage sweep: metrics.json states the failed run's verdict.
+            "loop_phases.py",
             "providers/gateway.py",
             "providers/openai.py",
+            # Joined in the carriage sweep: status.json (the live sink) carries the same set
+            # its offline twin projects.
+            "recorder.py",
             # Joined in the burn-down: the backend record that carries the classification to the
             # surfaces an operator reads (type, protocol, the driver that promotes it, and the
             # projection that serves it).
@@ -5488,6 +5645,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # Joined in the burn-down's durable batch: see config_recoverable above.
             "core/checkpoint.py",
             "core/model_io.py",
+            # Joined in the carriage sweep, with core/projections.py and recorder.py: the two
+            # status readers carry the parked fact and drop it at terminal, like the event.
+            "core/projections.py",
             # Joined in the burn-down: the park type that records the failed turn, its event
             # schema, and the loop that writes both plus the two transcript records.
             "core/result.py",
@@ -5500,6 +5660,15 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "providers/gateway.py",
             # Joined in the burn-down: the classifier reports the retries its own SDK made.
             "providers/openai.py",
+            "recorder.py",
+            # Joined in the carriage sweep: the backend record carries all five park facts
+            # (type, protocol, event capture, the driver's promotion, and the projections
+            # that serve them) — provider_retried while parked, dropped at terminal.
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
+            "reference/backend/run_state.py",
+            "reference/backend/run_types.py",
+            "reference/backend/session_drive.py",
             "reference/llm_gateway/http.py",
             "reference/llm_gateway/service.py",
         }

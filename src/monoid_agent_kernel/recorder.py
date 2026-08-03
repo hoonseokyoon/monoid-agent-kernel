@@ -97,9 +97,25 @@ class StdoutJsonlSink:
 
 
 # The parks a model turn starting must clear. The offline twin
-# (``core/projections.py:_PARKED_STATES``) names the same pair.
+# (``core/projections.py:_PARKED_STATES``) names the same set. PAUSED joined when the pause
+# became visible on this surface: a resumed pump unparks it exactly like the other two.
 _PARKED_STATE_VALUES = frozenset(
-    {SessionState.AWAITING_INPUT.value, SessionState.AWAITING_TASKS.value}
+    {
+        SessionState.AWAITING_INPUT.value,
+        SessionState.AWAITING_TASKS.value,
+        SessionState.PAUSED.value,
+    }
+)
+
+# The failure-classification keys a parked ``turn.failed`` writes beside ``error`` /
+# ``error_code``. One tuple, because three branches share one rule: the park writes them, the
+# unpark clears them, and a non-failed terminal heals them.
+_FAILURE_CLASSIFICATION_KEYS = (
+    "provider_error_code",
+    "http_status",
+    "retryable",
+    "config_recoverable",
+    "provider_retried",
 )
 
 
@@ -150,6 +166,14 @@ class StatusJsonSink:
                     "error_code": data.get("error_code", ""),
                 }
             )
+            # The terminal heal: ASSIGNED error/error_code above, and a non-failed terminal
+            # clears the parked classification — a completed run must not keep a dead turn's
+            # ``retryable``. A failed terminal keeps it: ``run.finished{status:"failed"}``
+            # follows the ``run.failed`` that owns the terminal classification, and popping
+            # here would undo that record one event later.
+            if state is not SessionState.FAILED:
+                for key in _FAILURE_CLASSIFICATION_KEYS:
+                    self.state.pop(key, None)
         elif event.type == "run.failed":
             self.state.update(
                 {
@@ -158,8 +182,17 @@ class StatusJsonSink:
                     "error": data.get("error", ""),
                     "error_code": data.get("error_code", ""),
                     "error_type": data.get("type", ""),
+                    # Exactly what the event carries — the terminal twin of ``turn.failed``
+                    # keeps the classification and deliberately drops ``provider_retried``
+                    # (a per-call fact; publishing it here would publish one call's number
+                    # as the run's), so this branch drops it too rather than inventing it.
+                    "provider_error_code": data.get("provider_error_code", ""),
+                    "http_status": data.get("http_status"),
+                    "retryable": data.get("retryable", False),
+                    "config_recoverable": data.get("config_recoverable", False),
                 }
             )
+            self.state.pop("provider_retried", None)
         elif event.type == "run.waiting":
             self.state["state"] = session_state_value(SessionState.AWAITING_TASKS)
             self.state["terminal"] = False
@@ -187,22 +220,46 @@ class StatusJsonSink:
         elif event.type == "model.turn.started":
             self.state["current_turn_id"] = event.turn_id
             self.state["current_step"] = data.get("step")
-            # Both parks, not one. Clearing only ``AWAITING_INPUT`` here left a run that had
+            # Every park, not one. Clearing only ``AWAITING_INPUT`` here left a run that had
             # parked on background jobs reading as parked while the turn that unparked it was
             # already running — ``run.resumed`` is emitted for the job case but not for every
-            # path out of a task wait. The offline twin (``core/projections.py``) clears the
-            # same pair.
+            # path out of a task wait — and a resumed pause read as paused for the whole
+            # resumed turn. The offline twin (``core/projections.py``) clears the same set.
             if self.state.get("state") in _PARKED_STATE_VALUES:
                 self.state["state"] = session_state_value(SessionState.RUNNING)
                 self.state["terminal"] = False
                 self.state["waiting_for_background_jobs"] = False
                 self.state.pop("awaiting_input", None)
+            # The unpark clear, unconditional on purpose: a retried turn never passes through
+            # a parked state (the driver re-pumps straight from ``turn_failed``), so guarding
+            # this behind the parked-state check kept a dead turn's error beside
+            # state="running". While PARKED the failure remains — that is the point of
+            # carrying it — the model turn *starting* is what supersedes it.
+            self.state.pop("error", None)
+            self.state.pop("error_code", None)
+            for key in _FAILURE_CLASSIFICATION_KEYS:
+                self.state.pop(key, None)
         elif event.type == "turn.failed":
-            # A recoverable model-turn park. The event carries the whole classification; without
-            # this the status file an operator reads showed error="" for a run parked in
-            # TURN_FAILED. State is untouched: the park that follows names it.
+            # A recoverable model-turn park. The event carries the whole classification and
+            # this branch used to copy two of its seven facts — ``config_recoverable`` alone
+            # cannot separate an ``insufficient_quota`` (fix config) from a ``rate_limit``
+            # (wait), so the full set rides. ``provider_usage`` stays out: metering, not
+            # classification. State is untouched: the park that follows names it.
             self.state["error"] = data.get("error", "")
             self.state["error_code"] = data.get("error_code", "")
+            self.state["provider_error_code"] = data.get("provider_error_code", "")
+            self.state["http_status"] = data.get("http_status")
+            self.state["retryable"] = data.get("retryable", False)
+            self.state["config_recoverable"] = data.get("config_recoverable", False)
+            self.state["provider_retried"] = data.get("provider_retried", False)
+        elif event.type == "session.state.changed":
+            # The pause park's session-lane projection. Without this branch a paused run read
+            # as "running" on the one artifact an operator polls. Only the pause emits this
+            # event today, and this reader binds only the state it can prove: a future
+            # emitter with a new state value must decide its own projection here.
+            if data.get("state") == session_state_value(SessionState.PAUSED):
+                self.state["state"] = session_state_value(SessionState.PAUSED)
+                self.state["terminal"] = False
         elif event.type == "tool.call.started":
             self.state["current_tool"] = data.get("tool")
             self.state["current_tool_call_id"] = data.get("call_id")

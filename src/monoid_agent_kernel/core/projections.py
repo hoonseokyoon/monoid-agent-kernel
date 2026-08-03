@@ -15,16 +15,59 @@ from monoid_agent_kernel.public_view import public_path
 from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
 
 
-# The two non-terminal parks this projection can be sitting in when a model turn starts. Named
+# The non-terminal parks this projection can be sitting in when a model turn starts. Named
 # once so the offline projection and ``recorder.py:StatusJsonSink`` clear the same set: the sink
 # used to clear only ``AWAITING_INPUT``, which left a task-parked run reading as parked after the
-# turn that unparked it had already begun.
+# turn that unparked it had already begun. PAUSED joined when the pause became visible on the
+# status surfaces: a resumed pump unparks it exactly like the other two.
 _PARKED_STATES = frozenset(
     {
         session_state_value(SessionState.AWAITING_INPUT),
         session_state_value(SessionState.AWAITING_TASKS),
+        session_state_value(SessionState.PAUSED),
     }
 )
+
+# The failure-classification facts ``turn.failed`` carries beside ``error``/``error_code``
+# (minus the metering-only ``provider_usage``). One rule for their whole life on this
+# projection: the park assigns them, the unpark clears them, and a non-failed terminal heals
+# them — the same three moments ``recorder.py:StatusJsonSink`` binds.
+_FAILURE_CLASSIFICATION_DEFAULTS: dict[str, Any] = {
+    "provider_error_code": "",
+    "http_status": None,
+    "retryable": False,
+    "config_recoverable": False,
+    "provider_retried": False,
+}
+
+
+def _event_text(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _event_flag(data: dict[str, Any], key: str) -> bool:
+    """A boolean fact off durable event data, or ``False`` — a truthy string on a corrupt or
+    hand-written log must not become a claim that a failure is retryable."""
+    value = data.get(key)
+    return value if type(value) is bool else False
+
+
+def _event_http_status(data: dict[str, Any]) -> int | None:
+    value = data.get("http_status")
+    return value if type(value) is int else None
+
+
+def _assign_failure_classification(projection: dict[str, Any], data: dict[str, Any]) -> None:
+    projection["provider_error_code"] = _event_text(data, "provider_error_code")
+    projection["http_status"] = _event_http_status(data)
+    projection["retryable"] = _event_flag(data, "retryable")
+    projection["config_recoverable"] = _event_flag(data, "config_recoverable")
+    projection["provider_retried"] = _event_flag(data, "provider_retried")
+
+
+def _clear_failure_classification(projection: dict[str, Any]) -> None:
+    projection.update(_FAILURE_CLASSIFICATION_DEFAULTS)
 
 
 def project_run_status(run_dir: Path) -> dict[str, Any]:
@@ -60,6 +103,15 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         # string is already filtered through ``public_view.py:public_error_message`` by its
         # writer (status.json, metrics.json, and the ``turn.failed`` event data below).
         "error": status_payload.get("error") or metrics.get("error") or "",
+        # The classification beside the error, declared for the same reason and seeded from
+        # status.json (the one artifact that spells these keys this way; metrics.json spells
+        # the status ``provider_http_status``). Guarded reads: a corrupt artifact must not
+        # turn a string into a retryable claim.
+        "provider_error_code": _event_text(status_payload, "provider_error_code"),
+        "http_status": _event_http_status(status_payload),
+        "retryable": _event_flag(status_payload, "retryable"),
+        "config_recoverable": _event_flag(status_payload, "config_recoverable"),
+        "provider_retried": _event_flag(status_payload, "provider_retried"),
         "workspace_backend": (
             status_payload.get("workspace_backend")
             or metrics.get("workspace_backend")
@@ -123,24 +175,36 @@ def _apply_event_projection(
                 "workspace_backend", ""
             )
         elif event_type == "run.finished":
+            # Terminal branches ASSIGN, never or-fallback. The or kept a dead turn's
+            # ``error_code`` on a cleanly completed run: ``turn.failed -> (recovery) ->
+            # run.finished{status:"completed", error_code:""}`` read the empty string as
+            # "keep the stale value", and ``error`` was never touched at all — the same
+            # sequence the sink twin already healed.
             projection["state"] = session_state_value(
                 session_state_from_run_status(
                     _optional_text(data.get("status"), "run.finished status")
                     or projection["state"],
-                    error_code=(
-                        _optional_text(data.get("error_code"), "run.finished error_code")
-                        or projection["error_code"]
-                        or ""
-                    ),
+                    error_code=_optional_text(data.get("error_code"), "run.finished error_code")
+                    or "",
                     terminal=True,
                 )
             )
             projection["terminal"] = True
-            projection["error_code"] = data.get("error_code") or projection["error_code"]
+            projection["error"] = _event_text(data, "error")
+            projection["error_code"] = _event_text(data, "error_code")
+            # ...and the classification heals with it, except on a failed terminal, where the
+            # ``run.failed`` one event earlier owns it and a clear here would undo that record.
+            if projection["state"] != session_state_value(SessionState.FAILED):
+                _clear_failure_classification(projection)
         elif event_type == "run.failed":
             projection["state"] = session_state_value(SessionState.FAILED)
             projection["terminal"] = True
-            projection["error_code"] = data.get("error_code") or projection["error_code"]
+            projection["error"] = _event_text(data, "error")
+            projection["error_code"] = _event_text(data, "error_code")
+            # Exactly what the terminal event carries: the classification, minus
+            # ``provider_retried`` — a per-call fact the terminal vocabulary deliberately
+            # drops, so it is cleared rather than carried over from the park.
+            _assign_failure_classification(projection, data)
         elif event_type == "run.waiting":
             projection["state"] = session_state_value(SessionState.AWAITING_TASKS)
             projection["terminal"] = False
@@ -158,11 +222,20 @@ def _apply_event_projection(
             projection["waiting_for_background_jobs"] = False
         elif event_type == "turn.failed":
             # A recoverable model-turn park. The event carries the whole classification and this
-            # projection used to show none of it, so an offline `monoid status` on a parked run
-            # reported error_code="". State is left alone on purpose: ``turn.failed`` is not
-            # terminal and the park that follows it (``run.awaiting_input``) names the state.
-            projection["error"] = data.get("error") or projection["error"]
-            projection["error_code"] = data.get("error_code") or projection["error_code"]
+            # projection used to show two of its seven facts, so an offline `monoid status` on a
+            # parked run could not separate an ``insufficient_quota`` (fix config) from a
+            # ``rate_limit`` (wait). Assigned, not or-ed: the newest park owns the answer.
+            # State is left alone on purpose: ``turn.failed`` is not terminal and the park that
+            # follows it (``run.awaiting_input``) names the state.
+            projection["error"] = _event_text(data, "error")
+            projection["error_code"] = _event_text(data, "error_code")
+            _assign_failure_classification(projection, data)
+        elif event_type == "session.state.changed":
+            # The pause park's session-lane projection — the sink twin binds the same event.
+            # Only the state this reader can prove: the pause is today's sole emitter.
+            if data.get("state") == session_state_value(SessionState.PAUSED):
+                projection["state"] = session_state_value(SessionState.PAUSED)
+                projection["terminal"] = False
         elif event_type == "agent.config.updated":
             projection["agent_config"] = {
                 "definition_id": data.get("definition_id"),
@@ -178,6 +251,14 @@ def _apply_event_projection(
                 projection["state"] = session_state_value(SessionState.RUNNING)
                 projection["terminal"] = False
                 projection["waiting_for_background_jobs"] = False
+            # The unpark clear, outside the parked-state guard on purpose: a retried turn
+            # never passes through a parked state (the driver re-pumps straight from
+            # ``turn_failed``), and the dead turn's error must not ride beside
+            # state="running". While parked the failure remains — the model turn *starting*
+            # is what supersedes it. Same rule, same moment, on the sink twin.
+            projection["error"] = ""
+            projection["error_code"] = ""
+            _clear_failure_classification(projection)
         elif event_type == "tool.call.started":
             projection["current_tool"] = data.get("tool")
         elif event_type in {"tool.call.finished", "tool.call.failed"}:
