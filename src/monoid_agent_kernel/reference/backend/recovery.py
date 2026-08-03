@@ -265,8 +265,15 @@ class RecoveryService:
             await self._context.acquire_run_slot()
             acquired = True
             if loop.has_pending_tasks():
+                # ``status="completed"``, not ``"running"``. The durable status vocabulary is
+                # completed/failed/limited (core/result.py), and this synthetic park used to be
+                # minted outside it — latent only because it is re-driven rather than
+                # serialized, with nothing on the type saying so. The first path that
+                # checkpointed it would have raised at the recovery boundary this exists to
+                # serve. Behaviour is unchanged: nothing between here and the driver reads
+                # ``status`` on an ``awaiting_tasks`` park, which branches on ``reason``.
                 suspension = Suspension(
-                    reason="awaiting_tasks", status="running", has_external=True
+                    reason="awaiting_tasks", status="completed", has_external=True
                 )
             record = self._context.record(run_id)
             result = await self._context.drive_open_session(

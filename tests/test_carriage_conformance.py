@@ -195,33 +195,18 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "suspension",
         "reason",
         "loop.py:_apump_turn",
-        "turn.interrupted's data.reason is a *cause* vocabulary (\"user_stop\") while "
-        "Suspension.reason is a *park* vocabulary (\"interrupted\"), one word for two "
-        "vocabularies on one event; and the pause twin emits no turn.paused at all, only a "
-        "session.state.changed, so the two sibling parks are not observable the same way",
-        "burn-down",
-    ),
-    CarriageGap(
-        "run-status projection",
-        "limited",
-        "core/lifecycle.py:state_from_suspension",
-        "three mappers, three answers for one terminal budget-limited run: this one reports "
-        "FAILED (a terminal park arrives as reason=\"terminal\" and only error_code=\"cancelled\" "
-        "escapes that branch), session_state_from_run_status(\"limited\") reports LIMITED, and "
-        "LoopSession.close reports COMPLETED because it tests only for \"failed\". The state an "
-        "operator sees is decided by which surface they asked",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "status",
-        "reference/backend/recovery.py:run_recovered",
-        "constructs Suspension(status=\"running\"), which is outside the vocabulary every "
-        "durable reader accepts (core/result.py:suspension_from_checkpoint_payload admits only "
-        "completed/failed/limited). Latent because this synthetic park is re-driven and never "
-        "serialized — but nothing on the type says so, and the first code path that checkpoints "
-        "it raises at the recovery boundary it was built to serve",
-        "burn-down",
+        "BY DESIGN, and split out from the burn-down entry it used to share. turn.interrupted's "
+        "data.reason is a *cause* vocabulary (\"user_stop\") and Suspension.reason is a *park* "
+        "vocabulary (\"interrupted\"): one key name, two domains, deliberately. The event answers "
+        "\"why did this stop\", the park answers \"where is the run now\", the two value sets are "
+        "disjoint, and neither is derivable from the other — so a reader that joins them by name "
+        "is joining two different questions. Registered rather than deleted because the collision "
+        "is real and only a declaration keeps it from being 'fixed' into one vocabulary; "
+        "documented at core/schemas.py:turn.interrupted and in docs/CONTRACTS.md's event-reads "
+        "section. The other half of the old entry — the pause park emitting no turn-lane event at "
+        "all — was a genuine asymmetry and is closed: turn.paused now rides beside "
+        "turn.interrupted with the same cause vocabulary",
+        "by-design",
     ),
     # --- the success wire ---------------------------------------------------------------
     CarriageGap(
@@ -957,6 +942,30 @@ _DICT_READ_CALLS = frozenset(
         "tuple",  # iterates keys into a new tuple
     }
 )
+
+
+def test_every_exempted_callee_is_a_builtin() -> None:
+    """The "builtin that cannot reach a mutator" claim, mechanized rather than restated.
+
+    The justification above is what keeps this list a proof instead of a per-callee audit — and
+    it was prose. A helper named ``dict`` in the censused module, or a plain
+    ``_fold_counters`` added here because it "looked harmless when I read it", satisfied the
+    comment and defeated the rule. A name that does not resolve on ``builtins`` is not one this
+    list is allowed to exempt.
+    """
+
+    import builtins
+
+    unresolved = sorted(name for name in _DICT_READ_CALLS if not hasattr(builtins, name))
+    assert unresolved == [], {
+        "exempted_but_not_a_builtin": unresolved,
+        "hint": "the exemption list is 'builtins that read keys and return a new object'; a "
+        "project helper here is a per-callee audit, which is the hand transcription this "
+        "suite exists to stop trusting",
+    }
+    # ...and none of them is a mapping mutator that happens to live on builtins.
+    assert not _DICT_READ_CALLS & {"setattr", "vars", "exec", "eval", "delattr"}
+
 
 # The one non-builtin call a censused function hands a tracked dict to today, and the reason it
 # cannot simply be refused: it *is* the site :func:`_emit_data_keys` resolves the binding for
@@ -1756,6 +1765,11 @@ _UNREADABLE_BINDING_SOURCES: dict[str, str] = {
     # name bound to a dict this census had stopped being able to read.
     "a call that can mutate what it was handed": 'data = {"error": 1}\nenrich(data)\n',
     "an alias written through": 'data = {"error": 1}\nalias = data\nalias["attempt"] = 2\n',
+    # The emit exemption is keyed on an ATTRIBUTE call. A bare ``emit(data=x)`` — a module-level
+    # function that happens to share the method name — is an opaque callee like any other, and
+    # the two comments beside ``_CENSUSED_EMIT_ARGUMENT`` used to write it without the receiver,
+    # which reads as the opposite. Pinned so the narrow rule is a fact, not a description of one.
+    "a bare call sharing the emit method name": 'data = {"error": 1}\nemit(data=data)\n',
 }
 
 
@@ -4830,25 +4844,33 @@ def test_the_three_run_status_projections_differ_only_by_what_their_surface_carr
     assert backend == EVENT_CONSUMER_CORE
 
 
-def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
-    """Registered: one word, two vocabularies, on one event.
+def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
+    """Registered BY DESIGN: one key name, two vocabularies, on two sibling events.
 
-    ``data.reason`` on ``turn.interrupted`` names the CAUSE (``user_stop``); ``Suspension.reason``
-    names the PARK (``interrupted``). Pinned as the collision it is: the emit's literal and the
-    proof that its value is not a member of the park vocabulary it shares a field name with.
+    ``data.reason`` on ``turn.interrupted``/``turn.paused`` names the CAUSE (``user_stop`` /
+    ``user_pause``); ``Suspension.reason`` names the PARK (``interrupted`` / ``paused``). The
+    assertions are unchanged from when this was a burn-down entry — they pin the emit's literals
+    and the proof that neither value is a member of the park vocabulary it shares a field name
+    with — but what they pin is now a declared fact rather than a defect: merging the two would
+    make one field answer two questions.
+
+    The genuine half of the old entry is closed below: the pause park emits a turn-lane event of
+    its own now, so the two sibling parks ARE observable the same way.
     """
 
-    emitted = _emit_data_keys("loop.py", "turn.interrupted")
-    assert emitted == {"reason"}, {"emitted": sorted(emitted)}
-    values = _literal_dict_keys_where("loop.py", "reason", "user_stop")
-    assert len(values) == 1, {"turn_interrupted_reason_literals": len(values)}
-    assert values[0] == {"reason"}
-    assert "user_stop" not in _SUSPENSION_REASONS, {
-        "hint": "the two vocabularies merged: drop the registry entry",
-    }
-    assert "interrupted" in _SUSPENSION_REASONS
-    # The pause twin emits no event of its own, which is the other half of the entry.
-    assert not [
+    for event_type, cause in (("turn.interrupted", "user_stop"), ("turn.paused", "user_pause")):
+        emitted = _emit_data_keys("loop.py", event_type)
+        assert emitted == {"reason"}, {"event": event_type, "emitted": sorted(emitted)}
+        values = _literal_dict_keys_where("loop.py", "reason", cause)
+        assert len(values) == 1, {"event": event_type, "reason_literals": len(values)}
+        assert values[0] == {"reason"}
+        assert cause not in _SUSPENSION_REASONS, {
+            "event": event_type,
+            "hint": "the cause and park vocabularies merged — this entry says they must not",
+        }
+    assert {"interrupted", "paused"} <= _SUSPENSION_REASONS
+    # The asymmetry that WAS a defect: the pause park emitted only a session-lane event.
+    paused_emits = [
         node
         for node in ast.walk(_module_tree("loop.py"))
         if isinstance(node, ast.Call)
@@ -4857,7 +4879,21 @@ def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "turn.paused"
-    ], {"hint": "turn.paused exists now: the two parks are symmetric — drop the entry"}
+    ]
+    assert len(paused_emits) == 1, {
+        "turn_paused_emit_sites": len(paused_emits),
+        "hint": "the pause park's turn-lane event is the interrupt's twin: exactly one site",
+    }
+    # Both are declared event types with a data schema, and the schemas are the same shape.
+    from monoid_agent_kernel.core.events import AgentEventType
+    from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
+
+    assert {"turn.interrupted", "turn.paused"} <= set(get_args(AgentEventType))
+    assert (
+        EVENT_DATA_SCHEMAS["turn.paused"]["properties"]
+        == EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]
+    )
+    assert EVENT_DATA_SCHEMAS["turn.paused"]["additionalProperties"] is False
 
 
 def test_every_error_expression_the_result_payload_serves_is_filtered() -> None:
@@ -5117,11 +5153,14 @@ def test_both_terminal_paths_meter_the_run_through_one_seam() -> None:
         }
 
 
-def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
-    """Registered (round 2): one run, three surfaces, three states.
+def test_three_mappers_answer_a_terminal_limited_run_one_way() -> None:
+    """Was registered (round 2): one run, three surfaces, three states.
 
-    Pinned value-level on all three, so a fix to any one of them trips this census and forces
-    the semantic decision the divergence has been deferring.
+    ``state_from_suspension`` said FAILED, ``session_state_from_run_status("limited")`` said
+    LIMITED, and ``LoopSession.close`` said COMPLETED — for one budget- or validator-limited run.
+    LIMITED is canonical. Still pinned value-level on all three, because a *divergence* is what
+    this census exists to catch and the three are independent functions; and the cancel case is
+    pinned beside it, because the harmonization runs through the same branch cancel does.
     """
 
     from monoid_agent_kernel.core.lifecycle import (
@@ -5136,36 +5175,58 @@ def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
     )
 
     class _ClosingLoop:
-        def close(self) -> Any:
-            return dataclasses.replace(_maximal_turn(), status="limited")
+        def __init__(self, status: str, error_code: str = "") -> None:
+            self._status = status
+            self._error_code = error_code
 
-    session = LoopSession(loop=_ClosingLoop())  # type: ignore[arg-type]
-    session.close()
+        def close(self) -> Any:
+            return dataclasses.replace(
+                _maximal_turn(), status=self._status, error_code=self._error_code
+            )
+
+    def _closed(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_ClosingLoop(status, error_code))  # type: ignore[arg-type]
+        session.close()
+        return session.state
 
     verdicts = {
         "core/lifecycle.py:state_from_suspension": state_from_suspension(parked),
         "core/lifecycle.py:session_state_from_run_status": session_state_from_run_status(
             "limited", terminal=True
         ),
-        "core/lifecycle.py:LoopSession.close": session.state,
+        "core/lifecycle.py:LoopSession.close": _closed("limited"),
     }
-    assert verdicts == {
-        "core/lifecycle.py:state_from_suspension": SessionState.FAILED,
-        "core/lifecycle.py:session_state_from_run_status": SessionState.LIMITED,
-        "core/lifecycle.py:LoopSession.close": SessionState.COMPLETED,
-    }, {
+    assert set(verdicts.values()) == {SessionState.LIMITED}, {
         "verdicts": {name: value.value for name, value in verdicts.items()},
-        "hint": "harmonized? make them agree, update EXPECTED and drop the registry entry",
+        "hint": "three mappers over one run must not answer three ways again",
     }
-    # And LIMITED is a real state all three could have returned.
+    # Cancel still escapes to its own terminal state on all three, and a real failure to FAILED.
+    cancelled = Suspension(reason="terminal", status="limited", error_code="cancelled")
+    assert state_from_suspension(cancelled) is SessionState.CANCELLED
+    assert (
+        session_state_from_run_status("limited", error_code="cancelled", terminal=True)
+        is SessionState.CANCELLED
+    )
+    assert _closed("limited", "cancelled") is SessionState.CANCELLED
+    assert state_from_suspension(Suspension(reason="terminal", status="failed")) is (
+        SessionState.FAILED
+    )
+    assert _closed("failed") is SessionState.FAILED
+    assert _closed("completed") is SessionState.COMPLETED
+    # ...and ``close`` reaches them through the shared mapper rather than its own == test.
+    close_source = _live_source(LoopSession.close)
+    assert "session_state_from_run_status" in close_source, {
+        "hint": "a fourth hand-rolled terminal mapping is how the first three diverged",
+    }
     assert REASON_TO_STATE["limited"] is SessionState.LIMITED
 
 
-def test_gap_the_recovery_park_is_built_outside_the_durable_status_vocabulary() -> None:
-    """Registered (round 2): reference/backend/recovery.py mints Suspension(status="running").
+def test_the_recovery_park_is_built_inside_the_durable_status_vocabulary() -> None:
+    """Was registered (round 2): reference/backend/recovery.py minted Suspension(status="running").
 
-    Latent, and pinned as latent: the synthetic park is re-driven rather than serialized, so the
-    landmine is documented by showing what happens the first time something checkpoints it.
+    Latent — the synthetic park is re-driven rather than serialized — but nothing on the type said
+    so, and the first path that checkpointed it raised at the recovery boundary it exists to
+    serve. Pinned as the in-vocabulary mint plus a round-trip that now SUCCEEDS.
     """
 
     recovered = _function_node("reference/backend/recovery.py", "run_recovered")
@@ -5181,14 +5242,18 @@ def test_gap_the_recovery_park_is_built_outside_the_durable_status_vocabulary() 
         and node.func.id == "Suspension"
     ]
     assert minted == [
-        {"reason": "'awaiting_tasks'", "status": "'running'", "has_external": "True"}
+        {"reason": "'awaiting_tasks'", "status": "'completed'", "has_external": "True"}
     ], {"suspensions_minted_during_recovery": minted}
 
-    synthetic = Suspension(reason="awaiting_tasks", status="running", has_external=True)  # type: ignore[arg-type]
+    synthetic = Suspension(reason="awaiting_tasks", status="completed", has_external=True)
     payload = suspension_checkpoint_payload(synthetic)
-    assert payload["status"] == "running"
-    with pytest.raises(ValueError):
-        suspension_from_checkpoint_payload(payload)
+    assert payload["status"] == "completed"
+    assert suspension_from_checkpoint_payload(payload) == synthetic
+    # The vocabulary itself, so a widened reader does not quietly make this pin vacuous.
+    from monoid_agent_kernel.core.result import SUSPENSION_CHECKPOINT_STATUSES
+
+    assert SUSPENSION_CHECKPOINT_STATUSES == {"completed", "failed", "limited"}
+    assert "running" not in SUSPENSION_CHECKPOINT_STATUSES
 
 
 # --------------------------------------------------------------------------------------
@@ -5563,19 +5628,19 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
     # ``core/checkpoint.py`` and ``core/spec.py`` carry aliased facts under other names
     # (``provider_http_status``, an omitted ``generation`` block), so no headline-name scan
     # reaches them and they are registered without appearing in one.
-    alias_only = {
-        "core/checkpoint.py",
-        "core/spec.py",
-        # Registrations whose fact is not a headline wire field: the tool-service counters with
-        # no durable slot, the three disagreeing terminal-state mappers, a Suspension built
-        # outside the durable status vocabulary, and the cause-vs-park vocabulary collision on
-        # one event name. Each is pinned by its own assertion below; no name scan can reach them.
-        "core/lifecycle.py",
-        "reference/backend/recovery.py",
-        "loop.py",
-    }
+    # ``core/spec.py`` carries an aliased fact under another name (an omitted ``generation``
+    # block), so no headline-name scan reaches it and it is registered without appearing in one.
+    # This set is kept MINIMAL on purpose: an entry here that is also a scanned carrier reads as
+    # "no scan can reach this file", which stops being true the moment the file gains the field —
+    # exactly the stale-exemption drift the rest of this suite exists to catch.
+    alias_only = {"core/spec.py"}
     unaccounted = registered_paths - all_carriers - alias_only
     assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}
+    stale = alias_only & all_carriers
+    assert stale == set(), {
+        "exempted_but_actually_scanned": sorted(stale),
+        "hint": "a headline scan reaches this file now: drop its exemption",
+    }
     # Every family the census covers must not also be declared as one it does not.
     covered_families = {gap.family for gap in KNOWN_GAPS}
     declared_future = {family.family for family in FUTURE_FAMILIES}

@@ -1080,6 +1080,17 @@ redrive.
 
 ### Event Reads
 
+**`data.reason` is two vocabularies, on purpose.** On `turn.interrupted` and `turn.paused` it is a
+**cause** — what stopped the turn (`"user_stop"`, `"user_pause"`). On `Suspension.reason` (and on
+the durable `last_suspension` payload) it is a **park** — the state the session came to rest in
+(`"interrupted"`, `"paused"`, `"turn_failed"`, `"awaiting_tasks"`, `"settled"`, `"limited"`,
+`"terminal"`). The two sets are disjoint and neither is derivable from the other: the event answers
+*why did this stop*, the park answers *where is the run now*. A reader that joins them by field
+name is joining two different questions. The two turn-lane stop events are symmetric — a pause
+emits `turn.paused` exactly as a stop emits `turn.interrupted` — so a consumer watching the turn
+lane sees both parks; the `session.state.changed` event beside them carries the lifecycle
+projection.
+
 `GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.
 `from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
 with `from_seq=next_seq` to avoid duplicates; omitting `limit` preserves the historical "return all

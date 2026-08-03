@@ -23,9 +23,12 @@ from monoid_agent_kernel.core.lifecycle import (
     state_from_suspension,
     to_session_state,
 )
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.output_validator import ValidationOutcome
 from monoid_agent_kernel.core.result import Suspension
-from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -52,10 +55,32 @@ def test_terminal_reason_maps_to_failed() -> None:
     assert state_from_suspension(_suspension("terminal", status="failed")) is SessionState.FAILED
 
 
+def test_terminal_limited_maps_to_limited_on_every_mapper() -> None:
+    """One run, three surfaces, one answer.
+
+    A budget- or output-validator-limited terminal park used to project three different ways:
+    ``state_from_suspension`` said FAILED (the terminal branch read only ``error_code``),
+    ``session_state_from_run_status("limited")`` said LIMITED, and ``LoopSession.close`` said
+    COMPLETED (it tested only for ``"failed"``). The state an operator saw depended on which
+    surface they asked. LIMITED is canonical — the run hit a bound, it did not fail and it did
+    not succeed — and the three are asserted together so a fix to one of them cannot re-diverge.
+    """
+    parked = _suspension("terminal", status="limited", error_code="output_validator_unsatisfied")
+
+    assert state_from_suspension(parked) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", terminal=True) is SessionState.LIMITED
+    assert REASON_TO_STATE["limited"] is SessionState.LIMITED
+
+
 def test_cancel_terminal_maps_to_cancelled() -> None:
     # Cancel arrives as reason="terminal", status="limited", error_code="cancelled".
+    # Checked BEFORE the limited branch above, so the harmonization does not swallow a cancel.
     cancelled = _suspension("terminal", status="limited", error_code="cancelled")
     assert state_from_suspension(cancelled) is SessionState.CANCELLED
+    assert (
+        session_state_from_run_status("limited", error_code="cancelled", terminal=True)
+        is SessionState.CANCELLED
+    )
 
 
 def test_reason_map_covers_every_non_terminal_reason() -> None:
@@ -146,6 +171,68 @@ def test_facade_state_walks_created_idle_running_awaiting(tmp_path: Path) -> Non
     assert turn.final_text == "done"
     assert session.state is SessionState.AWAITING_INPUT
     result = session.close()
+    assert result.status == "completed"
+    assert session.state is SessionState.COMPLETED
+
+
+def test_closing_a_limited_run_reports_limited_not_completed(tmp_path: Path) -> None:
+    """The third mapper, driven end to end rather than asserted on a value.
+
+    ``close()`` tested ``status == "failed"`` and folded everything else into COMPLETED, so a run
+    that exhausted its output-validator budget — the exact case the LIMITED state exists for —
+    closed as a clean success on this surface while the pump's own projection said LIMITED.
+    """
+
+    class _RejectEverything:
+        id = "reject.all"
+        schema = None
+
+        def validate(self, view):  # noqa: ANN001, ANN202
+            del view
+            return ValidationOutcome(ok=False, feedback="never satisfied")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            limits=RunLimits(max_output_retries=0),
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")]),
+        runtime_config_provider=runtime_provider(
+            AgentRuntimeConfig(
+                definition_id="test-agent",
+                output_validators=(
+                    OutputValidatorBinding(validator_id="reject.all", enabled=True),
+                ),
+            )
+        ),
+        output_validators=(_RejectEverything(),),
+    )
+    session = LoopSession(loop)
+    session.open()
+
+    suspension = session.run_until_suspended("go")
+    assert suspension.status == "limited"
+    assert session.state is SessionState.LIMITED
+
+    result = session.close()
+
+    assert result.status == "limited"
+    assert session.state is SessionState.LIMITED, "close() folded a limited run into COMPLETED"
+
+
+def test_closing_a_clean_run_still_reports_completed(tmp_path: Path) -> None:
+    """The other half of the same routing change: nothing else moved."""
+
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    session = LoopSession(_loop(tmp_path, adapter))
+    session.open()
+    session.submit("go")
+
+    result = session.close()
+
     assert result.status == "completed"
     assert session.state is SessionState.COMPLETED
 
@@ -299,6 +386,33 @@ def test_session_state_changed_event_emitted_on_pause(tmp_path: Path) -> None:
     changed = [json.loads(line) for line in lines if json.loads(line)["type"] == "session.state.changed"]
     assert changed, "expected a session.state.changed event"
     assert changed[-1]["data"]["state"] == "paused"
+
+
+def test_pause_emits_a_turn_lane_event_like_its_interrupt_twin(tmp_path: Path) -> None:
+    """The pause park emitted only the session-lane event; the stop park emitted both.
+
+    Two sibling parks, and a consumer watching the turn lane saw one of them. ``turn.paused``
+    carries the same shape as ``turn.interrupted`` — a CAUSE (`"user_pause"`), not a
+    ``Suspension.reason`` — and is bound to the turn it froze.
+    """
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    session.run_until_suspended("go")
+
+    events_path = tmp_path / "runs" / spec.run_id / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    paused = [event for event in events if event["type"] == "turn.paused"]
+    assert len(paused) == 1, "expected exactly one turn.paused"
+    assert paused[0]["data"] == {"reason": "user_pause"}
+    assert paused[0]["turn_id"], "the pause event names the turn it froze"
+    # Ordered ahead of the lifecycle projection, like turn.failed is ahead of its park.
+    types = [event["type"] for event in events]
+    assert types.index("turn.paused") < types.index("session.state.changed")
+    # ...and the finished run's whole artifact set still validates, which is what makes the new
+    # event type a DECLARED one rather than a string the schema walks past.
+    session.resume()
+    session.close()
+    assert validate_run_dir(spec.run_root / spec.run_id) == []
 
 
 def test_pause_survives_restart_via_checkpoint(tmp_path: Path) -> None:

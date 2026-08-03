@@ -70,16 +70,24 @@ REASON_TO_STATE: dict[str, SessionState] = {
 def state_from_suspension(suspension: Suspension) -> SessionState:
     """Project a pump ``Suspension`` onto a ``SessionState``.
 
-    ``"terminal"`` always means the loop set ``_Session.terminal=True`` — a dead run.
-    Cancel arrives as ``reason="terminal"`` with ``error_code="cancelled"`` and maps to
-    the distinct ``CANCELLED`` state; any other terminal maps to ``FAILED``. (Clean
-    ``COMPLETED`` is reached only via ``close()`` returning a successful
-    ``AgentRunResult``, never via a ``Suspension``.)
+    ``"terminal"`` always means the loop set ``_Session.terminal=True`` — a dead run. Its
+    ``status`` then decides which terminal state, because the park carries the answer and
+    guessing produced three of them: this function reported ``FAILED``,
+    ``session_state_from_run_status("limited")`` reported ``LIMITED`` and ``LoopSession.close``
+    reported ``COMPLETED``, for one budget-limited run. ``LIMITED`` is canonical.
+
+    Cancel arrives as ``reason="terminal"``, ``status="limited"``, ``error_code="cancelled"`` and
+    still maps to the distinct ``CANCELLED`` state — checked first, exactly as before. A terminal
+    ``status="limited"`` otherwise maps to ``LIMITED`` (a budget or output-validator exhaustion is
+    not a failure), and anything else to ``FAILED``. (Clean ``COMPLETED`` is reached only via
+    ``close()`` returning a successful ``AgentRunResult``, never via a ``Suspension``.)
     """
     if suspension.reason == "terminal":
-        return (
-            SessionState.CANCELLED if suspension.error_code == "cancelled" else SessionState.FAILED
-        )
+        if suspension.error_code == "cancelled":
+            return SessionState.CANCELLED
+        if suspension.status == "limited":
+            return SessionState.LIMITED
+        return SessionState.FAILED
     try:
         return REASON_TO_STATE[suspension.reason]
     except KeyError as exc:  # pragma: no cover - guards a future unmapped reason
@@ -93,7 +101,20 @@ def state_from_suspension(suspension: Suspension) -> SessionState:
 #: this table before assigning. Terminal states have an empty out-set. The table is
 #: permissive about ``COMPLETED`` / ``FAILED`` from any live state because ``close()`` and
 #: ``cancel()`` can finalize a run from any non-terminal park.
-_LIVE_FINALIZE = frozenset({SessionState.COMPLETED, SessionState.FAILED, SessionState.CANCELLED})
+# ``LIMITED`` joins the finalize set because ``close()`` can now land there: a terminal
+# budget- or validator-limited result maps to LIMITED rather than being folded into COMPLETED,
+# and the state a limited close produces has to be reachable from whichever park the run was
+# sitting in when it was closed. (LIMITED is still not in ``TERMINAL_STATES``: the vocabulary
+# value is shared by a live limited park and a terminal limited result, and a live one is
+# resumable — which is why it keeps a ``RUNNING`` out-edge of its own below.)
+_LIVE_FINALIZE = frozenset(
+    {
+        SessionState.COMPLETED,
+        SessionState.FAILED,
+        SessionState.CANCELLED,
+        SessionState.LIMITED,
+    }
+)
 LEGAL_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
     SessionState.CREATED: frozenset({SessionState.IDLE}) | _LIVE_FINALIZE,
     SessionState.IDLE: frozenset({SessionState.RUNNING}) | _LIVE_FINALIZE,
@@ -402,7 +423,17 @@ class LoopSession:
     def close(self) -> Any:
         result = self.loop.close()
         status = getattr(result, "status", "completed")
-        self._set_state(SessionState.FAILED if status == "failed" else SessionState.COMPLETED)
+        # Routed through the one mapper rather than an ``== "failed"`` test. That test folded
+        # every non-failed terminal into COMPLETED, so a budget- or validator-limited run — the
+        # exact case the LIMITED state exists for — closed as a clean success, while the two
+        # other mappers over the same run answered FAILED and LIMITED.
+        self._set_state(
+            session_state_from_run_status(
+                status,
+                error_code=getattr(result, "error_code", "") or "",
+                terminal=True,
+            )
+        )
         return result
 
     # --- control: pause / resume / cancel ---------------------------------------------

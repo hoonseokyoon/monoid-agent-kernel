@@ -1644,6 +1644,17 @@ class AgentLoop:
             # pending_observations + the step counter), so a paused run also survives a restart.
             # ``status`` is cosmetic here; branch on ``reason``.
             self._pause_requested = False
+            # The turn-lane twin of ``turn.interrupted``, and the same CAUSE vocabulary. Without
+            # it the two sibling parks were not observable the same way: a stop emitted a
+            # turn-lane event and a pause emitted only the session-lane one below, so a consumer
+            # watching turns saw one park and not the other.
+            res.recorder.emit(
+                "turn.paused",
+                turn_id=session.active_turn_id,
+                parent_id=session.active_turn_parent_id,
+                data={"reason": "user_pause"},
+                level="info",
+            )
             # Literal state names keep the engine decoupled from the FSM module (the lifecycle
             # layer sits ABOVE the loop); they match SessionState.RUNNING/PAUSED values.
             res.recorder.emit(

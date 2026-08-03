@@ -207,9 +207,22 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=("error_code",),
     ),
+    # ``reason`` here is a CAUSE vocabulary — what stopped the turn ("user_stop") — and it is
+    # deliberately NOT ``Suspension.reason``, which is a PARK vocabulary naming the state the
+    # session came to rest in ("interrupted"). One key name, two domains, on purpose: the event
+    # answers "why did this stop", the park answers "where is the run now". A reader that joins
+    # them by name is reading two different questions. See docs/CONTRACTS.md, event reads.
     "turn.interrupted": _data_schema(
         {"reason": _STR},
         required=(),
+    ),
+    # The interrupt's twin, and the same cause vocabulary ("user_pause"). The pause park used to
+    # emit no event of its own — only a ``session.state.changed`` — so two sibling parks were not
+    # observable the same way: a consumer watching the turn lane saw the stop and missed the
+    # pause. Observability only; no projection consumes it.
+    "turn.paused": _data_schema(
+        {"reason": _STR},
+        required=("reason",),
     ),
     "model.output.delta": _data_schema(
         {"text": _STR},
