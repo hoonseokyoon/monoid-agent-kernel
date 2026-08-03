@@ -1752,8 +1752,12 @@ competing input.
   classification (`retryable`, `http_status`, `config_recoverable`,
   `provider_error_code`, `provider_retried`). `turn` is excluded by design — it is a
   projection artifact of local paths and metrics, and a recovery driver needs only the
-  boundary facts to return the same park. Every key is optional on read: an absent one
-  takes the default, which is what a checkpoint written before that key existed meant.
+  boundary facts to return the same park. `reason` and `status` are required and must be members
+  of the park and durable-status vocabularies; every other key is optional on read, and an absent
+  one takes the default, which is what a checkpoint written before that key existed meant. The
+  payload is schema-checked at the recovery boundary (types, vocabularies) rather than at the
+  reader, and the same schema applies to the copy stored under
+  `applied_input_receipts[<input_id>].suspension`.
 - `CheckpointStore` (protocol): `put(checkpoint, blobs)` commits **atomically** and
   flips a `LATEST` pointer last (a half-written checkpoint is never returned);
   `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
@@ -1780,6 +1784,21 @@ competing input.
   `runtime_config` restored, remaining duration carried forward (downtime does not
   count against `max_duration_s`), and any shell job left `running` on disk folded in
   as a failed observation.
+- **Durable cancellation:** `cancellation_requested` is written into every snapshot whenever the
+  run's cancellation token was cancelled, and `restore()` honors it *unconditionally* — if the
+  restored loop has no `cancellation_token`, one is minted and cancelled, so the next boundary
+  check raises `RunCancelled`. The flag is the request; the token is only the channel a boundary
+  check reads it through. A recovery driver that rebuilds an `AgentLoop` without passing a token
+  (the ordinary shape) therefore cannot silently un-cancel a run whose cancellation was durable.
+  An embedder that deliberately re-runs a cancelled checkpoint clears
+  `checkpoint.cancellation_requested` before restoring.
+- The snapshot also carries the **output-validator repair state** (`output_retries` *and*
+  `output_failure_history`, so a restored mid-repair run continues its attempt numbering and
+  keeps `failures_by_validator` in `metrics.json`) and the **delegation roll-ups**
+  (`subagent_count`, `subagent_usage`, `skill_activation_count`, `skills_activated`), which are
+  restored onto the rebuilt tool context so `metrics.json` reports one epoch rather than
+  pre-restart token totals beside post-restart subagent counts. The per-activation tool
+  *service* counters (shell/web call counts) are not durable and restart at zero.
 - `AgentLoop.release_parked()` closes recorder/sink and process-local loop resources after a
   durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh

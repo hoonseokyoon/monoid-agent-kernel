@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION,
     LocalFsCheckpointStore,
     RunCheckpoint,
+    _validate_checkpoint_payload,
     decode_checkpoint,
     read_checkpoint,
     read_checkpoint_checked,
@@ -1162,6 +1163,90 @@ def test_restore_reads_pre_v020_runtime_config_scope_from_checkpoint(tmp_path: P
         "monoid.literal-bang.v1"
     )
     loop.close()
+
+
+def test_a_malformed_park_payload_is_refused_at_the_recovery_boundary(tmp_path: Path) -> None:
+    """``last_suspension`` used to be validated as "an object or null" and nothing more.
+
+    So a park payload with a ``status`` outside the durable vocabulary, or a string
+    ``retryable``, travelled all the way to ``suspension_from_checkpoint_payload`` — where it
+    became a ValueError from a different module, or for the bools silently did not become
+    anything at all. Refused here instead, at the boundary that owns the artifact.
+    """
+    park = suspension_checkpoint_payload(
+        Suspension(reason="turn_failed", status="failed", retryable=True, http_status=429)
+    )
+    write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1", last_suspension=dict(park)))
+    restored = read_checkpoint(tmp_path)
+    assert restored is not None
+    assert suspension_from_checkpoint_payload(restored.last_suspension).retryable is True
+
+    for broken in ({**park, "status": "running"}, {**park, "retryable": "yes"}):
+        payload = json.loads(
+            (tmp_path / "checkpoint.json").read_text(encoding="utf-8")
+        )
+        payload["last_suspension"] = broken
+        (tmp_path / "checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
+        # The reader never raises — it reports. "corrupt" is the refusal.
+        assert read_checkpoint_checked(tmp_path).status == "corrupt", broken
+        assert read_checkpoint(tmp_path) is None
+        with pytest.raises(ValueError):
+            _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": broken})
+
+    # A pre-v0.21 park payload carries only what the reader requires and still loads.
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    payload["last_suspension"] = {"reason": "settled", "status": "completed"}
+    (tmp_path / "checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
+    legacy = read_checkpoint(tmp_path)
+    assert legacy is not None and legacy.last_suspension == {
+        "reason": "settled",
+        "status": "completed",
+    }
+
+
+def test_metrics_after_a_restore_report_one_epoch_not_two(tmp_path: Path) -> None:
+    """The RunState counters rode the snapshot; the context-owned ones did not.
+
+    ``loop_phases.build_metrics`` writes both families into one ``metrics.json``, so a restored
+    run reported pre-restart token totals beside post-restart subagent and skill counts — an
+    artifact mixing two epochs with nothing saying which is which.
+    """
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+
+    loop.restore(
+        RunCheckpoint(
+            run_id=spec.run_id,
+            seq=1,
+            total_usage={"input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
+            total_tool_calls=3,
+            subagent_count=2,
+            subagent_usage={"input_tokens": 30, "output_tokens": 5, "total_tokens": 35},
+            skill_activation_count=1,
+            skills_activated=["lecture-note"],
+        )
+    )
+    context = loop._session.res.context  # type: ignore[union-attr]
+    assert context.subagent_count == 2
+    assert context.skills_activated == ["lecture-note"]
+
+    loop.run_until_suspended("go")
+    result = loop.close()
+
+    metrics = json.loads((result.run_dir / "metrics.json").read_text(encoding="utf-8"))
+    # The pre-restart epoch, on both families of counter rather than one.
+    assert metrics["tool_calls"] == 3
+    assert metrics["input_tokens"] >= 40
+    assert metrics["subagent_count"] == 2
+    assert metrics["subagent_usage"]["total_tokens"] == 35
+    assert metrics["skill_activation_count"] == 1
+    assert metrics["skills_activated"] == ["lecture-note"]
+    # ...and the next snapshot carries them forward, so a second restart is not a second reset.
+    assert result.metrics["subagent_count"] == 2
 
 
 def _mk(path: Path) -> Path:

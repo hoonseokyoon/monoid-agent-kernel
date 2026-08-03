@@ -2450,7 +2450,17 @@ class AgentLoop:
             ),
             total_tool_calls=state.total_tool_calls,
             output_retries=state.output_retries,
+            # The budget's evidence, beside the budget. Restoring the counter without the
+            # history renumbered a mid-repair run's attempts from 1 and dropped
+            # failures_by_validator out of metrics.json.
+            output_failure_history=[dict(entry) for entry in state.output_failure_history],
             total_usage=dict(state.total_usage),
+            # The AgentToolContext-owned roll-ups, so metrics.json reports one epoch rather
+            # than pre-restart token totals beside post-restart subagent/skill counts.
+            subagent_count=res.context.subagent_count,
+            subagent_usage=dict(res.context.subagent_usage),
+            skill_activation_count=res.context.skill_activation_count,
+            skills_activated=list(res.context.skills_activated),
             messages=list(state.messages),
             session_step=session.session_step,
             submit_local_step=session.submit_local_step,
@@ -2674,6 +2684,7 @@ class AgentLoop:
             previous_runtime_config=previous_runtime_config,
             total_tool_calls=cp.total_tool_calls,
             output_retries=cp.output_retries,
+            output_failure_history=[dict(entry) for entry in cp.output_failure_history],
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
@@ -2684,6 +2695,13 @@ class AgentLoop:
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
         )
+        # The context-owned roll-ups, restored beside their RunState twins above so
+        # ``build_metrics`` reports one epoch. The context is rebuilt per activation, so these
+        # are the only counters on it that have a durable slot at all.
+        res.context.subagent_count = cp.subagent_count
+        res.context.subagent_usage = dict(cp.subagent_usage)
+        res.context.skill_activation_count = cp.skill_activation_count
+        res.context.skills_activated = list(cp.skills_activated)
         # Reinstall durable (approved) capability leases so a human-approved capability is not
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:
@@ -2759,7 +2777,17 @@ class AgentLoop:
         crashed = self._crashed_shell_observations(res)
         if crashed:
             state.pending_observations = state.pending_observations + crashed
-        if cp.cancellation_requested and self.cancellation_token is not None:
+        if cp.cancellation_requested:
+            # Unconditional. ``snapshot()`` writes this flag whenever the token was cancelled,
+            # and the restore used to apply it only when a token was already installed — so a
+            # recovery driver that rebuilds the loop without one (the ordinary shape: a fresh
+            # AgentLoop has ``cancellation_token=None``) silently un-cancelled a run whose
+            # cancellation was durable. Minting here matches ``astream`` above and
+            # ``LoopSession.cancel``: the flag is the request, the token is only the channel a
+            # boundary check reads it through. An embedder deliberately re-running a cancelled
+            # checkpoint clears ``cancellation_requested`` before restoring.
+            if self.cancellation_token is None:
+                self.cancellation_token = CancellationToken()
             self.cancellation_token.cancel()
 
     @staticmethod

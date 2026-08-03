@@ -133,7 +133,10 @@ class Suspension:
     provider_retried: bool = False
 
 
-_SUSPENSION_REASONS = frozenset(
+# The park vocabulary and the durable status vocabulary, one definition each. Public because the
+# checkpoint validator schema-checks the park payload against exactly what the reader below
+# accepts — a second hand-copy of either set is how the two ends drift apart.
+SUSPENSION_REASONS = frozenset(
     {
         "settled",
         "awaiting_tasks",
@@ -144,6 +147,10 @@ _SUSPENSION_REASONS = frozenset(
         "paused",
     }
 )
+SUSPENSION_CHECKPOINT_STATUSES = frozenset({"completed", "failed", "limited"})
+
+# Retained spelling for the in-module readers below and for existing importers.
+_SUSPENSION_REASONS = SUSPENSION_REASONS
 
 
 def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
@@ -174,9 +181,9 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
 
     reason = parse_str(payload, "reason")
     status = parse_str(payload, "status")
-    if reason not in _SUSPENSION_REASONS:
+    if reason not in SUSPENSION_REASONS:
         raise ValueError(f"unsupported durable suspension reason: {reason!r}")
-    if status not in {"completed", "failed", "limited"}:
+    if status not in SUSPENSION_CHECKPOINT_STATUSES:
         raise ValueError(f"unsupported durable suspension status: {status!r}")
     raw_task_ids = optional_list(payload, "awaiting_task_ids")
     if any(not isinstance(task_id, str) for task_id in raw_task_ids):

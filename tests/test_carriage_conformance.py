@@ -223,15 +223,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "it raises at the recovery boundary it was built to serve",
         "burn-down",
     ),
-    CarriageGap(
-        "suspension",
-        "last_suspension",
-        "core/checkpoint.py:_validate_checkpoint_payload",
-        "the durable park payload is validated as \"an object or null\" and nothing more — it "
-        "has no schema of its own, so every field the census pins on the writer/reader pair is "
-        "unpinned on the durable artifact itself; this suite is currently its only twin",
-        "burn-down",
-    ),
     # --- the success wire ---------------------------------------------------------------
     CarriageGap(
         "success-envelope",
@@ -258,37 +249,25 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     # --- checkpoint carriage: what the snapshot leaves behind ---------------------------
     # Hand-found cells of the family FUTURE_FAMILIES declares as "run-state -> checkpoint
     # carriage": there is no census diffing ``snapshot()``'s written key set against the live
-    # RunState + tool context, so these three were found one at a time and are pinned one at a
-    # time.
+    # RunState + tool context, so these were found one at a time and are pinned one at a time.
     CarriageGap(
         "checkpoint",
-        "output_failure_history",
+        "shell_calls/web_search_calls/total_shell_duration_s (tool-service counters)",
         "loop.py:snapshot",
-        "the sibling of a checkpointed field is not checkpointed: output_retries rides the "
-        "snapshot and its history does not, so a run restored mid-repair renumbers its attempts "
-        "from an empty history and loses failures_by_validator — the retry BUDGET survives and "
-        "the evidence the budget was spent on does not",
-        "burn-down",
-    ),
-    CarriageGap(
-        "checkpoint",
-        "subagent_count/subagent_usage/skill_activation_count",
-        "loop.py:snapshot",
-        "the context-owned counters have no checkpoint slot although their RunState twins "
-        "(total_usage, total_tool_calls) do, and loop_phases.py:build_metrics writes all of "
-        "them into one metrics.json — so a restored run reports pre-restart token totals beside "
-        "post-restart subagent and skill counts, an artifact mixing two epochs with nothing "
-        "saying which is which",
-        "burn-down",
-    ),
-    CarriageGap(
-        "checkpoint",
-        "cancellation_requested",
-        "loop.py:_rehydrate",
-        "asymmetric write/read: snapshot() records the flag unconditionally, and the restore "
-        "applies it only when a cancellation token is already installed on the loop. A recovery "
-        "driver that rebuilds the loop without one silently un-cancels a run whose cancellation "
-        "was durable",
+        "NARROWED from the context-counter entry the burn-down closed. The AgentToolContext's "
+        "own roll-ups (subagent_count/subagent_usage/skill_activation_count/skills_activated) "
+        "are checkpointed and restored now, but loop_phases.py:build_metrics also splats three "
+        "SERVICE metric blocks into the same metrics.json — ShellService.metrics(), "
+        "WebService.metrics() and JobsService.background_metrics() — and the first two have no "
+        "durable slot at all, so those columns still restart at zero while the token totals "
+        "beside them are cumulative. Not fixed rather than fake-fixed: the services are rebuilt "
+        "per activation and their counters are ~12 heterogeneous fields (ints, a duration float, "
+        "a per-binding dict), so an honest fix is a service-owned checkpoint payload with its "
+        "own validation bucket, not five more scalars on RunCheckpoint. The jobs block is the "
+        "exception and the reason this is narrow rather than absent: it is DERIVED from "
+        "job_manager.list_jobs(), whose hosted tasks the checkpoint already carries — only the "
+        "shell BackgroundJobs it also counts are unrestorable, and tasks.py documents why (a "
+        "subprocess cannot cross a process boundary)",
         "burn-down",
     ),
     # --- checkpoint validation ---------------------------------------------------------
@@ -3883,9 +3862,12 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
         "pending_user_input",
         "previous_runtime_config",
         "workspace_base",
+        # No longer "an object or null": the park payload has a schema of its own now
+        # (``_validate_suspension_payload``), shared with the receipt copy below.
         "last_suspension",
         "tool_call_counts",
         "total_usage",
+        "subagent_usage",
         "revoked_before",
         "remaining_duration_s",
         "queued_messages",
@@ -3915,6 +3897,10 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "output_retries",
             "session_step",
             "submit_local_step",
+            # The context-owned roll-ups, checkpointed in the burn-down so metrics.json
+            # reports one epoch rather than two.
+            "subagent_count",
+            "skill_activation_count",
         }
     ),
     "_CHECKPOINT_BOOL_FIELDS": frozenset({"terminal", "revoked_all", "cancellation_requested"}),
@@ -3928,6 +3914,8 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "pending_capability_replays",
             "pending_tool_approval_replays",
             "outbox_requests",
+            # The evidence behind ``output_retries``, which rode this snapshot without it.
+            "output_failure_history",
         }
     ),
     "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
@@ -3939,6 +3927,7 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "revoked_capabilities",
             "inbox_seen_ids",
             "applied_input_ids",
+            "skills_activated",
         }
     ),
 }
@@ -4044,20 +4033,78 @@ def test_6a_the_inline_branches_named_here_are_the_branches_that_exist() -> None
     }
 
 
-def test_6b_the_park_payload_is_validated_as_an_object_and_nothing_more() -> None:
-    """The registered gap, pinned: ``last_suspension`` has no schema of its own.
+def test_6b_the_park_payload_has_a_schema_and_both_of_its_carriers_share_it() -> None:
+    """Was registered: ``last_suspension`` was validated as "an object or null" and no more.
 
-    Every field family 1 pins on the writer/reader pair is unpinned on the durable artifact —
-    the validator accepts any object at all, so a park payload with a string ``retryable``
-    reaches the reader, which is where it becomes a ValueError instead of a clear rejection.
+    Every field family 1 pins on the writer/reader pair was unpinned on the durable artifact, so
+    a park payload with a string ``retryable`` or an out-of-vocabulary ``status`` reached
+    ``suspension_from_checkpoint_payload`` — where it became a ValueError from another module, or
+    for the bools silently did not.
+
+    Pinned on BOTH carriers of one payload shape. The receipt copy
+    (``applied_input_receipts[*].suspension``) is written by the same
+    ``suspension_checkpoint_payload`` and read back by the same reader (the DBOS run driver does
+    exactly that), and it had the identical weaker check.
     """
 
     from monoid_agent_kernel.core.checkpoint import _validate_checkpoint_payload
 
-    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": {"anything": [1, 2, 3]}})
+    park = suspension_checkpoint_payload(_maximal_suspension())
+    receipt = {"r-1": {"suspension": dict(park)}}
+
+    def _both(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """One park payload, in each of the two places a checkpoint can carry it."""
+
+        return [
+            {"run_id": "run_1", "last_suspension": payload},
+            {"run_id": "run_1", "applied_input_receipts": {"r-1": {"suspension": payload}}},
+        ]
+
+    # The real writer's output validates, and so does an explicit null / an absent field.
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": dict(park)})
+    _validate_checkpoint_payload({"run_id": "run_1", "applied_input_receipts": receipt})
     _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": None})
+    _validate_checkpoint_payload({"run_id": "run_1"})
+    # A pre-v0.21 payload carries only what the reader requires; absence stays legal.
+    for candidate in _both({"reason": "settled", "status": "completed"}):
+        _validate_checkpoint_payload(candidate)
+
+    refused: list[dict[str, Any]] = [
+        {"anything": [1, 2, 3]},  # what the old "object or null" check accepted
+        {**park, "status": "running"},  # outside the durable status vocabulary
+        {**park, "reason": "unparked"},  # outside the park vocabulary
+        {**park, "retryable": "yes"},  # the mistyped bool the reader would have coerced
+        {**park, "config_recoverable": 1},
+        {**park, "provider_retried": "true"},
+        {**park, "error_code": 500},
+        {**park, "http_status": "429"},
+        {**park, "awaiting_task_ids": [1, 2]},
+    ]
+    for payload in refused:
+        for candidate in _both(payload):
+            with pytest.raises(ValueError):
+                _validate_checkpoint_payload(candidate)
     with pytest.raises(ValueError):
         _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": "not an object"})
+
+    # The vocabularies are the reader's own, not a hand copy beside it.
+    from monoid_agent_kernel.core import checkpoint as checkpoint_module
+
+    validator = _function_node("core/checkpoint.py", "_validate_suspension_payload")
+    imported = {
+        alias.name
+        for node in ast.walk(validator)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert {"SUSPENSION_REASONS", "SUSPENSION_CHECKPOINT_STATUSES"} <= imported, {
+        "hint": "a hand copy of either vocabulary is how the validator and the reader drift",
+    }
+    assert not [
+        name
+        for name, value in vars(checkpoint_module).items()
+        if isinstance(value, frozenset) and _SUSPENSION_REASONS <= value
+    ], {"hint": "the park vocabulary got a second definition in the validator's module"}
 
 
 # --------------------------------------------------------------------------------------
@@ -4888,33 +4935,53 @@ def _snapshot_written_keys() -> frozenset[str]:
     return frozenset(keyword.arg for keyword in calls[0].keywords if keyword.arg)
 
 
-def test_gap_the_snapshot_omits_the_siblings_of_the_fields_it_writes() -> None:
-    """Registered (round 2, three cells of the uncensused run-state carriage family)."""
+def _rehydrate_read_attributes() -> frozenset[str]:
+    """The ``cp.<field>`` reads ``loop.py:_rehydrate`` makes off the checkpoint."""
+
+    return _attribute_reads_on(_function_node("loop.py", "_rehydrate"), "cp")
+
+
+def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_write() -> None:
+    """Was registered (round 2, three cells of the uncensused run-state carriage family).
+
+    Two of the three closed here: the retry budget's evidence, and the context-owned roll-ups
+    metrics.json reports beside the RunState totals. Pinned on all three legs — the checkpoint
+    field, the snapshot write, and the restore read — because a field written and never read back
+    is a snapshot that grew without the restore noticing.
+    """
 
     from monoid_agent_kernel.core.checkpoint import RunCheckpoint
     from monoid_agent_kernel.loop import AgentToolContext, RunState
 
     written = _snapshot_written_keys()
+    restored = _rehydrate_read_attributes()
     state_fields = {field.name for field in dataclasses.fields(RunState)}
     context_fields = {field.name for field in dataclasses.fields(AgentToolContext)}
 
-    # (a) output_retries rides; its history does not.
+    # (a) output_retries rides, and so does the history the attempt numbering is derived from.
     assert {"output_retries", "output_failure_history"} <= state_fields
-    assert "output_retries" in written
-    assert "output_failure_history" not in written, {
-        "hint": "checkpointed now? add it to RunCheckpoint's census and drop the registry entry",
-    }
-    assert "output_failure_history" not in RunCheckpoint.__dataclass_fields__
+    assert {"output_retries", "output_failure_history"} <= written
+    assert {"output_retries", "output_failure_history"} <= restored
+    assert "output_failure_history" in RunCheckpoint.__dataclass_fields__
 
-    # (b) the RunState counters ride; the context-owned ones do not, and metrics.json mixes them.
-    context_counters = {"subagent_count", "subagent_usage", "skill_activation_count"}
+    # (b) the context-owned counters ride beside their RunState twins, so metrics.json reports
+    # one epoch rather than pre-restart totals beside post-restart subagent and skill counts.
+    context_counters = {
+        "subagent_count",
+        "subagent_usage",
+        "skill_activation_count",
+        "skills_activated",
+    }
     assert context_counters <= context_fields
     assert {"total_usage", "total_tool_calls"} <= written
-    assert context_counters.isdisjoint(written), {
-        "carried_now": sorted(context_counters & written),
-        "hint": "one epoch at last: drop the registry entry",
+    assert context_counters <= written, {
+        "still_dropped": sorted(context_counters - written),
+        "hint": "one epoch: every counter build_metrics reads must survive the restart",
     }
-    assert context_counters.isdisjoint(RunCheckpoint.__dataclass_fields__)
+    assert context_counters <= restored, {
+        "written_but_never_read_back": sorted(context_counters - restored),
+    }
+    assert context_counters <= set(RunCheckpoint.__dataclass_fields__)
     metrics_names = _names_in(
         _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
     )
@@ -4922,9 +4989,46 @@ def test_gap_the_snapshot_omits_the_siblings_of_the_fields_it_writes() -> None:
         "hint": "these are the counters that reach metrics.json beside the restored totals",
     }
 
+    # (c) still open, narrowed: the tool SERVICE counters. ``build_metrics`` splats three
+    # service metrics blocks into the same file and none of them has a checkpoint slot.
+    service_metric_keys = {
+        "shell_calls",
+        "failed_shell_calls",
+        "total_shell_duration_s",
+        "web_search_calls",
+        "web_fetch_calls",
+    }
+    assert service_metric_keys.isdisjoint(RunCheckpoint.__dataclass_fields__), {
+        "carried_now": sorted(service_metric_keys & set(RunCheckpoint.__dataclass_fields__)),
+        "hint": "the narrowed registry entry says these have no durable slot: update both",
+    }
+    splatted = {
+        ast.unparse(value)
+        for node in ast.walk(
+            _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+        )
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if key is None
+    }
+    assert {
+        "context.shell_service.metrics()",
+        "context.jobs_service.background_metrics()",
+        "context.web_service.metrics()",
+    } <= splatted, {
+        "metrics_blocks_splatted": sorted(splatted),
+        "hint": "the narrowed entry names these three service blocks",
+    }
 
-def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally() -> None:
-    """Registered (round 2): a restore without a token un-cancels a durably-cancelled run."""
+
+def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
+    """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
+
+    The flag is the request; the token is only the channel a boundary check reads it through. So
+    the restore mints one when the loop has none, exactly as ``astream`` and ``LoopSession.cancel``
+    do — pinned as "the guard is the flag alone, and a token is minted", because re-introducing a
+    token precondition anywhere in that branch restores the defect.
+    """
 
     assert "cancellation_requested" in _snapshot_written_keys()
     restore = _function_node("loop.py", "_rehydrate")
@@ -4933,11 +5037,29 @@ def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally()
         for node in ast.walk(restore)
         if isinstance(node, ast.If) and "cancellation_requested" in ast.unparse(node.test)
     ]
-    assert guards == ["cp.cancellation_requested and self.cancellation_token is not None"], {
+    assert guards == ["cp.cancellation_requested"], {
         "restore_guards": guards,
-        "hint": "the read is unconditional now (or the guard changed): update EXPECTED and drop "
-        "the registry entry",
+        "hint": "a second condition on this branch is the asymmetry that was closed",
     }
+    minting = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CancellationToken"
+    ]
+    assert minting == ["CancellationToken()"], {
+        "tokens_minted_during_restore": minting,
+        "hint": "without minting, a loop rebuilt with no token silently un-cancels the run",
+    }
+    cancels = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cancel"
+    ]
+    assert cancels == ["self.cancellation_token.cancel()"], {"cancel_calls": cancels}
 
 
 def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
@@ -5220,6 +5342,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # Joined in the burn-down: the immutable record of one call, the live stream lane
             # (outcome type, sidecar writer/reader) that used to classify with half the
             # vocabulary.
+            # Joined in the burn-down's durable batch: the park payload has a schema now, and
+            # this is one of the fields it type-checks.
+            "core/checkpoint.py",
             "core/model_content.py",
             "core/model_io.py",
             "core/model_stream.py",
@@ -5245,6 +5370,8 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     "provider_retried": frozenset(
         {
             "contracts.py",
+            # Joined in the burn-down's durable batch: see config_recoverable above.
+            "core/checkpoint.py",
             "core/model_io.py",
             # Joined in the burn-down: the park type that records the failed turn, its event
             # schema, and the loop that writes both plus the two transcript records.
@@ -5439,10 +5566,10 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
     alias_only = {
         "core/checkpoint.py",
         "core/spec.py",
-        # Registrations whose fact is not a headline wire field: the three disagreeing
-        # terminal-state mappers, a Suspension built outside the durable status vocabulary, and
-        # the cause-vs-park vocabulary collision on one event name. Each is pinned by its own
-        # assertion below; no name scan can reach them.
+        # Registrations whose fact is not a headline wire field: the tool-service counters with
+        # no durable slot, the three disagreeing terminal-state mappers, a Suspension built
+        # outside the durable status vocabulary, and the cause-vs-park vocabulary collision on
+        # one event name. Each is pinned by its own assertion below; no name scan can reach them.
         "core/lifecycle.py",
         "reference/backend/recovery.py",
         "loop.py",

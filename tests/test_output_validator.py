@@ -413,11 +413,66 @@ def test_from_tools_enables_validator_one_liner(tmp_path: Path) -> None:
 
 
 def test_output_retries_survives_checkpoint_round_trip(tmp_path: Path) -> None:
-    cp = RunCheckpoint(run_id="run_1", output_retries=2)
+    history = [{"attempt": 1, "failures": [{"validator_id": "require.foo", "feedback": "no FOO"}]}]
+    cp = RunCheckpoint(run_id="run_1", output_retries=2, output_failure_history=history)
     write_checkpoint(tmp_path, cp)
     restored = read_checkpoint(tmp_path)
     assert restored is not None
     assert restored.output_retries == 2  # else a mid-repair restart double-grants the budget
+    # ...and the evidence rides beside the budget. The counter alone survived, so a restored
+    # run renumbered its attempts from 1 (the number is ``len(history) + 1``) and dropped
+    # failures_by_validator out of metrics.json.
+    assert restored.output_failure_history == history
+
+
+def test_a_restored_mid_repair_run_continues_its_attempt_numbering(tmp_path: Path) -> None:
+    """The behavioural half: the retry BUDGET used to survive and its evidence did not.
+
+    The checkpoint below is a run that already burned one repair attempt against
+    ``require.foo``. Restored into a fresh loop whose budget is exhausted, the next rejection
+    must be attempt **2** and the roll-up must name BOTH epochs' validators — a restored run
+    that renumbers from 1 reports a first failure that never happened and loses the evidence
+    that the budget was spent.
+    """
+    sink = MemoryEventSink()
+    before = {
+        "attempt": 1,
+        "failures": [{"validator_id": "require.foo", "feedback": "must contain FOO"}],
+    }
+    loop = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=1)),
+        model_adapter=FakeModelAdapter(turns=[_text_turn("FOO here")]),
+        runtime_config_provider=_provider("forbid.foo"),
+        output_validators=(ForbidFoo(),),
+        event_sinks=(sink,),
+    )
+    loop.restore(
+        RunCheckpoint(
+            run_id=loop.spec.run_id,
+            seq=1,
+            output_retries=1,
+            output_failure_history=[dict(before)],
+        )
+    )
+
+    # Re-pumped with ``None`` — the same turn-sequence continued, which is what a mid-repair
+    # restore is. (A NEW user input deliberately resets the budget: the repair budget belongs
+    # to one turn-sequence, so restoring it only matters on this path.)
+    suspension = loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert suspension.status == "limited"
+    assert result.error_code == "output_validator_unsatisfied"
+    exhausted = [event for event in sink.events if event.type == "output.validator.exhausted"]
+    assert exhausted
+    assert [entry["attempt"] for entry in exhausted[-1].data["history"]] == [1, 2]
+    # Both epochs' validators in one roll-up, in the event and in metrics.json alike.
+    assert set(exhausted[-1].data["failures_by_validator"]) == {"require.foo", "forbid.foo"}
+    assert set(result.metrics["output_validation"]["failures_by_validator"]) == {
+        "require.foo",
+        "forbid.foo",
+    }
+    assert result.metrics["output_validation"]["retries"] == 1
 
 
 # --- item A: stop_reason promotion across adapters -----------------------------------------
