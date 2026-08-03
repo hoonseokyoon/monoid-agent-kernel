@@ -225,6 +225,17 @@ only when configured — a generation-free runtime config keeps its pre-v0.21 `c
 a *configured* one intentionally does not verify across mixed-version backend-run recovery
 (configure generation only on a fully rolled fleet).
 
+The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
+terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
+request keys above it is written unconditionally, beside `retryable` and `provider_retried`,
+because a reader must not have to tell "not config-fixable" apart from "a server that never
+mentions it" — both mean `false`. Skew is symmetric and lossless in both directions: an old
+client ignores the additive key and keeps deriving the classification from the 4xx status as
+before, and a new client reading an old server's body defaults the field to `false`, which is
+the value that server's failures already carried. `TRANSCRIPT_RECORD_SCHEMA`'s `model_turn`
+branch declares the same field, which the writer had always emitted under an open
+`additionalProperties`; no stored transcript changes and no reader has to migrate.
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other

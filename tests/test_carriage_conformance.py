@@ -206,52 +206,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "added to withhold",
         "burn-down",
     ),
-    # --- config_recoverable: born on the client, dies at the hop -----------------------
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "reference/llm_gateway/http.py:_error_body",
-        "no wire key: the one error field with no transport, so a config-fixable refusal "
-        "arrives one hop out as an ordinary failure (only the 4xx status hints at it)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_parse_gateway_response",
-        "reconstructs config_recoverable=False even when the body carries the key",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_chunk_from_event",
-        "stream-error twin of _parse_gateway_response: same dropped read",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_error_from_status_body",
-        "non-200 twin of _parse_gateway_response: same dropped read",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "config_recoverable",
-        "core/schemas.py:TRANSCRIPT_RECORD_SCHEMA",
-        "the model_turn branch does not declare config_recoverable although loop.py:_apump_turn "
-        "writes it; additionalProperties=True is what keeps the record valid, not the schema",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/openai.py:_model_error_from_openai",
-        "no branch sets config_recoverable, so a provider-side config refusal is never flagged "
-        "at the one adapter that can classify it",
-        "burn-down",
-    ),
     # --- http_status: carried by some siblings, dropped by the others ------------------
     CarriageGap(
         "transportable-error",
@@ -308,14 +262,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "burn-down",
     ),
     # --- provider_retried / provider_usage: stamped, then unrecorded -------------------
-    CarriageGap(
-        "transportable-error",
-        "provider_retried",
-        "providers/openai.py:_model_error_from_openai",
-        "no branch sets provider_retried, so the adapter that owns a retry loop never reports "
-        "having run it",
-        "burn-down",
-    ),
     CarriageGap(
         "suspension",
         "provider_retried",
@@ -1073,7 +1019,7 @@ def test_the_usage_authority_is_the_normalizers_assignable_domain_not_one_probe(
 # --------------------------------------------------------------------------------------
 
 # Wire key -> the ModelAdapterError fact it carries across the gateway hop.  Declared rather
-# than inferred, because three of the six are renames and one has no key at all.
+# than inferred, because three of the seven are renames.
 TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     # ``message`` is positional-only-in-effect: read back through ``str(exc)``, never an attribute.
     "error": "message",
@@ -1082,6 +1028,9 @@ TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     # reconstruction (registered by-design above).
     "error_code": "provider_error_code",
     "retryable": "retryable",
+    # The classification whose only transport used to be the 4xx status ``_model_error_status``
+    # picks; it has its own key now, written unconditionally like the two booleans beside it.
+    "config_recoverable": "config_recoverable",
     # Server-derived: ``_model_error_status`` picks the status, it is not copied off the exception.
     "http_status": "http_status",
     "provider_retried": "provider_retried",
@@ -1089,8 +1038,11 @@ TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     "usage": "provider_usage",
 }
 
-# The one transportable fact with no wire key at all (registered burn-down above).
-TRANSPORTABLE_ERROR_UNCARRIED = frozenset({"config_recoverable"})
+# Transportable facts with no wire key at all. Empty today -- ``config_recoverable`` was the last
+# one and the burn-down gave it a key. Kept rather than deleted: the disjointness guards below are
+# the mechanism that notices the *next* such fact, and they are vacuously true over an empty set
+# instead of absent.
+TRANSPORTABLE_ERROR_UNCARRIED: frozenset[str] = frozenset()
 
 # Checkpoint spelling of the same fact (core/checkpoint.py:RunCheckpoint), registered by-design.
 CHECKPOINT_FIELD_ALIASES: dict[str, str] = {"http_status": "provider_http_status"}
@@ -2247,8 +2199,12 @@ def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> No
     assert "provider_error_code" in declared
     assert "provider_error_code" in wire_facts
 
-    # The event carries the fact the wire cannot (family 2's headline burn-down), so a fix that
-    # adds the wire key must not need to touch this event.
+    # The event named this from the start and the wire could not; the burn-down gave the wire a
+    # key without touching the event, which is the whole point of comparing them here.
+    assert "config_recoverable" in declared
+    assert "config_recoverable" in wire_facts
+
+    # And if a *next* fact joins the uncarried set, this event must still declare it.
     assert TRANSPORTABLE_ERROR_UNCARRIED <= declared
 
     # ...and drops the two the wire carries. Registered burn-down: the transcript record written
@@ -2257,9 +2213,10 @@ def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> No
     assert "usage" not in declared
 
 
-# core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` is written
-# by loop.py:_apump_turn but never declared here (registered burn-down); the record stays valid
-# only because the branch sets additionalProperties=True.
+# core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` was written
+# by loop.py:_apump_turn and undeclared here, and the record stayed valid only because the branch
+# sets additionalProperties=True -- so the pin below is now "declares exactly what is written",
+# and a *next* undeclared key fails on it rather than being absorbed by the open cap.
 TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
     {
         "kind",
@@ -2272,6 +2229,7 @@ TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
         "error_code",
         "provider_error_code",
         "retryable",
+        "config_recoverable",
         "http_status",
     }
 )
@@ -2284,7 +2242,9 @@ def _transcript_model_turn_branch() -> dict[str, Any]:
     raise AssertionError("TRANSCRIPT_RECORD_SCHEMA has no model_turn branch")
 
 
-def test_1d_transcript_schema_declares_less_than_the_writer_writes() -> None:
+def test_1d_the_transcript_schema_declares_every_key_the_writer_writes() -> None:
+    """The open cap is a tolerance, not a declaration, so what it absorbs is pinned here."""
+
     branch = _transcript_model_turn_branch()
     declared = frozenset(branch["properties"])
     assert declared == TRANSCRIPT_MODEL_TURN_DECLARED, {
@@ -2298,9 +2258,9 @@ def test_1d_transcript_schema_declares_less_than_the_writer_writes() -> None:
     ]
     assert len(written) == 1, {"model_turn_failure_records_found": len(written)}
     undeclared = written[0] - declared
-    assert undeclared == {"config_recoverable"}, {
+    assert undeclared == set(), {
         "written_but_undeclared": sorted(undeclared),
-        "hint": "declare it in TRANSCRIPT_RECORD_SCHEMA and drop the registry entry",
+        "hint": "additionalProperties=True keeps the record valid; declare the key anyway",
     }
     assert branch["additionalProperties"] is True
 
@@ -2479,6 +2439,7 @@ def _maximal_error_body() -> dict[str, Any]:
         str(exc),
         error_code=exc.provider_error_code,
         retryable=exc.retryable,
+        config_recoverable=exc.config_recoverable,
         provider_retried=exc.provider_retried,
         usage=provider_usage_of(exc),
     )
@@ -2542,16 +2503,19 @@ def test_2a_the_two_server_writers_answer_one_exception_identically() -> None:
     assert written["http_status"] == int(status)
     # The exception's own facts, not the writer's defaults.
     assert written["retryable"] is True
+    assert written["config_recoverable"] is True
     assert written["provider_retried"] is True
     assert written["usage"] == provider_usage_of(exc)
 
 
-def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_nothing_else() -> None:
-    """The one status the wire *does* carry the uncarried fact through, end to end.
+def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_as_a_flag() -> None:
+    """Both halves of the same statement, pinned on the real writer.
 
-    ``config_recoverable`` has no wire key (registered burn-down), and the only thing a client
-    can read it off is the 4xx ``_model_error_status`` picks. Pinned on the real writer so a
-    change to either half is a failure here.
+    The status was the *only* thing a client could read this off, and it is a hint rather than a
+    statement: a 4xx says the request was at fault, not that configuration fixes it, and a
+    refusal raised with no HTTP status at all (an applied-parameters proof failure) had nothing
+    to leave behind. Now the classification rides its own key and the status still agrees with
+    it, so a change to either half is a failure here.
     """
 
     refused = ModelAdapterError(
@@ -2563,6 +2527,7 @@ def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_nothing_e
     written, status = _write_exception_body(refused)
     assert status == HTTPStatus.UNPROCESSABLE_ENTITY
     assert written["http_status"] == 422
+    assert written["config_recoverable"] is True
     assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(written)
 
 
@@ -2572,7 +2537,7 @@ def test_2a_server_error_body_writes_exactly_the_alias_table() -> None:
         "missing": sorted(SERVER_ERROR_BODY_KEYS - set(body)),
         "extra": sorted(set(body) - SERVER_ERROR_BODY_KEYS),
     }
-    # The one transportable fact with no key (registered burn-down).
+    # No transportable fact is left without a key; a new one must join the table, not this gap.
     assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(body)
 
 
@@ -2634,7 +2599,12 @@ def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> 
     exc = _minimal_adapter_error()
     # The probe is only minimal if the exception really is: every fact at its default.
     assert provider_usage_of(exc) == {}
-    assert (exc.retryable, exc.provider_retried, exc.provider_error_code) == (False, False, "")
+    assert (
+        exc.retryable,
+        exc.config_recoverable,
+        exc.provider_retried,
+        exc.provider_error_code,
+    ) == (False, False, False, "")
 
     written, status = _write_exception_body(exc)
     assert frozenset(written) == GATEWAY_MINIMAL_ERROR_BODY_KEYS, {
@@ -2648,6 +2618,7 @@ def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> 
     assert status == HTTPStatus.BAD_GATEWAY
     assert written["http_status"] == 502
     assert written["retryable"] is False
+    assert written["config_recoverable"] is False
     assert written["provider_retried"] is False
     assert written["error_code"] == gateway_client.GATEWAY_BAD_RESPONSE
     assert written["error"] == str(exc)
@@ -2678,11 +2649,15 @@ def test_2a_the_minimal_failure_reaches_the_stream_writer_identically() -> None:
 
 
 def _maximal_wire_body() -> dict[str, Any]:
-    """The server body plus ``config_recoverable`` — present so a reader that reads it would."""
+    """The server body, which is now the whole wire.
 
-    body = _maximal_error_body()
-    body["config_recoverable"] = True
-    return body
+    This used to be ``_maximal_error_body()`` plus a hand-added ``config_recoverable`` — the one
+    fact the writers could not emit, added here so a reader that *did* read it would show up in
+    the behavioral census. The writers emit it now, so the two bodies are the same dict and the
+    reader censuses below read exactly what the server writes.
+    """
+
+    return _maximal_error_body()
 
 
 def _read_r1(body: dict[str, Any]) -> ModelAdapterError:
@@ -2718,6 +2693,7 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     carried = {
         "provider_error_code": got.provider_error_code,
         "retryable": got.retryable,
+        "config_recoverable": got.config_recoverable,
         "http_status": got.http_status,
         "provider_retried": got.provider_retried,
         "provider_usage": provider_usage_of(got),
@@ -2725,6 +2701,7 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     assert carried == {
         "provider_error_code": body["error_code"],
         "retryable": body["retryable"],
+        "config_recoverable": body["config_recoverable"],
         "http_status": body["http_status"],
         "provider_retried": body["provider_retried"],
         "provider_usage": body["usage"],
@@ -2733,12 +2710,13 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     # The message survives, but R3 wraps it with the status line it was read from.
     assert body["error"] in str(got)
 
-    # Registered losses. Both flip to a failure the moment a reader starts binding them.
-    assert got.config_recoverable is False, "config_recoverable is now read — update the census"
+    # The registered loss. It flips to a failure the moment a reader starts binding it.
     assert got.error_code == ModelAdapterError.error_code, (
         "the kernel error_code has no wire slot; it must reconstruct to the class default"
     )
+    # An instance attribute rather than a class default, so the read above is a real read.
     assert "config_recoverable" not in vars(type(got))
+    assert "config_recoverable" in vars(got)
 
 
 def test_2b_r3_takes_http_status_from_the_status_line_not_the_body() -> None:
@@ -2765,6 +2743,12 @@ def test_2b_r3_defaults_retryable_from_the_status_when_the_body_is_silent() -> N
 # values a *pre-field* gateway produces, so they are the compatibility contract of every added
 # key -- and they are per reader, because R3 derives two of them from the status line it was
 # read from while R1/R2 have no status to derive from.
+#
+# ``config_recoverable`` is in here for a different reason than it used to be: it was the fact no
+# reader read, and its ``False`` was the constructor default. It is now READ, with an explicit
+# ``default=False``, on all three readers -- so these entries are the compatibility contract of
+# the added key (an older gateway omits it and every reader answers "not config-fixable"), and a
+# reader that derived it from the status the way R3 derives ``retryable`` would fail here.
 SILENT_BODY_DEFAULTS: dict[str, dict[str, Any]] = {
     "providers/gateway.py:_parse_gateway_response": {
         "provider_error_code": gateway_client.GATEWAY_BAD_RESPONSE,
@@ -2846,8 +2830,7 @@ def test_2b_every_reader_defaults_an_absent_key_the_registered_way(reader: str) 
 # --- the reader set itself, and what each reader reads ---------------------------------
 
 # Full read-key census per reader, pinned. A reader that grows a read of a key no writer
-# emits, or stops reading one, fails here -- including the moment ``config_recoverable``
-# finally becomes a read (its registered burn-down), which must update these sets.
+# emits, or stops reading one, fails here.
 GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     "providers/gateway.py:_parse_gateway_response": frozenset(
         {
@@ -2855,6 +2838,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "error",
             "error_code",
             "retryable",
+            "config_recoverable",
             "http_status",
             "provider_retried",
             "usage",
@@ -2875,6 +2859,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "error",
             "error_code",
             "retryable",
+            "config_recoverable",
             "http_status",
             "provider_retried",
             "usage",
@@ -2894,7 +2879,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
     # ``usage`` is read for it by ``_reported_error_usage``, not named at the call site.
     "providers/gateway.py:_error_from_status_body": frozenset(
-        {"error", "error_code", "retryable", "provider_retried", "usage"}
+        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
     ),
 }
 
@@ -3021,9 +3006,10 @@ def test_2b_each_reader_reads_exactly_the_keys_the_census_accounts_for(reader: s
         "newly_read": sorted(read - expected),
         "no_longer_read": sorted(expected - read),
     }
-    # The registered dropped read, stated once per reader rather than inferred.
+    # No reader may bind a fact the writers cannot emit, stated once per reader rather than
+    # inferred. Vacuous while the uncarried set is empty, and the guard the next such fact meets.
     assert read.isdisjoint(TRANSPORTABLE_ERROR_UNCARRIED), {
-        "hint": "a reader started binding config_recoverable: update EXPECTED and the registry",
+        "hint": "a reader binds a fact with no wire key: give it one or register the gap",
     }
     # Every error-family key the server can write is read back here (R3's status quirk aside).
     unread = SERVER_ERROR_BODY_KEYS - read
@@ -3038,7 +3024,13 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
     origin = _maximal_adapter_error()
     restored = _read_r1(_maximal_wire_body())
 
-    preserved = {"provider_error_code", "retryable", "http_status", "provider_retried"}
+    preserved = {
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "http_status",
+        "provider_retried",
+    }
     for attribute in sorted(preserved):
         assert getattr(restored, attribute) == getattr(origin, attribute), attribute
     assert provider_usage_of(restored) == provider_usage_of(origin)
@@ -3050,7 +3042,7 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
         and attribute != "provider_usage"
         and getattr(restored, attribute, None) != getattr(origin, attribute)
     }
-    assert lost == {"config_recoverable", "error_code"}, {
+    assert lost == {"error_code"}, {
         "lost_across_the_hop": sorted(lost),
         "hint": "a shrinking loss set means a gap was fixed: update EXPECTED and the registry",
     }
@@ -3077,8 +3069,15 @@ def test_2c_only_two_of_five_gateway_validators_forward_the_status_they_know() -
     }
 
 
-def test_2c_the_openai_classifier_sets_neither_retry_nor_recoverability_flag() -> None:
-    """Every ModelAdapterError branch of the one adapter that could classify them."""
+def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
+    """Every ModelAdapterError branch of the one adapter that can classify them.
+
+    Pinned per branch, not as a union: a union says "some branch carries the flag", which is the
+    half-bound shape this suite exists to catch. Both facts are properties of the call rather
+    than of its classification -- whether the SDK already retried it, and whether the remedy is
+    the caller's configuration -- so every branch must state both, including the tail that has
+    neither a status nor a code to reason from.
+    """
 
     tree = _module_tree("providers/openai.py")
     classifier = next(
@@ -3094,15 +3093,28 @@ def test_2c_the_openai_classifier_sets_neither_retry_nor_recoverability_flag() -
         and node.func.id == "ModelAdapterError"
     ]
     assert len(branches) == 4, {"classification_branches": len(branches)}
-    flagged = {
-        keyword.arg
+    flagged = [
+        {
+            keyword.arg
+            for keyword in branch.keywords
+            if keyword.arg in {"provider_retried", "config_recoverable"}
+        }
+        for branch in branches
+    ]
+    assert flagged == [{"provider_retried", "config_recoverable"}] * 4, {
+        "flags_per_branch": [sorted(names) for names in flagged],
+        "hint": "a branch stopped stating one of the two: bind it, do not narrow this pin",
+    }
+    # And the recoverability verdict comes from one predicate at all four sites rather than four
+    # hand-written conditions, which is the only version of this that cannot fall out of step.
+    recoverability = {
+        ast.unparse(keyword.value).split("(")[0]
         for branch in branches
         for keyword in branch.keywords
-        if keyword.arg in {"provider_retried", "config_recoverable"}
+        if keyword.arg == "config_recoverable"
     }
-    assert flagged == set(), {
-        "flags_now_set": sorted(flagged),
-        "hint": "the classifier started carrying a flag: drop its registry entry",
+    assert recoverability == {"_config_shaped_refusal"}, {
+        "config_recoverable_expressions": sorted(recoverability),
     }
 
 
@@ -4589,7 +4601,12 @@ def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_six
         "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
         "hint": "the receipt's read set is the record's whole vocabulary",
     }
-    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(read)
+    # Named rather than derived from ``TRANSPORTABLE_ERROR_UNCARRIED``, which used to hold this
+    # fact and is empty now that the wire carries it: a pin over an empty set proves nothing,
+    # and this entry is still open.
+    assert "config_recoverable" not in read, {
+        "hint": "the receipt reads it now: drop the registry entry and pin the new behaviour",
+    }
     # Every fact it does read is a real attribute of the exception it reads them from.
     maximal = _maximal_adapter_error()
     assert read <= set(vars(maximal)) | {"provider_usage"}
@@ -4635,7 +4652,10 @@ def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> N
         "hint": "the closed cap is why adding the fact is a schema change, not a patch",
     }
     assert "retryable" in declared
-    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(declared), {
+    # Named rather than derived from ``TRANSPORTABLE_ERROR_UNCARRIED``: that set is empty now
+    # that the gateway wire carries the fact, and a vacuous pin is not a pin. This lane still
+    # does not, which is what the registry entry says.
+    assert "config_recoverable" not in declared, {
         "hint": "carried now? update EXPECTED and drop the registry entry",
     }
 
@@ -5186,6 +5206,8 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "observability/otel.py",
             "providers/base.py",
             "providers/gateway.py",
+            # Joined in the burn-down: the classifier reports the retries its own SDK made.
+            "providers/openai.py",
             "reference/llm_gateway/http.py",
             "reference/llm_gateway/service.py",
         }

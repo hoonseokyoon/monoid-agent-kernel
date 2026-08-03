@@ -961,6 +961,17 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             http_status=error_http_status,
             known_provider_retried=provider_retried,
         )
+        # The remedy the failure names, read back rather than inferred from the status. Absent
+        # reads as False -- an older gateway that never mentions the key, and a failure that
+        # really is not config-fixable, mean the same thing to a driver.
+        config_recoverable = _exact_gateway_bool(
+            data,
+            "config_recoverable",
+            default=False,
+            context="error response",
+            http_status=error_http_status,
+            known_provider_retried=provider_retried,
+        )
         envelope_error = ModelAdapterError(
             _gateway_string(
                 data,
@@ -982,6 +993,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
                 or GATEWAY_BAD_RESPONSE
             ),
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=error_http_status,
             provider_retried=provider_retried,
         )
@@ -1293,6 +1305,15 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             http_status=error_http_status,
             known_provider_retried=retried,
         )
+        # The sync twin's rule, on the transport that reports the same failure as a frame.
+        config_recoverable = _exact_gateway_bool(
+            event,
+            "config_recoverable",
+            default=False,
+            context="stream error",
+            http_status=error_http_status,
+            known_provider_retried=retried,
+        )
         stream_error = ModelAdapterError(
             _gateway_string(
                 event,
@@ -1313,6 +1334,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 or GATEWAY_BAD_RESPONSE
             ),
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=error_http_status,
             provider_retried=retried,
         )
@@ -1393,6 +1415,17 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         http_status=status,
         known_provider_retried=provider_retried,
     )
+    # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the status
+    # line: a 4xx is a hint that the request was at fault, not a statement that configuration
+    # fixes it, so an unstated key is False here rather than status-shaped.
+    config_recoverable = _exact_gateway_bool(
+        error_payload,
+        "config_recoverable",
+        default=False,
+        context="HTTP error response",
+        http_status=status,
+        known_provider_retried=provider_retried,
+    )
     message = (
         _gateway_string(
             error_payload,
@@ -1408,6 +1441,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
         retryable=retryable,
+        config_recoverable=config_recoverable,
         http_status=status,
         # Read for the same reason as ``retryable``: it is a fact about the call the gateway is
         # reporting, and a failure is where it matters most. ``retryable`` forecasts a *future*

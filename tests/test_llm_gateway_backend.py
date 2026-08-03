@@ -823,11 +823,15 @@ def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None
     assert body["error_code"] == "unsupported_request_shape"
     assert body["retryable"] is False
     assert body["http_status"] == 422
+    # The remedy is configuration, and the wire says so rather than leaving the client to infer
+    # it from the status: a 4xx is a hint, `config_recoverable` is the statement.
+    assert body["config_recoverable"] is True
     assert "messages" in body["error"]
     # The classification survives the hop for the client that has to act on it.
     reconstructed = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
     assert reconstructed.provider_error_code == "unsupported_request_shape"
     assert reconstructed.http_status == 422
+    assert reconstructed.config_recoverable is True
 
 
 def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_frame() -> None:
@@ -872,9 +876,11 @@ def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_
     assert terminal["error_code"] == "unsupported_request_shape"
     assert terminal["retryable"] is False
     assert terminal["http_status"] == 422
+    assert terminal["config_recoverable"] is True
     assert "messages" in terminal["error"]
     # And the client's frame parser reconstructs the same classification the sync reader does.
     reconstructed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(terminal)).value
     assert reconstructed.provider_error_code == "unsupported_request_shape"
     assert reconstructed.http_status == 422
     assert reconstructed.retryable is False
+    assert reconstructed.config_recoverable is True

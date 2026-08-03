@@ -128,6 +128,38 @@ out in commit messages and here.
   CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
   in the parallel shard. No public surface, wire format, or shipped contract changes.
 
+### Added — `config_recoverable` crosses the hop it was minted to describe
+
+- **The gateway error envelope carries `config_recoverable`** on both writers (the non-200 body
+  and the terminal SSE `error` frame, which share one `_error_body` definition) and all three
+  client readers bind it (`_parse_gateway_response`, `_chunk_from_event`,
+  `_error_from_status_body`). It was the one transportable fact on `ModelAdapterError` with no
+  wire key at all: a refusal whose remedy is the caller's configuration arrived one hop out as an
+  ordinary terminal failure, and the only thing a client could read it off was the 422 the
+  server's status mapper picks — a hint rather than a statement, and nothing at all for the
+  refusals that carry no HTTP status of their own. Written unconditionally beside `retryable` and
+  `provider_retried`, so absence means "an older gateway" and reads as `false`; read through the
+  same exact-boolean reader as its siblings, so a coerced `"false"` is refused rather than
+  believed. Additive in both directions and no protocol identifier changes
+  (docs/COMPATIBILITY.md).
+- **`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch declares it**, which the failure-record
+  writer had emitted since the field existed; the record was valid only because that branch sets
+  `additionalProperties: True`. No stored transcript changes.
+- **`OpenAIModelAdapter` classifies both facts on every branch.** `_model_error_from_openai`
+  produces four `ModelAdapterError`s and stated neither flag: the adapter that reads the
+  provider's own classification never said the refusal was config-shaped, and the adapter whose
+  SDK owns a retry loop never reported having run it. Recoverability now comes from one predicate
+  (`_config_shaped_refusal`: a non-retryable 4xx, the same rule `AgentLoop._recoverable_turn_error`
+  already applies) evaluated at all four sites rather than a condition per branch. The retry count
+  is read off the final request's `x-stainless-retry-count` header, which the OpenAI SDK stamps on
+  every attempt and every `APIError` retains — the SDK hands `retries_taken` only to the success
+  path — and any shape that cannot answer reads as "no retry" rather than claiming one.
+- Six `KNOWN_GAPS` entries closed in `tests/test_carriage_conformance.py`; the census constants
+  moved with them (`TRANSPORTABLE_ERROR_UNCARRIED` is now empty, kept as the guard the next such
+  fact meets). Two registered-gap pins that had leaned on that set — the call receipt's read set
+  and the closed `stream_closed` schema — now name the field directly, because a pin over an
+  empty set proves nothing and both entries are still open.
+
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 
 - **The Studio profile preview is a record, and now substitutes like one.** Preserving a tool

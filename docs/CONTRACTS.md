@@ -406,7 +406,10 @@ both transports. A budget that skipped refused calls would not be a bound. The c
 survives a hop — the gateway error envelope carries `usage` (present only when the failed call
 actually spent tokens, so an error raised before reaching a provider keeps its previous wire
 shape), and a gateway meters a billed failure against the tenant rather than losing it to the
-raise.
+raise. The classification survives it too: the envelope carries `config_recoverable` as its own
+key, written unconditionally, so a client one hop out reads the remedy as a statement instead of
+inferring it from the 422 — which matters most for the refusals that carry no HTTP status of
+their own.
 One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
 been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
 call sees the unproven text before the error arrives; the sync transport delivers nothing on
@@ -1530,6 +1533,30 @@ additionally carry optional priced sub-counts when the provider reports them —
 `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `audio_tokens` —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
+
+Error response (the non-200 body, and — minus the `type` tag — the terminal SSE `error` frame,
+which is written from the same definition so the two transports cannot drift):
+
+```json
+{
+  "error": "upstream refused an unproven turn",
+  "error_code": "gateway_generation_not_applied",
+  "retryable": false,
+  "config_recoverable": true,
+  "http_status": 422,
+  "provider_retried": false,
+  "usage": {"input_tokens": 120, "output_tokens": 40, "total_tokens": 160}
+}
+```
+
+`error_code` is the **provider** code (the kernel-level `ModelAdapterError.error_code` has no
+wire slot and reconstructs to its class default). `retryable` forecasts a future attempt;
+`config_recoverable` says the remedy is the caller's configuration instead, so the two are
+independent and a client that reads only the status has to guess at the second. `provider_retried`
+records attempts the gateway's own backend already made. All three booleans and `http_status` are
+written unconditionally, so absence means "an older gateway" and reads as the default; `usage` is
+the one omitted-when-empty key, because an error raised before a provider was reached costs
+nothing and keeps its pre-`usage` wire shape.
 
 **Applied echoes.** When the request carried a `generation` block **and the upstream adapter
 declared `generation_support = "native"` for this call's config**, the response body and the

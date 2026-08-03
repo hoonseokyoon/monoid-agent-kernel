@@ -685,6 +685,9 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
                 "error_code": {"type": "string"},
                 "provider_error_code": {"type": "string"},
                 "retryable": {"type": "boolean"},
+                # The failure record's writer has always emitted this beside ``retryable``; the
+                # branch only stayed valid because ``additionalProperties`` is True here.
+                "config_recoverable": {"type": "boolean"},
                 "http_status": {"type": ["integer", "null"]},
             },
             "additionalProperties": True,

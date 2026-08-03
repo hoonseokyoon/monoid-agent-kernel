@@ -448,6 +448,7 @@ def test_gateway_one_shot_maps_non_utf8_json_to_bad_response(monkeypatch: Any) -
     [
         {"type": "text_delta", "text": "hi", "provider_retried": "false"},
         {"type": "error", "error": "busy", "retryable": "false"},
+        {"type": "error", "error": "busy", "config_recoverable": "false"},
     ],
 )
 def test_gateway_sse_rejects_truthy_non_boolean_controls(frame: dict[str, Any]) -> None:
@@ -506,7 +507,7 @@ def test_gateway_rejects_coercible_wire_http_status(payload: dict[str, Any]) -> 
     assert "http_status" in str(caught.value)
 
 
-@pytest.mark.parametrize("field_name", ["retryable", "provider_retried"])
+@pytest.mark.parametrize("field_name", ["retryable", "provider_retried", "config_recoverable"])
 def test_gateway_non_200_rejects_truthy_non_boolean_controls(field_name: str) -> None:
     from monoid_agent_kernel.providers.gateway import _error_from_status_body
 
@@ -547,6 +548,10 @@ def test_gateway_non_200_validation_preserves_upstream_retry_evidence(
         ({"error": 42}, True),
         ({"error": "busy", "retryable": "false"}, True),
         ({"error": "busy", "provider_retried": "false"}, False),
+        # The third boolean control on this wire goes through the same exact-boolean reader, so
+        # a coerced ``"false"`` must refuse on all three readers rather than authorize a config
+        # fix nobody stated.
+        ({"error": "busy", "config_recoverable": "false"}, True),
     ],
 )
 def test_gateway_error_validation_preserves_valid_status_and_retry_evidence(
@@ -1033,6 +1038,88 @@ def test_a_non_200_body_carries_the_backend_retry_end_to_end() -> None:
     assert _error_from_status_body(400, json.dumps(body)).provider_retried is True
     plain = _error_body(400, "refused", error_code="gateway_bad_request")
     assert _error_from_status_body(400, json.dumps(plain)).provider_retried is False
+
+
+def test_every_error_constructor_reads_the_config_recoverability() -> None:
+    """The `provider_retried` twin above, for the classification that had no wire slot at all.
+
+    `config_recoverable` says "the remedy is configuration, not another attempt", and it used to
+    die at the hop: no server writer emitted it and all three client readers rebuilt `False`, so
+    a config-fixable refusal arrived one hop out as an ordinary terminal failure and only the 4xx
+    `_model_error_status` picks hinted at it. Every reader is driven, because a fact bound on one
+    of them and not its siblings is the shape this wire keeps producing.
+    """
+    from monoid_agent_kernel.providers.gateway import (
+        _chunk_from_event,
+        _error_from_http_error,
+        _error_from_status_body,
+    )
+
+    body = {
+        "error": "upstream refused an unproven turn",
+        "error_code": "gateway_generation_not_applied",
+        "retryable": False,
+        "http_status": 422,
+        "config_recoverable": True,
+    }
+
+    with pytest.raises(ModelAdapterError) as sync_read:
+        _parse_gateway_response(dict(body))
+    assert sync_read.value.config_recoverable is True
+
+    with pytest.raises(ModelAdapterError) as stream_read:
+        _chunk_from_event({"type": "error", **body})
+    assert stream_read.value.config_recoverable is True
+
+    assert _error_from_status_body(422, json.dumps(body)).config_recoverable is True
+    assert _error_from_http_error(_http_error(422, json.dumps(body))).config_recoverable is True
+
+    # An older gateway that never mentions the key still reads as "not config-fixable" — the
+    # compatibility contract of the added field, stated on every reader.
+    silent = {key: value for key, value in body.items() if key != "config_recoverable"}
+    with pytest.raises(ModelAdapterError) as silent_sync:
+        _parse_gateway_response(dict(silent))
+    assert silent_sync.value.config_recoverable is False
+    with pytest.raises(ModelAdapterError) as silent_stream:
+        _chunk_from_event({"type": "error", **silent})
+    assert silent_stream.value.config_recoverable is False
+    assert _error_from_status_body(422, json.dumps(silent)).config_recoverable is False
+
+
+def test_both_server_writers_put_the_config_recoverability_on_the_wire() -> None:
+    """The writer half: one body definition, two writers, and the same key on both.
+
+    The non-200 body and the SSE terminal frame are separate call sites around `_error_body`,
+    which is exactly where a field goes missing — `provider_retried` reached both only because
+    they were reviewed together.
+    """
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body, _stream_error_frame
+
+    refused = ModelAdapterError(
+        "upstream refused an unproven turn",
+        provider_error_code="gateway_generation_not_applied",
+        retryable=False,
+        config_recoverable=True,
+    )
+    body = _error_body(
+        422,
+        str(refused),
+        error_code=refused.provider_error_code,
+        retryable=refused.retryable,
+        config_recoverable=refused.config_recoverable,
+    )
+    assert body["config_recoverable"] is True
+    assert _error_from_status_body(422, json.dumps(body)).config_recoverable is True
+
+    frame = _stream_error_frame(None, refused)
+    assert frame["config_recoverable"] is True
+    assert {key: value for key, value in frame.items() if key != "type"} == body
+
+    # The default direction: a failure the gateway raised on its own is not config-fixable, and
+    # the key is written rather than omitted, so a reader never has to guess which it was.
+    plain = _stream_error_frame(None, ModelAdapterError("refused"))
+    assert plain["config_recoverable"] is False
 
 
 def test_a_first_attempt_failure_does_not_claim_a_retry() -> None:

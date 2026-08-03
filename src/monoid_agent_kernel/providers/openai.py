@@ -630,6 +630,46 @@ _PROVIDER_CODE_STATUS: dict[str, int] = {
 _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded", "rate_limited"})
 
 
+def _config_shaped_refusal(status: int | None, *, retryable: bool) -> bool:
+    """Whether the remedy for this failure is the caller's configuration, not another attempt.
+
+    One predicate for every branch of the classifier below, because a rule proven on one of two
+    parallel branches is exactly how a classification goes half-missing here. It is the same
+    statement ``AgentLoop._recoverable_turn_error`` already makes about a 4xx -- the turn fails,
+    the session survives, the caller changes the request -- said on the exception rather than
+    re-derived from a status a later hop may no longer have.
+    """
+
+    return not retryable and status is not None and 400 <= status < 500
+
+
+def _provider_retried_by_the_sdk(exc: Exception) -> bool:
+    """Whether the OpenAI client's own retry loop had already re-sent this request.
+
+    The kernel counts one adapter call per turn however many attempts happen inside it, so a call
+    the SDK re-sent twice before failing was recorded as a clean single attempt on the receipt,
+    the failure record and the wire.
+
+    The SDK does not put ``retries_taken`` on an exception -- it passes the count only into
+    ``_process_response``, i.e. the success path -- but every request it builds stamps the count
+    into the ``x-stainless-retry-count`` header it sends, and every ``APIError`` keeps the final
+    ``httpx.Request`` that carried it (openai 2.41.1, ``_base_client._build_headers``). So the
+    evidence survives on the failure too, one attribute hop away.
+
+    Read defensively in both directions: this classifier also answers for exceptions that never
+    came from the SDK at all (a client constructor failure, a payload ``TypeError``), and a
+    *claimed* retry is worse than an unknown one -- anything unreadable means "no retry".
+    """
+
+    headers = getattr(getattr(exc, "request", None), "headers", None)
+    if headers is None:
+        return False
+    try:
+        return int(headers.get("x-stainless-retry-count") or 0) > 0
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP status
     and error code, so downstream (gateway HTTP mapping, kernel classification, core recoverability,
@@ -646,14 +686,20 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     # 400 about an unsupported knob apart from a 400 about a non-strict output_schema.
     param = body.get("param") if isinstance(body, dict) else None
     param_detail = f", param={param}" if isinstance(param, str) and param else ""
+    # Facts about the call rather than about its class, so every branch below states them: the
+    # remedy (config vs. another attempt) and the attempts the SDK already spent.
+    retried = _provider_retried_by_the_sdk(exc)
 
     if isinstance(status, int) and 400 <= status < 500:
+        retryable = status == 429 and code not in {"insufficient_quota"}
         return ModelAdapterError(
             f"provider rejected the request (HTTP {status}{param_detail})",
             error_code="model_error",
             provider_error_code=code,
-            retryable=(status == 429 and code not in {"insufficient_quota"}),
+            retryable=retryable,
+            config_recoverable=_config_shaped_refusal(status, retryable=retryable),
             http_status=status,
+            provider_retried=retried,
         )
     if isinstance(status, int) and 500 <= status < 600:
         return ModelAdapterError(
@@ -661,22 +707,34 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
             error_code="model_error",
             provider_error_code=code,
             retryable=True,
+            config_recoverable=_config_shaped_refusal(status, retryable=True),
             http_status=status,
+            provider_retried=retried,
         )
     # No usable HTTP status. Recover what we can from the body code so the failure isn't masked as
     # a generic "provider call failed" (e.g. a streaming 429 insufficient_quota with no status_code).
     if code:
+        inferred_status = _PROVIDER_CODE_STATUS.get(code)
+        retryable = code in _RETRYABLE_PROVIDER_CODES
         return ModelAdapterError(
             f"provider error: {code}",
             error_code="model_error",
             provider_error_code=code,
-            retryable=(code in _RETRYABLE_PROVIDER_CODES),
-            http_status=_PROVIDER_CODE_STATUS.get(code),
+            retryable=retryable,
+            # The status is synthesized here rather than reported, and a synthesized 4xx is as
+            # config-shaped as a reported one -- the same predicate answers both branches, so
+            # the flag cannot be right on one and absent on its twin.
+            config_recoverable=_config_shaped_refusal(inferred_status, retryable=retryable),
+            http_status=inferred_status,
+            provider_retried=retried,
         )
     return ModelAdapterError(
         f"provider call failed ({type(exc).__name__})",
         error_code="model_error",
         provider_error_code="unclassified_provider_error",
+        # Nothing to classify: no status and no code, so no remedy is claimed either.
+        config_recoverable=_config_shaped_refusal(None, retryable=False),
+        provider_retried=retried,
     )
 
 
