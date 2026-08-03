@@ -210,9 +210,21 @@ def make_llm_gateway_handler(
 
         def _write_sse_frame(self, frame: dict[str, Any]) -> None:
             # Single-line JSON (no indent), flushed per frame so the stream is live.
+            #
+            # ``ensure_ascii=True`` here and NOT in ``_write_json`` above, because "single-line"
+            # is the whole framing on this route and the two ends disagree about what a line is.
+            # U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE survive an
+            # ``ensure_ascii=False`` dump as themselves, and the line-splitting readers clients
+            # use -- httpx's ``aiter_lines``, which this repo's own GatewayModelAdapter reads
+            # with -- break on all three. The client then parses a JSON object that stops
+            # mid-string and reports a bad response for a turn this server produced, framed and
+            # already metered. Model text can contain any of them (``final_text``, and the
+            # relayed ``reasoning`` array, whose plaintext entries need never appear in the
+            # answer at all), so escaping them is the frame writer's job, not the model's. The
+            # length-delimited body has no such ambiguity and keeps its smaller encoding.
             self.wfile.write(
                 b"data: "
-                + json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                + json.dumps(frame, ensure_ascii=True, allow_nan=False).encode("utf-8")
                 + b"\n\n"
             )
             self.wfile.flush()

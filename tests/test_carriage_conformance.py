@@ -1441,6 +1441,70 @@ def _helper_home(name: str) -> str:
     return GATEWAY_WIRE_READ_HELPER_HOMES.get(name, "providers/gateway.py")
 
 
+def _gateway_import_homes() -> dict[str, str]:
+    """Every name ``providers/gateway.py`` imports from a module OF THIS PACKAGE, mapped to that
+    module's path relative to the package root.
+
+    The map above is a hand list, and a hand list can be wrong in two directions. One of them is
+    loud: a registered helper that no longer exists blows up in :func:`_function_node`. The other
+    was silent, and it is the case a NEW shared helper lands in — a helper the readers call that
+    is neither defined in ``gateway.py`` nor registered here resolves to nothing at all, so
+    :func:`_helper_home` never looks for it, the discovery below drops it for not being
+    ``reachable``, and every read-key census quietly stops counting the keys it carries. An
+    unregistered LOCAL helper is discovered and diffed; an unregistered FOREIGN one was invisible.
+
+    The import statement that made it callable is the answer, so it is read rather than trusted.
+    Only names imported from this package resolve: ``json``/``typing`` names are not helpers of
+    ours, and a module path that is not a file (a package ``__init__`` re-export) is left
+    unresolved rather than guessed at.
+    """
+
+    homes: dict[str, str] = {}
+    for node in ast.walk(_module_tree("providers/gateway.py")):
+        if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
+            continue
+        if not node.module.startswith("monoid_agent_kernel."):
+            continue
+        relative = node.module[len("monoid_agent_kernel.") :].replace(".", "/") + ".py"
+        if not (PACKAGE / relative).is_file():
+            continue
+        for alias in node.names:
+            homes[alias.asname or alias.name] = relative
+    return homes
+
+
+def _foreign_wire_read_helper_homes() -> dict[str, str]:
+    """The derived twin of ``GATEWAY_WIRE_READ_HELPER_HOMES``: where each FOREIGN wire-reading
+    helper the registered readers call is defined.
+
+    A called name qualifies only if all three hold — ``gateway.py`` imports it from a module of
+    this package, that module defines a function by that name, and the function reads a key off
+    one of its parameters. That is the same predicate the local discovery uses
+    (:func:`_reads_a_mapping_parameter`), applied across the module boundary the hand map exists
+    to cross, so a builtin, a class, or a codec that takes a string is not mistaken for a helper.
+
+    One blind spot stays, and it is not the one this closes: a helper called through its module
+    (``_common.usage_reported_by(...)``) is an ``ast.Attribute``, which
+    :func:`_called_local_names` does not collect on any of these censuses. This module imports
+    its helpers by name, which is what makes the derivation total for it.
+    """
+
+    local = _all_functions("providers/gateway.py")
+    imported = _gateway_import_homes()
+    called: set[str] = set()
+    for reader in GATEWAY_ERROR_READERS:
+        for node in local[reader.split(":", 1)[1]]:
+            called |= _called_local_names(node)
+    homes: dict[str, str] = {}
+    for name in sorted(called - set(local)):
+        home = imported.get(name)
+        if home is None:
+            continue
+        if any(_reads_a_mapping_parameter(node) for node in _all_functions(home).get(name, [])):
+            homes[name] = home
+    return homes
+
+
 # The helpers a derived scan can find: they take the wire mapping itself and read a key off it
 # (a literal one, or the ``key`` parameter their callers pass). Pinned in full, so a new
 # ``_gateway_float(payload, key, *, http_status)`` carrying a new key fails here.
@@ -2875,10 +2939,13 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
     # A helper the readers call is a wire reader wherever it is defined. ``usage_reported_by``
     # is shared with the OpenAI adapter and lives in ``providers/_common.py``, so a scan of this
     # module alone stopped discovering it -- and a helper that is not discovered is one whose
-    # keys every census below quietly stops counting. Only the registered homes are merged in,
-    # so this does not drag the whole shared module into the gateway's reader census.
+    # keys every census below quietly stops counting. The homes are DERIVED from this module's
+    # own imports rather than read off the hand map, so the next shared helper is discovered
+    # here (and diffed below) instead of being dropped for not being registered -- the one
+    # direction the hand map could be wrong in without saying so. Only names the readers
+    # actually call resolve, so this does not drag the whole shared module into the census.
     reachable = dict(functions)
-    for helper, home in GATEWAY_WIRE_READ_HELPER_HOMES.items():
+    for helper, home in _foreign_wire_read_helper_homes().items():
         reachable.setdefault(helper, _all_functions(home)[helper])
     discovered = {
         name
@@ -2915,6 +2982,41 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
             "hint": "it carries a wire key of its own now: move it to "
             "GATEWAY_MAPPING_READ_HELPERS and account for the key it reads",
         }
+
+
+def test_2b_the_helper_home_map_is_every_foreign_helper_the_readers_call() -> None:
+    """The third closed hand list in this family, and the one with a silent failure mode.
+
+    ``GATEWAY_WIRE_READ_HELPERS`` is diffed against a scan of the gateway module, so an
+    unregistered helper defined THERE fails loudly. A helper defined in another module and left
+    out of the home map failed nothing: it is not in the module scan, so the discovery above
+    dropped it as unreachable, and ``_helper_home`` would not have known where to parse it
+    anyway -- the keys it reads simply stopped being counted, on both sides of every pinned
+    read-set. Derived from the imports that make it callable, so registering a home is now the
+    only way to keep the census green.
+    """
+
+    derived = _foreign_wire_read_helper_homes()
+    assert derived == GATEWAY_WIRE_READ_HELPER_HOMES, {
+        "called_by_a_reader_with_no_home_registered": sorted(
+            set(derived) - set(GATEWAY_WIRE_READ_HELPER_HOMES)
+        ),
+        "registered_but_no_reader_reaches_it": sorted(
+            set(GATEWAY_WIRE_READ_HELPER_HOMES) - set(derived)
+        ),
+        "moved": {
+            name: (GATEWAY_WIRE_READ_HELPER_HOMES[name], derived[name])
+            for name in set(derived) & set(GATEWAY_WIRE_READ_HELPER_HOMES)
+            if derived[name] != GATEWAY_WIRE_READ_HELPER_HOMES[name]
+        },
+        "hint": "a shared wire-reading helper: register its home AND add it to "
+        "GATEWAY_WIRE_READ_HELPERS, or every read-key census stops counting its keys",
+    }
+    # And each registered home really is where the helper lives, which is what ``_helper_home``
+    # promises its callers.
+    for helper, home in GATEWAY_WIRE_READ_HELPER_HOMES.items():
+        assert _helper_home(helper) == home
+        assert helper in _all_functions(home)
 
 
 @pytest.mark.parametrize("reader", sorted(GATEWAY_READER_WIRE_KEYS))

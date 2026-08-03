@@ -278,9 +278,11 @@ loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink()
 resolves it the same way — what the answering adapter declares as `provider_name`, falling back to
 `ModelConfig.provider` when it declares nothing (`providers/base.py:resolved_provider_name`).
 `GatewayModelAdapter` declares the provider it relays (default `"openai"`; set it per deployment
-with `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`, or
-`RunnerBackend(llm_gateway_provider=...)`; `none` disables it), so a call routed through the
-gateway is attributed to the **model that served it** rather than to the transport it arrived over.
+with `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`,
+`RunnerBackend(llm_gateway_provider=...)`, or — for the reference Studio, whose embedder seam is
+itself such a factory — `StudioConfig(llm_gateway_provider=...)`; `none` disables it), so a call
+routed through the gateway is attributed to the **model that served it** rather than to the
+transport it arrived over.
 
 Four surfaces change together, deliberately, because one expression feeds all of them:
 `ModelCallReceipt.provider_name` (previously `""` on this route); `gen_ai.provider.name` on the

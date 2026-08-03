@@ -431,6 +431,83 @@ def test_the_client_behind_that_stream_reports_what_the_refusal_cost() -> None:
     assert gateway.tenant_usage("tenant_a")["total_tokens"] == 460
 
 
+# --- the separators an SSE frame must not put on the wire raw -----------------------------
+#
+# SSE is a LINE protocol, and "line" is not the same word on both ends of it. The frame writer
+# serialized with ``ensure_ascii=False``, which leaves U+2028, U+2029 and U+0085 in the body as
+# themselves; httpx -- what this repo's own streaming client reads with -- splits ``aiter_lines``
+# on all three. The client's parser then sees a JSON object that stops mid-string and reports
+# ``gateway_bad_response`` for a turn the server has already produced, already framed and already
+# metered. ``final_text`` could always carry one; the relayed ``reasoning`` array made it
+# reachable from content that never appears in the answer at all, which is why it is pinned on
+# both carriers. Real HTTP on both tests: a hand-fed line list cannot fail this way.
+
+_LINE_SEPARATORS = "\u2028\u2029\u0085"
+
+
+def _streamed_turn_over_http(chunks: list[Any]) -> Any:
+    """Drive the shipped client against the shipped server and assemble what it received."""
+
+    server, manager = _server_for(lambda *_: FakeStreamingModelAdapter(chunk_turns=[chunks]))
+    with serving(server) as base_url:
+        adapter = _adapter(base_url, _llm_token(manager))
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+        return assemble_streamed_turn(asyncio.run(_collect(adapter.astream_turn(request))))
+
+
+def test_a_relayed_reasoning_entry_survives_the_unicode_line_separators() -> None:
+    pytest.importorskip("httpx")
+    plaintext = f"weighed{_LINE_SEPARATORS}the options"
+    reasoning = (
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},
+        {"type": "message", "content": [{"type": "output_text", "text": plaintext}]},
+    )
+    turn = _streamed_turn_over_http(
+        [
+            TextDelta("ok"),
+            TurnComplete(response_id="prov", usage={"total_tokens": 5}, reasoning=reasoning),
+        ]
+    )
+
+    assert turn.final_text == "ok"
+    assert tuple(turn.reasoning) == reasoning, {
+        "relayed": turn.reasoning,
+        "hint": "the terminal frame was split mid-JSON on a separator the client calls a line",
+    }
+
+
+def test_final_text_survives_a_unicode_line_separator_on_the_stream() -> None:
+    """The carrier that predates the reasoning array, on the delta frames rather than the
+    terminal one -- separate frames, same writer, and only one of them was ever exercised."""
+
+    pytest.importorskip("httpx")
+    answer = "before\u2028after"
+    turn = _streamed_turn_over_http(
+        [TextDelta(answer), TurnComplete(response_id="prov", usage={"total_tokens": 5})]
+    )
+    assert turn.final_text == answer
+
+
+def test_the_length_delimited_transport_carries_them_as_it_always_did() -> None:
+    """The counterweight: the non-streaming body is framed by ``Content-Length``, not by lines.
+
+    Nothing in it can be split by a separator, so it keeps ``ensure_ascii=False`` and the
+    smaller body that goes with it -- the escape is a property of the LINE protocol, not of the
+    gateway's JSON.
+    """
+
+    answer = f"before{_LINE_SEPARATORS}after"
+    server, manager = _server_for(
+        lambda *_: FakeModelAdapter(
+            turns=[ModelTurn(response_id="prov", final_text=answer, usage={"total_tokens": 4})]
+        )
+    )
+    with serving(server) as base_url:
+        adapter = _adapter(base_url, _llm_token(manager))
+        turn = adapter.next_turn(ModelRequest(instruction="go", system_prompt="sys", tools=()))
+    assert turn.final_text == answer
+
+
 def test_the_streamed_backoff_waits_without_holding_the_event_loop(monkeypatch: Any) -> None:
     """The streamed retry path must not use the blocking wait.
 
