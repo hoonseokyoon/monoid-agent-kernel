@@ -506,13 +506,20 @@ def _applied_echoes(
 def _reasoning_payload(turn: ModelTurn) -> dict[str, Any]:
     """The turn's provider-native reasoning artifacts, for whichever transport is writing.
 
-    The kernel captures these opaque items (OpenAI's ``reasoning`` output items, carrying their
-    ``encrypted_content``) and replays them verbatim on the next by-value turn, which is what
-    makes a ZDR reasoning round-trip possible at all. The request half of that loop already
-    crossed this hop -- ``messages`` ride by value and are forwarded untouched -- but the
+    The kernel captures these items and replays them verbatim on the next by-value turn, which
+    is what makes a ZDR reasoning round-trip possible at all. The request half of that loop
+    already crossed this hop -- ``messages`` ride by value and are forwarded untouched -- but the
     response half did not, so a run routed through the gateway captured nothing and replayed
-    nothing. Relayed verbatim: the items are already provider-encrypted and this hop has no
-    business interpreting them.
+    nothing. Relayed verbatim, because this hop has no business interpreting them.
+
+    Not opaque, though, and the distinction matters to whoever writes the redaction policy: the
+    captured subsequence is ``reasoning`` items PLUS the ``function_call``/``message`` items they
+    are paired with (the provider validates that adjacency), so only the reasoning-type entries
+    carry ``encrypted_content``. A ``message`` entry holds the model's plaintext answer and a
+    ``function_call`` entry holds plaintext arguments -- the same content ``final_text`` and
+    ``tool_calls`` carry on this very envelope. Treat the array as MODEL CONTENT when logging or
+    truncating: it roughly doubles a small body, and it defeats any bound applied only to the
+    fields beside it.
 
     Built by one function and used by both writers, exactly like :func:`_applied_echoes`, so the
     two transports cannot come to disagree about a fact neither of them authored.

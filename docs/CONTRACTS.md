@@ -340,7 +340,7 @@ Four further opt-in protocols declare optional capability members:
   `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
   parameterizes the capability rather than declaring it.
 - `ProviderNamedModelAdapter.provider_name: str | None` — tags captured `ModelTurn.reasoning` with
-  provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
+  provider+model so those items only round-trip back to a matching adapter and model.
   Omitting it means "do not tag", and `None` says the same thing explicitly — which is what a
   deployment needs when its gateway fronts an upstream with no reasoning artifacts, hence the
   optional type rather than `str`. A *forwarding* adapter declares the provider whose artifacts it
@@ -671,6 +671,28 @@ shape that cannot carry them is a stream that ends without a terminal frame — 
 end-of-turn metadata channel at all, exactly as it has none for `usage` or the turn handle — and
 that absence is tolerated rather than refused: the turn reads no artifacts and the next turn
 replays none.
+
+**Replay is guaranteed only for the active window, and requests are pruned to it.** The active
+window is everything after the last `user` message — the in-flight tool loop. A captured
+reasoning block is replayable while it sits inside that window, and once a new user message
+lands it is outside forever, because the window only moves forward. The kernel therefore builds
+each request from a wire copy with the `reasoning` key removed from every message before the
+window start. What the provider sees is unchanged: outside the window the adapter already
+reconstructed those turns from `content`/`tool_calls` and never read the block. What changes is
+size — the un-pruned request re-sent one dead block per user turn on every later request, which
+grows with the conversation and is paid to the provider, to the gateway in between (twice on
+that route), and to the resolved-wire guard that `max_message_log_bytes` bounds. Note that on a
+media-free run the durable-log check reads the same limit over a strictly larger log, so it is
+that check, not the wire one, that a runaway conversation trips first; the prune buys request
+bytes rather than a new headroom regime. The rule lives in one function
+(`providers/_common.reasoning_replay_window_start`), read by both the adapter that decides what
+to replay and the kernel that decides what to send. **The durable message log and the checkpoint
+are not pruned** — they keep every captured block verbatim, so a restored run and a forensic
+reader both see what the model produced. Both routes benefit: the direct OpenAI one (bytes to
+the provider) and the gateway one, where the block would otherwise cross two hops. `prompt_digest`
+identifies the conversation the model actually saw, so it is taken over the pruned request; the
+same conversation digests differently than it did before this rule, which is the digest staying
+honest rather than a compatibility break — nothing compares digests across versions.
 
 ### Output Validation
 
@@ -1622,9 +1644,27 @@ Successful response:
 }
 ```
 
-`reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim. The items
-are **opaque**: already provider-encrypted, never interpreted or displayed by the gateway or the
-kernel, and meaningful only to the provider that produced them. They ride the response body and
+`reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim: the
+provider's output-item subsequence, adjacency-preserving — the `reasoning` items **plus the
+`function_call` or `message` items they are paired with**, because the provider validates that
+pairing when the subsequence is sent back. Only the `reasoning`-type entries are encrypted; a
+`message` entry carries the model's plaintext answer text and a `function_call` entry carries
+plaintext tool arguments, both of which also appear in `final_text` / `tool_calls` on the same
+envelope. Nothing here is interpreted by the gateway or the kernel, but **a redaction or logging
+policy must treat this array as model content**, not as an opaque blob: it duplicates content the
+rest of the envelope already bounds, so a surface that truncates `final_text` and dumps
+`reasoning` raw has not truncated anything. Sizewise it roughly doubles a small body when
+populated, and it is the payload the kernel prunes off historical turns (see the replay-window
+rule above).
+
+Note that `reasoning` names two different things on the two halves of this protocol, and they
+are not the same shape: on the **request** it is the reasoning *config* object
+(`{"effort": ..., "summary": ...}`, documented above), and on the **response** it is this
+artifact *array*. A server that echoes request keys back onto its response body therefore
+answers an array-valued key with an object, which the response reader refuses as
+`gateway_bad_response`.
+
+The artifacts ride the response body and
 the terminal `turn_complete` stream frame — the same two writers, built from one function — and
 exist so the provider-native reasoning round-trip survives this hop: the kernel captures them,
 tags them with the relaying adapter's `provider_name` plus the model, carries them in the

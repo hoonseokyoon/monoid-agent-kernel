@@ -230,12 +230,21 @@ stream frame, again without changing the protocol identifier. Its conditionality
 image of the request keys above: those are *request*-conditional (present when the caller
 configured the feature), while `reasoning` is **response**-conditional — present only when the
 upstream actually produced artifacts — so traffic whose upstream produces none keeps its exact
-previous wire shape either way. Skew is lossless in both directions and, unlike the echoes, fails
-*open* rather than closed, because the key proves nothing: an old client ignores the additive
-array, and a new client reading an old server (or a stream that ends without a terminal frame)
-reads the absence as `()` through the permissive response reader. The only consequence of skew is
-that the provider-native reasoning round-trip does not happen on that hop — the loop appends no
-reasoning block for an empty tuple, and the next turn is an ordinary untagged one.
+previous wire shape either way. Skew is lossless in both directions: an old client ignores the
+additive array, and a new client reading an old server (or a stream that ends without a terminal
+frame) reads the absence as `()` through the permissive response reader. The only consequence of
+that skew is that the provider-native reasoning round-trip does not happen on that hop — the loop
+appends no reasoning block for an empty tuple, and the next turn is an ordinary untagged one.
+
+Failing *open* is scoped to **absence**, and only absence: a key that is not there proves
+nothing, so nothing is refused. A key that IS there must be an array of objects, because that is
+the only shape the replay path can hand back to a provider; a present-but-malformed value is
+refused non-retryably as `gateway_bad_response` by both readers (body and terminal frame). One
+skew case reaches that refusal in a way worth naming: the same protocol uses a `reasoning` key on
+the **request** body for the reasoning *config* object, so a third-party gateway that echoes
+request keys onto its response answers an array-valued key with an object and is refused. That is
+the correct outcome — the value is unusable for replay either way — but the cause is not obvious
+from the error, so check for a request echo before suspecting the upstream's artifacts.
 
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the

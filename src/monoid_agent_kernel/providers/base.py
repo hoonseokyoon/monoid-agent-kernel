@@ -124,11 +124,14 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
-    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call`` output
-    # items), captured verbatim and in their original order so the engine can round-trip them
-    # on the next by-value turn. Opaque to the core — never displayed, never reconstructed; an
-    # adapter that has no reasoning leaves this empty (the neutral seam). See the OpenAI adapter
-    # and the loop's assistant-message append for capture + re-injection.
+    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call``/``message``
+    # output items), captured verbatim and in their original order so the engine can round-trip
+    # them on the next by-value turn. Uninterpreted by the core — never displayed, never
+    # reconstructed — but not opaque: only the reasoning-type entries are provider-encrypted,
+    # while a paired ``message``/``function_call`` entry duplicates the plaintext of
+    # ``final_text``/``tool_calls``. Anything that logs or truncates this must treat it as model
+    # content. An adapter that has no reasoning leaves this empty (the neutral seam). See the
+    # OpenAI adapter and the loop's assistant-message append for capture + re-injection.
     reasoning: tuple[dict[str, Any], ...] = ()
     # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
     stop_reason: StopReason | None = None
@@ -319,7 +322,7 @@ class MultimodalModelAdapter(Protocol):
 
 
 class ProviderNamedModelAdapter(Protocol):
-    """An adapter that identifies whose opaque reasoning items it produces.
+    """An adapter that identifies whose provider-native reasoning items it produces.
 
     The loop reads ``provider_name`` via ``getattr(adapter, "provider_name", None)`` and tags
     captured :attr:`ModelTurn.reasoning` with provider+model, so items only round-trip back to
@@ -791,6 +794,16 @@ def _normalize_model_turn(turn: Any) -> Any:
 
     reasoning = getattr(turn, "reasoning", ())
     if not isinstance(reasoning, (list, tuple)):
+        # DIVERGENCE, deliberate: the stream twin (``_normalize_model_stream_chunk``, on
+        # ``TurnComplete``) RAISES on this same non-sequence, while the turn path coerces to ().
+        # It is wire-observable — a custom adapter returning a malformed ``reasoning`` has its
+        # turn silently stripped and its stream hard-failed — and it stands because the two
+        # paths have different jobs. This one, per the docstring above, must keep accepting the
+        # structurally-compatible legacy objects that predate the protocol, where an attribute
+        # of an unexpected shape means "this adapter has no reasoning" rather than "this adapter
+        # is broken"; there is no reasoning to lose. The stream path is the strict ingress: its
+        # chunks are the protocol's own dataclasses, so a bad value there is a real defect, and
+        # a silently-emptied terminal frame would drop artifacts the round-trip needs.
         reasoning = ()
     normalized_reasoning = normalize_json_ingress(reasoning)
     reasoning = (
@@ -883,6 +896,12 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
         if reasoning is None:
             reasoning = ()
         if not isinstance(reasoning, (list, tuple)):
+            # DIVERGENCE, deliberate: the one-shot twin (``_normalize_model_turn``) coerces this
+            # same non-sequence to () instead of raising. Strictness belongs here — a stream
+            # chunk is one of this protocol's own dataclasses, not a legacy duck-typed object,
+            # so a malformed value is a defect rather than "no reasoning", and emptying it
+            # quietly would drop the terminal frame's artifacts on the floor. See the comment at
+            # the turn-path site for why tolerance belongs there.
             raise ValueError("turn complete reasoning must be an array or null")
         normalized_reasoning = normalize_json_ingress(reasoning)
         reasoning = (

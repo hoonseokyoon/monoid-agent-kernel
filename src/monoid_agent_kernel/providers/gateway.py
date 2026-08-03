@@ -147,8 +147,10 @@ class GatewayModelAdapter:
     token_provider: Callable[[], str | None] | None = None
     # Whose native reasoning artifacts this transport RELAYS -- the upstream provider behind the
     # gateway, never the hop itself. The loop reads it (ProviderNamedModelAdapter) to tag the
-    # opaque items it captured off a turn, and replays a tagged block only to a matching
-    # adapter and model, so the tag has to name the thing that can actually read the items back:
+    # items it captured off a turn (encrypted reasoning entries and the plaintext message/
+    # function_call entries paired with them -- see ``_gateway_reasoning_items``), and replays a
+    # tagged block only to a matching adapter and model, so the tag has to name the thing that
+    # can actually read the items back:
     # an OpenAI-encrypted reasoning item returned to anything else is an unusable request one
     # turn later. Without this field the loop dropped every artifact the gateway relayed, one
     # line after the reader reconstructed it.
@@ -854,7 +856,17 @@ def _gateway_reasoning_items(
     can hand back to a provider: the items travel into the by-value ``messages`` log and out
     again to the upstream adapter verbatim, so a scalar or a half-list would be discovered by
     the *provider*, one hop and one turn later, as an unclassifiable request. Contents are not
-    inspected past that -- they are opaque and provider-encrypted by construction.
+    inspected past that -- but "not inspected" is not "opaque". The captured subsequence is the
+    provider's ``reasoning`` items plus the ``function_call``/``message`` items paired with them,
+    so only the reasoning-type entries are encrypted: the rest is plaintext answer text and tool
+    arguments, duplicating what ``final_text``/``tool_calls`` carry beside it. Anything that
+    logs, previews, or truncates this value must treat it as model content.
+
+    Note also that ``reasoning`` means one thing on the request body (the reasoning CONFIG
+    object this adapter writes in ``_payload``) and another here on the response (this artifact
+    ARRAY). A third-party gateway that echoes request keys onto its response therefore answers
+    with an object where an array belongs, and lands on the refusal below -- which is the correct
+    outcome (the replay path cannot use it), just an unobvious cause.
 
     A tuple is accepted beside a list for the same reason ``tool_calls`` accepts one two dozen
     lines below: JSON only ever produces a list, but this reader also serves in-process Python
