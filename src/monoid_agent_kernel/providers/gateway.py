@@ -119,6 +119,26 @@ class GatewayModelAdapter:
     # near expiry, keeping a long run (one that outlives the token TTL) authenticated without a
     # restart. ``None`` = today's static behavior.
     token_provider: Callable[[], str | None] | None = None
+    # Whose native reasoning artifacts this transport RELAYS -- the upstream provider behind the
+    # gateway, never the hop itself. The loop reads it (ProviderNamedModelAdapter) to tag the
+    # opaque items it captured off a turn, and replays a tagged block only to a matching
+    # adapter and model, so the tag has to name the thing that can actually read the items back:
+    # an OpenAI-encrypted reasoning item returned to anything else is an unusable request one
+    # turn later. Without this field the loop dropped every artifact the gateway relayed, one
+    # line after the reader reconstructed it.
+    #
+    # Defaults to the reference gateway's hardcoded upstream (``_upstream_model_config`` builds
+    # ``provider="openai"`` and ``_build_adapter`` falls back to ``OpenAIModelAdapter``). A
+    # deployment whose ``provider_adapter_factory`` routes elsewhere must set this to its real
+    # upstream; ``None`` disables tagging, which is the protocol's documented "do not tag" and
+    # the right answer for a gateway fronting an upstream with no reasoning artifacts.
+    #
+    # It also names the provider on the observability surfaces that probe an adapter for one --
+    # the model-call receipt, its OTel ``gen_ai.provider.name``, and the model-stream context --
+    # which is the correct attribution for all three: those spans describe the call the *model*
+    # served, and "gateway" is the transport it arrived over. ``ModelConfig.provider`` still
+    # carries that transport string beside it.
+    provider_name: str | None = "openai"
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True

@@ -315,7 +315,9 @@ def test_optional_capability_protocols_are_satisfied_by_shipped_adapters() -> No
 
     expected = {
         MultimodalModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
-        ProviderNamedModelAdapter: (OpenAIModelAdapter,),
+        # The gateway joined in X-3: it declares the UPSTREAM provider whose opaque reasoning
+        # artifacts it relays, so the loop can tag them and replay them back through the hop.
+        ProviderNamedModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
         ConfiguredModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
         AddressedModelAdapter: (GatewayModelAdapter,),
     }

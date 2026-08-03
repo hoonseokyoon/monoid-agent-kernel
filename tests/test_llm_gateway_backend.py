@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import threading
@@ -16,8 +17,13 @@ from support.http import (
     serving,
     wait_http_ready as _wait_http_ready,
 )
-from support.runtime import runtime_config
+from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.providers.base import ModelRequest
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -1078,3 +1084,140 @@ def test_a_malformed_reasoning_value_is_refused_by_both_readers(malformed) -> No
     framed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(frame)).value
     assert framed.provider_error_code == "gateway_bad_response"
     assert framed.retryable is False
+
+
+class _CapturingReasoningUpstream(_OneShotReasoningBackend):
+    """Produces reasoning on the first turn, and records what the second turn was handed.
+
+    The recording is the whole point: the round-trip is only real if the items the gateway
+    relayed come back *up* the same hop, tagged, inside the by-value message log the upstream
+    adapter reads.
+    """
+
+    def next_turn(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return ModelTurn(
+                response_id="provider_response_1",
+                final_text="thought about it",
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                reasoning=self.items,
+                stop_reason="stop",
+            )
+        return ModelTurn(
+            response_id="provider_response_2",
+            final_text="and again",
+            usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            stop_reason="stop",
+        )
+
+
+def test_the_reasoning_round_trip_survives_the_gateway_hop_end_to_end(tmp_path: Path) -> None:
+    """X-3's actual claim, in one test: capture -> wire -> tag -> replay, across a real hop.
+
+    Each half was provable on its own and the feature was still dead. The wire carried the
+    items but the loop refused to tag them, because tagging is gated on the adapter naming the
+    provider whose artifacts these are — and the gateway adapter named nobody, so the block was
+    dropped one line after the reader that had just reconstructed it. What this asserts is the
+    only thing that proves the round-trip: the SECOND request the upstream receives carries the
+    FIRST turn's items, verbatim, tagged with the provider and model they can be replayed to.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    manager = _token_manager()
+    upstream = _CapturingReasoningUpstream()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        loop = AgentLoop(
+            spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config("fs.write", model=config)),
+        )
+        loop.open()
+        loop.submit("first")
+        loop.submit("second")
+        loop.close()
+
+    assert len(upstream.requests) == 2, "the loop must have driven two turns over the hop"
+    replayed = [
+        message
+        for message in (upstream.requests[1].messages or ())
+        if message.get("role") == "assistant"
+    ]
+    assert replayed, "the second turn must carry the first turn's assistant reply by value"
+    assert replayed[0]["reasoning"] == {
+        # The provider whose artifacts these are — the gateway's UPSTREAM, not the transport.
+        # Replay only round-trips to a matching adapter and model, so a tag naming the hop
+        # would send OpenAI's encrypted items back to something that cannot read them.
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "items": [dict(item) for item in upstream.items],
+    }
+
+
+def test_the_gateway_call_is_attributed_to_the_upstream_it_relays(tmp_path: Path) -> None:
+    """The deliberate side effect of naming the upstream, pinned rather than discovered later.
+
+    ``provider_name`` is not a private channel to the loop's reasoning tag: three observability
+    surfaces probe an adapter for it — the model-call receipt, its OTel ``gen_ai.provider.name``
+    (``receipt.provider_name or receipt.model.provider``) and the model-stream context. Through
+    the gateway all three previously fell back to the transport string. They now say "openai",
+    which is the honest answer for a span describing the call a *model* served; the transport is
+    still on the same receipt, as ``model.provider``. Using the existing seam is the decision —
+    a second attribute would give the tag and the spans two truths to drift between.
+    """
+
+    del tmp_path
+    manager = _token_manager()
+    upstream = _OneShotReasoningBackend()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        runner = ModelCallRunner(adapter=adapter)
+        _turn, receipt = asyncio.run(
+            runner.acall(
+                ModelRequest(
+                    instruction="hello", system_prompt="sys", tools=(), model=config
+                )
+            )
+        )
+
+    assert receipt.provider_name == "openai"
+    assert receipt.model.provider == "gateway", "the transport must still be legible on the receipt"
+    # The exact expression the two OTel span builders evaluate.
+    assert (receipt.provider_name or receipt.model.provider) == "openai"
+
+
+def test_the_relayed_provider_is_configurable_and_can_be_switched_off() -> None:
+    """Default, override, and the documented "do not tag" — one deployment shape each.
+
+    The default matches the reference gateway's hardcoded upstream. A deployment whose
+    ``provider_adapter_factory`` routes somewhere else must say so, because a tag naming the
+    wrong provider is worse than no tag: the loop would replay one provider's opaque items to
+    another, one turn later, as an unreadable request.
+    """
+
+    plain = GatewayModelAdapter(ModelConfig(provider="gateway"))
+    assert plain.provider_name == "openai"
+    assert GatewayModelAdapter(ModelConfig(), provider_name="anthropic").provider_name == "anthropic"
+    assert GatewayModelAdapter(ModelConfig(), provider_name=None).provider_name is None
