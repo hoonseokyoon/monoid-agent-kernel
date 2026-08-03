@@ -17,8 +17,34 @@ The run-directory artifact set is:
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
 - `model-content.jsonl`: optional private model-stream sidecar with output/reasoning segments and
   settled text (`monoid.model-content.v1`)
-- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`)
-- `metrics.json`: final counters and timing
+- `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
+  non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
+  from the `session.state.changed` event). While a run is parked on a recoverable turn failure
+  the file carries the failure's full classification beside `error`/`error_code` —
+  `provider_error_code`, `http_status`, `retryable`, `config_recoverable`, `provider_retried` —
+  copied off the `turn.failed` event. A model turn starting clears the block (the new turn
+  supersedes the dead one), and a non-failed terminal heals it; on a failed terminal the
+  `run.failed` classification remains (minus `provider_retried`, a per-call fact the terminal
+  vocabulary drops). Absent keys mean "no live failure to classify" — which is also what their
+  absence on a pre-v0.21 artifact meant. The offline projection (`monoid status`, reading
+  `events.jsonl`) answers with the same fields under the same rules. When a run dies without a
+  live recorder — the reference backend's recovery gives it up for good (unrecoverable after
+  `max_recover_attempts`, or corrupt durable state), or the backend records a driver failure
+  (`record_run_failure`) — the terminal statement is written here too, by one shared writer:
+  `state: "failed"`, `terminal: true`, the failure bundle's error pair, plus a quarantine
+  marker naming the lane (`given_up_by_recovery` for recovery's give-ups,
+  `recorded_by_run_failure` for the driver-failure lane) — because none of these paths emit a
+  terminal event: without the artifact, every status reader kept reporting the dead run's
+  last park. All three writers go through `run_state.write_failure_status_artifact` (a writer
+  census in `tests/test_carriage_conformance.py` binds every `failure.json` writer to a
+  terminal statement), which also seeds the schema-required watermark keys
+  (`last_event_seq: 0`, `last_event_type: ""`) when it mints the artifact over a run that
+  never wrote one, so the minted file stays `STATUS_SCHEMA`-valid. The offline projection
+  honors the markers over the (necessarily park-ending) event log.
+- `metrics.json`: final counters and timing. On a failed run it also records the failure's
+  verdict beside the provider detail it already carried: `retryable` and `config_recoverable`
+  join `provider_error_code` / `provider_http_status`, so an operator holding only this
+  artifact can tell "resend after a config fix" from "this will fail the same way".
 - `manifest.json`: run contract, agent config metadata, binding-aware tool surface, workspace backend
 - `workspace.base.json`: base snapshot used for proposal comparison
 - `workspace.index.json`: context/index artifact
@@ -349,5 +375,12 @@ feed and descendant event polling.
 
 Each run writes `metrics.json` (and emits a `metrics.updated` event per turn) with
 final counters and timing: `status`, `duration_s`, `tool_calls`, shell/background-job counters,
-web-call counters, and token usage (`input_tokens`, `output_tokens`, `total_tokens`,
-`reasoning_tokens`). See [Outputs](#outputs) for the full run-directory artifact set.
+web-call counters, and token usage (`input_tokens`, `output_tokens`, `total_tokens`, plus the
+priced sub-counts `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens` and
+`audio_tokens`). Each sub-count appears on the event only when the adapter reported one, so a
+run that used no cache publishes no cache columns rather than a row of zeros — a dashboard
+should treat an absent sub-count as "not reported", not as zero. `metrics.updated` is emitted
+once per model call, including a call that failed *after* the provider billed for it (that arm
+adds the billed tokens to the totals, so it publishes them too); a failure that reached no
+provider adds nothing and emits nothing. See [Outputs](#outputs) for the full run-directory
+artifact set.

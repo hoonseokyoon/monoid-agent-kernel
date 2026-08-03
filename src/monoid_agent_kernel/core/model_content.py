@@ -68,6 +68,7 @@ class ModelContentSnapshot:
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
     retryable: bool = False
+    config_recoverable: bool = False
     segment_count: int = 0
     last_segment_index: int | None = None
 
@@ -494,6 +495,7 @@ class _ModelContentWriter:
                 "usage": None if outcome.usage is None else dict(outcome.usage),
                 "error_code": outcome.error_code,
                 "retryable": outcome.retryable,
+                "config_recoverable": outcome.config_recoverable,
                 "finished_at": utc_timestamp(),
             }
         )
@@ -588,6 +590,7 @@ class _RecoveredStream:
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
     retryable: bool = False
+    config_recoverable: bool = False
 
     def snapshot(self) -> ModelContentSnapshot:
         # A valid segment after a malformed/missing record has no trustworthy placement offset.
@@ -609,6 +612,7 @@ class _RecoveredStream:
             usage=self.usage,
             error_code=self.error_code,
             retryable=self.retryable,
+            config_recoverable=self.config_recoverable,
             segment_count=len(ordered),
             last_segment_index=indexes[-1] if indexes else None,
         )
@@ -1019,6 +1023,9 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
     usage = record.get("usage")
     error_code = record.get("error_code")
     retryable = record.get("retryable", False)
+    # Optional and defaulted, like ``retryable``: a sidecar written before this key existed is a
+    # valid record, not a skipped one. Present-but-mistyped is still refused below.
+    config_recoverable = record.get("config_recoverable", False)
     finished_at = record.get("finished_at")
     if final_text is not None and not isinstance(final_text, str):
         return False
@@ -1028,6 +1035,8 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
         return False
     if type(retryable) is not bool:
         return False
+    if type(config_recoverable) is not bool:
+        return False
     if not isinstance(finished_at, str) or not finished_at.endswith("Z"):
         return False
     recovered.status = status
@@ -1035,6 +1044,7 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
     recovered.usage = usage
     recovered.error_code = error_code
     recovered.retryable = retryable
+    recovered.config_recoverable = config_recoverable
     return True
 
 

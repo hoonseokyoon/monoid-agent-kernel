@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -22,6 +23,7 @@ from monoid_agent_kernel.core.durable_metadata import (
     DurableMetadataCommitter,
     validate_recovery_metadata,
 )
+from monoid_agent_kernel.core.projections import status_artifact_records_close
 from monoid_agent_kernel.core.result import (
     AgentRunResult,
     Suspension,
@@ -37,9 +39,28 @@ from monoid_agent_kernel.reference.backend.ports import (
     MutableRunRecordPort,
     RunRequestPort,
 )
+from monoid_agent_kernel.reference.backend.run_state import write_failure_status_artifact
 from monoid_agent_kernel.reference.backend.runtime_config import runtime_config_from_meta
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.backend")
+
+
+class ResumeOutcome(enum.Enum):
+    """What one :meth:`RecoveryService.attempt_resume` concluded.
+
+    A bare ``False`` used to fold three different refusals into one shape, and
+    ``resume_run`` then blamed every one of them on a ``failure.json`` that mostly did not
+    exist. The vocabulary is the decision, not the diagnosis: ``CLOSED`` — the run already
+    ended (a terminal status artifact, or a terminal checkpoint); ``ALREADY_LIVE`` — a
+    concurrent resume won the atomic record claim, so the run IS being resumed, just not by
+    this caller; ``FAILED`` — the attempt genuinely did not resume the run (a deferred read,
+    invalid durable state, or a resume exception — the give-up policy applies here and only
+    here). Only ``RESUMED`` means this caller now owns a live run."""
+
+    RESUMED = "resumed"
+    CLOSED = "closed"
+    ALREADY_LIVE = "already_live"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -68,6 +89,9 @@ class RecoveryContext:
     drive_open_session: DriveOpenSessionPort
     record_run_result: Callable[[str, AgentRunResult], None]
     record_run_failure: Callable[[str, Exception], None]
+    # ``(run_id, tenant_id)`` — the record-free metering seam for the give-up paths, which end
+    # a run that was never re-registered (RunStateMutationService.meter_abandoned_run).
+    meter_abandoned_run: Callable[[str, str], None]
     acquire_run_slot: Callable[[], Awaitable[None]]
     release_run_slot: Callable[[], None]
 
@@ -89,7 +113,7 @@ class RecoveryService:
                 continue
             if (run_dir / "failure.json").exists():
                 continue
-            if self.attempt_resume(run_dir, run_id):
+            if self.attempt_resume(run_dir, run_id) is ResumeOutcome.RESUMED:
                 recovered.append(run_id)
         return recovered
 
@@ -110,7 +134,7 @@ class RecoveryService:
                 continue
             if not lease_store.try_claim(run_id, worker_id, lease_ttl_s):
                 continue
-            if self.attempt_resume(run_dir, run_id):
+            if self.attempt_resume(run_dir, run_id) is ResumeOutcome.RESUMED:
                 _LOGGER.info("watchdog: reclaimed orphaned run %s", run_id)
                 reclaimed.append(run_id)
             elif (
@@ -120,15 +144,26 @@ class RecoveryService:
                 lease_store.release(run_id)
         return reclaimed
 
-    def attempt_resume(self, run_dir: Path, run_id: str) -> bool:
+    def attempt_resume(self, run_dir: Path, run_id: str) -> ResumeOutcome:
+        if self._closed_by_status_artifact(run_dir):
+            # A run that CLOSED limited is the one terminal outcome with no other
+            # recovery-visible marker: its park checkpoint is non-terminal (a live-limited
+            # park is resumable by design), ``close()`` keeps checkpoints for every
+            # non-completed status, and no failure.json exists — so every recovery pass
+            # re-drove it, appending another terminal run.finished and re-metering its full
+            # cumulative usage per restart, forever. The durable status artifact the close
+            # path already writes is the terminal marker, and consulting it on the reader
+            # side covers run dirs closed before this guard existed. Not a quarantine: no
+            # failure bundle, just a recognition that the run already ended.
+            return ResumeOutcome.CLOSED
         try:
             checkpoint_result = load_latest_checked(self._checkpoint_store(), run_id)
         except Exception as exc:
             _LOGGER.warning("checkpoint read for run %s deferred: %s", run_id, exc)
-            return False
+            return ResumeOutcome.FAILED
         if not checkpoint_result.ok:
             self._record_checked_load_failure(run_dir, run_id, checkpoint_result)
-            return False
+            return ResumeOutcome.FAILED
         stored = checkpoint_result.value
         assert stored is not None
         if stored.checkpoint.run_id != run_id or stored.checkpoint.seq != stored.seq:
@@ -140,17 +175,19 @@ class RecoveryService:
                     sequence=stored.seq,
                 ),
             )
-            return False
+            return ResumeOutcome.FAILED
         if stored.checkpoint.terminal:
-            return False
+            # The run's own end, committed durably: nothing to resume — the checkpoint twin
+            # of the status-artifact close above.
+            return ResumeOutcome.CLOSED
         try:
             metadata_result = self.read_recovery_meta_checked(run_dir, run_id)
         except Exception as exc:
             _LOGGER.warning("recovery metadata read for run %s deferred: %s", run_id, exc)
-            return False
+            return ResumeOutcome.FAILED
         if not metadata_result.ok:
             self._record_checked_load_failure(run_dir, run_id, metadata_result)
-            return False
+            return ResumeOutcome.FAILED
         meta = metadata_result.value
         assert meta is not None
         try:
@@ -163,7 +200,7 @@ class RecoveryService:
                     f"backend-run recovery metadata validation failed ({exc})"
                 ),
             )
-            return False
+            return ResumeOutcome.FAILED
         try:
             resumed = self.resume_from_checkpoint(stored, meta)
         except Exception as exc:
@@ -185,13 +222,22 @@ class RecoveryService:
                     exc_type=type(exc).__name__,
                     overwrite=True,
                 )
+                write_failure_status_artifact(
+                    run_dir,
+                    run_id,
+                    error=f"recovery failed after {attempts} attempts: {exc}",
+                    error_code="unrecoverable",
+                    exc_type=type(exc).__name__,
+                    marker="given_up_by_recovery",
+                )
+                self._meter_giveup(run_dir, run_id, meta)
                 _LOGGER.error("run %s marked unrecoverable", run_id)
-            return False
+            return ResumeOutcome.FAILED
         if resumed is False:
             # A concurrent recovery path won the atomic record claim. It owns the activation.
-            return False
+            return ResumeOutcome.ALREADY_LIVE
         self.clear_recover_attempts(run_dir)
-        return True
+        return ResumeOutcome.RESUMED
 
     def resume_from_checkpoint(self, stored: CheckpointRecord, meta: dict[str, Any]) -> bool:
         checkpoint = stored.checkpoint
@@ -265,8 +311,15 @@ class RecoveryService:
             await self._context.acquire_run_slot()
             acquired = True
             if loop.has_pending_tasks():
+                # ``status="completed"``, not ``"running"``. The durable status vocabulary is
+                # completed/failed/limited (core/result.py), and this synthetic park used to be
+                # minted outside it — latent only because it is re-driven rather than
+                # serialized, with nothing on the type saying so. The first path that
+                # checkpointed it would have raised at the recovery boundary this exists to
+                # serve. Behaviour is unchanged: nothing between here and the driver reads
+                # ``status`` on an ``awaiting_tasks`` park, which branches on ``reason``.
                 suspension = Suspension(
-                    reason="awaiting_tasks", status="running", has_external=True
+                    reason="awaiting_tasks", status="completed", has_external=True
                 )
             record = self._context.record(run_id)
             result = await self._context.drive_open_session(
@@ -325,6 +378,65 @@ class RecoveryService:
             exc_type="DurableLoadError",
             overwrite=True,
         )
+        write_failure_status_artifact(
+            run_dir,
+            run_id,
+            error=f"{result.message}{sequence}",
+            error_code=result.error_code or "durable_state_invalid",
+            exc_type="DurableLoadError",
+            marker="given_up_by_recovery",
+        )
+        # This quarantine ends the run for good (failure.json makes every later pass skip
+        # it), so what it had spent must reach the ledger now or never.
+        self._meter_giveup(run_dir, run_id, None)
+
+    def _closed_by_status_artifact(self, run_dir: Path) -> bool:
+        """Whether the run's durable status artifact records a CLOSE.
+
+        The payload-level answer lives in ``core.projections.status_artifact_records_close``
+        — ONE function for this guard and for ``list_runs``' ``recoverable`` fact, so the
+        two cannot drift: it resolves current artifacts (``state`` + explicit ``terminal``)
+        and legacy pre-``state`` ones, and treats a failure-quarantine statement (any
+        :data:`~monoid_agent_kernel.core.projections.FAILURE_QUARANTINE_MARKERS` marker) as
+        NOT a close — while the quarantine stands, every caller of ``attempt_resume``
+        refuses the dir on failure.json before reaching this guard, and once an operator
+        lifts it (the restore_hint's prescribed flow) this guard must not keep refusing the
+        resume. Unreadable or malformed artifacts answer False — the checkpoint/metadata
+        pipeline owns durable-state corruption, and a best-effort projection must not block
+        a genuine recovery. A MISSING (or operator-deleted) status.json answers False the
+        same way, so a closed-limited run whose artifact is gone can be resurrected once —
+        it then re-closes limited and rewrites the artifact, which bounds the damage to one
+        extra drive that self-heals at re-close. Falling back to deeper evidence (event-log
+        replay) for that edge was considered and declined: the artifact is written from run
+        start, so its absence is overwhelmingly "not a run dir we closed", and a fallible
+        deep read here must not block genuine recovery."""
+        try:
+            payload = loads_json_ingress((run_dir / "status.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return status_artifact_records_close(payload)
+
+    def _meter_giveup(self, run_dir: Path, run_id: str, meta: Mapping[str, Any] | None) -> None:
+        """Meter a given-up run's spend through the record-free seam, best-effort tenant.
+
+        The resume-failure give-up already holds validated metadata; the corrupt-state
+        quarantine may not, so the tenant is re-read from the recovery descriptor. A run with
+        no attributable tenant cannot enter a tenant ledger — logged, not invented."""
+        if meta is None:
+            try:
+                meta = self.read_recovery_meta(run_dir, run_id)
+            except Exception:  # noqa: BLE001 - metering must never mask the recorded failure
+                meta = None
+        tenant_id = str((meta or {}).get("tenant_id") or "")
+        if not tenant_id:
+            _LOGGER.warning(
+                "run %s given up with no attributable tenant; its spend is not metered", run_id
+            )
+            return
+        try:
+            self._context.meter_abandoned_run(run_id, tenant_id)
+        except Exception:  # noqa: BLE001 - metering must never mask the recorded failure
+            _LOGGER.exception("metering the abandoned run %s failed", run_id)
 
     def read_recover_attempts(self, run_dir: Path) -> int:
         try:
@@ -353,6 +465,9 @@ class RecoveryService:
         error_code: str,
         exc_type: str,
         overwrite: bool,
+        http_status: int | None = None,
+        retryable: bool = False,
+        config_recoverable: bool = False,
     ) -> None:
         failure_path = run_dir / "failure.json"
         if failure_path.exists() and not overwrite:
@@ -370,11 +485,27 @@ class RecoveryService:
             "run_id": run_id,
             "error": error,
             "error_code": error_code,
+            # The core's twin of this bundle (``loop.py``) carries the provider status, and this
+            # writer is the one a worker crash leaves behind -- the case where the bundle is the
+            # only record there is. ``None`` for the recovery-path failures that never reached a
+            # provider, which is what an absent status means there too.
+            "http_status": http_status,
+            # The classification twin of the status above. The defaults are the honest reading of
+            # "nothing classified this": a recovery-path failure (unrecoverable, invalid durable
+            # state) has no provider verdict to report, and the durable readers already treat an
+            # absent flag as False. Only the caller holding the run's own exception
+            # (``run_state.record_run_failure``) passes anything else.
+            "retryable": retryable,
+            "config_recoverable": config_recoverable,
             "type": exc_type,
             "last_good_seq": last_good_seq,
+            # The actual operator flow, verified: ``recover_runs`` and ``resume_run`` both
+            # SKIP/refuse a dir carrying failure.json, so the quarantine must be lifted first.
+            # The previous hint said "resume via recover_runs" with the bundle still in place
+            # — unfollowable as written.
             "restore_hint": (
-                f"restore checkpoint seq {last_good_seq} for run {run_id} via CheckpointStore, "
-                "then resume via recover_runs"
+                f"last good checkpoint is seq {last_good_seq}; delete failure.json to lift "
+                "the quarantine, then recover_runs (or resume_run) restores it"
                 if last_good_seq > 0
                 else "no recoverable checkpoint; inspect run logs and run.json"
             ),

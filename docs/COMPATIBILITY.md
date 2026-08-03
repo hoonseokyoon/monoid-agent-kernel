@@ -225,6 +225,58 @@ only when configured — a generation-free runtime config keeps its pre-v0.21 `c
 a *configured* one intentionally does not verify across mixed-version backend-run recovery
 (configure generation only on a fully rolled fleet).
 
+The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
+terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
+request keys above it is written unconditionally, beside `retryable` and `provider_retried`,
+because a reader must not have to tell "not config-fixable" apart from "a server that never
+mentions it" — both mean `false`. Skew is symmetric and lossless in both directions: an old
+client ignores the additive key and keeps deriving the classification from the 4xx status as
+before, and a new client reading an old server's body defaults the field to `false`, which is
+the value that server's failures already carried. `TRANSCRIPT_RECORD_SCHEMA`'s `model_turn`
+branch declares the same field, which the writer had always emitted under an open
+`additionalProperties`; no stored transcript changes and no reader has to migrate.
+
+Both writers of `monoid.failure.v1` — the core's `run_dir/failure.json` and the reference
+backend's — add `http_status`, written as `null` when the failure never reached a provider, and
+`retryable` / `config_recoverable`, the classification the `run.failed` event beside them
+carries. The artifact's reader policy is permissive and its consumers read keys off the JSON, so
+an older bundle simply has no such key and a reader must treat "absent" and `null`/`false`
+alike. The schema identifier is unchanged.
+
+The durable park observation inside `monoid.checkpoint.v1` (`last_suspension`) gains
+`provider_error_code` and `provider_retried`, and `turn.failed` / `run.failed` /
+`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch gain the event fields that carry the same facts
+(`provider_retried`, `provider_usage`, `retryable`, `config_recoverable`). All are additive:
+the park reader defaults every absent key, so a pre-v0.21 checkpoint restores exactly as before,
+and the event schemas grow optional properties without changing a `required` list. No checkpoint
+schema version bump, and no reader has to migrate.
+
+`status.json` additionally becomes a recovery input without any shape change: the Reference
+backend's resume paths now read its terminal projection (via the same tolerant
+`lifecycle_from_status_artifact` reader, so a legacy bare `status: "limited"` keeps its
+pre-`state` terminal-limited meaning) to recognize a run that already closed, where before it
+was observability only. A missing or unreadable artifact changes nothing — recovery proceeds as
+it always did. Relatedly, a run cancelled at a park now commits an ordinary
+`monoid.checkpoint.v1` park snapshot at the ack (`cancellation_requested`, an existing field)
+and a terminal one at close; pre-existing readers need no migration.
+
+`status.json` and `metrics.json` grow the failure-classification keys their readers already had
+event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
+`retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and
+`status.json` can now say `state: "paused"` for a cooperatively paused run. All additive under
+each schema's open `additionalProperties`, declared in `STATUS_SCHEMA` / `METRICS_SCHEMA`
+without an identifier change: absent keys on a pre-v0.21 artifact mean what those runs meant —
+no live failure classified, no pause projected — and a reader must treat "absent" and the
+default (`false` / `null` / `""`) alike.
+
+`metrics.updated` grows the three priced sub-counts beside `reasoning_tokens`
+(`cache_read_tokens`, `cache_creation_tokens`, `audio_tokens`), each emitted only when the
+adapter reported one — an absent sub-count means "not reported", not zero. Both tenant-usage
+JSON projections (the gateway's `/internal/llm/tenants/{id}/usage` and the backend's
+`tenant_usage`) gain the same four keys. Neither is a versioned artifact in the inventory above
+and neither has a serialized reader contract; the additions are new keys on a read-only
+projection, so a consumer that ignores them stays correct.
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other

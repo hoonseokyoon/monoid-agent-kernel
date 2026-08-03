@@ -126,6 +126,44 @@ def test_llm_gateway_validates_token_and_returns_opaque_turn_handle() -> None:
     assert gateway.handle_turn(token, other_model)["turn_handle"].startswith("turn_")
 
 
+def test_llm_gateway_tenant_meter_reports_every_priced_sub_count() -> None:
+    """The meter normalized seven counts and summed three, so the four priced sub-counts -- each
+    billed differently from a plain input token -- never reached the tenant ledger. A provider
+    that reports a cost ONLY as sub-counts metered as total=0: the priced call was invisible."""
+
+    manager = _token_manager()
+
+    def factory(_claims, _config):
+        class Adapter:
+            def next_turn(self, request):
+                del request
+                return ModelTurn(
+                    response_id="provider_1",
+                    final_text="done",
+                    usage={
+                        "input_tokens": 5,
+                        "output_tokens": 2,
+                        "total_tokens": 7,
+                        "cache_read_tokens": 900,
+                        "cache_creation_tokens": 120,
+                        "reasoning_tokens": 30,
+                        "audio_tokens": 4,
+                    },
+                )
+
+        return Adapter()
+
+    gateway = LlmGatewayBackend(token_manager=manager, provider_adapter_factory=factory)
+    gateway.handle_turn(_llm_token(manager), _payload())
+
+    usage = gateway.tenant_usage("tenant_a")
+    assert usage["total_tokens"] == 7
+    assert usage["cache_read_tokens"] == 900
+    assert usage["cache_creation_tokens"] == 120
+    assert usage["reasoning_tokens"] == 30
+    assert usage["audio_tokens"] == 4
+
+
 def test_llm_gateway_python_boundary_normalizes_request_and_response_values() -> None:
     manager = _token_manager()
     seen_requests = []
@@ -823,11 +861,15 @@ def test_the_by_reference_refusal_reaches_the_wire_as_a_classified_422() -> None
     assert body["error_code"] == "unsupported_request_shape"
     assert body["retryable"] is False
     assert body["http_status"] == 422
+    # The remedy is configuration, and the wire says so rather than leaving the client to infer
+    # it from the status: a 4xx is a hint, `config_recoverable` is the statement.
+    assert body["config_recoverable"] is True
     assert "messages" in body["error"]
     # The classification survives the hop for the client that has to act on it.
     reconstructed = pytest.raises(ModelAdapterError, _parse_gateway_response, body).value
     assert reconstructed.provider_error_code == "unsupported_request_shape"
     assert reconstructed.http_status == 422
+    assert reconstructed.config_recoverable is True
 
 
 def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_frame() -> None:
@@ -872,9 +914,11 @@ def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_
     assert terminal["error_code"] == "unsupported_request_shape"
     assert terminal["retryable"] is False
     assert terminal["http_status"] == 422
+    assert terminal["config_recoverable"] is True
     assert "messages" in terminal["error"]
     # And the client's frame parser reconstructs the same classification the sync reader does.
     reconstructed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(terminal)).value
     assert reconstructed.provider_error_code == "unsupported_request_shape"
     assert reconstructed.http_status == 422
     assert reconstructed.retryable is False
+    assert reconstructed.config_recoverable is True

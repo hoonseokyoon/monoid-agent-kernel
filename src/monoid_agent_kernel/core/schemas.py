@@ -124,6 +124,11 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": _STR,
             "provider_error_code": _STR,
             "http_status": {"type": ["integer", "null"]},
+            # The terminal twin of ``turn.failed`` carries the same classification it does:
+            # ``fail_recoverable`` promotes one into the other, so a config-fixable failure that
+            # a driver gave up on must still say it was config-fixable in the record of giving up.
+            "retryable": _BOOL,
+            "config_recoverable": _BOOL,
         },
         required=("error_code",),
     ),
@@ -191,12 +196,33 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "http_status": {"type": ["integer", "null"]},
             "retryable": _BOOL,
             "config_recoverable": _BOOL,
+            # Whether the adapter's own retry budget was already spent before this park.
+            "provider_retried": _BOOL,
+            # What the refused call already cost. A failure *after* a billed answer is an
+            # ordinary shape (the applied-parameters proof refusals are exactly that), and the
+            # transcript twin written on the same failure has always recorded it. Named for the
+            # kernel fact, not for the gateway wire's compat-frozen ``usage`` alias — the event
+            # spells ``provider_error_code`` for the same reason.
+            "provider_usage": _OBJ,
         },
         required=("error_code",),
     ),
+    # ``reason`` here is a CAUSE vocabulary — what stopped the turn ("user_stop") — and it is
+    # deliberately NOT ``Suspension.reason``, which is a PARK vocabulary naming the state the
+    # session came to rest in ("interrupted"). One key name, two domains, on purpose: the event
+    # answers "why did this stop", the park answers "where is the run now". A reader that joins
+    # them by name is reading two different questions. See docs/CONTRACTS.md, event reads.
     "turn.interrupted": _data_schema(
         {"reason": _STR},
         required=(),
+    ),
+    # The interrupt's twin, and the same cause vocabulary ("user_pause"). The pause park used to
+    # emit no event of its own — only a ``session.state.changed`` — so two sibling parks were not
+    # observable the same way: a consumer watching the turn lane saw the stop and missed the
+    # pause. Observability only; no projection consumes it.
+    "turn.paused": _data_schema(
+        {"reason": _STR},
+        required=("reason",),
     ),
     "model.output.delta": _data_schema(
         {"text": _STR},
@@ -217,7 +243,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "input_tokens": _INT,
             "output_tokens": _INT,
             "total_tokens": _INT,
+            # The priced sub-counts, each present only when the adapter reported one. All four
+            # are billed differently from a plain input token, so a live consumer that sees only
+            # ``reasoning_tokens`` cannot show what a cache-heavy run actually cost.
+            "cache_read_tokens": _INT,
+            "cache_creation_tokens": _INT,
             "reasoning_tokens": _INT,
+            "audio_tokens": _INT,
             "web_search_calls": _INT,
             "web_fetch_calls": _INT,
             "web_context_calls": _INT,
@@ -685,6 +717,13 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
                 "error_code": {"type": "string"},
                 "provider_error_code": {"type": "string"},
                 "retryable": {"type": "boolean"},
+                # The failure record's writer has always emitted this beside ``retryable``; the
+                # branch only stayed valid because ``additionalProperties`` is True here.
+                "config_recoverable": {"type": "boolean"},
+                # Written by BOTH model_turn records (success and failure): the private replay
+                # artifact of a retried-then-successful call used to read as a clean single
+                # attempt, which is exactly the case where the retry evidence matters most.
+                "provider_retried": {"type": "boolean"},
                 "http_status": {"type": ["integer", "null"]},
             },
             "additionalProperties": True,
@@ -858,6 +897,11 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "usage": {"type": ["object", "null"]},
                 "error_code": {"type": ["string", "null"]},
                 "retryable": {"type": "boolean"},
+                # Additive and optional: a sidecar written before this key existed still
+                # validates, and the reader defaults it to False. Declared in the same change as
+                # the writer because ``additionalProperties`` is False here — a record key with
+                # no schema slot is a validation failure, not a forward-compatible extra.
+                "config_recoverable": {"type": "boolean"},
                 "finished_at": {"type": "string", "pattern": "Z$"},
             },
             "additionalProperties": False,
@@ -945,6 +989,15 @@ METRICS_SCHEMA: dict[str, Any] = {
         "duration_s": {"type": "number", "minimum": 0},
         "error": {"type": "string"},
         "error_code": {"type": "string"},
+        # The failure classification, declared with its writer (the ``stream_closed``
+        # precedent: declare even under ``additionalProperties: True``, because an open cap is
+        # a tolerance, not a declaration). The code/status pair is written whenever the run
+        # recorded provider detail; the two booleans only on a failed run, where the state
+        # they are read from is classified fresh.
+        "provider_error_code": {"type": "string"},
+        "provider_http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
     },
     "additionalProperties": True,
 }
@@ -956,9 +1009,23 @@ STATUS_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "state": {"type": "string"},
         "terminal": {"type": "boolean"},
-        "last_event_seq": {"type": "integer", "minimum": 1},
+        # ``minimum: 0``, not 1: the event sink always writes >= 1, but the failure-quarantine
+        # writer (``run_state.write_failure_status_artifact``) can mint this artifact over a
+        # run that never wrote status.json, and its honest seed is 0 — "no committed event
+        # known to this writer". Every reader already accepts 0 (and reconciles against the
+        # committed log tail).
+        "last_event_seq": {"type": "integer", "minimum": 0},
         "last_event_type": {"type": "string"},
         "updated_at": {"type": "string"},
+        # The classification a parked ``turn.failed`` writes into this artifact (declared
+        # with the writer, the same rule as METRICS_SCHEMA above). Cleared on unpark and
+        # healed at a non-failed terminal, so absence means "no live failure to classify" —
+        # which is also what absence on a pre-v0.21 artifact meant.
+        "provider_error_code": {"type": "string"},
+        "http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
+        "provider_retried": {"type": "boolean"},
     },
     "additionalProperties": True,
 }

@@ -108,6 +108,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
+                    config_recoverable=exc.config_recoverable,
                     provider_retried=exc.provider_retried,
                     usage=provider_usage_of(exc),
                 )
@@ -147,6 +148,7 @@ def make_llm_gateway_handler(
             *,
             error_code: str = GATEWAY_BAD_RESPONSE,
             retryable: bool = False,
+            config_recoverable: bool = False,
             provider_retried: bool = False,
             usage: Mapping[str, int] | None = None,
         ) -> None:
@@ -156,6 +158,7 @@ def make_llm_gateway_handler(
                     message,
                     error_code=error_code,
                     retryable=retryable,
+                    config_recoverable=config_recoverable,
                     provider_retried=provider_retried,
                     usage=usage,
                 ),
@@ -209,6 +212,7 @@ def _error_body(
     *,
     error_code: str = GATEWAY_BAD_RESPONSE,
     retryable: bool = False,
+    config_recoverable: bool = False,
     provider_retried: bool = False,
     usage: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
@@ -230,12 +234,21 @@ def _error_body(
     see its own attempts, so without it a call the provider retried and then failed was recorded as
     a clean single attempt -- and a failure is where that record matters most. It defaults False,
     which is what an error the gateway raised on its own, before reaching a provider, means.
+
+    ``config_recoverable`` says the remedy is the caller's *configuration* rather than another
+    attempt. It is the one classification the kernel mints that had no transport: the 4xx
+    ``_model_error_status`` picks below is a hint a client has to interpret, and every non-status
+    carrier of the same fact -- an applied-parameters proof refusal raised with no HTTP status at
+    all -- had nothing left to say one hop out. Written unconditionally, like ``retryable`` and
+    ``provider_retried``: a reader must not have to distinguish "not config-fixable" from "an
+    older gateway that never mentions it", and both spellings mean the same False anyway.
     """
 
     body: dict[str, Any] = {
         "error": message,
         "error_code": error_code,
         "retryable": retryable,
+        "config_recoverable": config_recoverable,
         "http_status": int(status),
         "provider_retried": provider_retried,
     }
@@ -257,6 +270,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
                 str(exc),
                 error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                 retryable=exc.retryable,
+                config_recoverable=exc.config_recoverable,
                 provider_retried=exc.provider_retried,
                 usage=provider_usage_of(exc),
             ),

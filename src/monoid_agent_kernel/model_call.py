@@ -238,6 +238,15 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
 
     `bool` is excluded because it is an `int` subclass and a boolean token count is a bug, not a
     count of one -- the same rule the receipt applies.
+
+    `type(value) is int` rather than `isinstance`, which is what its three siblings
+    (`providers/base.py:provider_usage_of`, `providers/gateway.py:_reported_error_usage`,
+    `core/model_io.py:ModelCallReceipt.with_error`) already spell. An `isinstance` here accepted
+    every `int` subclass -- an `IntEnum` a provider SDK hands back as a token count is the real
+    shape -- so one stamp read as a recordable usage on this path and as no usage at all on the
+    three that consume it, and the receipt this function feeds would then reject what it accepted.
+    Excluding `bool` is now implied, and kept spelled out because it is the case a reader checks
+    for first.
     """
 
     return {
@@ -245,7 +254,7 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
         for key, value in usage.items()
         if isinstance(key, str)
         and not isinstance(value, bool)
-        and isinstance(value, int)
+        and type(value) is int
         and value >= 0
     }
 

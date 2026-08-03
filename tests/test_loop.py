@@ -1177,6 +1177,74 @@ def test_metrics_omit_reasoning_tokens_when_absent(tmp_path: Path) -> None:
         loop.close()
 
 
+def test_metrics_surface_every_priced_sub_count_when_reported(tmp_path: Path) -> None:
+    """``reasoning_tokens`` was the only one of the four priced sub-counts on this event, so a
+    cache-heavy run's priced detail never reached a live consumer -- and a cache read, a cache
+    write and an audio token are each billed differently from a plain input token."""
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text="done",
+                usage={
+                    "input_tokens": 5,
+                    "output_tokens": 9,
+                    "total_tokens": 14,
+                    "cache_read_tokens": 1_200,
+                    "cache_creation_tokens": 300,
+                    "reasoning_tokens": 7,
+                    "audio_tokens": 4,
+                },
+            )
+        ]
+    )
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics
+        data = metrics[-1].data
+        assert data["cache_read_tokens"] == 1_200
+        assert data["cache_creation_tokens"] == 300
+        assert data["reasoning_tokens"] == 7
+        assert data["audio_tokens"] == 4
+    finally:
+        loop.close()
+
+
+def test_metrics_omit_every_priced_sub_count_the_adapter_did_not_report(tmp_path: Path) -> None:
+    """The other half of the conditional, on all four: a run that used no cache must not read
+    as one whose cache saved nothing."""
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text="done",
+                usage={
+                    "input_tokens": 5,
+                    "output_tokens": 9,
+                    "total_tokens": 14,
+                    "reasoning_tokens": 7,
+                },
+            )
+        ]
+    )
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics
+        data = metrics[-1].data
+        assert data["reasoning_tokens"] == 7
+        assert "cache_read_tokens" not in data
+        assert "cache_creation_tokens" not in data
+        assert "audio_tokens" not in data
+    finally:
+        loop.close()
+
+
 def test_recoverable_turn_error_classifier() -> None:
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=400))
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))
@@ -1409,6 +1477,14 @@ def test_non_recoverable_model_error_is_terminal(tmp_path: Path) -> None:
         # logs and the UI can see the real cause.
         assert failed[0].data["provider_error_code"] == "server_error"
         assert failed[0].data["http_status"] == 500
+        # ...and the terminal park a driver reads carries the same classification the event
+        # does. The Suspension had the fields and the terminal construction dropped them, so a
+        # backend promoting "what the park knew" onto its record promoted defaults over the
+        # truth its own event log carried.
+        assert susp.provider_error_code == "server_error"
+        assert susp.http_status == 500
+        assert susp.retryable is False
+        assert susp.config_recoverable is False
         assert list(run_root.rglob("failure.json"))
     finally:
         loop.close()
@@ -1453,7 +1529,9 @@ def test_turn_failed_after_tool_round_clears_observations(tmp_path: Path) -> Non
 
 
 def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
-    adapter = _ScriptedAdapter([ModelAdapterError("bad", http_status=400)])
+    adapter = _ScriptedAdapter(
+        [ModelAdapterError("bad", http_status=400, config_recoverable=True)]
+    )
     loop, sink, run_root = _loop_with(tmp_path, adapter)
     loop.open()
     try:
@@ -1462,8 +1540,49 @@ def test_fail_recoverable_promotes_to_terminal(tmp_path: Path) -> None:
         assert loop._session is not None and loop._session.terminal is True
         assert "run.failed" in [e.type for e in sink.events]
         assert list(run_root.rglob("failure.json"))
+        # The durable observation of the terminal park keeps the inherited classification the
+        # run.failed event beside it carries — the checkpoint is where a post-restart reader
+        # learns what this run died of.
+        assert loop.checkpoint_store is not None
+        stored = loop.checkpoint_store.latest(loop.spec.run_id)
+        assert stored is not None and stored.checkpoint.last_suspension is not None
+        assert stored.checkpoint.last_suspension["config_recoverable"] is True
+        assert stored.checkpoint.last_suspension["http_status"] == 400
     finally:
         loop.close()
+
+
+def test_metrics_json_reports_the_failure_classification(tmp_path: Path) -> None:
+    """metrics.json carried provider_error_code/provider_http_status and dropped the verdict.
+
+    The pair beside them — retryable / config_recoverable — is what an operator reading only
+    the metrics artifact needs to decide "resend after a config fix" vs "it will fail the same
+    way". Written on failed runs, from the same state the run.failed event reads.
+    """
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError(
+                "quota exhausted",
+                http_status=429,
+                provider_error_code="insufficient_quota",
+                config_recoverable=True,
+            )
+        ]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    assert loop.run_until_suspended("hi").reason == "turn_failed"
+    loop.fail_recoverable("gave up after retries", error_code="model_error")
+    loop.close()
+
+    metrics = json.loads(
+        (run_root / loop.spec.run_id / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert metrics["status"] == "failed"
+    assert metrics["provider_error_code"] == "insufficient_quota"
+    assert metrics["provider_http_status"] == 429
+    assert metrics["retryable"] is False
+    assert metrics["config_recoverable"] is True
 
 
 def test_promotion_preserves_provider_details_from_turn_failed(tmp_path: Path) -> None:
@@ -1512,8 +1631,192 @@ def test_fresh_terminal_failure_clears_stale_provider_details(tmp_path: Path) ->
         assert failed, "run.failed emitted"
         assert failed[0].data["http_status"] == 500
         assert failed[0].data["provider_error_code"] == ""  # not the stale rate_limit_exceeded
+        # Same rule for the classification beside it: the 429 was retryable and this 500 is not.
+        assert failed[0].data["retryable"] is False
+        assert failed[0].data["config_recoverable"] is False
     finally:
         loop.close()
+
+
+def test_the_park_records_the_provider_code_and_the_retry_it_was_classified_by(
+    tmp_path: Path,
+) -> None:
+    """The park a driver reads must carry the two facts the decision actually turns on.
+
+    ``retryable``/``http_status`` cannot separate an ``insufficient_quota`` (a human fixes the
+    billing) from a ``rate_limit_exceeded`` (back off and re-issue), and an exhausted adapter
+    retry budget reads as an untried call. Both lived only inside the live exception before
+    v0.21 — so a checkpoint restore handed the recovery driver a park with no reason on it.
+    """
+
+    from monoid_agent_kernel.core.result import (
+        suspension_checkpoint_payload,
+        suspension_from_checkpoint_payload,
+    )
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    exc = ModelAdapterError(
+        "rate limited",
+        http_status=429,
+        provider_error_code="rate_limit_exceeded",
+        retryable=True,
+        provider_retried=True,
+    )
+    mark_provider_usage(exc, {"input_tokens": 11, "output_tokens": 0, "total_tokens": 11})
+    loop, sink, _run_root = _loop_with(tmp_path, _ScriptedAdapter([exc]))
+    loop.open()
+    try:
+        susp = loop.run_until_suspended("hi")
+        assert susp.reason == "turn_failed"
+        assert susp.provider_error_code == "rate_limit_exceeded"
+        assert susp.provider_retried is True
+        # ...and the durable park observation carries both across a restart.
+        restored = suspension_from_checkpoint_payload(suspension_checkpoint_payload(susp))
+        assert restored.provider_error_code == "rate_limit_exceeded"
+        assert restored.provider_retried is True
+        # ...and the event beside it states the retry and what the refused call already cost.
+        failed = [e for e in sink.events if e.type == "turn.failed"][-1]
+        assert failed.data["provider_retried"] is True
+        assert failed.data["provider_usage"] == {
+            "input_tokens": 11,
+            "output_tokens": 0,
+            "total_tokens": 11,
+        }
+    finally:
+        loop.close()
+
+
+def test_the_blocking_facade_hands_the_driver_the_whole_classification(tmp_path: Path) -> None:
+    """``TurnNotSettled`` is a driver's only handle on a park it never sees as a Suspension."""
+
+    from monoid_agent_kernel.errors import TurnNotSettled
+
+    exc = ModelAdapterError(
+        "quota exhausted",
+        http_status=429,
+        provider_error_code="insufficient_quota",
+        retryable=True,
+        provider_retried=True,
+        config_recoverable=True,
+    )
+    loop, _sink, _run_root = _loop_with(tmp_path, _ScriptedAdapter([exc]))
+    loop.open()
+    try:
+        with pytest.raises(TurnNotSettled) as parked:
+            loop.submit("hi")
+        assert parked.value.provider_error_code == "insufficient_quota"
+        assert parked.value.provider_retried is True
+        assert parked.value.config_recoverable is True
+    finally:
+        loop.close()
+
+
+def test_the_terminal_record_keeps_the_classification_the_park_carried(tmp_path: Path) -> None:
+    """``fail_recoverable`` promotes a classified park into the record of having given up.
+
+    Both writers of that record are built from one state in one breath, so both must say it:
+    the log an operator tails and the bundle they restore from.
+    """
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelAdapterError(
+                "the gateway sent no generation_applied echo",
+                provider_error_code="gateway_generation_not_applied",
+                retryable=False,
+                config_recoverable=True,
+            )
+        ]
+    )
+    loop, sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        loop.fail_recoverable("gave up after retries", error_code="model_error")
+        failed = [e for e in sink.events if e.type == "run.failed"]
+        assert failed and failed[0].data["config_recoverable"] is True
+        assert failed[0].data["retryable"] is False
+        bundles = list(run_root.rglob("failure.json"))
+        assert len(bundles) == 1
+        bundle = json.loads(bundles[0].read_text(encoding="utf-8"))
+        assert bundle["config_recoverable"] is True
+        assert bundle["retryable"] is False
+    finally:
+        loop.close()
+
+
+def test_a_billed_refusal_publishes_the_cost_it_added_to_the_totals(tmp_path: Path) -> None:
+    """A call that fails *after* the provider billed for it moved the totals and published
+    nothing: the success path emitted one ``metrics.updated`` per turn and this arm emitted
+    none, so a run whose only model call failed billed never reported its cost at all."""
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    exc = ModelAdapterError(
+        "refused after a complete answer",
+        http_status=400,
+        provider_error_code="gateway_generation_not_applied",
+    )
+    mark_provider_usage(
+        exc,
+        {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12, "reasoning_tokens": 3},
+    )
+    loop, sink, _run_root = _loop_with(tmp_path, _ScriptedAdapter([exc]))
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert len(metrics) == 1, [e.type for e in sink.events]
+        assert metrics[-1].data["total_tokens"] == 12
+        assert metrics[-1].data["input_tokens"] == 7
+        assert metrics[-1].data["reasoning_tokens"] == 3
+    finally:
+        loop.close()
+
+
+def test_a_refusal_that_cost_nothing_publishes_no_meter(tmp_path: Path) -> None:
+    """The other half of the conditional: an error raised before the provider was reached adds
+    nothing to the totals, so it must not publish an unchanged meter as if a turn had run."""
+
+    exc = ModelAdapterError("bad request", http_status=400)
+    loop, sink, _run_root = _loop_with(tmp_path, _ScriptedAdapter([exc]))
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hi").reason == "turn_failed"
+        assert [e for e in sink.events if e.type == "metrics.updated"] == []
+    finally:
+        loop.close()
+
+
+def test_the_transcript_records_the_retry_on_a_successful_call(tmp_path: Path) -> None:
+    """The private replay artifact of a retried-then-successful call read as a clean single
+    attempt, which is exactly the case where the retry evidence matters."""
+
+    adapter = _ScriptedAdapter(
+        [
+            ModelTurn(
+                response_id="r1",
+                final_text="done",
+                usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                provider_retried=True,
+            )
+        ]
+    )
+    loop, _sink, run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+    finally:
+        loop.close()
+    transcripts = list(run_root.rglob("transcript.jsonl"))
+    assert len(transcripts) == 1
+    records = [
+        json.loads(line)
+        for line in transcripts[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    model_turns = [record for record in records if record["kind"] == "model_turn"]
+    assert model_turns and all(record["provider_retried"] is True for record in model_turns)
 
 
 # --- DX-9: turn-level interrupt (a "stop" that keeps the session alive) -----------------
@@ -1979,7 +2282,14 @@ def test_a_restored_turn_failed_park_still_closes_as_the_failure_it_is(tmp_path:
     loop = _loop_for(
         spec,
         _ScriptedAdapter(
-            [ModelAdapterError("bad config", http_status=400, error_code="model_error")]
+            [
+                ModelAdapterError(
+                    "bad config",
+                    http_status=400,
+                    error_code="model_error",
+                    config_recoverable=True,
+                )
+            ]
         ),
         MemoryEventSink(),
     )
@@ -1993,7 +2303,12 @@ def test_a_restored_turn_failed_park_still_closes_as_the_failure_it_is(tmp_path:
 
     assert result.status == "failed"
     assert list(spec.run_root.rglob("failure.json"))
-    assert "run.failed" in [e.type for e in sink.events]
+    failed = [e for e in sink.events if e.type == "run.failed"]
+    assert failed
+    # ...and the classification survives with it. The live RunState twins are not checkpoint
+    # fields; the durable park observation is their one authority, read back at restore — so a
+    # promotion after a crash records a config-fixable failure as the config-fixable one it is.
+    assert failed[0].data["config_recoverable"] is True
     # The failure detail survives the hop rather than degrading to a generic message.
     assert "bad config" in (result.error or "")
 
@@ -2048,12 +2363,12 @@ def test_a_restored_settled_park_is_not_promoted_into_a_failure(tmp_path: Path) 
 
 def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path) -> None:
     """``run_once`` absorbs a non-settling park because ``close()`` turns it into the record
-    that IS the call's result — but ``close()`` promotes only ``turn_failed``. An interrupt
-    (and a pause) produced no record at all, so the run finalized ``completed`` with no
-    settled answer: a one-shot caller told to stop was told it had succeeded, and the
-    completed-run cleanup deleted the checkpoints the park had preserved. Only the park
-    ``close()`` can honestly promote is absorbed; the others surface typed, after the same
-    cleanup."""
+    that IS the call's result — but only ``turn_failed`` is absorbed. An interrupt (and a
+    pause) still surfaces as ``TurnNotSettled`` after the same close, and that close now
+    records the honest outcome underneath the raise: ``close()``'s unsettled-close
+    promotion finalizes ``limited``/``closed_unsettled`` (the turn never settled) and keeps
+    the checkpoints — it used to finalize a clean ``completed`` with an empty answer and
+    delete them."""
 
     from monoid_agent_kernel.errors import TurnNotSettled
 
@@ -2072,6 +2387,20 @@ def test_run_once_does_not_report_an_interrupted_run_as_a_success(tmp_path: Path
     with pytest.raises(TurnNotSettled) as parked:
         loop.run_once("go")
     assert parked.value.reason == "interrupted"
+
+    # The record beneath the typed raise is honest now (deliberate pin move: this used to
+    # finalize completed and delete the checkpoints the park preserved).
+    events_path = spec.run_root / spec.run_id / "events.jsonl"
+    finished = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "run.finished"
+    ]
+    assert finished and finished[-1]["data"]["status"] == "limited"
+    assert finished[-1]["data"]["error_code"] == "closed_unsettled"
+    from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+    assert LocalFsCheckpointStore(spec.run_root).latest(spec.run_id) is not None
 
 
 def test_run_once_still_returns_the_promoted_failure_for_a_turn_failure(

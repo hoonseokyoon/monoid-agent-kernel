@@ -626,6 +626,10 @@ class ModelCallReceipt:
     error_code: str = ""
     provider_error_code: str = ""
     retryable: bool = False
+    # The sixth fact the exception carries. ``retryable`` says "waiting may help";
+    # ``config_recoverable`` says "changing configuration will". A receipt that recorded only the
+    # first could not tell an auditor why an exhausted retry budget was never going to succeed.
+    config_recoverable: bool = False
     http_status: int | None = None
     redaction_digest: str = ""
     capture_downgrades: int = 0
@@ -638,7 +642,13 @@ class ModelCallReceipt:
         if self.capture_downgrades < 0:
             raise ValueError("model call capture_downgrades must not be negative")
         for key, value in self.usage.items():
-            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+            # ``type(value) is not int`` rather than ``isinstance``: the same "what is a
+            # countable int" its four sibling readers spell (``provider_usage_of``,
+            # ``_reported_error_usage``, ``with_error``, ``_recordable_usage``). ``isinstance``
+            # here accepted every ``int`` subclass -- an ``IntEnum`` a provider SDK hands back
+            # as a token count is the real shape -- so this constructor admitted a count that
+            # every reader of the stamp had just refused. Excluding ``bool`` is now implied.
+            if not isinstance(key, str) or type(value) is not int:
                 raise WireValidationError("model call usage must be a mapping of str to int")
             # Every other counter on this receipt refuses a negative, and usage is the one that gets
             # summed: a single ``{"input_tokens": -100}`` in an audit payload silently subtracts from
@@ -685,6 +695,13 @@ class ModelCallReceipt:
         except Exception:
             retryable = False
         try:
+            config_recoverable_value = getattr(exc, "config_recoverable", False)
+            config_recoverable = (
+                config_recoverable_value if type(config_recoverable_value) is bool else False
+            )
+        except Exception:
+            config_recoverable = False
+        try:
             http_status = getattr(exc, "http_status", None)
         except Exception:
             http_status = None
@@ -722,6 +739,7 @@ class ModelCallReceipt:
             error_code=normalized_error_code,
             provider_error_code=provider_error_code,
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=http_status,
             usage=usage,
             # A failed call is the one most likely to have been retried, so the marker has to
@@ -750,6 +768,7 @@ class ModelCallReceipt:
             "error_code": self.error_code,
             "provider_error_code": self.provider_error_code,
             "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
             "http_status": self.http_status,
             "redaction_digest": self.redaction_digest,
             "capture_downgrades": self.capture_downgrades,
@@ -780,6 +799,9 @@ class ModelCallReceipt:
             error_code=parse_str(payload, "error_code"),
             provider_error_code=parse_str(payload, "provider_error_code"),
             retryable=parse_bool(payload, "retryable"),
+            # Absent on every receipt written before this field existed, which is legal and
+            # reads as False; present-but-mistyped is refused, like every other bool here.
+            config_recoverable=parse_bool(payload, "config_recoverable"),
             http_status=None if raw_status is None else parse_int(payload, "http_status"),
             redaction_digest=parse_str(payload, "redaction_digest"),
             capture_downgrades=parse_int(payload, "capture_downgrades"),

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from monoid_agent_kernel.core.model_content import ModelContentStore
+from monoid_agent_kernel.core.model_content import ModelContentStore, read_model_content
 from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
@@ -109,6 +109,33 @@ def test_model_content_schema_accepts_optional_retryability_and_rejects_non_bool
     assert _errors({**record, "retryable": 1})
 
 
+def test_the_closed_record_carries_both_halves_of_the_classification() -> None:
+    """The live stream lane used to say only whether waiting might help.
+
+    ``additionalProperties`` is False on this branch, so the key and its schema slot had to land
+    together: a writer emitting an undeclared key produces a record that fails its own schema.
+    Optional, so a sidecar written before the key existed still validates.
+    """
+    record = {
+        "schema_version": "monoid.model-content.v1",
+        "kind": "stream_closed",
+        "run_id": "run-1",
+        "stream_id": "stream-1",
+        "status": "failed",
+        "final_text": "partial",
+        "usage": None,
+        "error_code": "model_not_found",
+        "retryable": False,
+        "config_recoverable": True,
+        "finished_at": "2026-08-01T00:00:02Z",
+    }
+
+    assert _errors(record) == []
+    assert _errors({**record, "config_recoverable": 1})
+    del record["config_recoverable"]
+    assert _errors(record) == []
+
+
 def test_model_content_schema_rejects_unknown_fields_and_missing_versions() -> None:
     record = {
         "kind": "stream_segment",
@@ -168,7 +195,16 @@ def test_model_content_store_writes_only_schema_valid_records(tmp_path: Path) ->
         )
     )
     writer.push(ModelStreamDelta(channel="output", text="hello"))
-    writer.close(ModelStreamOutcome(status="completed", final_text="hello", usage={}))
+    writer.close(
+        ModelStreamOutcome(
+            status="failed",
+            final_text="hello",
+            usage={},
+            error_code="model_not_found",
+            retryable=False,
+            config_recoverable=True,
+        )
+    )
     store.settled_text("hello", content_digest("hello"), content_length("hello") or 0)
     store.close()
 
@@ -181,3 +217,9 @@ def test_model_content_store_writes_only_schema_valid_records(tmp_path: Path) ->
         "settled_text",
     ]
     assert all(_errors(record) == [] for record in records)
+    # Both halves of the classification reach the record the studio and the recovery reader see.
+    closed = next(record for record in records if record["kind"] == "stream_closed")
+    assert (closed["retryable"], closed["config_recoverable"]) == (False, True)
+    # ...and the tolerant reader carries them back off the file.
+    recovered = read_model_content(path).snapshots[0]
+    assert (recovered.retryable, recovered.config_recoverable) == (False, True)

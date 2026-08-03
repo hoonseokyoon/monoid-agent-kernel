@@ -104,6 +104,104 @@ def test_dbos_run_receipt_reconstructs_exact_durable_boundary() -> None:
     assert DbosRunReceipt.from_json(receipt.to_json()) == receipt
 
 
+def _limited_family_checkpoint(
+    command: DbosResumeCommand,
+    suspension: Suspension,
+    *,
+    recorded_state: str,
+    terminal: bool,
+) -> RunCheckpoint:
+    return RunCheckpoint(
+        run_id=command.run_id,
+        seq=5,
+        last_suspension=suspension_checkpoint_payload(suspension),
+        applied_input_ids=[command.checkpoint_marker],
+        applied_input_receipts={
+            command.checkpoint_marker: {
+                "checkpoint_seq": 5,
+                "checkpoint_sha256": "a" * 64,
+                "state": recorded_state,
+                "terminal": terminal,
+                "suspension": suspension_checkpoint_payload(suspension),
+            }
+        },
+    )
+
+
+def test_pre_v021_failed_receipt_is_accepted_at_a_terminal_limited_boundary() -> None:
+    """The one boundary v0.21's mapping actually changed: a terminal ``status="limited"``
+    projected to FAILED in every release before it, so a pre-v0.21 receipt there says
+    "failed" for what this process names "limited". Both spellings pass, there only."""
+
+    command = DbosResumeCommand("run_1", "resume_1", 4)
+    terminal_limited = Suspension(
+        reason="terminal",
+        status="limited",
+        error="budget spent",
+        error_code="max_steps_exceeded",
+    )
+    receipt = DbosRunReceipt.from_checkpoint(
+        command,
+        _limited_family_checkpoint(
+            command, terminal_limited, recorded_state="failed", terminal=True
+        ),
+    )
+    assert receipt.state == "limited"
+
+
+def test_failed_receipt_is_rejected_at_a_cancelled_boundary() -> None:
+    """A cancel boundary also arrives ``status="limited"`` (with ``error_code="cancelled"``),
+    but pre-v0.21 processes already recorded "cancelled" there — so a receipt claiming
+    "failed" at a cancelled boundary is corrupt, not compatible."""
+
+    command = DbosResumeCommand("run_1", "resume_1", 4)
+    cancelled = Suspension(
+        reason="terminal",
+        status="limited",
+        error="run cancelled",
+        error_code="cancelled",
+    )
+    own_spelling = DbosRunReceipt.from_checkpoint(
+        command,
+        _limited_family_checkpoint(command, cancelled, recorded_state="cancelled", terminal=True),
+    )
+    assert own_spelling.state == "cancelled"
+
+    with pytest.raises(NativeAgentError) as raised:
+        DbosRunReceipt.from_checkpoint(
+            command,
+            _limited_family_checkpoint(command, cancelled, recorded_state="failed", terminal=True),
+        )
+    assert raised.value.error_code == "invalid_input_receipt"
+
+
+def test_failed_receipt_is_rejected_at_a_live_limited_park() -> None:
+    """A live-limited park (``reason="limited"``) carries ``status="limited"`` too, and its
+    LIMITED projection predates v0.21 — a "failed" receipt there was never a valid spelling."""
+
+    command = DbosResumeCommand("run_1", "resume_1", 4)
+    live_limited = Suspension(
+        reason="limited",
+        status="limited",
+        error="budget spent",
+        error_code="max_steps_exceeded",
+    )
+    own_spelling = DbosRunReceipt.from_checkpoint(
+        command,
+        _limited_family_checkpoint(command, live_limited, recorded_state="limited", terminal=False),
+    )
+    assert own_spelling.state == "limited"
+
+    with pytest.raises(NativeAgentError) as raised:
+        DbosRunReceipt.from_checkpoint(
+            command,
+            _limited_family_checkpoint(
+                command, live_limited, recorded_state="failed", terminal=False
+            ),
+        )
+    assert raised.value.error_code == "invalid_input_receipt"
+
+
 def test_old_dbos_resume_reconstructs_its_own_boundary_after_newer_input() -> None:
     old_command = DbosResumeCommand("run_1", "resume_old", 4)
     new_command = DbosResumeCommand("run_1", "resume_new", 5)

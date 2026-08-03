@@ -7,6 +7,321 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a success the SDK re-sent stops reading as a clean first attempt
+
+- **`OpenAIModelAdapter` reports the SDK's own retries on its success paths too.** The retry
+  probe added in the burn-down (`_provider_retried_by_the_sdk`) ran only on exceptions, so a
+  call the OpenAI client's internal retry loop re-sent before *succeeding* was written to
+  `transcript.jsonl`, the `ModelCallReceipt` and the gateway success body/frames as
+  `provider_retried: false` — contrary to the field's audit semantics, while the identical
+  call one failure later reported its retries. Both success lanes now read the same stamped
+  `x-stainless-retry-count` header through the same one parser as the failure path: the
+  non-streaming turn goes through `with_raw_response` (the parsed model keeps no reference to
+  the HTTP exchange; the wrapper's `.parse()` yields the same object, and its
+  `.http_response.request` carries the header — verified empirically on openai 2.41.1,
+  including that the wrapper has no `.request` of its own), and the streaming path reads
+  `stream.response.request`, stamping the verdict on EVERY chunk rather than only
+  `TurnComplete`, so a stream abandoned mid-flight still reports it. The probe's guard policy
+  is unchanged on all lanes: anything unreadable means "no retry", never a raise. No wire or
+  schema change — the turn/chunk carriers, transcript success record, receipt and gateway
+  bodies already had the field and now receive the true value.
+
+### Fixed — every failure quarantine speaks, and a resume refusal says why
+
+- **`record_run_failure` — the third `failure.json` writer — makes the terminal statement the
+  give-up sites make.** A run whose driver died (a build failure, a drive exception, a
+  recovered run's re-drive failing) got `failure.json` and a FAILED in-memory record but its
+  `status.json` kept the old park, so after a restart `status()`/`list_runs` reported
+  `awaiting_input, terminal=false` forever while `recover_runs` skipped the dir — byte-for-byte
+  the symptom the give-up sites had just been cured of. All three quarantine lanes now write
+  the artifact through ONE shared writer (`run_state.write_failure_status_artifact`), each with
+  an honest marker (`given_up_by_recovery`; `recorded_by_run_failure`) and its own
+  `error_code` — and the pairing is bound structurally: a writer census in
+  `tests/test_carriage_conformance.py` discovers every `failure.json` writer in src and fails
+  any that neither writes the terminal artifact nor emits `run.failed`. Reader-side backstop
+  for pre-fix dirs: `lifecycle_from_status_artifact` now reads a failure bundle beside a
+  NON-terminal parked artifact as `failed`/terminal (a terminal artifact — a genuine close —
+  still wins, and deleting the bundle restores the park, so the restore-hint flow is intact).
+  The record also gets the FAILED-terminal heal `record_run_result` applies (keep the four
+  classification facts, drop `provider_retried`).
+- **The minted quarantine artifact is schema-valid over a run that never wrote status.json.**
+  The give-up writer over a missing/unreadable `status.json` omitted `STATUS_SCHEMA`'s
+  required watermark keys, so `monoid validate` rejected the very file the fix mints. The
+  shared writer seeds `last_event_seq: 0` / `last_event_type: ""` ("no committed event known
+  to this writer"; the schema's floor moves to 0 — every reader already accepted it and
+  reconciles against the committed log tail), reads the prior payload with the resilient
+  reader so an atomic-replace race cannot drop identity/metrics, and merges over whatever it
+  preserved.
+- **A closed-limited run is no longer advertised `recoverable: true` beside
+  `terminal: true`.** `list_runs` computed `recoverable` from {no failure.json, non-terminal
+  checkpoint} only, and a run that CLOSED limited keeps a non-terminal park checkpoint by
+  design — so the listing advertised a dead run resumable and `resume_run` then 400'd with
+  "inspect failure.json" over a bundle that does not exist. The projection now consults the
+  same close-recording artifact fact recovery's guard consults — one function
+  (`core.projections.status_artifact_records_close`), both callers, read off the payload the
+  row already loads.
+- **Resume refusals are typed.** `attempt_resume` answers `ResumeOutcome`
+  (resumed/closed/already_live/failed) instead of a bare bool, and `resume_run` maps it:
+  closed → `NativeAgentError(error_code="run_terminal")`; a lost register-record claim race
+  (the studio double-click shape) → the already-live success shape (`resumed: false`, like
+  the record-exists branch) instead of a 400 for a resume that in fact succeeded; only a
+  genuine non-resume keeps the inspect-logs/failure.json hint.
+
+### Fixed — the close boundary tells the truth, and a dead run reads dead everywhere
+
+- **The terminal heal reaches the backend record.** Terminals minted at the close boundary
+  (a pending-cancel promotion, the unrecovered turn-failure promotion, the new unsettled-close
+  promotion) never pass the driver's top-of-loop park promotion — so at a CANCELLED terminal
+  reached by cancelling a `turn_failed` park, live `GET /status` served the dead turn's five
+  classification facts beside `error_code="cancelled"` while `status.json` healed them, and the
+  two branches of the same endpoint disagreed across a restart. `record_run_result` — the one
+  seam every terminal result funnels through — now binds the same rule the status sink and the
+  offline projection already bind: a non-failed terminal (completed/limited/cancelled) clears
+  the five facts on the record; a failed terminal keeps the four what-it-died-of facts and drops
+  the per-call `provider_retried`, exactly as `run.failed`'s vocabulary does. All three readers
+  are pinned to one answer per close-boundary terminal kind.
+- **Closing a mid-turn PAUSED (or interrupted) run no longer finalizes a clean success and
+  deletes its only restore point.** A turn frozen at a step boundary (pause) or abandoned before
+  settling (interrupt) read the per-submit reset state at close: `run.finished` said
+  `completed` with an empty answer and the completed-run cleanup deleted the checkpoints holding
+  the frozen turn — backend-reachable via `pause_run` + idle timeout. `close()` now promotes a
+  mid-turn park to `status="limited"` / `error_code="closed_unsettled"` (one new code, both
+  variants, documented in CONTRACTS.md) with an empty classification and its checkpoints kept;
+  the marker rides the checkpoint's `last_suspension`, so a restored park closes the same way.
+  A resumed pause that settles keeps the clean-completion contract.
+- **Cancelling a settled park keeps the settled answer.** `cancel_run` + close (and `drain()`
+  at deploy) replaced the parked turn's settled `final_text` with "Stopped because the run was
+  cancelled." on the result, `run.finished`, and every readable surface — v0.20 returned the
+  answer with the wrong COMPLETED status, and the status fix silently took the answer. The
+  pending-cancel promotion now preserves the park's settled text (the cancel statement lives in
+  `error`/`error_code`); a mid-turn cancel, which has no settled text, keeps the stop notice.
+- **A given-up run reads terminal on every status surface.** The recovery give-up paths
+  (unrecoverable after `max_recover_attempts`; corrupt durable state) wrote `failure.json` and
+  metered — but no terminal status artifact, so `status()`, `list_runs` and the offline
+  projection all answered `state=awaiting_input, terminal=False, error=""` forever while
+  `resume_run` refused the run as unrecoverable. Both sites now write the terminal statement
+  into `status.json` (the sink's `run.failed` shape, plus a `given_up_by_recovery` marker the
+  closed-run recovery guard and the offline projection honor), and `restore_hint` now names the
+  actual operator flow — delete `failure.json` to lift the quarantine, then
+  `recover_runs`/`resume_run` — which previously pointed at a path that skips quarantined dirs.
+- **The cancel-ack checkpoint no longer races the drive.** `cancel_run` read `record.state` on
+  the HTTP thread and persisted later on the shared loop: a park state read just before the
+  drive resumed let a mid-turn snapshot overwrite the committed park checkpoint's content at the
+  same seq, and an idle-timeout close landing between ack and persist made `snapshot()` raise
+  `run_not_open` — a 500 after acknowledging the cancel. The quiescence check + ack checkpoint +
+  wake signal now run as one callable on the drive's own loop, double-gated on the record's park
+  state and the loop's committed-park marker (`AgentLoop.at_quiescent_park()`), and a persist
+  refused with `run_not_open`/`run_terminal` is treated as the successful cancel it is. The
+  remaining mid-turn/mid-close window is documented as honestly non-durable.
+
+### Fixed — the facade wraps what restore produces, and deadness is a recorded fact
+
+- **`LoopSession` can wrap a restored loop, as its docstring always promised.** A fresh
+  `LoopSession(loop)` over a restored parked loop reported `created`; `open()` raised
+  `run_already_open`, and any pump crashed the FSM (`illegal_session_transition`
+  created->running) — the facade's own embedder contract had no restore story (the backend
+  drives loops directly, so only the facade lane was broken). Construction now derives the
+  initial state from the wrapped loop when no explicit `_state` is passed: a terminal session
+  maps through the shared terminal precedence, a parked session maps its rehydrated
+  `last_suspension` through the same checkpoint reader + pump projector (also seeding
+  `inspect()`'s last-park view), and an open-but-unpumped session is `idle`. A fresh un-opened
+  loop still yields `created`, and the backend's explicit `LoopSession(loop, _state=record.state)`
+  seeding is untouched.
+- **`health()` no longer answers dead during the backend's `aopen` window.** Between
+  `attach_loop` (loop findable, `run.started` already recorded RUNNING) and `open()` assigning
+  `loop._session` on its worker thread, an HTTP-thread inspect/health facade read
+  `_session is None` + state != `created` as dead — alive=False/terminal=True for a run
+  milliseconds from its first pump. `AgentLoop` now records a monotonic finalization fact
+  (`_finalized`) at exactly the sites that tear the activation down — `close()`,
+  `release_parked()`, `discard_uncommitted()` (the async facades and every failure path route
+  through these; `restore()` never sets it) — and `_loop_is_dead()` is `session.terminal` OR
+  (no session AND finalized). The window answers alive; every previously closed cell (post-close
+  park facade, close-that-raises, pre-close terminal-limited) still answers dead.
+
+### Fixed — a closed run stays closed, a cancel is a cancel, and every abandoned run reaches the ledger
+
+- **Recovery no longer resurrects a closed LIMITED run.** A run that closed limited (e.g.
+  `max_steps`) was the one terminal outcome with no recovery-visible marker: its park checkpoint
+  is non-terminal (a live-limited park is resumable by design), `close()` keeps checkpoints for
+  every non-completed status, and no failure.json exists — so `recover_runs()` (and the watchdog
+  reclaim) re-drove it on EVERY pass: another terminal `run.finished` appended per restart, and
+  the full cumulative usage re-metered into each fresh tenant ledger, forever. `attempt_resume`
+  now consults the run's durable status artifact (`lifecycle_from_status_artifact`, which also
+  resolves legacy bare `status="limited"` dirs closed before this fix) and recognizes the closed
+  run — a skip, not a quarantine. A run that genuinely crashed at a limited park (non-terminal
+  status artifact) still recovers.
+- **Cancelling a PARKED run records CANCELLED, not a clean COMPLETED.** The cancel was acked,
+  the close signal broke the drive — and `close()` then read the per-submit reset state
+  (`status="completed"`), so `run.finished` said completed, the record overwrote
+  `error_code="cancelled"` with `""`, and the completed-run cleanup deleted the cancelled run's
+  checkpoints. `close()`/`aclose()` now promote a pending cancel through the mid-run
+  `RunCancelled` vocabulary (`status="limited"`, `error_code="cancelled"`, terminal park
+  checkpoint, checkpoints kept), so a park-cancel classifies exactly like a mid-turn cancel.
+- **An acknowledged cancel of a parked run is durable.** The park checkpoint predated the
+  cancel, so a crash before the terminal record restored the run uncancelled despite the ack.
+  `cancel_run` of a quiescent (parked) run now commits a checkpoint carrying
+  `cancellation_requested` before the ack returns; the restore path already honors it. A cancel
+  landing mid-turn keeps its existing path (the pump's own terminal park), with a documented
+  residual crash window.
+- **The recovery give-up paths meter what the run had spent.** The
+  resume-failed-`max_recover_attempts` give-up and the corrupt-durable-state quarantine wrote
+  failure.json and stopped — a run that crashed after N billed turns and could never be resumed
+  was never counted and its checkpointed spend never reached any ledger. Both now route through
+  a record-free metering seam (`meter_abandoned_run`) with the same spend source, high-water
+  semantics, and run count as the failure path.
+- **Failure metering survives a corrupt status.json and reads the fresher source.** One
+  non-count metric (`{"input_tokens": 12.5}`) turned failure-recording into an escaping
+  `ValueError` — after `runs` was incremented, past the failure paths that yield the streaming
+  client's terminal frame. And the all-or-nothing fallback (checkpoint wins if present) dropped
+  everything billed between the last park and a mid-turn death. `_spent_before_failure` now
+  folds BOTH durable sources per key (guarded: non-negative ints only, unreadable keys dropped)
+  and takes the per-key max — strictly closer to "billed once per token", with
+  `record_run_result`'s strictness for kernel-written values untouched.
+- **The DBOS receipt-verifier compat window matches its stated scope.** The pre-v0.21 "failed"
+  spelling was accepted for ANY `status="limited"` suspension — but cancel boundaries and
+  live-limited parks carry that status too, and pre-v0.21 processes already recorded
+  "cancelled"/"limited" there, so a "failed" receipt at those boundaries is corrupt, not
+  compatible. The widening now applies only at a terminal-limited boundary (the one mapping
+  v0.21 actually changed), and both directions are pinned in tests.
+
+### Fixed — every status surface carries the classification, and the pause is visible on all of them
+
+- **The durable status readers carry the FULL failure classification, one rule, all carriers.**
+  `turn.failed` emits seven facts and every consumer copied a different fragment: `status.json`'s
+  sink and the offline projection kept `error`/`error_code`, the backend record the same pair,
+  the park promotion only `config_recoverable` — and `config_recoverable` alone cannot separate
+  an `insufficient_quota` (fix the config) from a `rate_limit` (wait). All three consumers now
+  copy `provider_error_code` / `http_status` / `retryable` / `config_recoverable` /
+  `provider_retried` beside the error pair (`provider_usage` is metering and stays off status
+  surfaces), the session driver promotes all five off every park (assigned, never or-ed, so a
+  clean settle clears stale answers — including the error text, which used to survive a clean
+  settle on the record), `BackendRunRecord` gains the missing fields, and `status()` / `result()`
+  serve them on the live branch **and** on the record-is-None branch, so a post-restart operator
+  gets the same answer from status.json that the live record gave.
+- **Terminal events heal instead of or-falling-back.** The offline projection's terminal
+  branches read `data.get("error_code") or projection["error_code"]`, so
+  `turn.failed -> recovery -> run.finished{completed, error_code:""}` reported the dead turn's
+  `model_error` on a cleanly completed run — and `run.finished` never touched `error` at all.
+  Terminal branches now ASSIGN error/error_code and heal the classification (a failed terminal
+  keeps what `run.failed` carries, minus `provider_retried` — a per-call fact the terminal
+  vocabulary deliberately drops), on the offline projection and the sink twin alike.
+- **A model turn starting clears the dead turn's answer everywhere.** The retry path re-pumps
+  straight from `turn_failed` without passing a parked state, so the parked-state-guarded clears
+  never fired and all three readers showed the previous failure beside `state="running"`. The
+  unpark clear is unconditional on `model.turn.started` now, on both file readers and the record.
+- **The pause is observable on the durable surfaces.** While paused, `status.json` and the
+  offline projection said `state="running"`; after resume, the backend record said `"paused"`
+  through the whole resumed turn. Both file readers project `session.state.changed{state:
+  "paused"}` (the session-lane carrier; `turn.paused` stays a turn-lane cause event), `PAUSED`
+  joins every park-clear set (`_PARKED_STATES`, the sink twin, `record_event`'s), and the
+  driver's paused-resume branch marks the record RUNNING when it re-pumps.
+- **The terminal park carries what its own `run.failed` event says.** The terminal `Suspension`
+  constructions dropped the classification fields the type already declared, so a driver
+  promoting "what the park knew" promoted defaults over the truth its own event log carried —
+  all three terminal constructions (non-recoverable model error, the generic failure arm, and
+  `fail_recoverable`'s persisted park) now populate them from the same state the emit reads.
+- **`metrics.json` states the verdict.** It carried `provider_error_code` /
+  `provider_http_status` and dropped `retryable` / `config_recoverable`; a failed run's metrics
+  now record both, declared in `METRICS_SCHEMA` (and the status.json block in `STATUS_SCHEMA`)
+  under the stream_closed precedent — declare even under `additionalProperties: True`. Absent
+  keys on pre-v0.21 artifacts mean what those runs meant (see COMPATIBILITY.md).
+- The carriage census grows the cells that would have caught this: a per-consumer-branch pin of
+  the classification key-subset each `turn.failed`/`run.failed` branch copies (helper-following,
+  so a read moved into a function stays censused), the pause event on the two file readers'
+  handled-set pins with the record's absence declared, and the new carrier files registered.
+
+### Fixed — the facade answers for the loop it wraps
+
+- **The blocking settle twin shares the pump's terminal precedence.** A `LoopSession.submit()`
+  that spends the session tool-call budget hands back `status="limited"` with the session
+  terminal, and `_derive_after_settle` read only the terminal flag: FAILED, where
+  `run_until_suspended` answered LIMITED for the identical run — and a cancelled submit
+  answered FAILED where the pump said CANCELLED. The divergence then escalated: `close()`
+  computed LIMITED (or CANCELLED) through the shared mapper and crashed the FSM
+  (`illegal_session_transition 'failed' -> 'limited'`) *after* the loop had already finalized,
+  so the embedder lost the `AgentRunResult` it was owed. The precedence — cancelled first,
+  then a terminal `status="limited"` to LIMITED, else FAILED — now lives in one
+  `_terminal_outcome_state` that `state_from_suspension` and `_derive_after_settle` both call,
+  and the census pin that proved three mappers agree seats the fourth mapper it had missed.
+- **`health()` and `inspect()` bind to actual loop liveness.** A closed limited run — facade
+  in LIMITED (a park state), `loop._session` gone — reported `alive=True,
+  can_accept_input=True`, while a live-but-terminal session reported the self-contradictory
+  `alive=False, can_accept_input=True`. One predicate (session terminal, or activation torn
+  down after leaving CREATED) now answers for `alive`, for `can_accept_input`, and for the
+  no-session `inspect().terminal` that hardcoded `False` — so a closed run no longer reads
+  as live. Pre-open (CREATED, no session yet) still reads as alive-but-not-accepting.
+- **A refused pump never moves the facade.** `submit()` / `resume()` /
+  `run_until_suspended()` wrote RUNNING *before* asking the loop, so the loop's `run_not_open`
+  / `run_terminal` refusal left the facade wedged in RUNNING — permanently, post-close, since
+  RUNNING accepts no input and a dead loop can never settle it back out. The pumps check loop
+  openness and terminality first and refuse with the loop's own typed error codes from the
+  truthful state (a never-opened facade now refuses `run_not_open` instead of
+  `illegal_session_transition`). And a `close()` that raises lands the facade on FAILED when
+  the loop is dead — `AgentLoop.close` discards the activation before re-raising — rather
+  than leaving an input-accepting park state over it.
+
+### Fixed — the transport failures one adapter parked, the other terminalized
+
+- **A transient connection failure on the direct OpenAI adapter ends the turn, not the run.**
+  `openai.APIConnectionError` (and the `APITimeoutError` that subclasses it) carries no status
+  and no body, so it fell to the classifier's unclassified tail: retryable=False, terminal for
+  the whole session — while the gateway adapter classifies the identical condition (`URLError`
+  / `TimeoutError` / `OSError`) retryable=True and the loop parks `turn_failed` for the backend
+  to backoff-retry. The classifier now has a connection-family branch — `openai_timeout` /
+  `openai_network_error`, the direct adapter's spelling of the `*_timeout` / `*_network_error`
+  pair every other transport uses — retryable, no claimed status, and still carrying the
+  retries the SDK itself spent on the family it retries most. The family binds both spellings
+  of the drop: the SDK wraps transport failures into `APIConnectionError` only up to the
+  response headers (`_base_client._request`), and its streaming iterator has no translation at
+  all — so the identical drop mid-body raises the *raw* `httpx.ReadError` / `ReadTimeout` /
+  `RemoteProtocolError` into the classifier, where it fell past the new branch to the
+  unclassified tail and terminalized the flagship streaming lane. The raw families now answer
+  with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
+  `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
+  connection that dropped, and the status branches above already classify it).
+- **A fresh terminal failure classifies the record from its own event.** The record's
+  `run.failed` branch copied the error pair only — justified by the driver's park promotion,
+  which never runs for a terminal that never parked (a non-recoverable failure on the stream
+  lane, or any first-turn failure) — so live `status()`/`result()` served default
+  classification against a status.json that carried the truth. The branch now takes the
+  event's whole classification through the same guarded reads as its `turn.failed` twin.
+- **The live stream broker carries both halves of the failure classification.** The closed
+  frame forwarded only `retryable`, so a live consumer of the reference backend's model
+  stream read a config-fixable failure as merely non-retryable while the model-content
+  sidecar beside the lane recorded both facts. `LiveModelStreamFrame` gains an optional
+  `config_recoverable` (validated, serialized, forwarded by the writer's close), registered
+  as a carrier file in the conformance census.
+- **A driver death answers the same on the live record and the durable artifact.**
+  `record_run_failure` wrote the exception's provider code, HTTP status and recovery flags
+  into status.json but mutated only the error pair on the live record — `status()`/`result()`
+  prefer the active record, so they served the last park's stale classification (or defaults)
+  against the just-written artifact until the record was released. The record now takes the
+  same guarded exception reads the artifact takes.
+- **A 408/409 from the provider is transient, not a configuration defect.** The 4xx branch
+  recognized only 429 as retryable, so a request timeout (408) or conflict (409) came out
+  retryable=False — and the one config predicate then stamped `config_recoverable=True`,
+  parking the turn with a "change your configuration" answer for a condition that clears on
+  backoff. Both statuses are now retryable, and the predicate itself excludes them
+  (`_TRANSIENT_4XX_STATUSES`), so no present or future caller can claim config for a
+  transient 4xx.
+- **The SDK-retry probe classifies a request-less httpx error instead of crashing on it.**
+  `httpx.HTTPError.request` is a *property that raises* `RuntimeError` when unset, and the one
+  probe read outside a `try` swallowed only `AttributeError` — so a mid-stream network drop
+  (`ReadError` while consuming the body, retryable connection family per the bullet above)
+  reached the classifier and came out as a raw `RuntimeError` in place of the classified
+  error, which the gateway route then mapped to an anonymous 500: the verdict was decided by
+  the probe's crash, not by the classification. The whole read now sits in one guard with the
+  probe's own stated policy — anything unreadable means "no retry" — in the fully-covered
+  style of `provider_usage_of`.
+- **The receipt constructor joins the four readers of the countable-int predicate.**
+  `ModelCallReceipt.__post_init__` answered `isinstance(value, int)` where the four readers of
+  one usage stamp (`provider_usage_of`, `_reported_error_usage`, `with_error`,
+  `_recordable_usage`) all answer `type(value) is int`, so the constructor accepted the
+  `IntEnum` every reader beside it refuses — a receipt could carry a count no consumer would
+  count. The five-sibling agreement is pinned in the census (the four-readers pin now seats
+  the fifth), with the deliberate asymmetry stated: failure-path readers filter silently, the
+  success-path constructor refuses loudly.
+
 ### Added — a field-carriage conformance suite (repo-internal drift tooling)
 
 - **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier
@@ -127,6 +442,149 @@ out in commit messages and here.
 - Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
   CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
   in the parallel shard. No public surface, wire format, or shipped contract changes.
+
+### Added — `config_recoverable` crosses the hop it was minted to describe
+
+- **The gateway error envelope carries `config_recoverable`** on both writers (the non-200 body
+  and the terminal SSE `error` frame, which share one `_error_body` definition) and all three
+  client readers bind it (`_parse_gateway_response`, `_chunk_from_event`,
+  `_error_from_status_body`). It was the one transportable fact on `ModelAdapterError` with no
+  wire key at all: a refusal whose remedy is the caller's configuration arrived one hop out as an
+  ordinary terminal failure, and the only thing a client could read it off was the 422 the
+  server's status mapper picks — a hint rather than a statement, and nothing at all for the
+  refusals that carry no HTTP status of their own. Written unconditionally beside `retryable` and
+  `provider_retried`, so absence means "an older gateway" and reads as `false`; read through the
+  same exact-boolean reader as its siblings, so a coerced `"false"` is refused rather than
+  believed. Additive in both directions and no protocol identifier changes
+  (docs/COMPATIBILITY.md).
+- **`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch declares it**, which the failure-record
+  writer had emitted since the field existed; the record was valid only because that branch sets
+  `additionalProperties: True`. No stored transcript changes.
+- **`OpenAIModelAdapter` classifies both facts on every branch.** `_model_error_from_openai`
+  produces four `ModelAdapterError`s and stated neither flag: the adapter that reads the
+  provider's own classification never said the refusal was config-shaped, and the adapter whose
+  SDK owns a retry loop never reported having run it. Recoverability now comes from one predicate
+  (`_config_shaped_refusal`: a non-retryable 4xx, the same rule `AgentLoop._recoverable_turn_error`
+  already applies) evaluated at all four sites rather than a condition per branch. The retry count
+  is read off the final request's `x-stainless-retry-count` header, which the OpenAI SDK stamps on
+  every attempt and every `APIError` retains — the SDK hands `retries_taken` only to the success
+  path — and any shape that cannot answer reads as "no retry" rather than claiming one.
+- Six `KNOWN_GAPS` entries closed in `tests/test_carriage_conformance.py`; the census constants
+  moved with them (`TRANSPORTABLE_ERROR_UNCARRIED` is now empty, kept as the guard the next such
+  fact meets). Two registered-gap pins that had leaned on that set — the call receipt's read set
+  and the closed `stream_closed` schema — now name the field directly, because a pin over an
+  empty set proves nothing and both entries are still open.
+
+### Fixed — every priced count reaches every ledger
+
+- **Both tenant meters sum the four priced sub-counts.** The gateway's `LlmGatewayUsage` and the
+  reference backend's `TenantUsage` each normalized seven counts and summed three, so a
+  cache-heavy or reasoning-heavy run under-reported on both — and a call priced *only* in
+  sub-counts (an entirely cache-read turn) metered as `total=0`, invisible to the ledger.
+  `total_tokens` is still what the provider reported and is never re-derived; what changed is
+  that the sub-counts are their own columns, so such a call is visible in the ones it was
+  actually expressed in. Fixed on both meters in one change: two meters with one omission is
+  precisely the shape where fixing one leaves the other.
+- **`metrics.updated` publishes all four.** It declared `reasoning_tokens` alone (R10's studio
+  meter) and not its three siblings, so a cache-heavy run's priced detail never reached a live
+  consumer. Each is written only when the adapter reported one, so an absent sub-count means
+  "not reported" rather than zero. **Dashboard step-change:** a consumer summing token columns
+  across events will see cache/audio columns appear for the first time on runs that were already
+  producing them.
+- **A subagent's sub-counts reach its parent.** The roll-up read a hard-coded three-key tuple,
+  so a child's cache and reasoning tokens stopped at the child — an undercount in exactly the
+  aggregate a bound is checked against. It now filters the child's metrics through
+  `providers/_common.py:NORMALIZED_USAGE_KEYS`, the emitted domain of `normalize_usage`, rather
+  than a wider hand copy (and a filter rather than a splat: `result.metrics` carries
+  `tool_calls` / `duration_s` beside the counts). The token budget itself is unchanged — it
+  reads the three headline counts — so this is a reporting step-change, not a behavior change
+  for runs near a bound. The roll-up's own comment claimed it did not touch `total_usage` while
+  the code beneath it did; the comment now matches.
+- **A run that dies of an exception is metered.** `record_run_failure` fed the tenant ledger
+  nothing at all — not even the run count — while `record_run_result` beside it did, so a run
+  that died of a driver exception after N billed turns reported zero for every one of them. It
+  meters what the run had already spent, from the last committed checkpoint (its
+  `total_usage`), falling back to the on-disk status projection, and counts the run either way.
+  Both terminal paths report *cumulative* totals from different sources, so both go through one
+  seam that owns a per-run high-water mark: a run metered on failure, recovered, and then
+  completed is billed once for each token, and counted once as a run.
+- Four more `KNOWN_GAPS` entries closed (plus the two round-2 twin registrations beside them).
+
+### Added — the park records the classification the wire already carried
+
+- **`Suspension` gains `provider_error_code` and `provider_retried`, and both ride the
+  checkpoint.** The park a recovery driver reads carried `retryable` / `http_status` /
+  `config_recoverable` and not the two facts the decision usually turns on: `insufficient_quota`
+  (a human fixes the billing) and `rate_limit_exceeded` (back off and re-issue) are the *same*
+  retryable/status pair and opposite answers, and an exhausted adapter retry budget read as an
+  untried call. Both lived only inside the live exception, so a checkpoint restore handed the
+  driver a park with no reason on it. `suspension_checkpoint_payload` writes them and its reader
+  defaults them when absent, so a pre-v0.21 checkpoint restores unchanged. `TurnNotSettled`
+  re-stamps both onto itself as well — that facade hands a driver an exception and nothing else.
+- **`turn.failed` states the retry and the cost.** The event declared the classification and not
+  `provider_retried` or the usage of a call that failed *after* the provider billed for it, while
+  the transcript record written on the very same failure recorded both. Named `provider_usage`
+  after the kernel fact, not after the gateway wire's compat-frozen `usage` alias — the same rule
+  that makes this event spell `provider_error_code` where the wire says `error_code`.
+- **`run.failed` and `failure.json` keep the classification the promotion used to lose.**
+  `fail_recoverable` (and `close()` on an unrecovered park) turns a classified `turn.failed` into
+  the terminal record, and the terminal record could not say a failure was config-fixable — the
+  one thing an operator reading it needs in order to know whether resending is worth anything.
+  The live `RunState` twins are deliberately not new `RunCheckpoint` fields: the durable park
+  observation already carries them, and `restore()` reads them back from it, so the restore path
+  has one authority instead of two that can disagree. The reference backend's second writer of
+  `monoid.failure.v1` carries the same two, read off the failing exception by name and never
+  coerced; its recovery-path callers hold no provider verdict and leave the honest `false`.
+- **The success transcript record states `provider_retried`.** `ModelTurn` carries it and the
+  call receipt records it, so the private replay artifact of a retried-then-successful call read
+  as a clean single attempt — the case where the retry evidence matters most. Its failure twin
+  records it too, so the two halves of one artifact cannot drift apart again.
+- **A billed refusal now publishes the cost it added to the totals.** The `ModelAdapterError` arm
+  accumulated the usage of a call that failed after billing and emitted no `metrics.updated`,
+  while the success path beside it emitted one per turn — so a run whose only model call failed
+  billed never reported its cost at all. Both paths now call one `_emit_metrics_updated` writer
+  (a second inline emit would be a twin to keep in step); the failure-path emission fires only
+  when something was actually billed.
+- Six more `KNOWN_GAPS` entries closed. The affected census pins state the harmonized behaviour;
+  what `run.failed` still does *not* take from `turn.failed` (`provider_usage`,
+  `provider_retried` — per-call facts, not classifications of the run) is pinned as a set, so a
+  new divergence between the two is a failure rather than a silence.
+
+### Fixed — the status rides every validator and the bundle; records substitute; one predicate
+
+- **`failure.json` carries `http_status`, on both of its writers.** The core's bundle
+  (`loop.py`) emitted the `run.failed` event and the operator's restore aid from the same run
+  state and gave the status to only one of them, so diagnosing a failure from the bundle alone
+  could not tell a 429 from a 400 from a transport error. The reference backend
+  (`recovery.py:write_failure_bundle`) is the second writer of the same `monoid.failure.v1`
+  artifact — the one a worker crash leaves behind, where the bundle is the only record there is —
+  and it carries the field too, read off the failing exception by name and never coerced. Written
+  as `null` when the failure reached no provider, so "no status" and "an older writer" stay
+  distinguishable. A new census pin diffs the two writers' key sets against each other, because
+  one artifact with two hand-written writers is how the field could have landed on one half.
+- **The four gateway validators that could not name a status now can.**
+  `_exact_gateway_int`, `_gateway_fragment_string`, `_gateway_usage` and
+  `_portable_gateway_payload` gained the `http_status` parameter their `_exact_gateway_bool` /
+  `_gateway_string` siblings already forwarded into the `ModelAdapterError` they raise, so one
+  malformed payload no longer classifies two ways depending on which of its fields was malformed.
+  All six are driven directly in a test that reads the status back off the raise — a parameter
+  can be accepted and dropped.
+- **The run manifest's tool projection substitutes a non-portable schema locally.**
+  `core/manifest.py:_tool_spec_payload` embedded `input_schema` raw and was portable only
+  because `RunManifest.to_json` normalizes the whole assembled manifest one frame up — a property
+  of its caller, not of itself, and its transcript twin had already needed the substitution
+  locally. Manifest output is byte-identical (`to_json` normalizes an already-normalized payload
+  to itself); what changes is that a second caller no longer inherits an anonymous
+  `allow_nan=False` durability failure.
+- **One predicate for one stamp.** `model_call.py:_recordable_usage` asked
+  `isinstance(value, int)` where its three siblings (`provider_usage_of`,
+  `_reported_error_usage`, `ModelCallReceipt.with_error`) ask `type(value) is int`, so an
+  `IntEnum` token count — the shape a provider SDK plausibly returns — was a recordable usage on
+  one path and no usage at all on the three that consume it, and the receipt this function feeds
+  would then reject what it had just accepted.
+- Seven more `KNOWN_GAPS` entries closed; the affected census pins now state the harmonized
+  behaviour (all six validators forward, all four readers agree, three record projections
+  substitute) rather than the old divergence.
 
 ### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
 

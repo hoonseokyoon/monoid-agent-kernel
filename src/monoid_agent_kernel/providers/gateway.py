@@ -659,6 +659,7 @@ def _exact_gateway_int(
     minimum: int,
     maximum: int | None = None,
     allow_none: bool = False,
+    http_status: int | None = None,
     known_provider_retried: bool = False,
 ) -> int | None:
     if key not in payload:
@@ -678,6 +679,7 @@ def _exact_gateway_int(
         f"LLM gateway returned an invalid {context}: {key} must be {requirement}",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=known_provider_retried,
     )
 
@@ -732,6 +734,7 @@ def _gateway_fragment_string(
     key: str,
     *,
     context: str,
+    http_status: int | None = None,
     known_provider_retried: bool,
 ) -> str | None:
     """Validate a model content fragment while deferring cross-frame Unicode repair."""
@@ -745,6 +748,7 @@ def _gateway_fragment_string(
         f"LLM gateway returned an invalid {context}: {key} must be a string",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=known_provider_retried,
     )
 
@@ -753,6 +757,7 @@ def _gateway_usage(
     value: Any,
     *,
     context: str,
+    http_status: int | None = None,
     known_provider_retried: bool = False,
 ) -> dict[str, int]:
     try:
@@ -762,6 +767,7 @@ def _gateway_usage(
             f"LLM gateway returned an invalid {context}: usage must contain token counts",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
+            http_status=http_status,
             provider_retried=known_provider_retried,
         ) from exc
 
@@ -770,6 +776,7 @@ def _portable_gateway_payload(
     value: Any,
     *,
     context: str,
+    http_status: int | None = None,
     known_provider_retried: bool = False,
 ) -> Any:
     try:
@@ -779,6 +786,7 @@ def _portable_gateway_payload(
             f"LLM gateway returned an invalid {context}",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
+            http_status=http_status,
             provider_retried=known_provider_retried,
         ) from exc
 
@@ -935,12 +943,17 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
         )
+    # The best status this reader knows before any field of the payload has been validated: an
+    # already-trustworthy ``http_status`` off an error envelope, and nothing at all otherwise.
+    # Every validator below is handed it, so a malformed payload raises a classified failure that
+    # still names the status the server reported rather than an unclassifiable one.
+    status_hint = _gateway_http_status_hint(data) if "error" in data else None
     provider_retried = _exact_gateway_bool(
         data,
         "provider_retried",
         default=False,
         context="response",
-        http_status=_gateway_http_status_hint(data) if "error" in data else None,
+        http_status=status_hint,
     )
     if "error" in data:
         error_http_status = _exact_gateway_int(
@@ -951,11 +964,23 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             minimum=100,
             maximum=599,
             allow_none=True,
+            http_status=status_hint,
             known_provider_retried=provider_retried,
         )
         retryable = _exact_gateway_bool(
             data,
             "retryable",
+            default=False,
+            context="error response",
+            http_status=error_http_status,
+            known_provider_retried=provider_retried,
+        )
+        # The remedy the failure names, read back rather than inferred from the status. Absent
+        # reads as False -- an older gateway that never mentions the key, and a failure that
+        # really is not config-fixable, mean the same thing to a driver.
+        config_recoverable = _exact_gateway_bool(
+            data,
+            "config_recoverable",
             default=False,
             context="error response",
             http_status=error_http_status,
@@ -982,6 +1007,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
                 or GATEWAY_BAD_RESPONSE
             ),
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=error_http_status,
             provider_retried=provider_retried,
         )
@@ -1029,6 +1055,7 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             args = _portable_gateway_payload(
                 args,
                 context="tool call arguments",
+                http_status=status_hint,
                 known_provider_retried=provider_retried,
             )
         if not isinstance(args, dict):
@@ -1088,11 +1115,13 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
         usage=_gateway_usage(
             data.get("usage"),
             context="response",
+            http_status=status_hint,
             known_provider_retried=provider_retried,
         ),
         raw=_portable_gateway_payload(
             data,
             context="response",
+            http_status=status_hint,
             known_provider_retried=provider_retried,
         ),
         stop_reason=stop_reason,
@@ -1182,6 +1211,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 event,
                 "text",
                 context="text delta",
+                http_status=status_hint,
                 known_provider_retried=retried,
             )
             or "",
@@ -1193,6 +1223,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 event,
                 "text",
                 context="reasoning delta",
+                http_status=status_hint,
                 known_provider_retried=retried,
             )
             or "",
@@ -1206,6 +1237,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 default=0,
                 context="tool-call delta",
                 minimum=0,
+                http_status=status_hint,
                 known_provider_retried=retried,
             ),
             arguments_fragment=(
@@ -1213,6 +1245,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                     event,
                     "arguments_fragment",
                     context="tool-call delta",
+                    http_status=status_hint,
                     known_provider_retried=retried,
                 )
                 or ""
@@ -1264,6 +1297,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             usage=_gateway_usage(
                 event.get("usage"),
                 context="turn-complete frame",
+                http_status=status_hint,
                 known_provider_retried=retried,
             ),
             stop_reason=_gateway_string(
@@ -1283,11 +1317,21 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
             minimum=100,
             maximum=599,
             allow_none=True,
+            http_status=status_hint,
             known_provider_retried=retried,
         )
         retryable = _exact_gateway_bool(
             event,
             "retryable",
+            default=False,
+            context="stream error",
+            http_status=error_http_status,
+            known_provider_retried=retried,
+        )
+        # The sync twin's rule, on the transport that reports the same failure as a frame.
+        config_recoverable = _exact_gateway_bool(
+            event,
+            "config_recoverable",
             default=False,
             context="stream error",
             http_status=error_http_status,
@@ -1313,6 +1357,7 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 or GATEWAY_BAD_RESPONSE
             ),
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=error_http_status,
             provider_retried=retried,
         )
@@ -1393,6 +1438,17 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         http_status=status,
         known_provider_retried=provider_retried,
     )
+    # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the status
+    # line: a 4xx is a hint that the request was at fault, not a statement that configuration
+    # fixes it, so an unstated key is False here rather than status-shaped.
+    config_recoverable = _exact_gateway_bool(
+        error_payload,
+        "config_recoverable",
+        default=False,
+        context="HTTP error response",
+        http_status=status,
+        known_provider_retried=provider_retried,
+    )
     message = (
         _gateway_string(
             error_payload,
@@ -1408,6 +1464,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
         retryable=retryable,
+        config_recoverable=config_recoverable,
         http_status=status,
         # Read for the same reason as ``retryable``: it is a fact about the call the gateway is
         # reporting, and a failure is where it matters most. ``retryable`` forecasts a *future*

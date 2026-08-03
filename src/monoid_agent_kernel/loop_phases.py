@@ -551,6 +551,17 @@ class LoopFinalizer:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
+        if state.status == "failed":
+            # The verdict beside the code/status pair above: retryable (waiting may help) and
+            # config_recoverable (configuration will) are two facts, and this artifact carried
+            # neither. Gated on the failed status because that is the one terminal outcome
+            # ``_record_failure`` classifies fresh — on a completed or limited run the state
+            # pair can be a recovered turn's leftovers, and publishing a stale ``retryable``
+            # on a clean run is the staleness this release exists to remove.
+            # (``provider_retried`` is deliberately absent: a per-call fact with no run-level
+            # source — RunState never carries it — and the terminal vocabulary drops it.)
+            metrics["retryable"] = state.retryable
+            metrics["config_recoverable"] = state.config_recoverable
         if state.error:
             # Through the same filter `events.jsonl`, `status.json` and `failure.json` use. This was
             # the one surface carrying it raw, and `_error_from_status_body` embeds the *entire* LLM

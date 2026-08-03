@@ -135,33 +135,57 @@ The run lifecycle is:
   (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
   (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
   `suspension` carries the reason plus the `retryable` / `http_status` /
-  `config_recoverable` classification. The non-blocking pump
+  `config_recoverable` / `provider_error_code` / `provider_retried`
+  classification — all five re-stamped onto the exception itself, because a
+  driver on this facade holds an exception and nothing else. The last two are
+  what separates an `insufficient_quota` (a human fixes the billing) from a
+  `rate_limit_exceeded` (back off and re-issue) and an exhausted adapter retry
+  budget from an untried call. The non-blocking pump
   (`run_until_suspended`) returns the same park as a `Suspension` with
   `turn=None` instead of raising; `astream` ends the stream with it as
   `stream.suspension`.
 - `commit_checkpoint()` — opt-in: adopt the current proposed workspace state as
   the new diff baseline, so later proposals report only post-commit changes.
 - `close() -> AgentRunResult` — finalize: cancel jobs, write the terminal
-  proposal, emit `run.finished`, close the recorder.
+  proposal, emit `run.finished`, close the recorder. A cancellation acknowledged
+  while the run sat at a quiescent park (no pump stepping to raise in) is
+  promoted here through the mid-run vocabulary — the result carries
+  `status="limited"`, `error_code="cancelled"`, a terminal park checkpoint is
+  committed, and the checkpoints are kept (only a clean completion deletes them).
+  A cancel does not take the answer with it: if the park had settled text (the
+  run answered, then sat awaiting input), `result.final_text` keeps that answer —
+  the cancel statement lives in `error`/`error_code` — and only a park with no
+  text of its own (a mid-turn cancel) carries the kernel's
+  "Stopped because the run was cancelled." notice. A close over a **mid-turn park**
+  (`paused`/`interrupted` — a turn that never settled) must not finalize a clean
+  success either: it promotes to `status="limited"`,
+  `error_code="closed_unsettled"` (one code for both variants), with an empty
+  failure classification (nothing here is a provider failure) and its checkpoints
+  kept, so the frozen turn's only restore point survives the close. A settled
+  `awaiting_input` park is not this — its turn completed and close finalizes the
+  success it was; an acknowledged cancel is the operator's stronger verdict and
+  wins over the unsettled promotion.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
   `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
   park does not raise here: the closing `finally` promotes an unrecovered
   `turn_failed` park to the terminal failure record, and that failed
   `AgentRunResult` is the return value — for `turn_failed` only, the one park
-  `close()` can promote; an `interrupted` or `paused` park has no record to
-  return as, so it surfaces as `TurnNotSettled` after the same close. That
-  raise is the *only* signal for those two parks: the run record still
-  finalizes `completed` (a user stop is not a failure) and the completed-run
-  cleanup deletes its checkpoints — a caller that wants to resume an
-  interrupted turn uses the multi-turn facades, where the session stays alive.
-  `close()` performs the same promotion
+  absorbed; an `interrupted` or `paused` park still surfaces as
+  `TurnNotSettled` after the same close, and that close records the honest
+  outcome underneath the raise: `run.finished` carries `status="limited"`,
+  `error_code="closed_unsettled"` (the turn never settled — a user stop is not
+  a success either) and the checkpoints are kept — a caller that wants to
+  resume an interrupted turn uses the multi-turn facades, where the session
+  stays alive. `close()` performs the same promotion
   for any driver (the explicit form is `fail_recoverable`): a run closed on an
   unrecovered recoverable failure finalizes `failed` with `failure.json`
-  written and its checkpoints kept, never as a clean success. The promotion
-  survives a restart: `restore()` rehydrates the pending failure from the
-  checkpoint's `last_suspension` (only `reason="turn_failed"`; a later settle
-  clears it), so a recovered run left idle and then closed records the failure
-  it parked on rather than a clean success that deletes its own checkpoints.
+  written and its checkpoints kept, never as a clean success. Both promotions
+  survive a restart: `restore()` rehydrates the pending failure and the
+  mid-turn park marker from the checkpoint's `last_suspension`
+  (`reason="turn_failed"` and `reason="paused"`/`"interrupted"` respectively; a
+  later settle clears both), so a recovered run left idle and then closed
+  records the park it died in rather than a clean success that deletes its own
+  checkpoints.
 
 ### AgentRunSpec
 
@@ -406,7 +430,10 @@ both transports. A budget that skipped refused calls would not be a bound. The c
 survives a hop — the gateway error envelope carries `usage` (present only when the failed call
 actually spent tokens, so an error raised before reaching a provider keeps its previous wire
 shape), and a gateway meters a billed failure against the tenant rather than losing it to the
-raise.
+raise. The classification survives it too: the envelope carries `config_recoverable` as its own
+key, written unconditionally, so a client one hop out reads the remedy as a statement instead of
+inferring it from the 422 — which matters most for the refusals that carry no HTTP status of
+their own.
 One streaming caveat is inherent to enforcing at the terminal frame: every delta has already
 been delivered to the consumer when the refusal raises, so a streaming consumer of a `"fail"`
 call sees the unproven text before the error arrives; the sync transport delivers nothing on
@@ -985,8 +1012,26 @@ that wraps an `AgentLoop`, owns the FSM, and delegates execution:
   `session_state_from_run_status(status, error_code=..., terminal=...)` is the tolerant reader for
   older `status.json` payloads.
 - `LoopSession.open() / submit() / run_until_suspended() / close()` delegate to the loop and
-  re-derive `state` at each boundary. `inspect() -> SessionInspection` and `health() ->
-  SessionHealth` are recomputed from live loop state on every call (never stale).
+  re-derive `state` at each boundary. A fresh facade constructed over a loop that already has a
+  live session — a restored loop, or one opened before it was wrapped — seeds its state from
+  that session at construction (the terminal outcome for a terminal session, the last committed
+  park for a parked one, `idle` for an open-but-unpumped one), so `resume()`/`submit()` continue
+  a restored run where it parked; a fresh un-opened loop still yields `created`, and an
+  explicitly passed `_state` always wins over derivation. The blocking and pump halves share one
+  terminal settle
+  precedence (cancelled first, then a terminal `status="limited"` to `limited`, else `failed`),
+  so a budget-terminal or cancelled `submit()` answers exactly what `run_until_suspended` answers
+  for the identical run. `inspect() -> SessionInspection` and `health() -> SessionHealth` are
+  recomputed from live loop state on every call (never stale), and both bind to actual loop
+  liveness: `can_accept_input` is `false` (and `alive` is `false`) whenever the loop can no
+  longer pump — its session is terminal, or the activation was torn down by `close()` /
+  `release_parked()` / `discard_uncommitted()` (each records a loop-side finalization fact at
+  the same site where it drops the session). Deadness is that recorded fact, never a guess from
+  the facade's own state: a findable loop whose `open()` has not yet assigned its session — the
+  backend's `aopen` window — answers alive, not dead. A `submit()`/`resume()` over a dead loop is
+  refused with the loop's own typed error (`run_not_open` / `run_terminal`) *before* any FSM
+  write, so a refused pump never moves the facade; a `close()` that raises lands the facade on
+  `failed` rather than leaving an input-accepting park state over the dead loop.
 - `pause()` / `resume()` / `cancel(reason)`: pause freezes the turn at the *next start-of-step*
   boundary (its in-flight `pending_observations` are kept), suspends with `reason="paused"`, and
   persists a checkpoint — so resume (a `run_until_suspended(None)` re-pump) continues the same
@@ -1071,6 +1116,33 @@ claimed commands per run. Owner watchdogs drain inboxes alongside lease recovery
 redrive.
 
 ### Event Reads
+
+**`data.reason` is two vocabularies, on purpose.** On `turn.interrupted` and `turn.paused` it is a
+**cause** — what stopped the turn (`"user_stop"`, `"user_pause"`). On `Suspension.reason` (and on
+the durable `last_suspension` payload) it is a **park** — the state the session came to rest in
+(`"interrupted"`, `"paused"`, `"turn_failed"`, `"awaiting_tasks"`, `"settled"`, `"limited"`,
+`"terminal"`). The two sets are disjoint and neither is derivable from the other: the event answers
+*why did this stop*, the park answers *where is the run now*. A reader that joins them by field
+name is joining two different questions. The two turn-lane stop events are symmetric — a pause
+emits `turn.paused` exactly as a stop emits `turn.interrupted` — so a consumer watching the turn
+lane sees both parks; the `session.state.changed` event beside them carries the lifecycle
+projection, and it is the carrier the status readers consume: `status.json` and the offline
+projection show `state: "paused"` from it (the backend record's pause state is owned by the
+session driver, which observes the `paused` Suspension directly).
+
+**Status readers carry the whole failure classification, under one rule.** The three consumers
+of the run event stream (`status.json`'s live sink, the offline `events.jsonl` projection, and
+the backend record) copy the full set — `provider_error_code`, `http_status`, `retryable`,
+`config_recoverable`, `provider_retried` — beside `error`/`error_code` when a `turn.failed`
+parks the run, because `config_recoverable` alone cannot separate an `insufficient_quota` (fix
+the config) from a `rate_limit` (wait). The classification remains for as long as the park does;
+a `model.turn.started` clears it (the new turn supersedes the dead one, including on the
+no-park retry path), and terminal events assign rather than or-fallback, so a completed run
+never keeps a recovered turn's error. A failed terminal keeps the `run.failed` classification —
+minus `provider_retried`, the per-call fact the terminal vocabulary deliberately drops.
+`GET /v1/runs/{id}/status` and `/result` serve the same five off the record, on the live branch
+and on the post-restart (status.json-backed) branch alike; `provider_usage` on `turn.failed` is
+metering, not classification, and stays off every status surface.
 
 `GET /v1/runs/{run_id}/events?from_seq=N&limit=M` returns `{run_id, events, next_seq, has_more}`.
 `from_seq` remains inclusive for backward compatibility. When `limit` is present, callers resume
@@ -1531,6 +1603,38 @@ additionally carry optional priced sub-counts when the provider reports them —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
+The sub-counts travel the whole reporting chain, not just the totals: `metrics.updated`
+publishes each one it has (omitting the ones the adapter did not report), both tenant ledgers
+(the gateway's and the reference backend's) sum them as their own columns, and a subagent's
+sub-counts roll up into its parent through the same normalized vocabulary. `total_tokens` is
+still whatever the provider reported and is never re-derived from the sub-counts, so a call
+priced *only* in sub-counts reports `total_tokens: 0` and is visible in the columns it was
+actually expressed in. The token BUDGET is unchanged — it reads the three headline counts.
+
+Error response (the non-200 body, and — minus the `type` tag — the terminal SSE `error` frame,
+which is written from the same definition so the two transports cannot drift):
+
+```json
+{
+  "error": "upstream refused an unproven turn",
+  "error_code": "gateway_generation_not_applied",
+  "retryable": false,
+  "config_recoverable": true,
+  "http_status": 422,
+  "provider_retried": false,
+  "usage": {"input_tokens": 120, "output_tokens": 40, "total_tokens": 160}
+}
+```
+
+`error_code` is the **provider** code (the kernel-level `ModelAdapterError.error_code` has no
+wire slot and reconstructs to its class default). `retryable` forecasts a future attempt;
+`config_recoverable` says the remedy is the caller's configuration instead, so the two are
+independent and a client that reads only the status has to guess at the second. `provider_retried`
+records attempts the gateway's own backend already made. All three booleans and `http_status` are
+written unconditionally, so absence means "an older gateway" and reads as the default; `usage` is
+the one omitted-when-empty key, because an error raised before a provider was reached costs
+nothing and keeps its pre-`usage` wire shape.
+
 **Applied echoes.** When the request carried a `generation` block **and the upstream adapter
 declared `generation_support = "native"` for this call's config**, the response body and the
 terminal `turn_complete` stream frame echo `generation_applied` — the exact block the gateway
@@ -1706,7 +1810,18 @@ competing input.
   conversation** (`messages` — provider-neutral user/assistant/tool log, vendor-
   independent), and the **latest `runtime_config`**. It returns `None` — refusing —
   while a live in-process shell job is still running (a subprocess cannot cross a
-  process boundary).
+  process boundary). The park itself is recorded as `last_suspension`, the durable
+  observation of one `Suspension`: `reason`, `status`, `final_text`, `error`,
+  `error_code`, `awaiting_task_ids`, `has_external`, and the full failure
+  classification (`retryable`, `http_status`, `config_recoverable`,
+  `provider_error_code`, `provider_retried`). `turn` is excluded by design — it is a
+  projection artifact of local paths and metrics, and a recovery driver needs only the
+  boundary facts to return the same park. `reason` and `status` are required and must be members
+  of the park and durable-status vocabularies; every other key is optional on read, and an absent
+  one takes the default, which is what a checkpoint written before that key existed meant. The
+  payload is schema-checked at the recovery boundary (types, vocabularies) rather than at the
+  reader, and the same schema applies to the copy stored under
+  `applied_input_receipts[<input_id>].suspension`.
 - `CheckpointStore` (protocol): `put(checkpoint, blobs)` commits **atomically** and
   flips a `LATEST` pointer last (a half-written checkpoint is never returned);
   `latest(run_id)`; `delete(run_id)`. `LocalFsCheckpointStore` is the default
@@ -1733,13 +1848,39 @@ competing input.
   `runtime_config` restored, remaining duration carried forward (downtime does not
   count against `max_duration_s`), and any shell job left `running` on disk folded in
   as a failed observation.
+- **Durable cancellation:** `cancellation_requested` is written into every snapshot whenever the
+  run's cancellation token was cancelled, and `restore()` honors it *unconditionally* — if the
+  restored loop has no `cancellation_token`, one is minted and cancelled, so the next boundary
+  check raises `RunCancelled`. The flag is the request; the token is only the channel a boundary
+  check reads it through. A recovery driver that rebuilds an `AgentLoop` without passing a token
+  (the ordinary shape) therefore cannot silently un-cancel a run whose cancellation was durable.
+  An embedder that deliberately re-runs a cancelled checkpoint clears
+  `checkpoint.cancellation_requested` before restoring. On the Reference backend, `cancel_run`
+  of a QUIESCENT (parked) run commits a fresh park checkpoint carrying the flag before the ack
+  returns, so the acknowledged cancel survives a crash that lands before the terminal record; a
+  cancel that arrives while a turn is stepping stays in-memory until the pump's boundary check
+  writes its own terminal park (that residual window is the mid-turn crash exposure).
+- The snapshot also carries the **output-validator repair state** (`output_retries` *and*
+  `output_failure_history`, so a restored mid-repair run continues its attempt numbering and
+  keeps `failures_by_validator` in `metrics.json`) and the **delegation roll-ups**
+  (`subagent_count`, `subagent_usage`, `skill_activation_count`, `skills_activated`), which are
+  restored onto the rebuilt tool context so `metrics.json` reports one epoch rather than
+  pre-restart token totals beside post-restart subagent counts. The per-activation tool
+  *service* counters (shell/web call counts) are not durable and restart at zero.
 - `AgentLoop.release_parked()` closes recorder/sink and process-local loop resources after a
   durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
   process. Terminal artifact finalization remains the caller's responsibility.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
-  (`{error, error_code, type, last_good_seq, restore_hint}`) — fail loud, name the
-  checkpoint to restore from. No auto-recovery.
+  (`{error, error_code, provider_error_code, http_status, retryable, config_recoverable, type,
+  last_good_seq, restore_hint}`) —
+  fail loud, name the checkpoint to restore from. `http_status` is the provider status the
+  `run.failed` event beside it carries, written as `null` when the failure never reached a
+  provider. `retryable` / `config_recoverable` are that same event's classification, read from
+  the same run state: `fail_recoverable` (and `close()` on an unrecovered park) promotes a
+  classified `turn.failed` into this record, and the promotion keeps the classification —
+  including across a restart, where the checkpoint's `last_suspension` is where it is read back
+  from. No auto-recovery.
 
 #### Reference operational scopes
 
@@ -1758,10 +1899,17 @@ competing input.
   authoritative bad state. `recover_runs()`
   writes an actionable failure bundle for corrupt or unsupported durable state. It scans
   `run_root`; the active watchdog discovers cross-instance orphaned
-  runs from the shared lease store. Recovery skips terminal checkpoints and failed runs, rebuilds
+  runs from the shared lease store. Recovery skips terminal checkpoints, failed runs, and runs
+  whose durable status artifact records a terminal outcome — a run that CLOSED limited keeps a
+  non-terminal park checkpoint (a live-limited park is resumable by design) and no failure.json,
+  so `status.json`'s terminal reading (including legacy bare `status="limited"` dirs) is the
+  marker that stops it from being re-driven on every pass. It then rebuilds
   each run (re-issuing gateway tokens from the signing key, **re-provisioning the base workspace**
   is the deployment's job), `restore()`s the loop with the store's blobs, re-enqueues durably-saved
-  follow-up messages, and resumes.
+  follow-up messages, and resumes. Both give-up paths (unrecoverable after
+  `max_recover_attempts`; corrupt/unsupported durable state) also meter the run's
+  checkpointed/projected spend into the tenant ledger through the same high-water seam the
+  failure path uses — a run recovery abandons is still a run that billed.
 - The experimental v0.19.2 DBOS activation-recovery profile has a narrow operational scope. One
   stable executor slot has one active process; a restart reuses the same executor identity and
   application version after the prior process terminates or is fenced. One private Reference host
@@ -1801,14 +1949,47 @@ requires explicit host orchestration.
 
 - **Failure bundle on every failure.** Beyond the core's own `failure.json`, the reference
   backend's `_record_run_failure` also writes `run_dir/failure.json`
-  (`monoid.failure.v1`: `error, error_code, type, last_good_seq, restore_hint,
-  failed_at`) — the durable mark is written *before* the in-memory terminal state, so a
-  worker crash that bypassed the loop's own bundle still leaves a mark and a restart never
-  resumes a crashed run into a loop.
+  (`monoid.failure.v1`: `error, error_code, http_status, retryable, config_recoverable, type,
+  last_good_seq, restore_hint, failed_at`) — the durable mark is written *before* the in-memory
+  terminal state, so a worker crash that bypassed the loop's own bundle still leaves a mark and
+  a restart never resumes a crashed run into a loop. The status and the two classification flags
+  are read off the failing exception by name and never coerced; the recovery-path writers
+  (unrecoverable, invalid durable state) hold no provider verdict and leave them at
+  `null` / `false`. It writes the terminal statement into `status.json` in the same breath —
+  through the one shared quarantine writer, with this lane's `recorded_by_run_failure` marker
+  and the failure's *own* `error_code` — because a driver failure has no live recorder and
+  therefore no terminal event: without the artifact, every status surface kept serving the
+  run's last park after a restart while `recover_runs` skipped its dir on `failure.json`. A
+  failure bundle beside a non-terminal artifact is also honored reader-side
+  (`lifecycle_from_status_artifact`): the pair reads `failed`/terminal even for dirs
+  quarantined before this writer existed, while a *terminal* artifact (a genuine close) still
+  wins over the bundle.
 - **Bounded recovery.** `recover_runs()` logs (not swallows) a resume failure and tracks
   attempts in `run_dir/recover_attempts.json` (`{count}`); after the cap it writes a
   `failure.json` with `error_code="unrecoverable"`, so a poison checkpoint is permanently
-  skipped instead of retried forever.
+  skipped instead of retried forever. Both give-up paths (unrecoverable after the cap;
+  corrupt/unsupported durable state) also write the terminal statement into `status.json`
+  through the same shared writer (`state="failed"`, `terminal=true`, the bundle's error pair,
+  an empty classification, and a `given_up_by_recovery` marker) — without it, `status()`,
+  `list_runs` and the offline projection kept answering the run's last park
+  (`awaiting_input`, `terminal=false`) for a permanently dead run while `resume_run` refused
+  it as unrecoverable. The bundle's `restore_hint` names the actual operator flow: delete
+  `failure.json` to lift the quarantine, then `recover_runs` (or `resume_run`) restores the
+  last good checkpoint — the quarantine markers (`given_up_by_recovery`,
+  `recorded_by_run_failure`) are what keep the closed-run status guard from mistaking a
+  quarantine statement for a close once the quarantine is lifted.
+- **Typed resume refusals.** `attempt_resume` answers a `ResumeOutcome`, not a bool, and
+  `resume_run` maps it: `resumed` — the caller now owns a live run; `closed` (the durable
+  status artifact or a terminal checkpoint records the run's own end — e.g. a close while
+  budget-limited, whose park checkpoint is non-terminal by design) refuses with the loop's
+  own terminal vocabulary, `NativeAgentError(error_code="run_terminal")`, instead of a hint
+  at a `failure.json` that does not exist; `already_live` (a concurrent resume won the
+  atomic record claim — the double-click shape) answers the same already-live success shape
+  as the record-exists branch, `resumed: false`, because the run *is* being resumed; only
+  `failed` — a genuine non-resume — keeps the inspect-logs/failure.json error. `list_runs`'
+  `recoverable` consults the same close-recording artifact fact through the same function
+  (`core.projections.status_artifact_records_close`), so the listing never advertises a run
+  `resume_run` will refuse as closed.
 
 ### Active watchdog / lease (legacy backend only)
 

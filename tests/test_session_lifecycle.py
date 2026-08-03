@@ -23,9 +23,13 @@ from monoid_agent_kernel.core.lifecycle import (
     state_from_suspension,
     to_session_state,
 )
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.output_validator import ValidationOutcome
 from monoid_agent_kernel.core.result import Suspension
-from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
+from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -52,10 +56,32 @@ def test_terminal_reason_maps_to_failed() -> None:
     assert state_from_suspension(_suspension("terminal", status="failed")) is SessionState.FAILED
 
 
+def test_terminal_limited_maps_to_limited_on_every_mapper() -> None:
+    """One run, three surfaces, one answer.
+
+    A budget- or output-validator-limited terminal park used to project three different ways:
+    ``state_from_suspension`` said FAILED (the terminal branch read only ``error_code``),
+    ``session_state_from_run_status("limited")`` said LIMITED, and ``LoopSession.close`` said
+    COMPLETED (it tested only for ``"failed"``). The state an operator saw depended on which
+    surface they asked. LIMITED is canonical — the run hit a bound, it did not fail and it did
+    not succeed — and the three are asserted together so a fix to one of them cannot re-diverge.
+    """
+    parked = _suspension("terminal", status="limited", error_code="output_validator_unsatisfied")
+
+    assert state_from_suspension(parked) is SessionState.LIMITED
+    assert session_state_from_run_status("limited", terminal=True) is SessionState.LIMITED
+    assert REASON_TO_STATE["limited"] is SessionState.LIMITED
+
+
 def test_cancel_terminal_maps_to_cancelled() -> None:
     # Cancel arrives as reason="terminal", status="limited", error_code="cancelled".
+    # Checked BEFORE the limited branch above, so the harmonization does not swallow a cancel.
     cancelled = _suspension("terminal", status="limited", error_code="cancelled")
     assert state_from_suspension(cancelled) is SessionState.CANCELLED
+    assert (
+        session_state_from_run_status("limited", error_code="cancelled", terminal=True)
+        is SessionState.CANCELLED
+    )
 
 
 def test_reason_map_covers_every_non_terminal_reason() -> None:
@@ -146,6 +172,68 @@ def test_facade_state_walks_created_idle_running_awaiting(tmp_path: Path) -> Non
     assert turn.final_text == "done"
     assert session.state is SessionState.AWAITING_INPUT
     result = session.close()
+    assert result.status == "completed"
+    assert session.state is SessionState.COMPLETED
+
+
+def test_closing_a_limited_run_reports_limited_not_completed(tmp_path: Path) -> None:
+    """The third mapper, driven end to end rather than asserted on a value.
+
+    ``close()`` tested ``status == "failed"`` and folded everything else into COMPLETED, so a run
+    that exhausted its output-validator budget — the exact case the LIMITED state exists for —
+    closed as a clean success on this surface while the pump's own projection said LIMITED.
+    """
+
+    class _RejectEverything:
+        id = "reject.all"
+        schema = None
+
+        def validate(self, view):  # noqa: ANN001, ANN202
+            del view
+            return ValidationOutcome(ok=False, feedback="never satisfied")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            limits=RunLimits(max_output_retries=0),
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")]),
+        runtime_config_provider=runtime_provider(
+            AgentRuntimeConfig(
+                definition_id="test-agent",
+                output_validators=(
+                    OutputValidatorBinding(validator_id="reject.all", enabled=True),
+                ),
+            )
+        ),
+        output_validators=(_RejectEverything(),),
+    )
+    session = LoopSession(loop)
+    session.open()
+
+    suspension = session.run_until_suspended("go")
+    assert suspension.status == "limited"
+    assert session.state is SessionState.LIMITED
+
+    result = session.close()
+
+    assert result.status == "limited"
+    assert session.state is SessionState.LIMITED, "close() folded a limited run into COMPLETED"
+
+
+def test_closing_a_clean_run_still_reports_completed(tmp_path: Path) -> None:
+    """The other half of the same routing change: nothing else moved."""
+
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")])
+    session = LoopSession(_loop(tmp_path, adapter))
+    session.open()
+    session.submit("go")
+
+    result = session.close()
+
     assert result.status == "completed"
     assert session.state is SessionState.COMPLETED
 
@@ -276,6 +364,13 @@ def test_pause_lands_at_step_boundary_then_resumes(tmp_path: Path) -> None:
     # The pause park persisted a checkpoint (snapshot serialized pending_observations).
     cp = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert cp is not None
+    # ...and the pause is visible on the durable status surface, not only in the FSM: an
+    # operator polling status.json used to read "running" for the whole park.
+    status = json.loads(
+        (spec.run_root / spec.run_id / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["state"] == "paused"
+    assert status["terminal"] is False
 
     # Resume continues the SAME turn (the kept tool observation is re-sent) to settle.
     settled = session.resume()
@@ -299,6 +394,33 @@ def test_session_state_changed_event_emitted_on_pause(tmp_path: Path) -> None:
     changed = [json.loads(line) for line in lines if json.loads(line)["type"] == "session.state.changed"]
     assert changed, "expected a session.state.changed event"
     assert changed[-1]["data"]["state"] == "paused"
+
+
+def test_pause_emits_a_turn_lane_event_like_its_interrupt_twin(tmp_path: Path) -> None:
+    """The pause park emitted only the session-lane event; the stop park emitted both.
+
+    Two sibling parks, and a consumer watching the turn lane saw one of them. ``turn.paused``
+    carries the same shape as ``turn.interrupted`` — a CAUSE (`"user_pause"`), not a
+    ``Suspension.reason`` — and is bound to the turn it froze.
+    """
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    session.run_until_suspended("go")
+
+    events_path = tmp_path / "runs" / spec.run_id / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    paused = [event for event in events if event["type"] == "turn.paused"]
+    assert len(paused) == 1, "expected exactly one turn.paused"
+    assert paused[0]["data"] == {"reason": "user_pause"}
+    assert paused[0]["turn_id"], "the pause event names the turn it froze"
+    # Ordered ahead of the lifecycle projection, like turn.failed is ahead of its park.
+    types = [event["type"] for event in events]
+    assert types.index("turn.paused") < types.index("session.state.changed")
+    # ...and the finished run's whole artifact set still validates, which is what makes the new
+    # event type a DECLARED one rather than a string the schema walks past.
+    session.resume()
+    session.close()
+    assert validate_run_dir(spec.run_root / spec.run_id) == []
 
 
 def test_pause_survives_restart_via_checkpoint(tmp_path: Path) -> None:
@@ -343,6 +465,347 @@ def test_cancel_terminalizes_run(tmp_path: Path) -> None:
     assert suspension.error_code == "cancelled"
     assert session.state is SessionState.CANCELLED
     assert session._cancel_reason == "operator stop"
+
+
+# --- the blocking settle twin + liveness binding (v0.21 burn-down) ------------------------
+
+
+def _terminal_limited_session(tmp_path: Path) -> LoopSession:
+    """A session whose one submit spends the whole session tool-call budget: the loop settles
+    ``status="limited"`` / ``error_code="max_tool_calls_exceeded"`` and — because the budget is
+    session-cumulative — marks the session terminal at the same park."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            limits=RunLimits(max_tool_calls=1),
+        ),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    response_id="r1",
+                    tool_calls=(
+                        fake_tool_call("fs_write", {"path": "A.md", "content": "a\n"}, "c1"),
+                        fake_tool_call("fs_write", {"path": "B.md", "content": "b\n"}, "c2"),
+                    ),
+                )
+            ]
+        ),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    return LoopSession(loop)
+
+
+def test_blocking_submit_maps_a_terminal_limited_turn_like_the_pump(tmp_path: Path) -> None:
+    """The blocking settle twin of ``state_from_suspension``'s terminal precedence.
+
+    ``submit()`` of a run that spends its session tool-call budget hands back
+    ``status="limited"`` with the session terminal, and ``_derive_after_settle`` read only the
+    terminal flag — FAILED — while ``run_until_suspended`` answered LIMITED for the identical
+    run. Worse, the divergence escalated: ``close()`` then computed LIMITED via
+    ``session_state_from_run_status`` and crashed the FSM (``'failed' -> 'limited'``) AFTER the
+    loop had already finalized, so the embedder lost the ``AgentRunResult``.
+    """
+    session = _terminal_limited_session(tmp_path)
+    session.open()
+
+    turn = session.submit("go")
+
+    assert turn.status == "limited"
+    assert turn.error_code == "max_tool_calls_exceeded"
+    assert session.state is SessionState.LIMITED
+
+    result = session.close()  # must not raise illegal_session_transition
+    assert result.status == "limited"
+    assert session.state is SessionState.LIMITED
+
+
+def test_blocking_submit_maps_a_cancelled_turn_to_cancelled(tmp_path: Path) -> None:
+    """Cancel's blocking half: the turn arrives as ``status="limited"`` +
+    ``error_code="cancelled"`` and must map CANCELLED first, exactly as the pump half does —
+    it mapped to FAILED, and ``close()`` then crashed on ``'failed' -> 'cancelled'``."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    session = LoopSession(_loop(tmp_path, adapter))
+    session.open()
+    session.submit("go")
+    session.cancel(reason="operator stop")
+
+    turn = session.submit("again")
+
+    assert turn.error_code == "cancelled"
+    assert session.state is SessionState.CANCELLED
+
+    result = session.close()  # must not raise illegal_session_transition
+    assert result.error_code == "cancelled"
+    assert session.state is SessionState.CANCELLED
+
+
+def test_a_closed_limited_run_reports_dead_and_refuses_resume(tmp_path: Path) -> None:
+    """Post-close, the loop is gone (``_session is None``) but the facade sits in LIMITED — a
+    park state. ``health()``/``inspect()`` said alive-and-accepting over the dead loop, and
+    ``resume()`` wrote RUNNING *before* asking the loop, which then refused (``run_not_open``)
+    — wedging the facade in RUNNING permanently."""
+    session = _terminal_limited_session(tmp_path)
+    session.open()
+    suspension = session.run_until_suspended("go")
+    assert suspension.status == "limited"
+    assert session.state is SessionState.LIMITED
+
+    session.close()
+    assert session.state is SessionState.LIMITED
+    assert session.loop._session is None
+
+    health = session.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+    assert session.inspect().terminal is True
+
+    with pytest.raises(NativeAgentError) as exc_info:
+        session.resume()
+    assert exc_info.value.error_code == "run_not_open"
+    assert session.state is SessionState.LIMITED, "a refused pump must not move the facade"
+
+
+def test_a_terminal_limited_park_refuses_input_before_close(tmp_path: Path) -> None:
+    """Pre-close, the pump half of the same cell: the session object is live but terminal.
+    ``health()`` answered the self-contradictory (alive=False, can_accept_input=True), and
+    ``resume()`` wrote RUNNING before the loop's ``run_terminal`` refusal."""
+    session = _terminal_limited_session(tmp_path)
+    session.open()
+    session.run_until_suspended("go")
+    assert session.state is SessionState.LIMITED
+    live = session.loop._session
+    assert live is not None and live.terminal is True
+
+    health = session.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+
+    with pytest.raises(NativeAgentError) as exc_info:
+        session.resume()
+    assert exc_info.value.error_code == "run_terminal"
+    assert session.state is SessionState.LIMITED, "a refused pump must not move the facade"
+
+    # The truthful state is still closable, and closes to itself.
+    result = session.close()
+    assert result.status == "limited"
+    assert session.state is SessionState.LIMITED
+
+
+def test_a_close_that_raises_does_not_leave_an_accepting_park_over_a_dead_loop() -> None:
+    """``AgentLoop.close`` discards the activation (``_session = None``) before re-raising, so
+    a facade left in its park state would keep answering "accepting input" forever. It must
+    land on FAILED (the loop is dead) and re-raise the loop's error."""
+
+    class _ExplodingClosedLoop:
+        _session = None
+        # Models AgentLoop.close's failure path faithfully: it runs discard_uncommitted()
+        # before re-raising, and that teardown sets the loop-side finalization fact deadness
+        # now derives from (a bare `_session is None` no longer means dead — the backend's
+        # aopen window looks exactly like that, milliseconds before the first pump).
+        _finalized = True
+
+        def close(self) -> None:
+            raise NativeAgentError("finalize failed", error_code="checkpoint_persist_failed")
+
+    session = LoopSession(_ExplodingClosedLoop(), _state=SessionState.AWAITING_INPUT)  # type: ignore[arg-type]
+
+    with pytest.raises(NativeAgentError) as exc_info:
+        session.close()
+    assert exc_info.value.error_code == "checkpoint_persist_failed"
+
+    assert session.state is SessionState.FAILED
+    health = session.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+
+
+def test_submit_before_open_raises_run_not_open_without_moving_the_fsm(tmp_path: Path) -> None:
+    """The pre-pump guard's CREATED cell: an unopened facade must refuse with the loop's own
+    typed error (it used to raise ``illegal_session_transition`` from the RUNNING write)."""
+    session = LoopSession(_loop(tmp_path, FakeModelAdapter(turns=[])))
+
+    with pytest.raises(NativeAgentError) as exc_info:
+        session.submit("go")
+    assert exc_info.value.error_code == "run_not_open"
+    assert session.state is SessionState.CREATED
+
+
+# --- fresh-facade derivation + loop-side deadness (v0.21 burn-down, round 2) --------------
+
+
+def test_fresh_facade_over_a_restored_parked_loop_derives_its_state(tmp_path: Path) -> None:
+    """The facade's own restore story, which its docstring promised and its constructor broke:
+    a fresh ``LoopSession(loop2)`` over a restored paused loop reported CREATED, ``open()``
+    raised ``run_already_open``, and any pump raised ``illegal_session_transition``
+    created->running — the facade could not wrap the one loop shape restore produces. It now
+    derives its initial state from the restored session's last committed park."""
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    assert session.run_until_suspended("go").reason == "paused"
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    base2 = tmp_path / "workspace2"
+    base2.mkdir()
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=tmp_path / "runs", run_id=spec.run_id)
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r2", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop2.restore(record.checkpoint, blobs=record.blob)
+
+    resumed = LoopSession(loop2)  # no explicit _state: the state comes from the loop
+
+    assert resumed.state is SessionState.PAUSED
+    assert resumed.inspect().last_suspension_reason == "paused"
+    assert resumed.health().alive is True
+    settled = resumed.resume()  # PAUSED -> RUNNING -> AWAITING_INPUT, same as in-process
+    assert settled.reason == "settled"
+    assert resumed.state is SessionState.AWAITING_INPUT
+    result = resumed.close()
+    assert result.status == "completed"
+    assert resumed.state is SessionState.COMPLETED
+
+
+def test_fresh_facade_over_a_restored_terminal_loop_derives_the_terminal_state(
+    tmp_path: Path,
+) -> None:
+    """The terminal cell of the same derivation: a restored terminal-limited loop must come up
+    LIMITED (through the shared terminal precedence — a cancel would come up CANCELLED, a real
+    failure FAILED), report dead, and refuse a pump without moving the FSM."""
+    session = _terminal_limited_session(tmp_path)
+    session.open()
+    suspension = session.run_until_suspended("go")
+    # The session-cumulative budget parks reason="limited" and raises the terminal flag at the
+    # same boundary — the checkpoint carries terminal=True beside the limited park.
+    assert suspension.reason == "limited" and suspension.status == "limited"
+    live = session.loop._session
+    assert live is not None and live.terminal is True
+    spec = session.loop.spec
+
+    record = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert record is not None
+    base2 = tmp_path / "workspace2"
+    base2.mkdir()
+    spec2 = AgentRunSpec(workspace_root=base2, run_root=spec.run_root, run_id=spec.run_id)
+    loop2 = AgentLoop(
+        spec=spec2,
+        model_adapter=FakeModelAdapter(turns=[]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop2.restore(record.checkpoint, blobs=record.blob)
+
+    restored = LoopSession(loop2)
+
+    assert restored.state is SessionState.LIMITED
+    health = restored.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+    with pytest.raises(NativeAgentError) as exc_info:
+        restored.resume()
+    assert exc_info.value.error_code == "run_terminal"
+    assert restored.state is SessionState.LIMITED, "a refused pump must not move the facade"
+
+
+def test_fresh_facade_over_an_open_unpumped_loop_derives_idle(tmp_path: Path) -> None:
+    """A loop opened before it was wrapped (session present, no park yet) is IDLE, and the
+    normal flow continues from there byte-identically."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+
+    session = LoopSession(loop)
+
+    assert session.state is SessionState.IDLE
+    turn = session.submit("go")
+    assert turn.final_text == "hi"
+    assert session.state is SessionState.AWAITING_INPUT
+    result = session.close()
+    assert result.status == "completed"
+
+
+def test_a_fresh_unopened_loop_still_yields_created(tmp_path: Path) -> None:
+    """The constraint on the derivation: the normal path is untouched — no session, no
+    derivation, CREATED exactly as before."""
+    session = LoopSession(_loop(tmp_path, FakeModelAdapter(turns=[])))
+    assert session.state is SessionState.CREATED
+    session.open()
+    assert session.state is SessionState.IDLE
+
+
+def test_an_explicitly_seeded_state_is_not_overridden_by_derivation(tmp_path: Path) -> None:
+    """commands.py builds ``LoopSession(loop, _state=record.state)`` for inspect/health — an
+    explicitly passed state is the caller's (backend's) knowledge and derivation must not
+    fight it."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+    seeded = LoopSession(loop, _state=SessionState.RUNNING)
+    assert seeded.state is SessionState.RUNNING
+
+
+def test_health_during_the_backend_aopen_window_answers_alive(tmp_path: Path) -> None:
+    """The false-dead window: the backend attaches the loop (findable) before ``aopen``
+    finishes on its worker thread, and ``run.started`` sets record.state=RUNNING before
+    ``open()`` returns and assigns ``loop._session``. An HTTP-thread inspect/health facade
+    (``LoopSession(loop, _state=RUNNING)``) read ``_session is None`` + state != CREATED as
+    dead — alive=False/terminal=True for a run milliseconds from its first pump. Deadness is
+    now a loop-side finalization fact, and the window answers not-dead."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)  # never opened: _session is None, nothing finalized
+    window = LoopSession(loop, _state=SessionState.RUNNING)
+
+    health = window.health()
+    assert health.alive is True
+    assert health.can_accept_input is False  # RUNNING accepts no input — but it is not dead
+    assert window.inspect().terminal is False
+
+
+def test_a_closed_loop_is_dead_to_any_fresh_facade(tmp_path: Path) -> None:
+    """The other side of the same predicate: after ``close()`` nulls ``_session`` the loop is
+    finalized, and ANY facade over it — including a fresh one seeded with a live park state —
+    answers dead."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    session = LoopSession(loop)
+    session.open()
+    session.submit("go")
+    session.close()
+
+    fresh = LoopSession(loop, _state=SessionState.AWAITING_INPUT)
+    health = fresh.health()
+    assert health.alive is False
+    assert health.can_accept_input is False
+    assert fresh.inspect().terminal is True
+
+
+def test_discard_uncommitted_marks_the_loop_dead(tmp_path: Path) -> None:
+    """The second ``_session``-nulling teardown site carries the same finalization fact."""
+    adapter = FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="hi")])
+    loop = _loop(tmp_path, adapter)
+    loop.open()
+    loop.discard_uncommitted()
+
+    fresh = LoopSession(loop, _state=SessionState.RUNNING)
+    assert fresh.health().alive is False
+    assert fresh.inspect().terminal is True
+
+
+def test_release_parked_marks_this_activation_dead(tmp_path: Path) -> None:
+    """The third site: ``release_parked`` leaves the RUN durably resumable (by a NEW loop via
+    restore), but THIS activation is torn down — a facade over it must answer dead."""
+    session, spec = _pausing_session(tmp_path)
+    session.open()
+    assert session.run_until_suspended("go").reason == "paused"
+    session.loop.release_parked()
+
+    fresh = LoopSession(session.loop, _state=SessionState.PAUSED)
+    assert fresh.health().alive is False
+    assert fresh.inspect().terminal is True
 
 
 # --- Step 5: status-vocabulary reconciliation ---------------------------------------------
@@ -397,6 +860,46 @@ def test_lifecycle_from_status_artifact_projects_legacy_status() -> None:
 def test_lifecycle_from_status_artifact_uses_failure_fallback() -> None:
     assert lifecycle_from_status_artifact(None) == (SessionState.CREATED, False)
     assert lifecycle_from_status_artifact(None, failure_present=True) == (SessionState.FAILED, True)
+
+
+def test_a_failure_bundle_outranks_a_non_terminal_parked_artifact() -> None:
+    """A parked artifact + a failure bundle = the run is dead. ``failure_present`` used to
+    fire only when the payload had NO state at all, so a quarantined run whose artifact still
+    said ``awaiting_input`` read as a healthy park on every artifact-backed surface. A
+    TERMINAL artifact still wins over ``failure_present`` (the close is the stronger, later
+    statement), and without the bundle the park reads exactly as before — which is what keeps
+    the restore-hint flow (delete failure.json, then resume) working."""
+
+    parked = {"state": "awaiting_input", "terminal": False}
+    assert lifecycle_from_status_artifact(parked, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    assert lifecycle_from_status_artifact(parked, failure_present=False) == (
+        SessionState.AWAITING_INPUT,
+        False,
+    )
+    # Non-terminal in every spelling: a live-limited park and a mid-turn RUNNING crash both
+    # read dead beside a bundle.
+    assert lifecycle_from_status_artifact({"state": "limited"}, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    assert lifecycle_from_status_artifact({"state": "running"}, failure_present=True) == (
+        SessionState.FAILED,
+        True,
+    )
+    # A terminal artifact still wins — explicit and legacy-inferred alike.
+    assert lifecycle_from_status_artifact(
+        {"state": "limited", "terminal": True}, failure_present=True
+    ) == (SessionState.LIMITED, True)
+    assert lifecycle_from_status_artifact(
+        {"state": "completed"}, failure_present=True
+    ) == (SessionState.COMPLETED, True)
+    assert lifecycle_from_status_artifact({"status": "limited"}, failure_present=True) == (
+        SessionState.LIMITED,
+        True,
+    )
 
 
 def test_cancelled_is_terminal() -> None:

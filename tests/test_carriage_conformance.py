@@ -191,322 +191,22 @@ class CarriageGap:
 DISPOSITIONS = frozenset({"burn-down", "v0.21-track:B1", "by-design"})
 
 KNOWN_GAPS: tuple[CarriageGap, ...] = (
-    # --- the public-error filter: applied on three of four paths out of one payload ----
-    CarriageGap(
-        "public-error-filter",
-        "error",
-        "reference/backend/projection.py:result",
-        "the ready branch serves the RAW AgentRunResult.error at the top level while the "
-        "not-ready branch of the same method serves record.error and the metrics block of the "
-        "same payload serves metrics[\"error\"] — both of which went through "
-        "public_view.py:public_error_message (run_state.py:record_run_result and "
-        "loop_phases.py:build_metrics). AgentRunResult.error is deliberately raw because the "
-        "embedding application is inside the trust boundary; this response is not, so the one "
-        "branch that omits the filter publishes over HTTP exactly what the filter beside it was "
-        "added to withhold",
-        "burn-down",
-    ),
-    # --- config_recoverable: born on the client, dies at the hop -----------------------
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "reference/llm_gateway/http.py:_error_body",
-        "no wire key: the one error field with no transport, so a config-fixable refusal "
-        "arrives one hop out as an ordinary failure (only the 4xx status hints at it)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_parse_gateway_response",
-        "reconstructs config_recoverable=False even when the body carries the key",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_chunk_from_event",
-        "stream-error twin of _parse_gateway_response: same dropped read",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/gateway.py:_error_from_status_body",
-        "non-200 twin of _parse_gateway_response: same dropped read",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "config_recoverable",
-        "core/schemas.py:TRANSCRIPT_RECORD_SCHEMA",
-        "the model_turn branch does not declare config_recoverable although loop.py:_apump_turn "
-        "writes it; additionalProperties=True is what keeps the record valid, not the schema",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "providers/openai.py:_model_error_from_openai",
-        "no branch sets config_recoverable, so a provider-side config refusal is never flagged "
-        "at the one adapter that can classify it",
-        "burn-down",
-    ),
-    # --- http_status: carried by some siblings, dropped by the others ------------------
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "loop.py:_record_failure",
-        "the failure bundle (write_failure) omits http_status while the run.failed event beside "
-        "it carries it, so the operator's restore aid loses the status the log kept",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_exact_gateway_int",
-        "validator has no http_status parameter, so a malformed-payload error it raises loses "
-        "the status its _exact_gateway_bool/_gateway_string siblings forward",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_gateway_fragment_string",
-        "same missing parameter as _exact_gateway_int",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_gateway_usage",
-        "same missing parameter as _exact_gateway_int",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "http_status",
-        "providers/gateway.py:_portable_gateway_payload",
-        "fourth sibling with the same missing parameter",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "retryable/config_recoverable",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "run.failed (the terminal twin of turn.failed) declares neither, although "
-        "loop.py:fail_recoverable promotes a turn.failed carrying both into exactly this "
-        "record — so the terminal log of a config-fixable failure cannot say it was one",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "retryable/config_recoverable",
-        "loop.py:_record_failure",
-        "the run.failed emit site and the write_failure bundle beside it are built from the "
-        "same state and neither writes the classification the promoted turn.failed carried",
-        "burn-down",
-    ),
-    # --- provider_retried / provider_usage: stamped, then unrecorded -------------------
-    CarriageGap(
-        "transportable-error",
-        "provider_retried",
-        "providers/openai.py:_model_error_from_openai",
-        "no branch sets provider_retried, so the adapter that owns a retry loop never reports "
-        "having run it",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_retried",
-        "core/result.py:Suspension",
-        "absent from every kernel record of a failed turn (Suspension, its checkpoint payload, "
-        "and the turn.failed event), so it survives only inside the live exception",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_usage",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "turn.failed declares no usage (nor provider_retried) although the transcript twin "
-        "written on the same failure records both cost and classification. Borderline sibling, "
-        "noted rather than registered separately: the CADENCE of the cumulative meter has the "
-        "same shape. loop.py's ModelAdapterError arm accumulates the billed usage into "
-        "state.total_usage and emits no metrics.updated, while the success path below it emits "
-        "one per turn — so a billed-refused turn's cost is in the totals but not yet on the "
-        "live stream, and a run that only ever fails never publishes it at all",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_retried",
-        "loop.py:_apump_turn",
-        "the SUCCESS model_turn transcript record omits it although ModelTurn carries it and "
-        "the receipt records it, so the private replay artifact of a retried-then-successful "
-        "call reads as a clean single attempt (its failure twin omits it too)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "provider_error_code",
-        "core/result.py:Suspension",
-        "not a Suspension field, so the provider code a driver needs to decide re-attempt vs "
-        "config-fix is lost through checkpoint recovery (it lives only on RunState)",
-        "burn-down",
-    ),
-    # --- usage sub-counts: normalized, then flattened ----------------------------------
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "reference/llm_gateway/service.py:LlmGatewayUsage",
-        "the tenant meter sums only input/output/total, dropping the four priced sub-counts "
-        "normalize_usage emits; corollary A8 — a billed failure that reports ONLY sub-counts "
-        "meters as total=0, so the priced call is invisible to the meter entirely",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/audio_tokens",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "metrics.updated declares reasoning_tokens but not its three sibling sub-counts, so a "
-        "cache-heavy run's priced detail never reaches a live consumer",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "loop.py:_run_subagent_child",
-        "the parent roll-up hard-codes a 3-key tuple, so a child's sub-counts never reach the "
-        "parent's budget — an undercount in exactly the aggregate a bound is checked against",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "reference/backend/run_state.py:TenantUsage",
-        "the unregistered twin of the gateway meter above: add_metrics sums input/output/total "
-        "and eight web counters and drops the four priced sub-counts, so the BACKEND tenant "
-        "ledger under-reports a cache-heavy or reasoning-heavy run exactly like the gateway's. "
-        "Two meters, one omission, and fixing one of them leaves the other",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "metrics",
-        "reference/backend/run_state.py:record_run_failure",
-        "meters nothing at all, while record_run_result beside it feeds result.metrics into the "
-        "tenant ledger — so a run that dies of a driver exception after N billed turns leaves "
-        "the ledger reporting zero for every one of them (not even the run count)",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "provider_usage",
-        "model_call.py:_recordable_usage",
-        "accepts int subclasses (IntEnum) that providers/base.py:provider_usage_of, "
-        "providers/gateway.py:_reported_error_usage and core/model_io.py:ModelCallReceipt "
-        "all reject, so one stamp reads as three different usages depending on the consumer",
-        "burn-down",
-    ),
-    # --- config_recoverable: the consumers that were designed for it and ignore it -----
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "reference/backend/session_drive.py:drive_open_session",
-        "the designed consumer branches on retryable only, so a config-recoverable park is "
-        "treated exactly like any other non-retryable turn failure: the driver gives up and "
-        "promotes it rather than surfacing the config fix the classification exists to name",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "core/model_io.py:ModelCallReceipt",
-        "with_error reads five facts off the exception (error_code, provider_error_code, "
-        "retryable, http_status, provider_retried) and not this one, so the immutable record "
-        "of the call cannot say the failure was config-fixable",
-        "burn-down",
-    ),
-    CarriageGap(
-        "transportable-error",
-        "config_recoverable",
-        "core/model_stream.py:ModelStreamOutcome",
-        "the stream_closed record (core/schemas.py, additionalProperties False) carries "
-        "retryable and no config_recoverable, so the live stream lane classifies a park with "
-        "half the vocabulary the park itself carries — and the closed cap means adding it is a "
-        "schema change, not an oversight to patch",
-        "burn-down",
-    ),
-    # --- turn.failed: written by the kernel, consumed by nobody ------------------------
-    CarriageGap(
-        "suspension",
-        "turn.failed",
-        "reference/backend/run_state.py:record_event",
-        "no status projection consumes turn.failed (neither this one nor core/projections.py), "
-        "so a run parked in TURN_FAILED serves error=\"\" over HTTP: the event carries the whole "
-        "classification and the surface an operator actually reads shows none of it",
-        "burn-down",
-    ),
     CarriageGap(
         "suspension",
         "reason",
         "loop.py:_apump_turn",
-        "turn.interrupted's data.reason is a *cause* vocabulary (\"user_stop\") while "
-        "Suspension.reason is a *park* vocabulary (\"interrupted\"), one word for two "
-        "vocabularies on one event; and the pause twin emits no turn.paused at all, only a "
-        "session.state.changed, so the two sibling parks are not observable the same way",
-        "burn-down",
-    ),
-    # --- one event vocabulary, three projections that each drop a different cell --------
-    CarriageGap(
-        "run-status projection",
-        "run.awaiting_input",
-        "core/projections.py:_apply_event_projection",
-        "the offline projection handles run.waiting and not run.awaiting_input, so a run parked "
-        "for a hosted task or user input still reads as running to `monoid status` — while "
-        "recorder.py:StatusJsonSink, which consumes the same stream, handles both",
-        "burn-down",
-    ),
-    CarriageGap(
-        "run-status projection",
-        "run.waiting",
-        "reference/backend/run_state.py:record_event",
-        "the exact mirror image of the offline projection's hole: this consumer handles "
-        "run.awaiting_input and not run.waiting, so the two readers of one event stream are "
-        "each blind to the park the other sees. StatusJsonSink is the control — it handles "
-        "both, and clears the wait on model.turn.started",
-        "burn-down",
-    ),
-    CarriageGap(
-        "run-status projection",
-        "limited",
-        "core/lifecycle.py:state_from_suspension",
-        "three mappers, three answers for one terminal budget-limited run: this one reports "
-        "FAILED (a terminal park arrives as reason=\"terminal\" and only error_code=\"cancelled\" "
-        "escapes that branch), session_state_from_run_status(\"limited\") reports LIMITED, and "
-        "LoopSession.close reports COMPLETED because it tests only for \"failed\". The state an "
-        "operator sees is decided by which surface they asked",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "status",
-        "reference/backend/recovery.py:run_recovered",
-        "constructs Suspension(status=\"running\"), which is outside the vocabulary every "
-        "durable reader accepts (core/result.py:suspension_from_checkpoint_payload admits only "
-        "completed/failed/limited). Latent because this synthetic park is re-driven and never "
-        "serialized — but nothing on the type says so, and the first code path that checkpoints "
-        "it raises at the recovery boundary it was built to serve",
-        "burn-down",
-    ),
-    CarriageGap(
-        "suspension",
-        "last_suspension",
-        "core/checkpoint.py:_validate_checkpoint_payload",
-        "the durable park payload is validated as \"an object or null\" and nothing more — it "
-        "has no schema of its own, so every field the census pins on the writer/reader pair is "
-        "unpinned on the durable artifact itself; this suite is currently its only twin",
-        "burn-down",
+        "BY DESIGN, and split out from the burn-down entry it used to share. turn.interrupted's "
+        "data.reason is a *cause* vocabulary (\"user_stop\") and Suspension.reason is a *park* "
+        "vocabulary (\"interrupted\"): one key name, two domains, deliberately. The event answers "
+        "\"why did this stop\", the park answers \"where is the run now\", the two value sets are "
+        "disjoint, and neither is derivable from the other — so a reader that joins them by name "
+        "is joining two different questions. Registered rather than deleted because the collision "
+        "is real and only a declaration keeps it from being 'fixed' into one vocabulary; "
+        "documented at core/schemas.py:turn.interrupted and in docs/CONTRACTS.md's event-reads "
+        "section. The other half of the old entry — the pause park emitting no turn-lane event at "
+        "all — was a genuine asymmetry and is closed: turn.paused now rides beside "
+        "turn.interrupted with the same cause vocabulary",
+        "by-design",
     ),
     # --- the success wire ---------------------------------------------------------------
     CarriageGap(
@@ -524,16 +224,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     # --- tool catalog ------------------------------------------------------------------
     CarriageGap(
         "tool-spec",
-        "input_schema",
-        "core/manifest.py:_tool_spec_payload",
-        "embeds the schema raw and is portable only because RunManifest.to_json normalizes the "
-        "whole assembled manifest one frame up; its transcript twin (core/tool_surface.py) "
-        "needed the substitution locally, so this projection is one caller away from the same "
-        "anonymous durability failure",
-        "burn-down",
-    ),
-    CarriageGap(
-        "tool-spec",
         "id",
         "providers/openai.py:_openai_tool_schema",
         "the Responses API keys a tool by name, so the kernel id has no slot and the mapping "
@@ -544,37 +234,25 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     # --- checkpoint carriage: what the snapshot leaves behind ---------------------------
     # Hand-found cells of the family FUTURE_FAMILIES declares as "run-state -> checkpoint
     # carriage": there is no census diffing ``snapshot()``'s written key set against the live
-    # RunState + tool context, so these three were found one at a time and are pinned one at a
-    # time.
+    # RunState + tool context, so these were found one at a time and are pinned one at a time.
     CarriageGap(
         "checkpoint",
-        "output_failure_history",
+        "shell_calls/web_search_calls/total_shell_duration_s (tool-service counters)",
         "loop.py:snapshot",
-        "the sibling of a checkpointed field is not checkpointed: output_retries rides the "
-        "snapshot and its history does not, so a run restored mid-repair renumbers its attempts "
-        "from an empty history and loses failures_by_validator — the retry BUDGET survives and "
-        "the evidence the budget was spent on does not",
-        "burn-down",
-    ),
-    CarriageGap(
-        "checkpoint",
-        "subagent_count/subagent_usage/skill_activation_count",
-        "loop.py:snapshot",
-        "the context-owned counters have no checkpoint slot although their RunState twins "
-        "(total_usage, total_tool_calls) do, and loop_phases.py:build_metrics writes all of "
-        "them into one metrics.json — so a restored run reports pre-restart token totals beside "
-        "post-restart subagent and skill counts, an artifact mixing two epochs with nothing "
-        "saying which is which",
-        "burn-down",
-    ),
-    CarriageGap(
-        "checkpoint",
-        "cancellation_requested",
-        "loop.py:_rehydrate",
-        "asymmetric write/read: snapshot() records the flag unconditionally, and the restore "
-        "applies it only when a cancellation token is already installed on the loop. A recovery "
-        "driver that rebuilds the loop without one silently un-cancels a run whose cancellation "
-        "was durable",
+        "NARROWED from the context-counter entry the burn-down closed. The AgentToolContext's "
+        "own roll-ups (subagent_count/subagent_usage/skill_activation_count/skills_activated) "
+        "are checkpointed and restored now, but loop_phases.py:build_metrics also splats three "
+        "SERVICE metric blocks into the same metrics.json — ShellService.metrics(), "
+        "WebService.metrics() and JobsService.background_metrics() — and the first two have no "
+        "durable slot at all, so those columns still restart at zero while the token totals "
+        "beside them are cumulative. Not fixed rather than fake-fixed: the services are rebuilt "
+        "per activation and their counters are ~12 heterogeneous fields (ints, a duration float, "
+        "a per-binding dict), so an honest fix is a service-owned checkpoint payload with its "
+        "own validation bucket, not five more scalars on RunCheckpoint. The jobs block is the "
+        "exception and the reason this is narrow rather than absent: it is DERIVED from "
+        "job_manager.list_jobs(), whose hosted tasks the checkpoint already carries — only the "
+        "shell BackgroundJobs it also counts are unrestorable, and tasks.py documents why (a "
+        "subprocess cannot cross a process boundary)",
         "burn-down",
     ),
     # --- checkpoint validation ---------------------------------------------------------
@@ -952,6 +630,8 @@ def _maximal_suspension() -> Suspension:
         retryable=True,
         http_status=429,
         config_recoverable=True,
+        provider_error_code="insufficient_quota",
+        provider_retried=True,
     )
 
 
@@ -1073,7 +753,7 @@ def test_the_usage_authority_is_the_normalizers_assignable_domain_not_one_probe(
 # --------------------------------------------------------------------------------------
 
 # Wire key -> the ModelAdapterError fact it carries across the gateway hop.  Declared rather
-# than inferred, because three of the six are renames and one has no key at all.
+# than inferred, because three of the seven are renames.
 TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     # ``message`` is positional-only-in-effect: read back through ``str(exc)``, never an attribute.
     "error": "message",
@@ -1082,6 +762,9 @@ TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     # reconstruction (registered by-design above).
     "error_code": "provider_error_code",
     "retryable": "retryable",
+    # The classification whose only transport used to be the 4xx status ``_model_error_status``
+    # picks; it has its own key now, written unconditionally like the two booleans beside it.
+    "config_recoverable": "config_recoverable",
     # Server-derived: ``_model_error_status`` picks the status, it is not copied off the exception.
     "http_status": "http_status",
     "provider_retried": "provider_retried",
@@ -1089,8 +772,11 @@ TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
     "usage": "provider_usage",
 }
 
-# The one transportable fact with no wire key at all (registered burn-down above).
-TRANSPORTABLE_ERROR_UNCARRIED = frozenset({"config_recoverable"})
+# Transportable facts with no wire key at all. Empty today -- ``config_recoverable`` was the last
+# one and the burn-down gave it a key. Kept rather than deleted: the disjointness guards below are
+# the mechanism that notices the *next* such fact, and they are vacuously true over an empty set
+# instead of absent.
+TRANSPORTABLE_ERROR_UNCARRIED: frozenset[str] = frozenset()
 
 # Checkpoint spelling of the same fact (core/checkpoint.py:RunCheckpoint), registered by-design.
 CHECKPOINT_FIELD_ALIASES: dict[str, str] = {"http_status": "provider_http_status"}
@@ -1256,6 +942,30 @@ _DICT_READ_CALLS = frozenset(
         "tuple",  # iterates keys into a new tuple
     }
 )
+
+
+def test_every_exempted_callee_is_a_builtin() -> None:
+    """The "builtin that cannot reach a mutator" claim, mechanized rather than restated.
+
+    The justification above is what keeps this list a proof instead of a per-callee audit — and
+    it was prose. A helper named ``dict`` in the censused module, or a plain
+    ``_fold_counters`` added here because it "looked harmless when I read it", satisfied the
+    comment and defeated the rule. A name that does not resolve on ``builtins`` is not one this
+    list is allowed to exempt.
+    """
+
+    import builtins
+
+    unresolved = sorted(name for name in _DICT_READ_CALLS if not hasattr(builtins, name))
+    assert unresolved == [], {
+        "exempted_but_not_a_builtin": unresolved,
+        "hint": "the exemption list is 'builtins that read keys and return a new object'; a "
+        "project helper here is a per-callee audit, which is the hand transcription this "
+        "suite exists to stop trusting",
+    }
+    # ...and none of them is a mapping mutator that happens to live on builtins.
+    assert not _DICT_READ_CALLS & {"setattr", "vars", "exec", "eval", "delattr"}
+
 
 # The one non-builtin call a censused function hands a tracked dict to today, and the reason it
 # cannot simply be refused: it *is* the site :func:`_emit_data_keys` resolves the binding for
@@ -2055,6 +1765,11 @@ _UNREADABLE_BINDING_SOURCES: dict[str, str] = {
     # name bound to a dict this census had stopped being able to read.
     "a call that can mutate what it was handed": 'data = {"error": 1}\nenrich(data)\n',
     "an alias written through": 'data = {"error": 1}\nalias = data\nalias["attempt"] = 2\n',
+    # The emit exemption is keyed on an ATTRIBUTE call. A bare ``emit(data=x)`` — a module-level
+    # function that happens to share the method name — is an opaque callee like any other, and
+    # the two comments beside ``_CENSUSED_EMIT_ARGUMENT`` used to write it without the receiver,
+    # which reads as the opposite. Pinned so the narrow rule is a fact, not a description of one.
+    "a bare call sharing the emit method name": 'data = {"error": 1}\nemit(data=data)\n',
 }
 
 
@@ -2186,7 +1901,17 @@ def test_1b_one_reason_vocabulary_spelled_in_three_places() -> None:
 # field, so a caller can branch without reaching through ``.suspension``. That copy is a hand
 # list: a new Suspension classification field is not re-stamped unless someone remembers.
 TURN_NOT_SETTLED_RESTAMPED = frozenset(
-    {"reason", "retryable", "http_status", "config_recoverable"}
+    {
+        "reason",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The two the burn-down added to the park and to this copy in one change: the blocking
+        # facade hands a driver an exception and nothing else, and ``insufficient_quota`` vs
+        # ``rate_limit_exceeded`` is the same retryable/http_status pair with opposite answers.
+        "provider_error_code",
+        "provider_retried",
+    }
 )
 
 
@@ -2210,7 +1935,19 @@ def test_1b_the_not_settled_exception_restamps_exactly_the_registered_fields() -
 # core/schemas.py:EVENT_DATA_SCHEMAS["turn.failed"] — additionalProperties is False, so this is
 # the total wire domain of the event, not a lower bound.
 TURN_FAILED_EVENT_KEYS = frozenset(
-    {"error", "error_code", "provider_error_code", "retryable", "http_status", "config_recoverable"}
+    {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The burn-down's two: the attempt already made, and what the refused call already cost.
+        # ``provider_usage`` is the KERNEL spelling — the gateway wire's compat-frozen alias for
+        # the same fact is ``usage``, and this event names facts, not wire keys (see below).
+        "provider_retried",
+        "provider_usage",
+    }
 )
 
 
@@ -2229,7 +1966,7 @@ def test_1c_turn_failed_schema_and_emit_site_agree_on_one_key_set() -> None:
     }
 
 
-def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> None:
+def test_1c_turn_failed_now_names_every_fact_the_wire_carries() -> None:
     """Cross-check against family 2, so the event and the wire cannot drift independently.
 
     The event uses the KERNEL spelling of each fact where the wire uses its alias, so the
@@ -2247,19 +1984,31 @@ def test_1c_turn_failed_carries_the_wire_classification_but_not_the_cost() -> No
     assert "provider_error_code" in declared
     assert "provider_error_code" in wire_facts
 
-    # The event carries the fact the wire cannot (family 2's headline burn-down), so a fix that
-    # adds the wire key must not need to touch this event.
+    # The event named this from the start and the wire could not; the burn-down gave the wire a
+    # key without touching the event, which is the whole point of comparing them here.
+    assert "config_recoverable" in declared
+    assert "config_recoverable" in wire_facts
+
+    # And if a *next* fact joins the uncarried set, this event must still declare it.
     assert TRANSPORTABLE_ERROR_UNCARRIED <= declared
 
-    # ...and drops the two the wire carries. Registered burn-down: the transcript record written
-    # on the very same failure keeps the cost, so this event is the odd one out, not the rule.
-    assert wire_facts - declared == {"provider_retried", "provider_usage"}
+    # ...and the event now names every one of them. It used to drop the retry and the cost, and
+    # the transcript record written on the very same failure kept both -- so the event was the
+    # odd one out rather than the rule, which is what the burn-down closed.
+    assert wire_facts - declared == set(), {
+        "carried_by_the_wire_and_not_by_the_event": sorted(wire_facts - declared),
+    }
+    # The event spells each fact by its KERNEL name. ``usage`` is the wire's compat-frozen alias
+    # for ``provider_usage``, exactly as ``error_code`` is the wire's alias for
+    # ``provider_error_code``, and neither alias has a slot on this event.
     assert "usage" not in declared
+    assert "provider_usage" in declared
 
 
-# core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` is written
-# by loop.py:_apump_turn but never declared here (registered burn-down); the record stays valid
-# only because the branch sets additionalProperties=True.
+# core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` was written
+# by loop.py:_apump_turn and undeclared here, and the record stayed valid only because the branch
+# sets additionalProperties=True -- so the pin below is now "declares exactly what is written",
+# and a *next* undeclared key fails on it rather than being absorbed by the open cap.
 TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
     {
         "kind",
@@ -2272,6 +2021,8 @@ TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
         "error_code",
         "provider_error_code",
         "retryable",
+        "config_recoverable",
+        "provider_retried",
         "http_status",
     }
 )
@@ -2284,7 +2035,9 @@ def _transcript_model_turn_branch() -> dict[str, Any]:
     raise AssertionError("TRANSCRIPT_RECORD_SCHEMA has no model_turn branch")
 
 
-def test_1d_transcript_schema_declares_less_than_the_writer_writes() -> None:
+def test_1d_the_transcript_schema_declares_every_key_the_writer_writes() -> None:
+    """The open cap is a tolerance, not a declaration, so what it absorbs is pinned here."""
+
     branch = _transcript_model_turn_branch()
     declared = frozenset(branch["properties"])
     assert declared == TRANSCRIPT_MODEL_TURN_DECLARED, {
@@ -2298,23 +2051,23 @@ def test_1d_transcript_schema_declares_less_than_the_writer_writes() -> None:
     ]
     assert len(written) == 1, {"model_turn_failure_records_found": len(written)}
     undeclared = written[0] - declared
-    assert undeclared == {"config_recoverable"}, {
+    assert undeclared == set(), {
         "written_but_undeclared": sorted(undeclared),
-        "hint": "declare it in TRANSCRIPT_RECORD_SCHEMA and drop the registry entry",
+        "hint": "additionalProperties=True keeps the record valid; declare the key anyway",
     }
     assert branch["additionalProperties"] is True
 
 
 # The other ``kind="model_turn"`` record: the one written when the turn SUCCEEDS. It shares a
 # schema branch with the failure record above, so it is the same declared vocabulary minus the
-# error half -- and it drops ``provider_retried``, which ``ModelTurn`` carries and the receipt
-# records (registered burn-down).
+# error half -- ``provider_retried`` included, which is what the burn-down added: the record of a
+# retried-then-successful call used to read as a clean single attempt.
 TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS = frozenset(
-    {"kind", "step", "response_id", "final_text", "tool_calls", "usage"}
+    {"kind", "step", "response_id", "final_text", "tool_calls", "usage", "provider_retried"}
 )
 
 
-def test_1d_the_success_transcript_record_omits_the_retry_its_turn_reports() -> None:
+def test_1d_the_success_transcript_record_states_the_retry_its_turn_reports() -> None:
     written = [
         keys
         for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
@@ -2326,11 +2079,16 @@ def test_1d_the_success_transcript_record_omits_the_retry_its_turn_reports() -> 
         "extra": sorted(written[0] - TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS),
     }
     assert written[0] <= frozenset(_transcript_model_turn_branch()["properties"])
-    # The fact the record cannot state, present on the object it was written from.
+    # The fact is stated by the record and present on the object it was written from -- and its
+    # failure twin states it too, so the two halves of one artifact cannot drift apart again.
     assert "provider_retried" in {field.name for field in dataclasses.fields(ModelTurn)}
-    assert "provider_retried" not in written[0], {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
-    }
+    assert "provider_retried" in written[0]
+    failure = [
+        keys
+        for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
+        if "error" in keys
+    ]
+    assert len(failure) == 1 and "provider_retried" in failure[0]
 
 
 def test_1e_the_checkpoint_alias_is_copied_at_exactly_two_sites() -> None:
@@ -2361,25 +2119,49 @@ def test_1e_the_checkpoint_alias_is_copied_at_exactly_two_sites() -> None:
     }, {"copy_sites": copies, "hint": "a third copy of the alias, or a lost one"}
 
 
-def test_1d_failure_bundle_drops_the_status_the_event_beside_it_keeps() -> None:
-    """loop.py:_record_failure emits run.failed and writes failure.json from the same state."""
+def test_1d_the_failure_bundle_and_the_event_beside_it_carry_the_same_status() -> None:
+    """loop.py:_record_failure emits run.failed and writes failure.json from the same state.
+
+    The bundle used to drop ``http_status`` while the event kept it, which is the same fact
+    written twice from one place and bound once -- so the pin is now an intersection rather than
+    an absence, and a key that reaches one of the two and not the other fails here.
+    """
 
     event_keys = _emit_data_keys("loop.py", "run.failed")
     bundles = _call_dict_arg_keys("loop.py", "write_failure")
     assert len(bundles) == 1, {"write_failure_sites": len(bundles)}
     assert "http_status" in event_keys
-    assert "http_status" not in bundles[0], {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+    assert "http_status" in bundles[0], {
+        "hint": "the operator's restore aid must keep the status the log kept",
     }
-    assert {"error", "error_code", "provider_error_code"} <= (event_keys & bundles[0])
+    shared = {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "type",
+    }
+    assert shared <= (event_keys & bundles[0]), {
+        "carried_by_only_one_of_the_two": sorted(shared - (event_keys & bundles[0])),
+    }
 
 
 # The terminal-failure trio, pinned in full rather than probed for one key. ``run.failed`` is
-# ``turn.failed``'s terminal twin -- ``fail_recoverable`` promotes one into the other -- and it
-# declares neither ``retryable`` nor ``config_recoverable``, so the classification a driver used
-# to decide "park for a config fix" is gone from the record of having given up (burn-down).
+# ``turn.failed``'s terminal twin -- ``fail_recoverable`` promotes one into the other -- and the
+# burn-down gave it the classification that promotion used to lose, on the event and on the
+# bundle written from the same state in the same breath.
 RUN_FAILED_EVENT_KEYS = frozenset(
-    {"error", "error_code", "type", "provider_error_code", "http_status"}
+    {
+        "error",
+        "error_code",
+        "type",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+    }
 )
 FAILURE_BUNDLE_KEYS = frozenset(
     {
@@ -2388,11 +2170,22 @@ FAILURE_BUNDLE_KEYS = frozenset(
         "error",
         "error_code",
         "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
         "type",
         "last_good_seq",
         "restore_hint",
     }
 )
+
+# The SECOND writer of ``failure.json``, and the reason it is pinned beside the first: the two
+# are separate code writing one artifact under one schema id (``monoid.failure.v1``), and the
+# reference backend's is the one a worker crash leaves behind -- the case where the bundle is the
+# only record there is. It carries no ``provider_error_code`` (its callers hold an exception, not
+# the loop's classified run state) and adds ``failed_at``; every other key must match, so a field
+# added to one writer and not the other fails here rather than at an operator's console.
+REFERENCE_FAILURE_BUNDLE_KEYS = (FAILURE_BUNDLE_KEYS - {"provider_error_code"}) | {"failed_at"}
 
 
 def test_1d_run_failed_pins_its_schema_its_emit_site_and_its_bundle() -> None:
@@ -2415,22 +2208,60 @@ def test_1d_run_failed_pins_its_schema_its_emit_site_and_its_bundle() -> None:
     }
 
 
-def test_1d_the_terminal_failure_record_drops_the_classification_its_twin_carries() -> None:
-    """``turn.failed`` -> ``run.failed`` is a real promotion path, and it loses two facts.
+def test_1d_the_reference_backend_writes_the_same_bundle_the_core_does() -> None:
+    """The twin writer of one durable artifact, diffed against the core's key set.
+
+    ``monoid.failure.v1`` has two independent writers and a permissive reader policy, so a field
+    that reaches one of them is invisible to the other's consumers and to every schema check --
+    which is exactly how the status this commit adds could have landed on one half. The
+    difference between them is pinned as a set, not tolerated as "roughly the same".
+    """
+
+    writer = _function_node(
+        "reference/backend/recovery.py", "write_failure_bundle", within="RecoveryService"
+    )
+    literals = [node for node in ast.walk(writer) if isinstance(node, ast.Dict)]
+    assert len(literals) == 1, {"dict_literals_in_the_writer": len(literals)}
+    written = _pinned_dict_keys(
+        literals[0], "reference/backend/recovery.py:write_failure_bundle"
+    )
+    assert written == REFERENCE_FAILURE_BUNDLE_KEYS, {
+        "missing": sorted(REFERENCE_FAILURE_BUNDLE_KEYS - written),
+        "extra": sorted(written - REFERENCE_FAILURE_BUNDLE_KEYS),
+        "hint": "a key reached one failure-bundle writer and not its twin",
+    }
+    assert "http_status" in written
+    # Stated as a difference so a *new* divergence between the two writers is a failure, not a
+    # silence: the reference writer holds an exception rather than the loop's classified state.
+    core = _call_dict_arg_keys("loop.py", "write_failure")[0]
+    assert core - written == {"provider_error_code"}
+    assert written - core == {"failed_at"}
+
+
+def test_1d_the_terminal_failure_record_keeps_the_classification_its_twin_carries() -> None:
+    """``turn.failed`` -> ``run.failed`` is a real promotion path; what it loses is pinned.
 
     ``AgentLoop.fail_recoverable`` exists to turn an exhausted recoverable turn failure into the
     terminal record, and ``close()`` performs the same promotion for an unrecovered park -- so a
-    config-recoverable terminal failure is an ordinary outcome, not a hypothetical. The terminal
-    record cannot say so: ``retryable`` and ``config_recoverable`` ride the turn event and stop
-    there (registered burn-down).
+    config-recoverable terminal failure is an ordinary outcome, not a hypothetical. The
+    classification now survives the promotion; the remainder is stated as a set rather than
+    tolerated, so a *new* fact that reaches one event and not the other fails here.
+
+    The two that stop at the turn event are per-CALL facts, not classifications of the run:
+    ``provider_usage`` is what one refused call cost (the cumulative lane -- metrics.updated and
+    metrics.json -- is where a run's cost is reported, and it already carries these tokens), and
+    ``provider_retried`` describes attempts inside one adapter call (recorded per call on the
+    transcript record and the receipt). Promoting either onto the terminal record would mean
+    publishing one call's number as the run's.
     """
 
     turn_failed = frozenset(EVENT_DATA_SCHEMAS["turn.failed"]["properties"])
     lost = turn_failed - RUN_FAILED_EVENT_KEYS
-    assert lost == {"retryable", "config_recoverable"}, {
+    assert lost == {"provider_retried", "provider_usage"}, {
         "lost_on_promotion": sorted(lost),
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+        "hint": "a fact reached the turn event and not its terminal twin",
     }
+    assert {"retryable", "config_recoverable"} <= RUN_FAILED_EVENT_KEYS
     # And the durable park payload keeps both, so the fact exists at the moment of promotion.
     payload = suspension_checkpoint_payload(_maximal_suspension())
     assert {"retryable", "config_recoverable"} <= set(payload)
@@ -2479,6 +2310,7 @@ def _maximal_error_body() -> dict[str, Any]:
         str(exc),
         error_code=exc.provider_error_code,
         retryable=exc.retryable,
+        config_recoverable=exc.config_recoverable,
         provider_retried=exc.provider_retried,
         usage=provider_usage_of(exc),
     )
@@ -2542,16 +2374,19 @@ def test_2a_the_two_server_writers_answer_one_exception_identically() -> None:
     assert written["http_status"] == int(status)
     # The exception's own facts, not the writer's defaults.
     assert written["retryable"] is True
+    assert written["config_recoverable"] is True
     assert written["provider_retried"] is True
     assert written["usage"] == provider_usage_of(exc)
 
 
-def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_nothing_else() -> None:
-    """The one status the wire *does* carry the uncarried fact through, end to end.
+def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_as_a_flag() -> None:
+    """Both halves of the same statement, pinned on the real writer.
 
-    ``config_recoverable`` has no wire key (registered burn-down), and the only thing a client
-    can read it off is the 4xx ``_model_error_status`` picks. Pinned on the real writer so a
-    change to either half is a failure here.
+    The status was the *only* thing a client could read this off, and it is a hint rather than a
+    statement: a 4xx says the request was at fault, not that configuration fixes it, and a
+    refusal raised with no HTTP status at all (an applied-parameters proof failure) had nothing
+    to leave behind. Now the classification rides its own key and the status still agrees with
+    it, so a change to either half is a failure here.
     """
 
     refused = ModelAdapterError(
@@ -2563,6 +2398,7 @@ def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_nothing_e
     written, status = _write_exception_body(refused)
     assert status == HTTPStatus.UNPROCESSABLE_ENTITY
     assert written["http_status"] == 422
+    assert written["config_recoverable"] is True
     assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(written)
 
 
@@ -2572,7 +2408,7 @@ def test_2a_server_error_body_writes_exactly_the_alias_table() -> None:
         "missing": sorted(SERVER_ERROR_BODY_KEYS - set(body)),
         "extra": sorted(set(body) - SERVER_ERROR_BODY_KEYS),
     }
-    # The one transportable fact with no key (registered burn-down).
+    # No transportable fact is left without a key; a new one must join the table, not this gap.
     assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(body)
 
 
@@ -2634,7 +2470,12 @@ def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> 
     exc = _minimal_adapter_error()
     # The probe is only minimal if the exception really is: every fact at its default.
     assert provider_usage_of(exc) == {}
-    assert (exc.retryable, exc.provider_retried, exc.provider_error_code) == (False, False, "")
+    assert (
+        exc.retryable,
+        exc.config_recoverable,
+        exc.provider_retried,
+        exc.provider_error_code,
+    ) == (False, False, False, "")
 
     written, status = _write_exception_body(exc)
     assert frozenset(written) == GATEWAY_MINIMAL_ERROR_BODY_KEYS, {
@@ -2648,6 +2489,7 @@ def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> 
     assert status == HTTPStatus.BAD_GATEWAY
     assert written["http_status"] == 502
     assert written["retryable"] is False
+    assert written["config_recoverable"] is False
     assert written["provider_retried"] is False
     assert written["error_code"] == gateway_client.GATEWAY_BAD_RESPONSE
     assert written["error"] == str(exc)
@@ -2678,11 +2520,15 @@ def test_2a_the_minimal_failure_reaches_the_stream_writer_identically() -> None:
 
 
 def _maximal_wire_body() -> dict[str, Any]:
-    """The server body plus ``config_recoverable`` — present so a reader that reads it would."""
+    """The server body, which is now the whole wire.
 
-    body = _maximal_error_body()
-    body["config_recoverable"] = True
-    return body
+    This used to be ``_maximal_error_body()`` plus a hand-added ``config_recoverable`` — the one
+    fact the writers could not emit, added here so a reader that *did* read it would show up in
+    the behavioral census. The writers emit it now, so the two bodies are the same dict and the
+    reader censuses below read exactly what the server writes.
+    """
+
+    return _maximal_error_body()
 
 
 def _read_r1(body: dict[str, Any]) -> ModelAdapterError:
@@ -2718,6 +2564,7 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     carried = {
         "provider_error_code": got.provider_error_code,
         "retryable": got.retryable,
+        "config_recoverable": got.config_recoverable,
         "http_status": got.http_status,
         "provider_retried": got.provider_retried,
         "provider_usage": provider_usage_of(got),
@@ -2725,6 +2572,7 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     assert carried == {
         "provider_error_code": body["error_code"],
         "retryable": body["retryable"],
+        "config_recoverable": body["config_recoverable"],
         "http_status": body["http_status"],
         "provider_retried": body["provider_retried"],
         "provider_usage": body["usage"],
@@ -2733,12 +2581,13 @@ def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(rea
     # The message survives, but R3 wraps it with the status line it was read from.
     assert body["error"] in str(got)
 
-    # Registered losses. Both flip to a failure the moment a reader starts binding them.
-    assert got.config_recoverable is False, "config_recoverable is now read — update the census"
+    # The registered loss. It flips to a failure the moment a reader starts binding it.
     assert got.error_code == ModelAdapterError.error_code, (
         "the kernel error_code has no wire slot; it must reconstruct to the class default"
     )
+    # An instance attribute rather than a class default, so the read above is a real read.
     assert "config_recoverable" not in vars(type(got))
+    assert "config_recoverable" in vars(got)
 
 
 def test_2b_r3_takes_http_status_from_the_status_line_not_the_body() -> None:
@@ -2765,6 +2614,12 @@ def test_2b_r3_defaults_retryable_from_the_status_when_the_body_is_silent() -> N
 # values a *pre-field* gateway produces, so they are the compatibility contract of every added
 # key -- and they are per reader, because R3 derives two of them from the status line it was
 # read from while R1/R2 have no status to derive from.
+#
+# ``config_recoverable`` is in here for a different reason than it used to be: it was the fact no
+# reader read, and its ``False`` was the constructor default. It is now READ, with an explicit
+# ``default=False``, on all three readers -- so these entries are the compatibility contract of
+# the added key (an older gateway omits it and every reader answers "not config-fixable"), and a
+# reader that derived it from the status the way R3 derives ``retryable`` would fail here.
 SILENT_BODY_DEFAULTS: dict[str, dict[str, Any]] = {
     "providers/gateway.py:_parse_gateway_response": {
         "provider_error_code": gateway_client.GATEWAY_BAD_RESPONSE,
@@ -2846,8 +2701,7 @@ def test_2b_every_reader_defaults_an_absent_key_the_registered_way(reader: str) 
 # --- the reader set itself, and what each reader reads ---------------------------------
 
 # Full read-key census per reader, pinned. A reader that grows a read of a key no writer
-# emits, or stops reading one, fails here -- including the moment ``config_recoverable``
-# finally becomes a read (its registered burn-down), which must update these sets.
+# emits, or stops reading one, fails here.
 GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     "providers/gateway.py:_parse_gateway_response": frozenset(
         {
@@ -2855,6 +2709,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "error",
             "error_code",
             "retryable",
+            "config_recoverable",
             "http_status",
             "provider_retried",
             "usage",
@@ -2875,6 +2730,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "error",
             "error_code",
             "retryable",
+            "config_recoverable",
             "http_status",
             "provider_retried",
             "usage",
@@ -2894,7 +2750,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
     # ``usage`` is read for it by ``_reported_error_usage``, not named at the call site.
     "providers/gateway.py:_error_from_status_body": frozenset(
-        {"error", "error_code", "retryable", "provider_retried", "usage"}
+        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
     ),
 }
 
@@ -3021,9 +2877,10 @@ def test_2b_each_reader_reads_exactly_the_keys_the_census_accounts_for(reader: s
         "newly_read": sorted(read - expected),
         "no_longer_read": sorted(expected - read),
     }
-    # The registered dropped read, stated once per reader rather than inferred.
+    # No reader may bind a fact the writers cannot emit, stated once per reader rather than
+    # inferred. Vacuous while the uncarried set is empty, and the guard the next such fact meets.
     assert read.isdisjoint(TRANSPORTABLE_ERROR_UNCARRIED), {
-        "hint": "a reader started binding config_recoverable: update EXPECTED and the registry",
+        "hint": "a reader binds a fact with no wire key: give it one or register the gap",
     }
     # Every error-family key the server can write is read back here (R3's status quirk aside).
     unread = SERVER_ERROR_BODY_KEYS - read
@@ -3038,7 +2895,13 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
     origin = _maximal_adapter_error()
     restored = _read_r1(_maximal_wire_body())
 
-    preserved = {"provider_error_code", "retryable", "http_status", "provider_retried"}
+    preserved = {
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "http_status",
+        "provider_retried",
+    }
     for attribute in sorted(preserved):
         assert getattr(restored, attribute) == getattr(origin, attribute), attribute
     assert provider_usage_of(restored) == provider_usage_of(origin)
@@ -3050,35 +2913,81 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
         and attribute != "provider_usage"
         and getattr(restored, attribute, None) != getattr(origin, attribute)
     }
-    assert lost == {"config_recoverable", "error_code"}, {
+    assert lost == {"error_code"}, {
         "lost_across_the_hop": sorted(lost),
         "hint": "a shrinking loss set means a gap was fixed: update EXPECTED and the registry",
     }
 
 
-def test_2c_only_two_of_five_gateway_validators_forward_the_status_they_know() -> None:
-    """Sibling census: the same defect shape as a missing wire key, one call frame in."""
+GATEWAY_STATUS_FORWARDING_VALIDATORS = (
+    "_exact_gateway_bool",
+    "_gateway_string",
+    "_exact_gateway_int",
+    "_gateway_fragment_string",
+    "_gateway_usage",
+    "_portable_gateway_payload",
+)
 
-    forwarding = set()
-    for name in (
-        "_exact_gateway_bool",
-        "_gateway_string",
-        "_exact_gateway_int",
-        "_gateway_fragment_string",
-        "_gateway_usage",
-        "_portable_gateway_payload",
-    ):
-        parameters = _live_signature(getattr(gateway_client, name)).parameters
-        if "http_status" in parameters:
-            forwarding.add(name)
-    assert forwarding == {"_exact_gateway_bool", "_gateway_string"}, {
-        "forwarding_http_status": sorted(forwarding),
-        "hint": "a validator gained the parameter: update EXPECTED and drop its registry entry",
+
+def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
+    """Sibling census: the same defect shape as a missing wire key, one call frame in.
+
+    Two of six carried the parameter, so the *same* malformed payload produced a classified
+    failure naming HTTP 400 or one naming nothing at all, decided by which field of it happened
+    to be malformed. Pinned as "all six", so a seventh validator that arrives without it fails
+    rather than joining a majority.
+
+    A signature pin is the right shape here and an incomplete proof on its own, because a
+    parameter can be accepted and dropped:
+    ``test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises``
+    (tests/test_gateway_provider.py) drives all six and reads the status back off the raise. Note
+    what today's *callers* can supply: the status a reader knows is the error-envelope hint, and
+    the four newly-parameterized validators run on the non-error branches, so they are threaded
+    the same expression their siblings use and receive ``None`` from it. The asymmetry is what is
+    fixed -- a validator that cannot name a status its caller holds -- not a live loss at these
+    four call sites.
+    """
+
+    forwarding = {
+        name
+        for name in GATEWAY_STATUS_FORWARDING_VALIDATORS
+        if "http_status" in _live_signature(getattr(gateway_client, name)).parameters
+    }
+    assert forwarding == set(GATEWAY_STATUS_FORWARDING_VALIDATORS), {
+        "not_forwarding_http_status": sorted(
+            set(GATEWAY_STATUS_FORWARDING_VALIDATORS) - forwarding
+        ),
+        "hint": "a validator that cannot name the status its caller already read",
     }
 
 
-def test_2c_the_openai_classifier_sets_neither_retry_nor_recoverability_flag() -> None:
-    """Every ModelAdapterError branch of the one adapter that could classify them."""
+def test_2c_the_four_new_status_parameters_did_not_make_a_value_validator_read_a_key() -> None:
+    """The helper-census corollary of the fix above, stated where the fix could break it.
+
+    ``_gateway_usage`` and ``_portable_gateway_payload`` are registered as *value* validators:
+    they take an already-extracted value, name no wire key of their own, and are excluded from
+    the mapping-reader discovery on exactly that basis. Adding a scalar parameter must not change
+    that -- and a scalar named ``http_status`` is one edit away from being read off the payload
+    instead of passed in.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        node = functions[name][0]
+        assert "http_status" in {argument.arg for argument in node.args.kwonlyargs}
+        assert _mapping_parameters(node) == frozenset(), {"now_takes_a_mapping": name}
+        assert not _reads_a_mapping_parameter(node), {"now_reads_a_key": name}
+
+
+def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
+    """Every ModelAdapterError branch of the one adapter that can classify them.
+
+    Pinned per branch, not as a union: a union says "some branch carries the flag", which is the
+    half-bound shape this suite exists to catch. Both facts are properties of the call rather
+    than of its classification -- whether the SDK already retried it, and whether the remedy is
+    the caller's configuration -- so every branch must state both, including the tail that has
+    neither a status nor a code to reason from.
+    """
 
     tree = _module_tree("providers/openai.py")
     classifier = next(
@@ -3093,16 +3002,31 @@ def test_2c_the_openai_classifier_sets_neither_retry_nor_recoverability_flag() -
         and isinstance(node.func, ast.Name)
         and node.func.id == "ModelAdapterError"
     ]
-    assert len(branches) == 4, {"classification_branches": len(branches)}
-    flagged = {
-        keyword.arg
+    # Five: 4xx, 5xx, the connection family (retryable like its gateway twin), the body-code
+    # recovery, and the unclassified tail.
+    assert len(branches) == 5, {"classification_branches": len(branches)}
+    flagged = [
+        {
+            keyword.arg
+            for keyword in branch.keywords
+            if keyword.arg in {"provider_retried", "config_recoverable"}
+        }
+        for branch in branches
+    ]
+    assert flagged == [{"provider_retried", "config_recoverable"}] * 5, {
+        "flags_per_branch": [sorted(names) for names in flagged],
+        "hint": "a branch stopped stating one of the two: bind it, do not narrow this pin",
+    }
+    # And the recoverability verdict comes from one predicate at all four sites rather than four
+    # hand-written conditions, which is the only version of this that cannot fall out of step.
+    recoverability = {
+        ast.unparse(keyword.value).split("(")[0]
         for branch in branches
         for keyword in branch.keywords
-        if keyword.arg in {"provider_retried", "config_recoverable"}
+        if keyword.arg == "config_recoverable"
     }
-    assert flagged == set(), {
-        "flags_now_set": sorted(flagged),
-        "hint": "the classifier started carrying a flag: drop its registry entry",
+    assert recoverability == {"_config_shaped_refusal"}, {
+        "config_recoverable_expressions": sorted(recoverability),
     }
 
 
@@ -3111,13 +3035,15 @@ def test_2c_the_openai_classifier_sets_neither_retry_nor_recoverability_flag() -
 # --------------------------------------------------------------------------------------
 
 # reference/llm_gateway/service.py:LlmGatewayUsage — the tenant meter's total emitted domain.
-GATEWAY_METER_KEYS = frozenset(
-    {"tenant_id", "calls", "input_tokens", "output_tokens", "total_tokens"}
-)
+GATEWAY_METER_KEYS = frozenset({"tenant_id", "calls"}) | NORMALIZED_USAGE_KEYS
 
 
-def test_3a_tenant_meter_drops_every_priced_sub_count() -> None:
-    """Behavioral: ``add`` normalizes seven keys and sums three, which no key diff can show."""
+def test_3a_tenant_meter_sums_every_priced_sub_count() -> None:
+    """Behavioral: ``add`` normalizes seven keys and must sum all seven.
+
+    A key diff cannot show this on its own -- the meter used to normalize all seven and add
+    three -- so the counts are read back by value against the maximal usage.
+    """
 
     meter = LlmGatewayUsage(tenant_id="tenant-1")
     meter.add(dict(_MAXIMAL_USAGE))
@@ -3126,60 +3052,74 @@ def test_3a_tenant_meter_drops_every_priced_sub_count() -> None:
         "missing": sorted(GATEWAY_METER_KEYS - set(reported)),
         "extra": sorted(set(reported) - GATEWAY_METER_KEYS),
     }
-    dropped = NORMALIZED_USAGE_KEYS - set(reported)
-    assert dropped == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "reasoning_tokens",
-        "audio_tokens",
-    }, {"dropped_sub_counts": sorted(dropped)}
+    assert NORMALIZED_USAGE_KEYS - set(reported) == set()
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
 
 
-def test_3a_a_sub_count_only_billed_call_meters_as_zero() -> None:
-    """Corollary A8: the meter cannot see a cost expressed only in sub-counts."""
+def test_3a_a_sub_count_only_billed_call_is_visible_to_the_meter() -> None:
+    """Corollary A8, closed: the meter can now see a cost expressed only in sub-counts.
+
+    ``total_tokens`` stays 0 -- that is what the provider reported, and this ledger does not
+    invent a total the provider did not send. What changed is that the priced call is no longer
+    invisible: its cost is reported in the columns it was actually expressed in.
+    """
 
     meter = LlmGatewayUsage(tenant_id="tenant-1")
     meter.add({"cache_read_tokens": 5_000, "reasoning_tokens": 900})
     reported = meter.to_json()
     counted = (reported["input_tokens"], reported["output_tokens"], reported["total_tokens"])
     assert counted == (0, 0, 0)
+    assert reported["cache_read_tokens"] == 5_000
+    assert reported["reasoning_tokens"] == 900
     assert reported["calls"] == 1
 
 
-# core/schemas.py:EVENT_DATA_SCHEMAS["metrics.updated"] — reasoning_tokens is the only sub-count.
-METRICS_UPDATED_KEYS = frozenset(
-    {
-        "step",
-        "tool_calls",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "reasoning_tokens",
-        "web_search_calls",
-        "web_fetch_calls",
-        "web_context_calls",
-        "web_failed_calls",
-    }
+# core/schemas.py:EVENT_DATA_SCHEMAS["metrics.updated"] — the whole normalized usage vocabulary
+# now, plus the step/tool/web counters. It used to declare ``reasoning_tokens`` alone of the four
+# priced sub-counts, so a cache-heavy run's priced detail never reached a live consumer.
+METRICS_UPDATED_KEYS = (
+    frozenset(
+        {
+            "step",
+            "tool_calls",
+            "web_search_calls",
+            "web_fetch_calls",
+            "web_context_calls",
+            "web_failed_calls",
+        }
+    )
+    | NORMALIZED_USAGE_KEYS
 )
 
 
-def test_3b_metrics_updated_declares_one_of_the_four_sub_counts() -> None:
+def test_3b_metrics_updated_declares_every_priced_sub_count() -> None:
     declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
     assert declared == METRICS_UPDATED_KEYS, {
         "missing": sorted(METRICS_UPDATED_KEYS - declared),
         "extra": sorted(declared - METRICS_UPDATED_KEYS),
     }
-    assert NORMALIZED_USAGE_KEYS - declared == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "audio_tokens",
+    assert NORMALIZED_USAGE_KEYS - declared == set(), {
+        "emitted_by_the_normalizer_and_undeclared_here": sorted(
+            NORMALIZED_USAGE_KEYS - declared
+        ),
     }
 
 
 # The one usage-bearing emit site the ``data={...}`` census cannot see: it passes a *name*
 # (``data=metrics_data``), so the literal lives in an assignment several statements earlier and
 # a key added there reaches the wire with no schema entry and no census.
-METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - {"reasoning_tokens"}
+#
+# The four priced sub-counts are the conditional half: each is written only when the adapter
+# reported one, so a run that used no cache does not publish a column of zeros. Everything else
+# rides the literal unconditionally.
+METRICS_UPDATED_CONDITIONAL_KEYS = frozenset(
+    {"cache_read_tokens", "cache_creation_tokens", "reasoning_tokens", "audio_tokens"}
+)
+METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - METRICS_UPDATED_CONDITIONAL_KEYS
 
 
 def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
@@ -3191,7 +3131,9 @@ def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
     or a ``{**extra}`` in the literal reached the wire with no schema entry and no failure here.
     """
 
-    pump = _function_node("loop.py", "_apump_turn")
+    # The literal moved out of ``_apump_turn`` when the emission became one writer serving both
+    # the settled and the billed-refused path; the census follows the binding to its function.
+    pump = _function_node("loop.py", "_emit_metrics_updated")
     written = _dict_writes(pump).get("metrics_data")
     assert written is not None and len(written.literals) == 1, {
         "metrics_data_literals": 0 if written is None else len(written.literals),
@@ -3206,9 +3148,12 @@ def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
         "emitted_always": sorted(written.literals[0]),
         "expected": sorted(METRICS_UPDATED_UNCONDITIONAL_KEYS),
     }
-    # ``reasoning_tokens`` is added only when the adapter reported one, which is why it is the
-    # single sub-count on this event and why it cannot be censused off the literal alone.
-    assert conditional == {"reasoning_tokens"}, {"emitted_conditionally": sorted(conditional)}
+    # Each priced sub-count is added only when the adapter reported one, which is why none of
+    # them can be censused off the literal alone.
+    assert conditional == METRICS_UPDATED_CONDITIONAL_KEYS, {
+        "emitted_conditionally": sorted(conditional),
+        "expected": sorted(METRICS_UPDATED_CONDITIONAL_KEYS),
+    }
     declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
     assert written.keys == declared, {
         "emitted_not_declared": sorted(written.keys - declared),
@@ -3253,19 +3198,34 @@ def test_3e_the_lenient_error_usage_reader_passes_a_key_no_normalizer_emits() ->
     assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
 
 
-def test_3c_subagent_rollup_hard_codes_three_of_the_seven_usage_keys() -> None:
-    """The parent budget reads a literal tuple, so a sub-count can never reach it."""
+def test_3c_the_subagent_rollup_filters_through_the_usage_authority() -> None:
+    """The parent budget reads the normalizer's whole domain, and reads it from one place.
 
-    tree = _module_tree("loop.py")
-    child = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_run_subagent_child"
+    It used to read a literal three-key tuple, so a child's cache and reasoning tokens never
+    reached the parent -- an undercount in exactly the aggregate a bound is checked against. The
+    fix is a filter through the authority, not a wider hand copy, so this pin is two claims: the
+    module constant IS the census's authority, and the roll-up spells no usage key of its own.
+    """
+
+    from monoid_agent_kernel.providers._common import (
+        NORMALIZED_USAGE_KEYS as declared_authority,
     )
-    rolled: list[frozenset[str]] = []
+
+    assert declared_authority == NORMALIZED_USAGE_KEYS, {
+        "in_the_module_only": sorted(declared_authority - NORMALIZED_USAGE_KEYS),
+        "in_the_census_only": sorted(NORMALIZED_USAGE_KEYS - declared_authority),
+        "hint": "the constant beside normalize_usage must be its emitted domain",
+    }
+
+    child = _function_node("loop.py", "_run_subagent_child")
+    assert "NORMALIZED_USAGE_KEYS" in _names_in(child), {
+        "hint": "the roll-up no longer names the authority it is meant to filter through",
+    }
+    # ...and no hand-written subset of it survives anywhere in the function: a tuple, list or set
+    # display of usage keys is the shape this census caught the first time.
+    hand_written: list[frozenset[str]] = []
     for node in ast.walk(child):
-        if not isinstance(node, ast.Tuple):
+        if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             continue
         names = {
             element.value
@@ -3273,11 +3233,10 @@ def test_3c_subagent_rollup_hard_codes_three_of_the_seven_usage_keys() -> None:
             if isinstance(element, ast.Constant) and isinstance(element.value, str)
         }
         if names and names <= NORMALIZED_USAGE_KEYS:
-            rolled.append(frozenset(names))
-    assert len(rolled) == 1, {"usage_key_tuples_in_the_rollup": [sorted(item) for item in rolled]}
-    assert rolled[0] == {"input_tokens", "output_tokens", "total_tokens"}, {
-        "rolled_up": sorted(rolled[0]),
-        "hint": "widened? update EXPECTED and drop the registry entry",
+            hand_written.append(frozenset(names))
+    assert hand_written == [], {
+        "hand_written_usage_key_sets": [sorted(item) for item in hand_written],
+        "hint": "a second spelling of the usage domain beside the authority it filters through",
     }
 
 
@@ -3287,15 +3246,36 @@ class _SubclassedCount(IntEnum):
     SEVEN = 7
 
 
-def test_3d_the_four_readers_of_one_stamp_disagree_about_what_a_count_is() -> None:
-    """Same stamp, four predicates, two verdicts — pinned so harmonizing them fails here."""
+def test_3d_the_five_siblings_of_one_stamp_agree_about_what_a_count_is() -> None:
+    """Same stamp, five predicates, one verdict — pinned so a sixth spelling fails here.
+
+    ``_recordable_usage`` used to answer ``isinstance(value, int)`` where its three siblings
+    answer ``type(value) is int``, so an ``IntEnum`` a provider SDK hands back as a token count
+    was a recordable usage on one path and no usage at all on the three that consume it — and
+    the receipt this one feeds would then reject what it had just accepted.
+
+    The receipt *constructor* was the fifth spelling of the same predicate:
+    ``ModelCallReceipt.__post_init__`` answered ``isinstance`` too, so it accepted the
+    ``IntEnum`` every reader beside it refuses — a receipt could carry a count no consumer of
+    the stamp would count. It differs from the four in failure mode, deliberately: the readers
+    sit on failure paths and filter silently (a malformed count must not replace the failure
+    being reported), the constructor sits on the success path and refuses loudly.
+    """
 
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
 
     subclassed = {"input_tokens": _SubclassedCount.SEVEN}
     stamped = ModelAdapterError("billed then refused")
     mark_provider_usage(stamped, dict(subclassed))
     assert vars(stamped)["provider_usage"] == subclassed
+
+    def constructor_counts_it(usage: dict[str, Any]) -> bool:
+        try:
+            ModelCallReceipt(usage=usage)
+        except WireValidationError:
+            return False
+        return True
 
     verdicts = {
         "providers/base.py:provider_usage_of": bool(provider_usage_of(stamped)),
@@ -3306,22 +3286,27 @@ def test_3d_the_four_readers_of_one_stamp_disagree_about_what_a_count_is() -> No
             dict(ModelCallReceipt().with_error(stamped).usage)
         ),
         "model_call.py:_recordable_usage": bool(_recordable_usage(dict(subclassed))),
+        "core/model_io.py:ModelCallReceipt.__post_init__": constructor_counts_it(
+            dict(subclassed)
+        ),
     }
     assert verdicts == {
         "providers/base.py:provider_usage_of": False,
         "providers/gateway.py:_reported_error_usage": False,
         "core/model_io.py:ModelCallReceipt.with_error": False,
-        "model_call.py:_recordable_usage": True,
+        "model_call.py:_recordable_usage": False,
+        "core/model_io.py:ModelCallReceipt.__post_init__": False,
     }, {
         "verdicts": verdicts,
-        "hint": "harmonized? make them agree, update EXPECTED and drop the registry entry",
+        "hint": "one stamp, one verdict: a sibling that disagrees reclassifies a billed call",
     }
 
 
-def test_3d_a_bool_is_not_a_count_on_any_reader() -> None:
-    """The one thing all four agree on, so the divergence above is about subclasses only."""
+def test_3d_a_bool_is_not_a_count_on_any_sibling() -> None:
+    """The one thing all five agree on, so the divergence above is about subclasses only."""
 
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
 
     stamped = ModelAdapterError("boolean count")
     mark_provider_usage(stamped, {"input_tokens": True})
@@ -3329,6 +3314,8 @@ def test_3d_a_bool_is_not_a_count_on_any_reader() -> None:
     assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
     assert dict(ModelCallReceipt().with_error(stamped).usage) == {}
     assert _recordable_usage({"input_tokens": True}) == {}
+    with pytest.raises(WireValidationError, match="mapping of str to int"):
+        ModelCallReceipt(usage={"input_tokens": True})
 
 
 # --------------------------------------------------------------------------------------
@@ -3817,20 +3804,22 @@ def test_5b_only_the_record_projections_substitute_a_non_finite_schema() -> None
         # An HTTP egress *describing* a request is a record of one, and this endpoint
         # serializes with allow_nan=False.
         "reference/studio/server.py:_gateway_tool_schema",
+        # The third record projection. It used to be portable only because ``RunManifest.to_json``
+        # normalizes the whole assembled manifest one frame up -- a property of its caller, not of
+        # itself -- and the transcript twin beside it had already needed the substitution locally.
+        "core/manifest.py:_tool_spec_payload",
     }, {
         "substituting_projections": sorted(substituting),
         "hint": "a projection changed sides: that is a request/record decision, not a refactor",
     }
-    # The manifest is a record too, and it substitutes -- but one level up, in
-    # ``RunManifest.to_json``, which normalizes the whole assembled manifest. So the projection
-    # itself is on the request side of this rule and is only safe because of its caller
-    # (registered burn-down: the transcript twin needed the substitution *locally*, and
-    # ``_tool_spec_payload`` is not the manifest's only caller-shaped surface).
+    # And the manifest's own output is unchanged, because ``to_json`` normalizes an
+    # already-normalized payload to itself: this closed a latent second-caller hazard without
+    # rewriting a byte of any manifest a run has already written.
     from monoid_agent_kernel.core.manifest import RunManifest
 
     manifest_payload = _manifest_tool_spec_payload(spec)
-    assert manifest_payload["input_schema"]["enum"][0] != manifest_payload["input_schema"]["enum"][0]
-    assert normalize_json_ingress(manifest_payload)["input_schema"]["enum"] == [None]
+    assert manifest_payload["input_schema"]["enum"] == [None]
+    assert normalize_json_ingress(manifest_payload) == manifest_payload
     assert "normalize_json_ingress" in _live_source(RunManifest.to_json)
 
 
@@ -3911,9 +3900,12 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
         "pending_user_input",
         "previous_runtime_config",
         "workspace_base",
+        # No longer "an object or null": the park payload has a schema of its own now
+        # (``_validate_suspension_payload``), shared with the receipt copy below.
         "last_suspension",
         "tool_call_counts",
         "total_usage",
+        "subagent_usage",
         "revoked_before",
         "remaining_duration_s",
         "queued_messages",
@@ -3943,6 +3935,10 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "output_retries",
             "session_step",
             "submit_local_step",
+            # The context-owned roll-ups, checkpointed in the burn-down so metrics.json
+            # reports one epoch rather than two.
+            "subagent_count",
+            "skill_activation_count",
         }
     ),
     "_CHECKPOINT_BOOL_FIELDS": frozenset({"terminal", "revoked_all", "cancellation_requested"}),
@@ -3956,6 +3952,8 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "pending_capability_replays",
             "pending_tool_approval_replays",
             "outbox_requests",
+            # The evidence behind ``output_retries``, which rode this snapshot without it.
+            "output_failure_history",
         }
     ),
     "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
@@ -3967,6 +3965,7 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "revoked_capabilities",
             "inbox_seen_ids",
             "applied_input_ids",
+            "skills_activated",
         }
     ),
 }
@@ -4072,20 +4071,78 @@ def test_6a_the_inline_branches_named_here_are_the_branches_that_exist() -> None
     }
 
 
-def test_6b_the_park_payload_is_validated_as_an_object_and_nothing_more() -> None:
-    """The registered gap, pinned: ``last_suspension`` has no schema of its own.
+def test_6b_the_park_payload_has_a_schema_and_both_of_its_carriers_share_it() -> None:
+    """Was registered: ``last_suspension`` was validated as "an object or null" and no more.
 
-    Every field family 1 pins on the writer/reader pair is unpinned on the durable artifact —
-    the validator accepts any object at all, so a park payload with a string ``retryable``
-    reaches the reader, which is where it becomes a ValueError instead of a clear rejection.
+    Every field family 1 pins on the writer/reader pair was unpinned on the durable artifact, so
+    a park payload with a string ``retryable`` or an out-of-vocabulary ``status`` reached
+    ``suspension_from_checkpoint_payload`` — where it became a ValueError from another module, or
+    for the bools silently did not.
+
+    Pinned on BOTH carriers of one payload shape. The receipt copy
+    (``applied_input_receipts[*].suspension``) is written by the same
+    ``suspension_checkpoint_payload`` and read back by the same reader (the DBOS run driver does
+    exactly that), and it had the identical weaker check.
     """
 
     from monoid_agent_kernel.core.checkpoint import _validate_checkpoint_payload
 
-    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": {"anything": [1, 2, 3]}})
+    park = suspension_checkpoint_payload(_maximal_suspension())
+    receipt = {"r-1": {"suspension": dict(park)}}
+
+    def _both(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """One park payload, in each of the two places a checkpoint can carry it."""
+
+        return [
+            {"run_id": "run_1", "last_suspension": payload},
+            {"run_id": "run_1", "applied_input_receipts": {"r-1": {"suspension": payload}}},
+        ]
+
+    # The real writer's output validates, and so does an explicit null / an absent field.
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": dict(park)})
+    _validate_checkpoint_payload({"run_id": "run_1", "applied_input_receipts": receipt})
     _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": None})
+    _validate_checkpoint_payload({"run_id": "run_1"})
+    # A pre-v0.21 payload carries only what the reader requires; absence stays legal.
+    for candidate in _both({"reason": "settled", "status": "completed"}):
+        _validate_checkpoint_payload(candidate)
+
+    refused: list[dict[str, Any]] = [
+        {"anything": [1, 2, 3]},  # what the old "object or null" check accepted
+        {**park, "status": "running"},  # outside the durable status vocabulary
+        {**park, "reason": "unparked"},  # outside the park vocabulary
+        {**park, "retryable": "yes"},  # the mistyped bool the reader would have coerced
+        {**park, "config_recoverable": 1},
+        {**park, "provider_retried": "true"},
+        {**park, "error_code": 500},
+        {**park, "http_status": "429"},
+        {**park, "awaiting_task_ids": [1, 2]},
+    ]
+    for payload in refused:
+        for candidate in _both(payload):
+            with pytest.raises(ValueError):
+                _validate_checkpoint_payload(candidate)
     with pytest.raises(ValueError):
         _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": "not an object"})
+
+    # The vocabularies are the reader's own, not a hand copy beside it.
+    from monoid_agent_kernel.core import checkpoint as checkpoint_module
+
+    validator = _function_node("core/checkpoint.py", "_validate_suspension_payload")
+    imported = {
+        alias.name
+        for node in ast.walk(validator)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert {"SUSPENSION_REASONS", "SUSPENSION_CHECKPOINT_STATUSES"} <= imported, {
+        "hint": "a hand copy of either vocabulary is how the validator and the reader drift",
+    }
+    assert not [
+        name
+        for name, value in vars(checkpoint_module).items()
+        if isinstance(value, frozenset) and _SUSPENSION_REASONS <= value
+    ], {"hint": "the park vocabulary got a second definition in the validator's module"}
 
 
 # --------------------------------------------------------------------------------------
@@ -4540,21 +4597,38 @@ def _attribute_reads_on(function: ast.AST, name: str) -> frozenset[str]:
     )
 
 
-def test_gap_the_designed_consumer_of_config_recoverable_never_names_it() -> None:
-    """Registered: reference/backend/session_drive.py:drive_open_session branches on retryable.
+def test_the_driver_records_config_recoverable_without_branching_on_it() -> None:
+    """Was registered: the driver the classification was added for never named it.
 
-    The driver is the consumer the classification was added for — it is the code that decides
-    retry-vs-give-up on a parked turn — and ``config_recoverable`` does not appear in it at all.
-    Pinned by absence, so the first branch that reads the fact fails here and the registry entry
-    has to go with it.
+    Closed by *recording* rather than by parking. The decision the driver makes is
+    retry-vs-give-up, and a config-fixable failure is not fixable by the driver — it is fixable by
+    whoever reads the surface the driver feeds. So the fact is promoted onto the record (which
+    ``status()``/``result()`` serve) and control flow is unchanged, and both halves are pinned:
+    the read exists, and ``retryable`` is still the only thing the retry branch tests.
     """
 
     driver = _function_node("reference/backend/session_drive.py", "drive_open_session")
     names = _names_in(driver)
     assert "retryable" in names, "the driver stopped branching on retryable — recheck this pin"
-    assert "config_recoverable" not in names, {
-        "hint": "the driver reads it now: drop the registry entry and pin the new behaviour",
+    assert "config_recoverable" in names, {
+        "hint": "the driver stopped reading the classification it promotes onto the record",
     }
+    # The read is off the suspension and the write is onto the record — not the reverse, and not
+    # a second control-flow input smuggled in beside the first.
+    assert "config_recoverable" in _attribute_reads_on(driver, "suspension")
+    assert "config_recoverable" in _attribute_reads_on(driver, "record")
+    branched_on = {
+        ast.unparse(node.test)
+        for node in ast.walk(driver)
+        if isinstance(node, ast.If)
+    }
+    assert not [test for test in branched_on if "config_recoverable" in test], {
+        "branches_testing_the_classification": sorted(
+            test for test in branched_on if "config_recoverable" in test
+        ),
+        "hint": "D2 was 'expose it, do not park on it' — a branch here is a control-flow change",
+    }
+    assert "suspension.retryable" in branched_on
 
 
 # core/model_io.py:ModelCallReceipt.with_error — every fact it lifts off the exception, by name.
@@ -4563,6 +4637,9 @@ RECEIPT_ERROR_FACTS = frozenset(
         "error_code",
         "provider_error_code",
         "retryable",
+        # The sixth: waiting-may-help and configuration-will-help are two facts, and the receipt
+        # used to record only the first.
+        "config_recoverable",
         "http_status",
         "provider_retried",
         # Read too, and for the same reason the wire carries it: a failure after a billed answer.
@@ -4571,13 +4648,13 @@ RECEIPT_ERROR_FACTS = frozenset(
 )
 
 
-def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_sixth() -> None:
-    """Registered: the immutable record of a call cannot say the failure was config-fixable.
+def test_the_call_receipt_reads_every_fact_the_exception_transports() -> None:
+    """Was registered as "five facts and not the sixth"; the sixth is read now.
 
-    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so today it
-    reaches every fact through ``getattr(exc, ..., default)`` — but the fix that closes this gap
-    is a one-line ``exc.config_recoverable`` on the ``ModelAdapterError`` branch, and a pin that
-    censuses the getattr form alone would stay green through it.
+    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so it reaches
+    every fact through ``getattr(exc, ..., default)`` — but a plain ``exc.config_recoverable`` on
+    a narrowed branch is the other natural spelling, and a pin that censused the getattr form
+    alone would have stayed green through the fix that closed the gap.
     """
 
     with_error = _function_node("core/model_io.py", "with_error", within="ModelCallReceipt")
@@ -4589,7 +4666,14 @@ def test_gap_the_call_receipt_reads_five_facts_off_the_exception_and_not_the_six
         "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
         "hint": "the receipt's read set is the record's whole vocabulary",
     }
-    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(read)
+    # ...and every fact it reads reaches the durable record, rather than being read and dropped.
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    written = set(ModelCallReceipt().to_json())
+    assert read - written == {"provider_usage"}, {
+        "read_but_never_written": sorted(read - written),
+        "hint": "provider_usage is folded into ``usage``; anything else here is a dropped fact",
+    }
     # Every fact it does read is a real attribute of the exception it reads them from.
     maximal = _maximal_adapter_error()
     assert read <= set(vars(maximal)) | {"provider_usage"}
@@ -4608,6 +4692,9 @@ STREAM_CLOSED_RECORD_KEYS = frozenset(
         "usage",
         "error_code",
         "retryable",
+        # Joined in the burn-down, schema and writer in one change because the cap below is
+        # closed: the live lane now classifies with the same two words the park carries.
+        "config_recoverable",
         "finished_at",
     }
 )
@@ -4622,8 +4709,15 @@ def _stream_closed_branch() -> dict[str, Any]:
     raise AssertionError("MODEL_CONTENT_RECORD_SCHEMA has no stream_closed branch")
 
 
-def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> None:
-    """Registered: the live stream lane carries retryable and no config_recoverable."""
+def test_the_stream_closed_record_classifies_with_the_whole_vocabulary() -> None:
+    """Was registered: the live stream lane carried retryable and no config_recoverable.
+
+    Pinned on all three carriers of one record, because ``additionalProperties`` is False: the
+    outcome type, the writer's literal, and the schema branch have to move together or the record
+    fails its own validation.
+    """
+
+    from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 
     branch = _stream_closed_branch()
     declared = frozenset(branch["properties"])
@@ -4632,17 +4726,32 @@ def test_gap_the_stream_closed_record_classifies_with_half_the_vocabulary() -> N
         "extra": sorted(declared - STREAM_CLOSED_RECORD_KEYS),
     }
     assert branch["additionalProperties"] is False, {
-        "hint": "the closed cap is why adding the fact is a schema change, not a patch",
+        "hint": "the closed cap is why adding a fact here is a schema change, not a patch",
     }
-    assert "retryable" in declared
-    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(declared), {
-        "hint": "carried now? update EXPECTED and drop the registry entry",
+    assert {"retryable", "config_recoverable"} <= declared
+    # The writer's literal: what ``close()`` actually puts on the record.
+    written = _literal_dict_keys_where("core/model_content.py", "kind", "stream_closed")
+    assert len(written) == 1, {"stream_closed_writers": len(written)}
+    assert written[0] == STREAM_CLOSED_RECORD_KEYS, {
+        "written": sorted(written[0]),
+        "hint": "the writer and the closed schema must name the same keys",
     }
+    # ...and the outcome the writer reads them off carries both classifications.
+    outcome_fields = {field.name for field in dataclasses.fields(ModelStreamOutcome)}
+    assert {"retryable", "config_recoverable"} <= outcome_fields
+    # Optional on the record, so a sidecar written before the key existed still validates.
+    assert "config_recoverable" not in branch["required"]
 
 
 # The three consumers of one event stream, and the event types each one dispatches on. Pinned
-# per consumer, because the defect here is not a missing branch anywhere in particular — it is
-# that no two of them handle the same set and nothing said so.
+# per consumer, because the defect here was not a missing branch anywhere in particular — it was
+# that no two of them handled the same set and nothing said so.
+#
+# Converged in the burn-down: the two parks (``run.waiting``, ``run.awaiting_input``) and the
+# classification (``turn.failed``) are now handled by all three, so the sets differ only by the
+# events a consumer's *surface* has no slot for. Those differences are named in
+# ``EVENT_CONSUMER_SINK_ONLY`` / ``EVENT_CONSUMER_OFFLINE_ONLY`` below and asserted as the whole
+# remaining diff, so a fourth divergence cannot appear quietly.
 EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
     # name -> (module, enclosing class, the expression it switches on)
     "core/projections.py:_apply_event_projection": (
@@ -4657,21 +4766,46 @@ EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
     ),
     "recorder.py:StatusJsonSink.emit": ("recorder.py", "StatusJsonSink", "event.type"),
 }
+# What every status consumer must handle: the lifecycle edges, both parks, and the recoverable
+# turn failure whose classification is the only thing a parked run has to show.
+EVENT_CONSUMER_CORE = frozenset(
+    {
+        "run.started",
+        "run.finished",
+        "run.failed",
+        "run.waiting",
+        "run.awaiting_input",
+        "run.resumed",
+        "turn.failed",
+        "model.turn.started",
+    }
+)
+# The progress detail two of the three project. The backend record has no slot for any of it —
+# it carries lifecycle + classification and the run dir carries the rest — so this is a surface
+# difference, not a hole.
+EVENT_CONSUMER_PROGRESS = frozenset(
+    {
+        "agent.config.updated",
+        "tool.call.started",
+        "tool.call.finished",
+        "tool.call.failed",
+        "workspace.proposal.updated",
+    }
+)
+# The pause park's session-lane projection, handled by the two status-file readers. NOT part of
+# ``EVENT_CONSUMER_CORE``: the backend record's pause state is owned by session_drive (the
+# driver observes the ``paused`` Suspension directly and a ``record_event`` state write would
+# race it — the same reason its ``turn.failed`` branch never touches state), so the record
+# deliberately has no branch for this event.
+EVENT_CONSUMER_PAUSE = frozenset({"session.state.changed"})
 EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
-    # No ``run.awaiting_input``: an offline ``monoid status`` reports a parked run as running.
-    "core/projections.py:_apply_event_projection": frozenset(
+    # The offline projection reads the *committed log*, so it can also fold the durable proposal
+    # lifecycle that the two live sinks never see (they fire before the artifacts are written).
+    "core/projections.py:_apply_event_projection": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
+    | frozenset(
         {
-            "run.started",
-            "run.finished",
-            "run.failed",
-            "run.waiting",
-            "run.resumed",
-            "agent.config.updated",
-            "model.turn.started",
-            "tool.call.started",
-            "tool.call.finished",
-            "tool.call.failed",
-            "workspace.proposal.updated",
             "proposal.package.exported",
             "proposal.approved",
             "proposal.rejected",
@@ -4679,45 +4813,23 @@ EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
             "proposal.conflict",
         }
     ),
-    # The mirror image: ``run.awaiting_input`` and no ``run.waiting``.
-    "reference/backend/run_state.py:record_event": frozenset(
-        {
-            "run.started",
-            "run.awaiting_input",
-            "run.resumed",
-            "model.turn.started",
-            "run.finished",
-            "run.failed",
-        }
-    ),
-    # The control: both parks, and it clears the wait on model.turn.started. (``job.*`` is
-    # matched by prefix rather than equality, so it is outside this census by construction.)
-    "recorder.py:StatusJsonSink.emit": frozenset(
-        {
-            "run.started",
-            "run.finished",
-            "run.failed",
-            "run.waiting",
-            "run.resumed",
-            "run.awaiting_input",
-            "agent.config.updated",
-            "model.turn.started",
-            "tool.call.started",
-            "tool.call.finished",
-            "tool.call.failed",
-            "plan.updated",
-            "metrics.updated",
-            "workspace.proposal.updated",
-        }
-    ),
+    # The narrowest surface: an in-memory lifecycle record. No progress detail by design.
+    "reference/backend/run_state.py:record_event": EVENT_CONSUMER_CORE,
+    # The fan-out sink. Its two extras are the live-only projections nothing durable carries.
+    # (``job.*`` is matched by prefix rather than equality, so it is outside this census by
+    # construction.)
+    "recorder.py:StatusJsonSink.emit": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
+    | frozenset({"plan.updated", "metrics.updated"}),
 }
 
 
 @pytest.mark.parametrize("consumer", sorted(EVENT_CONSUMERS))
-def test_gap_each_status_consumer_handles_its_own_subset_of_one_event_stream(
+def test_each_status_consumer_handles_the_whole_core_of_one_event_stream(
     consumer: str,
 ) -> None:
-    """Registered (three entries): two projections, each blind to the park the other sees."""
+    """Was registered (three entries): two projections, each blind to the park the other saw."""
 
     relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
     name = consumer.split(":", 1)[1].split(".")[-1]
@@ -4729,48 +4841,200 @@ def test_gap_each_status_consumer_handles_its_own_subset_of_one_event_stream(
         "consumer": consumer,
         "newly_handled": sorted(handled - expected),
         "no_longer_handled": sorted(expected - handled),
-        "hint": "a consumer that gained a branch closes a registered gap: drop its entry",
+        "hint": "a consumer that gained or lost a branch changes what an operator can read",
     }
-    # Registered burn-down, stated once per consumer: nothing projects the terminal
-    # classification a parked run carries, so the surface an operator reads shows none of it.
-    assert "turn.failed" not in handled, {
+    # The convergence itself, restated per consumer so no single one can drift back out of it.
+    assert EVENT_CONSUMER_CORE <= handled, {
         "consumer": consumer,
-        "hint": "a status projection consumes turn.failed now — drop the registry entry",
+        "core_events_not_handled": sorted(EVENT_CONSUMER_CORE - handled),
+        "hint": "the three readers of one stream agreed on this core; this one no longer does",
     }
 
 
-def test_gap_the_two_run_status_projections_are_each_blind_to_the_others_park() -> None:
-    """The diff itself, so the asymmetry is the assertion rather than an inference."""
+def test_the_three_run_status_projections_differ_only_by_what_their_surface_carries() -> None:
+    """The diff itself, so the convergence is the assertion rather than an inference."""
 
     offline = EVENT_CONSUMER_HANDLED["core/projections.py:_apply_event_projection"]
     backend = EVENT_CONSUMER_HANDLED["reference/backend/run_state.py:record_event"]
     control = EVENT_CONSUMER_HANDLED["recorder.py:StatusJsonSink.emit"]
-    assert "run.waiting" in offline and "run.awaiting_input" not in offline
-    assert "run.awaiting_input" in backend and "run.waiting" not in backend
-    assert {"run.waiting", "run.awaiting_input"} <= control, {
-        "hint": "the sink is the control: it proves both parks are observable from this stream",
+    # Both parks and the classification, on all three.
+    for handled in (offline, backend, control):
+        assert {"run.waiting", "run.awaiting_input", "turn.failed"} <= handled
+    # The pause projection, on both status-file readers and deliberately NOT on the record:
+    # session_drive owns the record's lifecycle and observes the paused Suspension directly, so
+    # a record_event state write would race it (the reason is on EVENT_CONSUMER_PAUSE).
+    assert EVENT_CONSUMER_PAUSE <= offline and EVENT_CONSUMER_PAUSE <= control
+    assert not (EVENT_CONSUMER_PAUSE & backend)
+    # The whole remaining difference, named. Nothing is handled by one reader alone except the
+    # durable proposal lifecycle (only the log reader sees it) and the two live-only projections
+    # (only the fan-out sink can build them).
+    assert offline - control == {
+        "proposal.package.exported",
+        "proposal.approved",
+        "proposal.rejected",
+        "proposal.applied",
+        "proposal.conflict",
+    }
+    assert control - offline == {"plan.updated", "metrics.updated"}
+    # The backend record is a strict subset of both: it carries lifecycle + classification only.
+    assert backend < offline and backend < control
+    assert backend == EVENT_CONSUMER_CORE
+
+
+# The classification key-subset each status-consumer branch copies off its event, pinned per
+# branch. This is the cell the "status.json projection" future family predicted: three
+# consumers each hand-copy keys out of ``turn.failed``/``run.failed`` data, and a fact added to
+# the event reaches N-1 of them unless something diffs the copies. The event-type pins above
+# say each consumer HAS the branch; these say what the branch CARRIES.
+#
+# ``turn.failed``'s carried set is its emit set minus ``provider_usage`` (metering, not
+# classification — it stays off every status surface). ``run.failed``'s is exactly the event's
+# own key set: the terminal vocabulary deliberately drops ``provider_retried``.
+TURN_FAILED_STATUS_CARRIED = TURN_FAILED_EVENT_KEYS - {"provider_usage"}
+STATUS_CONSUMER_BRANCH_READS: dict[tuple[str, str], frozenset[str]] = {
+    ("recorder.py:StatusJsonSink.emit", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    ("recorder.py:StatusJsonSink.emit", "run.failed"): RUN_FAILED_EVENT_KEYS,
+    ("core/projections.py:_apply_event_projection", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The offline projection's terminal branch reads the ``provider_retried`` slot the event
+    # never carries — that IS the heal (the projection declares the key, so clearing it means
+    # assigning the absent-key default) — and has no ``error_type`` slot, so ``type`` is the
+    # one run.failed key it does not copy (a declared surface difference with the sink).
+    ("core/projections.py:_apply_event_projection", "run.failed"): (
+        RUN_FAILED_EVENT_KEYS - {"type"}
+    )
+    | {"provider_retried"},
+    ("reference/backend/run_state.py:record_event", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The record's ``run.failed`` branch copies the event's whole classification, exactly like
+    # its ``turn.failed`` twin. Its previous error-pair-only pin was justified twice and both
+    # justifications proved false on a path: "the driver's park promotion assigns all five"
+    # fails for terminals minted at the close boundary (pending-cancel, unrecovered-turn-
+    # failure, unsettled-close — fixed by the ``record_run_result`` heal), and the heal in turn
+    # KEEPS the record's values at a FAILED terminal — which are defaults for a FRESH terminal
+    # that never parked (a non-recoverable failure on the stream lane, or any first-turn
+    # failure), so live ``status()`` omitted the classification status.json carried. ``type``
+    # is not copied (the record has no ``error_type`` slot — declared surface difference with
+    # the sink); ``provider_retried`` is assigned the terminal vocabulary's constant False,
+    # not read from data (run.failed does not carry it).
+    ("reference/backend/run_state.py:record_event", "run.failed"): RUN_FAILED_EVENT_KEYS
+    - {"type"},
+}
+
+
+def _module_level_functions(relative_path: str) -> dict[str, Any]:
+    return {
+        node.name: node
+        for node in _module_tree(relative_path).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
 
-def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
-    """Registered: one word, two vocabularies, on one event.
+def _event_data_reads(relative_path: str, body: list[ast.stmt]) -> frozenset[str]:
+    """Constant keys ``body`` reads off event data, following same-module helper calls.
 
-    ``data.reason`` on ``turn.interrupted`` names the CAUSE (``user_stop``); ``Suspension.reason``
-    names the PARK (``interrupted``). Pinned as the collision it is: the emit's literal and the
-    proof that its value is not a member of the park vocabulary it shares a field name with.
+    Two spellings of a read are collected, for the reason the receipt pin collects both
+    ``getattr`` forms: the inline ``data.get("key")`` and the guarded-helper call
+    ``_event_flag(data, "key")``. Helper calls resolved by name in the same module are
+    followed (``_assign_failure_classification`` reads five keys the call site never spells),
+    so a read moved into a helper stays censused. Attribute calls other than ``.get`` are NOT
+    reads — ``self.state.pop("key")`` is a clear, and counting it as a read would let a
+    dropped copy hide behind its own cleanup.
     """
 
-    emitted = _emit_data_keys("loop.py", "turn.interrupted")
-    assert emitted == {"reason"}, {"emitted": sorted(emitted)}
-    values = _literal_dict_keys_where("loop.py", "reason", "user_stop")
-    assert len(values) == 1, {"turn_interrupted_reason_literals": len(values)}
-    assert values[0] == {"reason"}
-    assert "user_stop" not in _SUSPENSION_REASONS, {
-        "hint": "the two vocabularies merged: drop the registry entry",
+    helpers = _module_level_functions(relative_path)
+    read: set[str] = set()
+    visited: set[str] = set()
+
+    def _collect(nodes: list[ast.stmt]) -> None:
+        for node in nodes:
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "get"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                ):
+                    read.add(call.args[0].value)
+                elif isinstance(call.func, ast.Name):
+                    for argument in call.args:
+                        if isinstance(argument, ast.Constant) and isinstance(
+                            argument.value, str
+                        ):
+                            read.add(argument.value)
+                    helper = helpers.get(call.func.id)
+                    if helper is not None and call.func.id not in visited:
+                        visited.add(call.func.id)
+                        _collect(helper.body)
+
+    _collect(body)
+    return frozenset(read)
+
+
+@pytest.mark.parametrize("consumer_branch", sorted(STATUS_CONSUMER_BRANCH_READS))
+def test_each_status_consumer_branch_copies_its_pinned_classification_subset(
+    consumer_branch: tuple[str, str],
+) -> None:
+    consumer, event_type = consumer_branch
+    relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
+    name = consumer.split(":", 1)[1].split(".")[-1]
+    function = _function_node(relative_path, name, within=class_name)
+    branches = [
+        node.body
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Eq)
+        and ast.unparse(node.test.left) == subject
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == event_type
+    ]
+    assert len(branches) == 1, {"consumer": consumer, "branches_for": event_type}
+    read = _event_data_reads(relative_path, branches[0])
+    expected = STATUS_CONSUMER_BRANCH_READS[consumer_branch]
+    assert read == expected, {
+        "consumer": consumer,
+        "event_type": event_type,
+        "newly_read": sorted(read - expected),
+        "no_longer_read": sorted(expected - read),
+        "hint": "a classification fact reached this consumer's branch on one reader and not "
+        "its pinned subset — update every twin in the same change",
     }
-    assert "interrupted" in _SUSPENSION_REASONS
-    # The pause twin emits no event of its own, which is the other half of the entry.
-    assert not [
+    assert "provider_usage" not in read, {
+        "consumer": consumer,
+        "hint": "provider_usage is metering, not classification; it stays off status surfaces",
+    }
+
+
+def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
+    """Registered BY DESIGN: one key name, two vocabularies, on two sibling events.
+
+    ``data.reason`` on ``turn.interrupted``/``turn.paused`` names the CAUSE (``user_stop`` /
+    ``user_pause``); ``Suspension.reason`` names the PARK (``interrupted`` / ``paused``). The
+    assertions are unchanged from when this was a burn-down entry — they pin the emit's literals
+    and the proof that neither value is a member of the park vocabulary it shares a field name
+    with — but what they pin is now a declared fact rather than a defect: merging the two would
+    make one field answer two questions.
+
+    The genuine half of the old entry is closed below: the pause park emits a turn-lane event of
+    its own now, so the two sibling parks ARE observable the same way.
+    """
+
+    for event_type, cause in (("turn.interrupted", "user_stop"), ("turn.paused", "user_pause")):
+        emitted = _emit_data_keys("loop.py", event_type)
+        assert emitted == {"reason"}, {"event": event_type, "emitted": sorted(emitted)}
+        values = _literal_dict_keys_where("loop.py", "reason", cause)
+        assert len(values) == 1, {"event": event_type, "reason_literals": len(values)}
+        assert values[0] == {"reason"}
+        assert cause not in _SUSPENSION_REASONS, {
+            "event": event_type,
+            "hint": "the cause and park vocabularies merged — this entry says they must not",
+        }
+    assert {"interrupted", "paused"} <= _SUSPENSION_REASONS
+    # The asymmetry that WAS a defect: the pause park emitted only a session-lane event.
+    paused_emits = [
         node
         for node in ast.walk(_module_tree("loop.py"))
         if isinstance(node, ast.Call)
@@ -4779,22 +5043,36 @@ def test_gap_turn_interrupted_speaks_a_cause_vocabulary_the_park_type_cannot() -
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "turn.paused"
-    ], {"hint": "turn.paused exists now: the two parks are symmetric — drop the entry"}
+    ]
+    assert len(paused_emits) == 1, {
+        "turn_paused_emit_sites": len(paused_emits),
+        "hint": "the pause park's turn-lane event is the interrupt's twin: exactly one site",
+    }
+    # Both are declared event types with a data schema, and the schemas are the same shape.
+    from monoid_agent_kernel.core.events import AgentEventType
+    from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
+
+    assert {"turn.interrupted", "turn.paused"} <= set(get_args(AgentEventType))
+    assert (
+        EVENT_DATA_SCHEMAS["turn.paused"]["properties"]
+        == EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]
+    )
+    assert EVENT_DATA_SCHEMAS["turn.paused"]["additionalProperties"] is False
 
 
-def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> None:
-    """Registered (round 2, leak-adjacent): three of four paths out of one payload filter.
+def test_every_error_expression_the_result_payload_serves_is_filtered() -> None:
+    """Was registered (round 2, leak-adjacent): three of four paths out of one payload filtered.
 
-    ``record.error`` and ``metrics["error"]`` are written through
-    ``public_view.py:public_error_message``; the ready branch of ``result()`` serves
-    ``result.error`` — the deliberately raw ``AgentRunResult.error`` — straight to an HTTP
-    response. Pinned statically, because a value-level probe would need a whole finished run and
-    the fact is which expression the branch names.
+    ``record.error`` and ``metrics["error"]`` come pre-filtered from their writers
+    (``public_view.py:public_error_message`` in ``run_state.py``/``loop_phases.py``); the ready
+    branch of ``result()`` served ``result.error`` — the deliberately raw ``AgentRunResult.error``
+    — straight to an HTTP response. The filter landed in the projection, so the route stays a
+    dumb serializer.
 
-    Pinned at *both* ends. The projection is one of the two places a filter could land: the HTTP
-    route hands what ``result()`` returns to ``_write_json`` unchanged, so a fix applied there
-    instead — filtering on the way out, or calling the projection through a wrapper — would
-    close the gap while a projection-only pin stayed green and the registry entry stayed.
+    Pinned at *both* ends, and that is still the point: the route hands what ``result()`` returns
+    to ``_write_json`` unchanged, so the wire's contents are decided by these two functions
+    together. A filter that moved to the route, or a route that stopped writing the dict whole,
+    is a change to where the boundary is and has to be re-argued.
     """
 
     projection = _function_node("reference/backend/projection.py", "result")
@@ -4805,15 +5083,16 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
         for key, value in zip(node.keys, node.values):
             if isinstance(key, ast.Constant) and key.value == "error":
                 served.append(ast.unparse(value))
-    assert sorted(served) == ["record.error", "result.error"], {
+    assert sorted(served) == [
+        "public_error_message(result.error)",
+        "record.error",
+    ], {
         "error_expressions_served": sorted(served),
-        "hint": "the raw one is the ready branch; a filter here closes the gap",
+        "hint": "``record.error`` arrives pre-filtered from record_run_result; the raw "
+        "AgentRunResult.error is filtered here. A third expression is an unproven one",
     }
-    assert "public_error_message" not in _names_in(projection), {
-        "hint": "the projection filters now: drop the registry entry",
-    }
-    # The caller-side half: the route writes the projection's dict wholesale, so a filter added
-    # between ``result()`` and the wire flips this pin too rather than only the one above.
+    # The route is the dumb serializer this arrangement depends on: it writes the projection's
+    # dict wholesale and applies no filter of its own.
     route = _function_node("reference/backend/http.py", "do_GET", within="make_backend_handler")
     served_wholesale = [
         ast.unparse(node.args[0])
@@ -4826,13 +5105,13 @@ def test_gap_the_ready_result_branch_serves_the_error_its_siblings_filter() -> N
     ]
     assert served_wholesale == ["backend.result(run_id, self._bearer_token())"], {
         "how_the_route_writes_the_projection": served_wholesale,
-        "hint": "the route stopped writing result() unchanged: if that is the filter, drop the "
-        "registry entry; if it is not, the raw error still reaches the wire",
+        "hint": "the route stopped writing result() unchanged — the filter's placement assumed "
+        "it did",
     }
     assert "public_error_message" not in _names_in(route), {
-        "hint": "the route filters now: drop the registry entry and pin the new behaviour",
+        "hint": "two filters on one value: decide which one owns it",
     }
-    # The two writers this branch disagrees with, so the asymmetry is asserted and not assumed.
+    # The two sibling writers this branch now agrees with, asserted and not assumed.
     assert "public_error_message" in _names_in(
         _function_node("reference/backend/run_state.py", "record_run_result")
     )
@@ -4856,33 +5135,53 @@ def _snapshot_written_keys() -> frozenset[str]:
     return frozenset(keyword.arg for keyword in calls[0].keywords if keyword.arg)
 
 
-def test_gap_the_snapshot_omits_the_siblings_of_the_fields_it_writes() -> None:
-    """Registered (round 2, three cells of the uncensused run-state carriage family)."""
+def _rehydrate_read_attributes() -> frozenset[str]:
+    """The ``cp.<field>`` reads ``loop.py:_rehydrate`` makes off the checkpoint."""
+
+    return _attribute_reads_on(_function_node("loop.py", "_rehydrate"), "cp")
+
+
+def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_write() -> None:
+    """Was registered (round 2, three cells of the uncensused run-state carriage family).
+
+    Two of the three closed here: the retry budget's evidence, and the context-owned roll-ups
+    metrics.json reports beside the RunState totals. Pinned on all three legs — the checkpoint
+    field, the snapshot write, and the restore read — because a field written and never read back
+    is a snapshot that grew without the restore noticing.
+    """
 
     from monoid_agent_kernel.core.checkpoint import RunCheckpoint
     from monoid_agent_kernel.loop import AgentToolContext, RunState
 
     written = _snapshot_written_keys()
+    restored = _rehydrate_read_attributes()
     state_fields = {field.name for field in dataclasses.fields(RunState)}
     context_fields = {field.name for field in dataclasses.fields(AgentToolContext)}
 
-    # (a) output_retries rides; its history does not.
+    # (a) output_retries rides, and so does the history the attempt numbering is derived from.
     assert {"output_retries", "output_failure_history"} <= state_fields
-    assert "output_retries" in written
-    assert "output_failure_history" not in written, {
-        "hint": "checkpointed now? add it to RunCheckpoint's census and drop the registry entry",
-    }
-    assert "output_failure_history" not in RunCheckpoint.__dataclass_fields__
+    assert {"output_retries", "output_failure_history"} <= written
+    assert {"output_retries", "output_failure_history"} <= restored
+    assert "output_failure_history" in RunCheckpoint.__dataclass_fields__
 
-    # (b) the RunState counters ride; the context-owned ones do not, and metrics.json mixes them.
-    context_counters = {"subagent_count", "subagent_usage", "skill_activation_count"}
+    # (b) the context-owned counters ride beside their RunState twins, so metrics.json reports
+    # one epoch rather than pre-restart totals beside post-restart subagent and skill counts.
+    context_counters = {
+        "subagent_count",
+        "subagent_usage",
+        "skill_activation_count",
+        "skills_activated",
+    }
     assert context_counters <= context_fields
     assert {"total_usage", "total_tool_calls"} <= written
-    assert context_counters.isdisjoint(written), {
-        "carried_now": sorted(context_counters & written),
-        "hint": "one epoch at last: drop the registry entry",
+    assert context_counters <= written, {
+        "still_dropped": sorted(context_counters - written),
+        "hint": "one epoch: every counter build_metrics reads must survive the restart",
     }
-    assert context_counters.isdisjoint(RunCheckpoint.__dataclass_fields__)
+    assert context_counters <= restored, {
+        "written_but_never_read_back": sorted(context_counters - restored),
+    }
+    assert context_counters <= set(RunCheckpoint.__dataclass_fields__)
     metrics_names = _names_in(
         _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
     )
@@ -4890,9 +5189,46 @@ def test_gap_the_snapshot_omits_the_siblings_of_the_fields_it_writes() -> None:
         "hint": "these are the counters that reach metrics.json beside the restored totals",
     }
 
+    # (c) still open, narrowed: the tool SERVICE counters. ``build_metrics`` splats three
+    # service metrics blocks into the same file and none of them has a checkpoint slot.
+    service_metric_keys = {
+        "shell_calls",
+        "failed_shell_calls",
+        "total_shell_duration_s",
+        "web_search_calls",
+        "web_fetch_calls",
+    }
+    assert service_metric_keys.isdisjoint(RunCheckpoint.__dataclass_fields__), {
+        "carried_now": sorted(service_metric_keys & set(RunCheckpoint.__dataclass_fields__)),
+        "hint": "the narrowed registry entry says these have no durable slot: update both",
+    }
+    splatted = {
+        ast.unparse(value)
+        for node in ast.walk(
+            _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+        )
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if key is None
+    }
+    assert {
+        "context.shell_service.metrics()",
+        "context.jobs_service.background_metrics()",
+        "context.web_service.metrics()",
+    } <= splatted, {
+        "metrics_blocks_splatted": sorted(splatted),
+        "hint": "the narrowed entry names these three service blocks",
+    }
 
-def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally() -> None:
-    """Registered (round 2): a restore without a token un-cancels a durably-cancelled run."""
+
+def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
+    """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
+
+    The flag is the request; the token is only the channel a boundary check reads it through. So
+    the restore mints one when the loop has none, exactly as ``astream`` and ``LoopSession.cancel``
+    do — pinned as "the guard is the flag alone, and a token is minted", because re-introducing a
+    token precondition anywhere in that branch restores the defect.
+    """
 
     assert "cancellation_requested" in _snapshot_written_keys()
     restore = _function_node("loop.py", "_rehydrate")
@@ -4901,15 +5237,38 @@ def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally()
         for node in ast.walk(restore)
         if isinstance(node, ast.If) and "cancellation_requested" in ast.unparse(node.test)
     ]
-    assert guards == ["cp.cancellation_requested and self.cancellation_token is not None"], {
+    assert guards == ["cp.cancellation_requested"], {
         "restore_guards": guards,
-        "hint": "the read is unconditional now (or the guard changed): update EXPECTED and drop "
-        "the registry entry",
+        "hint": "a second condition on this branch is the asymmetry that was closed",
     }
+    minting = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CancellationToken"
+    ]
+    assert minting == ["CancellationToken()"], {
+        "tokens_minted_during_restore": minting,
+        "hint": "without minting, a loop rebuilt with no token silently un-cancels the run",
+    }
+    cancels = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cancel"
+    ]
+    assert cancels == ["self.cancellation_token.cancel()"], {"cancel_calls": cancels}
 
 
-def test_gap_the_backend_tenant_meter_drops_the_same_sub_counts_the_gateway_does() -> None:
-    """Registered (round 2): the unregistered twin of the gateway meter, pinned behaviorally."""
+def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
+    """The gateway meter's twin, pinned behaviorally and cross-asserted against it.
+
+    Two meters, one omission: both summed input/output/total and dropped the four priced
+    sub-counts, and fixing one of them would have left the other. The cross-assert below is what
+    makes them one rule rather than two that happen to agree today.
+    """
 
     from monoid_agent_kernel.reference.backend.run_state import TenantUsage
 
@@ -4917,20 +5276,26 @@ def test_gap_the_backend_tenant_meter_drops_the_same_sub_counts_the_gateway_does
     meter.add_metrics({**_MAXIMAL_USAGE, "web_search_calls": 3})
     reported = meter.to_json()
     dropped = NORMALIZED_USAGE_KEYS - set(reported)
-    assert dropped == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "reasoning_tokens",
-        "audio_tokens",
-    }, {"dropped_sub_counts": sorted(dropped)}
-    # ...the exact set the gateway meter drops, so the two ledgers are wrong the same way.
+    assert dropped == set(), {"dropped_sub_counts": sorted(dropped)}
+    # ...and the gateway's ledger drops exactly the same nothing, so the two agree by rule.
     assert dropped == NORMALIZED_USAGE_KEYS - GATEWAY_METER_KEYS
-    assert reported["total_tokens"] == _MAXIMAL_USAGE["total_tokens"]
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
     assert reported["web_search_calls"] == 3
 
 
-def test_gap_a_run_that_dies_of_an_exception_meters_nothing() -> None:
-    """Registered (round 2): record_run_failure has no meter, its sibling does."""
+def test_both_terminal_paths_meter_the_run_through_one_seam() -> None:
+    """``record_run_failure`` metered nothing at all while its sibling fed the ledger.
+
+    Pinned as "one seam", not as "both call ``add_metrics``": the two paths report CUMULATIVE
+    totals from different sources (the last checkpoint, and ``AgentRunResult.metrics``), so the
+    guard against billing a metered-then-recovered-then-completed run twice is that a single
+    function owns the per-run high-water mark. A second caller of ``add_metrics`` would be a
+    second place that has to remember the mark.
+    """
 
     failure = _function_node(
         "reference/backend/run_state.py", "record_run_failure", within="RunStateMutationService"
@@ -4938,19 +5303,32 @@ def test_gap_a_run_that_dies_of_an_exception_meters_nothing() -> None:
     success = _function_node(
         "reference/backend/run_state.py", "record_run_result", within="RunStateMutationService"
     )
-    assert "add_metrics" in _names_in(success)
-    assert "add_metrics" not in _names_in(failure), {
-        "hint": "the failure path meters now: drop the registry entry",
+    seam = _function_node(
+        "reference/backend/run_state.py", "_meter_run", within="RunStateMutationService"
+    )
+    assert "_meter_run" in _names_in(success)
+    assert "_meter_run" in _names_in(failure), {
+        "hint": "the failure path meters nothing again",
     }
-    # Not even the run count, which is what add_metrics increments first.
-    assert "_usage" not in _names_in(failure)
+    assert "add_metrics" in _names_in(seam)
+    for path in (failure, success):
+        assert "add_metrics" not in _names_in(path), {
+            "hint": "a second ledger writer beside the seam that owns the high-water mark",
+        }
 
 
-def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
-    """Registered (round 2): one run, three surfaces, three states.
+def test_the_settle_mappers_answer_a_terminal_limited_run_one_way() -> None:
+    """Was registered (round 2): one run, three surfaces, three states — then a fourth.
 
-    Pinned value-level on all three, so a fix to any one of them trips this census and forces
-    the semantic decision the divergence has been deferring.
+    ``state_from_suspension`` said FAILED, ``session_state_from_run_status("limited")`` said
+    LIMITED, and ``LoopSession.close`` said COMPLETED — for one budget- or validator-limited run.
+    LIMITED is canonical. The v0.21 burn-down then found the mapper this census had NOT seated at
+    the table diverging the same way: ``LoopSession._derive_after_settle`` (the blocking
+    ``submit()`` twin of the pump) read only the terminal flag and said FAILED where
+    ``run_until_suspended`` said LIMITED — and ``close()`` then crashed the FSM on the
+    ``'failed' -> 'limited'`` edge. All four are pinned value-level, because a *divergence* is
+    what this census exists to catch; the cancel case is pinned beside each, because the
+    harmonization runs through the same branch cancel does.
     """
 
     from monoid_agent_kernel.core.lifecycle import (
@@ -4965,36 +5343,80 @@ def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
     )
 
     class _ClosingLoop:
-        def close(self) -> Any:
-            return dataclasses.replace(_maximal_turn(), status="limited")
+        def __init__(self, status: str, error_code: str = "") -> None:
+            self._status = status
+            self._error_code = error_code
 
-    session = LoopSession(loop=_ClosingLoop())  # type: ignore[arg-type]
-    session.close()
+        def close(self) -> Any:
+            return dataclasses.replace(
+                _maximal_turn(), status=self._status, error_code=self._error_code
+            )
+
+    def _closed(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_ClosingLoop(status, error_code))  # type: ignore[arg-type]
+        session.close()
+        return session.state
+
+    class _TerminalSettledLoop:
+        # The shape _derive_after_settle reads: a live session object whose terminal flag the
+        # loop raised at the settle boundary (max_tool_calls, cancel, a non-recoverable error).
+        class _Session:
+            terminal = True
+
+        _session = _Session()
+
+    def _derived(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_TerminalSettledLoop())  # type: ignore[arg-type]
+        return session._derive_after_settle(
+            dataclasses.replace(_maximal_turn(), status=status, error_code=error_code)
+        )
 
     verdicts = {
         "core/lifecycle.py:state_from_suspension": state_from_suspension(parked),
         "core/lifecycle.py:session_state_from_run_status": session_state_from_run_status(
             "limited", terminal=True
         ),
-        "core/lifecycle.py:LoopSession.close": session.state,
+        "core/lifecycle.py:LoopSession.close": _closed("limited"),
+        "core/lifecycle.py:LoopSession._derive_after_settle": _derived("limited"),
     }
-    assert verdicts == {
-        "core/lifecycle.py:state_from_suspension": SessionState.FAILED,
-        "core/lifecycle.py:session_state_from_run_status": SessionState.LIMITED,
-        "core/lifecycle.py:LoopSession.close": SessionState.COMPLETED,
-    }, {
+    assert set(verdicts.values()) == {SessionState.LIMITED}, {
         "verdicts": {name: value.value for name, value in verdicts.items()},
-        "hint": "harmonized? make them agree, update EXPECTED and drop the registry entry",
+        "hint": "the settle mappers over one run must not answer two ways again",
     }
-    # And LIMITED is a real state all three could have returned.
+    # Cancel still escapes to its own terminal state on all four, and a real failure to FAILED.
+    cancelled = Suspension(reason="terminal", status="limited", error_code="cancelled")
+    assert state_from_suspension(cancelled) is SessionState.CANCELLED
+    assert (
+        session_state_from_run_status("limited", error_code="cancelled", terminal=True)
+        is SessionState.CANCELLED
+    )
+    assert _closed("limited", "cancelled") is SessionState.CANCELLED
+    assert _derived("limited", "cancelled") is SessionState.CANCELLED
+    assert state_from_suspension(Suspension(reason="terminal", status="failed")) is (
+        SessionState.FAILED
+    )
+    assert _closed("failed") is SessionState.FAILED
+    assert _derived("failed") is SessionState.FAILED
+    assert _closed("completed") is SessionState.COMPLETED
+    # ...and ``close`` reaches them through the shared mapper rather than its own == test,
+    # while the pump and blocking settle halves share the terminal precedence literally.
+    close_source = _live_source(LoopSession.close)
+    assert "session_state_from_run_status" in close_source, {
+        "hint": "a fourth hand-rolled terminal mapping is how the first three diverged",
+    }
+    assert "_terminal_outcome_state" in _live_source(state_from_suspension)
+    assert "_terminal_outcome_state" in _live_source(LoopSession._derive_after_settle), {
+        "hint": "the blocking settle twin re-rolling the precedence is how the fourth diverged",
+    }
     assert REASON_TO_STATE["limited"] is SessionState.LIMITED
 
 
-def test_gap_the_recovery_park_is_built_outside_the_durable_status_vocabulary() -> None:
-    """Registered (round 2): reference/backend/recovery.py mints Suspension(status="running").
+def test_the_recovery_park_is_built_inside_the_durable_status_vocabulary() -> None:
+    """Was registered (round 2): reference/backend/recovery.py minted Suspension(status="running").
 
-    Latent, and pinned as latent: the synthetic park is re-driven rather than serialized, so the
-    landmine is documented by showing what happens the first time something checkpoints it.
+    Latent — the synthetic park is re-driven rather than serialized — but nothing on the type said
+    so, and the first path that checkpointed it raised at the recovery boundary it exists to
+    serve. Pinned as the in-vocabulary mint plus a round-trip that now SUCCEEDS.
     """
 
     recovered = _function_node("reference/backend/recovery.py", "run_recovered")
@@ -5010,14 +5432,18 @@ def test_gap_the_recovery_park_is_built_outside_the_durable_status_vocabulary() 
         and node.func.id == "Suspension"
     ]
     assert minted == [
-        {"reason": "'awaiting_tasks'", "status": "'running'", "has_external": "True"}
+        {"reason": "'awaiting_tasks'", "status": "'completed'", "has_external": "True"}
     ], {"suspensions_minted_during_recovery": minted}
 
-    synthetic = Suspension(reason="awaiting_tasks", status="running", has_external=True)  # type: ignore[arg-type]
+    synthetic = Suspension(reason="awaiting_tasks", status="completed", has_external=True)
     payload = suspension_checkpoint_payload(synthetic)
-    assert payload["status"] == "running"
-    with pytest.raises(ValueError):
-        suspension_from_checkpoint_payload(payload)
+    assert payload["status"] == "completed"
+    assert suspension_from_checkpoint_payload(payload) == synthetic
+    # The vocabulary itself, so a widened reader does not quietly make this pin vacuous.
+    from monoid_agent_kernel.core.result import SUSPENSION_CHECKPOINT_STATUSES
+
+    assert SUSPENSION_CHECKPOINT_STATUSES == {"completed", "failed", "limited"}
+    assert "running" not in SUSPENSION_CHECKPOINT_STATUSES
 
 
 # --------------------------------------------------------------------------------------
@@ -5117,8 +5543,22 @@ def test_future_family_stream_frames_has_two_hand_built_carriers() -> None:
 
 
 # core/schemas.py:STATUS_SCHEMA — what the operator-facing status file declares about itself.
+# The classification block joined in the burn-down, declared with its writer (the sink's
+# ``turn.failed`` branch) under the stream_closed precedent: declare even under an open cap.
 STATUS_SCHEMA_KEYS = frozenset(
-    {"run_id", "state", "terminal", "last_event_seq", "last_event_type", "updated_at"}
+    {
+        "run_id",
+        "state",
+        "terminal",
+        "last_event_seq",
+        "last_event_type",
+        "updated_at",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "provider_retried",
+    }
 )
 
 
@@ -5168,24 +5608,82 @@ def test_future_family_status_json_is_already_wider_than_its_own_schema() -> Non
 CARRIER_FILES: dict[str, frozenset[str]] = {
     "config_recoverable": frozenset(
         {
+            # Joined in the burn-down: the immutable record of one call, the live stream lane
+            # (outcome type, sidecar writer/reader) that used to classify with half the
+            # vocabulary.
+            # Joined in the burn-down's durable batch: the park payload has a schema now, and
+            # this is one of the fields it type-checks.
+            "core/checkpoint.py",
+            "core/model_content.py",
+            "core/model_io.py",
+            "core/model_stream.py",
+            # Joined in the burn-down's carriage sweep: the offline run-status projection
+            # carries the full classification a parked turn.failed emits.
+            "core/projections.py",
             "core/result.py",
             "core/schemas.py",
             "errors.py",
             "loop.py",
+            # Joined in the carriage sweep: metrics.json states the failed run's verdict.
+            "loop_phases.py",
             "providers/gateway.py",
             "providers/openai.py",
+            # Joined in the carriage sweep: status.json (the live sink) carries the same set
+            # its offline twin projects.
+            "recorder.py",
+            # Joined in the burn-down: the backend record that carries the classification to the
+            # surfaces an operator reads (type, protocol, the driver that promotes it, and the
+            # projection that serves it).
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
+            "reference/backend/recovery.py",
+            "reference/backend/run_state.py",
+            # Joined in the Codex review cycle: the live stream broker frame carries the same
+            # classification pair its model-content sidecar records — retryable alone told a
+            # live consumer half the park's vocabulary.
+            "reference/backend/model_stream.py",
+            "reference/backend/run_types.py",
+            "reference/backend/service.py",
+            "reference/backend/session_drive.py",
             "reference/llm_gateway/http.py",
         }
     ),
     "provider_retried": frozenset(
         {
             "contracts.py",
+            # Joined in the burn-down's durable batch: see config_recoverable above.
+            "core/checkpoint.py",
             "core/model_io.py",
+            # Joined in the carriage sweep, with core/projections.py and recorder.py: the two
+            # status readers carry the parked fact and drop it at terminal, like the event.
+            "core/projections.py",
+            # Joined in the burn-down: the park type that records the failed turn, its event
+            # schema, and the loop that writes both plus the two transcript records.
+            "core/result.py",
+            "core/schemas.py",
             "errors.py",
+            "loop.py",
             "model_call.py",
             "observability/otel.py",
             "providers/base.py",
             "providers/gateway.py",
+            # Joined in the burn-down: the classifier reports the retries its own SDK made.
+            "providers/openai.py",
+            "recorder.py",
+            # Joined in the carriage sweep: the backend record carries all five park facts
+            # (type, protocol, event capture, the driver's promotion, and the projections
+            # that serve them) — provider_retried while parked, dropped at terminal.
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
+            # ``reference/backend/recovery.py`` LEFT this set in the round-3 fix: the give-up
+            # status artifact's ``provider_retried`` POP (the same drop the sink's
+            # ``run.failed`` branch makes) moved into the ONE shared quarantine writer,
+            # ``run_state.write_failure_status_artifact`` — run_state.py below already
+            # carries it, and recovery now calls the shared writer instead of naming the
+            # fact itself.
+            "reference/backend/run_state.py",
+            "reference/backend/run_types.py",
+            "reference/backend/session_drive.py",
             "reference/llm_gateway/http.py",
             "reference/llm_gateway/service.py",
         }
@@ -5193,6 +5691,8 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     "provider_usage": frozenset(
         {
             "core/model_io.py",
+            # Joined in the burn-down: turn.failed declares what the refused call cost.
+            "core/schemas.py",
             "loop.py",
             "providers/base.py",
             "providers/gateway.py",
@@ -5205,6 +5705,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",
+            # Joined in the burn-down: the two tenant ledgers now sum the priced sub-counts
+            # instead of folding them away.
+            "reference/backend/run_state.py",
+            "reference/llm_gateway/service.py",
         }
     ),
     # The W5 echo pair. ``reasoning_applied`` is the registered v0.21-track:B1 gap and has no
@@ -5358,30 +5862,19 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
     # ``core/checkpoint.py`` and ``core/spec.py`` carry aliased facts under other names
     # (``provider_http_status``, an omitted ``generation`` block), so no headline-name scan
     # reaches them and they are registered without appearing in one.
-    alias_only = {
-        "core/checkpoint.py",
-        "core/spec.py",
-        # Registered for what they DO NOT carry: the driver that branches on retryable
-        # alone, the status projection that never reads turn.failed, and the stream-outcome
-        # lane whose closed schema has no config_recoverable. A headline-name scan cannot
-        # reach a file by the name it fails to mention.
-        "reference/backend/session_drive.py",
-        "reference/backend/run_state.py",
-        "core/model_stream.py",
-        # Registered by the ToolSpec family, whose authority is a dataclass rather than a
-        # headline field name — its census (family 5) is the backstop for these.
-        "core/manifest.py",
-        # Round-2 registrations whose fact is not a headline wire field either: the raw/filtered
-        # error asymmetry, the two half-blind run-status projections, the three disagreeing
-        # terminal-state mappers, and a Suspension built outside the durable status vocabulary.
-        # Each is pinned by its own assertion below; no name scan can reach them.
-        "reference/backend/projection.py",
-        "core/projections.py",
-        "core/lifecycle.py",
-        "reference/backend/recovery.py",
-    }
+    # ``core/spec.py`` carries an aliased fact under another name (an omitted ``generation``
+    # block), so no headline-name scan reaches it and it is registered without appearing in one.
+    # This set is kept MINIMAL on purpose: an entry here that is also a scanned carrier reads as
+    # "no scan can reach this file", which stops being true the moment the file gains the field —
+    # exactly the stale-exemption drift the rest of this suite exists to catch.
+    alias_only = {"core/spec.py"}
     unaccounted = registered_paths - all_carriers - alias_only
     assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}
+    stale = alias_only & all_carriers
+    assert stale == set(), {
+        "exempted_but_actually_scanned": sorted(stale),
+        "hint": "a headline scan reaches this file now: drop its exemption",
+    }
     # Every family the census covers must not also be declared as one it does not.
     covered_families = {gap.family for gap in KNOWN_GAPS}
     declared_future = {family.family for family in FUTURE_FAMILIES}
@@ -5389,4 +5882,219 @@ def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None
         "declared_uncensused_but_registered_as_covered": sorted(
             covered_families & declared_future
         ),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Failure-quarantine writer census — every failure.json writer ends the run out loud
+# --------------------------------------------------------------------------------------
+#
+# Finding shape (PR #94 round 3): ``record_run_failure`` was the THIRD ``failure.json``
+# writer and the only one with no terminal statement — no status artifact, no ``run.failed``
+# — so after a restart every artifact-backed status surface served the run's old park
+# (``awaiting_input, terminal=false``) forever while ``recover_runs`` skipped the dir on
+# failure.json.  The rule is structural, so it is bound structurally: every function in src
+# that writes ``failure.json`` (directly, or through one of the two primitive writers) must,
+# in its own control flow, either write the terminal status artifact through the ONE shared
+# writer (``run_state.write_failure_status_artifact``) or emit ``run.failed`` (the loop's
+# lane — its ``StatusJsonSink`` consumes that event into the same artifact).  A fourth
+# writer that does neither fails HERE, not at an operator's console.
+
+_FAILURE_BUNDLE_PRIMITIVE_NAMES = frozenset({"write_failure", "write_failure_bundle"})
+_TERMINAL_STATUS_WRITER = "write_failure_status_artifact"
+
+#: The two functions that construct ``failure.json`` and write it themselves.  Their CALLERS
+#: are what the pairing census below binds; the primitives are data movement.
+FAILURE_JSON_PRIMITIVE_WRITERS = frozenset(
+    {
+        ("recorder.py", "AgentRecorder.write_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.write_failure_bundle"),
+    }
+)
+
+#: Every function that invokes a failure-bundle primitive, pinned exactly.  A new caller
+#: fails the pin (and then the pairing assertion says what it owes).
+FAILURE_QUARANTINE_WRITERS = frozenset(
+    {
+        ("loop.py", "AgentLoop._record_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+        ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+        ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        ("reference/backend/service.py", "RunnerBackend._write_failure_bundle"),
+    }
+)
+
+#: Delegating seams with no decision of their own.  Verified structurally below (a
+#: non-docstring body of exactly one delegating call) so logic cannot hide behind the
+#: exemption; their callers reach the primitives through injected callables named
+#: ``write_failure_bundle`` and are censused as callers themselves.
+_FAILURE_BUNDLE_PASS_THROUGHS = frozenset(
+    {("reference/backend/service.py", "RunnerBackend._write_failure_bundle")}
+)
+
+
+def _iter_src_functions():
+    """Every function definition under src, as ``(module, dotted qualname, node)``."""
+
+    def walk(node: ast.AST, prefix: str, rel: str):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qual = prefix + child.name
+                yield rel, qual, child
+                yield from walk(child, qual + ".", rel)
+            elif isinstance(child, ast.ClassDef):
+                yield from walk(child, prefix + child.name + ".", rel)
+            else:
+                yield from walk(child, prefix, rel)
+
+    for path in sorted(PACKAGE.rglob("*.py")):
+        rel = path.relative_to(PACKAGE).as_posix()
+        yield from walk(_module_tree(rel), "", rel)
+
+
+def _own_nodes(func: ast.AST):
+    """A function's own control flow: nested defs/lambdas excluded (they run when called,
+    not when the writer runs), so a terminal statement inside a closure cannot satisfy the
+    pairing and a nested def's writer call is attributed to the nested def."""
+
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _own_calls(func: ast.AST) -> list[tuple[str, ast.Call]]:
+    calls: list[tuple[str, ast.Call]] = []
+    for node in _own_nodes(func):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name):
+            calls.append((target.id, node))
+        elif isinstance(target, ast.Attribute):
+            calls.append((target.attr, node))
+    return calls
+
+
+def _emits_run_failed(func: ast.AST) -> bool:
+    for name, call in _own_calls(func):
+        if name != "emit" or not call.args:
+            continue
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and first.value == "run.failed":
+            return True
+    return False
+
+
+def test_the_failure_json_primitive_writers_are_exactly_the_censused_two() -> None:
+    """A third function that constructs failure.json itself bypasses the caller census below,
+    so the primitives are pinned first: mentioning the filename and writing json atomically in
+    one function is the shape both writers have and no reader has."""
+
+    found = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if any(
+            isinstance(node, ast.Constant) and node.value == "failure.json"
+            for node in _own_nodes(func)
+        )
+        and any(name == "write_json_atomic" for name, _ in _own_calls(func))
+    )
+    assert found == FAILURE_JSON_PRIMITIVE_WRITERS, {
+        "new_primitives": sorted(str(site) for site in found - FAILURE_JSON_PRIMITIVE_WRITERS),
+        "gone_primitives": sorted(str(site) for site in FAILURE_JSON_PRIMITIVE_WRITERS - found),
+        "hint": "a new direct failure.json writer: census it here and bind its callers below",
+    }
+
+
+def test_every_failure_json_writer_is_paired_with_a_terminal_statement() -> None:
+    """The census: each discovered caller of a failure-bundle primitive must, in the same
+    control flow, write the shared terminal status artifact or emit ``run.failed``."""
+
+    sites: dict[tuple[str, str], ast.AST] = {}
+    for module, qual, func in _iter_src_functions():
+        if (module, qual) in FAILURE_JSON_PRIMITIVE_WRITERS:
+            continue
+        if any(name in _FAILURE_BUNDLE_PRIMITIVE_NAMES for name, _ in _own_calls(func)):
+            sites[(module, qual)] = func
+
+    assert frozenset(sites) == FAILURE_QUARANTINE_WRITERS, {
+        "new_writers": sorted(
+            str(site) for site in frozenset(sites) - FAILURE_QUARANTINE_WRITERS
+        ),
+        "gone_writers": sorted(
+            str(site) for site in FAILURE_QUARANTINE_WRITERS - frozenset(sites)
+        ),
+        "hint": "a failure.json writer appeared or moved: census it here AND pair it with a "
+        "terminal statement (the shared status-artifact writer, or a run.failed emit)",
+    }
+
+    unbound: list[str] = []
+    for (module, qual), func in sorted(sites.items()):
+        if (module, qual) in _FAILURE_BUNDLE_PASS_THROUGHS:
+            # The exemption is earned structurally, not granted: a pass-through has no body
+            # beyond its docstring and the one delegating call.
+            body = [
+                stmt
+                for stmt in func.body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                )
+            ]
+            delegates = (
+                len(body) == 1
+                and isinstance(body[0], (ast.Expr, ast.Return))
+                and isinstance(body[0].value, ast.Call)
+                and isinstance(body[0].value.func, ast.Attribute)
+                and body[0].value.func.attr in _FAILURE_BUNDLE_PRIMITIVE_NAMES
+            )
+            assert delegates, {
+                "pass_through": f"{module}:{qual}",
+                "hint": "no longer a pure delegation -- it now owes the pairing itself",
+            }
+            continue
+        writes_artifact = any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+        if not (writes_artifact or _emits_run_failed(func)):
+            unbound.append(f"{module}:{qual}")
+
+    assert unbound == [], {
+        "writers_with_no_terminal_statement": unbound,
+        "hint": "a failure.json write that leaves status.json parked: after a restart every "
+        "status surface reports the dead run as a healthy park forever",
+    }
+
+
+def test_the_terminal_quarantine_artifact_has_one_writer_and_three_callers() -> None:
+    """One shared writer, all three quarantine lanes through it — the fix that replaced two
+    hand-rolled artifact writes.  A fourth lane must appear here (and in the census above)."""
+
+    definitions = frozenset(
+        (module, qual)
+        for module, qual, _func in _iter_src_functions()
+        if qual.split(".")[-1] == _TERMINAL_STATUS_WRITER
+    )
+    assert definitions == frozenset(
+        {("reference/backend/run_state.py", _TERMINAL_STATUS_WRITER)}
+    ), {"definitions": sorted(str(site) for site in definitions)}
+
+    callers = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if qual.split(".")[-1] != _TERMINAL_STATUS_WRITER
+        and any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+    )
+    assert callers == frozenset(
+        {
+            ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+            ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+            ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        }
+    ), {
+        "callers": sorted(str(site) for site in callers),
+        "hint": "the quarantine artifact rides all three failure lanes through ONE writer",
     }

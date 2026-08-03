@@ -67,8 +67,16 @@ class TurnNotSettled(NativeAgentError):
     the one-shot ``run_once`` absorbs it — its closing ``finally`` promotes an unrecovered
     park to the terminal failure record and returns that failed result. ``suspension``
     carries the full evidence (reason, error, ``retryable``, ``http_status``,
-    ``config_recoverable``) so a driver can decide between re-attempt, config fix, and
-    giving up — the same decision the Suspension-reading driver makes.
+    ``config_recoverable``, ``provider_error_code``, ``provider_retried``) so a driver can
+    decide between re-attempt, config fix, and giving up — the same decision the
+    Suspension-reading driver makes.
+
+    The classification is re-stamped onto the exception itself, not left behind
+    ``.suspension``, because this is the *blocking* facade: a driver here holds an exception
+    and nothing else. That decision is only as good as its inputs, which is why the provider's
+    own code and the adapter's spent retry budget are stamped beside the two booleans —
+    ``insufficient_quota`` (fix the config) and ``rate_limit_exceeded`` (back off) are the
+    same ``retryable``/``http_status`` pair and opposite answers.
     """
 
     error_code = "turn_not_settled"
@@ -81,6 +89,8 @@ class TurnNotSettled(NativeAgentError):
         self.retryable = suspension.retryable
         self.http_status = suspension.http_status
         self.config_recoverable = suspension.config_recoverable
+        self.provider_error_code = suspension.provider_error_code
+        self.provider_retried = suspension.provider_retried
 
 
 class PermissionDenied(NativeAgentError):
