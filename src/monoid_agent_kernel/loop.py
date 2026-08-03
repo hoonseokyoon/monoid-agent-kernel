@@ -203,6 +203,7 @@ from monoid_agent_kernel.providers.base import (
     format_async_result_text,
     provider_usage_of,
 )
+from monoid_agent_kernel.providers._common import NORMALIZED_USAGE_KEYS
 from monoid_agent_kernel.public_view import (
     args_preview,
     finish_args_preview,
@@ -2984,12 +2985,20 @@ class AgentLoop:
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
+        # The child's metrics FILTERED to the usage vocabulary. The authority is
+        # ``providers/_common.py:NORMALIZED_USAGE_KEYS`` -- the whole emitted domain of
+        # ``normalize_usage`` -- rather than a hand-written three-key tuple, which meant a
+        # child's cache and reasoning tokens never reached the parent's budget: an undercount in
+        # exactly the aggregate a bound is checked against. Filtered rather than splatted,
+        # because ``result.metrics`` also carries ``steps_limit`` / ``tool_calls`` /
+        # ``duration_s``, and folding those into a token total would corrupt it.
         usage = {
             key: result.metrics[key]
-            for key in ("input_tokens", "output_tokens", "total_tokens")
+            for key in NORMALIZED_USAGE_KEYS
             if isinstance(result.metrics, dict) and key in result.metrics
         }
-        # Report-only roll-up onto the parent context (NOT total_usage; see field comment).
+        # Report-only roll-up onto the parent context, AND into the parent's cumulative
+        # ``total_usage`` -- a child's tokens are spent on the parent's budget.
         if self._session is not None:
             parent_ctx = self._session.res.context
             parent_ctx.subagent_count += 1
@@ -3302,10 +3311,20 @@ class AgentLoop:
             "web_context_calls": context.web_service.web_context_calls,
             "web_failed_calls": context.web_service.web_failed_calls,
         }
-        # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
-        # adapter reports them, so the studio meter can show the reasoning share (R10).
+        # The priced sub-counts, each published only when the adapter reported one -- a run that
+        # used no cache must not read as one whose cache saved nothing. ``reasoning_tokens`` was
+        # the only one of the four on this event (R10's studio meter), so a cache-heavy run's
+        # priced detail never reached a live consumer at all. Spelled out one key at a time on
+        # purpose: a loop over a key tuple writes a computed subscript, which the carriage census
+        # cannot read, and an unreadable write is a wire key with no schema diff.
+        if state.total_usage.get("cache_read_tokens"):
+            metrics_data["cache_read_tokens"] = state.total_usage["cache_read_tokens"]
+        if state.total_usage.get("cache_creation_tokens"):
+            metrics_data["cache_creation_tokens"] = state.total_usage["cache_creation_tokens"]
         if state.total_usage.get("reasoning_tokens"):
             metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
+        if state.total_usage.get("audio_tokens"):
+            metrics_data["audio_tokens"] = state.total_usage["audio_tokens"]
         recorder.emit(
             "metrics.updated",
             turn_id=turn_id,

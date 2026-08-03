@@ -78,11 +78,25 @@ class LlmGatewayTurnRecord:
 
 @dataclass
 class LlmGatewayUsage:
+    """The tenant meter. It sums what ``normalize_usage`` emits — all of it.
+
+    The four sub-counts below are priced differently from plain input tokens (a cache read is
+    cheap, a cache write and a reasoning token are not), so a meter that folds them away cannot
+    reconstruct a bill. Worse, a provider that reports a cost *only* as sub-counts metered as
+    total=0: the priced call was invisible to this ledger entirely. ``total_tokens`` is still
+    whatever the provider reported as the total and is not re-derived here — the sub-counts are
+    reported beside it as their own columns, which is what makes such a call visible.
+    """
+
     tenant_id: str
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    reasoning_tokens: int = 0
+    audio_tokens: int = 0
 
     def add(self, usage: dict[str, int]) -> None:
         normalized = normalize_usage(usage)
@@ -90,6 +104,11 @@ class LlmGatewayUsage:
         self.input_tokens += normalized["input_tokens"]
         self.output_tokens += normalized["output_tokens"]
         self.total_tokens += normalized["total_tokens"]
+        # Emitted only when the adapter reported one, so each read defaults.
+        self.cache_read_tokens += normalized.get("cache_read_tokens", 0)
+        self.cache_creation_tokens += normalized.get("cache_creation_tokens", 0)
+        self.reasoning_tokens += normalized.get("reasoning_tokens", 0)
+        self.audio_tokens += normalized.get("audio_tokens", 0)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -98,6 +117,10 @@ class LlmGatewayUsage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "audio_tokens": self.audio_tokens,
         }
 
 

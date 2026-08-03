@@ -1539,6 +1539,14 @@ additionally carry optional priced sub-counts when the provider reports them —
 which the kernel sums into per-run totals and checks against the token budget. These
 fields are additive; a consumer that ignores them stays correct.
 
+The sub-counts travel the whole reporting chain, not just the totals: `metrics.updated`
+publishes each one it has (omitting the ones the adapter did not report), both tenant ledgers
+(the gateway's and the reference backend's) sum them as their own columns, and a subagent's
+sub-counts roll up into its parent through the same normalized vocabulary. `total_tokens` is
+still whatever the provider reported and is never re-derived from the sub-counts, so a call
+priced *only* in sub-counts reports `total_tokens: 0` and is visible in the columns it was
+actually expressed in. The token BUDGET is unchanged — it reads the three headline counts.
+
 Error response (the non-200 body, and — minus the `type` tag — the terminal SSE `error` frame,
 which is written from the same definition so the two transports cannot drift):
 

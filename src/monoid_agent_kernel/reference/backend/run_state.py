@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.event_sequencing import RunEventSequencer
 from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -79,11 +81,23 @@ def record_lifecycle_payload(record: RunRecordPort) -> dict[str, Any]:
 
 @dataclass
 class TenantUsage:
+    """The backend tenant ledger — the twin of the gateway's ``LlmGatewayUsage``.
+
+    The four priced sub-counts are summed here for the same reason they are summed there: they
+    are billed differently from plain input tokens, and a ledger that folds them away
+    under-reports a cache-heavy or reasoning-heavy run. Two meters, one rule; fixing one of them
+    and leaving the other is exactly the shape the carriage census exists to refuse.
+    """
+
     tenant_id: str
     runs: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    reasoning_tokens: int = 0
+    audio_tokens: int = 0
     web_search_calls: int = 0
     web_fetch_calls: int = 0
     web_context_calls: int = 0
@@ -93,11 +107,19 @@ class TenantUsage:
     web_context_source_count: int = 0
     web_context_bytes_returned: int = 0
 
-    def add_metrics(self, metrics: dict[str, Any]) -> None:
-        self.runs += 1
+    def add_metrics(self, metrics: dict[str, Any], *, count_run: bool = True) -> None:
+        """Fold one run's metrics in. ``count_run=False`` for a second fold of the SAME run —
+        the failure path meters what a run spent before it died, and a later recovery that
+        completes must add its remainder without the ledger counting the run twice."""
+        if count_run:
+            self.runs += 1
         self.input_tokens += _nonnegative_metric(metrics, "input_tokens")
         self.output_tokens += _nonnegative_metric(metrics, "output_tokens")
         self.total_tokens += _nonnegative_metric(metrics, "total_tokens")
+        self.cache_read_tokens += _nonnegative_metric(metrics, "cache_read_tokens")
+        self.cache_creation_tokens += _nonnegative_metric(metrics, "cache_creation_tokens")
+        self.reasoning_tokens += _nonnegative_metric(metrics, "reasoning_tokens")
+        self.audio_tokens += _nonnegative_metric(metrics, "audio_tokens")
         self.web_search_calls += _nonnegative_metric(metrics, "web_search_calls")
         self.web_fetch_calls += _nonnegative_metric(metrics, "web_fetch_calls")
         self.web_context_calls += _nonnegative_metric(metrics, "web_context_calls")
@@ -116,6 +138,10 @@ class TenantUsage:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "audio_tokens": self.audio_tokens,
             "web_search_calls": self.web_search_calls,
             "web_fetch_calls": self.web_fetch_calls,
             "web_context_calls": self.web_context_calls,
@@ -148,6 +174,10 @@ class RunStateMutationContext:
     now: Callable[[], float]
     write_failure_bundle: Callable[..., None]
     append_event: Callable[..., Any]
+    # How the failure path finds what the run had already spent. A run that dies of a driver
+    # exception never produces an ``AgentRunResult``, so its cumulative usage lives only in the
+    # last committed checkpoint (and, failing that, in the status projection on disk).
+    checkpoint_store_provider: Callable[[], CheckpointStore | None] | None = None
     event_sequencer: RunEventSequencer = field(default_factory=RunEventSequencer)
     logger: logging.Logger = field(
         default_factory=lambda: logging.getLogger("monoid_agent_kernel.backend")
@@ -160,6 +190,12 @@ class RunStateMutationService:
     def __init__(self, context: RunStateMutationContext) -> None:
         self._context = context
         self._usage: dict[str, TenantUsage] = {}
+        # Per-run high-water mark of what has already been metered, keyed by run id. Both
+        # terminal paths meter cumulative totals — the failure path from the last checkpoint,
+        # the result path from ``AgentRunResult.metrics`` — and a run that is metered on
+        # failure, recovered, and then completes would otherwise be billed twice for every
+        # token it spent before the crash. Process-local, exactly like ``_usage`` itself.
+        self._metered: dict[str, dict[str, int]] = {}
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
         def _read() -> dict[str, Any]:
@@ -270,11 +306,57 @@ class RunStateMutationService:
             record.error = public_error_message(result.error)
             record.error_code = result.error_code
             record.finished_at = self._context.now()
-            self._usage.setdefault(record.tenant_id, TenantUsage(record.tenant_id)).add_metrics(
-                result.metrics
-            )
+            self._meter_run(record.tenant_id, run_id, result.metrics)
 
         self._context.with_record_lock(_mutate)
+
+    def _meter_run(self, tenant_id: str, run_id: str, metrics: Mapping[str, Any]) -> None:
+        """Fold a run's CUMULATIVE metrics into the tenant ledger, counting each token once.
+
+        The single seam both terminal paths go through. ``metrics`` is a running total, not a
+        delta, so what is added is the part above this run's high-water mark; the run itself is
+        counted on the first metering only. Values this ledger cannot read as counts pass
+        through untouched, so ``add_metrics``'s own validation still answers for them.
+        """
+
+        first_metering = run_id not in self._metered
+        mark = self._metered.setdefault(run_id, {})
+        unmetered: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if type(value) is not int or value < 0:
+                unmetered[key] = value
+                continue
+            unmetered[key] = max(0, value - mark.get(key, 0))
+            mark[key] = max(mark.get(key, 0), value)
+        self._usage.setdefault(tenant_id, TenantUsage(tenant_id)).add_metrics(
+            unmetered, count_run=first_metering
+        )
+
+    def _spent_before_failure(self, run_id: str) -> dict[str, Any]:
+        """What a run had already spent when it died, from the most durable source available.
+
+        A run that dies of a driver exception produces no ``AgentRunResult``, so its usage lives
+        in the last committed checkpoint. The status projection on disk is the fallback (it holds
+        the last ``metrics.updated`` payload), and an empty mapping is the honest answer when
+        neither exists — the run is still counted, which is more than the ledger used to say.
+        """
+
+        provider = self._context.checkpoint_store_provider
+        store = provider() if provider is not None else None
+        if store is not None:
+            try:
+                stored = store.latest(run_id)
+            except Exception:  # pragma: no cover - a lookup failure must not mask the failure
+                stored = None
+            if stored is not None:
+                return dict(stored.checkpoint.total_usage)
+        status_path = self._context.run_root_provider() / run_id / "status.json"
+        try:
+            payload = loads_json_ingress(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        return dict(metrics) if isinstance(metrics, dict) else {}
 
     def record_run_failure(self, run_id: str, exc: Exception) -> None:
         self._context.write_failure_bundle(
@@ -297,6 +379,9 @@ class RunStateMutationService:
             retryable=_error_flag(exc, "retryable"),
             config_recoverable=_error_flag(exc, "config_recoverable"),
         )
+        # Read outside the record lock: this reaches the checkpoint store and the run directory,
+        # exactly like the bundle write above it.
+        spent = self._spent_before_failure(run_id)
 
         def _mutate() -> None:
             record = self._context.record(run_id)
@@ -304,5 +389,9 @@ class RunStateMutationService:
             record.error = public_error_message(str(exc))
             record.error_code = getattr(exc, "error_code", "internal_error")
             record.finished_at = self._context.now()
+            # A run that dies of a driver exception after N billed turns used to leave the
+            # ledger reporting zero for every one of them -- not even the run count -- while
+            # ``record_run_result`` beside it fed the same ledger from the same seam.
+            self._meter_run(record.tenant_id, run_id, spent)
 
         self._context.with_record_lock(_mutate)

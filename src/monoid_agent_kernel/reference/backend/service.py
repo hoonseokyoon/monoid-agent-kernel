@@ -577,6 +577,7 @@ class RunnerBackend:
                     **kwargs,
                 ),
                 append_event=append_event_to_run,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
                 event_sequencer=_RUN_EVENT_SEQUENCER,
                 logger=_LOGGER,
             )

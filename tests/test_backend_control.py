@@ -251,6 +251,120 @@ def test_the_backend_failure_bundle_states_the_classification_the_exception_carr
     assert bundle["retryable"] is False
 
 
+def test_a_run_that_dies_of_an_exception_meters_what_it_had_already_spent(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """A run that dies of a driver exception after N billed turns left the tenant ledger
+    reporting zero for every one of them -- not even the run count -- while
+    ``record_run_result`` beside it fed the same ledger. It never produces an
+    ``AgentRunResult``, so what it spent lives in the last committed checkpoint."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_metered"
+    record = _backend_record(run_id, backend.run_root / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={
+                "input_tokens": 40,
+                "output_tokens": 20,
+                "total_tokens": 60,
+                "reasoning_tokens": 5,
+            },
+        )
+    )
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 60
+    assert usage["reasoning_tokens"] == 5
+
+
+def test_a_failure_with_no_checkpoint_meters_from_the_status_projection(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The fallback: a run that died before its first park has no checkpoint, and the operator
+    status file on disk holds the last ``metrics.updated`` payload. With neither, the run is
+    still counted -- which is more than the ledger used to say."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_status_fallback"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.joinpath("status.json").write_text(
+        json.dumps({"run_id": run_id, "metrics": {"total_tokens": 25, "input_tokens": 25}}),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+
+
+def test_a_metered_failure_that_is_recovered_and_completes_is_not_billed_twice(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Both terminal paths report CUMULATIVE totals, from different sources. Without a per-run
+    high-water mark, a run metered on failure and then recovered to completion would have every
+    pre-crash token counted a second time -- and the run counted as two runs."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_then_recovered"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+        )
+    )
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+    backend._record_run_result(
+        run_id,
+        AgentRunResult(
+            run_id=run_id,
+            status="completed",
+            final_text="recovered and finished",
+            run_dir=run_dir,
+            diff_path=run_dir / "diff.patch",
+            proposal_path=run_dir / "proposal.json",
+            # The cumulative total of the whole run: the 60 already metered, plus 30 more.
+            metrics={"input_tokens": 60, "output_tokens": 30, "total_tokens": 90},
+        ),
+    )
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 90
+    assert usage["input_tokens"] == 60
+    assert usage["output_tokens"] == 30
+
+
 def test_the_backend_failure_bundle_claims_no_classification_it_was_not_given(
     tmp_path: Path,
     backend_factory: Any,

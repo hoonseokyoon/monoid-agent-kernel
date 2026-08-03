@@ -75,6 +75,25 @@ def project_message_to_text(message: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+# Every key :func:`normalize_usage` below can emit, and therefore the whole vocabulary of a
+# normalized usage mapping. Declared here, beside the function that is its authority, so a
+# consumer that must FILTER a wider mapping down to usage (the subagent roll-up folds a child's
+# whole metrics dict into the parent's totals, where a stray ``duration_s`` would corrupt them)
+# names the domain rather than hand-copying a subset of it. Kept in step with the function by
+# ``tests/test_carriage_conformance.py``, which reads the keys the live callable can assign.
+NORMALIZED_USAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "reasoning_tokens",
+        "audio_tokens",
+    }
+)
+
+
 def _usage_object(value: Any, field_name: str) -> dict[str, Any]:
     if value is None:
         return {}

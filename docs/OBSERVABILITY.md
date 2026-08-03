@@ -349,5 +349,12 @@ feed and descendant event polling.
 
 Each run writes `metrics.json` (and emits a `metrics.updated` event per turn) with
 final counters and timing: `status`, `duration_s`, `tool_calls`, shell/background-job counters,
-web-call counters, and token usage (`input_tokens`, `output_tokens`, `total_tokens`,
-`reasoning_tokens`). See [Outputs](#outputs) for the full run-directory artifact set.
+web-call counters, and token usage (`input_tokens`, `output_tokens`, `total_tokens`, plus the
+priced sub-counts `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens` and
+`audio_tokens`). Each sub-count appears on the event only when the adapter reported one, so a
+run that used no cache publishes no cache columns rather than a row of zeros — a dashboard
+should treat an absent sub-count as "not reported", not as zero. `metrics.updated` is emitted
+once per model call, including a call that failed *after* the provider billed for it (that arm
+adds the billed tokens to the totals, so it publishes them too); a failure that reached no
+provider adds nothing and emits nothing. See [Outputs](#outputs) for the full run-directory
+artifact set.

@@ -206,51 +206,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "added to withhold",
         "burn-down",
     ),
-    # --- usage sub-counts: normalized, then flattened ----------------------------------
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "reference/llm_gateway/service.py:LlmGatewayUsage",
-        "the tenant meter sums only input/output/total, dropping the four priced sub-counts "
-        "normalize_usage emits; corollary A8 — a billed failure that reports ONLY sub-counts "
-        "meters as total=0, so the priced call is invisible to the meter entirely",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/audio_tokens",
-        "core/schemas.py:EVENT_DATA_SCHEMAS",
-        "metrics.updated declares reasoning_tokens but not its three sibling sub-counts, so a "
-        "cache-heavy run's priced detail never reaches a live consumer",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "loop.py:_run_subagent_child",
-        "the parent roll-up hard-codes a 3-key tuple, so a child's sub-counts never reach the "
-        "parent's budget — an undercount in exactly the aggregate a bound is checked against",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
-        "reference/backend/run_state.py:TenantUsage",
-        "the unregistered twin of the gateway meter above: add_metrics sums input/output/total "
-        "and eight web counters and drops the four priced sub-counts, so the BACKEND tenant "
-        "ledger under-reports a cache-heavy or reasoning-heavy run exactly like the gateway's. "
-        "Two meters, one omission, and fixing one of them leaves the other",
-        "burn-down",
-    ),
-    CarriageGap(
-        "usage",
-        "metrics",
-        "reference/backend/run_state.py:record_run_failure",
-        "meters nothing at all, while record_run_result beside it feeds result.metrics into the "
-        "tenant ledger — so a run that dies of a driver exception after N billed turns leaves "
-        "the ledger reporting zero for every one of them (not even the run count)",
-        "burn-down",
-    ),
     # --- config_recoverable: the consumers that were designed for it and ignore it -----
     CarriageGap(
         "transportable-error",
@@ -3159,13 +3114,15 @@ def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
 # --------------------------------------------------------------------------------------
 
 # reference/llm_gateway/service.py:LlmGatewayUsage — the tenant meter's total emitted domain.
-GATEWAY_METER_KEYS = frozenset(
-    {"tenant_id", "calls", "input_tokens", "output_tokens", "total_tokens"}
-)
+GATEWAY_METER_KEYS = frozenset({"tenant_id", "calls"}) | NORMALIZED_USAGE_KEYS
 
 
-def test_3a_tenant_meter_drops_every_priced_sub_count() -> None:
-    """Behavioral: ``add`` normalizes seven keys and sums three, which no key diff can show."""
+def test_3a_tenant_meter_sums_every_priced_sub_count() -> None:
+    """Behavioral: ``add`` normalizes seven keys and must sum all seven.
+
+    A key diff cannot show this on its own -- the meter used to normalize all seven and add
+    three -- so the counts are read back by value against the maximal usage.
+    """
 
     meter = LlmGatewayUsage(tenant_id="tenant-1")
     meter.add(dict(_MAXIMAL_USAGE))
@@ -3174,60 +3131,74 @@ def test_3a_tenant_meter_drops_every_priced_sub_count() -> None:
         "missing": sorted(GATEWAY_METER_KEYS - set(reported)),
         "extra": sorted(set(reported) - GATEWAY_METER_KEYS),
     }
-    dropped = NORMALIZED_USAGE_KEYS - set(reported)
-    assert dropped == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "reasoning_tokens",
-        "audio_tokens",
-    }, {"dropped_sub_counts": sorted(dropped)}
+    assert NORMALIZED_USAGE_KEYS - set(reported) == set()
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
 
 
-def test_3a_a_sub_count_only_billed_call_meters_as_zero() -> None:
-    """Corollary A8: the meter cannot see a cost expressed only in sub-counts."""
+def test_3a_a_sub_count_only_billed_call_is_visible_to_the_meter() -> None:
+    """Corollary A8, closed: the meter can now see a cost expressed only in sub-counts.
+
+    ``total_tokens`` stays 0 -- that is what the provider reported, and this ledger does not
+    invent a total the provider did not send. What changed is that the priced call is no longer
+    invisible: its cost is reported in the columns it was actually expressed in.
+    """
 
     meter = LlmGatewayUsage(tenant_id="tenant-1")
     meter.add({"cache_read_tokens": 5_000, "reasoning_tokens": 900})
     reported = meter.to_json()
     counted = (reported["input_tokens"], reported["output_tokens"], reported["total_tokens"])
     assert counted == (0, 0, 0)
+    assert reported["cache_read_tokens"] == 5_000
+    assert reported["reasoning_tokens"] == 900
     assert reported["calls"] == 1
 
 
-# core/schemas.py:EVENT_DATA_SCHEMAS["metrics.updated"] — reasoning_tokens is the only sub-count.
-METRICS_UPDATED_KEYS = frozenset(
-    {
-        "step",
-        "tool_calls",
-        "input_tokens",
-        "output_tokens",
-        "total_tokens",
-        "reasoning_tokens",
-        "web_search_calls",
-        "web_fetch_calls",
-        "web_context_calls",
-        "web_failed_calls",
-    }
+# core/schemas.py:EVENT_DATA_SCHEMAS["metrics.updated"] — the whole normalized usage vocabulary
+# now, plus the step/tool/web counters. It used to declare ``reasoning_tokens`` alone of the four
+# priced sub-counts, so a cache-heavy run's priced detail never reached a live consumer.
+METRICS_UPDATED_KEYS = (
+    frozenset(
+        {
+            "step",
+            "tool_calls",
+            "web_search_calls",
+            "web_fetch_calls",
+            "web_context_calls",
+            "web_failed_calls",
+        }
+    )
+    | NORMALIZED_USAGE_KEYS
 )
 
 
-def test_3b_metrics_updated_declares_one_of_the_four_sub_counts() -> None:
+def test_3b_metrics_updated_declares_every_priced_sub_count() -> None:
     declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
     assert declared == METRICS_UPDATED_KEYS, {
         "missing": sorted(METRICS_UPDATED_KEYS - declared),
         "extra": sorted(declared - METRICS_UPDATED_KEYS),
     }
-    assert NORMALIZED_USAGE_KEYS - declared == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "audio_tokens",
+    assert NORMALIZED_USAGE_KEYS - declared == set(), {
+        "emitted_by_the_normalizer_and_undeclared_here": sorted(
+            NORMALIZED_USAGE_KEYS - declared
+        ),
     }
 
 
 # The one usage-bearing emit site the ``data={...}`` census cannot see: it passes a *name*
 # (``data=metrics_data``), so the literal lives in an assignment several statements earlier and
 # a key added there reaches the wire with no schema entry and no census.
-METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - {"reasoning_tokens"}
+#
+# The four priced sub-counts are the conditional half: each is written only when the adapter
+# reported one, so a run that used no cache does not publish a column of zeros. Everything else
+# rides the literal unconditionally.
+METRICS_UPDATED_CONDITIONAL_KEYS = frozenset(
+    {"cache_read_tokens", "cache_creation_tokens", "reasoning_tokens", "audio_tokens"}
+)
+METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - METRICS_UPDATED_CONDITIONAL_KEYS
 
 
 def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
@@ -3256,9 +3227,12 @@ def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
         "emitted_always": sorted(written.literals[0]),
         "expected": sorted(METRICS_UPDATED_UNCONDITIONAL_KEYS),
     }
-    # ``reasoning_tokens`` is added only when the adapter reported one, which is why it is the
-    # single sub-count on this event and why it cannot be censused off the literal alone.
-    assert conditional == {"reasoning_tokens"}, {"emitted_conditionally": sorted(conditional)}
+    # Each priced sub-count is added only when the adapter reported one, which is why none of
+    # them can be censused off the literal alone.
+    assert conditional == METRICS_UPDATED_CONDITIONAL_KEYS, {
+        "emitted_conditionally": sorted(conditional),
+        "expected": sorted(METRICS_UPDATED_CONDITIONAL_KEYS),
+    }
     declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
     assert written.keys == declared, {
         "emitted_not_declared": sorted(written.keys - declared),
@@ -3303,19 +3277,34 @@ def test_3e_the_lenient_error_usage_reader_passes_a_key_no_normalizer_emits() ->
     assert gateway_client._reported_error_usage({"usage": {"input_tokens": True}}) == {}
 
 
-def test_3c_subagent_rollup_hard_codes_three_of_the_seven_usage_keys() -> None:
-    """The parent budget reads a literal tuple, so a sub-count can never reach it."""
+def test_3c_the_subagent_rollup_filters_through_the_usage_authority() -> None:
+    """The parent budget reads the normalizer's whole domain, and reads it from one place.
 
-    tree = _module_tree("loop.py")
-    child = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_run_subagent_child"
+    It used to read a literal three-key tuple, so a child's cache and reasoning tokens never
+    reached the parent -- an undercount in exactly the aggregate a bound is checked against. The
+    fix is a filter through the authority, not a wider hand copy, so this pin is two claims: the
+    module constant IS the census's authority, and the roll-up spells no usage key of its own.
+    """
+
+    from monoid_agent_kernel.providers._common import (
+        NORMALIZED_USAGE_KEYS as declared_authority,
     )
-    rolled: list[frozenset[str]] = []
+
+    assert declared_authority == NORMALIZED_USAGE_KEYS, {
+        "in_the_module_only": sorted(declared_authority - NORMALIZED_USAGE_KEYS),
+        "in_the_census_only": sorted(NORMALIZED_USAGE_KEYS - declared_authority),
+        "hint": "the constant beside normalize_usage must be its emitted domain",
+    }
+
+    child = _function_node("loop.py", "_run_subagent_child")
+    assert "NORMALIZED_USAGE_KEYS" in _names_in(child), {
+        "hint": "the roll-up no longer names the authority it is meant to filter through",
+    }
+    # ...and no hand-written subset of it survives anywhere in the function: a tuple, list or set
+    # display of usage keys is the shape this census caught the first time.
+    hand_written: list[frozenset[str]] = []
     for node in ast.walk(child):
-        if not isinstance(node, ast.Tuple):
+        if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             continue
         names = {
             element.value
@@ -3323,11 +3312,10 @@ def test_3c_subagent_rollup_hard_codes_three_of_the_seven_usage_keys() -> None:
             if isinstance(element, ast.Constant) and isinstance(element.value, str)
         }
         if names and names <= NORMALIZED_USAGE_KEYS:
-            rolled.append(frozenset(names))
-    assert len(rolled) == 1, {"usage_key_tuples_in_the_rollup": [sorted(item) for item in rolled]}
-    assert rolled[0] == {"input_tokens", "output_tokens", "total_tokens"}, {
-        "rolled_up": sorted(rolled[0]),
-        "hint": "widened? update EXPECTED and drop the registry entry",
+            hand_written.append(frozenset(names))
+    assert hand_written == [], {
+        "hand_written_usage_key_sets": [sorted(item) for item in hand_written],
+        "hint": "a second spelling of the usage domain beside the authority it filters through",
     }
 
 
@@ -4974,8 +4962,13 @@ def test_gap_the_cancellation_flag_is_written_always_and_applied_conditionally()
     }
 
 
-def test_gap_the_backend_tenant_meter_drops_the_same_sub_counts_the_gateway_does() -> None:
-    """Registered (round 2): the unregistered twin of the gateway meter, pinned behaviorally."""
+def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
+    """The gateway meter's twin, pinned behaviorally and cross-asserted against it.
+
+    Two meters, one omission: both summed input/output/total and dropped the four priced
+    sub-counts, and fixing one of them would have left the other. The cross-assert below is what
+    makes them one rule rather than two that happen to agree today.
+    """
 
     from monoid_agent_kernel.reference.backend.run_state import TenantUsage
 
@@ -4983,20 +4976,26 @@ def test_gap_the_backend_tenant_meter_drops_the_same_sub_counts_the_gateway_does
     meter.add_metrics({**_MAXIMAL_USAGE, "web_search_calls": 3})
     reported = meter.to_json()
     dropped = NORMALIZED_USAGE_KEYS - set(reported)
-    assert dropped == {
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "reasoning_tokens",
-        "audio_tokens",
-    }, {"dropped_sub_counts": sorted(dropped)}
-    # ...the exact set the gateway meter drops, so the two ledgers are wrong the same way.
+    assert dropped == set(), {"dropped_sub_counts": sorted(dropped)}
+    # ...and the gateway's ledger drops exactly the same nothing, so the two agree by rule.
     assert dropped == NORMALIZED_USAGE_KEYS - GATEWAY_METER_KEYS
-    assert reported["total_tokens"] == _MAXIMAL_USAGE["total_tokens"]
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
     assert reported["web_search_calls"] == 3
 
 
-def test_gap_a_run_that_dies_of_an_exception_meters_nothing() -> None:
-    """Registered (round 2): record_run_failure has no meter, its sibling does."""
+def test_both_terminal_paths_meter_the_run_through_one_seam() -> None:
+    """``record_run_failure`` metered nothing at all while its sibling fed the ledger.
+
+    Pinned as "one seam", not as "both call ``add_metrics``": the two paths report CUMULATIVE
+    totals from different sources (the last checkpoint, and ``AgentRunResult.metrics``), so the
+    guard against billing a metered-then-recovered-then-completed run twice is that a single
+    function owns the per-run high-water mark. A second caller of ``add_metrics`` would be a
+    second place that has to remember the mark.
+    """
 
     failure = _function_node(
         "reference/backend/run_state.py", "record_run_failure", within="RunStateMutationService"
@@ -5004,12 +5003,18 @@ def test_gap_a_run_that_dies_of_an_exception_meters_nothing() -> None:
     success = _function_node(
         "reference/backend/run_state.py", "record_run_result", within="RunStateMutationService"
     )
-    assert "add_metrics" in _names_in(success)
-    assert "add_metrics" not in _names_in(failure), {
-        "hint": "the failure path meters now: drop the registry entry",
+    seam = _function_node(
+        "reference/backend/run_state.py", "_meter_run", within="RunStateMutationService"
+    )
+    assert "_meter_run" in _names_in(success)
+    assert "_meter_run" in _names_in(failure), {
+        "hint": "the failure path meters nothing again",
     }
-    # Not even the run count, which is what add_metrics increments first.
-    assert "_usage" not in _names_in(failure)
+    assert "add_metrics" in _names_in(seam)
+    for path in (failure, success):
+        assert "add_metrics" not in _names_in(path), {
+            "hint": "a second ledger writer beside the seam that owns the high-water mark",
+        }
 
 
 def test_gap_three_mappers_answer_a_terminal_limited_run_three_ways() -> None:
@@ -5285,6 +5290,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",
+            # Joined in the burn-down: the two tenant ledgers now sum the priced sub-counts
+            # instead of folding them away.
+            "reference/backend/run_state.py",
+            "reference/llm_gateway/service.py",
         }
     ),
     # The W5 echo pair. ``reasoning_applied`` is the registered v0.21-track:B1 gap and has no

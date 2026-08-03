@@ -1177,6 +1177,74 @@ def test_metrics_omit_reasoning_tokens_when_absent(tmp_path: Path) -> None:
         loop.close()
 
 
+def test_metrics_surface_every_priced_sub_count_when_reported(tmp_path: Path) -> None:
+    """``reasoning_tokens`` was the only one of the four priced sub-counts on this event, so a
+    cache-heavy run's priced detail never reached a live consumer -- and a cache read, a cache
+    write and an audio token are each billed differently from a plain input token."""
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text="done",
+                usage={
+                    "input_tokens": 5,
+                    "output_tokens": 9,
+                    "total_tokens": 14,
+                    "cache_read_tokens": 1_200,
+                    "cache_creation_tokens": 300,
+                    "reasoning_tokens": 7,
+                    "audio_tokens": 4,
+                },
+            )
+        ]
+    )
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics
+        data = metrics[-1].data
+        assert data["cache_read_tokens"] == 1_200
+        assert data["cache_creation_tokens"] == 300
+        assert data["reasoning_tokens"] == 7
+        assert data["audio_tokens"] == 4
+    finally:
+        loop.close()
+
+
+def test_metrics_omit_every_priced_sub_count_the_adapter_did_not_report(tmp_path: Path) -> None:
+    """The other half of the conditional, on all four: a run that used no cache must not read
+    as one whose cache saved nothing."""
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                final_text="done",
+                usage={
+                    "input_tokens": 5,
+                    "output_tokens": 9,
+                    "total_tokens": 14,
+                    "reasoning_tokens": 7,
+                },
+            )
+        ]
+    )
+    loop, sink, _ = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        loop.run_until_suspended("hi")
+        metrics = [e for e in sink.events if e.type == "metrics.updated"]
+        assert metrics
+        data = metrics[-1].data
+        assert data["reasoning_tokens"] == 7
+        assert "cache_read_tokens" not in data
+        assert "cache_creation_tokens" not in data
+        assert "audio_tokens" not in data
+    finally:
+        loop.close()
+
+
 def test_recoverable_turn_error_classifier() -> None:
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=400))
     assert _recoverable_turn_error(ModelAdapterError("x", http_status=401))

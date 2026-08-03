@@ -160,6 +160,41 @@ out in commit messages and here.
   and the closed `stream_closed` schema — now name the field directly, because a pin over an
   empty set proves nothing and both entries are still open.
 
+### Fixed — every priced count reaches every ledger
+
+- **Both tenant meters sum the four priced sub-counts.** The gateway's `LlmGatewayUsage` and the
+  reference backend's `TenantUsage` each normalized seven counts and summed three, so a
+  cache-heavy or reasoning-heavy run under-reported on both — and a call priced *only* in
+  sub-counts (an entirely cache-read turn) metered as `total=0`, invisible to the ledger.
+  `total_tokens` is still what the provider reported and is never re-derived; what changed is
+  that the sub-counts are their own columns, so such a call is visible in the ones it was
+  actually expressed in. Fixed on both meters in one change: two meters with one omission is
+  precisely the shape where fixing one leaves the other.
+- **`metrics.updated` publishes all four.** It declared `reasoning_tokens` alone (R10's studio
+  meter) and not its three siblings, so a cache-heavy run's priced detail never reached a live
+  consumer. Each is written only when the adapter reported one, so an absent sub-count means
+  "not reported" rather than zero. **Dashboard step-change:** a consumer summing token columns
+  across events will see cache/audio columns appear for the first time on runs that were already
+  producing them.
+- **A subagent's sub-counts reach its parent.** The roll-up read a hard-coded three-key tuple,
+  so a child's cache and reasoning tokens stopped at the child — an undercount in exactly the
+  aggregate a bound is checked against. It now filters the child's metrics through
+  `providers/_common.py:NORMALIZED_USAGE_KEYS`, the emitted domain of `normalize_usage`, rather
+  than a wider hand copy (and a filter rather than a splat: `result.metrics` carries
+  `tool_calls` / `duration_s` beside the counts). The token budget itself is unchanged — it
+  reads the three headline counts — so this is a reporting step-change, not a behavior change
+  for runs near a bound. The roll-up's own comment claimed it did not touch `total_usage` while
+  the code beneath it did; the comment now matches.
+- **A run that dies of an exception is metered.** `record_run_failure` fed the tenant ledger
+  nothing at all — not even the run count — while `record_run_result` beside it did, so a run
+  that died of a driver exception after N billed turns reported zero for every one of them. It
+  meters what the run had already spent, from the last committed checkpoint (its
+  `total_usage`), falling back to the on-disk status projection, and counts the run either way.
+  Both terminal paths report *cumulative* totals from different sources, so both go through one
+  seam that owns a per-run high-water mark: a run metered on failure, recovered, and then
+  completed is billed once for each token, and counted once as a run.
+- Four more `KNOWN_GAPS` entries closed (plus the two round-2 twin registrations beside them).
+
 ### Added — the park records the classification the wire already carried
 
 - **`Suspension` gains `provider_error_code` and `provider_retried`, and both ride the

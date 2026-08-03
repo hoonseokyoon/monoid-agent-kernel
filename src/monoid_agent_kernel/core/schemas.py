@@ -230,7 +230,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "input_tokens": _INT,
             "output_tokens": _INT,
             "total_tokens": _INT,
+            # The priced sub-counts, each present only when the adapter reported one. All four
+            # are billed differently from a plain input token, so a live consumer that sees only
+            # ``reasoning_tokens`` cannot show what a cache-heavy run actually cost.
+            "cache_read_tokens": _INT,
+            "cache_creation_tokens": _INT,
             "reasoning_tokens": _INT,
+            "audio_tokens": _INT,
             "web_search_calls": _INT,
             "web_fetch_calls": _INT,
             "web_context_calls": _INT,

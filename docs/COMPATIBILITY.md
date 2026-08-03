@@ -251,6 +251,14 @@ the park reader defaults every absent key, so a pre-v0.21 checkpoint restores ex
 and the event schemas grow optional properties without changing a `required` list. No checkpoint
 schema version bump, and no reader has to migrate.
 
+`metrics.updated` grows the three priced sub-counts beside `reasoning_tokens`
+(`cache_read_tokens`, `cache_creation_tokens`, `audio_tokens`), each emitted only when the
+adapter reported one — an absent sub-count means "not reported", not zero. Both tenant-usage
+JSON projections (the gateway's `/internal/llm/tenants/{id}/usage` and the backend's
+`tenant_usage`) gain the same four keys. Neither is a versioned artifact in the inventory above
+and neither has a serialized reader contract; the additions are new keys on a read-only
+projection, so a consumer that ignores them stays correct.
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other
