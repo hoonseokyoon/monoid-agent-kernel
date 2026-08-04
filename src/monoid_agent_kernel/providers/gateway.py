@@ -897,7 +897,7 @@ def _gateway_reasoning_items(
 
 
 def _validated_generation_echo(
-    applied: Any, *, provider_retried: bool = False
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
 ) -> dict[str, Any] | None:
     """Shape-check one ``generation_applied`` echo. One rule, both transports.
 
@@ -907,6 +907,11 @@ def _validated_generation_echo(
     sync response and the streamed terminal frame read the same key out of different
     envelopes -- the streamed side used to reject a malformed echo that the sync side accepted
     under ``"omit"``.
+
+    ``http_status`` is the same parameter every other validator on this wire takes, for the same
+    reason: a caller that already holds a trustworthy status hands it over, so which field of one
+    malformed frame happened to be bad does not decide whether the refusal can name a status. The
+    enforcement callers below hold none and pass none.
     """
 
     if applied is None or isinstance(applied, dict):
@@ -915,11 +920,14 @@ def _validated_generation_echo(
         "LLM gateway returned an invalid generation_applied echo: expected an object",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=provider_retried,
     )
 
 
-def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> bool | None:
+def _validated_schema_echo(
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
+) -> bool | None:
     """The ``schema_applied`` twin of :func:`_validated_generation_echo`, same rule."""
 
     if applied is None or isinstance(applied, bool):
@@ -928,6 +936,7 @@ def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> b
         "LLM gateway returned an invalid schema_applied echo: expected a boolean",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=provider_retried,
     )
 
@@ -1420,10 +1429,14 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         # billed frame the same way, and only the echo pair was carrying the cost out.
         try:
             applied = _validated_generation_echo(
-                event.get("generation_applied"), provider_retried=retried
+                event.get("generation_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
             )
             schema_applied = _validated_schema_echo(
-                event.get("schema_applied"), provider_retried=retried
+                event.get("schema_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
             )
             # The gateway's opaque turn_handle is the continuation handle the core stores.
             return TurnComplete(

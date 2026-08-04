@@ -1410,9 +1410,12 @@ def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
 #
 # This is a HAND list, and every census below that resolves a key through it inherits its
 # blindness: ``_literal_wire_keys`` picks a reader's keys out of the arguments it hands these
-# helpers, so a ninth helper carrying a ninth key would make that key invisible and the pinned
-# read-set would still match. ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``
-# below derives the same set from the module and diffs it against this one.
+# helpers, so a twelfth helper carrying a twelfth key would make that key invisible and the pinned
+# read-set would still match. Both halves of it are derived and diffed against the module below --
+# ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use`` for the helpers that
+# read the wire mapping themselves, and
+# ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use`` for the ones handed
+# an already-extracted value.
 GATEWAY_WIRE_READ_HELPERS = frozenset(
     {
         "_gateway_string",
@@ -1424,6 +1427,8 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "usage_reported_by",
         "_portable_gateway_payload",
         "_gateway_reasoning_items",
+        "_validated_generation_echo",
+        "_validated_schema_echo",
     }
 )
 
@@ -1473,6 +1478,22 @@ def _gateway_import_homes() -> dict[str, str]:
     return homes
 
 
+def _gateway_reader_callees() -> frozenset[str]:
+    """Every name the registered readers call: the reach of all three censuses in this family.
+
+    Written once because it *is* the shared premise -- "a helper is what a reader hands the wire
+    to" -- and three copies of the reach is three copies that can drift apart while each stays
+    internally consistent.
+    """
+
+    local = _all_functions("providers/gateway.py")
+    called: set[str] = set()
+    for reader in GATEWAY_ERROR_READERS:
+        for node in local[reader.split(":", 1)[1]]:
+            called |= _called_local_names(node)
+    return frozenset(called)
+
+
 def _foreign_wire_read_helper_homes() -> dict[str, str]:
     """The derived twin of ``GATEWAY_WIRE_READ_HELPER_HOMES``: where each FOREIGN wire-reading
     helper the registered readers call is defined.
@@ -1491,12 +1512,8 @@ def _foreign_wire_read_helper_homes() -> dict[str, str]:
 
     local = _all_functions("providers/gateway.py")
     imported = _gateway_import_homes()
-    called: set[str] = set()
-    for reader in GATEWAY_ERROR_READERS:
-        for node in local[reader.split(":", 1)[1]]:
-            called |= _called_local_names(node)
     homes: dict[str, str] = {}
-    for name in sorted(called - set(local)):
+    for name in sorted(_gateway_reader_callees() - set(local)):
         home = imported.get(name)
         if home is None:
             continue
@@ -1519,9 +1536,22 @@ GATEWAY_MAPPING_READ_HELPERS = frozenset(
     }
 )
 # The registered helpers no mapping scan can reach: they validate an already-extracted
-# ``value: Any``, so they carry no wire key of their own and the caller names the key.
+# ``value: Any``, so they carry no wire key of their own and the caller names the key. Pinned in
+# full for the same reason as its sibling above, and derived the same way -- this list was the
+# hand-written half of the closing equality in
+# ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``, so a new value
+# validator could be added to *both* hand lists at once and the equality stayed green while
+# nothing had checked the module. ``_validated_generation_echo``/``_validated_schema_echo`` were
+# exactly that: this shape since they were written, registered nowhere until the derivation below
+# named them.
 GATEWAY_WIRE_VALUE_VALIDATORS = frozenset(
-    {"_gateway_usage", "_portable_gateway_payload", "_gateway_reasoning_items"}
+    {
+        "_gateway_usage",
+        "_portable_gateway_payload",
+        "_gateway_reasoning_items",
+        "_validated_generation_echo",
+        "_validated_schema_echo",
+    }
 )
 
 
@@ -2882,9 +2912,19 @@ def _discovered_gateway_error_readers() -> set[str]:
     helper, so it was not a reader; it is now, because reading a key off a parameter used as a
     mapping is the same act whether a helper or the reader itself performs it. The registered
     helpers are excluded by name: every one of them reads a key and raises, and a helper is what
-    the *other* census in this family is for
-    (``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``), so counting them
-    here would only move the hand list, not derive it.
+    the *other* censuses in this family are for
+    (``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use`` and
+    ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use``), so counting
+    them here would only move the hand list, not derive it.
+
+    Which helper, though, is the part that mattered. "Calls a registered helper" counted the VALUE
+    validators too, and a value validator is handed something its caller already pulled off the
+    wire — so the moment ``_validated_generation_echo``/``_validated_schema_echo`` were registered,
+    their callers ``_check_generation_applied``/``_check_schema_applied`` became "readers": policy
+    checks that never touch a mapping, hold no wire in hand, and have none of a reader's pinned
+    key sets or round-trip behavior to answer for. Only the MAPPING-reading helpers count now, and
+    that loses no reader: getting a value out of the wire to hand onward means reading the mapping,
+    either directly (caught by ``_reads_a_mapping_parameter``) or through one of those helpers.
     """
 
     functions = _all_functions("providers/gateway.py")
@@ -2902,7 +2942,7 @@ def _discovered_gateway_error_readers() -> set[str]:
                 (_called_local_names(node) & constructing) - {name}
             )
             reads_the_wire = bool(
-                _called_local_names(node) & GATEWAY_WIRE_READ_HELPERS
+                _called_local_names(node) & GATEWAY_MAPPING_READ_HELPERS
             ) or _reads_a_mapping_parameter(node)
             if raises_a_model_error and reads_the_wire:
                 discovered.add(f"providers/gateway.py:{name}")
@@ -2932,10 +2972,7 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
     """
 
     functions = _all_functions("providers/gateway.py")
-    called_by_readers: set[str] = set()
-    for reader in GATEWAY_ERROR_READERS:
-        for node in functions[reader.split(":", 1)[1]]:
-            called_by_readers |= _called_local_names(node)
+    called_by_readers = _gateway_reader_callees()
     # A helper the readers call is a wire reader wherever it is defined. ``usage_reported_by``
     # is shared with the OpenAI adapter and lives in ``providers/_common.py``, so a scan of this
     # module alone stopped discovering it -- and a helper that is not discovered is one whose
@@ -2960,8 +2997,12 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
         "census below silently stops counting the keys it carries",
     }
     assert discovered <= GATEWAY_WIRE_READ_HELPERS
-    # The hand list is exactly the discovered mapping readers plus the two value validators,
-    # which take an already-extracted value and therefore name no key of their own.
+    # The hand list is exactly the discovered mapping readers plus the value validators, which
+    # take an already-extracted value and therefore name no key of their own. Both operands of
+    # this equality used to be hand-written, which is what made it a tautology dressed as a
+    # census: a new helper of either shape, added to two lists in one edit, kept it green. The
+    # left one is derived above and the right one in
+    # ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use`` below.
     assert GATEWAY_MAPPING_READ_HELPERS | GATEWAY_WIRE_VALUE_VALIDATORS == (
         GATEWAY_WIRE_READ_HELPERS
     ), {
@@ -2982,6 +3023,92 @@ def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> No
             "hint": "it carries a wire key of its own now: move it to "
             "GATEWAY_MAPPING_READ_HELPERS and account for the key it reads",
         }
+
+
+def _discovered_gateway_wire_value_validators() -> set[str]:
+    """Every helper the registered readers hand an ALREADY-EXTRACTED value to for shape-checking.
+
+    The mirror image of the mapping-reader discovery above, and the same three-part predicate read
+    the other way round: a function one of the registered readers calls, that raises a
+    ``ModelAdapterError`` of its own, and that reads no key off any parameter. The last clause is
+    what separates the two families rather than a second hand list -- a helper reads the wire
+    mapping or it is handed a value already pulled off it, never both -- so the two derivations
+    partition ``GATEWAY_WIRE_READ_HELPERS`` instead of overlapping and leaving a remainder nobody
+    checks.
+
+    Two limits, stated because they are the shapes that would walk past this:
+
+    *Direct construction only.* ``_discovered_gateway_error_readers`` resolves one level of raise
+    delegation; this cannot, because a validator's own CALLERS delegate to it. Widening here would
+    discover ``_check_generation_applied``/``_check_schema_applied`` -- policy enforcement that
+    calls a validator and reads no mapping either -- and a census that names the enforcement
+    functions validators is not a census of validators. A validator that hands its raise to a
+    local factory therefore evades this; the raise sites in this module are all in the function
+    that decides them.
+
+    *Foreign helpers resolve, but only through an import this module makes.* Same reach as the
+    mapping half (``_foreign_wire_read_helper_homes``), so a value validator that moves into
+    ``providers/_common.py`` to be shared is still discovered rather than silently dropped for
+    living elsewhere.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    registered_readers = {name.split(":", 1)[1] for name in GATEWAY_ERROR_READERS}
+    reachable = dict(functions)
+    imported = _gateway_import_homes()
+    # Only names the readers actually call resolve, so this does not drag every imported module
+    # into the census -- the same restraint ``_foreign_wire_read_helper_homes`` states.
+    for name in _gateway_reader_callees() - set(functions):
+        if name in imported:
+            reachable[name] = _all_functions(imported[name]).get(name, [])
+    return {
+        name
+        for name in _gateway_reader_callees()
+        # A reader that calls a reader is not a value validator: the reader census owns those, the
+        # same way that one excludes the helpers by name. Vacuous today (no registered reader
+        # calls another), and the guard the first one meets -- a reader whose own wire reading is
+        # all done by helpers satisfies every other clause here.
+        if name not in registered_readers
+        and reachable.get(name)
+        and any(_constructs_directly(node, "ModelAdapterError") for node in reachable[name])
+        and not any(_reads_a_mapping_parameter(node) for node in reachable[name])
+    }
+
+
+def test_2b_the_value_validator_list_is_every_value_validator_the_readers_use() -> None:
+    """The other half of the helper list, derived rather than trusted.
+
+    ``GATEWAY_WIRE_VALUE_VALIDATORS`` was a pure hand list with nothing behind it, and it is one
+    operand of the closing equality in the test above -- whose other operand is derived. So the
+    equality proved the derived mapping readers were registered and proved nothing at all about
+    this side: a new validator of this shape, written into both hand lists in one edit, kept every
+    assertion in this family green while no scan had ever looked at the module. Two of the five it
+    now names were exactly that, sitting unregistered since they were written
+    (``_validated_generation_echo`` and ``_validated_schema_echo``, both handed
+    ``event.get(...)``/``applied`` by a reader with the key named at the call site).
+
+    Registration is not bookkeeping. These names are excluded from the READER discovery by name,
+    they are what ``_literal_wire_keys`` treats as key-carrying calls, and the per-validator
+    assertions above are what hold them to "reads no key of its own" -- an unregistered one is
+    held to none of it.
+    """
+
+    discovered = _discovered_gateway_wire_value_validators()
+    assert discovered == GATEWAY_WIRE_VALUE_VALIDATORS, {
+        "validates_a_wire_value_but_is_unregistered": sorted(
+            discovered - GATEWAY_WIRE_VALUE_VALIDATORS
+        ),
+        "registered_but_no_longer_a_value_validator": sorted(
+            GATEWAY_WIRE_VALUE_VALIDATORS - discovered
+        ),
+        "hint": "a new wire-value validator: add it to GATEWAY_WIRE_VALUE_VALIDATORS and "
+        "GATEWAY_WIRE_READ_HELPERS, or it is held to none of this family's rules",
+    }
+    assert discovered <= GATEWAY_WIRE_READ_HELPERS
+    # And the two families really are disjoint, which is what makes the closing equality above a
+    # partition rather than a coincidence: a helper counted twice would let one drop out of the
+    # union unnoticed.
+    assert discovered.isdisjoint(GATEWAY_MAPPING_READ_HELPERS)
 
 
 def test_2b_the_helper_home_map_is_every_foreign_helper_the_readers_call() -> None:
@@ -3079,7 +3206,30 @@ GATEWAY_STATUS_FORWARDING_VALIDATORS = (
     "_gateway_fragment_string",
     "_gateway_usage",
     "_portable_gateway_payload",
+    "_gateway_reasoning_items",
+    "_validated_generation_echo",
+    "_validated_schema_echo",
 )
+
+
+def _validators_that_refuse_the_wire() -> set[str]:
+    """Every registered wire helper that answers a malformed value by RAISING.
+
+    Which is the whole population the pin below is about: a helper that raises is a helper whose
+    refusal either names the status its caller already read or silently does not. The two lenient
+    readers on this wire drop out on their own terms -- ``_gateway_http_status_hint`` is where a
+    status comes FROM, and ``usage_reported_by`` never raises by design (it runs inside an
+    except-handler) -- so neither is asked for a parameter it has no error to put it on.
+    """
+
+    return {
+        name
+        for name in GATEWAY_WIRE_READ_HELPERS
+        if any(
+            _constructs_directly(node, "ModelAdapterError")
+            for node in _all_functions(_helper_home(name))[name]
+        )
+    }
 
 
 def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
@@ -3087,20 +3237,35 @@ def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
 
     Two of six carried the parameter, so the *same* malformed payload produced a classified
     failure naming HTTP 400 or one naming nothing at all, decided by which field of it happened
-    to be malformed. Pinned as "all six", so a seventh validator that arrives without it fails
-    rather than joining a majority.
+    to be malformed. Pinned as "all of them" rather than "the six known ones": the list WAS a
+    closed hand tuple of six, and it went stale the first time it was tested -- X-3's
+    ``_gateway_reasoning_items`` arrived carrying the parameter and joined nothing, because a
+    signature pin over a hand list can only check the names already on it. The population is
+    derived now, from the one property that makes the parameter meaningful (the helper raises), so
+    a tenth validator is held to this whether or not anyone remembers the tuple.
 
     A signature pin is the right shape here and an incomplete proof on its own, because a
     parameter can be accepted and dropped:
     ``test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises``
-    (tests/test_gateway_provider.py) drives all six and reads the status back off the raise. Note
-    what today's *callers* can supply: the status a reader knows is the error-envelope hint, and
-    the four newly-parameterized validators run on the non-error branches, so they are threaded
-    the same expression their siblings use and receive ``None`` from it. The asymmetry is what is
-    fixed -- a validator that cannot name a status its caller holds -- not a live loss at these
-    four call sites.
+    (tests/test_gateway_provider.py) drives every one of them and reads the status back off the
+    raise. Note what today's *callers* can supply: the status a reader knows is the error-envelope
+    hint, and the newly-parameterized validators run on the non-error branches, so they are
+    threaded the same expression their siblings use and receive ``None`` from it. The asymmetry is
+    what is fixed -- a validator that cannot name a status its caller holds -- not a live loss at
+    those call sites.
     """
 
+    raising = _validators_that_refuse_the_wire()
+    assert raising == set(GATEWAY_STATUS_FORWARDING_VALIDATORS), {
+        "raises_but_is_not_censused_here": sorted(
+            raising - set(GATEWAY_STATUS_FORWARDING_VALIDATORS)
+        ),
+        "censused_but_no_longer_raises": sorted(
+            set(GATEWAY_STATUS_FORWARDING_VALIDATORS) - raising
+        ),
+        "hint": "a new refusing validator: register it here and drive it in "
+        "test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises",
+    }
     forwarding = {
         name
         for name in GATEWAY_STATUS_FORWARDING_VALIDATORS
@@ -3114,14 +3279,17 @@ def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
     }
 
 
-def test_2c_the_four_new_status_parameters_did_not_make_a_value_validator_read_a_key() -> None:
+def test_2c_no_status_parameter_made_a_wire_value_validator_read_a_key() -> None:
     """The helper-census corollary of the fix above, stated where the fix could break it.
 
-    ``_gateway_usage`` and ``_portable_gateway_payload`` are registered as *value* validators:
-    they take an already-extracted value, name no wire key of their own, and are excluded from
-    the mapping-reader discovery on exactly that basis. Adding a scalar parameter must not change
-    that -- and a scalar named ``http_status`` is one edit away from being read off the payload
-    instead of passed in.
+    The value validators take an already-extracted value, name no wire key of their own, and are
+    excluded from the mapping-reader discovery on exactly that basis. Adding a scalar parameter
+    must not change that -- and a scalar named ``http_status`` is one edit away from being read off
+    the payload instead of passed in.
+
+    Stated over the registered set rather than over the four the original fix touched, which is
+    what makes it a rule instead of a receipt: ``_gateway_reasoning_items`` and then the two echo
+    validators joined that set afterwards, and each was held to this the moment it did.
     """
 
     functions = _all_functions("providers/gateway.py")

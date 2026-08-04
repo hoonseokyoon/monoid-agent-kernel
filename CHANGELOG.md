@@ -7,6 +7,33 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the other half of the gateway helper census is derived, and two validators join it
+
+- **(tests) The wire-value validator list is derived from the module rather than hand-kept.** The
+  gateway helper census closed with `mapping readers | value validators == registered helpers`,
+  and only the left operand was derived: the right one was a hand list, so a new validator written
+  into both hand lists in one edit kept the equality green while no scan had ever looked at the
+  module. Two were already sitting in that hole — `_validated_generation_echo` and
+  `_validated_schema_echo`, this shape since they were written, registered nowhere — and X-3's
+  `_gateway_reasoning_items` was registered only because someone chose to. Discovered now by the
+  mirror of the mapping predicate: called by a registered reader, raises a `ModelAdapterError` of
+  its own, reads no key off any parameter. The two derivations partition the helper list instead
+  of overlapping, so nothing falls in the remainder.
+- **(tests) "Reads the wire" means holding the mapping, not calling any registered helper.**
+  Registering the two echo validators promoted their callers — `_check_generation_applied` and
+  `_check_schema_applied`, policy checks that never touch a mapping — into *error readers*, with
+  none of a reader's pinned key sets or round-trip behavior to answer for. The reader discovery
+  now counts only the mapping-reading helpers, which loses no reader: pulling a value off the wire
+  to hand onward means reading the mapping, directly or through one of those.
+- **The two echo validators can name the status their caller already read.** Every other refusing
+  validator on this wire takes `http_status`; these two could not, so the *same* malformed
+  terminal frame produced a classified failure carrying a status or one carrying nothing, decided
+  by which field of it was bad. Inert at today's call sites (the streamed reader's hint is `None`
+  outside an error frame, exactly as for the four parameterized before them) — the asymmetry is
+  what is fixed. The census population is derived from "does the helper raise" now, because the
+  hand tuple of six had already gone stale: `_gateway_reasoning_items` arrived carrying the
+  parameter and joined nothing.
+
 ### Fixed — round three: the stamp is read wherever it lands, and the frame stops splitting
 
 - **A refused call's cost reaches the ledger whatever type the refusal is.** The receipt and the
