@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.wire_validation import (
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -41,8 +42,6 @@ _STREAM_HIGH_WATER = 2000
 # long it will wait for it. Both are far below the request-path limits on purpose: a refused
 # request has not earned the server's read budget, and every legitimate body on these routes is a
 # few KB of JSON already sitting in the socket by the time the error is written.
-_ERROR_BODY_DRAIN_BYTES = 64 * 1024
-_ERROR_BODY_DRAIN_TIMEOUT_S = 0.5
 
 
 def _drain_to_sentinel(q: queue.Queue, *, deadline_s: float = 15.0) -> None:
@@ -63,13 +62,6 @@ def make_backend_handler(
 ) -> type[BaseHTTPRequestHandler]:
     class BackendHttpHandler(BaseHTTPRequestHandler):
         server_version = "MonoidBackend/0.2"
-        # Per-request, reset by BaseHTTPRequestHandler re-instantiating nothing: handle_one_request
-        # runs on one instance for a keep-alive connection, so this is cleared per request below.
-        _body_consumed = False
-
-        def handle_one_request(self) -> None:
-            self._body_consumed = False
-            super().handle_one_request()
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -386,7 +378,9 @@ def make_backend_handler(
             return None
 
         def _read_json(self) -> dict[str, Any]:
-            self._body_consumed = True
+            # ``read_json_limited`` marks the body read for us now, on every path that leaves the
+            # socket empty -- including the one where the body was consumed and then failed to
+            # decode, which the hand-rolled marker here used to cover by marking unconditionally.
             return read_json_limited(self)
 
         def _parse_run_request(self, payload: dict[str, Any]) -> BackendRunRequest:
@@ -577,64 +571,8 @@ def make_backend_handler(
                 )
 
         def _write_error(self, status: HTTPStatus, message: str) -> None:
-            self._discard_unread_request_body()
+            drain_request_body(self)
             self._write_json({"error": message}, status=status)
-
-        def _discard_unread_request_body(self) -> None:
-            """Consume a request body the error path never read, so the error can be delivered.
-
-            An error raised BEFORE the body is read leaves the client's bytes sitting in the
-            socket, and ``_require_admin()`` is the first statement of both run routes -- so the
-            request most likely to be refused is also the one whose body is guaranteed unread.
-            This handler is HTTP/1.0, so it closes after every response; closing a socket that
-            still holds unread data makes the platform answer the client with an RST instead of
-            a FIN, and the response already written is discarded with it. The caller sees a
-            dropped connection rather than the 401 the server sent, and cannot tell a rejected
-            token from a broken network. ``read_json_limited``'s 413 branch names the same race
-            for the one case it could see; this is the other one, and it is the common one.
-
-            It is a race, not a certainty -- whether the RST wins depends on how much of the
-            response the client's kernel had already taken -- which is why it reads as a flaky
-            test rather than as a broken route.
-
-            Bounded in BOTH directions, because this runs on a request that failed auth and must
-            not become a way to spend the server on one. Size is capped well below
-            ``MAX_REQUEST_BYTES``, and the wait is capped far below the 30s request timeout: a
-            client that has already sent its body -- which is every real one, for a few KB of
-            JSON that rides the same segments as the headers -- is drained immediately, while one
-            that declares a body and dribbles it holds a handler thread for the short timeout
-            rather than the long one. Exceeding either cap closes the connection undrained, which
-            is what the 413 branch already does and is no worse than the behaviour this replaces.
-            """
-
-            if self._body_consumed:
-                return
-            self._body_consumed = True
-            try:
-                length = int(self.headers.get("Content-Length") or "0")
-            except (TypeError, ValueError):
-                self.close_connection = True
-                return
-            if length <= 0:
-                return
-            if length > _ERROR_BODY_DRAIN_BYTES:
-                self.close_connection = True
-                return
-            previous_timeout = None
-            try:
-                previous_timeout = self.connection.gettimeout()
-                self.connection.settimeout(_ERROR_BODY_DRAIN_TIMEOUT_S)
-                self.rfile.read(length)
-            except OSError:
-                # Includes the drain timeout: a body that has not arrived is not worth waiting
-                # for, and the close is exactly what would have happened without the drain.
-                self.close_connection = True
-            finally:
-                if previous_timeout is not None:
-                    try:
-                        self.connection.settimeout(previous_timeout)
-                    except OSError:  # pragma: no cover - socket already torn down
-                        pass
 
         def _write_json(
             self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK

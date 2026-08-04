@@ -7,6 +7,36 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — an early rejection reaches the client on all four reference servers, not one
+
+- **A response written before the request body was read was being discarded by a TCP reset.** A
+  handler that answers a POST without consuming the body leaves the client's bytes in the kernel
+  receive buffer; closing that socket sends an RST rather than a FIN, and the RST discards whatever
+  the client has not yet pulled out of its own buffer — so a status the server wrote and flushed
+  successfully never arrives. The caller sees `ConnectionAbortedError` instead. Every early
+  rejection has this shape: an unknown path, a missing or bad token, an over-large body.
+- **The cost is a reclassified error, not a lost one.** `gateway_auth_error` carries
+  `retryable: false`; a transport abort reads as transient to every retry policy in this repo, so a
+  credential failure was retried as though it might succeed next time. On the llm-gateway wire the
+  whole classified body goes with it — `retryable`, `config_recoverable`, the provider code, and
+  the billed `usage` a refused-but-generated turn still owes.
+- **The fix already existed on one of the four servers.** `BackendHttpHandler` had it as
+  `_discard_unread_request_body`, with an accurate analysis of the same race, and the other three
+  wrote their rejections into that reset for as long as it existed. Promoted verbatim in behavior
+  to `_shared.http_util.drain_request_body` and called by all four `_write_error` funnels — the
+  same bounds it always had (64 KiB cap, 0.5s drain timeout well under the 30s connection timeout,
+  close-undrained past either, because this runs for a caller already refused). Its per-request
+  marker is now keyed to the request's own headers object, so it invalidates itself on a keep-alive
+  connection instead of needing every handler to reset a boolean.
+- **(tests) The rule is bound on each handler rather than on the one whose test caught it.** The
+  symptom was a ~5-15% flake in `test_mcp_gateway_rejects_bad_token_when_admin_configured`. It is
+  intermittent only because the handler's header read is buffered: a body sharing the segment its
+  headers arrived in gets swallowed incidentally, and `http.client` sends the two separately while
+  a hand-written probe using one `sendall` does not — which is why the obvious reproduction reports
+  "cannot reproduce". `tests/test_http_reject_drains_body.py` splits the send deliberately, making
+  all four reject paths fail 100% before the fix, and censuses every reference `_write_error` so a
+  fifth server cannot skip the drain.
+
 ### Added — the gateway names the upstream it relayed, and the client stops trusting its default
 
 - **The LLM-gateway success body and terminal `turn_complete` frame carry `provider`.** The

@@ -11,6 +11,7 @@ from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -123,6 +124,7 @@ def make_web_gateway_handler(
             *,
             error_code: str = "web_gateway_error",
         ) -> None:
+            drain_request_body(self)
             self._write_json(
                 {
                     "error": message,

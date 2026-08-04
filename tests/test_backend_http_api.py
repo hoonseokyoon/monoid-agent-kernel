@@ -30,6 +30,10 @@ from support.http import LINE_SEPARATORS, sse_data_frames_by_line
 
 from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.recorder import append_event_to_run
+from monoid_agent_kernel.reference._shared.http_util import (
+    drain_request_body,
+    mark_request_body_read,
+)
 from monoid_agent_kernel.reference.backend.http import make_backend_handler
 
 pytestmark = pytest.mark.integration
@@ -577,6 +581,14 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
 # dropped connection and cannot tell a rejected token from a broken network. Whether the RST wins
 # is a race, so the behavioral test for it (``test_backend_stream_rejects_non_admin``) failed
 # roughly one run in seven rather than every time. These pin the logic instead of the race.
+#
+# The logic itself is no longer the backend's own: it began here as
+# ``_discard_unread_request_body`` and is now ``_shared.http_util.drain_request_body``, called by
+# all four reference servers. It was correct here and absent from the other three for as long as
+# it existed, which is what let the identical reset go on discarding mcp-gateway 401s, every
+# server's 404s, and the llm gateway's classified error bodies. These stay as the unit-level pin
+# on the shared function's semantics; ``tests/test_http_reject_drains_body.py`` binds the rule on
+# each of the four handlers.
 
 
 class _FakeSocket:
@@ -614,7 +626,6 @@ def _drain_handler(headers: dict[str, str], reader: Any) -> Any:
     handler.rfile = reader
     handler.connection = _FakeSocket()
     handler.close_connection = False
-    handler._body_consumed = False
     return handler
 
 
@@ -622,7 +633,7 @@ def test_an_error_response_drains_the_body_its_route_never_read() -> None:
     reader = _RecordingReader(b"x" * 40)
     handler = _drain_handler({"Content-Length": "40"}, reader)
 
-    handler._discard_unread_request_body()
+    drain_request_body(handler)
 
     assert reader.reads == [40], "the refused request's body must leave the socket"
     assert handler.close_connection is False
@@ -637,9 +648,9 @@ def test_a_body_already_read_by_the_route_is_not_read_twice() -> None:
 
     reader = _RecordingReader(b"x" * 40)
     handler = _drain_handler({"Content-Length": "40"}, reader)
-    handler._body_consumed = True
+    mark_request_body_read(handler)
 
-    handler._discard_unread_request_body()
+    drain_request_body(handler)
 
     assert reader.reads == []
     assert handler.close_connection is False
@@ -658,7 +669,7 @@ def test_a_body_the_error_path_will_not_drain_closes_the_connection(
     reader = _RecordingReader(b"")
     handler = _drain_handler(headers, reader)
 
-    handler._discard_unread_request_body()
+    drain_request_body(handler)
 
     assert reader.reads == [], why
     assert handler.close_connection is True, why
@@ -671,17 +682,39 @@ def test_a_body_that_never_arrives_closes_rather_than_holding_the_thread() -> No
     reader = _RecordingReader(b"", fail=TimeoutError("timed out"))
     handler = _drain_handler({"Content-Length": "40"}, reader)
 
-    handler._discard_unread_request_body()
+    drain_request_body(handler)
 
     assert handler.close_connection is True
     assert handler.connection.timeouts == [0.5, 30.0], "the request timeout is restored"
+
+
+@pytest.mark.parametrize("missing", ["headers", "connection"])
+def test_a_handler_with_no_socket_is_skipped_rather_than_raising(missing: str) -> None:
+    """The drain runs as the first statement of every ``_write_error``, so it must not raise.
+
+    An exception here replaces the error response with no response at all -- worse than the reset
+    it prevents, on the same path. The shapes that reach it without a socket are real: the wire
+    censuses drive ``_write_exception`` on a handler built with ``__new__`` and only the JSON
+    writer replaced, precisely so the writer's argument list is exercised rather than copied.
+    Skipping is also the safe answer on its own terms, since without a connection there is no way
+    to bound the read.
+    """
+
+    handler = _drain_handler({"Content-Length": "40"}, _RecordingReader(b"x" * 40))
+    delattr_target = {"headers": "headers", "connection": "connection"}[missing]
+    setattr(handler, delattr_target, None)
+
+    drain_request_body(handler)  # must not raise
+
+    assert handler.rfile.reads == [], "nothing may be read without a bounded socket"
+    assert handler.close_connection is False
 
 
 def test_a_request_with_no_body_neither_reads_nor_closes() -> None:
     reader = _RecordingReader(b"")
     handler = _drain_handler({}, reader)
 
-    handler._discard_unread_request_body()
+    drain_request_body(handler)
 
     assert reader.reads == []
     assert handler.close_connection is False

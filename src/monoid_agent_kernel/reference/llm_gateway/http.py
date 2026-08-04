@@ -12,6 +12,7 @@ from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError, Perm
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -166,6 +167,12 @@ def make_llm_gateway_handler(
             provider_retried: bool = False,
             usage: Mapping[str, int] | None = None,
         ) -> None:
+            # Before the status, not after: the bytes have to leave the receive buffer before the
+            # close, and the close follows this write immediately. This wire is the one where the
+            # loss is worst -- every field below (``retryable``, ``config_recoverable``, the
+            # provider code, the billed ``usage``) is a classification the client acts on, and a
+            # reset replaces all of it with "network error", which reads as retryable.
+            drain_request_body(self)
             self._write_json(
                 _error_body(
                     status,
