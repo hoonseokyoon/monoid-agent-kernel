@@ -502,8 +502,10 @@ def _runtime_config_for(
             # its default upstream is the offline echo provider — which honestly declares no
             # reasoning_support, so under the default "fail" the reasoning_applied echo check
             # would refuse every offline turn. "omit" states what this app actually wants:
-            # best-effort transport. A proving upstream (the real OpenAI adapter behind the
-            # gateway) still emits the echo and still proves; nothing is lost there.
+            # best-effort transport. Against a proving upstream (the real OpenAI adapter behind
+            # the gateway) the server still EMITS the echo and this client still SHAPE-VALIDATES
+            # it -- a malformed reasoning_applied is refused either way. What "omit" gives up is
+            # exactly the enforcement: a missing or mismatched echo is tolerated here.
             reasoning=ReasoningConfig(effort=effort, summary=summary, on_unsupported="omit"),
         ),
         prompt=PromptSpec(system_prompt_base=system_prompt),

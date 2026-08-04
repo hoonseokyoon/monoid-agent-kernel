@@ -484,7 +484,11 @@ call sees the unproven text before the error arrives; the sync transport deliver
 refusal. A malformed echo (a non-object `generation_applied` or `reasoning_applied`, a
 non-boolean `schema_applied`)
 is a wire-shape error, not a policy question: it answers `gateway_bad_response` on both
-transports regardless of `on_unsupported`.
+transports regardless of `on_unsupported` — with one precedence caveat when a single envelope is
+both unproven and malformed, since the sync reader validates each echo inside its own checker and
+runs the three in sequence (so an earlier key's *policy* refusal, e.g. `gateway_generation_not_applied`,
+preempts a later key's *shape* refusal) while the stream validates all three shapes at frame parse
+before any policy branch.
 
 The echo comparison is not Python equality. A requested **number is proven only by a number**:
 `True == 1` and `False == 0.0` in Python, so a plain dict comparison let a server answering

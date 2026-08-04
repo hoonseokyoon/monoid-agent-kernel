@@ -15,8 +15,12 @@ out in commit messages and here.
   `normalize_usage` said "malformed usage" with a raw `ValueError` and the stop-reason walk
   raised a raw `AttributeError` — on the terminal path even after the ingress normalizer moved
   inside the guard, because Python evaluates the `TurnComplete` arguments first. The classifying
-  arms mint the classified error at the same seam that stamps the billed usage, chain the raw
-  cause, and change two real behaviors, both intended:
+  arms mint the classified error at the same seam that stamps the billed usage and chain the raw
+  cause; the arm that catches an already-typed refusal *backfills* the same code onto the bare
+  `ModelAdapterError`s the mapping's own field validators raise, and upgrades `provider_retried`
+  from the exchange the raise site cannot see — so the code is the whole class's, not the raw
+  arm's alone (backfill never overwrites a code a refusal already named, and the retry flag only
+  ever goes up). Two real behaviors change, both intended:
   - **In-process, the billed tokens reach the run budget.** A raw escape hit the loop's blanket
     wrapper, which re-minted it unstamped — so `total_usage`, the transcript record and
     `metrics.updated` all said zero for a call the provider billed, and only the getattr-based
@@ -31,7 +35,19 @@ out in commit messages and here.
   a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
   read-off-whatever-escaped property. `assemble_streamed_turn`'s bare `normalize_usage` re-run
   (provably dead — every folded chunk passes the internal ingress first) is guarded in the
-  ingress's classified voice rather than deleted, with a pin stating the contract.
+  ingress's classified voice rather than deleted. It is bound *structurally*: the behavioral
+  test for this shape is intercepted by the ingress and never reaches the guard, so deleting
+  the guard left the suite green;
+  `test_the_folds_usage_renormalization_stays_structurally_guarded` parses the fold and holds
+  the try/handler shape, the refusal's message and the classification it states.
+- **The fold's own tool-call refusals pay for the turn they were billed for.** Both
+  `stream_bad_tool_args` raises in `assemble_streamed_turn` — a model emitting non-JSON
+  function-call arguments is ordinary — escaped with no usage stamp and no `provider_retried`,
+  though the fold is holding both by then. The one-shot twin of that act pays through the
+  OpenAI reader's stamping seam, so a *streamed* turn the provider generated and billed was
+  metered at zero at the tenant ledger and in the run's token budget while its sync twin was
+  not. `providers/base.py` stays provider-neutral: the refusals keep their own
+  `stream_bad_tool_args` code, now non-retryable and carrying the retry the stream reported.
 
 ### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
 
@@ -43,8 +59,9 @@ out in commit messages and here.
   generation echo) on the response body and the terminal stream frame, derived from the new
   `reasoning_support` adapter declaration, never from the request; the client validates it
   beside its two siblings and enforces it at all three sites (sync, terminal frame, frameless
-  drain) as non-retryable, config-recoverable `gateway_reasoning_not_applied`. Fourth additive
-  key on an unchanged protocol identifier.
+  drain) as non-retryable, config-recoverable `gateway_reasoning_not_applied`. Fifth additive
+  response-direction key on an unchanged protocol identifier, after `generation_applied`,
+  `schema_applied`, `reasoning` and `provider`.
 - **The gate is `ReasoningConfig.is_default`, not payload truthiness.** The default reasoning
   config projects a non-empty provider block (`{"effort": "medium"}`), so the generation gate
   transcribed literally would have stamped an echo onto every default-config call and changed
@@ -71,8 +88,11 @@ out in commit messages and here.
   behaviorally by their own offline runs, and the two JSON producers by a sweep that
   *enumerates* every shipped runtime config (builder scaffold plus every `examples/*.json`
   that parses as one) and replays the client's own check against a silent upstream — so the
-  next shipped config inherits the pin instead of repeating the defect. A proving upstream
-  still emits the echo and still proves.
+  next shipped config inherits the pin instead of repeating the defect. Read `"omit"` for
+  exactly what it gives up: a proving upstream still *emits* the echo and the client still
+  *shape-validates* it (a malformed `reasoning_applied` is refused `gateway_bad_response`
+  either way), but a missing or mismatched echo is tolerated — enforcement is the whole of
+  what the knob trades away.
 - Census: the `KNOWN_GAPS` B1 entry is deleted and its `v0.21-track:B1` disposition token
   retired with it; `reasoning_applied` joins every echo census (`APPLIED_ECHO_KEYS`
   derivations, the wire key sets, the 7e refusal probes, the value-validator tables — now ten

@@ -20,8 +20,9 @@ def test_studio_reasoning_policy_is_best_effort() -> None:
     Its effort/summary knobs are display preferences and its default upstream is the offline
     echo provider, which honestly declares no ``reasoning_support``. Under the default
     ``"fail"`` the B1 ``reasoning_applied`` check refuses every offline turn; ``"omit"`` is
-    the documented way for an app that wants best-effort transport to say so, and a proving
-    upstream (the real OpenAI adapter behind the gateway) still emits and still proves.
+    the documented way for an app that wants best-effort transport to say so. Against a proving
+    upstream the server still emits the echo and the client still shape-validates it; what
+    ``"omit"`` gives up is the enforcement -- a missing or mismatched echo is tolerated.
     """
 
     config = _runtime_config_for([])

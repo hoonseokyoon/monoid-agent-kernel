@@ -283,11 +283,34 @@ One v0.21 change moves an existing wire *answer* rather than adding a key: when 
 gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
 now a non-retryable 502 `openai_bad_response` (carrying the billed `usage`), where the shapes
 that used to escape unclassified answered 400 `gateway_bad_request` or 500 with
-`retryable: true`. A client that retried on that 500 was re-buying tokens for a payload defect;
-a client that read the 400 as its own bad request was mis-remediating. Clients that follow the
-documented taxonomy (`retryable` / `config_recoverable` / `usage` off the envelope) need no
-change; only behavior keyed to those two literal statuses for this failure class does. Raw
-refusals from third-party adapters keep their previous arms and their stamped-usage carriage.
+`retryable: true`, and the shapes refused without a code of their own answered 502
+`gateway_bad_response` — the hop's own wire named for an upstream payload defect. A client that
+retried on that 500 was re-buying tokens for a payload defect; a client that read the 400 as its
+own bad request was mis-remediating; and one malformed body answered two different codes
+depending on which transport read it.
+
+Read the 400 → 502 half literally, because this kernel's own client does. `AgentLoop`
+(`_recoverable_turn_error`) treats **any** 4xx as a *recoverable* turn failure — the turn fails,
+the session survives, the caller can fix and resend — and an un-flagged 5xx as terminal. So this
+failure class moves from a park to a terminal run failure: a `failure.json` and a terminal
+session where a client previously got a suspension it could resume from. That direction is
+intended. It converges the hop with in-process behavior, where a malformed upstream payload has
+always ended the run, and no amount of resending the same call fixes a payload the upstream
+produced. On that half a client classifying off the envelope's `retryable` /
+`config_recoverable` / `usage` reads the same three values it read before (`false` / `false` /
+the billed counts); clients keyed to the literal status range — including this one — see a park
+become terminal. The 500 half changes the envelope too, and in the direction that stops the
+bleeding: `retryable` was `true` and is now `false`, so the client stops re-buying the tokens.
+
+If you implement this answer in your own gateway, write `"retryable": false` **and** the
+`error_code` explicitly into the 502 body. The client's error reader derives `retryable` from
+the status line only when the key is absent, and a bare 502 derives `retryable: true` under
+error code `gateway_server_error`, which is in the default `model.retry.retry_on` — so a body
+that omits the key is retried three times and re-buys exactly the tokens this change exists to
+stop paying for.
+
+Raw refusals from third-party adapters keep their previous arms and their stamped-usage
+carriage.
 
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
