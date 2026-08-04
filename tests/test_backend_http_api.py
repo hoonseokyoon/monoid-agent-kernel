@@ -26,8 +26,11 @@ from support.backend_harness import (
     threading,
     urlopen,
 )
+from support.http import LINE_SEPARATORS, sse_data_frames_by_line
+
 from monoid_agent_kernel.core.trace_context import new_traceparent, trace_id_of
 from monoid_agent_kernel.recorder import append_event_to_run
+from monoid_agent_kernel.reference.backend.http import make_backend_handler
 
 pytestmark = pytest.mark.integration
 
@@ -264,6 +267,61 @@ def test_backend_event_sse_resumes_from_last_event_id_without_duplicates(tmp_pat
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_event_sse_frames_survive_a_line_splitting_reader(tmp_path: Path) -> None:
+    """The events route is the second writer of the same shape, on a different frame class.
+
+    ``EventSubscriptionFrame.to_sse`` dumped with ``ensure_ascii=False``, so U+2028, U+2029 and
+    U+0085 in any event string reached the wire as themselves and a ``str.splitlines`` reader --
+    httpx's ``aiter_lines`` -- broke the frame there. Event data is not content-free: tool
+    arguments and results, error messages and model text all ride it, so a separator arrives here
+    the moment a model or a file supplies one. The split takes the frame's ``id:`` line with it,
+    which is what a reconnect resumes ``Last-Event-ID`` from, so a truncated frame also costs the
+    reader its place in the stream. Injected rather than modelled, so the carrier is the frame
+    writer and not whichever event happens to carry text under today's content policy.
+    """
+
+    pytest.importorskip("httpx")
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Run.",
+            runtime_config=_default_config(),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=5).value == "completed"
+    carried = f"before{LINE_SEPARATORS}after"
+    injected = append_event_to_run(
+        backend._record(submission.run_id).run_dir,
+        "outbox.requested",
+        data={"request_id": "separator_fixture", "destination": carried},
+    )
+    server, thread, base_url = _start_server(backend)
+    try:
+        frames = sse_data_frames_by_line(
+            f"{base_url}/v1/runs/{submission.run_id}/events?from_seq=1",
+            token=submission.run_token,
+            headers={"Accept": "text/event-stream"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    delivered = [frame for frame in frames if frame.get("seq") == injected.seq]
+    assert delivered, {
+        "seqs": [frame.get("seq") for frame in frames],
+        "hint": "the injected event never arrived whole",
+    }
+    assert delivered[0]["data"]["destination"] == carried
+    # The terminal ``event: end`` frame rides the same writer and is what tells a client the
+    # stream is over rather than cut.
+    assert frames[-1].get("terminal") is True
 
 
 def test_backend_event_sse_establishes_immediately_when_live_stream_is_caught_up(
@@ -508,3 +566,122 @@ def test_backend_http_multi_turn_messages_and_task_endpoints(tmp_path: Path) -> 
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# --- the request body an error response leaves in the socket -------------------------------
+#
+# ``_require_admin()`` is the first statement of both run routes, so the request most likely to
+# be refused is the one whose body is guaranteed unread. This handler is HTTP/1.0 and closes
+# after every response; closing a socket that still holds unread data makes the platform send an
+# RST rather than a FIN, and the 401 already written is discarded with it -- the caller sees a
+# dropped connection and cannot tell a rejected token from a broken network. Whether the RST wins
+# is a race, so the behavioral test for it (``test_backend_stream_rejects_non_admin``) failed
+# roughly one run in seven rather than every time. These pin the logic instead of the race.
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+        self._timeout: float | None = 30.0
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, value: float | None) -> None:
+        self._timeout = value
+        self.timeouts.append(value)
+
+
+class _RecordingReader:
+    def __init__(self, payload: bytes, *, fail: Exception | None = None) -> None:
+        self._payload = payload
+        self._fail = fail
+        self.reads: list[int] = []
+
+    def read(self, size: int) -> bytes:
+        self.reads.append(size)
+        if self._fail is not None:
+            raise self._fail
+        return self._payload[:size]
+
+
+def _drain_handler(headers: dict[str, str], reader: Any) -> Any:
+    """A handler instance with only the attributes the drain touches — no socket, no server."""
+
+    handler_cls = make_backend_handler(object(), admin_token="admin")
+    handler = object.__new__(handler_cls)
+    handler.headers = headers
+    handler.rfile = reader
+    handler.connection = _FakeSocket()
+    handler.close_connection = False
+    handler._body_consumed = False
+    return handler
+
+
+def test_an_error_response_drains_the_body_its_route_never_read() -> None:
+    reader = _RecordingReader(b"x" * 40)
+    handler = _drain_handler({"Content-Length": "40"}, reader)
+
+    handler._discard_unread_request_body()
+
+    assert reader.reads == [40], "the refused request's body must leave the socket"
+    assert handler.close_connection is False
+    # The wait is bounded well below the 30s request timeout and then restored, so a client that
+    # declares a body and dribbles it cannot hold a handler thread for the long one.
+    assert handler.connection.timeouts == [0.5, 30.0]
+
+
+def test_a_body_already_read_by_the_route_is_not_read_twice() -> None:
+    """The success path consumes the body itself; a later error must not read past it into
+    whatever the socket holds next."""
+
+    reader = _RecordingReader(b"x" * 40)
+    handler = _drain_handler({"Content-Length": "40"}, reader)
+    handler._body_consumed = True
+
+    handler._discard_unread_request_body()
+
+    assert reader.reads == []
+    assert handler.close_connection is False
+
+
+@pytest.mark.parametrize(
+    "headers,why",
+    [
+        ({"Content-Length": "9999999"}, "a body past the drain cap is closed on, not read"),
+        ({"Content-Length": "not-a-number"}, "an unparseable length cannot be drained"),
+    ],
+)
+def test_a_body_the_error_path_will_not_drain_closes_the_connection(
+    headers: dict[str, str], why: str
+) -> None:
+    reader = _RecordingReader(b"")
+    handler = _drain_handler(headers, reader)
+
+    handler._discard_unread_request_body()
+
+    assert reader.reads == [], why
+    assert handler.close_connection is True, why
+
+
+def test_a_body_that_never_arrives_closes_rather_than_holding_the_thread() -> None:
+    """The drain's own timeout is the bound. It is caught here rather than escaping into
+    ``_write_error``, which is already writing a response and cannot raise."""
+
+    reader = _RecordingReader(b"", fail=TimeoutError("timed out"))
+    handler = _drain_handler({"Content-Length": "40"}, reader)
+
+    handler._discard_unread_request_body()
+
+    assert handler.close_connection is True
+    assert handler.connection.timeouts == [0.5, 30.0], "the request timeout is restored"
+
+
+def test_a_request_with_no_body_neither_reads_nor_closes() -> None:
+    reader = _RecordingReader(b"")
+    handler = _drain_handler({}, reader)
+
+    handler._discard_unread_request_body()
+
+    assert reader.reads == []
+    assert handler.close_connection is False

@@ -2912,8 +2912,15 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if summary:
                 event = {**event, "studio_activity": summary}
             prefix = f"id: {event_id}\n" if event_id else ""
+            # ``ensure_ascii`` is left at its default of True, and stated rather than defaulted
+            # into: a line is the whole framing here. U+2028, U+2029 and U+0085 survive an
+            # ``ensure_ascii=False`` dump as themselves and split a frame mid-string for any
+            # ``str.splitlines`` reader (httpx's ``aiter_lines``) -- browsers' EventSource breaks
+            # on CR/LF only, so this route's own UI would not be the one to notice.
             self.wfile.write(
-                f"{prefix}data: {json.dumps(event, allow_nan=False)}\n\n".encode("utf-8")
+                f"{prefix}data: {json.dumps(event, ensure_ascii=True, allow_nan=False)}\n\n".encode(
+                    "utf-8"
+                )
             )
             self.wfile.flush()
 

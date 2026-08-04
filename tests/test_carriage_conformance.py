@@ -6935,3 +6935,126 @@ def test_the_terminal_quarantine_artifact_has_one_writer_and_three_callers() -> 
         "callers": sorted(str(site) for site in callers),
         "hint": "the quarantine artifact rides all three failure lanes through ONE writer",
     }
+
+
+# --------------------------------------------------------------------------------------
+# SSE frame-writer census — every line-framed writer escapes what its readers call a line
+# --------------------------------------------------------------------------------------
+#
+# Finding shape: SSE is a LINE protocol and "line" is not the same word on both ends of it.
+# ``json.dumps(..., ensure_ascii=False)`` leaves U+2028 LINE SEPARATOR, U+2029 PARAGRAPH
+# SEPARATOR and U+0085 NEXT LINE in the body as themselves — JSON escapes every other member of
+# ``str.splitlines``' set (the C0 controls) whatever ``ensure_ascii`` says, so those three are the
+# whole of what a frame writer must escape for itself. The line-splitting readers clients use
+# (httpx's ``aiter_lines``, whose splitter IS ``str.splitlines``) break the frame there and hand
+# their parser JSON that stops mid-string.
+#
+# It went unseen because the reader that can see it is the one this repo does not use on these
+# routes: a browser's ``EventSource`` breaks on CR/LF only, and the suite's own SSE helpers split
+# the body on ``\n\n`` or read it whole. So the UI and the tests were both structurally unable to
+# notice, and when the gateway writer was fixed the three twins on the backend and studio routes
+# kept the defect — the dispatch-shape asymmetry this file exists for, on a fifth pair of rails.
+#
+# The rule is therefore bound by construction rather than by remembering it: a function that
+# frames an SSE event serializes with ``ensure_ascii=True``, stated rather than defaulted into.
+# The writer set is pinned in full because the failure mode here is a NEW writer, not a changed
+# one — a sixth route added with the smaller encoding would otherwise ship the same bug again.
+
+_SSE_FRAME_WRITERS = (
+    ("core/event_subscription.py", "EventSubscriptionFrame.to_sse"),
+    ("reference/backend/http.py", "make_backend_handler.BackendHttpHandler._stream_run_sse"),
+    ("reference/backend/model_stream.py", "LiveModelStreamFrame.to_sse"),
+    (
+        "reference/llm_gateway/http.py",
+        "make_llm_gateway_handler.LlmGatewayHttpHandler._write_sse_frame",
+    ),
+    ("reference/studio/server.py", "_make_handler.StudioHandler._sse_send"),
+)
+
+
+def _own_constant_text(func: ast.AST) -> list[str]:
+    """Every string/bytes constant in a function's OWN body, bytes decoded.
+
+    Both spellings are load-bearing: two of these writers frame with ``b"data: "`` and three with
+    an f-string, and a scan that saw only one of them would census half the set.
+    """
+
+    texts: list[str] = []
+    for node in _own_nodes(func):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            value = node.value
+            texts.append(value.decode("utf-8", "replace") if isinstance(value, bytes) else value)
+    return texts
+
+
+def _sse_frame_writers() -> dict[tuple[str, str], ast.AST]:
+    """Every function that FRAMES an SSE event, discovered rather than listed.
+
+    Both halves of the framing are required — a ``data:`` field and the blank line that ends the
+    event — which is what separates a writer from the readers that also spell ``data: ``
+    (``providers/gateway.py`` and ``mcp/client.py`` parse the prefix off a line and never write a
+    terminator). A writer that split those two halves across functions would drop out of this
+    discovery, which is what the full pin below is for.
+    """
+
+    writers: dict[tuple[str, str], ast.AST] = {}
+    for module, qual, func in _iter_src_functions():
+        texts = _own_constant_text(func)
+        if any("data: " in text for text in texts) and any("\n\n" in text for text in texts):
+            writers[(module, qual)] = func
+    return writers
+
+
+def test_the_sse_frame_writers_are_exactly_the_censused_five() -> None:
+    """A sixth SSE route must register here, which is where it is told the rule below."""
+
+    assert frozenset(_sse_frame_writers()) == frozenset(_SSE_FRAME_WRITERS), {
+        "unregistered": sorted(
+            f"{module}:{qual}"
+            for module, qual in set(_sse_frame_writers()) - set(_SSE_FRAME_WRITERS)
+        ),
+        "registered_but_gone": sorted(
+            f"{module}:{qual}"
+            for module, qual in set(_SSE_FRAME_WRITERS) - set(_sse_frame_writers())
+        ),
+        "hint": "a new SSE writer: register it, and dump its payload with ensure_ascii=True",
+    }
+
+
+@pytest.mark.parametrize("module,qual", _SSE_FRAME_WRITERS)
+def test_each_sse_frame_writer_escapes_the_unicode_line_separators(module: str, qual: str) -> None:
+    """The rule itself, on every writer rather than on the one a bug report arrived about.
+
+    ``ensure_ascii`` must be stated, not defaulted into: the studio writer was accidentally
+    correct — it simply never passed the argument — and an edit that "made the encoding smaller"
+    the way the length-delimited bodies do would have broken it silently.
+    """
+
+    writers = _sse_frame_writers()
+    func = writers.get((module, qual))
+    assert func is not None, f"{module}:{qual} no longer frames an SSE event"
+    dumps = [
+        node
+        for node in _own_nodes(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "dumps"
+    ]
+    assert dumps, {
+        "writer": f"{module}:{qual}",
+        "hint": "an SSE writer that serializes elsewhere escapes nothing here -- the census "
+        "above cannot follow it, so keep the dump in the frame writer",
+    }
+    for call in dumps:
+        flags = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        ensure_ascii = flags.get("ensure_ascii")
+        assert isinstance(ensure_ascii, ast.Constant) and ensure_ascii.value is True, {
+            "writer": f"{module}:{qual}",
+            "line": call.lineno,
+            "hint": "U+2028/U+2029/U+0085 survive ensure_ascii=False and split the frame for "
+            "every str.splitlines reader (httpx aiter_lines); pass ensure_ascii=True",
+        }

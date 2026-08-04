@@ -34,6 +34,38 @@ out in commit messages and here.
   hand tuple of six had already gone stale: `_gateway_reasoning_items` arrived carrying the
   parameter and joined nothing.
 
+### Fixed — round four: the escaping rule reaches the other four SSE writers
+
+- **The three remaining SSE frame writers escape the characters their readers call line breaks.**
+  Round three fixed the gateway's writer and stopped there; the same `ensure_ascii=False` was
+  live on every other line-framed route in the repo — the backend run stream
+  (`POST /v1/runs/stream`), the run event stream (`GET /v1/runs/<id>/events`, via
+  `EventSubscriptionFrame.to_sse`) and the live model-content channel
+  (`LiveModelStreamFrame.to_sse`). U+2028, U+2029 and U+0085 reached the wire as themselves and
+  any `str.splitlines` reader — httpx's `aiter_lines`, what a third-party consumer reads these
+  routes with — split the frame mid-JSON. The model-content channel is the one a separator
+  reaches first, because every `delta` on it is raw provider text; on the two `id:`-carrying
+  routes the split also swallows the frame's id, which is the cursor a reconnect resumes from, so
+  a truncated frame costs the reader its place as well. The Studio writer was already correct by
+  accident (it never passed the argument) and now says so. Nothing in the wire *shape* changed —
+  the same JSON, spelled so a line protocol can carry it.
+- **An error response no longer leaves the request body in the socket.** `_require_admin()` is
+  the first statement of both run routes, so the request most likely to be refused is the one
+  whose body is guaranteed unread — and this handler is HTTP/1.0, so it closes after every
+  response. Closing a socket that still holds unread data makes the platform send an RST rather
+  than a FIN, discarding the 401 already written: the caller saw a dropped connection and could
+  not tell a rejected token from a broken network. Error responses now drain the body first,
+  bounded in both directions (64 KiB, 0.5s) because a refused request has not earned the server's
+  read budget; past either bound the connection is closed undrained, as before. Found by a test
+  that started flaking one run in seven once a pooled-connection client was pointed at the
+  neighbouring route.
+- **(tests) Every SSE frame writer is now censused rather than remembered.** The writer set is
+  discovered from the AST — a function that writes a `data:` field *and* the blank line that ends
+  the frame — pinned in full, and each one is required to state `ensure_ascii=True`. A sixth
+  route, or an edit that shrinks one of these encodings the way the length-delimited bodies do,
+  fails there. Round-trip tests on all three routes read with httpx's line splitter, because the
+  suite's existing SSE helpers split on `\n\n` and passed against the bug the whole time.
+
 ### Fixed — round three: the stamp is read wherever it lands, and the frame stops splitting
 
 - **A refused call's cost reaches the ledger whatever type the refusal is.** The receipt and the
