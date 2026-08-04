@@ -202,8 +202,9 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     format_async_result_text,
     provider_usage_of,
+    resolved_provider_name,
 )
-from monoid_agent_kernel.providers._common import NORMALIZED_USAGE_KEYS
+from monoid_agent_kernel.providers._common import NORMALIZED_USAGE_KEYS, prune_dead_reasoning
 from monoid_agent_kernel.public_view import (
     args_preview,
     finish_args_preview,
@@ -2252,13 +2253,7 @@ class AgentLoop:
 
         if wants_stream:
             if wants_content_stream:
-                try:
-                    provider_value = getattr(self.model_adapter, "provider_name", None)
-                    if not provider_value and request.model is not None:
-                        provider_value = request.model.provider
-                    provider = str(provider_value) if provider_value else None
-                except Exception:
-                    provider = None
+                provider = resolved_provider_name(self.model_adapter, request.model)
                 try:
                     model_value = request.model.model if request.model is not None else None
                     model = str(model_value) if model_value else None
@@ -3841,7 +3836,17 @@ class AgentLoop:
             # By-value wire copy: the durable log stays by-reference; a multimodal adapter
             # gets media resolved to wire blocks here (once per turn, not per retry). A
             # text-only adapter receives the by-reference log and projects it to text.
-            wire_messages = tuple(state.messages)
+            #
+            # Reasoning blocks that fall outside the active replay window (everything before the
+            # last user message) are dropped from that copy: the adapter's own replay rule
+            # ignores them, so they are bytes the provider provably discards -- and they
+            # accumulate, one per user turn, re-sent on every later request, against the wire cap
+            # here and the receiving server's body limit past it. ``state.messages`` and the
+            # checkpoint keep every block verbatim; only the request is pruned. This is the one
+            # seam every request is built through, so the prune binds all of them: the sync
+            # facade runs this same coroutine, and the streaming path builds its request from
+            # this same ``wire_messages``.
+            wire_messages = prune_dead_reasoning(state.messages)
             if getattr(self.model_adapter, "supports_multimodal", False):
                 # Tool-result image eviction runs on the by-reference copy BEFORE resolution,
                 # so dropped images are never read/encoded. Off unless a keep-N is configured.

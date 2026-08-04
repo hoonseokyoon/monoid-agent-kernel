@@ -339,9 +339,35 @@ Four further opt-in protocols declare optional capability members:
   by-value `messages` log to wire blocks before the call. A multimodal adapter may also expose
   `wire_image_encoding` (default `"base64"`); that attribute is not a protocol member because it
   parameterizes the capability rather than declaring it.
-- `ProviderNamedModelAdapter.provider_name: str` — tags captured `ModelTurn.reasoning` with
-  provider+model so opaque reasoning items only round-trip back to a matching adapter and model.
-  Omitting it means "do not tag".
+- `ProviderNamedModelAdapter.provider_name: str | None` — tags captured `ModelTurn.reasoning` with
+  provider+model so those items only round-trip back to a matching adapter and model.
+  Omitting it means "do not tag", and `None` says the same thing explicitly — which is what a
+  deployment needs when its gateway fronts an upstream with no reasoning artifacts, hence the
+  optional type rather than `str`. A *forwarding* adapter declares the provider whose artifacts it
+  relays, not itself: `GatewayModelAdapter.provider_name` names the gateway's **upstream** and
+  defaults to `"openai"`, matching the reference gateway's own default upstream. A deployment
+  whose `provider_adapter_factory` routes elsewhere must set it to that upstream, through
+  `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`,
+  `RunnerBackend(llm_gateway_provider=...)`, or — for the reference Studio, whose embedder seam
+  is exactly such a factory — `StudioConfig(llm_gateway_provider=...)`; those spell `None` as
+  `none`, and leaving them unset means "derive". The same attribute
+  names the provider on every observability surface that probes an adapter for one — via
+  `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`
+  (including when the declaration is unreadable — the tolerance path still falls back rather
+  than answering nothing),
+  and feeds `ModelCallReceipt.provider_name`, the model-stream context's `provider`, and
+  `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
+  through the gateway is therefore attributed to the model that served it, with the transport
+  still legible beside it as `ModelConfig.provider` and on the run manifest.
+  A forwarding adapter's declaration is a *guess about someone else's deployment*, so it is
+  **verified, never adopted**: the gateway names the upstream it actually relayed (`provider` on
+  the success body and terminal frame, below), and when that disagrees with what the client
+  declared, the client drops that turn's relayed `reasoning` artifacts and keeps everything else —
+  including the declaration itself, on every surface above. Adopting the server's answer per turn
+  would make one call's provider question have two answers again, which is what
+  `resolved_provider_name` exists to prevent; dropping is what the replay filter already does with
+  a tag that does not match, decided one hop earlier. A gateway that names no upstream (an older
+  one, or one whose upstream declares nothing) changes nothing.
 - `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
   `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
   actually ran under rather than a default the call never used.
@@ -647,6 +673,48 @@ shape is the one selected — is therefore refused at the adapter boundary with 
 supported route. It is a fail-closed refusal of a shape that cannot work here, not a claim about
 the shape in general: an adapter whose provider does persist responses is free to support it, and
 a stale handle riding *beside* `messages` is unaffected, since `messages` selects the shape.
+
+That by-value round-trip now survives the gateway hop in **both** directions. The request half
+always did — `messages` are forwarded verbatim, so a tagged reasoning block reaches the upstream
+adapter unchanged — but the response half did not, so a run routed through the gateway captured
+nothing to replay. The `reasoning` key on the success envelope (documented with the LLM gateway
+wire below) closes that: the artifacts cross the hop on both transports, are tagged with the
+relaying adapter's upstream `provider_name`, and are replayed to it on the next turn. The one
+shape that cannot carry them is a stream that ends without a terminal frame — it has no
+end-of-turn metadata channel at all, exactly as it has none for `usage` or the turn handle — and
+that absence is tolerated rather than refused: the turn reads no artifacts and the next turn
+replays none.
+
+**Replay is guaranteed only for the active window, and requests are pruned to it.** The active
+window is everything after the last `user` message — the in-flight tool loop. A captured
+reasoning block is replayable while it sits inside that window, and once a new user message
+lands it is outside forever, because the window only moves forward. "Last `user` message" means
+the last message *with role `user`*, whoever wrote it — the end user's next turn, and equally a
+user-role message the **kernel itself** authors: the `OutputValidator`'s repair prompt, and the
+observation messages a background or HITL result arrives on. An operator reading "a new user
+turn" would guess those do not count; they always have, because the adapter's replay filter
+reads the same role. So they are window boundaries, and everything before them is dead.
+
+The kernel therefore builds each request from a wire copy with the `reasoning` key removed from
+every message before the window start. Both of its request builders do — the loop's per-turn
+wire copy and the standalone validated call's repair request, which appends an assistant turn
+and a user-role repair prompt and so kills every block it was carrying. What the provider sees is
+unchanged in both — verified byte-identical on the repair path: outside the window the adapter
+already reconstructed those turns from `content`/`tool_calls` and never read the block. What changes is
+size — the un-pruned request re-sent one dead block per user turn on every later request, which
+grows with the conversation and is paid to the provider, to the gateway in between (twice on
+that route), and to the resolved-wire guard that `max_message_log_bytes` bounds. Note that on a
+media-free run the durable-log check reads the same limit over a strictly larger log, so it is
+that check, not the wire one, that a runaway conversation trips first; the prune buys request
+bytes rather than a new headroom regime. The rule lives in one function
+(`providers/_common.reasoning_replay_window_start`), read by both the adapter that decides what
+to replay and the kernel that decides what to send. **The durable message log and the checkpoint
+are not pruned** — they keep every captured block verbatim, so a restored run and a forensic
+reader both see what the model produced. Both routes benefit: the direct OpenAI one (bytes to
+the provider) and the gateway one, where the block would otherwise cross two hops. `prompt_digest`
+identifies the conversation the model actually saw, so it is taken over the pruned request; the
+same conversation digests differently than it did before this rule, which is the digest staying
+honest rather than a compatibility break — nothing compares digests across versions.
 
 ### Output Validation
 
@@ -1593,9 +1661,57 @@ Successful response:
   "tool_calls": [
     {"call_id": "call_1", "name": "read_notes", "arguments": {"path": "notes.md"}}
   ],
-  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+  "reasoning": [{"type": "reasoning", "id": "rs_...", "encrypted_content": "..."}],
+  "provider": "openai"
 }
 ```
+
+`reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim: the
+provider's output-item subsequence, adjacency-preserving — the `reasoning` items **plus the
+`function_call` or `message` items they are paired with**, because the provider validates that
+pairing when the subsequence is sent back. Only the `reasoning`-type entries are encrypted; a
+`message` entry carries the model's plaintext answer text and a `function_call` entry carries
+plaintext tool arguments, both of which also appear in `final_text` / `tool_calls` on the same
+envelope. Nothing here is interpreted by the gateway or the kernel, but **a redaction or logging
+policy must treat this array as model content**, not as an opaque blob: it duplicates content the
+rest of the envelope already bounds, so a surface that truncates `final_text` and dumps
+`reasoning` raw has not truncated anything. Sizewise it roughly doubles a small body when
+populated, and it is the payload the kernel prunes off historical turns (see the replay-window
+rule above).
+
+Note that `reasoning` names two different things on the two halves of this protocol, and they
+are not the same shape: on the **request** it is the reasoning *config* object
+(`{"effort": ..., "summary": ...}`, documented above), and on the **response** it is this
+artifact *array*. A server that echoes request keys back onto its response body therefore
+answers an array-valued key with an object, which the response reader refuses as
+`gateway_bad_response`.
+
+The artifacts ride the response body and
+the terminal `turn_complete` stream frame — the same two writers, built from one function — and
+exist so the provider-native reasoning round-trip survives this hop: the kernel captures them,
+tags them with the relaying adapter's `provider_name` plus the model, carries them in the
+by-value `messages` log, and the upstream adapter replays them on the next turn. The key is
+present **only when the upstream produced artifacts**, which makes it conditional on the *answer*
+rather than on the request (unlike the two applied echoes below). It is additive and ignorable:
+absence reads as "no artifacts", which is what an older gateway, a non-reasoning upstream, and a
+stream that ended without a terminal frame all honestly mean, and a run that reconstructs none
+simply replays none.
+
+`provider` names the upstream those artifacts came from, and rides the same two writers. Only the
+upstream adapter's own `provider_name` declaration is written here — never the gateway's own
+`ModelConfig.provider`, which is a hop-local constant (`"openai"` for every call this reference
+gateway serves) and would therefore *name* OpenAI for an upstream that is not. An upstream that
+declares nothing is unknown, and unknown is written by **omission**, which is a third
+conditionality beside the request-conditional echoes and the answer-conditional `reasoning`.
+
+The key exists because the client's own declaration is a guess: `GatewayModelAdapter.provider_name`
+defaults to `"openai"` — correct for this gateway's default upstream and wrong for any deployment
+whose `provider_adapter_factory` routes elsewhere without setting it — and it is what the captured
+artifacts get tagged with. A client reading `provider` **verifies** against it: on a mismatch it
+drops that turn's artifacts (they are unusable under either name) and changes nothing else, keeping
+its own declaration on the reasoning tag and on every observability surface. Absence gates nothing,
+so an older gateway and an undeclared upstream behave exactly as before the key existed.
 
 `usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
 additionally carry optional priced sub-counts when the provider reports them —

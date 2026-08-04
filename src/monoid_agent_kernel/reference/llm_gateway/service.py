@@ -26,6 +26,7 @@ from monoid_agent_kernel.providers._common import build_generation_payload, norm
 from monoid_agent_kernel.providers.base import (
     generation_support,
     provider_usage_of,
+    resolved_provider_name,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.base import (
@@ -165,8 +166,8 @@ class LlmGatewayBackend:
                     )
                 )
             )
-        except ModelAdapterError as failed:
-            self._meter(claims.tenant_id, provider_usage_of(failed))
+        except Exception as failed:
+            self._meter_failure(claims.tenant_id, failed)
             raise
         turn_handle = self._record_turn(claims, request, turn)
         self._meter(claims.tenant_id, turn.usage)
@@ -186,6 +187,8 @@ class LlmGatewayBackend:
             "provider_retried": turn.provider_retried,
         }
         result.update(_applied_echoes(request, adapter, config))
+        result.update(_reasoning_payload(turn))
+        result.update(_relayed_provider_payload(adapter))
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -285,6 +288,13 @@ class LlmGatewayBackend:
                     TurnComplete(
                         response_id=turn.response_id,
                         usage=turn.usage,
+                        # The reasoning artifacts ride the synthesized terminal chunk for the same
+                        # reason the retry evidence does: this chunk stands in for a stream the
+                        # provider could not produce, and ``assemble_streamed_turn`` reads
+                        # ``reasoning`` off ``TurnComplete`` and nowhere else -- so dropping it
+                        # here emptied the terminal frame on this branch alone, while the branch
+                        # that forwards the provider's own ``TurnComplete`` stayed correct.
+                        reasoning=turn.reasoning,
                         stop_reason=turn.stop_reason,
                         provider_retried=turn.provider_retried,
                     )
@@ -292,16 +302,19 @@ class LlmGatewayBackend:
             # Assemble once: the same usage drives both the meter and the outgoing frame, and the
             # assembled response id is what the opaque turn_handle maps to for continuation.
             turn = normalize_model_turn(assemble_streamed_turn(collected))
-        except ModelAdapterError as failed:
+        except Exception as failed:
             # The streaming twin of handle_turn's failure meter: a refusal can arrive *after*
             # the upstream produced and billed an answer (a chained hop's proof refusal is
             # exactly that), and this generator exits on the raise before the success-path
             # meter below -- so the billed tokens left the tenant ledger entirely on this
             # transport while the sync twin metered them. One handler around both sub-branches
-            # (the astream drive and the non-streaming fallback); ``provider_usage_of`` reads
-            # {} for an unbilled failure and ``_meter`` skips empty usage, so it stays a no-op
-            # there.
-            self._meter(claims.tenant_id, provider_usage_of(failed))
+            # (the astream drive and the non-streaming fallback), and ``Exception`` rather than
+            # ``ModelAdapterError`` for the reason ``_meter_failure`` states -- the OpenAI
+            # stream's terminal refusals, the ones this transport is most likely to meet, are
+            # raw types. ``BaseException`` is deliberately NOT caught: a consumer closing this
+            # generator raises ``GeneratorExit`` at the yields above, which is a cancelled read
+            # rather than a failed call.
+            self._meter_failure(claims.tenant_id, failed)
             raise
         turn_handle = self._record_turn(claims, request, turn)
         self._meter(claims.tenant_id, turn.usage)
@@ -316,6 +329,11 @@ class LlmGatewayBackend:
         # streaming client can read it from, and it is built by the same function so the two
         # transports cannot answer differently.
         frame.update(_applied_echoes(request, adapter, model_request.model))
+        frame.update(_reasoning_payload(turn))
+        # Written from the adapter, so it is the same answer on the branch that forwards the
+        # provider's own terminal chunk and the branch that synthesizes one -- neither of which
+        # carries an attribution the assembled turn could have been read for.
+        frame.update(_relayed_provider_payload(adapter))
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -376,6 +394,28 @@ class LlmGatewayBackend:
             return
         with self._lock:
             self._usage.setdefault(tenant_id, LlmGatewayUsage(tenant_id)).add(usage)
+
+    def _meter_failure(self, tenant_id: str, failed: BaseException) -> None:
+        """Charge the tenant for what an ESCAPING failure already cost, then let it escape.
+
+        Both transports' failure arms come through here instead of reading the stamp for
+        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The adapter
+        that first sees the provider's billed body stamps refusals of more than one type:
+        ``normalize_usage`` says "malformed usage" with a raw ``ValueError``, and *every* refusal
+        in the OpenAI stream's terminal region is a raw ``ValueError``/``AttributeError``, because
+        that path folds deltas and reads end-of-turn metadata directly rather than running the
+        one-shot mapping that classifies. Gated on ``ModelAdapterError``, this meter read the
+        stamp on exactly the failures that had already been classified and skipped the ones that
+        had not -- so an upstream whose final payload is malformed charged the tenant nothing for
+        a turn it had generated and billed, on the transport where that shape actually occurs.
+
+        Meter and re-raise: nothing is swallowed and nothing is reclassified here, so what
+        escapes is what arrived. ``provider_usage_of`` reads ``{}`` for an unbilled failure and
+        :meth:`_meter` skips empty usage, which is what keeps a failure raised before the
+        provider free.
+        """
+
+        self._meter(tenant_id, provider_usage_of(failed))
 
     def _record_turn(
         self,
@@ -492,6 +532,69 @@ def _applied_echoes(
     if request.output_schema is not None:
         echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
     return echoes
+
+
+def _reasoning_payload(turn: ModelTurn) -> dict[str, Any]:
+    """The turn's provider-native reasoning artifacts, for whichever transport is writing.
+
+    The kernel captures these items and replays them verbatim on the next by-value turn, which
+    is what makes a ZDR reasoning round-trip possible at all. The request half of that loop
+    already crossed this hop -- ``messages`` ride by value and are forwarded untouched -- but the
+    response half did not, so a run routed through the gateway captured nothing and replayed
+    nothing. Relayed verbatim, because this hop has no business interpreting them.
+
+    Not opaque, though, and the distinction matters to whoever writes the redaction policy: the
+    captured subsequence is ``reasoning`` items PLUS the ``function_call``/``message`` items they
+    are paired with (the provider validates that adjacency), so only the reasoning-type entries
+    carry ``encrypted_content``. A ``message`` entry holds the model's plaintext answer and a
+    ``function_call`` entry holds plaintext arguments -- the same content ``final_text`` and
+    ``tool_calls`` carry on this very envelope. Treat the array as MODEL CONTENT when logging or
+    truncating: it roughly doubles a small body, and it defeats any bound applied only to the
+    fields beside it.
+
+    Built by one function and used by both writers, exactly like :func:`_applied_echoes`, so the
+    two transports cannot come to disagree about a fact neither of them authored.
+
+    Omit-when-empty, and the conditionality is a property of the *answer* rather than of the
+    request: traffic whose upstream produced no reasoning keeps its exact previous wire shape,
+    and a client that never hears the key reads it as "no artifacts", which is the only thing an
+    absent key can honestly mean.
+    """
+
+    if not turn.reasoning:
+        return {}
+    return {"reasoning": [dict(item) for item in turn.reasoning]}
+
+
+def _relayed_provider_payload(adapter: ModelAdapter) -> dict[str, Any]:
+    """Whose artifacts this hop just relayed — for whichever transport is writing.
+
+    The client declares its upstream (``GatewayModelAdapter.provider_name``, defaulting to
+    ``"openai"`` because that is what this reference gateway fronts) and tags every captured
+    artifact with it. That declaration is a *guess about someone else's deployment*: a gateway
+    whose ``provider_adapter_factory`` routes elsewhere makes it wrong, and nothing on either
+    side could tell. This side can: it built the adapter. So it says so, and the client verifies
+    against its own declaration instead of trusting it (see
+    ``providers/gateway._readable_relayed_reasoning``).
+
+    Read from the upstream adapter's own DECLARATION and nothing else, which is why this passes
+    no config. ``resolved_provider_name(adapter, config)`` would fall back to
+    ``ModelConfig.provider``, and the config here is ``_upstream_model_config``'s — hardcoded
+    ``"openai"`` for every call this gateway serves, a hop-local fabrication rather than a fact
+    about the upstream. Through that fallback a non-OpenAI upstream that declares nothing would
+    be *named* OpenAI, minting the exact confident lie this key exists to delete. An undeclared
+    upstream is unknown, and unknown is written by omission: absence gates nothing on the client,
+    which is also what an older gateway's silence means, so the two are indistinguishable by
+    design.
+
+    Omit-when-unknown, one function, both writers — the rule and the construction
+    :func:`_reasoning_payload` and :func:`_applied_echoes` are already held to.
+    """
+
+    provider = resolved_provider_name(adapter, None)
+    if not provider:
+        return {}
+    return {"provider": provider}
 
 
 def _pump_astream(

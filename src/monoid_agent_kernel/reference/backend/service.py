@@ -63,6 +63,7 @@ from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
+from monoid_agent_kernel.providers.gateway import DEFAULT_RELAYED_PROVIDER
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     BACKEND_AUDIENCES,
@@ -369,6 +370,20 @@ class RunnerBackend:
     token_manager: TokenManager
     allowed_workspace_roots: tuple[Path, ...]
     llm_gateway_url: str
+    # Whose native reasoning artifacts the gateway at ``llm_gateway_url`` relays -- its UPSTREAM,
+    # never the hop. It becomes ``GatewayModelAdapter.provider_name`` on every adapter this
+    # backend builds (submitted runs and recovery's rebuilds alike), which tags the opaque
+    # reasoning items so they only replay to a matching provider, and names the provider on the
+    # model-call receipt and its OTel span. Defaults to the reference gateway's own upstream;
+    # ``None`` (or the string ``"none"``) means "do not tag", the right answer for a gateway
+    # fronting an upstream with no reasoning artifacts. Deliberately a backend field and NOT a
+    # ``ModelConfig`` one: it describes the deployment's transport, not the agent's config, and
+    # ``ModelConfig`` feeds ``config_hash`` (a new field there would invalidate durable recovery
+    # metadata for every existing run).
+    # Keyword-only so it can live beside the URL it describes without rebinding the positional
+    # arguments that predate it: an embedder's fifth positional was ``model_adapter_factory``
+    # and must stay so.
+    llm_gateway_provider: str | None = field(default=DEFAULT_RELAYED_PROVIDER, kw_only=True)
     model_adapter_factory: ModelAdapterFactory | None = None
     web_gateway_url: str | None = None
     allowed_apply_roots: tuple[Path, ...] = ()
@@ -592,6 +607,7 @@ class RunnerBackend:
             BackendLoopFactoryContext(
                 run_root_provider=lambda: self.run_root,
                 llm_gateway_url_provider=lambda: self.llm_gateway_url,
+                llm_gateway_provider_provider=lambda: self.llm_gateway_provider,
                 web_gateway_url_provider=lambda: self.web_gateway_url,
                 model_adapter_factory_provider=lambda: self.model_adapter_factory,
                 token_manager_provider=lambda: self.token_manager,

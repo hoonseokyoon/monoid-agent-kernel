@@ -30,6 +30,11 @@ from monoid_agent_kernel.providers._common import (
     build_reasoning_payload,
     normalize_usage,
     project_message_to_text,
+    # The lenient refusal-usage reader every stamp on this wire is fed from. It began as this
+    # module's ``_reported_error_usage``; the OpenAI adapter -- the SOURCE reader, the one that
+    # sees the provider's own billed body first -- had no equivalent at all, which is how a
+    # refusal there reached this hop already reporting zero. One function, both adapters.
+    usage_reported_by,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -43,11 +48,38 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_retried,
     mark_provider_usage,
     report_provider_retried,
+    resolved_provider_name,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
 DEFAULT_GATEWAY_URL_ENV = "MONOID_LLM_GATEWAY_URL"
 DEFAULT_GATEWAY_TOKEN_ENV = "MONOID_LLM_GATEWAY_TOKEN"
+
+# The upstream the *reference* gateway fronts when no ``provider_adapter_factory`` overrides it
+# (``_upstream_model_config`` builds ``provider="openai"``; ``_build_adapter`` falls back to
+# ``OpenAIModelAdapter``). It is the dataclass default of ``GatewayModelAdapter.provider_name``
+# and the default of every shipped builder's knob, defined once so those cannot drift apart.
+DEFAULT_RELAYED_PROVIDER = "openai"
+# How a *string-typed* configuration surface -- a CLI flag, an env var, a JSON field -- spells the
+# protocol's ``None`` ("do not tag"). Case-insensitive: an operator typing NONE means this.
+RELAYED_PROVIDER_NONE = "none"
+
+
+def resolve_relayed_provider(value: str | None) -> str | None:
+    """Read a configured upstream name into ``GatewayModelAdapter.provider_name``.
+
+    Shared by every string-typed surface that configures the relayed provider (the CLI's
+    ``--llm-gateway-provider``, the backend service field) so the sentinel and the trimming
+    behave identically on all of them. ``None``, blank, and the ``"none"`` sentinel all mean the
+    protocol's documented "do not tag"; anything else is the upstream's name, stripped.
+    """
+
+    if value is None:
+        return None
+    text = value.strip()
+    if not text or text.lower() == RELAYED_PROVIDER_NONE:
+        return None
+    return text
 
 GATEWAY_TIMEOUT = "gateway_timeout"
 GATEWAY_NETWORK_ERROR = "gateway_network_error"
@@ -119,9 +151,50 @@ class GatewayModelAdapter:
     # near expiry, keeping a long run (one that outlives the token TTL) authenticated without a
     # restart. ``None`` = today's static behavior.
     token_provider: Callable[[], str | None] | None = None
+    # Whose native reasoning artifacts this transport RELAYS -- the upstream provider behind the
+    # gateway, never the hop itself. The loop reads it (ProviderNamedModelAdapter) to tag the
+    # items it captured off a turn (encrypted reasoning entries and the plaintext message/
+    # function_call entries paired with them -- see ``_gateway_reasoning_items``), and replays a
+    # tagged block only to a matching adapter and model, so the tag has to name the thing that
+    # can actually read the items back:
+    # an OpenAI-encrypted reasoning item returned to anything else is an unusable request one
+    # turn later. Without this field the loop dropped every artifact the gateway relayed, one
+    # line after the reader reconstructed it.
+    #
+    # Defaults to the reference gateway's hardcoded upstream (``_upstream_model_config`` builds
+    # ``provider="openai"`` and ``_build_adapter`` falls back to ``OpenAIModelAdapter``). A
+    # deployment whose ``provider_adapter_factory`` routes elsewhere must set this to its real
+    # upstream; ``None`` disables tagging, which is the protocol's documented "do not tag" and
+    # the right answer for a gateway fronting an upstream with no reasoning artifacts.
+    #
+    # It also names the provider on the observability surfaces that probe an adapter for one --
+    # the model-call receipt, its OTel ``gen_ai.provider.name``, and the model-stream context --
+    # which is the correct attribution for all three: those spans describe the call the *model*
+    # served, and "gateway" is the transport it arrived over. ``ModelConfig.provider`` still
+    # carries that transport string beside it.
+    provider_name: str | None = DEFAULT_RELAYED_PROVIDER
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
+
+    def _declared_provider(self) -> str | None:
+        """This adapter's own upstream declaration, read the way every other reader reads one.
+
+        Through ``resolved_provider_name`` with no config, which is the shared expression's
+        declaration half alone: tolerant of a subclass whose ``provider_name`` raises, and
+        ``normalize_unicode_scalars``-normalized. The gateway *server* resolves the upstream's
+        declaration through the same call, so the two sides of the comparison in
+        :func:`_readable_relayed_reasoning` cannot disagree on normalization -- two spellings of
+        one name that differ only in Unicode form would otherwise read as a mismatch and drop
+        artifacts that were perfectly readable.
+
+        No config is passed on purpose: ``ModelConfig.provider`` on this adapter is ``"gateway"``,
+        the transport, and a transport name compared against an upstream name is a mismatch every
+        time.
+        """
+
+        return resolved_provider_name(self, None)
+
     def structured_output_support(self, config: ModelConfig | None = None) -> str:
         """This adapter *forwards*; it does not apply. So its claim is only as good as the
         proof it insists on, and that is exactly what ``on_unsupported`` controls.
@@ -208,7 +281,9 @@ class GatewayModelAdapter:
                     # first time, and overwriting turned that into a clean attempt. Two independent
                     # retry loops sit on this path and either one having run is the fact a receipt
                     # records.
-                    turn = _parse_gateway_response(data)
+                    turn = _parse_gateway_response(
+                        data, declared_provider=self._declared_provider()
+                    )
                     if attempt > 1:
                         turn = replace(turn, provider_retried=True)
                     # Stamped *before* the applied-parameter checks, exactly as the streaming
@@ -386,7 +461,9 @@ class GatewayModelAdapter:
                                     raise _StreamRetry(error)
                                 raise error
                             committed = True
-                            async for chunk in _aiter_sse_chunks(response):
+                            async for chunk in _aiter_sse_chunks(
+                                response, declared_provider=self._declared_provider()
+                            ):
                                 # Also on each chunk, so a chunk forwarded on its own still says
                                 # which stream it came from. Same ``attempt`` in the same scope as
                                 # the marker above, so the two cannot disagree.
@@ -791,8 +868,97 @@ def _portable_gateway_payload(
         ) from exc
 
 
+def _gateway_reasoning_items(
+    value: Any,
+    *,
+    context: str,
+    http_status: int | None = None,
+    known_provider_retried: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    """Shape-check the provider-native reasoning artifacts one response carries.
+
+    Absent or ``None`` reads as "no artifacts" -- an older gateway that never mentions the key
+    and an upstream that produced none say the same thing to a client, and both leave the next
+    turn with nothing to replay, which is the neutral behavior the loop already has.
+
+    Anything present must be a list of objects, because that is the only shape the replay path
+    can hand back to a provider: the items travel into the by-value ``messages`` log and out
+    again to the upstream adapter verbatim, so a scalar or a half-list would be discovered by
+    the *provider*, one hop and one turn later, as an unclassifiable request. Contents are not
+    inspected past that -- but "not inspected" is not "opaque". The captured subsequence is the
+    provider's ``reasoning`` items plus the ``function_call``/``message`` items paired with them,
+    so only the reasoning-type entries are encrypted: the rest is plaintext answer text and tool
+    arguments, duplicating what ``final_text``/``tool_calls`` carry beside it. Anything that
+    logs, previews, or truncates this value must treat it as model content.
+
+    Note also that ``reasoning`` means one thing on the request body (the reasoning CONFIG
+    object this adapter writes in ``_payload``) and another here on the response (this artifact
+    ARRAY). A third-party gateway that echoes request keys onto its response therefore answers
+    with an object where an array belongs, and lands on the refusal below -- which is the correct
+    outcome (the replay path cannot use it), just an unobvious cause.
+
+    A tuple is accepted beside a list for the same reason ``tool_calls`` accepts one two dozen
+    lines below: JSON only ever produces a list, but this reader also serves in-process Python
+    callers, and a sequence refused by one array-valued key of a body while its neighbour
+    accepts it is a difference with no rule behind it.
+
+    Written once for both transports, like :func:`_validated_generation_echo` beside it: the
+    sync response and the streamed terminal frame read the same key out of different envelopes,
+    and a reader that is stricter than its twin is the shape this file keeps producing.
+    """
+
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)) and all(isinstance(item, dict) for item in value):
+        return tuple(dict(item) for item in value)
+    raise ModelAdapterError(
+        f"LLM gateway returned invalid {context} reasoning: expected an array of objects",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        http_status=http_status,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _readable_relayed_reasoning(
+    items: tuple[dict[str, Any], ...],
+    *,
+    reported: str | None,
+    declared: str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Drop relayed artifacts the upstream this adapter DECLARES could never read back.
+
+    ``provider_name`` is this client's declaration of the gateway's upstream, and it defaults to
+    ``"openai"`` because that is what the reference gateway fronts -- so a deployment whose
+    ``provider_adapter_factory`` routes elsewhere and leaves the knob alone tags every captured
+    artifact with a provider that cannot read it. The server now names the upstream it actually
+    relayed (``provider`` on the success body and the terminal frame), which is the first time
+    either side of this hop could tell.
+
+    VERIFY, not adopt. The declaration keeps naming the provider everywhere it already does --
+    the reasoning tag, ``ModelCallReceipt.provider_name``, the model-stream context, every OTel
+    ``gen_ai.provider.name`` -- because a per-turn adoption would answer *one call's* provider
+    question two ways, which is the defect ``resolved_provider_name`` was written to end. What a
+    mismatch changes is only what it can honestly change: the artifacts, which are unusable under
+    either name. Same answer the replay filter gives a block whose tag does not match the current
+    adapter (``_reasoning_replay_flags``: drop rather than send half a validated pair), decided
+    one hop earlier so the run never carries an item it cannot spend.
+
+    Silent, and it drops rather than raises, for the reason the key is additive: absence proves
+    nothing, so an older gateway that names no upstream gates nothing, and a client that declares
+    none (the protocol's "do not tag") gates nothing either -- the loop already appends no
+    reasoning block for it, and reading a *match* out of two absences would be a second, weaker
+    copy of that rule. The turn itself is untouched: a mismatch invalidates the artifacts, not the
+    answer they came with.
+    """
+
+    if not items or not reported or not declared:
+        return items
+    return items if reported == declared else ()
+
+
 def _validated_generation_echo(
-    applied: Any, *, provider_retried: bool = False
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
 ) -> dict[str, Any] | None:
     """Shape-check one ``generation_applied`` echo. One rule, both transports.
 
@@ -802,6 +968,11 @@ def _validated_generation_echo(
     sync response and the streamed terminal frame read the same key out of different
     envelopes -- the streamed side used to reject a malformed echo that the sync side accepted
     under ``"omit"``.
+
+    ``http_status`` is the same parameter every other validator on this wire takes, for the same
+    reason: a caller that already holds a trustworthy status hands it over, so which field of one
+    malformed frame happened to be bad does not decide whether the refusal can name a status. The
+    enforcement callers below hold none and pass none.
     """
 
     if applied is None or isinstance(applied, dict):
@@ -810,11 +981,14 @@ def _validated_generation_echo(
         "LLM gateway returned an invalid generation_applied echo: expected an object",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=provider_retried,
     )
 
 
-def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> bool | None:
+def _validated_schema_echo(
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
+) -> bool | None:
     """The ``schema_applied`` twin of :func:`_validated_generation_echo`, same rule."""
 
     if applied is None or isinstance(applied, bool):
@@ -823,6 +997,7 @@ def _validated_schema_echo(applied: Any, *, provider_retried: bool = False) -> b
         "LLM gateway returned an invalid schema_applied echo: expected a boolean",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
+        http_status=http_status,
         provider_retried=provider_retried,
     )
 
@@ -936,7 +1111,11 @@ def _check_schema_applied(
     )
 
 
-def _parse_gateway_response(data: Any) -> ModelTurn:
+def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) -> ModelTurn:
+    """``declared_provider`` is the reading adapter's own ``provider_name``, resolved the same
+    way the server resolves the upstream's, so the two sides of one comparison cannot differ on
+    normalization. ``None`` (the default, and what a direct caller passes) gates nothing."""
+
     if not isinstance(data, dict):
         raise ModelAdapterError(
             "LLM gateway returned a non-object JSON response",
@@ -948,188 +1127,241 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
     # Every validator below is handed it, so a malformed payload raises a classified failure that
     # still names the status the server reported rather than an unclassifiable one.
     status_hint = _gateway_http_status_hint(data) if "error" in data else None
-    provider_retried = _exact_gateway_bool(
-        data,
-        "provider_retried",
-        default=False,
-        context="response",
-        http_status=status_hint,
-    )
-    if "error" in data:
-        error_http_status = _exact_gateway_int(
+    # A refusal off a payload that reported spending tokens carries that cost, whichever key of
+    # it turned out to be malformed: the upstream generated and billed the turn before this
+    # reader ever looked at it, and the refusal is the only carrier left for a call nothing
+    # downstream will assemble. THREE guarded regions cover this reader -- the pre-branch read
+    # here, the error branch, and the success branch -- because a refusal can escape from any of
+    # them and the rule is about the payload, not about which branch was reading it. The error
+    # branch stamps the failure it *builds*, but only after reading five keys of its own; the
+    # first version of this rule said the branch "builds and stamps its own failure" and treated
+    # that as covering it, which is true only when none of those five reads is the malformed one.
+    try:
+        provider_retried = _exact_gateway_bool(
             data,
-            "http_status",
-            default=None,
-            context="error response",
-            minimum=100,
-            maximum=599,
-            allow_none=True,
+            "provider_retried",
+            default=False,
+            context="response",
             http_status=status_hint,
-            known_provider_retried=provider_retried,
         )
-        retryable = _exact_gateway_bool(
-            data,
-            "retryable",
-            default=False,
-            context="error response",
-            http_status=error_http_status,
-            known_provider_retried=provider_retried,
-        )
-        # The remedy the failure names, read back rather than inferred from the status. Absent
-        # reads as False -- an older gateway that never mentions the key, and a failure that
-        # really is not config-fixable, mean the same thing to a driver.
-        config_recoverable = _exact_gateway_bool(
-            data,
-            "config_recoverable",
-            default=False,
-            context="error response",
-            http_status=error_http_status,
-            known_provider_retried=provider_retried,
-        )
-        envelope_error = ModelAdapterError(
-            _gateway_string(
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, usage_reported_by(data))
+        raise
+    if "error" in data:
+        # The whole construction is inside the guard, not just the stamp that ends it: an
+        # envelope whose ``http_status``/``retryable``/``config_recoverable``/``error``/
+        # ``error_code`` is malformed is refused HERE, before the failure it describes can be
+        # built, and that refusal was leaving with an empty ``provider_usage`` off a payload
+        # that had already reported what the turn burned. A malformed error envelope stays a
+        # non-retryable ``gateway_bad_response`` -- one rule with the success readers, because a
+        # broken envelope is a broken gateway whatever failure it was trying to report.
+        try:
+            error_http_status = _exact_gateway_int(
                 data,
-                "error",
+                "http_status",
+                default=None,
                 context="error response",
-                required=True,
+                minimum=100,
+                maximum=599,
+                allow_none=True,
+                http_status=status_hint,
                 known_provider_retried=provider_retried,
-                http_status=error_http_status,
             )
-            or "",
-            provider_error_code=(
+            retryable = _exact_gateway_bool(
+                data,
+                "retryable",
+                default=False,
+                context="error response",
+                http_status=error_http_status,
+                known_provider_retried=provider_retried,
+            )
+            # The remedy the failure names, read back rather than inferred from the status.
+            # Absent reads as False -- an older gateway that never mentions the key, and a
+            # failure that really is not config-fixable, mean the same thing to a driver.
+            config_recoverable = _exact_gateway_bool(
+                data,
+                "config_recoverable",
+                default=False,
+                context="error response",
+                http_status=error_http_status,
+                known_provider_retried=provider_retried,
+            )
+            envelope_error = ModelAdapterError(
                 _gateway_string(
                     data,
-                    "error_code",
+                    "error",
                     context="error response",
+                    required=True,
                     known_provider_retried=provider_retried,
                     http_status=error_http_status,
                 )
-                or GATEWAY_BAD_RESPONSE
-            ),
-            retryable=retryable,
-            config_recoverable=config_recoverable,
-            http_status=error_http_status,
-            provider_retried=provider_retried,
-        )
+                or "",
+                provider_error_code=(
+                    _gateway_string(
+                        data,
+                        "error_code",
+                        context="error response",
+                        known_provider_retried=provider_retried,
+                        http_status=error_http_status,
+                    )
+                    or GATEWAY_BAD_RESPONSE
+                ),
+                retryable=retryable,
+                config_recoverable=config_recoverable,
+                http_status=error_http_status,
+                provider_retried=provider_retried,
+            )
+        except ModelAdapterError as malformed:
+            mark_provider_usage(malformed, usage_reported_by(data))
+            raise
         # Third error reader on this wire, and the rule is the same on all three: a failure
         # that reports what it cost is recorded as having cost it.
-        mark_provider_usage(envelope_error, _reported_error_usage(data))
+        mark_provider_usage(envelope_error, usage_reported_by(data))
         raise envelope_error
-    _exact_gateway_bool(
-        data,
-        "retryable",
-        default=False,
-        context="response",
-        known_provider_retried=provider_retried,
-    )
-    raw_calls = data.get("tool_calls", ())
-    if raw_calls is None:
-        raw_calls = ()
-    if not isinstance(raw_calls, (list, tuple)):
-        raise ModelAdapterError(
-            "LLM gateway returned invalid tool_calls: expected an array",
-            provider_error_code=GATEWAY_BAD_RESPONSE,
-            provider_retried=provider_retried,
+    try:
+        _exact_gateway_bool(
+            data,
+            "retryable",
+            default=False,
+            context="response",
+            known_provider_retried=provider_retried,
         )
-    tool_calls: list[ToolCall] = []
-    for raw in raw_calls:
-        if not isinstance(raw, dict):
+        raw_calls = data.get("tool_calls", ())
+        if raw_calls is None:
+            raw_calls = ()
+        if not isinstance(raw_calls, (list, tuple)):
             raise ModelAdapterError(
-                "LLM gateway returned an invalid tool call",
+                "LLM gateway returned invalid tool_calls: expected an array",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 provider_retried=provider_retried,
             )
-        args = raw.get("arguments")
-        if args is None:
-            args = {}
-        if isinstance(args, str):
-            try:
-                args = loads_model_json_ingress(args)
-            except ValueError as exc:
+        tool_calls: list[ToolCall] = []
+        for raw in raw_calls:
+            if not isinstance(raw, dict):
+                raise ModelAdapterError(
+                    "LLM gateway returned an invalid tool call",
+                    provider_error_code=GATEWAY_BAD_RESPONSE,
+                    provider_retried=provider_retried,
+                )
+            args = raw.get("arguments")
+            if args is None:
+                args = {}
+            if isinstance(args, str):
+                try:
+                    args = loads_model_json_ingress(args)
+                except ValueError as exc:
+                    raise ModelAdapterError(
+                        f"invalid gateway tool call arguments for {raw.get('name')}",
+                        provider_error_code=GATEWAY_BAD_RESPONSE,
+                        provider_retried=provider_retried,
+                    ) from exc
+            else:
+                args = _portable_gateway_payload(
+                    args,
+                    context="tool call arguments",
+                    http_status=status_hint,
+                    known_provider_retried=provider_retried,
+                )
+            if not isinstance(args, dict):
                 raise ModelAdapterError(
                     f"invalid gateway tool call arguments for {raw.get('name')}",
                     provider_error_code=GATEWAY_BAD_RESPONSE,
                     provider_retried=provider_retried,
-                ) from exc
-        else:
-            args = _portable_gateway_payload(
-                args,
-                context="tool call arguments",
+                )
+            tool_calls.append(
+                ToolCall(
+                    id=_gateway_string(
+                        raw,
+                        "id",
+                        "call_id",
+                        context="tool call",
+                        required=True,
+                        known_provider_retried=provider_retried,
+                    )
+                    or "",
+                    name=_gateway_string(
+                        raw,
+                        "name",
+                        context="tool call",
+                        required=True,
+                        known_provider_retried=provider_retried,
+                    )
+                    or "",
+                    arguments=args,
+                )
+            )
+
+        # Whose artifacts the hop relayed, answered by the side that built the upstream adapter.
+        # Absent from an older gateway and from one whose upstream declares nothing, both of
+        # which mean "unknown" -- and unknown gates nothing (see
+        # :func:`_readable_relayed_reasoning`).
+        relayed_provider = _gateway_string(
+            data,
+            "provider",
+            context="response",
+            known_provider_retried=provider_retried,
+        )
+        # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
+        # infer the common cases so the loop's branch still works.
+        stop_reason = _gateway_string(
+            data,
+            "stop_reason",
+            context="response",
+            known_provider_retried=provider_retried,
+        )
+        if stop_reason is None:
+            stop_reason = "tool_calls" if tool_calls else "stop"
+        return ModelTurn(
+            response_id=_gateway_string(
+                data,
+                "response_id",
+                "turn_handle",
+                context="response",
+                known_provider_retried=provider_retried,
+            ),
+            final_text=_gateway_string(
+                data,
+                "final_text",
+                context="response",
+                known_provider_retried=provider_retried,
+            ),
+            tool_calls=tuple(tool_calls),
+            usage=_gateway_usage(
+                data.get("usage"),
+                context="response",
                 http_status=status_hint,
                 known_provider_retried=provider_retried,
-            )
-        if not isinstance(args, dict):
-            raise ModelAdapterError(
-                f"invalid gateway tool call arguments for {raw.get('name')}",
-                provider_error_code=GATEWAY_BAD_RESPONSE,
-                provider_retried=provider_retried,
-            )
-        tool_calls.append(
-            ToolCall(
-                id=_gateway_string(
-                    raw,
-                    "id",
-                    "call_id",
-                    context="tool call",
-                    required=True,
+            ),
+            raw=_portable_gateway_payload(
+                data,
+                context="response",
+                http_status=status_hint,
+                known_provider_retried=provider_retried,
+            ),
+            # The opaque provider-native reasoning artifacts the upstream produced, relayed
+            # by the gateway. Absent from an older gateway, which reads as "none" -- the same
+            # thing an adapter with no reasoning says, and all a wire that never mentions the
+            # key can mean. Gated on the upstream the server named, so a client whose configured
+            # declaration disagrees keeps none of what that declaration would mistag.
+            reasoning=_readable_relayed_reasoning(
+                _gateway_reasoning_items(
+                    data.get("reasoning"),
+                    context="response",
+                    http_status=status_hint,
                     known_provider_retried=provider_retried,
-                )
-                or "",
-                name=_gateway_string(
-                    raw,
-                    "name",
-                    context="tool call",
-                    required=True,
-                    known_provider_retried=provider_retried,
-                )
-                or "",
-                arguments=args,
-            )
+                ),
+                reported=relayed_provider,
+                declared=declared_provider,
+            ),
+            stop_reason=stop_reason,
+            # A retry the gateway's own backend made. Absent from an older gateway, which
+            # reads as "did not retry" -- the same default an adapter with no retry loop
+            # carries, and the only thing a wire that never mentions it can honestly mean.
+            provider_retried=provider_retried,
         )
-
-    # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
-    # infer the common cases so the loop's branch still works.
-    stop_reason = _gateway_string(
-        data,
-        "stop_reason",
-        context="response",
-        known_provider_retried=provider_retried,
-    )
-    if stop_reason is None:
-        stop_reason = "tool_calls" if tool_calls else "stop"
-    return ModelTurn(
-        response_id=_gateway_string(
-            data,
-            "response_id",
-            "turn_handle",
-            context="response",
-            known_provider_retried=provider_retried,
-        ),
-        final_text=_gateway_string(
-            data,
-            "final_text",
-            context="response",
-            known_provider_retried=provider_retried,
-        ),
-        tool_calls=tuple(tool_calls),
-        usage=_gateway_usage(
-            data.get("usage"),
-            context="response",
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        ),
-        raw=_portable_gateway_payload(
-            data,
-            context="response",
-            http_status=status_hint,
-            known_provider_retried=provider_retried,
-        ),
-        stop_reason=stop_reason,
-        # A retry the gateway's own backend made. Absent from an older gateway, which reads as
-        # "did not retry" -- the same default an adapter with no retry loop carries, and the only
-        # thing a wire that never mentions it can honestly mean.
-        provider_retried=provider_retried,
-    )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, usage_reported_by(data))
+        raise
 
 
 class _StreamRetry(Exception):
@@ -1139,18 +1371,25 @@ class _StreamRetry(Exception):
         self.error = error
 
 
-async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
+async def _aiter_sse_chunks(
+    response: Any, *, declared_provider: str | None = None
+) -> AsyncIterator[ModelStreamChunk]:
     """Parse the gateway's ``text/event-stream`` body into ``ModelStreamChunk``s.
 
     Minimal SSE: ``data:`` lines accumulate, a blank line dispatches one JSON frame, ``:``
     comment lines (keepalives) are ignored, and a trailing frame without a terminating blank
     line is still dispatched. An ``error`` frame raises ``ModelAdapterError``.
+
+    ``declared_provider`` is carried through to the frame reader untouched -- the streamed twin
+    of what ``next_turn`` hands its own parser. The stream reaches that reader through two
+    functions the adapter does not call directly, and a thread that stops at either of them
+    leaves this transport ungated while the blocking one enforces.
     """
     data_lines: list[str] = []
     async for line in response.aiter_lines():
         if line == "":
             if data_lines:
-                chunk = _decode_sse_chunk(data_lines)
+                chunk = _decode_sse_chunk(data_lines, declared_provider=declared_provider)
                 data_lines = []
                 if chunk is not None:
                     yield chunk
@@ -1160,12 +1399,14 @@ async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip(" "))
     if data_lines:
-        chunk = _decode_sse_chunk(data_lines)
+        chunk = _decode_sse_chunk(data_lines, declared_provider=declared_provider)
         if chunk is not None:
             yield chunk
 
 
-def _decode_sse_chunk(data_lines: list[str]) -> ModelStreamChunk | None:
+def _decode_sse_chunk(
+    data_lines: list[str], *, declared_provider: str | None = None
+) -> ModelStreamChunk | None:
     try:
         event = loads_model_stream_envelope_json_ingress("\n".join(data_lines))
     except ValueError as exc:
@@ -1178,10 +1419,12 @@ def _decode_sse_chunk(data_lines: list[str]) -> ModelStreamChunk | None:
             "LLM gateway stream returned a non-object frame",
             provider_error_code=GATEWAY_BAD_RESPONSE,
         )
-    return _chunk_from_event(event)
+    return _chunk_from_event(event, declared_provider=declared_provider)
 
 
-def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
+def _chunk_from_event(
+    event: dict[str, Any], *, declared_provider: str | None = None
+) -> ModelStreamChunk | None:
     # A retry the gateway's own backend made, as opposed to one this client's loop made. Read off
     # every frame that carries it, because a stream cancelled mid-flight never delivers the
     # terminal one. Absent reads as "did not retry", which is what a wire that never mentions it
@@ -1192,19 +1435,25 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         if type(raw_event_type) is str and raw_event_type == "error"
         else None
     )
-    retried = _exact_gateway_bool(
-        event,
-        "provider_retried",
-        default=False,
-        context="stream frame",
-        http_status=status_hint,
-    )
-    event_type = _gateway_string(
-        event,
-        "type",
-        context="stream frame",
-        known_provider_retried=retried,
-    )
+    # The sync reader's rule on the frame reader: a refusal off a frame that reported spending
+    # tokens carries that cost, and these two reads run before any branch can stamp for them.
+    try:
+        retried = _exact_gateway_bool(
+            event,
+            "provider_retried",
+            default=False,
+            context="stream frame",
+            http_status=status_hint,
+        )
+        event_type = _gateway_string(
+            event,
+            "type",
+            context="stream frame",
+            known_provider_retried=retried,
+        )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, usage_reported_by(event))
+        raise
     if event_type == "text_delta":
         return TextDelta(
             text=_gateway_fragment_string(
@@ -1266,124 +1515,145 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
         )
     if event_type == "turn_complete":
         # Same shape rule the sync response is held to; the enforcement functions call these
-        # too, so neither transport can be stricter than the other.
+        # too, so neither transport can be stricter than the other. The whole construction is
+        # inside the guard, not just the two echoes: every key read below refuses the same
+        # billed frame the same way, and only the echo pair was carrying the cost out.
         try:
             applied = _validated_generation_echo(
-                event.get("generation_applied"), provider_retried=retried
+                event.get("generation_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
             )
             schema_applied = _validated_schema_echo(
-                event.get("schema_applied"), provider_retried=retried
+                event.get("schema_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
+            )
+            # The gateway's opaque turn_handle is the continuation handle the core stores.
+            return TurnComplete(
+                generation_applied=applied,
+                schema_applied=schema_applied,
+                response_id=_gateway_string(
+                    event,
+                    "turn_handle",
+                    "response_id",
+                    context="turn-complete frame",
+                    known_provider_retried=retried,
+                ),
+                usage=_gateway_usage(
+                    event.get("usage"),
+                    context="turn-complete frame",
+                    http_status=status_hint,
+                    known_provider_retried=retried,
+                ),
+                # The terminal frame is the only frame that may carry the artifacts, and the
+                # only one ``assemble_streamed_turn`` reads them off. Same validator as the
+                # sync reader: a shape one transport accepts and the other refuses is the
+                # defect, not the fix. Same gate too, and for the stronger version of that
+                # reason: an artifact set one transport drops as unreadable and the other
+                # relays is a replay that fails only when a run happens to stream.
+                reasoning=_readable_relayed_reasoning(
+                    _gateway_reasoning_items(
+                        event.get("reasoning"),
+                        context="turn-complete frame",
+                        http_status=status_hint,
+                        known_provider_retried=retried,
+                    ),
+                    reported=_gateway_string(
+                        event,
+                        "provider",
+                        context="turn-complete frame",
+                        known_provider_retried=retried,
+                    ),
+                    declared=declared_provider,
+                ),
+                stop_reason=_gateway_string(
+                    event,
+                    "stop_reason",
+                    context="turn-complete frame",
+                    known_provider_retried=retried,
+                ),
+                provider_retried=retried,
             )
         except ModelAdapterError as malformed:
-            # A malformed echo on a *billed* frame still cost the tokens the same frame
+            # A malformed value on a *billed* frame still cost the tokens the same frame
             # reports. The sync twin validates inside the stamped check block, so its
             # ``gateway_bad_response`` carries ``provider_usage``; raising here at parse
             # time, before any stamp, lost the same money on one of two transports. Read
             # leniently -- a second malformation in ``usage`` must not replace the failure
             # being reported.
-            mark_provider_usage(malformed, _reported_error_usage(event))
+            mark_provider_usage(malformed, usage_reported_by(event))
             raise
-        # The gateway's opaque turn_handle is the continuation handle the core stores.
-        return TurnComplete(
-            generation_applied=applied,
-            schema_applied=schema_applied,
-            response_id=_gateway_string(
+    if event_type == "error":
+        # Guarded like the terminal frame above and like the body reader's error branch: these
+        # five reads run before the stamp that ends the branch, so a malformed key on an error
+        # frame that reported a cost refused for free on this transport too.
+        try:
+            error_http_status = _exact_gateway_int(
                 event,
-                "turn_handle",
-                "response_id",
-                context="turn-complete frame",
-                known_provider_retried=retried,
-            ),
-            usage=_gateway_usage(
-                event.get("usage"),
-                context="turn-complete frame",
+                "http_status",
+                default=None,
+                context="stream error",
+                minimum=100,
+                maximum=599,
+                allow_none=True,
                 http_status=status_hint,
                 known_provider_retried=retried,
-            ),
-            stop_reason=_gateway_string(
-                event,
-                "stop_reason",
-                context="turn-complete frame",
-                known_provider_retried=retried,
-            ),
-            provider_retried=retried,
-        )
-    if event_type == "error":
-        error_http_status = _exact_gateway_int(
-            event,
-            "http_status",
-            default=None,
-            context="stream error",
-            minimum=100,
-            maximum=599,
-            allow_none=True,
-            http_status=status_hint,
-            known_provider_retried=retried,
-        )
-        retryable = _exact_gateway_bool(
-            event,
-            "retryable",
-            default=False,
-            context="stream error",
-            http_status=error_http_status,
-            known_provider_retried=retried,
-        )
-        # The sync twin's rule, on the transport that reports the same failure as a frame.
-        config_recoverable = _exact_gateway_bool(
-            event,
-            "config_recoverable",
-            default=False,
-            context="stream error",
-            http_status=error_http_status,
-            known_provider_retried=retried,
-        )
-        stream_error = ModelAdapterError(
-            _gateway_string(
-                event,
-                "error",
-                context="stream error",
-                known_provider_retried=retried,
-                http_status=error_http_status,
             )
-            or "LLM gateway stream error",
-            provider_error_code=(
+            retryable = _exact_gateway_bool(
+                event,
+                "retryable",
+                default=False,
+                context="stream error",
+                http_status=error_http_status,
+                known_provider_retried=retried,
+            )
+            # The sync twin's rule, on the transport that reports the same failure as a frame.
+            config_recoverable = _exact_gateway_bool(
+                event,
+                "config_recoverable",
+                default=False,
+                context="stream error",
+                http_status=error_http_status,
+                known_provider_retried=retried,
+            )
+            stream_error = ModelAdapterError(
                 _gateway_string(
                     event,
-                    "error_code",
+                    "error",
                     context="stream error",
                     known_provider_retried=retried,
                     http_status=error_http_status,
                 )
-                or GATEWAY_BAD_RESPONSE
-            ),
-            retryable=retryable,
-            config_recoverable=config_recoverable,
-            http_status=error_http_status,
-            provider_retried=retried,
-        )
-        mark_provider_usage(stream_error, _reported_error_usage(event))
+                or "LLM gateway stream error",
+                provider_error_code=(
+                    _gateway_string(
+                        event,
+                        "error_code",
+                        context="stream error",
+                        known_provider_retried=retried,
+                        http_status=error_http_status,
+                    )
+                    or GATEWAY_BAD_RESPONSE
+                ),
+                retryable=retryable,
+                config_recoverable=config_recoverable,
+                http_status=error_http_status,
+                provider_retried=retried,
+            )
+        except ModelAdapterError as malformed:
+            mark_provider_usage(malformed, usage_reported_by(event))
+            raise
+        mark_provider_usage(stream_error, usage_reported_by(event))
         raise stream_error
+    # The ``*_delta`` branches above are deliberately unguarded, and that is a registered
+    # exclusion rather than an omission: a delta is the content channel and the shipped server
+    # never writes ``usage`` onto one (end-of-turn metadata rides the terminal frame, pinned by
+    # test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered). A guard there
+    # would read a key that is never present -- dead code standing in for a rule.
+    # tests/test_carriage_conformance.py registers the excluded reads and asserts the wire fact
+    # they rest on, so a server that started billing on a delta fails there.
     return None  # unknown frame type: forward-compatible, ignore
-
-
-def _reported_error_usage(payload: dict[str, Any]) -> dict[str, int]:
-    """Tokens a *failed* gateway call reported spending, read leniently.
-
-    The twin of the client-side stamp, for the hop: a gateway whose own upstream refused a
-    billed turn carries the cost in its error envelope, and without reading it back the outer
-    client reports zero for a call the provider charged for. Lenient on purpose -- a malformed
-    ``usage`` on an error path must not replace the failure being reported with a different
-    one, so anything unreadable simply reads as "not reported".
-    """
-
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return {}
-    return {
-        str(key): value
-        for key, value in usage.items()
-        if type(value) is int and value >= 0
-    }
 
 
 def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
@@ -1416,50 +1686,65 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
                 http_status=status,
                 provider_retried=False,
             )
-    provider_retried = _exact_gateway_bool(
-        error_payload,
-        "provider_retried",
-        default=False,
-        context="HTTP error response",
-        http_status=status,
-    )
-    provider_error_code = _gateway_string(
-        error_payload,
-        "error_code",
-        context="HTTP error response",
-        known_provider_retried=provider_retried,
-        http_status=status,
-    ) or _error_code_for_http_status(status)
-    retryable = _exact_gateway_bool(
-        error_payload,
-        "retryable",
-        default=_retryable_for_http_status(status),
-        context="HTTP error response",
-        http_status=status,
-        known_provider_retried=provider_retried,
-    )
-    # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the status
-    # line: a 4xx is a hint that the request was at fault, not a statement that configuration
-    # fixes it, so an unstated key is False here rather than status-shaped.
-    config_recoverable = _exact_gateway_bool(
-        error_payload,
-        "config_recoverable",
-        default=False,
-        context="HTTP error response",
-        http_status=status,
-        known_provider_retried=provider_retried,
-    )
-    message = (
-        _gateway_string(
+    # Every per-key read is inside the guard, for the reason the two envelope readers give: this
+    # function BUILDS the failure and stamps it at the end, so a malformed key refuses before the
+    # stamp is reached -- and this reader is the one both transports land in for a non-200, which
+    # is the shape most likely to be carrying a cost at all.
+    #
+    # It keeps *raising* on a malformed key rather than degrading to the status-derived defaults,
+    # and that raise escapes past the caller's ``_should_retry`` (``next_turn``'s ``HTTPError``
+    # arm builds this error before deciding to retry, and the streamed path builds it inline).
+    # So a 429 whose body is malformed is refused rather than retried: the body, not the status
+    # line, is the authority. A gateway that answers 429 with a body this reader cannot parse is
+    # broken, not busy, and retrying it burns the run's budget against a wall.
+    try:
+        provider_retried = _exact_gateway_bool(
             error_payload,
-            "error",
+            "provider_retried",
+            default=False,
+            context="HTTP error response",
+            http_status=status,
+        )
+        provider_error_code = _gateway_string(
+            error_payload,
+            "error_code",
             context="HTTP error response",
             known_provider_retried=provider_retried,
             http_status=status,
+        ) or _error_code_for_http_status(status)
+        retryable = _exact_gateway_bool(
+            error_payload,
+            "retryable",
+            default=_retryable_for_http_status(status),
+            context="HTTP error response",
+            http_status=status,
+            known_provider_retried=provider_retried,
         )
-        or detail
-        or f"HTTP {status}"
-    )
+        # Third reader, same read. Unlike ``retryable`` there is nothing to derive from the
+        # status line: a 4xx is a hint that the request was at fault, not a statement that
+        # configuration fixes it, so an unstated key is False here rather than status-shaped.
+        config_recoverable = _exact_gateway_bool(
+            error_payload,
+            "config_recoverable",
+            default=False,
+            context="HTTP error response",
+            http_status=status,
+            known_provider_retried=provider_retried,
+        )
+        message = (
+            _gateway_string(
+                error_payload,
+                "error",
+                context="HTTP error response",
+                known_provider_retried=provider_retried,
+                http_status=status,
+            )
+            or detail
+            or f"HTTP {status}"
+        )
+    except ModelAdapterError as malformed:
+        mark_provider_usage(malformed, usage_reported_by(error_payload))
+        raise
     error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
         provider_error_code=provider_error_code,
@@ -1471,7 +1756,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         # attempt; this records ones already made, upstream, by a retry loop this client cannot see.
         provider_retried=provider_retried,
     )
-    mark_provider_usage(error, _reported_error_usage(error_payload))
+    mark_provider_usage(error, usage_reported_by(error_payload))
     return error
 
 

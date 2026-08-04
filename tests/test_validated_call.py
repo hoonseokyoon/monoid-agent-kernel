@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from dataclasses import dataclass, field
 
 import pytest
@@ -826,3 +827,80 @@ def test_the_boundary_is_announced_even_for_a_single_non_streaming_attempt() -> 
 
     assert asyncio.run(_drive()).status == "ok"
     assert seen == [(0, AttemptStarted(0))]
+
+
+def test_a_by_value_repair_never_re_sends_reasoning_the_prompt_just_killed() -> None:
+    """The repair prompt is a new user message, so every captured block is dead on arrival.
+
+    The kernel's other request builder prunes at its one seam (``loop.py``'s ``wire_messages``);
+    this builder appends an assistant turn AND a user-role repair prompt, which moves the active
+    replay window past everything that came before -- so 100% of the reasoning it forwarded was
+    bytes the provider provably discards, paid for on every repair attempt and growing with the
+    conversation. The adapter's own replay filter always treated a kernel-authored user message
+    as a window boundary, so nothing the provider sees changes; what changes is the size.
+
+    The caller's own request is untouched: the prune builds the wire copy, it does not mutate.
+    """
+
+    carried = {
+        "role": "assistant",
+        "content": "earlier",
+        "reasoning": [{"type": "reasoning", "id": "rs_1", "encrypted_content": "enc_1"}],
+    }
+    request = ModelRequest(
+        instruction=None,
+        system_prompt="sys",
+        tools=(),
+        messages=(
+            {"role": "user", "content": "answer"},
+            carried,
+            {"role": "user", "content": "again"},
+            {
+                "role": "assistant",
+                "content": "still wrong",
+                "reasoning": [{"type": "reasoning", "id": "rs_2", "encrypted_content": "enc_2"}],
+            },
+        ),
+    )
+    h = _harness(
+        [
+            ModelTurn(final_text="nope", stop_reason="stop"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    assert h.run().status == "ok"
+
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None and len(repair.messages) == 6
+    assert all("reasoning" not in message for message in repair.messages)
+    assert "enc_1" not in json.dumps(list(repair.messages))
+    assert "enc_2" not in json.dumps(list(repair.messages))
+    # Everything else about the copy is unchanged, key order included.
+    assert repair.messages[1] == {"role": "assistant", "content": "earlier"}
+    assert repair.messages[-2] == {"role": "assistant", "content": "nope"}
+    assert repair.messages[-1]["role"] == "user"
+    # The caller still owns a request carrying every block verbatim.
+    assert carried["reasoning"] == [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc_1"}
+    ]
+    assert request.messages is not None
+    assert "reasoning" in request.messages[1]
+
+
+def test_a_synthesized_repair_has_no_reasoning_to_prune() -> None:
+    """The other builder branch, stated rather than assumed: it constructs its three messages
+    from literals here, so no captured block can reach it and there is nothing to drop."""
+
+    request = ModelRequest(instruction="one shot q", system_prompt="sys", tools=())
+    h = _harness(
+        [
+            ModelTurn(final_text="prose", stop_reason="stop"),
+            ModelTurn(final_text='{"fixed": true}', stop_reason="stop"),
+        ],
+        request=request,
+    )
+    assert h.run().status == "ok"
+    repair = h.adapter.requests[1]
+    assert repair.messages is not None
+    assert all(set(message) == {"role", "content"} for message in repair.messages)

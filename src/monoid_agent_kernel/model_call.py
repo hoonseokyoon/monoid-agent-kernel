@@ -240,7 +240,7 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
     count of one -- the same rule the receipt applies.
 
     `type(value) is int` rather than `isinstance`, which is what its three siblings
-    (`providers/base.py:provider_usage_of`, `providers/gateway.py:_reported_error_usage`,
+    (`providers/base.py:provider_usage_of`, `providers/_common.py:usage_reported_by`,
     `core/model_io.py:ModelCallReceipt.with_error`) already spell. An `isinstance` here accepted
     every `int` subclass -- an `IntEnum` a provider SDK hands back as a token count is the real
     shape -- so one stamp read as a recordable usage on this path and as no usage at all on the

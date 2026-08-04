@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import threading
@@ -16,8 +17,13 @@ from support.http import (
     serving,
     wait_http_ready as _wait_http_ready,
 )
-from support.runtime import runtime_config
+from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.providers.base import ModelRequest
+from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -27,6 +33,8 @@ from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider
 from monoid_agent_kernel.reference.llm_gateway.service import (
     LlmGatewayBackend,
     LlmGatewayTurnRecord,
+    _parse_turn_request,
+    _upstream_model_config,
 )
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.providers.base import (
@@ -36,13 +44,27 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    assemble_streamed_turn,
 )
-from monoid_agent_kernel.providers.gateway import _chunk_from_event, _parse_gateway_response
+from monoid_agent_kernel.providers.gateway import (
+    _chunk_from_event,
+    _decode_sse_chunk,
+    _parse_gateway_response,
+)
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _token_manager() -> TokenManager:
     return TokenManager.from_secret("y" * 32)
+
+
+def _eventually(predicate, *, timeout_s: float = 20.0) -> bool:  # noqa: ANN001
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _llm_token(manager: TokenManager, *, run_id: str = "run_1", tenant_id: str = "tenant_a") -> str:
@@ -922,3 +944,1022 @@ def test_the_by_reference_refusal_reaches_the_streamed_wire_as_a_terminal_error_
     assert reconstructed.http_status == 422
     assert reconstructed.retryable is False
     assert reconstructed.config_recoverable is True
+
+
+# --- X-3: the provider-native reasoning round-trip across the gateway hop ----------------
+#
+# The kernel captures opaque provider reasoning items into ``ModelTurn.reasoning`` and replays
+# them on the next by-value turn (DX-13a). The REQUEST half already survived the hop -- messages
+# ride by value, verbatim -- but the RESPONSE half did not: the gateway wrote the items to
+# neither transport, so a run routed through the gateway re-derived nothing to replay. These
+# four bind the wire; the loop-level acceptance test below binds capture -> wire -> tag -> replay.
+
+_REASONING_ITEMS: tuple[dict, ...] = (
+    {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc_1"},
+    {"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "enc_2"},
+)
+
+
+class _OneShotReasoningBackend:
+    """An upstream producing provider-native reasoning artifacts that CANNOT stream.
+
+    The non-streaming half is the point of keeping this class separate: the gateway synthesizes
+    a ``TurnComplete`` for it, and a synthesized terminal chunk that drops the turn's reasoning
+    empties the terminal frame on exactly one of the two streaming sub-branches.
+    """
+
+    def __init__(self, items: tuple[dict, ...] = _REASONING_ITEMS) -> None:
+        self.items = tuple(dict(item) for item in items)
+        self.requests: list = []
+
+    def next_turn(self, request):
+        self.requests.append(request)
+        return ModelTurn(
+            response_id="provider_response_secret_r",
+            final_text="answered",
+            usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            reasoning=self.items,
+            stop_reason="stop",
+        )
+
+
+class _StreamingReasoningBackend(_OneShotReasoningBackend):
+    """The same upstream, able to stream — so its own ``TurnComplete`` carries the items."""
+
+    async def astream_turn(self, request):
+        self.requests.append(request)
+        yield TextDelta(text="answered")
+        yield TurnComplete(
+            response_id="provider_response_secret_r",
+            usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            reasoning=self.items,
+            stop_reason="stop",
+        )
+
+
+def _reasoning_gateway(*, streams: bool = True, upstream=None):
+    manager = _token_manager()
+    if upstream is None:
+        upstream = (_StreamingReasoningBackend if streams else _OneShotReasoningBackend)()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    return gateway, _llm_token(manager), upstream
+
+
+def test_reasoning_artifacts_cross_the_sync_gateway_hop() -> None:
+    """Wire and reader together: a body key nobody reads back is the same dead feature."""
+
+    gateway, token, upstream = _reasoning_gateway(streams=False)
+    body = gateway.handle_turn(token, _payload())
+    assert body["reasoning"] == [dict(item) for item in upstream.items]
+    assert _parse_gateway_response(dict(body)).reasoning == upstream.items
+    # The opacity rule the rest of this wire keeps: the provider's response id never leaves.
+    assert "provider_response_secret_r" not in json.dumps(body)
+
+
+def test_reasoning_artifacts_cross_the_streamed_gateway_hop() -> None:
+    """The streamed twin. The terminal frame is the only frame that may carry the items."""
+
+    gateway, token, upstream = _reasoning_gateway()
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning"] == [dict(item) for item in upstream.items]
+    # Not on the deltas: the items are end-of-turn metadata, not content a consumer renders.
+    assert all("reasoning" not in frame for frame in frames[:-1])
+    chunks = [_chunk_from_event(frame) for frame in frames]
+    assert chunks[-1].reasoning == upstream.items
+    assert assemble_streamed_turn([c for c in chunks if c is not None]).reasoning == upstream.items
+
+
+def test_a_backend_that_cannot_stream_still_carries_its_reasoning() -> None:
+    """The third writer, and the one no key-set census sees.
+
+    When the upstream cannot stream, the gateway synthesizes the terminal chunk itself out of a
+    one-shot turn. The synthesized ``TurnComplete`` is what the assembled turn reads reasoning
+    off, so an omission there empties the terminal frame on this branch alone -- while the
+    branch that forwards the provider's own ``TurnComplete`` stays green.
+    """
+
+    gateway, token, upstream = _reasoning_gateway(streams=False)
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning"] == [dict(item) for item in upstream.items]
+    assert _chunk_from_event(terminal).reasoning == upstream.items
+
+
+# --- O1: the hop names the upstream whose artifacts it relayed ---------------------------
+#
+# X-3 above makes the artifacts cross the hop; the TAG that decides whether they are ever read
+# back is written from ``GatewayModelAdapter.provider_name`` -- the CLIENT's declaration, which
+# defaults to ``"openai"`` because that is what the reference gateway fronts. A deployment whose
+# ``provider_adapter_factory`` routes elsewhere and forgets the knob therefore tags every
+# captured artifact with a provider that cannot read it back, and nothing on either side of the
+# wire can tell. The server knows: it BUILT the upstream adapter. So it says so, additively, and
+# the client stops trusting its own default over an answer from the side that has one.
+
+
+class _NamedReasoningBackend(_StreamingReasoningBackend):
+    """A streaming upstream that declares whose artifacts it produces.
+
+    ``"acme"`` rather than a real provider name on purpose: the hop's own config hardcodes
+    ``provider="openai"``, so a name that could have come from there proves nothing.
+    """
+
+    provider_name = "acme"
+
+
+class _NamedOneShotReasoningBackend(_OneShotReasoningBackend):
+    """The non-streaming twin, for the branch that synthesizes its own terminal frame."""
+
+    provider_name = "acme"
+
+
+def test_the_gateway_names_the_upstream_it_relayed_on_both_transports() -> None:
+    gateway, token, _ = _reasoning_gateway(upstream=_NamedReasoningBackend())
+    body = gateway.handle_turn(token, _payload())
+    assert body["provider"] == "acme"
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    assert frames[-1]["provider"] == "acme"
+    # Terminal frame only, like the artifacts it describes: a stream cancelled mid-flight must
+    # not have half-learned an attribution for a turn it never assembled.
+    assert all("provider" not in frame for frame in frames[:-1])
+
+
+def test_the_synthesized_terminal_frame_names_the_upstream_too() -> None:
+    """The third writer -- the branch that builds its own ``TurnComplete`` from a one-shot turn.
+
+    Every other fact on this frame has been dropped here at least once (``reasoning`` was, in
+    this same PR), because it is separate code from the branch that forwards the provider's own
+    terminal chunk and no key-set census distinguishes them.
+    """
+
+    gateway, token, _ = _reasoning_gateway(upstream=_NamedOneShotReasoningBackend())
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    assert frames[-1]["provider"] == "acme"
+
+
+def test_the_hop_does_not_name_its_own_hardcoded_config_as_the_upstream() -> None:
+    """Omit-when-unknown, and the trap that makes the omission the only honest answer.
+
+    ``_upstream_model_config`` builds ``provider="openai"`` for **every** call this gateway
+    serves -- it is a hop-local fabrication, not a fact about the upstream. A key written through
+    that config as a fallback therefore answers ``"openai"`` for an upstream that is not OpenAI at
+    all, which is the confident lie this key exists to delete, re-minted one layer down. Only the
+    upstream adapter's own declaration is authority here; an upstream that declares nothing
+    leaves the key off, and the client keeps reading its configured declaration.
+    """
+
+    assert _upstream_model_config(_parse_turn_request(_payload())).provider == "openai", {
+        "hint": "if the hop stops fabricating a provider, this pin's premise is gone -- but so "
+        "is the reason the fallback was unsafe; re-derive rather than deleting the guard"
+    }
+    gateway, token, _ = _reasoning_gateway()  # declares nothing
+    body = gateway.handle_turn(token, _payload())
+    assert "provider" not in body, {
+        "wrote": body.get("provider"),
+        "hint": "an undeclared upstream is unknown, and unknown is written by omission",
+    }
+    frames = list(gateway.handle_turn_stream(token, _payload()))
+    assert "provider" not in frames[-1]
+
+
+def test_a_client_drops_relayed_reasoning_the_named_upstream_cannot_read_back() -> None:
+    """Verify, not adopt: the client keeps its own declaration and drops what it invalidates.
+
+    An OpenAI-encrypted item tagged ``"acme"`` -- or an Acme item tagged ``"openai"`` -- is an
+    unusable request one turn later, so the mismatch is decided here rather than discovered by a
+    provider. Same answer the replay filter already gives for a block whose tag does not match
+    (``_reasoning_replay_flags``: drop the window rather than send half a pair). Only the
+    unusable half is dropped; the turn itself is a normal, complete turn.
+    """
+
+    gateway, token, upstream = _reasoning_gateway(upstream=_NamedReasoningBackend())
+    body = gateway.handle_turn(token, _payload())
+    assert body["reasoning"], "the fixture must relay artifacts, or this pin proves nothing"
+
+    kept = _parse_gateway_response(dict(body), declared_provider="acme")
+    assert kept.reasoning == upstream.items
+    dropped = _parse_gateway_response(dict(body), declared_provider="openai")
+    assert dropped.reasoning == (), {
+        "kept": dropped.reasoning,
+        "hint": "the client's configured default lied about the upstream; the artifacts it "
+        "would have tagged with it are unreadable by anything",
+    }
+    # A dropped artifact set is not a refused turn: everything else survives intact.
+    assert (dropped.final_text, dropped.usage, dropped.response_id) == (
+        kept.final_text,
+        kept.usage,
+        kept.response_id,
+    )
+
+
+def test_the_streamed_reader_drops_the_same_mismatch_its_twin_does() -> None:
+    gateway, token, upstream = _reasoning_gateway(upstream=_NamedReasoningBackend())
+    terminal = list(gateway.handle_turn_stream(token, _payload()))[-1]
+    assert terminal["reasoning"]
+
+    kept = _chunk_from_event(dict(terminal), declared_provider="acme")
+    assert kept.reasoning == upstream.items
+    dropped = _chunk_from_event(dict(terminal), declared_provider="openai")
+    assert dropped.reasoning == ()
+    assert (dropped.usage, dropped.response_id, dropped.stop_reason) == (
+        kept.usage,
+        kept.response_id,
+        kept.stop_reason,
+    )
+
+
+def test_a_gateway_that_names_no_upstream_leaves_the_declaration_alone() -> None:
+    """The skew direction that must stay lossless: a server predating this key.
+
+    Absence proves nothing, so nothing is gated -- the client keeps trusting what it was
+    configured with, which is exactly the behavior it had before the key existed.
+    """
+
+    gateway, token, upstream = _reasoning_gateway()
+    body = gateway.handle_turn(token, _payload())
+    assert "provider" not in body
+    assert (
+        _parse_gateway_response(dict(body), declared_provider="openai").reasoning == upstream.items
+    )
+    terminal = list(gateway.handle_turn_stream(token, _payload()))[-1]
+    assert _chunk_from_event(dict(terminal), declared_provider="openai").reasoning == upstream.items
+
+
+def test_one_upstream_name_is_compared_the_same_way_on_both_transports() -> None:
+    """The two ingresses hand the readers DIFFERENT code units for the same name.
+
+    ``loads_model_stream_envelope_json_ingress`` deliberately does not normalize strings -- a
+    content fragment must keep its code units so a surrogate pair split across two frames can be
+    repaired downstream -- while the body's ingress has already combined them. So an upstream
+    named with an astral character arrives at the frame reader as ``[0xd83d, 0xde00]`` and at the
+    body reader as ``[0x1f600]``, and a comparison against ``event.get("provider")`` would match
+    on one transport and silently drop the artifacts on the other, for the same upstream. Reading
+    the key through ``_gateway_string`` (which normalizes, like the declaration's own resolver) is
+    what makes the two agree, and this is the pin that says so -- the symptom otherwise appears
+    only while streaming, only for that name, and looks like nothing at all.
+    """
+
+    name = "acme-\U0001f600"
+    frame = json.dumps(
+        {
+            "type": "turn_complete",
+            "turn_handle": "turn_1",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": [dict(item) for item in _REASONING_ITEMS],
+            "provider": name,
+        },
+        ensure_ascii=True,  # escapes the astral scalar as the surrogate pair the wire carries
+    )
+    # Through the real stream ingress, not a hand-built dict: the split is a property of the
+    # parser, and a dict literal in this file has already lost it.
+    streamed = _decode_sse_chunk([frame], declared_provider=name)
+    assert streamed.reasoning == _REASONING_ITEMS, {
+        "hint": "the same name read as a mismatch because the stream had not combined the pair"
+    }
+    body = _parse_gateway_response(
+        json.loads(frame) | {"final_text": "answered"}, declared_provider=name
+    )
+    assert body.reasoning == _REASONING_ITEMS
+    # And a genuinely different upstream still drops, so the pin above is not just "never drops".
+    assert _decode_sse_chunk([frame], declared_provider="acme").reasoning == ()
+
+
+def test_a_client_that_declares_no_upstream_gates_nothing() -> None:
+    """``provider_name=None`` is the protocol's "do not tag", and the loop honors it on its own.
+
+    Gating here too would be a second implementation of the same decision, and one that reads a
+    *match* out of two absences. The artifacts ride back untouched; the loop appends no reasoning
+    block for an adapter that declares nothing, so they are dropped where that rule lives.
+    """
+
+    gateway, token, upstream = _reasoning_gateway(upstream=_NamedReasoningBackend())
+    body = gateway.handle_turn(token, _payload())
+    assert _parse_gateway_response(dict(body), declared_provider=None).reasoning == upstream.items
+
+
+def test_the_adapter_verifies_with_the_declaration_it_publishes() -> None:
+    """End to end over real HTTP on the blocking transport, through the shipped adapter.
+
+    The two readers are gated by a parameter, and a parameter nobody passes is a dead branch:
+    this is the pin that the adapter actually hands its own ``provider_name`` down. It also
+    covers the reason the default is dangerous in the first place -- the adapter here is left at
+    its ``"openai"`` default while the server relays an Acme upstream.
+    """
+
+    gateway, token, _ = _reasoning_gateway(upstream=_NamedOneShotReasoningBackend())
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+        lying = GatewayModelAdapter(
+            ModelConfig(), gateway_url=f"{base_url}/internal/llm/turns", token=token
+        )
+        assert lying.provider_name == "openai", "the default is the hazard under test"
+        assert lying.next_turn(request).reasoning == ()
+
+        honest = GatewayModelAdapter(
+            ModelConfig(),
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=token,
+            provider_name="acme",
+        )
+        assert honest.next_turn(request).reasoning == _REASONING_ITEMS
+
+
+def _frameless_sse_adapter(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str]
+) -> GatewayModelAdapter:
+    """A gateway whose SSE body ends cleanly after its deltas -- no ``turn_complete`` frame.
+
+    The fake server is at the transport, not at the parser, because that is the only way to
+    reach the adapter's own frameless drain: filtering the terminal frame out of a complete
+    stream and calling ``assemble_streamed_turn`` by hand exercises the assembler and skips
+    every line of ``astream_turn`` that decides what a frameless body means.
+    """
+
+    httpx = pytest.importorskip("httpx")
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def aiter_lines(self):
+            for line in lines:
+                yield line
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> object:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return GatewayModelAdapter(config=ModelConfig(gateway_url="http://gateway.test"))
+
+
+def test_a_frameless_stream_reads_no_reasoning_and_does_not_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registered by-design: a stream with no terminal frame has nowhere to carry the items.
+
+    Tolerated as ``()``, exactly like ``usage`` and the turn handle on the same shape. A run
+    continuing over such a hop simply re-derives nothing to replay, which the loop already
+    treats as the neutral case (no reasoning block is appended for an empty tuple).
+
+    Driven through the real ``astream_turn`` drain, which is the code the registered gap names.
+    The reasoning *deltas* in the body are the point of the second assertion: a stream can
+    narrate its thinking and still hand back no replayable artifact, because the text channel
+    and the opaque items are two different things and only the terminal frame carries the
+    second one.
+    """
+
+    adapter = _frameless_sse_adapter(
+        monkeypatch,
+        [
+            'data: {"type":"reasoning_delta","text":"thinking"}',
+            "",
+            'data: {"type":"text_delta","text":"answered"}',
+            "",
+        ],
+    )
+    request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=adapter.config
+    )
+
+    async def _collect() -> list:
+        return [chunk async for chunk in adapter.astream_turn(request)]
+
+    chunks = asyncio.run(_collect())
+    assert chunks and not any(isinstance(chunk, TurnComplete) for chunk in chunks)
+    turn = assemble_streamed_turn(chunks)
+    assert turn.reasoning == ()
+    assert turn.final_text == "answered"
+    # The rest of the frameless tolerance, stated beside it: the same shape loses the handle
+    # and the usage too, and synthesizes the stop reason.
+    assert (turn.response_id, turn.usage, turn.stop_reason) == (None, {}, "stop")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["not-a-list", {"type": "reasoning"}, ["not-a-dict"], [{"ok": True}, 7]],
+    ids=["string", "object", "list-of-strings", "list-with-a-scalar"],
+)
+def test_a_malformed_reasoning_value_is_refused_by_both_readers(malformed) -> None:
+    """One validator, so the two transports cannot come to disagree about strictness."""
+
+    body = {
+        "protocol": "monoid.llm-turn.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": malformed,
+    }
+    sync = pytest.raises(ModelAdapterError, _parse_gateway_response, dict(body)).value
+    assert sync.provider_error_code == "gateway_bad_response"
+    assert sync.retryable is False
+
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": malformed,
+    }
+    framed = pytest.raises(ModelAdapterError, _chunk_from_event, dict(frame)).value
+    assert framed.provider_error_code == "gateway_bad_response"
+    assert framed.retryable is False
+
+
+def test_a_reasoning_tuple_is_accepted_by_both_readers() -> None:
+    """The half of the validator's tolerance nothing owned, so narrowing it stayed green.
+
+    ``_gateway_reasoning_items`` accepts a tuple beside a list for the reason ``tool_calls``
+    two dozen lines below it does: JSON only ever produces a list, but these readers also
+    serve in-process Python callers, and a sequence one array-valued key refuses while its
+    neighbour accepts it is a difference with no rule behind it. Every existing case fed a
+    list or a malformed value, so ``(list, tuple)`` -> ``list`` was an invisible change.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _gateway_reasoning_items
+
+    items = ({"type": "reasoning", "id": "rs_1"}, {"type": "reasoning", "id": "rs_2"})
+    accepted = _gateway_reasoning_items(items, context="response")
+    assert accepted == items and isinstance(accepted, tuple)
+
+    body = {
+        "protocol": "monoid.llm-turn.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": items,
+    }
+    assert _parse_gateway_response(dict(body)).reasoning == items
+
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "provider_retried": False,
+        "reasoning": items,
+    }
+    assert _chunk_from_event(dict(frame)).reasoning == items
+
+
+class _CapturingReasoningUpstream(_OneShotReasoningBackend):
+    """Produces reasoning on the first turn, and records what the second turn was handed.
+
+    The recording is the whole point: the round-trip is only real if the items the gateway
+    relayed come back *up* the same hop, tagged, inside the by-value message log the upstream
+    adapter reads.
+
+    The first turn asks for a tool rather than settling, so the second call the loop makes is
+    still inside the SAME active window (no new user message between them). That is the shape
+    the round-trip exists for -- the in-flight tool loop -- and the only shape in which a
+    replayed block is reachable at all: past a fresh user message the upstream's own replay rule
+    ignores it, and the kernel now prunes it off the wire for that reason.
+    """
+
+    def next_turn(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return ModelTurn(
+                response_id="provider_response_1",
+                tool_calls=(
+                    ToolCall(id="c1", name="fs_write", arguments={"path": "A.md", "content": "x"}),
+                ),
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                reasoning=self.items,
+                stop_reason="tool_calls",
+            )
+        return ModelTurn(
+            response_id="provider_response_2",
+            final_text="and again",
+            usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            stop_reason="stop",
+        )
+
+
+def test_the_reasoning_round_trip_survives_the_gateway_hop_end_to_end(tmp_path: Path) -> None:
+    """X-3's actual claim, in one test: capture -> wire -> tag -> replay, across a real hop.
+
+    Each half was provable on its own and the feature was still dead. The wire carried the
+    items but the loop refused to tag them, because tagging is gated on the adapter naming the
+    provider whose artifacts these are — and the gateway adapter named nobody, so the block was
+    dropped one line after the reader that had just reconstructed it. What this asserts is the
+    only thing that proves the round-trip: the SECOND request the upstream receives carries the
+    FIRST turn's items, verbatim, tagged with the provider and model they can be replayed to.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    manager = _token_manager()
+    upstream = _CapturingReasoningUpstream()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        loop = AgentLoop(
+            spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config("fs.write", model=config)),
+        )
+        loop.open()
+        loop.submit("first")
+        loop.close()
+
+    assert len(upstream.requests) == 2, "the loop must have driven two turns over the hop"
+    replayed = [
+        message
+        for message in (upstream.requests[1].messages or ())
+        if message.get("role") == "assistant"
+    ]
+    assert replayed, "the second turn must carry the first turn's assistant reply by value"
+    assert replayed[0]["reasoning"] == {
+        # The provider whose artifacts these are — the gateway's UPSTREAM, not the transport.
+        # Replay only round-trips to a matching adapter and model, so a tag naming the hop
+        # would send OpenAI's encrypted items back to something that cannot read them.
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "items": [dict(item) for item in upstream.items],
+    }
+
+
+def test_the_gateway_wire_stops_carrying_reasoning_a_new_user_turn_killed(tmp_path: Path) -> None:
+    """The other side of the same window, over the same real hop.
+
+    Once a user message lands, everything before it is outside the replay window forever — the
+    upstream reconstructs those turns from ``content``/``tool_calls`` and never looks at their
+    captured block. Sending them anyway is pure cost, and it is cost that grows with the length
+    of the conversation and crosses TWO hops here (loop → gateway → upstream). The relayed
+    request must carry the assistant turn and none of its dead reasoning.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    manager = _token_manager()
+    upstream = _CapturingReasoningUpstream()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        loop = AgentLoop(
+            spec=AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs"),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config("fs.write", model=config)),
+        )
+        loop.open()
+        loop.submit("first")  # two upstream calls: the tool loop, still one window
+        loop.submit("second")  # a new window — the first turn's block is now unreachable
+        loop.close()
+
+    assert len(upstream.requests) == 3
+    third = upstream.requests[2].messages or ()
+    assistants = [message for message in third if message.get("role") == "assistant"]
+    assert assistants, "the assistant turns themselves still ride by value"
+    assert all("reasoning" not in message for message in assistants)
+    assert "enc_1" not in json.dumps(list(third))
+
+
+def test_the_gateway_call_is_attributed_to_the_upstream_it_relays() -> None:
+    """The deliberate side effect of naming the upstream, pinned rather than discovered later.
+
+    ``provider_name`` is not a private channel to the loop's reasoning tag: three observability
+    surfaces probe an adapter for it — the model-call receipt, its OTel ``gen_ai.provider.name``
+    (``receipt.provider_name or receipt.model.provider``) and the model-stream context. Through
+    the gateway all three previously fell back to the transport string. They now say "openai",
+    which is the honest answer for a span describing the call a *model* served; the transport is
+    still on the same receipt, as ``model.provider``. Using the existing seam is the decision —
+    a second attribute would give the tag and the spans two truths to drift between.
+    """
+
+    manager = _token_manager()
+    upstream = _OneShotReasoningBackend()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        config = ModelConfig(provider="gateway", model="gpt-5.5")
+        adapter = GatewayModelAdapter(
+            config,
+            gateway_url=f"{base_url}/internal/llm/turns",
+            token=_llm_token(manager),
+        )
+        runner = ModelCallRunner(adapter=adapter)
+        _turn, receipt = asyncio.run(
+            runner.acall(
+                ModelRequest(
+                    instruction="hello", system_prompt="sys", tools=(), model=config
+                )
+            )
+        )
+
+    assert receipt.provider_name == "openai"
+    assert receipt.model.provider == "gateway", "the transport must still be legible on the receipt"
+    # The exact expression the two OTel span builders evaluate.
+    assert (receipt.provider_name or receipt.model.provider) == "openai"
+
+
+def test_the_relayed_provider_is_configurable_through_the_cli_builder(tmp_path: Path) -> None:
+    """Default, override, and the documented "do not tag" — through the *shipped* builder.
+
+    The predecessor of this test constructed ``GatewayModelAdapter(provider_name=...)`` by hand
+    and passed while no shipped construction site could reach the field: the CLI's
+    ``_model_adapter`` and the backend's ``build_model_adapter`` both took the default and had no
+    knob. A field configurable only from a test is not configurable. So every deployment shape
+    below is asserted on the adapter a *builder* returns.
+
+    The default matches the reference gateway's hardcoded upstream. A deployment whose
+    ``provider_adapter_factory`` routes somewhere else must say so, because a tag naming the
+    wrong provider is worse than no tag: the loop would replay one provider's opaque items to
+    another, one turn later, as an unreadable request.
+    """
+
+    from monoid_agent_kernel.cli import _model_adapter
+
+    del tmp_path
+    gateway_config = ModelConfig(provider="gateway")
+
+    def build(provider: str | None) -> GatewayModelAdapter:
+        adapter = _model_adapter(
+            gateway_config,
+            llm_gateway_url="http://gateway.local/internal/llm/turns",
+            llm_gateway_token_env="MONOID_LLM_GATEWAY_TOKEN",
+            llm_gateway_token_file=None,
+            llm_gateway_provider=provider,
+            allow_direct_provider_api=False,
+        )
+        assert isinstance(adapter, GatewayModelAdapter)
+        return adapter
+
+    assert build("openai").provider_name == "openai"
+    assert build("anthropic").provider_name == "anthropic"
+    # The flag is a string on the command line, so "do not tag" needs a spelling. Case-insensitive
+    # because an operator typing NONE means the same thing.
+    assert build("none").provider_name is None
+    assert build("NoNe").provider_name is None
+    assert build(None).provider_name is None
+
+
+def test_the_cli_run_command_threads_the_relayed_provider_into_the_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The flag reaches the adapter through the real ``run`` callback, not just the helper.
+
+    ``_model_adapter`` growing a parameter proves nothing on its own: the gap this closes was a
+    *threading* gap, and ``run`` is the only caller that can thread it. Patched at the adapter
+    class so the builder itself runs.
+    """
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seen: list[dict] = []
+
+    def recording_gateway_adapter(config, **kwargs):  # noqa: ANN001, ANN202
+        seen.append(dict(kwargs))
+        return FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+    monkeypatch.setattr(cli_module, "GatewayModelAdapter", recording_gateway_adapter)
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config("run.finish", model=ModelConfig(provider="gateway")).to_json()),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--runtime-config-file",
+            str(config_file),
+            "--llm-gateway-provider",
+            "anthropic",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen and seen[0]["provider_name"] == "anthropic"
+
+
+def test_the_cli_run_command_defaults_the_relayed_provider_to_the_reference_upstream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No flag = the reference gateway's own upstream, matching the adapter's dataclass default."""
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    seen: list[dict] = []
+
+    def recording_gateway_adapter(config, **kwargs):  # noqa: ANN001, ANN202
+        seen.append(dict(kwargs))
+        return FakeModelAdapter(turns=[ModelTurn(final_text="done")])
+
+    monkeypatch.setattr(cli_module, "GatewayModelAdapter", recording_gateway_adapter)
+    config_file = tmp_path / "runtime.json"
+    config_file.write_text(
+        json.dumps(runtime_config("run.finish", model=ModelConfig(provider="gateway")).to_json()),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "run",
+            "--workspace",
+            str(workspace),
+            "--instruction",
+            "Finish.",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--runtime-config-file",
+            str(config_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen and seen[0]["provider_name"] == "openai"
+
+
+def test_the_backend_builder_carries_the_configured_relayed_provider(tmp_path: Path) -> None:
+    """The backend's twin of the CLI knob, asserted at ``build_model_adapter``.
+
+    This is the function *recovery* rebuilds through as well (recovery.py resume ->
+    ``BackendLoopFactory.build`` -> ``build_model_adapter``), so the restore path inherits
+    whatever this one carries; the restore pin below asserts that inheritance end to end.
+    """
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    def adapter_for(**kwargs) -> GatewayModelAdapter:  # noqa: ANN003
+        backend = RunnerBackend(
+            run_root=tmp_path / "runs",
+            token_manager=_token_manager(),
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url="http://llm-gateway.internal/internal/llm/turns",
+            **kwargs,
+        )
+        try:
+            built = backend._loop_factory.build_model_adapter(spec, "token", ModelConfig())
+        finally:
+            backend.shutdown()
+        assert isinstance(built, GatewayModelAdapter)
+        return built
+
+    assert adapter_for().provider_name == "openai"
+    assert adapter_for(llm_gateway_provider="anthropic").provider_name == "anthropic"
+    assert adapter_for(llm_gateway_provider=None).provider_name is None
+
+
+def test_the_backend_serve_command_threads_the_relayed_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The backend's field needs a shipped way to be set, exactly as the CLI's does.
+
+    ``backend serve`` is the process that owns ``RunnerBackend`` in a deployment; a field only an
+    in-process embedder could reach would leave the out-of-process one on the default forever.
+    """
+
+    from click.testing import CliRunner
+
+    from monoid_agent_kernel import cli as cli_module
+
+    seen: dict = {}
+
+    class _Server:
+        def serve_forever(self) -> None:
+            raise KeyboardInterrupt
+
+        def server_close(self) -> None:
+            return None
+
+    class _Backend:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN003
+            seen.update(kwargs)
+
+        def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "RunnerBackend", _Backend)
+    monkeypatch.setattr(cli_module, "create_backend_server", lambda *a, **k: _Server())
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def serve(*extra: str):  # noqa: ANN202
+        seen.clear()
+        return CliRunner().invoke(
+            cli_module.main,
+            [
+                "backend",
+                "serve",
+                "--run-root",
+                str(tmp_path / "runs"),
+                "--workspace-root",
+                str(workspace),
+                "--llm-gateway-url",
+                "http://gateway.local/internal/llm/turns",
+                "--ephemeral-token-secret",
+                *extra,
+            ],
+        )
+
+    result = serve("--llm-gateway-provider", "anthropic")
+    assert result.exit_code == 0, result.output
+    assert seen["llm_gateway_provider"] == "anthropic"
+
+    result = serve()
+    assert result.exit_code == 0, result.output
+    assert seen["llm_gateway_provider"] == "openai"
+
+
+def test_a_restored_run_rebuilds_the_adapter_with_the_configured_relayed_provider(
+    tmp_path: Path,
+) -> None:
+    """The restore path is the one that silently reverts a per-deployment setting.
+
+    A recovered activation rebuilds its adapter from the *new* process's configuration, so a
+    setting carried only by the submit path would come back as the default one restart later —
+    and the reasoning tag would then name a provider the gateway does not front. Asserted on the
+    adapter the resumed loop actually holds.
+    """
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager, provider_adapter_factory=offline_provider_factory
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    run_root = tmp_path / "runs"
+    with serving(server) as gateway_url:
+        submitter = RunnerBackend(
+            run_root=run_root,
+            token_manager=manager,
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url=f"{gateway_url}/internal/llm/turns",
+        )
+        try:
+            submission = submitter.submit_run(
+                BackendRunRequest(
+                    tenant_id="tenant_a",
+                    user_id="user_a",
+                    workspace_root=workspace,
+                    instruction="hello",
+                    runtime_config=runtime_config("run.finish"),
+                    multi_turn=True,
+                )
+            )
+            run_id, token = submission.run_id, submission.run_token
+            assert _eventually(lambda: submitter.checkpoint_store.latest(run_id) is not None)
+        finally:
+            submitter.shutdown()
+
+        restorer = RunnerBackend(
+            run_root=run_root,
+            token_manager=manager,
+            allowed_workspace_roots=(workspace,),
+            llm_gateway_url=f"{gateway_url}/internal/llm/turns",
+            llm_gateway_provider="anthropic",
+        )
+        restorer.max_recover_attempts = 10_000
+        try:
+            assert restorer.resume_run(run_id, token)["resumed"] is True
+            rebuilt = restorer._record(run_id).loop.model_adapter
+            assert isinstance(rebuilt, GatewayModelAdapter)
+            assert rebuilt.provider_name == "anthropic"
+        finally:
+            restorer.cancel_run(run_id, token)
+            restorer.wait_for_run(run_id, timeout_s=20)
+            restorer.shutdown()
+
+
+def test_the_provider_resolution_survives_a_hostile_declaration_on_every_surface() -> None:
+    """The tolerance path used to short-circuit the fallback, so the surfaces disagreed.
+
+    ``resolved_provider_name`` is documented as ONE expression precisely so the model-stream
+    context, ``run.started``'s ``model_provider`` and the receipt-derived span cannot answer
+    differently about one call. A third-party ``provider_name`` that raises -- or whose ``str()``
+    does -- must not take a run down over a field nothing branches on, and that much held; but
+    the guard returned ``None`` instead of falling through, so on exactly that path the
+    model-stream context reported *no provider* while every other surface reported the configured
+    transport. Tolerance is "keep going", not "answer nothing".
+
+    The declared value is normalized the way ``ModelCallRunner`` normalizes its own read, which
+    is what makes the receipt and these two surfaces byte-identical rather than merely equal in
+    the easy case.
+    """
+
+    from monoid_agent_kernel.providers.base import ModelTurn, resolved_provider_name
+
+    config = ModelConfig(provider="gateway", model="gpt-5.5")
+
+    class _Answering:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="ok", usage={}, stop_reason="stop")
+
+    class _RaisingProperty(_Answering):
+        @property
+        def provider_name(self) -> str:
+            raise RuntimeError("third-party adapter property blew up")
+
+    class _RaisingStr(_Answering):
+        class _Unprintable:
+            def __str__(self) -> str:
+                raise RuntimeError("__str__ blew up")
+
+            def __bool__(self) -> bool:
+                return True
+
+        provider_name = _Unprintable()
+
+    for adapter in (_RaisingProperty(), _RaisingStr()):
+        resolved = resolved_provider_name(adapter, config)
+        assert resolved == "gateway", type(adapter).__name__
+        # The three surfaces, spelled as the three call sites spell them.
+        assert (resolved or config.provider) == "gateway"
+        runner = ModelCallRunner(adapter=adapter)
+        _turn, receipt = asyncio.run(
+            runner.acall(ModelRequest(instruction="hi", system_prompt="", tools=(), model=config))
+        )
+        assert (receipt.provider_name or receipt.model.provider) == "gateway"
+
+    # A declaration that IS readable still wins, and arrives normalized on both reads.
+    class _Surrogate(_Answering):
+        provider_name = "open\ud800ai"
+
+    runner = ModelCallRunner(adapter=_Surrogate())
+    _turn, receipt = asyncio.run(
+        runner.acall(ModelRequest(instruction="hi", system_prompt="", tools=(), model=config))
+    )
+    assert resolved_provider_name(_Surrogate(), config) == "open\ufffdai"
+    assert receipt.provider_name == resolved_provider_name(_Surrogate(), config)
+
+
+def test_a_declaration_free_adapter_still_resolves_to_the_configured_provider() -> None:
+    """The neutral case the tolerance path was accidentally imitating."""
+
+    from monoid_agent_kernel.providers.base import resolved_provider_name
+
+    class _Plain:
+        pass
+
+    assert resolved_provider_name(_Plain(), ModelConfig(provider="openai")) == "openai"
+    assert resolved_provider_name(_Plain(), None) is None

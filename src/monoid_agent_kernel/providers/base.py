@@ -124,11 +124,14 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
-    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call`` output
-    # items), captured verbatim and in their original order so the engine can round-trip them
-    # on the next by-value turn. Opaque to the core — never displayed, never reconstructed; an
-    # adapter that has no reasoning leaves this empty (the neutral seam). See the OpenAI adapter
-    # and the loop's assistant-message append for capture + re-injection.
+    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call``/``message``
+    # output items), captured verbatim and in their original order so the engine can round-trip
+    # them on the next by-value turn. Uninterpreted by the core — never displayed, never
+    # reconstructed — but not opaque: only the reasoning-type entries are provider-encrypted,
+    # while a paired ``message``/``function_call`` entry duplicates the plaintext of
+    # ``final_text``/``tool_calls``. Anything that logs or truncates this must treat it as model
+    # content. An adapter that has no reasoning leaves this empty (the neutral seam). See the
+    # OpenAI adapter and the loop's assistant-message append for capture + re-injection.
     reasoning: tuple[dict[str, Any], ...] = ()
     # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
     stop_reason: StopReason | None = None
@@ -319,17 +322,64 @@ class MultimodalModelAdapter(Protocol):
 
 
 class ProviderNamedModelAdapter(Protocol):
-    """An adapter that identifies whose opaque reasoning items it produces.
+    """An adapter that identifies whose provider-native reasoning items it produces.
 
     The loop reads ``provider_name`` via ``getattr(adapter, "provider_name", None)`` and tags
     captured :attr:`ModelTurn.reasoning` with provider+model, so items only round-trip back to
     a matching adapter and model. Omitting it means "do not tag": reasoning is not replayed,
     which is the correct neutral behavior for an adapter with no provider-native reasoning
     artifacts.
+
+    ``None`` carries that same sense from a *declared* member: ``str | None`` because a
+    forwarding adapter's upstream is a per-deployment setting, and a deployment fronting an
+    upstream with no reasoning artifacts has to be able to say so without dropping the attribute
+    (``GatewayModelAdapter.provider_name`` is exactly that field). Every reader already spells
+    the two the same way -- ``getattr(..., None)`` then a falsy check -- so declaring ``str``
+    only made the shipped adapter fail a type it satisfies behaviorally.
     """
 
     @property
-    def provider_name(self) -> str: ...
+    def provider_name(self) -> str | None: ...
+
+
+def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | None:
+    """The provider that ACTUALLY serves a call: what the adapter declares, else the config's.
+
+    One expression, because the answer is written to three surfaces that a reader compares --
+    the model-stream context's ``provider``, ``run.started``'s ``model_provider`` (and through it
+    every ``gen_ai.provider.name`` the event-driven OTel sink writes), and the receipt-derived
+    span's own fallback. They disagreed for one release: through a gateway the receipt named the
+    upstream and the event named the transport, for the same call.
+
+    A *forwarding* adapter declares its upstream, so preferring the declaration is what makes
+    these spans describe the model that answered rather than the hop the answer arrived over.
+    ``ModelConfig.provider`` remains the fallback and stays recorded verbatim on the run manifest,
+    so the transport is never lost.
+
+    Tolerant by construction: this feeds telemetry, and a third-party ``provider_name`` property
+    that raises -- or whose ``str()`` does -- must not take a run down over an attribute nothing
+    branches on. Mirrors the defensive probe in ``ModelCallRunner``, including its
+    ``normalize_unicode_scalars``, so the receipt's own read of a declaration and this one are
+    byte-identical rather than merely equal on well-behaved strings.
+
+    Tolerance means "keep going", not "answer nothing": the declaration guard FALLS THROUGH to
+    the config fallback rather than returning. It used to return ``None`` there, which made the
+    one documented expression give two answers on exactly the path it exists for -- the
+    model-stream context reported no provider at all while ``run.started``, the receipt and the
+    OTel span beside them all reported the configured transport for the same call.
+    """
+
+    try:
+        declared = getattr(adapter, "provider_name", None)
+        if declared:
+            return normalize_unicode_scalars(str(declared))
+    except Exception:
+        pass  # unreadable declaration: fall through to the config, do not answer nothing
+    try:
+        fallback = config.provider if config is not None else None
+        return normalize_unicode_scalars(str(fallback)) if fallback else None
+    except Exception:
+        return None
 
 
 class ConfiguredModelAdapter(Protocol):
@@ -752,6 +802,16 @@ def _normalize_model_turn(turn: Any) -> Any:
 
     reasoning = getattr(turn, "reasoning", ())
     if not isinstance(reasoning, (list, tuple)):
+        # DIVERGENCE, deliberate: the stream twin (``_normalize_model_stream_chunk``, on
+        # ``TurnComplete``) RAISES on this same non-sequence, while the turn path coerces to ().
+        # It is wire-observable — a custom adapter returning a malformed ``reasoning`` has its
+        # turn silently stripped and its stream hard-failed — and it stands because the two
+        # paths have different jobs. This one, per the docstring above, must keep accepting the
+        # structurally-compatible legacy objects that predate the protocol, where an attribute
+        # of an unexpected shape means "this adapter has no reasoning" rather than "this adapter
+        # is broken"; there is no reasoning to lose. The stream path is the strict ingress: its
+        # chunks are the protocol's own dataclasses, so a bad value there is a real defect, and
+        # a silently-emptied terminal frame would drop artifacts the round-trip needs.
         reasoning = ()
     normalized_reasoning = normalize_json_ingress(reasoning)
     reasoning = (
@@ -844,6 +904,12 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
         if reasoning is None:
             reasoning = ()
         if not isinstance(reasoning, (list, tuple)):
+            # DIVERGENCE, deliberate: the one-shot twin (``_normalize_model_turn``) coerces this
+            # same non-sequence to () instead of raising. Strictness belongs here — a stream
+            # chunk is one of this protocol's own dataclasses, not a legacy duck-typed object,
+            # so a malformed value is a defect rather than "no reasoning", and emptying it
+            # quietly would drop the terminal frame's artifacts on the floor. See the comment at
+            # the turn-path site for why tolerance belongs there.
             raise ValueError("turn complete reasoning must be an array or null")
         normalized_reasoning = normalize_json_ingress(reasoning)
         reasoning = (

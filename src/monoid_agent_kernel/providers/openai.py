@@ -18,6 +18,8 @@ from monoid_agent_kernel.providers._common import (
     build_generation_payload,
     build_reasoning_payload,
     normalize_usage,
+    reasoning_replay_window_start,
+    usage_reported_by,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -29,6 +31,8 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_usage,
+    normalize_model_stream_chunk,
 )
 
 
@@ -524,18 +528,10 @@ class OpenAIModelAdapter:
         # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
         # needs nothing from the client, and a consumer that stops at it holds a suspended
         # generator -- ``break`` does not close one -- which would pin the pool open for as long as
-        # it keeps the reference.
-        output_items = final_data.get("output") or []
-        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
-        yield TurnComplete(
-            response_id=final_data.get("id"),
-            usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
-            # encrypted_content lives only on the final response object, so reasoning items
-            # are captured here (from response.completed) rather than the per-token deltas.
-            reasoning=_capture_reasoning_items(output_items),
-            stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
-            provider_retried=provider_retried,
-        )
+        # it keeps the reference. The build is a named seam so its refusals carry their cost the
+        # way the one-shot reader's do; the ``yield`` stays out of it, so a consumer throwing into
+        # this generator is not mistaken for the payload being refused.
+        yield _terminal_chunk(final_data, provider_retried=provider_retried)
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
         """Build the request body **and prove it serializes**, naming a failure what it is.
@@ -971,23 +967,25 @@ def _reasoning_replay_flags(messages: tuple[dict[str, Any], ...], current_model:
     Two rules (see the DX-13a plan):
     - **Active window only**: reasoning is mandatory to round-trip only since the last ``user``
       message (the in-flight tool loop). Earlier reasoning is historical and droppable — OpenAI
-      tolerates historical function_call pairs without their reasoning.
+      tolerates historical function_call pairs without their reasoning. The window itself is
+      :func:`reasoning_replay_window_start`, shared with the kernel's wire prune so the rule
+      that decides what may be REPLAYED and the rule that decides what is worth SENDING are one
+      definition rather than two copies of the same index arithmetic.
     - **All-or-nothing model identity**: ``config.model`` is re-read every step, so a hot-swap
       can land mid-loop. If any active-window reasoning block isn't ``openai`` at the current
       model, drop reasoning for the whole window so we never send a half-paired set (→ no 400).
+      Deliberately scoped to the window: a block the window does not contain cannot influence
+      it, which is what lets the kernel prune historical blocks without changing this answer.
     """
-    last_user = -1
-    for index, message in enumerate(messages):
-        if message.get("role") == "user":
-            last_user = index
+    window_start = reasoning_replay_window_start(messages)
     window_ok = True
-    for message in messages[last_user + 1 :]:
+    for message in messages[window_start:]:
         reasoning = message.get("reasoning")
         if isinstance(reasoning, dict) and reasoning.get("items"):
             if reasoning.get("provider") != "openai" or reasoning.get("model") != current_model:
                 window_ok = False
                 break
-    return [index > last_user and window_ok for index in range(len(messages))]
+    return [index >= window_start and window_ok for index in range(len(messages))]
 
 
 def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
@@ -998,10 +996,16 @@ def _capture_reasoning_items(output: list[Any]) -> tuple[dict[str, Any], ...]:
     by-value request; dropping or reordering them yields a ``required following item`` 400.
     Capturing the exact subsequence verbatim — rather than reconstructing items from the parsed
     ``tool_calls``/``final_text`` — is the only construction that survives parallel/interleaved
-    tool calls and reasoning→message pairings. The opaque payload (``encrypted_content`` etc.)
+    tool calls and reasoning→message pairings. The encrypted payload (``encrypted_content`` etc.)
     is preserved; only the output-only ``status`` field is dropped, since the Responses *input*
     schema rejects it (``Unknown parameter: input[..].status``). Returns ``()`` when the turn
     carried no reasoning (non-reasoning models are untouched).
+
+    Only the ``reasoning`` entries are ciphertext. The pairing requirement means a ``message``
+    entry (the model's plaintext answer) and a ``function_call`` entry (plaintext arguments)
+    come along with them, so the captured tuple duplicates content that also reaches
+    ``final_text``/``tool_calls`` — it is model content for redaction and logging purposes, not
+    an opaque blob, wherever it is written (wire, ledger, event, checkpoint).
     """
     captured: list[dict[str, Any]] = []
     has_reasoning = False
@@ -1034,12 +1038,39 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
 
 
 def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
-    """Map one Responses-API body to a :class:`ModelTurn`.
+    """Map one Responses-API body to a :class:`ModelTurn`, stamping what a refusal cost.
 
     ``provider_retried`` is the caller's evidence about the HTTP exchange that produced ``data``
     -- the body itself carries no such fact -- and defaults to False, which is exactly true of
     every caller with no exchange to report on (the tests that parse a bare dict).
+
+    This is the SOURCE reader: every carrier downstream of it -- the receipt, the run's token
+    budget, the gateway's error envelope and the tenant ledger a hop away -- can only report a
+    cost this function recorded. It recorded none. A dozen malformed shapes are refused here on
+    bodies that carry a valid ``usage`` (a model emitting non-JSON function-call arguments is
+    ordinary), and every one of those refusals escaped empty, so a turn OpenAI generated and
+    billed was metered at zero everywhere behind it.
+
+    One seam around the whole mapping rather than a stamp per raise site: the rule is about the
+    payload, not about which key of it turned out to be malformed, and twelve stamps is twelve
+    chances to miss the thirteenth. ``Exception`` rather than ``ModelAdapterError`` because the
+    mapping refuses in more than one type -- ``normalize_usage`` says "malformed usage" with a
+    ``ValueError`` -- and a rule bound to one of two ways the same act is spelled is the shape
+    this codebase keeps re-earning. The stamp reads leniently (:func:`usage_reported_by`), so a
+    body whose ``usage`` is *itself* the malformed key records nothing rather than raising a
+    second failure over the first; well-formed bodies still normalize through the adapter's own
+    parser below and are untouched by this.
     """
+
+    try:
+        return _response_to_turn(data, provider_retried=provider_retried)
+    except Exception as refused:
+        mark_provider_usage(refused, usage_reported_by(data))
+        raise
+
+
+def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelTurn:
+    """The mapping itself. Called only through :func:`_parse_response`, which owns the stamp."""
 
     output = data.get("output", [])
     if output is None:
@@ -1114,6 +1145,57 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
         stop_reason=_stop_reason_from_response(data, tool_calls_present=bool(tool_calls)),
         provider_retried=provider_retried,
     )
+
+
+def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> TurnComplete:
+    """The streamed twin of :func:`_parse_response`: end-of-turn metadata, and its cost.
+
+    The stream never runs the one-shot mapping -- it folds deltas as they arrive and reads the
+    turn's metadata off ``response.completed``/``response.incomplete`` here -- so the rule the
+    body reader states had to be bound to this construction separately or it held on one of two
+    transports. Enumerated rather than assumed: ``normalize_usage`` refuses a malformed
+    ``usage``, and ``_stop_reason_from_response`` walks ``incomplete_details``, ``output`` and
+    each message's ``content``, so a final payload malformed in any of those is refused here on
+    a turn the provider already billed. The assembled chunk is then normalized inside the same
+    guard -- ``TurnComplete`` itself validates nothing, so the ingress normalizer's strict pass
+    (a non-string ``id`` is the reachable case) would otherwise refuse it one step later,
+    outside the stamp.
+
+    The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
+    ``ModelAdapterError``, which is why the guard catches ``Exception``. Every consumer of the
+    stamp reads it off the escaping exception whatever its type -- the receipt
+    (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the reference
+    gateway's tenant meter and both of its error writers, which used to inspect only a
+    ``ModelAdapterError`` and so skipped precisely this region. Stamping is still the whole of
+    the fix here: classifying these would change how the loop treats them, which is a separate
+    decision, and the carry no longer depends on making it.
+    """
+
+    try:
+        output_items = final_data.get("output") or []
+        has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
+        # Normalized INSIDE the guard, deliberately: ``TurnComplete`` itself validates nothing,
+        # so a field this construction copies raw (a non-string ``id`` is the reachable case)
+        # used to leave here successfully and be refused one step later by the ingress
+        # normalizer -- outside this ``try``, so the refusal carried no usage for a turn the
+        # provider already billed. Running the same normalization here moves every field's
+        # FIRST validation to where the stamp is; the downstream pass re-runs it idempotently.
+        return normalize_model_stream_chunk(
+            TurnComplete(
+                response_id=final_data.get("id"),
+                usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+                # encrypted_content lives only on the final response object, so reasoning items
+                # are captured here (from response.completed) rather than the per-token deltas.
+                reasoning=_capture_reasoning_items(output_items),
+                stop_reason=_stop_reason_from_response(
+                    final_data, tool_calls_present=has_tool_calls
+                ),
+                provider_retried=provider_retried,
+            )
+        )
+    except Exception as refused:
+        mark_provider_usage(refused, usage_reported_by(final_data))
+        raise
 
 
 def _coerce_response(response: object) -> dict[str, Any]:

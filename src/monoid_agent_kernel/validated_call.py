@@ -36,6 +36,7 @@ from monoid_agent_kernel.core.output_validator import (
     run_output_validators,
 )
 from monoid_agent_kernel.model_call import DeltaConsumer, ModelCallRunner, ShouldAbort
+from monoid_agent_kernel.providers._common import prune_dead_reasoning
 from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, ModelTurn
 
 ValidatedCallStatus = Literal["ok", "unsatisfied", "refusal", "truncated", "tool_calls"]
@@ -418,10 +419,24 @@ def _repair_request(
             observations=(),
             instruction=None,
             previous_turn_handle=None,
-            messages=(
-                *request.messages,
-                {"role": "assistant", "content": turn.final_text or ""},
-                {"role": "user", "content": repair_text},
+            # The repair prompt is a user message, which moves the active replay window past
+            # everything before it -- so every captured ``reasoning`` block in the incoming log
+            # is dead the moment this tuple is built, and forwarding it was pure cost repeated on
+            # every repair attempt. The kernel's other request builder prunes at its own seam
+            # (``loop.py``'s ``wire_messages``); this is the second one, and the rule is the same
+            # function. Nothing the provider sees changes: the adapter's replay filter already
+            # treated a kernel-authored user message as a window boundary. The caller's messages
+            # are not mutated -- ``prune_dead_reasoning`` builds the wire copy -- and the durable
+            # log keeps every block verbatim.
+            #
+            # The two branches below need nothing: they build their messages from literals here,
+            # so no captured block can reach them.
+            messages=prune_dead_reasoning(
+                [
+                    *request.messages,
+                    {"role": "assistant", "content": turn.final_text or ""},
+                    {"role": "user", "content": repair_text},
+                ]
             ),
         )
     if request.previous_turn_handle:

@@ -344,6 +344,217 @@ def test_gateway_adapter_raises_on_mid_stream_error_frame() -> None:
     assert excinfo.value.provider_error_code == "gateway_server_error"
 
 
+# --- the terminal payload a refused stream was already billed for -------------------------
+#
+# The OpenAI adapter stamps what a refused end-of-turn payload cost (``_terminal_chunk``), and
+# every refusal in that region is a RAW ``ValueError``/``AttributeError``: the stream never runs
+# the one-shot mapping that raises ``ModelAdapterError``. Both consumers on THIS route read the
+# stamp off the escaping exception -- the tenant ledger and the SSE error frame -- and both were
+# gated on ``ModelAdapterError``, so a stream whose final payload is malformed charged the tenant
+# nothing, told the client nothing, and came back ``retryable=True``: an invitation to buy the
+# same tokens again.
+
+_BILLED_TERMINAL_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+
+def _malformed_billed_terminal_payload() -> dict[str, Any]:
+    """A ``response.completed`` body that reports what the turn cost and is then refused."""
+
+    return {
+        "id": "resp_1",
+        "status": "completed",
+        "usage": dict(_BILLED_TERMINAL_USAGE),
+        # The terminal reader walks ``output`` for tool calls and for the stop reason, so a
+        # string there refuses with a raw ``AttributeError`` -- on a turn already generated.
+        "output": "not-an-array",
+    }
+
+
+class _BilledTerminalRefusal:
+    """An upstream whose stream delivers tokens and then refuses its own final payload."""
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:  # pragma: no cover - stream only
+        raise AssertionError("this upstream is only driven through astream_turn")
+
+    async def astream_turn(self, request: ModelRequest):
+        del request
+        from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+        yield TextDelta("partial")
+        yield _terminal_chunk(_malformed_billed_terminal_payload(), provider_retried=False)
+
+
+def _billed_refusal_server() -> tuple[Any, TokenManager, LlmGatewayBackend]:
+    """The shipped gateway in front of that upstream, with a handle on its tenant ledger."""
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda *_: _BilledTerminalRefusal(),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    return server, manager, gateway
+
+
+def test_a_stream_refused_on_its_terminal_payload_still_charges_the_tenant() -> None:
+    server, manager, gateway = _billed_refusal_server()
+    with serving(server) as base_url:
+        frames = _post_sse(base_url, _llm_token(manager), _turn_payload())
+
+    errors = [frame for frame in frames if frame["type"] == "error"]
+    assert len(errors) == 1, frames
+    assert errors[0].get("usage") == _BILLED_TERMINAL_USAGE, {
+        "error_frame": errors[0],
+        "hint": "the refusal carries what the stream already burned; the frame is the only "
+        "carrier a streaming client has left",
+    }
+    assert gateway.tenant_usage("tenant_a")["total_tokens"] == 460, {
+        "tenant_ledger": gateway.tenant_usage("tenant_a"),
+        "hint": "the generator exits on the raise, before the success-path meter",
+    }
+
+
+def test_the_client_behind_that_stream_reports_what_the_refusal_cost() -> None:
+    """End to end over real HTTP: the frame is read back onto the client's own exception."""
+
+    pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    server, manager, gateway = _billed_refusal_server()
+    with serving(server) as base_url:
+        adapter = _adapter(base_url, _llm_token(manager))
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+        with pytest.raises(ModelAdapterError) as refused:
+            asyncio.run(_collect(adapter.astream_turn(request)))
+
+    assert provider_usage_of(refused.value) == _BILLED_TERMINAL_USAGE
+    assert gateway.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+# --- the separators an SSE frame must not put on the wire raw -----------------------------
+#
+# SSE is a LINE protocol, and "line" is not the same word on both ends of it. The frame writer
+# serialized with ``ensure_ascii=False``, which leaves U+2028, U+2029 and U+0085 in the body as
+# themselves; httpx -- what this repo's own streaming client reads with -- splits ``aiter_lines``
+# on all three. The client's parser then sees a JSON object that stops mid-string and reports
+# ``gateway_bad_response`` for a turn the server has already produced, already framed and already
+# metered. ``final_text`` could always carry one; the relayed ``reasoning`` array made it
+# reachable from content that never appears in the answer at all, which is why it is pinned on
+# both carriers. Real HTTP on both tests: a hand-fed line list cannot fail this way.
+
+_LINE_SEPARATORS = "\u2028\u2029\u0085"
+
+
+def _streamed_turn_over_http(chunks: list[Any]) -> Any:
+    """Drive the shipped client against the shipped server and assemble what it received."""
+
+    server, manager = _server_for(lambda *_: FakeStreamingModelAdapter(chunk_turns=[chunks]))
+    with serving(server) as base_url:
+        adapter = _adapter(base_url, _llm_token(manager))
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+        return assemble_streamed_turn(asyncio.run(_collect(adapter.astream_turn(request))))
+
+
+def test_a_relayed_reasoning_entry_survives_the_unicode_line_separators() -> None:
+    pytest.importorskip("httpx")
+    plaintext = f"weighed{_LINE_SEPARATORS}the options"
+    reasoning = (
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},
+        {"type": "message", "content": [{"type": "output_text", "text": plaintext}]},
+    )
+    turn = _streamed_turn_over_http(
+        [
+            TextDelta("ok"),
+            TurnComplete(response_id="prov", usage={"total_tokens": 5}, reasoning=reasoning),
+        ]
+    )
+
+    assert turn.final_text == "ok"
+    assert tuple(turn.reasoning) == reasoning, {
+        "relayed": turn.reasoning,
+        "hint": "the terminal frame was split mid-JSON on a separator the client calls a line",
+    }
+
+
+def test_the_streaming_adapter_verifies_the_upstream_the_hop_names() -> None:
+    """O1's streamed twin, end to end over real HTTP through the shipped adapter.
+
+    The frame reader's gate is reached through three module-level functions
+    (``_aiter_sse_chunks`` -> ``_decode_sse_chunk`` -> ``_chunk_from_event``), none of which the
+    adapter calls directly with its declaration in hand -- so a thread that stops at any of them
+    leaves the streamed transport ungated while the blocking one enforces. That asymmetry is
+    this file's recurring defect shape, and only a real stream can see it.
+    """
+
+    pytest.importorskip("httpx")
+    reasoning = ({"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},)
+
+    class _AcmeBackend:
+        provider_name = "acme"
+
+        async def astream_turn(self, _request):
+            yield TextDelta("ok")
+            yield TurnComplete(
+                response_id="prov", usage={"total_tokens": 5}, reasoning=reasoning
+            )
+
+    server, manager = _server_for(lambda *_: _AcmeBackend())
+    with serving(server) as base_url:
+        token = _llm_token(manager)
+        url = f"{base_url}/internal/llm/turns"
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+
+        lying = GatewayModelAdapter(ModelConfig(), gateway_url=url, token=token)
+        assert lying.provider_name == "openai", "the default is the hazard under test"
+        dropped = assemble_streamed_turn(asyncio.run(_collect(lying.astream_turn(request))))
+
+        honest = GatewayModelAdapter(
+            ModelConfig(), gateway_url=url, token=token, provider_name="acme"
+        )
+        kept = assemble_streamed_turn(asyncio.run(_collect(honest.astream_turn(request))))
+
+    assert kept.reasoning == reasoning
+    assert dropped.reasoning == (), {
+        "kept": dropped.reasoning,
+        "hint": "the blocking transport gates this; a stream that does not is the same "
+        "unusable replay one turn later",
+    }
+    # Dropping the unreadable half does not damage the turn around it.
+    assert dropped.final_text == kept.final_text == "ok"
+
+
+def test_final_text_survives_a_unicode_line_separator_on_the_stream() -> None:
+    """The carrier that predates the reasoning array, on the delta frames rather than the
+    terminal one -- separate frames, same writer, and only one of them was ever exercised."""
+
+    pytest.importorskip("httpx")
+    answer = "before\u2028after"
+    turn = _streamed_turn_over_http(
+        [TextDelta(answer), TurnComplete(response_id="prov", usage={"total_tokens": 5})]
+    )
+    assert turn.final_text == answer
+
+
+def test_the_length_delimited_transport_carries_them_as_it_always_did() -> None:
+    """The counterweight: the non-streaming body is framed by ``Content-Length``, not by lines.
+
+    Nothing in it can be split by a separator, so it keeps ``ensure_ascii=False`` and the
+    smaller body that goes with it -- the escape is a property of the LINE protocol, not of the
+    gateway's JSON.
+    """
+
+    answer = f"before{_LINE_SEPARATORS}after"
+    server, manager = _server_for(
+        lambda *_: FakeModelAdapter(
+            turns=[ModelTurn(response_id="prov", final_text=answer, usage={"total_tokens": 4})]
+        )
+    )
+    with serving(server) as base_url:
+        adapter = _adapter(base_url, _llm_token(manager))
+        turn = adapter.next_turn(ModelRequest(instruction="go", system_prompt="sys", tools=()))
+    assert turn.final_text == answer
+
+
 def test_the_streamed_backoff_waits_without_holding_the_event_loop(monkeypatch: Any) -> None:
     """The streamed retry path must not use the blocking wait.
 

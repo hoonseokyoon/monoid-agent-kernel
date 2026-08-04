@@ -264,7 +264,8 @@ invoke_agent
 
 `chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
 not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
-`gen_ai.tool.name`, token usage). The zero-argument form preserves this metadata-only behavior:
+`gen_ai.provider.name`, `gen_ai.tool.name`, token usage). The zero-argument form preserves this
+metadata-only behavior:
 
 ```python
 from monoid_agent_kernel import AgentLoop
@@ -272,6 +273,38 @@ from monoid_agent_kernel.observability.otel import OtelEventSink
 
 loop = AgentLoop.from_config(spec, adapter, config, event_sinks=(OtelEventSink(),))
 ```
+
+**Provider attribution through the LLM gateway (v0.21).** Every surface that names a provider
+resolves it the same way — what the answering adapter declares as `provider_name`, falling back to
+`ModelConfig.provider` when it declares nothing (`providers/base.py:resolved_provider_name`).
+`GatewayModelAdapter` declares the provider it relays (default `"openai"`; set it per deployment
+with `monoid run --llm-gateway-provider`, `monoid backend serve --llm-gateway-provider`,
+`RunnerBackend(llm_gateway_provider=...)`, or — for the reference Studio, whose embedder seam is
+itself such a factory — `StudioConfig(llm_gateway_provider=...)`; `none` disables it), so a call
+routed through the gateway is attributed to the **model that served it** rather than to the
+transport it arrived over.
+
+Four surfaces change together, deliberately, because one expression feeds all of them:
+`ModelCallReceipt.provider_name` (previously `""` on this route); `gen_ai.provider.name` on the
+receipt-derived `chat` span, which reads that receipt; the model-stream context's `provider`
+(previously the config's string); and the `model_provider` field of the `run.started` event, which
+is where the *event-driven* sink — the zero-argument quickstart above, with no
+`model_io_subscriptions` — gets `gen_ai.provider.name` from. That last one is the reason this is
+stated as a mechanism rather than as a list: while `run.started` carried the raw config, one
+`OtelEventSink` class produced two different answers for one call depending on how it was wired.
+
+The agreement between those four is scoped to activations that emit `run.started`. An
+event-only sink attached to a **restored** run joins after that event was written, so it has no
+`model_provider` to read and reports no provider or model for the resumed turns; the
+receipt-driven configuration (`model_io_subscriptions`) has no such gap, because every call
+publishes its own receipt. This predates the provider-attribution change and is unaffected by
+it — a sink that needs provider attribution across a restore should be wired with subscriptions.
+
+The transport is not lost — `receipt.model.provider` still carries `"gateway"`, and `manifest.json`
+records the configured `model_provider` verbatim — so a dashboard that wants to group by hop groups
+by those. Deployments whose gateway fronts a different upstream should set the flag accordingly;
+leaving the default mislabels the spans in exactly the way it would mislabel the reasoning
+round-trip.
 
 W9 adds three controls to the same preset:
 

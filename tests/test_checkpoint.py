@@ -1249,6 +1249,54 @@ def test_metrics_after_a_restore_report_one_epoch_not_two(tmp_path: Path) -> Non
     assert result.metrics["subagent_count"] == 2
 
 
+class _TaggingAdapter(FakeModelAdapter):
+    """A ``FakeModelAdapter`` that names a provider, so the loop tags captured reasoning."""
+
+    provider_name = "openai"
+
+
+def test_the_checkpoint_keeps_reasoning_the_wire_stopped_sending(tmp_path: Path) -> None:
+    """The durable record and the request are different artifacts with different rules.
+
+    The wire drops a reasoning block once a new user message puts it outside the replay window
+    — it is bytes the upstream provably discards. The checkpoint is the run's record, not an
+    optimization: it keeps every captured block verbatim, so a restored run replays the same
+    conversation a never-parked one would and a forensic reader sees what the model produced.
+    """
+
+    items = [{"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc_1"}]
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    adapter = _TaggingAdapter(
+        turns=[
+            ModelTurn(response_id="r1", final_text="first", reasoning=tuple(items)),
+            ModelTurn(response_id="r2", final_text="second"),
+        ]
+    )
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    try:
+        loop.run_until_suspended("u1")
+        loop.run_until_suspended("u2")
+        # Read the park while the run is still open: closing finalizes and clears it.
+        checkpoint = _latest_checkpoint(spec)
+    finally:
+        loop.close()
+
+    # The second request no longer carries it: that block sits before the last user message.
+    replayed = [m for m in (adapter.requests[1].messages or ()) if m.get("role") == "assistant"]
+    assert replayed and "reasoning" not in replayed[0]
+
+    assert checkpoint is not None
+    logged = [m for m in checkpoint.messages if m.get("role") == "assistant"]
+    assert logged and logged[0]["reasoning"]["items"] == items
+    assert logged[0]["reasoning"]["provider"] == "openai"
+    assert "enc_1" in json.dumps(checkpoint.messages)
+
+
 def _mk(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

@@ -12,6 +12,7 @@ from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError, Perm
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -94,12 +95,22 @@ def make_llm_gateway_handler(
                 raise PermissionDenied("invalid admin token")
 
         def _write_exception(self, exc: Exception) -> None:
+            # What the failing call already cost, read once and carried by EVERY arm rather than
+            # by the classified one alone. The stamp does not belong to a type: the adapter that
+            # sees the provider's billed body first refuses in raw ``ValueError``/``AttributeError``
+            # as readily as in ``ModelAdapterError`` (``normalize_usage``, and the whole terminal
+            # region of the OpenAI stream), and those land on the ``ValueError`` and the generic
+            # arms below -- which wrote no ``usage`` at all, so the client one hop out recorded
+            # zero for a turn the upstream generated and billed. ``_error_body`` omits the key
+            # when it is empty, so the arms that never carry a cost keep their exact wire shape.
+            usage = provider_usage_of(exc)
             if isinstance(exc, PermissionDenied):
                 self._write_error(
                     HTTPStatus.UNAUTHORIZED,
                     str(exc),
                     error_code=GATEWAY_AUTH_ERROR,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, ModelAdapterError):
                 status = _model_error_status(exc)
@@ -110,7 +121,7 @@ def make_llm_gateway_handler(
                     retryable=exc.retryable,
                     config_recoverable=exc.config_recoverable,
                     provider_retried=exc.provider_retried,
-                    usage=provider_usage_of(exc),
+                    usage=usage,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -118,6 +129,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, ValueError):
                 self._write_error(
@@ -125,6 +137,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    usage=usage,
                 )
             elif isinstance(exc, NativeAgentError):
                 self._write_error(
@@ -132,6 +145,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=getattr(exc, "error_code", GATEWAY_BAD_REQUEST),
                     retryable=False,
+                    usage=usage,
                 )
             else:
                 self._write_error(
@@ -139,6 +153,7 @@ def make_llm_gateway_handler(
                     redact_internal_error(_LOGGER, self, exc),
                     error_code=GATEWAY_SERVER_ERROR,
                     retryable=True,
+                    usage=usage,
                 )
 
         def _write_error(
@@ -152,6 +167,12 @@ def make_llm_gateway_handler(
             provider_retried: bool = False,
             usage: Mapping[str, int] | None = None,
         ) -> None:
+            # Before the status, not after: the bytes have to leave the receive buffer before the
+            # close, and the close follows this write immediately. This wire is the one where the
+            # loss is worst -- every field below (``retryable``, ``config_recoverable``, the
+            # provider code, the billed ``usage``) is a classification the client acts on, and a
+            # reset replaces all of it with "network error", which reads as retryable.
+            drain_request_body(self)
             self._write_json(
                 _error_body(
                     status,
@@ -196,9 +217,21 @@ def make_llm_gateway_handler(
 
         def _write_sse_frame(self, frame: dict[str, Any]) -> None:
             # Single-line JSON (no indent), flushed per frame so the stream is live.
+            #
+            # ``ensure_ascii=True`` here and NOT in ``_write_json`` above, because "single-line"
+            # is the whole framing on this route and the two ends disagree about what a line is.
+            # U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE survive an
+            # ``ensure_ascii=False`` dump as themselves, and the line-splitting readers clients
+            # use -- httpx's ``aiter_lines``, which this repo's own GatewayModelAdapter reads
+            # with -- break on all three. The client then parses a JSON object that stops
+            # mid-string and reports a bad response for a turn this server produced, framed and
+            # already metered. Model text can contain any of them (``final_text``, and the
+            # relayed ``reasoning`` array, whose plaintext entries need never appear in the
+            # answer at all), so escaping them is the frame writer's job, not the model's. The
+            # length-delimited body has no such ambiguity and keeps its smaller encoding.
             self.wfile.write(
                 b"data: "
-                + json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                + json.dumps(frame, ensure_ascii=True, allow_nan=False).encode("utf-8")
                 + b"\n\n"
             )
             self.wfile.flush()
@@ -277,11 +310,18 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
         }
     return {
         "type": "error",
+        # The unclassified arm carries the cost too, exactly like its twin above and like
+        # ``_write_exception``'s. A stream that folds provider deltas and then refuses its own
+        # end-of-turn payload fails with a RAW ``ValueError``/``AttributeError`` -- the one shape
+        # this arm exists for -- and that is a refusal of a turn the upstream already generated
+        # and billed. Without the key, the only carrier a streaming client has says the call was
+        # free, and ``retryable=True`` below then invites it to buy the same tokens again.
         **_error_body(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             redact_internal_error(_LOGGER, handler, exc),
             error_code=GATEWAY_SERVER_ERROR,
             retryable=True,
+            usage=provider_usage_of(exc),
         ),
     }
 

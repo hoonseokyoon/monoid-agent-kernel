@@ -7,6 +7,364 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the terminal chunk is validated where its stamp is
+
+- **The stream's end-of-turn payload is normalized inside the usage guard.** `TurnComplete`
+  itself validates nothing, so a field the terminal construction copies raw — a non-string `id`
+  is the reachable case — used to leave `_terminal_chunk` successfully and be refused one step
+  later by the ingress normalizer's strict pass, outside the guard: the refusal carried no usage,
+  and the receipt, the run's token budget and the gateway tenant meter recorded zero for a turn
+  the provider already billed. The same normalization now runs inside the guarded region, so
+  every field's *first* validation happens where the stamp is; the downstream pass re-runs it
+  idempotently, and the refusal arrives classified (`ModelAdapterError`) rather than raw.
+
+### Fixed — a new keyword does not move the arguments that predate it
+
+- **`llm_gateway_provider` is keyword-only on every constructor it joined.** It landed
+  mid-dataclass on `RunnerBackend`, `BackendLoopFactoryContext` and `StudioConfig`, beside the
+  URL it describes — which silently rebound every later positional argument: an embedder's
+  fifth positional `model_adapter_factory` was stored as the relayed-provider string and the
+  factory left unset, surfacing only when `resolve_relayed_provider` called `.strip()` on a
+  callable. `kw_only=True` keeps the field beside its sibling without moving anything that
+  predates it. (`GatewayModelAdapter.provider_name` was already appended last and is untouched.)
+  The positional signatures of all four constructors are now pinned append-only in
+  `test_public_surface.py`, so the next mid-insert fails a test instead of an embedder.
+
+### Fixed — an early rejection reaches the client on all four reference servers, not one
+
+- **A response written before the request body was read was being discarded by a TCP reset.** A
+  handler that answers a POST without consuming the body leaves the client's bytes in the kernel
+  receive buffer; closing that socket sends an RST rather than a FIN, and the RST discards whatever
+  the client has not yet pulled out of its own buffer — so a status the server wrote and flushed
+  successfully never arrives. The caller sees `ConnectionAbortedError` instead. Every early
+  rejection has this shape: an unknown path, a missing or bad token, an over-large body.
+- **The cost is a reclassified error, not a lost one.** `gateway_auth_error` carries
+  `retryable: false`; a transport abort reads as transient to every retry policy in this repo, so a
+  credential failure was retried as though it might succeed next time. On the llm-gateway wire the
+  whole classified body goes with it — `retryable`, `config_recoverable`, the provider code, and
+  the billed `usage` a refused-but-generated turn still owes.
+- **The fix already existed on one of the four servers.** `BackendHttpHandler` had it as
+  `_discard_unread_request_body`, with an accurate analysis of the same race, and the other three
+  wrote their rejections into that reset for as long as it existed. Promoted verbatim in behavior
+  to `_shared.http_util.drain_request_body` and called by all four `_write_error` funnels — the
+  same bounds it always had (64 KiB cap, 0.5s drain timeout well under the 30s connection timeout,
+  close-undrained past either, because this runs for a caller already refused). Its per-request
+  marker is now keyed to the request's own headers object, so it invalidates itself on a keep-alive
+  connection instead of needing every handler to reset a boolean.
+- **(tests) The rule is bound on each handler rather than on the one whose test caught it.** The
+  symptom was a ~5-15% flake in `test_mcp_gateway_rejects_bad_token_when_admin_configured`. It is
+  intermittent only because the handler's header read is buffered: a body sharing the segment its
+  headers arrived in gets swallowed incidentally, and `http.client` sends the two separately while
+  a hand-written probe using one `sendall` does not — which is why the obvious reproduction reports
+  "cannot reproduce". `tests/test_http_reject_drains_body.py` splits the send deliberately, making
+  all four reject paths fail 100% before the fix, and censuses every reference `_write_error` so a
+  fifth server cannot skip the drain.
+
+### Added — the gateway names the upstream it relayed, and the client stops trusting its default
+
+- **The LLM-gateway success body and terminal `turn_complete` frame carry `provider`.** The
+  reasoning artifacts a hop relays are only replayable if the tag on them names a provider that
+  can read them back, and that tag was written from `GatewayModelAdapter.provider_name` — the
+  *client's* declaration, defaulting to `"openai"` because that is what the reference gateway
+  fronts. For a deployment whose `provider_adapter_factory` routes elsewhere the default is simply
+  wrong, and nothing on either side of the wire could tell. The server can: it built the upstream
+  adapter. Written from that adapter's own declaration and from nothing else — deliberately *not*
+  through the config fallback, because `_upstream_model_config` hardcodes `provider="openai"` for
+  every call this gateway serves, so the fallback would have named OpenAI for an upstream that is
+  not, minting the same confident lie one layer down. Additive and omit-when-unknown, on the rule
+  `reasoning` already uses.
+- **A client verifies against that name instead of adopting it.** On a mismatch the relayed
+  `reasoning` artifacts are dropped for that turn and nothing else changes — the declaration keeps
+  naming the provider on the reasoning tag, `ModelCallReceipt.provider_name`, the model-stream
+  context and every OTel `gen_ai.provider.name`. Adopting per turn would give *one call's* provider
+  question two answers again, which is the defect `resolved_provider_name` was written to end;
+  dropping is what the replay filter already does with a tag that does not match
+  (`_reasoning_replay_flags`), decided one hop earlier so the run never carries an item it cannot
+  spend. Both sides resolve their declaration through the same tolerant, Unicode-normalizing
+  expression, so two spellings of one name cannot read as a disagreement. Absence gates nothing on
+  either side, which is what makes an older gateway and an undeclared upstream indistinguishable
+  by design.
+- **(tests) The maximal upstream stub declares every capability the writers probe it for.** The
+  `reasoning` gap survived a whole wire census because the maximal builder left that field at its
+  default; a capability the stub never *declares* is invisible the same way, one level out — the
+  writer probes the adapter, reads nothing, omits the key, and no key-set diff can tell that from a
+  writer that never had the key. `provider_name` was exactly that on the day it was added. The
+  probe list is now derived from the two writers rather than hand-kept.
+
+### Fixed — the other half of the gateway helper census is derived, and two validators join it
+
+- **(tests) The wire-value validator list is derived from the module rather than hand-kept.** The
+  gateway helper census closed with `mapping readers | value validators == registered helpers`,
+  and only the left operand was derived: the right one was a hand list, so a new validator written
+  into both hand lists in one edit kept the equality green while no scan had ever looked at the
+  module. Two were already sitting in that hole — `_validated_generation_echo` and
+  `_validated_schema_echo`, this shape since they were written, registered nowhere — and X-3's
+  `_gateway_reasoning_items` was registered only because someone chose to. Discovered now by the
+  mirror of the mapping predicate: called by a registered reader, raises a `ModelAdapterError` of
+  its own, reads no key off any parameter. The two derivations partition the helper list instead
+  of overlapping, so nothing falls in the remainder.
+- **(tests) "Reads the wire" means holding the mapping, not calling any registered helper.**
+  Registering the two echo validators promoted their callers — `_check_generation_applied` and
+  `_check_schema_applied`, policy checks that never touch a mapping — into *error readers*, with
+  none of a reader's pinned key sets or round-trip behavior to answer for. The reader discovery
+  now counts only the mapping-reading helpers, which loses no reader: pulling a value off the wire
+  to hand onward means reading the mapping, directly or through one of those.
+- **The two echo validators can name the status their caller already read.** Every other refusing
+  validator on this wire takes `http_status`; these two could not, so the *same* malformed
+  terminal frame produced a classified failure carrying a status or one carrying nothing, decided
+  by which field of it was bad. Inert at today's call sites (the streamed reader's hint is `None`
+  outside an error frame, exactly as for the four parameterized before them) — the asymmetry is
+  what is fixed. The census population is derived from "does the helper raise" now, because the
+  hand tuple of six had already gone stale: `_gateway_reasoning_items` arrived carrying the
+  parameter and joined nothing.
+
+### Fixed — round four: the escaping rule reaches the other four SSE writers
+
+- **The three remaining SSE frame writers escape the characters their readers call line breaks.**
+  Round three fixed the gateway's writer and stopped there; the same `ensure_ascii=False` was
+  live on every other line-framed route in the repo — the backend run stream
+  (`POST /v1/runs/stream`), the run event stream (`GET /v1/runs/<id>/events`, via
+  `EventSubscriptionFrame.to_sse`) and the live model-content channel
+  (`LiveModelStreamFrame.to_sse`). U+2028, U+2029 and U+0085 reached the wire as themselves and
+  any `str.splitlines` reader — httpx's `aiter_lines`, what a third-party consumer reads these
+  routes with — split the frame mid-JSON. The model-content channel is the one a separator
+  reaches first, because every `delta` on it is raw provider text; on the two `id:`-carrying
+  routes the split also swallows the frame's id, which is the cursor a reconnect resumes from, so
+  a truncated frame costs the reader its place as well. The Studio writer was already correct by
+  accident (it never passed the argument) and now says so. Nothing in the wire *shape* changed —
+  the same JSON, spelled so a line protocol can carry it.
+- **An error response no longer leaves the request body in the socket.** `_require_admin()` is
+  the first statement of both run routes, so the request most likely to be refused is the one
+  whose body is guaranteed unread — and this handler is HTTP/1.0, so it closes after every
+  response. Closing a socket that still holds unread data makes the platform send an RST rather
+  than a FIN, discarding the 401 already written: the caller saw a dropped connection and could
+  not tell a rejected token from a broken network. Error responses now drain the body first,
+  bounded in both directions (64 KiB, 0.5s) because a refused request has not earned the server's
+  read budget; past either bound the connection is closed undrained, as before. Found by a test
+  that started flaking one run in seven once a pooled-connection client was pointed at the
+  neighbouring route.
+- **(tests) Every SSE frame writer is now censused rather than remembered.** The writer set is
+  discovered from the AST — a function that writes a `data:` field *and* the blank line that ends
+  the frame — pinned in full, and each one is required to state `ensure_ascii=True`. A sixth
+  route, or an edit that shrinks one of these encodings the way the length-delimited bodies do,
+  fails there. Round-trip tests on all three routes read with httpx's line splitter, because the
+  suite's existing SSE helpers split on `\n\n` and passed against the bug the whole time.
+
+### Fixed — round three: the stamp is read wherever it lands, and the frame stops splitting
+
+- **A refused call's cost reaches the ledger whatever type the refusal is.** The receipt and the
+  run's budget read the stamp off *any* exception; the reference gateway's tenant meter and both
+  of its error writers inspected only a `ModelAdapterError` — and on that route the refusals
+  that matter are not one. The OpenAI stream never runs the mapping that classifies, so every
+  refusal in its terminal region is a raw `ValueError`/`AttributeError`, and the sync reader has
+  one raw shape too (`normalize_usage` says "malformed usage" with a `ValueError`). An upstream
+  whose final payload was malformed therefore charged the tenant nothing, answered with an
+  envelope saying the call was free, and came back `gateway_server_error` with `retryable: true`
+  — an invitation to buy the same tokens again. The meter now charges off any escaping
+  `Exception` through one writer (meter-then-reraise: nothing swallowed, nothing reclassified,
+  `GeneratorExit` deliberately not caught), and `usage` rides *every* arm of `_write_exception`
+  and `_stream_error_frame` rather than the classified arm alone. Omit-when-empty is unchanged,
+  so a failure raised before a provider keeps its exact wire shape.
+- **The SSE frame writer escapes the three characters its readers call line breaks.** Frames
+  were serialized with `ensure_ascii=False`, so U+2028, U+2029 and U+0085 reached the wire as
+  themselves — and the line-splitting readers clients use (httpx's `aiter_lines`, which this
+  project's own `GatewayModelAdapter` reads a stream with) break on all three. The frame arrived
+  truncated mid-string and the client reported `gateway_bad_response` with no usage for a turn
+  the server had produced, framed and already metered. `final_text` could always carry one; the
+  relayed `reasoning` array made it reachable from plaintext that need never appear in the
+  answer. `ensure_ascii=True` on the SSE writer only — the length-delimited body is framed by
+  `Content-Length`, cannot be split by a character, and keeps its smaller encoding. Same JSON,
+  spelled so a line protocol can carry it.
+- **(tests) The gateway helper-home registry fails loudly for the next shared helper.** A
+  wire-reading helper defined in another module and left unregistered was dropped from discovery
+  as unreachable, so the keys it reads stopped being counted on both sides of every pinned
+  read-set. Homes are derived from the module's own imports now and diffed against the hand map.
+- **`docs/OBSERVABILITY.md` names the fourth surface that sets the relayed provider.** It listed
+  three where `docs/CONTRACTS.md` lists four; `StudioConfig(llm_gateway_provider=...)` is the
+  one a reader of that section is most likely to be holding.
+
+### Fixed — round two: the cost rule reaches the readers it was written for
+
+- **Every per-key refusal off a billed *error* envelope now carries its cost, on all three
+  readers.** Round one guarded the two success-shaped regions and left a comment claiming they
+  were "every other refusal this reader can raise". The error branch between them refutes it:
+  `_parse_gateway_response`'s `"error" in data` branch, its stream-frame twin, and
+  `_error_from_status_body` — the reader *both* transports land in for a non-200 — each read
+  five keys of their own before the stamp that ends the branch, so a malformed `http_status`,
+  `retryable`, `config_recoverable`, `error` or `error_code` on a payload carrying valid billed
+  usage refused for free. That is the shape most likely to report a cost at all: an error
+  envelope exists because a call failed, and a call that failed *after* the upstream generated is
+  what the rule was written for. One semantic on all three — a malformed error envelope stays a
+  non-retryable `gateway_bad_response`, because a broken envelope is a broken gateway whatever
+  failure it was reporting. In `_error_from_status_body` that raise escapes past the caller's
+  `_should_retry`, so a 429 with an unparseable body is refused rather than retried: the body,
+  not the status line, is the authority. No wire or schema change.
+- **The *source* reader stamps the body OpenAI already billed.** Every carrier of a refused
+  call's cost — the receipt, the run's token budget, the gateway's error envelope, the tenant
+  ledger a hop away — can only report what the adapter that first saw the provider's body
+  recorded, and `_parse_response` recorded nothing. A dozen malformed shapes are refused there on
+  bodies carrying a valid `usage` (a model emitting non-JSON function-call arguments is ordinary,
+  not exotic), so the gateway wrote `usage: {}` and metered zero for a turn OpenAI billed. The
+  streamed twin is a separate construction — the stream folds deltas and reads end-of-turn
+  metadata off `response.completed`, never running the one-shot mapping — and now carries the
+  same rule at its own seam. Its refusals are raw `ValueError`/`AttributeError`, which is why
+  that seam catches `Exception`; the consumers one hop out were widened to match in the same
+  release (above), so the stamp is read wherever it lands rather than only where the failure had
+  already been classified. The lenient reader is one function for both adapters
+  (`providers/_common.usage_reported_by`); well-formed paths are unchanged.
+- **`resolved_provider_name` no longer answers nothing on its tolerance path.** It is documented
+  as one expression so the model-stream context, `run.started` and the receipt-derived span
+  cannot disagree about one call — but its guard *returned* `None` instead of falling through, so
+  on exactly the path it exists for (a third-party `provider_name` that raises, or whose `str()`
+  does) the model-stream context reported no provider while every surface beside it reported the
+  configured transport. Tolerance is "keep going", not "answer nothing". The declaration is now
+  normalized the way `ModelCallRunner` normalizes its own read, so the two are byte-identical
+  rather than equal only on well-behaved strings.
+- **The validated call's repair request stops re-sending dead reasoning.** Its by-value branch
+  appended an assistant turn *and* a user-role repair prompt, then forwarded every prior
+  `reasoning` block behind them — 100% unreachable, since the prompt itself moves the active
+  window past them, and paid again on every repair attempt. Pruned through the same function the
+  loop's seam uses. What the provider sees is byte-identical; what changes is size.
+- **`StudioConfig(llm_gateway_provider=...)`.** Studio derives the relayed provider from whether
+  a `provider_factory` was injected, which can only answer "do not tag" for one — right as a
+  guess, and it left an embedder with an OpenAI-backed factory unable to say otherwise, so its
+  reasoning round-trip was silently dead. Unset still derives; set wins, through the same
+  resolver every other string-typed surface uses (`none` = "do not tag").
+
+### Changed — two sentences an operator would otherwise have to guess
+
+- **"Last `user` message" includes kernel-authored ones.** The replay-window rule counts the
+  `OutputValidator`'s repair prompt and background/HITL observation messages as window
+  boundaries, because the adapter's replay filter reads the role and always has. Someone reading
+  "a new user turn" would guess they do not count. No behavior change — the prune this documents
+  produces a byte-identical provider payload.
+- **The four-surface provider agreement is scoped to activations that emit `run.started`.** An
+  event-only sink attached to a *restored* run joins after that event was written and reports no
+  provider or model for the resumed turns. Pre-existing, and absent from the receipt-driven
+  configuration, where every call publishes its own receipt.
+
+### Fixed — a refused gateway turn still reports what it cost
+
+- **Every per-key refusal off a *validated success* envelope now carries the usage the envelope
+  reported.** The contract says it plainly — "A refused turn was still generated and billed, so
+  the refusal carries the usage the provider reported … on both transports" — and the rule was
+  bound to two of the places that raise it: the 200 *error* envelope, and the terminal frame's
+  `generation_applied`/`schema_applied` echo pair. Every other key of the same two envelopes
+  escaped unstamped, so a body or a `turn_complete` frame that reported spending tokens and was
+  then refused for a malformed `stop_reason`, `final_text`, `turn_handle`/`response_id`,
+  `tool_calls`, `retryable`, `provider_retried` — or the newly added `reasoning`, which
+  inherited the miss the day it shipped — left the run's cumulative token budget and its
+  `metrics.updated` at zero for a call the provider charged for. A budget that skips refused
+  calls is not a bound. Bound at the seam rather than per key, so the next wire key added to
+  either reader cannot repeat it; the lenient read is unchanged, so a body whose `usage` is
+  *itself* the malformed key stamps nothing rather than replacing the failure being reported.
+  No wire, schema or protocol change — the stamp already existed and now covers the payloads it
+  was written for.
+
+### Fixed — the upstream a gateway relays is configurable, and attribution agrees with itself
+
+- **`GatewayModelAdapter.provider_name` is reachable from the builders that ship.** It landed
+  configurable only by hand-constructing the adapter: neither `monoid run`'s `_model_adapter` nor
+  the backend's `build_model_adapter` could set it, so every deployment took the reference default
+  and a gateway fronting a different upstream mislabelled its reasoning tag and its spans with no
+  way to say otherwise. Adds `monoid run --llm-gateway-provider`, `monoid backend serve
+  --llm-gateway-provider`, and the `RunnerBackend(llm_gateway_provider=...)` field, all reading one
+  sentinel (`none` = the protocol's "do not tag"). The backend's value is applied inside
+  `build_model_adapter`, so the adapter recovery rebuilds after a restart inherits it instead of
+  reverting to the default. Deliberately not a `ModelConfig` field: it describes the deployment's
+  transport, not the agent, and that dataclass feeds `config_hash`.
+- **Agent Studio no longer attributes offline runs to OpenAI.** The relayed provider is decided at
+  the same site that decides the bundled gateway's upstream, so the offline echo model and any
+  injected provider factory tag nothing, while the `openai` deployment still reports `"openai"`.
+- **`OtelEventSink` stopped giving two answers for one call.** Its receipt-derived span read the
+  answering adapter's `provider_name`; its event-driven chat span read `run.started`'s
+  `model_provider`, filled from the raw `ModelConfig.provider` — so through the gateway the same
+  class reported the upstream in one configuration and the transport in another, and the
+  zero-argument form the docs teach was the disagreeing one. `run.started` now reports the provider
+  that actually serves the run (resolved by `resolved_provider_name(adapter, config)`, shared with
+  the model-stream context). No schema change; the transport stays recorded verbatim on
+  `manifest.json`.
+- **`ProviderNamedModelAdapter.provider_name` is typed `str | None`**, matching the shipped
+  `GatewayModelAdapter` field and the protocol's own documented "do not tag" sense.
+
+### Fixed — the request stops paying for reasoning the provider already discards
+
+- **Historical reasoning blocks are pruned from the wire.** The loop appended a captured
+  reasoning block to every assistant message and pruned none, while the rule that decides
+  whether a block is *replayable* lives in the OpenAI adapter: replay only inside the active
+  window — the messages after the last `user` message. A block outside that window is outside
+  forever, because the window only moves forward. Every user turn therefore added one dead
+  block and every later request re-sent all of them: on a four-user-turn conversation, ~97% of
+  the request's message bytes were payload the upstream provably throws away, growing
+  O(user_turns × payload) and paid twice on the gateway route. Requests are now built from a
+  wire copy with the key dropped from every message before the window start. What the provider
+  sees is unchanged and pinned as such — outside the window the adapter already reconstructed
+  those turns from `content`/`tool_calls`, and the model-identity scan reads only the window, so
+  a pruned log yields a byte-identical payload. `state.messages` and the checkpoint are
+  untouched: the durable record keeps every block verbatim. The window rule now exists once, in
+  `providers/_common.reasoning_replay_window_start`, read by both the adapter that decides what
+  to replay and the kernel that decides what to send. `prompt_digest` identifies the
+  conversation the model actually saw and so is taken over the pruned request.
+
+### Changed — the reasoning artifact array is documented as what it is
+
+- **Not opaque, and the redaction policy has to know.** The `reasoning` array was documented as
+  "already provider-encrypted, never interpreted". That holds for one of the three item types it
+  carries: the capture is the provider's verbatim output subsequence — reasoning items **plus**
+  the `message`/`function_call` items paired with them, because the provider validates that
+  adjacency on replay. A `message` entry is the model's plaintext answer and a `function_call`
+  entry is plaintext arguments, duplicating what `final_text`/`tool_calls` carry on the same
+  envelope. Anything that logs, previews, or truncates this value **must treat it as model
+  content**, or a surface that bounds `final_text` and dumps `reasoning` raw has bounded
+  nothing. It also roughly doubles a small body when populated. Docs and docstrings only.
+- **`reasoning` skew fails open on *absence*, not on malformed values.** A present value must be
+  an array of objects; a malformed one is refused non-retryably as `gateway_bad_response` by
+  both readers. One skew case worth naming: the same protocol uses `reasoning` on the *request*
+  body for the reasoning *config object*, so a third-party gateway echoing request keys back
+  answers an array-valued key with an object and trips that refusal.
+
+### Added — the provider-native reasoning round-trip survives the gateway hop
+
+- **`reasoning` joins the LLM gateway success envelope, on both transports.** The kernel captures
+  a provider's native reasoning artifacts off a turn (`ModelTurn.reasoning`, carrying OpenAI's
+  `encrypted_content`) and replays them verbatim on the next by-value turn — the ZDR reasoning
+  round-trip DX-13a is built on. Through the gateway that loop was dead in the response
+  direction: the server wrote the items to neither the sync body nor the terminal
+  `turn_complete` frame, and neither client reader named the key, so a run routed through the
+  gateway captured nothing and therefore replayed nothing. (The request direction always worked:
+  `messages` ride by value and are forwarded verbatim to the upstream adapter.) The key is a
+  JSON array of the provider's own item objects, relayed untouched — this hop has no business
+  interpreting them, though only the reasoning-type entries are encrypted (see the redaction
+  note above) — written by one shared
+  server helper and read by one shared strict validator, so the two transports cannot come to
+  disagree about the shape or about how strictly they refuse a malformed one. It is
+  omit-when-empty and **response**-conditional: present only when the upstream produced
+  artifacts, so traffic that produces none keeps its exact previous wire shape, and an absent
+  key reads as "no artifacts" on both an older gateway and a non-reasoning upstream. Additive
+  under `llm-turn-result.v1`; no protocol identifier changed.
+- **`GatewayModelAdapter` declares the upstream provider it relays.** The wire alone did not
+  revive the feature: the loop tags captured artifacts only when the adapter names a provider,
+  and the gateway adapter named none — so the block was dropped one line after the reader
+  reconstructed it. The new `provider_name` field defaults to `"openai"` (the reference
+  gateway's own default upstream), takes the deployment's real upstream when a
+  `provider_adapter_factory` routes elsewhere, and accepts `None` for the protocol's documented
+  "do not tag". It names the *upstream* rather than the hop because a tagged block is replayed
+  only to a matching adapter and model.
+- **Observability through the gateway now attributes to the model, not the transport.** That
+  same attribute is what three surfaces probe an adapter for, so naming the upstream changes all
+  three at once, deliberately: OTel's `gen_ai.provider.name` on the `chat` span,
+  `ModelCallReceipt.provider_name` (previously `""` on this route), and the model-stream
+  context's `provider` (previously the config's string) now report the upstream instead of
+  falling back to `"gateway"`. The transport stays legible beside them as
+  `receipt.model.provider`. Using the existing seam is the point — a second attribute would give
+  the reasoning tag and the spans two truths to drift between.
+- **Known limit, by design: a stream that ends without a terminal frame carries no artifacts.**
+  Such a stream has no end-of-turn metadata channel at all — the same reason it carries no
+  `usage` and no turn handle — so the absence is tolerated as `()` rather than refused, and a run
+  continuing over that hop simply re-derives nothing to replay (the loop appends no reasoning
+  block for an empty tuple). Registered as a by-design carriage gap rather than papered over.
+  A fail-closed *proof* that reasoning was applied remains a separate open track.
+
 ### Fixed — a success the SDK re-sent stops reading as a clean first attempt
 
 - **`OpenAIModelAdapter` reports the SDK's own retries on its success paths too.** The retry

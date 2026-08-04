@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.wire_validation import (
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -37,6 +38,10 @@ _LOGGER = logging.getLogger("monoid_agent_kernel.backend.http")
 _STREAM_SENTINEL = object()
 # Frames buffered before a slow/disconnected client is deemed too slow and the run cancelled.
 _STREAM_HIGH_WATER = 2000
+# How much of an unread request body an ERROR response will drain before closing instead, and how
+# long it will wait for it. Both are far below the request-path limits on purpose: a refused
+# request has not earned the server's read budget, and every legitimate body on these routes is a
+# few KB of JSON already sitting in the socket by the time the error is written.
 
 
 def _drain_to_sentinel(q: queue.Queue, *, deadline_s: float = 15.0) -> None:
@@ -373,6 +378,9 @@ def make_backend_handler(
             return None
 
         def _read_json(self) -> dict[str, Any]:
+            # ``read_json_limited`` marks the body read for us now, on every path that leaves the
+            # socket empty -- including the one where the body was consumed and then failed to
+            # decode, which the hand-rolled marker here used to cover by marking unconditionally.
             return read_json_limited(self)
 
         def _parse_run_request(self, payload: dict[str, Any]) -> BackendRunRequest:
@@ -457,10 +465,21 @@ def make_backend_handler(
             frame = first
             while True:
                 try:
+                    # ``ensure_ascii=True`` here and NOT in ``_write_json`` below, because a line
+                    # is the whole framing on this route and the two ends disagree about what one
+                    # is. U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE
+                    # survive an ``ensure_ascii=False`` dump as themselves, and the line-splitting
+                    # readers clients use -- httpx's ``aiter_lines``, whose splitter is
+                    # ``str.splitlines`` -- break on all three. The client then parses a JSON
+                    # object that stops mid-string and reports a bad response for a run this
+                    # server produced, framed and already metered. Every ``delta`` frame is model
+                    # text and every ``result`` frame carries ``final_text``, so escaping them is
+                    # the frame writer's job, not the model's. The length-delimited body has no
+                    # such ambiguity and keeps its smaller encoding.
                     self.wfile.write(
                         b"data: "
                         + json.dumps(
-                            frame, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                            frame, ensure_ascii=True, separators=(",", ":"), allow_nan=False
                         ).encode("utf-8")
                         + b"\n\n"
                     )
@@ -552,6 +571,7 @@ def make_backend_handler(
                 )
 
         def _write_error(self, status: HTTPStatus, message: str) -> None:
+            drain_request_body(self)
             self._write_json({"error": message}, status=status)
 
         def _write_json(

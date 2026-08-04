@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from http import HTTPStatus
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -23,12 +24,14 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     TurnComplete,
     generation_support,
+    provider_usage_of,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
 from monoid_agent_kernel.providers.gateway import (
     GATEWAY_BAD_RESPONSE,
     GATEWAY_GENERATION_NOT_APPLIED,
+    GATEWAY_RATE_LIMITED,
     GatewayModelAdapter,
     _check_generation_applied,
     _chunk_from_event,
@@ -1111,3 +1114,489 @@ def test_a_two_hundred_error_envelope_carries_the_cost_too() -> None:
             }
         )
     assert getattr(raised.value, "provider_usage", None) == _BILLED
+
+
+# --- and every OTHER refusal off a billed success envelope --------------------------------
+#
+# The rule the malformed-echo test above states -- "a malformed value on a *billed* frame still
+# cost the tokens the same frame reports" -- was bound to the echo pair and to nothing else. A
+# 200 body or a terminal frame whose ``stop_reason``/``final_text``/``reasoning``/... is
+# malformed is refused by the same readers on the same billed payload, and every one of those
+# refusals escaped with an empty ``provider_usage``: the run's budget lost the call.
+
+
+def _billed_success_body(**overrides: object) -> dict:
+    """A complete, well-formed 200 success body that reports what the turn cost."""
+
+    body: dict = {
+        "protocol": "monoid.llm-turn-result.v1",
+        "turn_handle": "turn_1",
+        "final_text": "answered",
+        "tool_calls": [],
+        "usage": dict(_BILLED),
+        "stop_reason": "stop",
+        "provider_retried": False,
+    }
+    body.update(overrides)
+    return body
+
+
+def _billed_terminal_frame(**overrides: object) -> dict:
+    """The streamed twin of :func:`_billed_success_body`."""
+
+    frame: dict = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": dict(_BILLED),
+        "stop_reason": "stop",
+        "provider_retried": False,
+    }
+    frame.update(overrides)
+    return frame
+
+
+# One malformed value per key each reader validates on its success envelope, keyed by the key
+# it corrupts. The behavioral census in tests/test_carriage_conformance.py diffs the same table
+# against the pinned read sets, so a NEW wire key cannot repeat this miss silently.
+_SYNC_BODY_REFUSALS: dict[str, dict] = {
+    "reasoning": {"reasoning": "not-an-array"},
+    "stop_reason": {"stop_reason": 7},
+    "final_text": {"final_text": 7},
+    "response_id": {"response_id": 7},
+    "turn_handle": {"turn_handle": 7},
+    "tool_calls": {"tool_calls": {"not": "an array"}},
+    "retryable": {"retryable": "yes"},
+    "provider_retried": {"provider_retried": "yes"},
+}
+_TERMINAL_FRAME_REFUSALS: dict[str, dict] = {
+    "reasoning": {"reasoning": "not-an-array"},
+    "stop_reason": {"stop_reason": 7},
+    "turn_handle": {"turn_handle": 7},
+    "generation_applied": {"generation_applied": [1, 2]},
+    "provider_retried": {"provider_retried": "yes"},
+}
+
+
+@pytest.mark.parametrize("key", sorted(_SYNC_BODY_REFUSALS))
+def test_a_refused_success_body_still_reports_the_tokens_it_burned(key: str) -> None:
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(_billed_success_body(**_SYNC_BODY_REFUSALS[key]))
+    assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(refused.value) == _BILLED
+
+
+@pytest.mark.parametrize("key", sorted(_TERMINAL_FRAME_REFUSALS))
+def test_a_refused_terminal_frame_still_reports_the_tokens_it_burned(key: str) -> None:
+    with pytest.raises(ModelAdapterError) as refused:
+        _chunk_from_event(_billed_terminal_frame(**_TERMINAL_FRAME_REFUSALS[key]))
+    assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(refused.value) == _BILLED
+
+
+@pytest.mark.parametrize(
+    "usage, stamped",
+    [
+        ("not-a-mapping", {}),
+        ({"input_tokens": 120, "output_tokens": "many", "total_tokens": 460}, {}),
+    ],
+    ids=["unreadable", "partly-readable"],
+)
+def test_a_refusal_off_a_malformed_usage_invents_no_tokens(usage: object, stamped: dict) -> None:
+    """The counterweight, and the reason the stamp reads leniently rather than validating.
+
+    ``usage`` is the *source* of the stamp, so when it is the malformed key there is nothing
+    trustworthy to stamp: a second malformation must not replace the failure being reported,
+    and a count that cannot be read must not be invented. Whatever counts survive the filter
+    are the ones the payload actually stated.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    expected = dict(stamped)
+    if isinstance(usage, dict):
+        expected = {
+            name: value
+            for name, value in usage.items()
+            if type(value) is int and value >= 0
+        }
+
+    with pytest.raises(ModelAdapterError) as sync:
+        _parse_gateway_response(_billed_success_body(usage=usage))
+    assert sync.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(sync.value) == expected
+
+    with pytest.raises(ModelAdapterError) as streamed:
+        _chunk_from_event(_billed_terminal_frame(usage=usage))
+    assert streamed.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(streamed.value) == expected
+
+
+def test_a_refusal_off_an_envelope_that_cost_nothing_stays_costless() -> None:
+    """The other counterweight: a malformed body that never reported a cost invents none."""
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    body = _billed_success_body(stop_reason=7)
+    body.pop("usage")
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(body)
+    assert provider_usage_of(refused.value) == {}
+
+    frame = _billed_terminal_frame(stop_reason=7)
+    frame.pop("usage")
+    with pytest.raises(ModelAdapterError) as framed:
+        _chunk_from_event(frame)
+    assert provider_usage_of(framed.value) == {}
+
+
+# --- and every refusal off a billed ERROR envelope ----------------------------------------
+#
+# The two guarded regions above are the SUCCESS-shaped halves of two readers. The ERROR-shaped
+# readers -- the ``"error" in data`` branch between them, its stream-frame twin, and the non-200
+# body reader both transports land in -- each read their own per-key block BEFORE the stamp that
+# ends the branch, so a malformed ``retryable``/``http_status``/``error_code``/``error``/
+# ``config_recoverable`` on a payload that had already reported what the turn burned raised
+# ``gateway_bad_response`` carrying nothing. That is the shape most likely to report a cost at
+# all: an error envelope exists precisely because a call failed, and a call that failed *after*
+# the upstream generated is the case the whole rule was written for.
+#
+# One semantic, stated once and pinned on every reader: a malformed error envelope is a broken
+# gateway, so the refusal is a non-retryable ``gateway_bad_response`` whatever the envelope
+# claimed about retryability and whatever HTTP status it rode in on. The probes below use a
+# retryable 429 envelope so both halves of that sentence bite.
+
+
+def _billed_error_envelope(**overrides: object) -> dict:
+    """A well-formed error envelope carrying a real cost, as the shipped writer emits one."""
+
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body
+
+    body = _error_body(
+        HTTPStatus.TOO_MANY_REQUESTS,
+        "upstream refused after billing the turn",
+        error_code=GATEWAY_RATE_LIMITED,
+        retryable=True,
+        config_recoverable=False,
+        provider_retried=True,
+        usage=dict(_BILLED),
+    )
+    body.update(overrides)
+    return body
+
+
+def _refused_error_body(body: dict) -> ModelAdapterError:
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _parse_gateway_response(dict(body))
+    return caught.value
+
+
+def _refused_error_frame(body: dict) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        _chunk_from_event({"type": "error", **body})
+    return caught.value
+
+
+def _refused_status_body(body: dict) -> ModelAdapterError:
+    """R3 *returns* on the well-formed path; a malformed key makes it raise instead.
+
+    The status is the envelope's own 429, so this pin is also the retry decision: the raise
+    escapes past ``_should_retry`` at the call site, which is the documented choice -- the body,
+    not the status line, is the authority on whether another attempt can help.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    status = int(_billed_error_envelope()["http_status"])
+    with pytest.raises(ModelAdapterError) as caught:
+        _error_from_status_body(status, json.dumps(body))
+    return caught.value
+
+
+_ERROR_ENVELOPE_READERS = {
+    "_parse_gateway_response": _refused_error_body,
+    "_chunk_from_event": _refused_error_frame,
+    "_error_from_status_body": _refused_status_body,
+}
+
+# One malformed value per key each reader validates on the error envelope. ``provider_retried``
+# is on R3 alone: the other two read it *before* the branch, where the round-one fix already
+# stamps it. The behavioral census in tests/test_carriage_conformance.py diffs this same table
+# against each reader's AST-derived error-branch read set.
+_ERROR_ENVELOPE_REFUSALS: dict[str, dict[str, dict]] = {
+    "_parse_gateway_response": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "_chunk_from_event": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "_error_from_status_body": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "provider_retried": {"provider_retried": "yes"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "reader, key",
+    sorted(
+        (reader, key)
+        for reader, probes in _ERROR_ENVELOPE_REFUSALS.items()
+        for key in probes
+    ),
+)
+def test_a_refused_error_envelope_still_reports_the_tokens_it_burned(
+    reader: str, key: str
+) -> None:
+    envelope = _billed_error_envelope(**_ERROR_ENVELOPE_REFUSALS[reader][key])
+    refused = _ERROR_ENVELOPE_READERS[reader](envelope)
+
+    assert refused.provider_error_code == GATEWAY_BAD_RESPONSE, {
+        "reader": reader,
+        "malformed_key": key,
+        "hint": "the probe must make THIS key the refusal, not the envelope's own error",
+    }
+    # One rule with the success readers: a malformed envelope is a broken gateway, so the
+    # refusal is not retryable even though this envelope claimed retryable=True on a 429.
+    assert refused.retryable is False
+    assert provider_usage_of(refused) == _BILLED, {
+        "reader": reader,
+        "malformed_key": key,
+        "carried_by_the_refusal": provider_usage_of(refused),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
+def test_a_well_formed_error_envelope_still_reports_its_own_classification() -> None:
+    """The counterweight the probes need: without a malformed key the envelope's OWN error
+    comes back, so ``gateway_bad_response`` above really does mean "this key was refused".
+
+    R3 is spelled separately because it *returns* its failure rather than raising it -- which
+    is exactly why the raise it grows on a malformed key escapes past ``_should_retry``.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+
+    envelope = _billed_error_envelope()
+    outcomes = [
+        _refused_error_body(envelope),
+        _refused_error_frame(envelope),
+        _error_from_status_body(int(envelope["http_status"]), json.dumps(envelope)),
+    ]
+    for outcome in outcomes:
+        assert outcome.provider_error_code == GATEWAY_RATE_LIMITED
+        assert outcome.retryable is True
+        assert provider_usage_of(outcome) == _BILLED
+
+
+def test_a_malformed_error_envelope_that_cost_nothing_stays_costless() -> None:
+    """The lenient-read counterweight, on the error shape: no reported cost, none invented."""
+
+    for reader, probes in _ERROR_ENVELOPE_REFUSALS.items():
+        envelope = _billed_error_envelope(**probes["error_code"])
+        envelope.pop("usage")
+        refused = _ERROR_ENVELOPE_READERS[reader](envelope)
+        assert provider_usage_of(refused) == {}, reader
+
+
+def test_a_malformed_error_envelope_from_an_inner_hop_reaches_the_tenant_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two-hop chain, end to end: the stamp is what makes the outer ledger move.
+
+    The inner gateway answers 200 with an *error* envelope whose ``error_code`` is malformed and
+    whose ``usage`` is valid. The outer client's body reader refuses it, and the reference
+    gateway's failure meter reads ``provider_usage_of`` off that refusal -- so an unstamped
+    refusal charged the tenant nothing for a turn the upstream generated and billed.
+    """
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    envelope = _billed_error_envelope(error_code=7)
+    assert envelope["usage"] == _BILLED
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(json.dumps(envelope).encode("utf-8")),
+    )
+    manager = _token_manager()
+    inner = ModelConfig(gateway_url="http://inner.test")
+    backend = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: GatewayModelAdapter(config=inner),
+    )
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+    assert refused.value.provider_error_code == GATEWAY_BAD_RESPONSE
+    assert provider_usage_of(refused.value) == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_meter() -> None:
+    """The SOURCE reader's end of the same chain, driven through the shipped gateway.
+
+    An upstream that hands its provider's billed body to the OpenAI reader and has it refused --
+    a model emitting non-JSON function-call arguments, which is ordinary. Every carrier behind
+    that refusal reads the same stamp: ``_error_body`` writes ``usage=provider_usage_of(exc)``
+    and the gateway's failure meter charges the tenant off it, so an unstamped refusal made a
+    paid turn free on both at once.
+    """
+
+    from monoid_agent_kernel.providers.openai import _parse_response
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body, _model_error_status
+
+    billed_body = {
+        "id": "resp_1",
+        "status": "completed",
+        "usage": dict(_BILLED),
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "fs_read",
+                "arguments": "{not json",
+            }
+        ],
+    }
+
+    class _RefusingUpstream:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return _parse_response(dict(billed_body))
+
+    manager = _token_manager()
+    backend = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: _RefusingUpstream(),
+    )
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+    assert provider_usage_of(refused.value) == _BILLED
+
+    envelope = _error_body(
+        _model_error_status(refused.value),
+        str(refused.value),
+        error_code=refused.value.provider_error_code,
+        retryable=refused.value.retryable,
+        config_recoverable=refused.value.config_recoverable,
+        provider_retried=refused.value.provider_retried,
+        usage=provider_usage_of(refused.value),
+    )
+    assert envelope["usage"] == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+# --- and the refusals that are not ``ModelAdapterError`` at all ---------------------------
+#
+# The source reader's seam catches ``Exception`` because the mapping refuses in more than one
+# type: ``normalize_usage`` says "malformed usage" with a raw ``ValueError``. So does every
+# refusal in the streamed twin's terminal region. The stamp rode those exceptions from the day
+# it shipped -- and NO consumer on the gateway route would read it, because the tenant meter and
+# both error writers were gated on ``ModelAdapterError``. A stamp nothing reads is not a fix.
+
+
+def _billed_body_with_unreadable_usage_details() -> dict:
+    """A billed Responses body whose ``usage`` detail block is malformed.
+
+    The one shape in the source reader's region that refuses with a raw ``ValueError``: the
+    counts themselves are perfectly readable (the lenient reader takes them), and it is the
+    nested ``input_tokens_details`` object that ``normalize_usage`` rejects.
+    """
+
+    return {
+        "id": "resp_1",
+        "status": "completed",
+        "usage": {**_BILLED, "input_tokens_details": "nope"},
+        "output": [],
+    }
+
+
+def _refusing_upstream_backend() -> tuple[LlmGatewayBackend, TokenManager]:
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    class _RawRefusal:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return _parse_response(_billed_body_with_unreadable_usage_details())
+
+    manager = _token_manager()
+    return (
+        LlmGatewayBackend(
+            token_manager=manager,
+            provider_adapter_factory=lambda _claims, _config: _RawRefusal(),
+        ),
+        manager,
+    )
+
+
+def test_a_raw_refusal_off_a_billed_body_still_charges_the_tenant() -> None:
+    backend, manager = _refusing_upstream_backend()
+
+    with pytest.raises(ValueError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+
+    assert not isinstance(refused.value, ModelAdapterError), {
+        "hint": "this probe is only about the RAW refusal; a classified one is already metered",
+    }
+    assert provider_usage_of(refused.value) == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460, {
+        "tenant_ledger": backend.tenant_usage("tenant_a"),
+        "hint": "the failure meter reads the stamp off whatever escaped, not off one type",
+    }
+
+
+def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
+    """Through the shipped HTTP handler, because the arm it lands in is not the classified one.
+
+    A raw ``ValueError`` is a 400 ``gateway_bad_request`` here, and the client behind it reads
+    ``usage`` off the body it gets -- so an arm that omits the key is a hop that reports zero for
+    a turn the upstream billed, exactly like the classified arm did before it carried one.
+    """
+
+    from support.http import serving
+
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+
+    backend, manager = _refusing_upstream_backend()
+    server = create_llm_gateway_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = Request(
+            f"{base_url}/internal/llm/turns",
+            data=json.dumps(_turn_payload()).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_llm_token(manager)}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as answered:
+            urlopen(request, timeout=10)
+        body = json.loads(answered.value.read().decode("utf-8"))
+
+    assert answered.value.code == 400
+    assert body["usage"] == _BILLED, {
+        "wire_body": body,
+        "hint": "the unclassified arms of the error writers carry the stamp like the "
+        "classified one, or the hop loses what the call cost",
+    }
+    # And the client rebuilds it: the stamp survives the hop rather than stopping at the wire.
+    rebuilt = _error_from_status_body(400, json.dumps(body))
+    assert provider_usage_of(rebuilt) == _BILLED

@@ -184,13 +184,26 @@ class LiveModelStreamFrame:
         return normalized
 
     def to_sse(self) -> bytes:
-        """Serialize this frame for a passive SSE response."""
+        """Serialize this frame for a passive SSE response.
+
+        ``ensure_ascii=True``, unlike :func:`_frame_size` below and unlike ``to_json``'s other
+        readers. A line is the whole framing on the wire and the two ends disagree about what one
+        is: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE survive an
+        ``ensure_ascii=False`` dump as themselves, and the line-splitting readers clients use --
+        httpx's ``aiter_lines``, whose splitter is ``str.splitlines`` -- break on all three. This
+        channel is model content by definition: every ``delta`` carries raw provider text and a
+        ``closed`` frame carries ``final_text``, so a separator arrives here as soon as a model
+        emits one, splitting the frame mid-string and taking its ``id:`` with it -- which is the
+        cursor a reconnect resumes from. Escaping is the frame writer's job, not the model's.
+        :func:`_frame_size` keeps the smaller encoding on purpose: it bounds what the in-process
+        ring retains, not what any socket is handed.
+        """
 
         if self.kind == "heartbeat":
             return b": keep-alive\n\n"
         payload = json.dumps(
             self.to_json(),
-            ensure_ascii=False,
+            ensure_ascii=True,
             separators=(",", ":"),
             allow_nan=False,
         )

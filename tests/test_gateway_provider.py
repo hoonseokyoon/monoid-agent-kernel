@@ -1048,14 +1048,23 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
     carrying nothing at all, decided by which field of it was malformed. Each is driven directly:
     accepting the parameter and dropping it on the floor would satisfy a signature census and
     fix nothing.
+
+    Nine now, not six. Every validator that joined the wire afterwards inherited the same
+    obligation -- ``_gateway_reasoning_items`` with X-3's reasoning hop, and the two echo
+    validators, which were the pair the value-validator census turned up unregistered. The list
+    the conformance suite pins against is derived from "does it raise", so a tenth arrives here as
+    a failing census rather than as a quiet omission.
     """
     from monoid_agent_kernel.providers.gateway import (
         _exact_gateway_bool,
         _exact_gateway_int,
         _gateway_fragment_string,
+        _gateway_reasoning_items,
         _gateway_string,
         _gateway_usage,
         _portable_gateway_payload,
+        _validated_generation_echo,
+        _validated_schema_echo,
     )
 
     raisers = {
@@ -1083,6 +1092,14 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
         "_portable_gateway_payload": lambda: _portable_gateway_payload(
             {1: "one"}, context="c", http_status=400
         ),
+        # An array of objects is the only shape the replay path can hand back to a provider.
+        "_gateway_reasoning_items": lambda: _gateway_reasoning_items(
+            ["not an object"], context="c", http_status=400
+        ),
+        "_validated_generation_echo": lambda: _validated_generation_echo(
+            "not an object", http_status=400
+        ),
+        "_validated_schema_echo": lambda: _validated_schema_echo("not a bool", http_status=400),
     }
 
     for name, raiser in raisers.items():

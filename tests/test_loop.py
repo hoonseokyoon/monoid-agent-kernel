@@ -2452,6 +2452,50 @@ def test_a_refused_turns_tokens_still_reach_the_run_budget(tmp_path: Path) -> No
         loop.close()
 
 
+def test_a_refused_gateway_body_puts_its_billed_tokens_in_the_run_budget(tmp_path: Path) -> None:
+    """The same rule end to end, off a real wire rather than a hand-stamped exception.
+
+    Two halves, and a pin on either one alone passes while the other is missing: the gateway
+    reader reads the cost off the payload it is refusing (``providers/gateway.py``), and the
+    loop adds it to ``total_usage`` (the arm above). The refusal here is produced by driving the
+    shipped parser over a billed 200 body with one malformed key -- the shape a gateway relaying
+    a reasoning-capable upstream actually produces -- so a stamp that stops covering that key
+    shows up as a run whose budget forgot a paid call.
+    """
+
+    from monoid_agent_kernel.providers.gateway import _parse_gateway_response
+
+    billed = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_gateway_response(
+            {
+                "protocol": "monoid.llm-turn-result.v1",
+                "turn_handle": "turn_1",
+                "final_text": "answered",
+                "tool_calls": [],
+                "usage": dict(billed),
+                "stop_reason": "stop",
+                "provider_retried": False,
+                "reasoning": "not-an-array",
+            }
+        )
+    assert refused.value.provider_error_code == "gateway_bad_response"
+
+    adapter = _ScriptedAdapter([refused.value])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        # A malformed body carries no HTTP status and no config remedy, so this park is the
+        # terminal one rather than ``turn_failed`` -- and the cost has to survive that arm too,
+        # which is the arm a gateway's own malformed answer actually lands on.
+        assert loop.run_until_suspended("hello").reason == "terminal"
+        assert dict(loop._session.state.total_usage) == billed  # type: ignore[union-attr]
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 460
+    finally:
+        loop.close()
+
+
 def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
     """The counterweight: an ordinary provider failure produced nothing and must cost
     nothing, or every failed call would inflate the budget."""
@@ -2472,3 +2516,140 @@ def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
         }
     finally:
         loop.close()
+
+
+# --- the wire prunes reasoning the provider can no longer replay ------------------------------
+
+_ITEMS_A: tuple[dict, ...] = (
+    {"type": "reasoning", "id": "rs_a", "summary": [], "encrypted_content": "enc_a"},
+    {"type": "function_call", "call_id": "c1", "name": "fs_write", "arguments": "{}"},
+)
+_ITEMS_B: tuple[dict, ...] = (
+    {"type": "reasoning", "id": "rs_b", "summary": [], "encrypted_content": "enc_b"},
+    {"type": "message", "id": "msg_b", "content": [{"type": "output_text", "text": "done"}]},
+)
+
+
+class _ReasoningWireAdapter:
+    """Records the wire ``messages`` of every request and tags its turns like OpenAI's adapter.
+
+    ``supports_multimodal`` is an instance attribute so one script can drive both wire-build
+    branches: the plain copy and the media-resolving one that also enforces the byte cap.
+    """
+
+    provider_name = "openai"
+
+    def __init__(self, turns: list[ModelTurn], *, multimodal: bool = False) -> None:
+        self.turns = list(turns)
+        self.requests: list = []
+        self.supports_multimodal = multimodal
+
+    def next_turn(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        return self.turns.pop(0)
+
+
+def _reasoning_wire_script() -> list[ModelTurn]:
+    """One tool-loop turn inside the first user's window, then a second user turn."""
+    return [
+        ModelTurn(
+            response_id="r1",
+            tool_calls=(fake_tool_call("fs_write", {"path": "A.md", "content": "x"}, "c1"),),
+            reasoning=_ITEMS_A,
+        ),
+        ModelTurn(response_id="r2", final_text="done", reasoning=_ITEMS_B, stop_reason="stop"),
+        ModelTurn(response_id="r3", final_text="again", stop_reason="stop"),
+    ]
+
+
+def _assistants(messages) -> list[dict]:  # noqa: ANN001
+    return [m for m in (messages or ()) if m.get("role") == "assistant"]
+
+
+@pytest.mark.parametrize("multimodal", (False, True))
+def test_the_wire_keeps_in_window_reasoning_and_drops_the_historical_kind(
+    tmp_path: Path, multimodal: bool
+) -> None:
+    """Replay is only possible inside the active window, so only that is worth sending.
+
+    The upstream rule (``_reasoning_replay_flags``) replays a captured block only while it sits
+    after the last user message; once a new user message lands, that block is outside the window
+    forever, because the window only moves forward. The loop appended one to every assistant
+    turn and pruned none, so a long conversation re-sent every dead block on every request —
+    bytes that count against the wire cap and the provider's body limit and buy nothing.
+    """
+
+    adapter = _ReasoningWireAdapter(_reasoning_wire_script(), multimodal=multimodal)
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter, "fs.write")
+    loop.open()
+    try:
+        assert loop.run_until_suspended("u1").reason == "settled"
+        assert loop.run_until_suspended("u2").reason == "settled"
+        durable = list(loop._session.state.messages)  # type: ignore[union-attr]
+    finally:
+        loop.close()
+
+    assert len(adapter.requests) == 3
+    # Request 2 is still inside the first user's window: the block must ride, verbatim.
+    in_window = _assistants(adapter.requests[1].messages)
+    assert in_window and in_window[0]["reasoning"]["items"] == [dict(i) for i in _ITEMS_A]
+    assert in_window[0]["reasoning"]["provider"] == "openai"
+
+    # Request 3 follows a new user message: every earlier block is unreachable → not on the wire.
+    after_new_user = adapter.requests[2].messages
+    roles = [m.get("role") for m in after_new_user]
+    assert roles == ["user", "assistant", "tool", "assistant", "user"]
+    assert all("reasoning" not in m for m in _assistants(after_new_user))
+    wire_json = json.dumps(list(after_new_user))
+    assert "enc_a" not in wire_json and "enc_b" not in wire_json
+
+    # The durable log is the record and keeps everything, verbatim — the prune copies, never mutates.
+    durable_assistants = [m for m in durable if m.get("role") == "assistant"]
+    assert [a["reasoning"]["items"] for a in durable_assistants[:2]] == [
+        [dict(item) for item in _ITEMS_A],
+        [dict(item) for item in _ITEMS_B],
+    ]
+    # Everything except that one key is the same message the log holds.
+    for wire, logged in zip(_assistants(after_new_user), durable_assistants):
+        assert wire == {k: v for k, v in logged.items() if k != "reasoning"}
+    assert len(wire_json) < len(json.dumps(durable))
+
+
+def test_the_reasoning_the_wire_carries_stops_growing_with_the_conversation(
+    tmp_path: Path,
+) -> None:
+    """The cost shape, not just the single-hop behaviour.
+
+    The defect was O(user_turns): every settled turn added a block and none ever left, so
+    request N re-sent N-1 blocks the upstream discards. Bounded to the active window, the
+    reasoning the wire carries is O(1) in the number of user turns — here every turn settles
+    immediately, so each fresh window is empty and the wire carries none at all while the
+    durable log accumulates all three.
+    """
+
+    fat = "z" * 2000
+    script = [
+        ModelTurn(
+            response_id=f"r{n}",
+            final_text=f"a{n}",
+            reasoning=({"type": "reasoning", "id": f"rs_{n}", "encrypted_content": f"{fat}{n}"},),
+            stop_reason="stop",
+        )
+        for n in range(3)
+    ]
+    adapter = _ReasoningWireAdapter(script, multimodal=True)
+    loop, _sink, _run_root = _loop_with(tmp_path, adapter, "fs.write")
+    loop.open()
+    try:
+        for turn in range(3):
+            assert loop.run_until_suspended(f"u{turn}").reason == "settled"
+        durable = list(loop._session.state.messages)  # type: ignore[union-attr]
+    finally:
+        loop.close()
+
+    assert len(adapter.requests) == 3
+    for request in adapter.requests:
+        assert fat not in json.dumps(list(request.messages or ()))
+    assert len([m for m in durable if "reasoning" in m]) == 3
+    # The last request sees the longest log; its reasoning payload is still nothing.
+    assert all("reasoning" not in m for m in (adapter.requests[-1].messages or ()))

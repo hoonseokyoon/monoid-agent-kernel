@@ -566,3 +566,241 @@ def test_d_unreadable_success_evidence_reads_as_no_retry_and_never_raises(
     _stub_async_openai(monkeypatch, _FakeAsyncStream(_stream_events()))
     chunks = _drain(_adapter())
     assert [chunk.provider_retried for chunk in chunks] == [False] * 5
+
+
+# --- a refused body was still generated and billed --------------------------------------
+#
+# The SOURCE reader. Everything downstream -- the gateway's error envelope, the tenant meter,
+# the outer client's receipt -- can only carry a cost this reader recorded, and it recorded
+# none: ``_parse_response`` refuses ~a dozen malformed shapes on a body that carries a valid
+# ``usage``, and every one of those refusals escaped empty. A model emitting non-JSON
+# function-call arguments is ordinary, not exotic, so this is the common case of a paid turn
+# disappearing from the ledger.
+
+
+_BILLED_RESPONSE_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+
+def _billed_response_body(**overrides: Any) -> dict[str, Any]:
+    """A complete, well-formed Responses body that reports what the turn cost."""
+
+    body: dict[str, Any] = {
+        "id": "resp_1",
+        "status": "completed",
+        "usage": dict(_BILLED_RESPONSE_USAGE),
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "id": "fc_1",
+                "name": "fs_read",
+                "arguments": '{"path": "a.md"}',
+            },
+            {"type": "message", "content": [{"type": "output_text", "text": "ok"}]},
+        ],
+    }
+    body.update(overrides)
+    return body
+
+
+def _call(**overrides: Any) -> dict[str, Any]:
+    item = {
+        "type": "function_call",
+        "call_id": "c1",
+        "id": "fc_1",
+        "name": "fs_read",
+        "arguments": "{}",
+    }
+    item.update(overrides)
+    return {"output": [item]}
+
+
+def _message(content: Any) -> dict[str, Any]:
+    return {"output": [{"type": "message", "content": content}]}
+
+
+# One malformed shape per raise site the body reader has, named by what it corrupts.
+_BILLED_BODY_REFUSALS: dict[str, dict[str, Any]] = {
+    "output-not-an-array": {"output": "nope"},
+    "output-item-not-an-object": {"output": ["nope"]},
+    "arguments-not-json": _call(arguments="{not json"),
+    "arguments-not-an-object": _call(arguments="[1, 2]"),
+    "arguments-wrong-type": _call(arguments=7),
+    "call-id-missing": _call(call_id=None, id=None),
+    "call-id-not-a-string": _call(call_id=7),
+    "name-missing": _call(name=None),
+    "name-not-a-string": _call(name=7),
+    "message-content-not-an-array": _message("nope"),
+    "message-content-item-not-an-object": _message(["nope"]),
+    "output-text-not-a-string": _message([{"type": "output_text", "text": 7}]),
+    "response-id-not-a-string": {"id": 7},
+    # The one raise site in this region that is NOT a ``ModelAdapterError``: the counts
+    # themselves are readable (the lenient reader takes them) and the nested detail block is
+    # what ``normalize_usage`` rejects, with a raw ``ValueError``. It is why the stamp's seam
+    # catches ``Exception``, and -- until the gateway's meter and error writers were widened to
+    # match -- it was the shape whose stamp no consumer on that route would read.
+    "usage-details-not-an-object": {
+        "usage": {**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    },
+}
+
+# The refusals above are ``ModelAdapterError`` unless named here. Recorded per shape rather
+# than widened for all of them: "the reader refuses in the classified type" is a pin worth
+# keeping on the twelve that do, and the exception to it is worth naming.
+_BILLED_BODY_REFUSAL_TYPES: dict[str, type[BaseException]] = {
+    "usage-details-not-an-object": ValueError,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_BILLED_BODY_REFUSALS))
+def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape: str) -> None:
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    body = _billed_response_body(**_BILLED_BODY_REFUSALS[shape])
+    with pytest.raises(_BILLED_BODY_REFUSAL_TYPES.get(shape, ModelAdapterError)) as refused:
+        _parse_response(body)
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
+        "malformed_shape": shape,
+        "carried_by_the_refusal": provider_usage_of(refused.value),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
+def test_a_refusal_off_a_response_body_that_cost_nothing_stays_costless() -> None:
+    """The counterweight: no reported cost, none invented -- and a malformed ``usage`` is
+    itself unreadable rather than a second failure raised over the first."""
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    silent = _billed_response_body(**_BILLED_BODY_REFUSALS["arguments-not-json"])
+    silent.pop("usage")
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_response(silent)
+    assert provider_usage_of(refused.value) == {}
+
+    unreadable = _billed_response_body(**_BILLED_BODY_REFUSALS["arguments-not-json"])
+    unreadable["usage"] = "not-a-mapping"
+    with pytest.raises(ModelAdapterError) as second:
+        _parse_response(unreadable)
+    assert second.value.provider_error_code == refused.value.provider_error_code
+    assert provider_usage_of(second.value) == {}
+
+
+def test_a_well_formed_billed_body_parses_exactly_as_it_did() -> None:
+    """The stamp is a failure-path addition only: the success path is byte-identical."""
+
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    turn = _parse_response(_billed_response_body(), provider_retried=True)
+    assert turn.response_id == "resp_1"
+    assert turn.final_text == "ok"
+    assert turn.usage == _BILLED_RESPONSE_USAGE
+    assert [(call.id, call.name, call.arguments) for call in turn.tool_calls] == [
+        ("c1", "fs_read", {"path": "a.md"})
+    ]
+    assert turn.stop_reason == "tool_calls"
+    assert turn.provider_retried is True
+
+
+# The streamed twin. The terminal chunk is built from the final response payload alone, outside
+# the classifier block, and its refusals are the same act on the same billed payload.
+#
+# ``tool_calls_present`` short-circuits the stop-reason walk, so every probe below drops the
+# function_call the well-formed body carries -- otherwise the malformed key is never reached and
+# the probe proves nothing.
+_BILLED_TERMINAL_REFUSALS: dict[str, dict[str, Any]] = {
+    "output-not-an-array": {"output": "nope"},
+    "malformed-incomplete-details": {
+        "status": "incomplete",
+        "incomplete_details": "nope",
+        "output": [],
+    },
+    "message-content-not-an-array": {"output": [{"type": "message", "content": "nope"}]},
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_BILLED_TERMINAL_REFUSALS))
+def test_a_refused_billed_terminal_payload_still_reports_the_tokens_it_burned(
+    shape: str,
+) -> None:
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(**_BILLED_TERMINAL_REFUSALS[shape])
+    with pytest.raises(Exception) as refused:
+        _terminal_chunk(payload, provider_retried=False)
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
+        "malformed_shape": shape,
+        "hint": "the stream's end-of-turn payload is billed exactly like the one-shot body",
+    }
+
+
+def test_a_billed_terminal_payload_with_a_malformed_id_still_reports_its_cost() -> None:
+    """The refusal the INGRESS NORMALIZER raises must carry the payload's cost too.
+
+    ``TurnComplete`` validates nothing, so a non-string ``id`` used to leave ``_terminal_chunk``
+    successfully and be refused one step later by ``normalize_model_stream_chunk`` -- outside the
+    guard, so the refusal carried no usage and the receipt, the run budget and the gateway meter
+    all recorded zero for a billed turn. The chunk is normalized inside the guarded region now,
+    so the first validation of every field happens where the stamp is.
+    """
+
+    from monoid_agent_kernel.providers.base import (
+        ModelAdapterError,
+        normalize_model_stream_chunk,
+        provider_usage_of,
+    )
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(id=123)
+    with pytest.raises(ModelAdapterError) as refused:
+        normalize_model_stream_chunk(_terminal_chunk(payload, provider_retried=False))
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
+        "hint": "the ingress normalizer's rejection is the same act on the same billed payload",
+    }
+
+
+def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_counts() -> None:
+    """The streamed twin of ``usage-details-not-an-object``, kept out of the table above.
+
+    Every probe in that table drops the ``function_call`` so the stop-reason walk is reached;
+    this shape refuses earlier -- ``normalize_usage`` runs while the ``TurnComplete`` arguments
+    are being evaluated -- so it does not share the table's precondition and is spelled here
+    instead of quietly making that comment false.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(
+        usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    )
+    with pytest.raises(ValueError) as refused:
+        _terminal_chunk(payload, provider_retried=False)
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -> None:
+    """The lenient read on the streamed twin: ``usage`` is the stamp's own source, so when IT
+    is malformed the refusal carries nothing rather than raising a second failure."""
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    with pytest.raises(ValueError) as refused:
+        _terminal_chunk(_billed_response_body(usage="nope"), provider_retried=False)
+    assert provider_usage_of(refused.value) == {}
+
+
+def test_a_well_formed_terminal_payload_builds_the_chunk_it_always_did() -> None:
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    chunk = _terminal_chunk(_billed_response_body(), provider_retried=True)
+    assert isinstance(chunk, TurnComplete)
+    assert chunk.response_id == "resp_1"
+    assert chunk.usage == _BILLED_RESPONSE_USAGE
+    assert chunk.stop_reason == "tool_calls"
+    assert chunk.provider_retried is True
