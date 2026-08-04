@@ -2496,6 +2496,44 @@ def test_a_refused_gateway_body_puts_its_billed_tokens_in_the_run_budget(tmp_pat
         loop.close()
 
 
+def test_a_refused_openai_body_puts_its_billed_tokens_in_the_run_budget(tmp_path: Path) -> None:
+    """The SOURCE reader's end of the rule above, through the loop's own accumulation arm.
+
+    Before the refusal was classified, ``_parse_response`` refused this shape with a raw
+    ``ValueError``: the stamp rode it out of the adapter, but the loop's blanket
+    ``except Exception`` arm re-wrapped it in a bare ``ModelAdapterError`` and nothing read the
+    original's ``provider_usage`` — so the run budget, the transcript and the metrics event all
+    recorded zero for a call the provider billed, while only the receipt (getattr-based)
+    carried the cost. Classified, the refusal takes the loop's ``ModelAdapterError`` arm and
+    the billed tokens reach ``total_usage``.
+    """
+
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    billed = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_response(
+            {
+                "id": "resp_1",
+                "status": "completed",
+                "usage": {**billed, "input_tokens_details": "nope"},
+                "output": [],
+            }
+        )
+    assert refused.value.provider_error_code == "openai_bad_response"
+
+    adapter = _ScriptedAdapter([refused.value])
+    loop, sink, _run_root = _loop_with(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "terminal"
+        assert dict(loop._session.state.total_usage) == billed  # type: ignore[union-attr]
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 460
+    finally:
+        loop.close()
+
+
 def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
     """The counterweight: an ordinary provider failure produced nothing and must cost
     nothing, or every failed call would inflate the budget."""

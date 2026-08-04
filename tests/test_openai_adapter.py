@@ -634,21 +634,19 @@ _BILLED_BODY_REFUSALS: dict[str, dict[str, Any]] = {
     "message-content-item-not-an-object": _message(["nope"]),
     "output-text-not-a-string": _message([{"type": "output_text", "text": 7}]),
     "response-id-not-a-string": {"id": 7},
-    # The one raise site in this region that is NOT a ``ModelAdapterError``: the counts
-    # themselves are readable (the lenient reader takes them) and the nested detail block is
-    # what ``normalize_usage`` rejects, with a raw ``ValueError``. It is why the stamp's seam
-    # catches ``Exception``, and -- until the gateway's meter and error writers were widened to
-    # match -- it was the shape whose stamp no consumer on that route would read.
+    # These two shapes used to refuse RAW (``normalize_usage``'s ``ValueError`` on the nested
+    # detail block; ``_stop_reason_from_response``'s ``AttributeError`` on a non-dict
+    # ``incomplete_details``) -- the classifying seam now hands every one of them out as the
+    # same ``openai_bad_response``, so the parametrized pin below holds one type for the whole
+    # table instead of naming exceptions to it.
     "usage-details-not-an-object": {
         "usage": {**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
     },
-}
-
-# The refusals above are ``ModelAdapterError`` unless named here. Recorded per shape rather
-# than widened for all of them: "the reader refuses in the classified type" is a pin worth
-# keeping on the twelve that do, and the exception to it is worth naming.
-_BILLED_BODY_REFUSAL_TYPES: dict[str, type[BaseException]] = {
-    "usage-details-not-an-object": ValueError,
+    "malformed-incomplete-details": {
+        "status": "incomplete",
+        "incomplete_details": "nope",
+        "output": [],
+    },
 }
 
 
@@ -658,7 +656,7 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
     from monoid_agent_kernel.providers.openai import _parse_response
 
     body = _billed_response_body(**_BILLED_BODY_REFUSALS[shape])
-    with pytest.raises(_BILLED_BODY_REFUSAL_TYPES.get(shape, ModelAdapterError)) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _parse_response(body)
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "malformed_shape": shape,
@@ -666,6 +664,37 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
         "hint": "a refused turn was still generated and billed; the refusal is the only "
         "carrier left for its cost",
     }
+
+
+def test_a_raw_malformed_billed_body_is_refused_classified() -> None:
+    """The chip's sync half: the shapes that refused raw arrive as ``openai_bad_response``.
+
+    A raw ``ValueError`` reached the loop's blanket wrapper (which dropped the usage stamp)
+    in-process, and the gateway's 400/500 arms over a hop -- the 500 arm even said
+    ``retryable: true`` for a payload defect, inviting a client to re-buy the same tokens.
+    Classified, the refusal keeps its stamp, names its code, and states non-retryability;
+    the raw cause stays chained for diagnosis.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    body = _billed_response_body(**_BILLED_BODY_REFUSALS["usage-details-not-an-object"])
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_response(body, provider_retried=True)
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+    assert isinstance(refused.value.__cause__, ValueError)
+
+    stop_reason_shape = _billed_response_body(
+        **_BILLED_BODY_REFUSALS["malformed-incomplete-details"]
+    )
+    with pytest.raises(ModelAdapterError) as second:
+        _parse_response(stop_reason_shape)
+    assert second.value.provider_error_code == "openai_bad_response"
+    assert isinstance(second.value.__cause__, AttributeError)
 
 
 def test_a_refusal_off_a_response_body_that_cost_nothing_stays_costless() -> None:

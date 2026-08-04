@@ -24,6 +24,7 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     TurnComplete,
     generation_support,
+    mark_provider_usage,
     provider_usage_of,
     reasoning_support,
     structured_output_support,
@@ -1784,19 +1785,21 @@ def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_met
 
 # --- and the refusals that are not ``ModelAdapterError`` at all ---------------------------
 #
-# The source reader's seam catches ``Exception`` because the mapping refuses in more than one
-# type: ``normalize_usage`` says "malformed usage" with a raw ``ValueError``. So does every
-# refusal in the streamed twin's terminal region. The stamp rode those exceptions from the day
-# it shipped -- and NO consumer on the gateway route would read it, because the tenant meter and
-# both error writers were gated on ``ModelAdapterError``. A stamp nothing reads is not a fix.
+# The shipped OpenAI reader classifies every refusal in its stamped regions now, but the meter
+# and both error writers deliberately stay type-agnostic: a THIRD-PARTY adapter behind this
+# gateway can still refuse its own provider's billed body in whatever type it likes, and a
+# consumer gated back down to ``ModelAdapterError`` would silently stop reading those stamps --
+# the exact regression the widened readers exist to prevent. The raw probes below therefore
+# drive a hand-stamped raw exception; the shipped reader's shapes get their own classified
+# probes beside them.
 
 
 def _billed_body_with_unreadable_usage_details() -> dict:
     """A billed Responses body whose ``usage`` detail block is malformed.
 
-    The one shape in the source reader's region that refuses with a raw ``ValueError``: the
-    counts themselves are perfectly readable (the lenient reader takes them), and it is the
-    nested ``input_tokens_details`` object that ``normalize_usage`` rejects.
+    The shape whose refusal was born raw (``normalize_usage``'s ``ValueError`` on the nested
+    detail block): the counts themselves are perfectly readable (the lenient reader takes
+    them). The classifying seam now hands it out as ``openai_bad_response``.
     """
 
     return {
@@ -1810,7 +1813,7 @@ def _billed_body_with_unreadable_usage_details() -> dict:
 def _refusing_upstream_backend() -> tuple[LlmGatewayBackend, TokenManager]:
     from monoid_agent_kernel.providers.openai import _parse_response
 
-    class _RawRefusal:
+    class _ClassifiedRefusal:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
             del request
             return _parse_response(_billed_body_with_unreadable_usage_details())
@@ -1819,14 +1822,36 @@ def _refusing_upstream_backend() -> tuple[LlmGatewayBackend, TokenManager]:
     return (
         LlmGatewayBackend(
             token_manager=manager,
-            provider_adapter_factory=lambda _claims, _config: _RawRefusal(),
+            provider_adapter_factory=lambda _claims, _config: _ClassifiedRefusal(),
+        ),
+        manager,
+    )
+
+
+def _hand_stamped_raw_backend() -> tuple[LlmGatewayBackend, TokenManager]:
+    """An upstream that refuses RAW with a stamped cost -- the third-party-adapter shape."""
+
+    class _RawThirdPartyRefusal:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raw = ValueError("third-party adapter refused its provider's billed body")
+            mark_provider_usage(raw, dict(_BILLED))
+            raise raw
+
+    manager = _token_manager()
+    return (
+        LlmGatewayBackend(
+            token_manager=manager,
+            provider_adapter_factory=lambda _claims, _config: _RawThirdPartyRefusal(),
         ),
         manager,
     )
 
 
 def test_a_raw_refusal_off_a_billed_body_still_charges_the_tenant() -> None:
-    backend, manager = _refusing_upstream_backend()
+    """The failure meter reads the stamp off whatever escaped, not off one type."""
+
+    backend, manager = _hand_stamped_raw_backend()
 
     with pytest.raises(ValueError) as refused:
         backend.handle_turn(_llm_token(manager), _turn_payload())
@@ -1841,12 +1866,33 @@ def test_a_raw_refusal_off_a_billed_body_still_charges_the_tenant() -> None:
     }
 
 
-def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
-    """Through the shipped HTTP handler, because the arm it lands in is not the classified one.
+def test_the_openai_readers_refusal_arrives_classified_at_the_gateway() -> None:
+    """The shipped source reader's end of the same chain, now in one classified voice.
 
-    A raw ``ValueError`` is a 400 ``gateway_bad_request`` here, and the client behind it reads
-    ``usage`` off the body it gets -- so an arm that omits the key is a hop that reports zero for
-    a turn the upstream billed, exactly like the classified arm did before it carried one.
+    The same billed body used to escape this hop as a raw ``ValueError``; the seam hands it
+    out as ``openai_bad_response`` with the stamp intact, and the tenant meter still moves.
+    """
+
+    backend, manager = _refusing_upstream_backend()
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert provider_usage_of(refused.value) == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
+    """Through the shipped HTTP handler: a classified payload defect is a 502 that still pays.
+
+    Before the classification this landed on the raw ``ValueError`` arm as a 400
+    ``gateway_bad_request`` -- a status that claims the CLIENT's request was bad and reads as
+    config-shaped -- while the raw ``AttributeError`` shapes landed on the 500 arm with
+    ``retryable: true``, inviting a client to re-buy the same tokens. ``openai_bad_response``
+    with no status and no config remedy maps to 502 BAD_GATEWAY, non-retryable, which is what
+    a malformed upstream answer is; the billed ``usage`` rides the envelope either way and the
+    client rebuilds the stamp from it.
     """
 
     from support.http import serving
@@ -1870,12 +1916,49 @@ def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
             urlopen(request, timeout=10)
         body = json.loads(answered.value.read().decode("utf-8"))
 
-    assert answered.value.code == 400
+    assert answered.value.code == 502
+    assert body["error_code"] == "openai_bad_response"
+    assert body["retryable"] is False
     assert body["usage"] == _BILLED, {
         "wire_body": body,
-        "hint": "the unclassified arms of the error writers carry the stamp like the "
-        "classified one, or the hop loses what the call cost",
+        "hint": "a refused-but-billed turn owes its cost on the wire whatever the arm",
     }
     # And the client rebuilds it: the stamp survives the hop rather than stopping at the wire.
+    rebuilt = _error_from_status_body(502, json.dumps(body))
+    assert provider_usage_of(rebuilt) == _BILLED
+    assert rebuilt.retryable is False
+
+
+def test_the_wire_answer_for_a_raw_third_party_refusal_keeps_its_arm() -> None:
+    """The raw arms did not move: a genuinely-raw upstream still answers 400 with its cost.
+
+    The 400 ``ValueError`` arm and its stamped-usage carriage exist for adapters this repo
+    does not ship; classifying the shipped reader must not have quietly retired them.
+    """
+
+    from support.http import serving
+
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+
+    backend, manager = _hand_stamped_raw_backend()
+    server = create_llm_gateway_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = Request(
+            f"{base_url}/internal/llm/turns",
+            data=json.dumps(_turn_payload()).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_llm_token(manager)}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as answered:
+            urlopen(request, timeout=10)
+        body = json.loads(answered.value.read().decode("utf-8"))
+
+    assert answered.value.code == 400
+    assert body["error_code"] == "gateway_bad_request"
+    assert body["usage"] == _BILLED
     rebuilt = _error_from_status_body(400, json.dumps(body))
     assert provider_usage_of(rebuilt) == _BILLED

@@ -1056,10 +1056,14 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
 
     One seam around the whole mapping rather than a stamp per raise site: the rule is about the
     payload, not about which key of it turned out to be malformed, and twelve stamps is twelve
-    chances to miss the thirteenth. ``Exception`` rather than ``ModelAdapterError`` because the
-    mapping refuses in more than one type -- ``normalize_usage`` says "malformed usage" with a
-    ``ValueError`` -- and a rule bound to one of two ways the same act is spelled is the shape
-    this codebase keeps re-earning. The stamp reads leniently (:func:`usage_reported_by`), so a
+    chances to miss the thirteenth. The seam also CLASSIFIES: the mapping refuses in more than
+    one type (``normalize_usage`` says "malformed usage" with a raw ``ValueError``, the
+    stop-reason walk with an ``AttributeError``), and a raw escape had a real consumer cost --
+    the loop's blanket wrapper re-minted it unstamped, so the run budget recorded zero
+    in-process, and over a hop the raw arms answered 400 (claiming the CLIENT's request was
+    bad) or 500 ``retryable: true`` (inviting a re-buy of the same tokens). Every non-classified
+    refusal leaves here as non-retryable ``openai_bad_response`` with the raw cause chained;
+    the stamp reads leniently (:func:`usage_reported_by`), so a
     body whose ``usage`` is *itself* the malformed key records nothing rather than raising a
     second failure over the first; well-formed bodies still normalize through the adapter's own
     parser below and are untouched by this.
@@ -1067,9 +1071,18 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
 
     try:
         return _response_to_turn(data, provider_retried=provider_retried)
-    except Exception as refused:
+    except ModelAdapterError as refused:
         mark_provider_usage(refused, usage_reported_by(data))
         raise
+    except Exception as raw:
+        refused = ModelAdapterError(
+            f"OpenAI returned a malformed response body: {raw}",
+            provider_error_code="openai_bad_response",
+            retryable=False,
+            provider_retried=provider_retried,
+        )
+        mark_provider_usage(refused, usage_reported_by(data))
+        raise refused from raw
 
 
 def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelTurn:
