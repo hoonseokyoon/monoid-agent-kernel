@@ -58,11 +58,21 @@ out in commit messages and here.
   mint proof for a call whose own policy said best-effort. `reasoning_support(adapter,
   config=None)` joins the exported fail-closed probe family; `OpenAIModelAdapter` declares it
   unconditionally (it puts the block on the Responses body), the fakes deliberately do not.
-- **Two shipped callers state their real policy instead of inheriting a refusal.** Studio's
-  reasoning summary/effort are display preferences and its offline upstream honestly declares
-  no `reasoning_support` — under the inherited `"fail"` every offline turn would have been
-  refused. Studio and the messy-workspace scenario now set `reasoning.on_unsupported="omit"`
-  (pinned as a policy test); a proving upstream still emits the echo and still proves.
+- **All five shipped callers state their real policy instead of inheriting a refusal.**
+  Configuring any reasoning key makes a config non-default, so the client starts demanding
+  proof — and `on_unsupported` inherited `"fail"`, which refuses every turn against an
+  upstream that declares no `reasoning_support` (the shipped `--provider fake` echo adapter,
+  any pre-B1 gateway, most third-party factories). Studio, the messy-workspace scenario, the
+  full-stack scenario, the `monoid builder init` scaffold and `examples/runtime-config.json`
+  — the file README, `docs/CLI.md`, the first-skill tutorial and `docs/OBSERVABILITY.md` all
+  tell a reader to pass — now set `reasoning.on_unsupported="omit"`. Their effort/summary are
+  display-grade preferences, not transport proof. Pinned three ways, because they are three
+  kinds of caller: Studio by a policy test on its config builder, the two scenarios
+  behaviorally by their own offline runs, and the two JSON producers by a sweep that
+  *enumerates* every shipped runtime config (builder scaffold plus every `examples/*.json`
+  that parses as one) and replays the client's own check against a silent upstream — so the
+  next shipped config inherits the pin instead of repeating the defect. A proving upstream
+  still emits the echo and still proves.
 - Census: the `KNOWN_GAPS` B1 entry is deleted and its `v0.21-track:B1` disposition token
   retired with it; `reasoning_applied` joins every echo census (`APPLIED_ECHO_KEYS`
   derivations, the wire key sets, the 7e refusal probes, the value-validator tables — now ten
