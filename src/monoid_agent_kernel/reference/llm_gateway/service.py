@@ -26,6 +26,7 @@ from monoid_agent_kernel.providers._common import build_generation_payload, norm
 from monoid_agent_kernel.providers.base import (
     generation_support,
     provider_usage_of,
+    resolved_provider_name,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.base import (
@@ -187,6 +188,7 @@ class LlmGatewayBackend:
         }
         result.update(_applied_echoes(request, adapter, config))
         result.update(_reasoning_payload(turn))
+        result.update(_relayed_provider_payload(adapter))
         return result
 
     def handle_turn_stream(self, token: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -328,6 +330,10 @@ class LlmGatewayBackend:
         # transports cannot answer differently.
         frame.update(_applied_echoes(request, adapter, model_request.model))
         frame.update(_reasoning_payload(turn))
+        # Written from the adapter, so it is the same answer on the branch that forwards the
+        # provider's own terminal chunk and the branch that synthesizes one -- neither of which
+        # carries an attribution the assembled turn could have been read for.
+        frame.update(_relayed_provider_payload(adapter))
         yield frame
 
     def tenant_usage(self, tenant_id: str) -> dict[str, Any]:
@@ -558,6 +564,37 @@ def _reasoning_payload(turn: ModelTurn) -> dict[str, Any]:
     if not turn.reasoning:
         return {}
     return {"reasoning": [dict(item) for item in turn.reasoning]}
+
+
+def _relayed_provider_payload(adapter: ModelAdapter) -> dict[str, Any]:
+    """Whose artifacts this hop just relayed — for whichever transport is writing.
+
+    The client declares its upstream (``GatewayModelAdapter.provider_name``, defaulting to
+    ``"openai"`` because that is what this reference gateway fronts) and tags every captured
+    artifact with it. That declaration is a *guess about someone else's deployment*: a gateway
+    whose ``provider_adapter_factory`` routes elsewhere makes it wrong, and nothing on either
+    side could tell. This side can: it built the adapter. So it says so, and the client verifies
+    against its own declaration instead of trusting it (see
+    ``providers/gateway._readable_relayed_reasoning``).
+
+    Read from the upstream adapter's own DECLARATION and nothing else, which is why this passes
+    no config. ``resolved_provider_name(adapter, config)`` would fall back to
+    ``ModelConfig.provider``, and the config here is ``_upstream_model_config``'s — hardcoded
+    ``"openai"`` for every call this gateway serves, a hop-local fabrication rather than a fact
+    about the upstream. Through that fallback a non-OpenAI upstream that declares nothing would
+    be *named* OpenAI, minting the exact confident lie this key exists to delete. An undeclared
+    upstream is unknown, and unknown is written by omission: absence gates nothing on the client,
+    which is also what an older gateway's silence means, so the two are indistinguishable by
+    design.
+
+    Omit-when-unknown, one function, both writers — the rule and the construction
+    :func:`_reasoning_payload` and :func:`_applied_echoes` are already held to.
+    """
+
+    provider = resolved_provider_name(adapter, None)
+    if not provider:
+        return {}
+    return {"provider": provider}
 
 
 def _pump_astream(

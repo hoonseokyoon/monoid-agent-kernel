@@ -2858,6 +2858,8 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "final_text",
             # X-3: the provider-native reasoning artifacts the hop now relays.
             "reasoning",
+            # O1: whose they are, per the side that built the upstream adapter.
+            "provider",
         }
     ),
     "providers/gateway.py:_chunk_from_event": frozenset(
@@ -2882,6 +2884,8 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "schema_applied",
             # X-3's streamed twin: the terminal frame is the only frame that carries them.
             "reasoning",
+            # O1's streamed twin, read off the same frame for the same reason.
+            "provider",
         }
     ),
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
@@ -4489,6 +4493,10 @@ GATEWAY_SUCCESS_BODY_KEYS = frozenset(
         # produced some. Conditional on the ANSWER rather than on the request, which is what
         # separates it from the two echoes beside it.
         "reasoning",
+        # O1: whose artifacts those are -- the upstream the hop actually relayed, present only
+        # when the upstream adapter declares it. A third conditionality (see
+        # ``GATEWAY_CONDITIONAL_WIRE_KEYS``).
+        "provider",
     }
 )
 GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
@@ -4501,6 +4509,7 @@ GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
         "generation_applied",
         "schema_applied",
         "reasoning",
+        "provider",
     }
 )
 # The frame is the body minus what the deltas already delivered, minus the protocol tag the
@@ -4517,10 +4526,17 @@ class _EverythingAdapter:
     ``tool_calls`` was the field this class left empty, and the omission is exactly how the
     ``reasoning`` gap survived: a wire census driven by a builder that never sets a field cannot
     tell a writer that drops it from a writer that never had it to write.
+
+    Maximal in the OTHER direction too, since O1: the optional capabilities the writers probe the
+    *adapter* for, not just the fields they read off its turn
+    (``test_7b_the_maximal_upstream_declares_every_capability_the_writers_probe``). ``provider_name``
+    is deliberately not ``"openai"`` -- that is what the hop's own config says for every call, so a
+    key that could have come from there would prove nothing about where it came from.
     """
 
     generation_support = "native"
     structured_output_support = "native"
+    provider_name = "acme"
 
     def next_turn(self, request: Any) -> ModelTurn:
         del request
@@ -4537,7 +4553,8 @@ class _EverythingAdapter:
 
 
 class _PlainAdapter:
-    """The MINIMAL upstream: no retry to report, and no native-support declaration to echo.
+    """The MINIMAL upstream: no retry to report, no native-support declaration to echo, and — since
+    O1 — no ``provider_name`` either, which is what makes that key's conditionality visible.
 
     Its counterpart to ``_EverythingAdapter`` is the point. A census driven only by the maximal
     probe pins the *union* of the wire keys, so a writer that started omitting a key whenever it
@@ -4620,15 +4637,17 @@ GATEWAY_MINIMAL_BODY_KEYS = frozenset(
 GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
     {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
 )
-# The keys that ride the wire only sometimes. Two conditionalities, deliberately unified into
+# The keys that ride the wire only sometimes. THREE conditionalities, deliberately unified into
 # one set because the *wire* property is the same one: the two echoes appear only when the
 # request asked for the feature (registered by-design on ``_applied_echoes``: traffic that
-# configures neither keeps its exact pre-W5 wire shape), and ``reasoning`` appears only when the
-# upstream produced artifacts. Widened by union rather than by editing ``APPLIED_ECHO_KEYS``:
-# that constant is the echo protocol's own domain (family 4 diffs ``_applied_echoes`` against
-# it), and folding a non-echo key into it would report reasoning as a third applied-parameters
-# proof — which is the separate v0.21-track:B1 gap, still open.
-GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS) | {"reasoning"}
+# configures neither keeps its exact pre-W5 wire shape), ``reasoning`` appears only when the
+# upstream produced artifacts, and ``provider`` only when the upstream adapter DECLARES one --
+# request-conditional, answer-conditional, and upstream-conditional respectively. Widened by
+# union rather than by editing ``APPLIED_ECHO_KEYS``: that constant is the echo protocol's own
+# domain (family 4 diffs ``_applied_echoes`` against it), and folding a non-echo key into it
+# would report these as further applied-parameters proofs — which is the separate
+# v0.21-track:B1 gap, still open.
+GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS) | {"reasoning", "provider"}
 
 
 def test_7a_the_minimal_request_pins_which_body_keys_are_conditional() -> None:
@@ -4770,6 +4789,75 @@ def test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default(
     }
 
 
+# Every attribute the two success writers probe off the UPSTREAM ADAPTER rather than off its
+# turn, mapped to the wire key it decides. The turn-field guard above has no reach here: a writer
+# fed by ``getattr(adapter, ...)`` is invisible to a builder that answers a maximal turn from an
+# adapter that declares nothing, which is the same blindness one level out.
+ADAPTER_PROBED_WIRE_KEYS: dict[str, str] = {
+    "generation_support": "generation_applied",
+    "structured_output_support": "schema_applied",
+    "provider_name": "provider",
+}
+
+
+def test_7b_the_maximal_upstream_declares_every_capability_the_writers_probe() -> None:
+    """The adapter-shaped twin of the turn-field guard, and the same defect one level out.
+
+    ``ModelTurn.reasoning`` was invisible to this whole family because the maximal builder never
+    set it. A capability the maximal builder never DECLARES is invisible the same way and for the
+    same reason: the writer probes the adapter, reads nothing, omits the key, and a census driven
+    by that adapter cannot tell the omission from a writer that never had the key to write.
+    ``provider_name`` was exactly that on the day it was added.
+
+    The map is diffed against the writers, not trusted: a fourth probe added to either writer has
+    to be answered here, by declaring it on the stub, before it can be censused at all.
+    """
+
+    probed: set[str] = set()
+    for writer in ("_applied_echoes", "_relayed_provider_payload"):
+        for node in _all_functions("reference/llm_gateway/service.py")[writer]:
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = call.func.id if isinstance(call.func, ast.Name) else None
+                # The three probes are called through the shared readers in ``providers/base``
+                # (``generation_support`` / ``structured_output_support`` /
+                # ``resolved_provider_name``), each of which getattrs one adapter attribute.
+                probed |= {
+                    attribute
+                    for attribute, reader in _ADAPTER_PROBE_READERS.items()
+                    if name == reader
+                }
+    assert probed == set(ADAPTER_PROBED_WIRE_KEYS), {
+        "probed_by_a_writer_but_unregistered": sorted(probed - set(ADAPTER_PROBED_WIRE_KEYS)),
+        "registered_but_no_writer_probes_it": sorted(set(ADAPTER_PROBED_WIRE_KEYS) - probed),
+        "hint": "a new adapter-probed wire key: register it here AND declare it on "
+        "_EverythingAdapter, or no census in this family can see it go missing",
+    }
+    undeclared = sorted(
+        attribute
+        for attribute in ADAPTER_PROBED_WIRE_KEYS
+        if getattr(_EverythingAdapter, attribute, None) in (None, "", False)
+    )
+    assert undeclared == [], {
+        "left_undeclared_by_the_maximal_upstream": undeclared,
+        "hint": "declare it on _EverythingAdapter with a distinguishable value -- a capability "
+        "the maximal probe never declares cannot be seen to be missing from either writer",
+    }
+    # And the keys they decide really are on the wire the maximal probe produces.
+    assert set(ADAPTER_PROBED_WIRE_KEYS.values()) <= GATEWAY_SUCCESS_BODY_KEYS
+
+
+# Which shared reader in ``providers/base`` each probed adapter attribute is read through. The
+# writers never getattr these themselves — that is the point of the shared readers — so the
+# census follows the call rather than looking for an attribute access that is not there.
+_ADAPTER_PROBE_READERS: dict[str, str] = {
+    "generation_support": "generation_support",
+    "structured_output_support": "structured_output_support",
+    "provider_name": "resolved_provider_name",
+}
+
+
 def _field_default(field: dataclasses.Field) -> Any:
     """The declared default of one dataclass field, factory or not."""
 
@@ -4798,6 +4886,7 @@ SUCCESS_READS_R1 = frozenset(
         "turn_handle",
         "final_text",
         "reasoning",
+        "provider",
     }
 )
 TURN_COMPLETE_READS_R2 = frozenset(
@@ -4809,6 +4898,7 @@ TURN_COMPLETE_READS_R2 = frozenset(
         "generation_applied",
         "schema_applied",
         "reasoning",
+        "provider",
     }
 )
 # Reads with no writer, each one accounted for.
@@ -4939,6 +5029,7 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
         "turn_handle": {"turn_handle": 7},
         "response_id": {"response_id": 7},
         "reasoning": {"reasoning": "not-an-array"},
+        "provider": {"provider": 7},
     },
     "providers/gateway.py:_chunk_from_event": {
         "type": {"type": 7},
@@ -4949,6 +5040,7 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
         "generation_applied": {"generation_applied": [1, 2]},
         "schema_applied": {"schema_applied": 7},
         "reasoning": {"reasoning": "not-an-array"},
+        "provider": {"provider": 7},
     },
 }
 # Reads with no probe, each one accounted for, like ``SUCCESS_DANGLING_READS`` above.

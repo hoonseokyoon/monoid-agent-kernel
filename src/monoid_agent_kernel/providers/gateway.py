@@ -48,6 +48,7 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_retried,
     mark_provider_usage,
     report_provider_retried,
+    resolved_provider_name,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -175,6 +176,25 @@ class GatewayModelAdapter:
 
     # Forwards resolved media blocks in the by-value ``messages`` verbatim to the gateway.
     supports_multimodal: ClassVar[bool] = True
+
+    def _declared_provider(self) -> str | None:
+        """This adapter's own upstream declaration, read the way every other reader reads one.
+
+        Through ``resolved_provider_name`` with no config, which is the shared expression's
+        declaration half alone: tolerant of a subclass whose ``provider_name`` raises, and
+        ``normalize_unicode_scalars``-normalized. The gateway *server* resolves the upstream's
+        declaration through the same call, so the two sides of the comparison in
+        :func:`_readable_relayed_reasoning` cannot disagree on normalization -- two spellings of
+        one name that differ only in Unicode form would otherwise read as a mismatch and drop
+        artifacts that were perfectly readable.
+
+        No config is passed on purpose: ``ModelConfig.provider`` on this adapter is ``"gateway"``,
+        the transport, and a transport name compared against an upstream name is a mismatch every
+        time.
+        """
+
+        return resolved_provider_name(self, None)
+
     def structured_output_support(self, config: ModelConfig | None = None) -> str:
         """This adapter *forwards*; it does not apply. So its claim is only as good as the
         proof it insists on, and that is exactly what ``on_unsupported`` controls.
@@ -261,7 +281,9 @@ class GatewayModelAdapter:
                     # first time, and overwriting turned that into a clean attempt. Two independent
                     # retry loops sit on this path and either one having run is the fact a receipt
                     # records.
-                    turn = _parse_gateway_response(data)
+                    turn = _parse_gateway_response(
+                        data, declared_provider=self._declared_provider()
+                    )
                     if attempt > 1:
                         turn = replace(turn, provider_retried=True)
                     # Stamped *before* the applied-parameter checks, exactly as the streaming
@@ -439,7 +461,9 @@ class GatewayModelAdapter:
                                     raise _StreamRetry(error)
                                 raise error
                             committed = True
-                            async for chunk in _aiter_sse_chunks(response):
+                            async for chunk in _aiter_sse_chunks(
+                                response, declared_provider=self._declared_provider()
+                            ):
                                 # Also on each chunk, so a chunk forwarded on its own still says
                                 # which stream it came from. Same ``attempt`` in the same scope as
                                 # the marker above, so the two cannot disagree.
@@ -896,6 +920,43 @@ def _gateway_reasoning_items(
     )
 
 
+def _readable_relayed_reasoning(
+    items: tuple[dict[str, Any], ...],
+    *,
+    reported: str | None,
+    declared: str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Drop relayed artifacts the upstream this adapter DECLARES could never read back.
+
+    ``provider_name`` is this client's declaration of the gateway's upstream, and it defaults to
+    ``"openai"`` because that is what the reference gateway fronts -- so a deployment whose
+    ``provider_adapter_factory`` routes elsewhere and leaves the knob alone tags every captured
+    artifact with a provider that cannot read it. The server now names the upstream it actually
+    relayed (``provider`` on the success body and the terminal frame), which is the first time
+    either side of this hop could tell.
+
+    VERIFY, not adopt. The declaration keeps naming the provider everywhere it already does --
+    the reasoning tag, ``ModelCallReceipt.provider_name``, the model-stream context, every OTel
+    ``gen_ai.provider.name`` -- because a per-turn adoption would answer *one call's* provider
+    question two ways, which is the defect ``resolved_provider_name`` was written to end. What a
+    mismatch changes is only what it can honestly change: the artifacts, which are unusable under
+    either name. Same answer the replay filter gives a block whose tag does not match the current
+    adapter (``_reasoning_replay_flags``: drop rather than send half a validated pair), decided
+    one hop earlier so the run never carries an item it cannot spend.
+
+    Silent, and it drops rather than raises, for the reason the key is additive: absence proves
+    nothing, so an older gateway that names no upstream gates nothing, and a client that declares
+    none (the protocol's "do not tag") gates nothing either -- the loop already appends no
+    reasoning block for it, and reading a *match* out of two absences would be a second, weaker
+    copy of that rule. The turn itself is untouched: a mismatch invalidates the artifacts, not the
+    answer they came with.
+    """
+
+    if not items or not reported or not declared:
+        return items
+    return items if reported == declared else ()
+
+
 def _validated_generation_echo(
     applied: Any, *, http_status: int | None = None, provider_retried: bool = False
 ) -> dict[str, Any] | None:
@@ -1050,7 +1111,11 @@ def _check_schema_applied(
     )
 
 
-def _parse_gateway_response(data: Any) -> ModelTurn:
+def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) -> ModelTurn:
+    """``declared_provider`` is the reading adapter's own ``provider_name``, resolved the same
+    way the server resolves the upstream's, so the two sides of one comparison cannot differ on
+    normalization. ``None`` (the default, and what a direct caller passes) gates nothing."""
+
     if not isinstance(data, dict):
         raise ModelAdapterError(
             "LLM gateway returned a non-object JSON response",
@@ -1226,6 +1291,16 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
                 )
             )
 
+        # Whose artifacts the hop relayed, answered by the side that built the upstream adapter.
+        # Absent from an older gateway and from one whose upstream declares nothing, both of
+        # which mean "unknown" -- and unknown gates nothing (see
+        # :func:`_readable_relayed_reasoning`).
+        relayed_provider = _gateway_string(
+            data,
+            "provider",
+            context="response",
+            known_provider_retried=provider_retried,
+        )
         # stop_reason rides the gateway wire (added by the gateway server). Older gateways omit it;
         # infer the common cases so the loop's branch still works.
         stop_reason = _gateway_string(
@@ -1266,12 +1341,17 @@ def _parse_gateway_response(data: Any) -> ModelTurn:
             # The opaque provider-native reasoning artifacts the upstream produced, relayed
             # by the gateway. Absent from an older gateway, which reads as "none" -- the same
             # thing an adapter with no reasoning says, and all a wire that never mentions the
-            # key can mean.
-            reasoning=_gateway_reasoning_items(
-                data.get("reasoning"),
-                context="response",
-                http_status=status_hint,
-                known_provider_retried=provider_retried,
+            # key can mean. Gated on the upstream the server named, so a client whose configured
+            # declaration disagrees keeps none of what that declaration would mistag.
+            reasoning=_readable_relayed_reasoning(
+                _gateway_reasoning_items(
+                    data.get("reasoning"),
+                    context="response",
+                    http_status=status_hint,
+                    known_provider_retried=provider_retried,
+                ),
+                reported=relayed_provider,
+                declared=declared_provider,
             ),
             stop_reason=stop_reason,
             # A retry the gateway's own backend made. Absent from an older gateway, which
@@ -1291,18 +1371,25 @@ class _StreamRetry(Exception):
         self.error = error
 
 
-async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
+async def _aiter_sse_chunks(
+    response: Any, *, declared_provider: str | None = None
+) -> AsyncIterator[ModelStreamChunk]:
     """Parse the gateway's ``text/event-stream`` body into ``ModelStreamChunk``s.
 
     Minimal SSE: ``data:`` lines accumulate, a blank line dispatches one JSON frame, ``:``
     comment lines (keepalives) are ignored, and a trailing frame without a terminating blank
     line is still dispatched. An ``error`` frame raises ``ModelAdapterError``.
+
+    ``declared_provider`` is carried through to the frame reader untouched -- the streamed twin
+    of what ``next_turn`` hands its own parser. The stream reaches that reader through two
+    functions the adapter does not call directly, and a thread that stops at either of them
+    leaves this transport ungated while the blocking one enforces.
     """
     data_lines: list[str] = []
     async for line in response.aiter_lines():
         if line == "":
             if data_lines:
-                chunk = _decode_sse_chunk(data_lines)
+                chunk = _decode_sse_chunk(data_lines, declared_provider=declared_provider)
                 data_lines = []
                 if chunk is not None:
                     yield chunk
@@ -1312,12 +1399,14 @@ async def _aiter_sse_chunks(response: Any) -> AsyncIterator[ModelStreamChunk]:
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip(" "))
     if data_lines:
-        chunk = _decode_sse_chunk(data_lines)
+        chunk = _decode_sse_chunk(data_lines, declared_provider=declared_provider)
         if chunk is not None:
             yield chunk
 
 
-def _decode_sse_chunk(data_lines: list[str]) -> ModelStreamChunk | None:
+def _decode_sse_chunk(
+    data_lines: list[str], *, declared_provider: str | None = None
+) -> ModelStreamChunk | None:
     try:
         event = loads_model_stream_envelope_json_ingress("\n".join(data_lines))
     except ValueError as exc:
@@ -1330,10 +1419,12 @@ def _decode_sse_chunk(data_lines: list[str]) -> ModelStreamChunk | None:
             "LLM gateway stream returned a non-object frame",
             provider_error_code=GATEWAY_BAD_RESPONSE,
         )
-    return _chunk_from_event(event)
+    return _chunk_from_event(event, declared_provider=declared_provider)
 
 
-def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
+def _chunk_from_event(
+    event: dict[str, Any], *, declared_provider: str | None = None
+) -> ModelStreamChunk | None:
     # A retry the gateway's own backend made, as opposed to one this client's loop made. Read off
     # every frame that carries it, because a stream cancelled mid-flight never delivers the
     # terminal one. Absent reads as "did not retry", which is what a wire that never mentions it
@@ -1458,12 +1549,23 @@ def _chunk_from_event(event: dict[str, Any]) -> ModelStreamChunk | None:
                 # The terminal frame is the only frame that may carry the artifacts, and the
                 # only one ``assemble_streamed_turn`` reads them off. Same validator as the
                 # sync reader: a shape one transport accepts and the other refuses is the
-                # defect, not the fix.
-                reasoning=_gateway_reasoning_items(
-                    event.get("reasoning"),
-                    context="turn-complete frame",
-                    http_status=status_hint,
-                    known_provider_retried=retried,
+                # defect, not the fix. Same gate too, and for the stronger version of that
+                # reason: an artifact set one transport drops as unreadable and the other
+                # relays is a replay that fails only when a run happens to stream.
+                reasoning=_readable_relayed_reasoning(
+                    _gateway_reasoning_items(
+                        event.get("reasoning"),
+                        context="turn-complete frame",
+                        http_status=status_hint,
+                        known_provider_retried=retried,
+                    ),
+                    reported=_gateway_string(
+                        event,
+                        "provider",
+                        context="turn-complete frame",
+                        known_provider_retried=retried,
+                    ),
+                    declared=declared_provider,
                 ),
                 stop_reason=_gateway_string(
                     event,

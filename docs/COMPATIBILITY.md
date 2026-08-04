@@ -236,6 +236,21 @@ frame) reads the absence as `()` through the permissive response reader. The onl
 that skew is that the provider-native reasoning round-trip does not happen on that hop — the loop
 appends no reasoning block for an empty tuple, and the next turn is an ordinary untagged one.
 
+The same writer adds `provider` beside it, on the same two carriers and again without changing the
+protocol identifier. Its conditionality is a third one: not request-conditional like the echoes and
+not answer-conditional like `reasoning`, but **upstream**-conditional — present only when the
+upstream adapter the gateway built declares a `provider_name`, so a deployment whose upstream
+declares none keeps its exact previous wire shape. Skew is lossless in both directions and the
+default direction is the important one: a new client reading an old server sees no key, and an
+absent key gates nothing, so it keeps trusting its own configured declaration exactly as it did
+before — that is the pre-v0.21 behavior, unchanged. An old client reading a new server ignores the
+key. When both ends are new and they *disagree*, the client drops that turn's relayed `reasoning`
+and nothing else: the artifacts are unreadable by whichever provider is really behind the hop, the
+turn's text, tool calls, usage and handle are untouched, and the client's own declaration keeps
+naming the provider on the reasoning tag, the receipt, and every OTel `gen_ai.provider.name`. The
+consequence of a mismatch is therefore the same one skew already has — no reasoning round-trip on
+that hop — rather than a refusal or a changed attribution.
+
 Failing *open* is scoped to **absence**, and only absence: a key that is not there proves
 nothing, so nothing is refused. A key that IS there must be an array of objects, because that is
 the only shape the replay path can hand back to a provider; a present-but-malformed value is
@@ -245,6 +260,12 @@ the **request** body for the reasoning *config* object, so a third-party gateway
 request keys onto its response answers an array-valued key with an object and is refused. That is
 the correct outcome — the value is unusable for replay either way — but the cause is not obvious
 from the error, so check for a request echo before suspecting the upstream's artifacts.
+
+`provider` is held to the same rule by the same readers: absent is unknown and gates nothing, but
+present must be a string, and a non-string is `gateway_bad_response` on both transports. Note what
+that separates — a *malformed* attribution is refused, while a *disagreeing* one is not: the first
+means the envelope cannot be read, the second means it was read and says something the client did
+not expect, which is a fact about a deployment rather than a broken wire.
 
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the

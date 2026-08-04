@@ -359,6 +359,15 @@ Four further opt-in protocols declare optional capability members:
   `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
   through the gateway is therefore attributed to the model that served it, with the transport
   still legible beside it as `ModelConfig.provider` and on the run manifest.
+  A forwarding adapter's declaration is a *guess about someone else's deployment*, so it is
+  **verified, never adopted**: the gateway names the upstream it actually relayed (`provider` on
+  the success body and terminal frame, below), and when that disagrees with what the client
+  declared, the client drops that turn's relayed `reasoning` artifacts and keeps everything else —
+  including the declaration itself, on every surface above. Adopting the server's answer per turn
+  would make one call's provider question have two answers again, which is what
+  `resolved_provider_name` exists to prevent; dropping is what the replay filter already does with
+  a tag that does not match, decided one hop earlier. A gateway that names no upstream (an older
+  one, or one whose upstream declares nothing) changes nothing.
 - `ConfiguredModelAdapter.config: ModelConfig` — the adapter's own fallback, used when
   `ModelRequest.model` is absent. A `ModelCallReceipt` reads it so it records the model the call
   actually ran under rather than a default the call never used.
@@ -1653,7 +1662,8 @@ Successful response:
     {"call_id": "call_1", "name": "read_notes", "arguments": {"path": "notes.md"}}
   ],
   "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-  "reasoning": [{"type": "reasoning", "id": "rs_...", "encrypted_content": "..."}]
+  "reasoning": [{"type": "reasoning", "id": "rs_...", "encrypted_content": "..."}],
+  "provider": "openai"
 }
 ```
 
@@ -1687,6 +1697,21 @@ rather than on the request (unlike the two applied echoes below). It is additive
 absence reads as "no artifacts", which is what an older gateway, a non-reasoning upstream, and a
 stream that ended without a terminal frame all honestly mean, and a run that reconstructs none
 simply replays none.
+
+`provider` names the upstream those artifacts came from, and rides the same two writers. Only the
+upstream adapter's own `provider_name` declaration is written here — never the gateway's own
+`ModelConfig.provider`, which is a hop-local constant (`"openai"` for every call this reference
+gateway serves) and would therefore *name* OpenAI for an upstream that is not. An upstream that
+declares nothing is unknown, and unknown is written by **omission**, which is a third
+conditionality beside the request-conditional echoes and the answer-conditional `reasoning`.
+
+The key exists because the client's own declaration is a guess: `GatewayModelAdapter.provider_name`
+defaults to `"openai"` — correct for this gateway's default upstream and wrong for any deployment
+whose `provider_adapter_factory` routes elsewhere without setting it — and it is what the captured
+artifacts get tagged with. A client reading `provider` **verifies** against it: on a mismatch it
+drops that turn's artifacts (they are unusable under either name) and changes nothing else, keeping
+its own declaration on the reasoning tag and on every observability surface. Absence gates nothing,
+so an older gateway and an undeclared upstream behave exactly as before the key existed.
 
 `usage` always carries `input_tokens` / `output_tokens` / `total_tokens`. It MAY
 additionally carry optional priced sub-counts when the provider reports them —

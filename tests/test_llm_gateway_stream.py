@@ -476,6 +476,53 @@ def test_a_relayed_reasoning_entry_survives_the_unicode_line_separators() -> Non
     }
 
 
+def test_the_streaming_adapter_verifies_the_upstream_the_hop_names() -> None:
+    """O1's streamed twin, end to end over real HTTP through the shipped adapter.
+
+    The frame reader's gate is reached through three module-level functions
+    (``_aiter_sse_chunks`` -> ``_decode_sse_chunk`` -> ``_chunk_from_event``), none of which the
+    adapter calls directly with its declaration in hand -- so a thread that stops at any of them
+    leaves the streamed transport ungated while the blocking one enforces. That asymmetry is
+    this file's recurring defect shape, and only a real stream can see it.
+    """
+
+    pytest.importorskip("httpx")
+    reasoning = ({"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},)
+
+    class _AcmeBackend:
+        provider_name = "acme"
+
+        async def astream_turn(self, _request):
+            yield TextDelta("ok")
+            yield TurnComplete(
+                response_id="prov", usage={"total_tokens": 5}, reasoning=reasoning
+            )
+
+    server, manager = _server_for(lambda *_: _AcmeBackend())
+    with serving(server) as base_url:
+        token = _llm_token(manager)
+        url = f"{base_url}/internal/llm/turns"
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=())
+
+        lying = GatewayModelAdapter(ModelConfig(), gateway_url=url, token=token)
+        assert lying.provider_name == "openai", "the default is the hazard under test"
+        dropped = assemble_streamed_turn(asyncio.run(_collect(lying.astream_turn(request))))
+
+        honest = GatewayModelAdapter(
+            ModelConfig(), gateway_url=url, token=token, provider_name="acme"
+        )
+        kept = assemble_streamed_turn(asyncio.run(_collect(honest.astream_turn(request))))
+
+    assert kept.reasoning == reasoning
+    assert dropped.reasoning == (), {
+        "kept": dropped.reasoning,
+        "hint": "the blocking transport gates this; a stream that does not is the same "
+        "unusable replay one turn later",
+    }
+    # Dropping the unreadable half does not damage the turn around it.
+    assert dropped.final_text == kept.final_text == "ok"
+
+
 def test_final_text_survives_a_unicode_line_separator_on_the_stream() -> None:
     """The carrier that predates the reasoning array, on the delta frames rather than the
     terminal one -- separate frames, same writer, and only one of them was ever exercised."""

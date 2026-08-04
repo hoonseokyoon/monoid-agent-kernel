@@ -7,6 +7,37 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the gateway names the upstream it relayed, and the client stops trusting its default
+
+- **The LLM-gateway success body and terminal `turn_complete` frame carry `provider`.** The
+  reasoning artifacts a hop relays are only replayable if the tag on them names a provider that
+  can read them back, and that tag was written from `GatewayModelAdapter.provider_name` — the
+  *client's* declaration, defaulting to `"openai"` because that is what the reference gateway
+  fronts. For a deployment whose `provider_adapter_factory` routes elsewhere the default is simply
+  wrong, and nothing on either side of the wire could tell. The server can: it built the upstream
+  adapter. Written from that adapter's own declaration and from nothing else — deliberately *not*
+  through the config fallback, because `_upstream_model_config` hardcodes `provider="openai"` for
+  every call this gateway serves, so the fallback would have named OpenAI for an upstream that is
+  not, minting the same confident lie one layer down. Additive and omit-when-unknown, on the rule
+  `reasoning` already uses.
+- **A client verifies against that name instead of adopting it.** On a mismatch the relayed
+  `reasoning` artifacts are dropped for that turn and nothing else changes — the declaration keeps
+  naming the provider on the reasoning tag, `ModelCallReceipt.provider_name`, the model-stream
+  context and every OTel `gen_ai.provider.name`. Adopting per turn would give *one call's* provider
+  question two answers again, which is the defect `resolved_provider_name` was written to end;
+  dropping is what the replay filter already does with a tag that does not match
+  (`_reasoning_replay_flags`), decided one hop earlier so the run never carries an item it cannot
+  spend. Both sides resolve their declaration through the same tolerant, Unicode-normalizing
+  expression, so two spellings of one name cannot read as a disagreement. Absence gates nothing on
+  either side, which is what makes an older gateway and an undeclared upstream indistinguishable
+  by design.
+- **(tests) The maximal upstream stub declares every capability the writers probe it for.** The
+  `reasoning` gap survived a whole wire census because the maximal builder left that field at its
+  default; a capability the stub never *declares* is invisible the same way, one level out — the
+  writer probes the adapter, reads nothing, omits the key, and no key-set diff can tell that from a
+  writer that never had the key. `provider_name` was exactly that on the day it was added. The
+  probe list is now derived from the two writers rather than hand-kept.
+
 ### Fixed — the other half of the gateway helper census is derived, and two validators join it
 
 - **(tests) The wire-value validator list is derived from the module rather than hand-kept.** The
