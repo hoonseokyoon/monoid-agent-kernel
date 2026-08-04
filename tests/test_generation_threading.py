@@ -49,6 +49,9 @@ from monoid_agent_kernel.reference.llm_gateway.service import (
 _SET = GenerationConfig(temperature=0.2, top_p=0.9, max_output_tokens=256)
 _SET_WIRE = {"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 256}
 
+_REASONING_SET = ReasoningConfig(effort="high", summary="auto")
+_REASONING_SET_WIRE = {"effort": "high", "summary": "auto"}
+
 
 def _request(config: ModelConfig) -> ModelRequest:
     return ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=config)
@@ -326,6 +329,7 @@ def _recording_backend(
         class Adapter:
             if upstream_applies:
                 generation_support = "native"
+                reasoning_support = "native"
 
             def next_turn(self, request):
                 return ModelTurn(
@@ -390,6 +394,181 @@ def test_gateway_service_stream_terminal_frame_echoes_too() -> None:
 
     plain = list(backend.handle_turn_stream(_llm_token(manager), _turn_payload()))
     assert "generation_applied" not in plain[-1]
+
+
+# --- B1: the reasoning echo --------------------------------------------------------------
+
+
+def test_gateway_service_echoes_reasoning_applied_per_upstream_support() -> None:
+    backend, manager, _ = _recording_backend()
+    result = backend.handle_turn(
+        _llm_token(manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+    )
+    assert result["reasoning_applied"] == _REASONING_SET_WIRE
+
+    # An upstream that does not declare produces no proof, and absence is the refusal signal.
+    silent, silent_manager, _ = _recording_backend(upstream_applies=False)
+    unproven = silent.handle_turn(
+        _llm_token(silent_manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+    )
+    assert "reasoning_applied" not in unproven
+
+    # A default-reasoning request demands no proof: pre-B1 traffic keeps its wire shape.
+    assert "reasoning_applied" not in backend.handle_turn(_llm_token(manager), _turn_payload())
+
+
+def test_gateway_service_stream_terminal_frame_echoes_reasoning_applied_too() -> None:
+    backend, manager, _ = _recording_backend()
+    frames = list(
+        backend.handle_turn_stream(
+            _llm_token(manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+        )
+    )
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning_applied"] == _REASONING_SET_WIRE
+
+    plain = list(backend.handle_turn_stream(_llm_token(manager), _turn_payload()))
+    assert "reasoning_applied" not in plain[-1]
+
+
+def test_the_default_effort_sentinel_still_demands_proof() -> None:
+    """``effort="default"`` projects an EMPTY forwarded block — but it is a configured value,
+    so the empty block is exactly what must come back. This is the value-drift catcher: a hop
+    that rebuilt ``"medium"`` out of an omitted effort forwards ``{"effort": "medium"}``, and
+    a boolean echo could never see the difference."""
+
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    backend, manager, _ = _recording_backend()
+    result = backend.handle_turn(
+        _llm_token(manager), _turn_payload(reasoning={"effort": "default"})
+    )
+    assert result["reasoning_applied"] == {}
+
+    # The client half of the same corner: {} is proven only by {}, never by absence.
+    _check_reasoning_applied({}, "fail", {})
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_reasoning_applied({}, "fail", None)
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    with pytest.raises(ModelAdapterError):
+        _check_reasoning_applied({}, "fail", {"effort": "medium"})
+
+
+def test_check_reasoning_applied_matrix() -> None:
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    # Unconfigured (None): nothing to prove, whatever the wire says.
+    _check_reasoning_applied(None, "fail", None)
+    _check_reasoning_applied(None, "fail", dict(_REASONING_SET_WIRE))
+
+    # Proven: the echoed block is the forwarded block, key for key.
+    _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", dict(_REASONING_SET_WIRE))
+
+    # Absent under "fail" is the older-gateway case: refused, and recoverably so.
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", None)
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert rejected.value.retryable is False
+    assert rejected.value.config_recoverable is True
+
+    # A mismatching echo is not proof either.
+    with pytest.raises(ModelAdapterError):
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", {"effort": "medium"})
+
+    # "omit" is the documented way to accept a best-effort transport.
+    _check_reasoning_applied(dict(_REASONING_SET_WIRE), "omit", None)
+
+    # Wire shape is not a policy question: malformed refuses before any policy branch.
+    with pytest.raises(ModelAdapterError) as bad:
+        _check_reasoning_applied(None, "omit", [1, 2])
+    assert bad.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
+def test_next_turn_rejects_a_server_that_never_echoes_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reasoning twin of the old-server simulation, governed by reasoning's OWN knob."""
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    monkeypatch.setattr(
+        gateway_module, "urlopen", lambda *_a, **_k: _FakeHttpResponse(_served_turn())
+    )
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = GatewayModelAdapter(config=config)
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        adapter.next_turn(_request(config))
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    # The refusal happens after a complete, billed answer: it carries the turn's usage.
+    assert provider_usage_of(rejected.value) == {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    omit = ModelConfig(
+        reasoning=ReasoningConfig(effort="high", summary="auto", on_unsupported="omit"),
+        gateway_url="http://gateway.test",
+    )
+    assert GatewayModelAdapter(config=omit).next_turn(_request(omit)).final_text == "ok"
+
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(
+            _served_turn({"reasoning_applied": dict(_REASONING_SET_WIRE)})
+        ),
+    )
+    assert GatewayModelAdapter(config=config).next_turn(_request(config)).final_text == "ok"
+
+
+def test_turn_complete_frame_carries_and_validates_the_reasoning_echo() -> None:
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "reasoning_applied": dict(_REASONING_SET_WIRE),
+    }
+    chunk = _chunk_from_event(frame)
+    assert isinstance(chunk, TurnComplete)
+    assert chunk.reasoning_applied == _REASONING_SET_WIRE
+
+    without = _chunk_from_event({**frame, "reasoning_applied": None})
+    assert isinstance(without, TurnComplete)
+    assert without.reasoning_applied is None
+
+    with pytest.raises(ModelAdapterError) as bad:
+        _chunk_from_event({**frame, "reasoning_applied": [1, 2]})
+    assert bad.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
+def test_a_stream_without_a_terminal_frame_refuses_unproven_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+
+    tolerant = ModelConfig(
+        reasoning=ReasoningConfig(effort="high", on_unsupported="omit"),
+        gateway_url="http://gateway.test",
+    )
+    chunks = _drain(_terminal_frameless_adapter(monkeypatch, tolerant), _request(tolerant))
+    assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
 
 
 def test_generation_support_probe_is_opt_in_and_fail_closed() -> None:
@@ -524,7 +703,7 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
         model="gpt-5.5",
         system_prompt="sys",
         tools=(),
-        reasoning=ReasoningConfig(),
+        reasoning=ReasoningConfig(effort="high", on_unsupported="omit"),
         generation=GenerationConfig(temperature=0.2, on_unsupported="omit"),
         output_schema={"type": "object"},
     )
@@ -534,9 +713,12 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     echoes = _applied_echoes(request, upstream, _upstream_model_config(request))
     assert "generation_applied" not in echoes
     assert echoes["schema_applied"] is False
+    # The reasoning twin: the inner hop admitted it was not proving, so no fresh echo.
+    assert "reasoning_applied" not in echoes
 
     proving_request = replace(
         request,
+        reasoning=_REASONING_SET,
         generation=GenerationConfig(temperature=0.2),
         output_schema={"type": "object"},
     )
@@ -548,6 +730,7 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     )
     assert proven["generation_applied"] == {"temperature": 0.2}
     assert proven["schema_applied"] is True
+    assert proven["reasoning_applied"] == _REASONING_SET_WIRE
 
 
 def test_gateway_service_never_asserts_application_from_the_request() -> None:
@@ -557,16 +740,29 @@ def test_gateway_service_never_asserts_application_from_the_request() -> None:
     sampling parameters no model ever saw."""
 
     backend, manager, _ = _recording_backend(upstream_applies=False)
-    payload = _turn_payload(generation=dict(_SET_WIRE))
+    payload = _turn_payload(
+        generation=dict(_SET_WIRE), reasoning=dict(_REASONING_SET_WIRE)
+    )
 
     assert "generation_applied" not in backend.handle_turn(_llm_token(manager), payload)
     frames = list(backend.handle_turn_stream(_llm_token(manager), payload))
     assert "generation_applied" not in frames[-1]
+    assert "reasoning_applied" not in backend.handle_turn(_llm_token(manager), payload)
+    assert "reasoning_applied" not in frames[-1]
 
     # ...and the client refuses that turn under the default policy, on both transports.
     with pytest.raises(ModelAdapterError) as rejected:
         _check_generation_applied(_SET_WIRE, "fail", None)
     assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    with pytest.raises(ModelAdapterError) as unproven_reasoning:
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", None)
+    assert unproven_reasoning.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
 
 
 @pytest.mark.parametrize("policy", ("fail", "omit"))
@@ -1255,6 +1451,7 @@ _TERMINAL_FRAME_REFUSALS: dict[str, dict] = {
     "stop_reason": {"stop_reason": 7},
     "turn_handle": {"turn_handle": 7},
     "generation_applied": {"generation_applied": [1, 2]},
+    "reasoning_applied": {"reasoning_applied": [1, 2]},
     "provider_retried": {"provider_retried": "yes"},
 }
 

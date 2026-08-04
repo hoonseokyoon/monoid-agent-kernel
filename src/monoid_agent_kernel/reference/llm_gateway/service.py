@@ -22,10 +22,15 @@ from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, Reasoni
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
-from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
+from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
+    build_reasoning_payload,
+    normalize_usage,
+)
 from monoid_agent_kernel.providers.base import (
     generation_support,
     provider_usage_of,
+    reasoning_support,
     resolved_provider_name,
     structured_output_support,
 )
@@ -505,14 +510,15 @@ def _applied_echoes(
 ) -> dict[str, Any]:
     """The applied-parameters proofs for one turn — built once, emitted by both transports.
 
-    Both echoes answer the same question, so both are derived the same way: **from what the
+    All three echoes answer the same question, so all are derived the same way: **from what the
     upstream adapter declared it does**, never from what the request asked for. A gateway that
     copied the requested block back would produce an exact match no matter what the upstream
     did with it — an offline echo adapter, a text-only backend, or any
     ``provider_adapter_factory`` that ignores ``ModelConfig.generation`` would all read as
     "applied", and the client's ``on_unsupported="fail"`` would accept sampling parameters that
-    were never sent to a model. Unproven is reported as unproven: the generation echo is simply
-    absent (which a fail-closed client refuses), and the schema echo is an explicit ``False``.
+    were never sent to a model. Unproven is reported as unproven: the generation and reasoning
+    echoes are simply absent (which a fail-closed client refuses), and the schema echo is an
+    explicit ``False``.
 
     ``config`` is the per-call config the upstream call runs under (``_upstream_model_config``),
     threaded into the probes because a declaration may be policy-conditional: a *chained*
@@ -521,8 +527,12 @@ def _applied_echoes(
     factory-built adapter mint proof for a call whose wire policy said ``"omit"`` — the exact
     copied-back-proof defect this function exists to rule out, one config-source hop later.
 
-    Both stay off the response entirely when the request did not use the feature, so traffic
-    that configures neither keeps its exact pre-W5 wire shape.
+    All three stay off the response entirely when the request did not use the feature, so
+    traffic that configures none keeps its exact pre-W5 wire shape. Reasoning's "did the
+    request use it" gate is ``is_default`` rather than the projected payload the other two
+    read, because the DEFAULT reasoning config projects a non-empty provider block
+    (``{"effort": "medium"}``) — and ``effort="default"`` projects an empty one that is still
+    a configured value, so ``reasoning_applied`` may legitimately be ``{}``.
     """
 
     echoes: dict[str, Any] = {}
@@ -531,6 +541,8 @@ def _applied_echoes(
         echoes["generation_applied"] = requested_generation
     if request.output_schema is not None:
         echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
+    if not config.reasoning.is_default and reasoning_support(adapter, config) == "native":
+        echoes["reasoning_applied"] = build_reasoning_payload(config.reasoning)
     return echoes
 
 

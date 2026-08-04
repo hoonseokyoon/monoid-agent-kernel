@@ -534,6 +534,11 @@ class TurnComplete:
     # ``output_schema`` to an upstream that natively enforces it. A sibling key, not a member
     # of the generation echo -- changing an existing key's shape is how old clients break.
     schema_applied: bool | None = None
+    # The reasoning member of the echo family (v0.21 B1): the forwarded reasoning block, in
+    # the generation echo's shape because reasoning has values a client can compare. ``{}`` is
+    # a real proof (``effort="default"`` forwards an empty block), so only ``None`` means the
+    # wire never mentioned it.
+    reasoning_applied: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -548,6 +553,8 @@ class TurnComplete:
             payload["generation_applied"] = dict(self.generation_applied)
         if self.schema_applied is not None:
             payload["schema_applied"] = self.schema_applied
+        if self.reasoning_applied is not None:
+            payload["reasoning_applied"] = dict(self.reasoning_applied)
         return payload
 
 

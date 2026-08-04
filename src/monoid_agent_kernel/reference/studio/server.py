@@ -496,7 +496,16 @@ def _runtime_config_for(
             tools.extend(bindings)
     return AgentRuntimeConfig(
         definition_id="studio-agent",
-        model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
+        model=ModelConfig(
+            model=model,
+            # Studio's effort/summary are DISPLAY preferences, not a correctness contract, and
+            # its default upstream is the offline echo provider — which honestly declares no
+            # reasoning_support, so under the default "fail" the reasoning_applied echo check
+            # would refuse every offline turn. "omit" states what this app actually wants:
+            # best-effort transport. A proving upstream (the real OpenAI adapter behind the
+            # gateway) still emits the echo and still proves; nothing is lost there.
+            reasoning=ReasoningConfig(effort=effort, summary=summary, on_unsupported="omit"),
+        ),
         prompt=PromptSpec(system_prompt_base=system_prompt),
         tools=tuple(tools),
     )

@@ -89,6 +89,7 @@ GATEWAY_AUTH_ERROR = "gateway_auth_error"
 GATEWAY_BAD_RESPONSE = "gateway_bad_response"
 GATEWAY_GENERATION_NOT_APPLIED = "gateway_generation_not_applied"
 GATEWAY_SCHEMA_NOT_APPLIED = "gateway_schema_not_applied"
+GATEWAY_REASONING_NOT_APPLIED = "gateway_reasoning_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
@@ -325,6 +326,14 @@ class GatewayModelAdapter:
                             data.get("schema_applied"),
                             known_provider_retried=turn.provider_retried,
                         )
+                        _check_reasoning_applied(
+                            None
+                            if config.reasoning.is_default
+                            else build_reasoning_payload(config.reasoning),
+                            config.reasoning.on_unsupported,
+                            data.get("reasoning_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
                     except ModelAdapterError as unproven:
                         mark_provider_usage(unproven, turn.usage)
                         raise
@@ -503,6 +512,14 @@ class GatewayModelAdapter:
                                             chunk.schema_applied,
                                             known_provider_retried=chunk.provider_retried,
                                         )
+                                        _check_reasoning_applied(
+                                            None
+                                            if config.reasoning.is_default
+                                            else build_reasoning_payload(config.reasoning),
+                                            config.reasoning.on_unsupported,
+                                            chunk.reasoning_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
                                     except ModelAdapterError as unproven:
                                         mark_provider_usage(unproven, chunk.usage)
                                         raise
@@ -529,6 +546,14 @@ class GatewayModelAdapter:
                             _check_schema_applied(
                                 request.output_schema is not None,
                                 config.generation.on_unsupported,
+                                None,
+                                known_provider_retried=attempt > 1,
+                            )
+                            _check_reasoning_applied(
+                                None
+                                if config.reasoning.is_default
+                                else build_reasoning_payload(config.reasoning),
+                                config.reasoning.on_unsupported,
                                 None,
                                 known_provider_retried=attempt > 1,
                             )
@@ -1015,6 +1040,24 @@ def _validated_schema_echo(
     )
 
 
+def _validated_reasoning_echo(
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
+) -> dict[str, Any] | None:
+    """The ``reasoning_applied`` sibling of :func:`_validated_generation_echo`, same rule --
+    an object like the generation echo, because reasoning's forwarded block has values the
+    client can compare, not just a yes/no like the schema's."""
+
+    if applied is None or isinstance(applied, dict):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid reasoning_applied echo: expected an object",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        http_status=http_status,
+        provider_retried=provider_retried,
+    )
+
+
 def _same_echoed_value(echoed: Any, requested: Any) -> bool:
     """One requested knob against its echo, without Python's cross-type numeric equality.
 
@@ -1095,11 +1138,15 @@ def _check_schema_applied(
 ) -> None:
     """The schema twin of :func:`_check_generation_applied`, same policy knob.
 
-    One ``on_unsupported`` governs both proofs deliberately: "how to treat a parameter the
-    transport cannot prove was applied" is one question, and two half-set knobs (fail for one,
-    omit for the other) would be a new surface for exactly the kind of asymmetry W5 exists to
-    close. ``applied`` is a tri-state: ``True`` proves it, ``False`` is the server saying its
-    upstream cannot enforce schemas, absent (``None``) is an older server.
+    One ``generation.on_unsupported`` governs the generation and schema proofs deliberately:
+    within one feature family, "how to treat a parameter the transport cannot prove was
+    applied" is one question, and two half-set knobs (fail for one, omit for the other) would
+    be a new surface for exactly the kind of asymmetry W5 exists to close. The rule is one
+    knob per feature family, not one knob for every proof: reasoning is a separate family
+    with its own ``reasoning.on_unsupported`` -- a field the request wire already carries
+    separately -- and :func:`_check_reasoning_applied` reads that one. ``applied`` is a
+    tri-state: ``True`` proves it, ``False`` is the server saying its upstream cannot enforce
+    schemas, absent (``None``) is an older server.
     """
 
     applied = _validated_schema_echo(applied, provider_retried=known_provider_retried)
@@ -1118,6 +1165,46 @@ def _check_schema_applied(
         f"LLM gateway did not apply the requested output schema: {detail}; "
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
+        retryable=False,
+        config_recoverable=True,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _check_reasoning_applied(
+    requested: dict[str, Any] | None,
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """The reasoning member of the proof family, governed by ``reasoning.on_unsupported``.
+
+    ``requested`` is the exact forwarded block this client derives from its own config
+    (``build_reasoning_payload``), or ``None`` when the config is the default -- the one case
+    with nothing to prove. ``None`` and ``{}`` are different requests on purpose:
+    ``effort="default"`` projects an *empty* forwarded block, and that block must come back as
+    ``{}`` -- a hop that quietly rebuilt ``"medium"`` out of an omitted effort echoes
+    ``{"effort": "medium"}`` and fails the match, which is exactly the drift this proof exists
+    to catch. So the early return tests ``is None``, never truthiness.
+    """
+
+    applied = _validated_reasoning_echo(applied, provider_retried=known_provider_retried)
+    if requested is None:
+        return
+    if _generation_echo_matches(applied, requested):
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no reasoning_applied echo (older gateway?)"
+        if applied is None
+        else "the reasoning_applied echo does not match the requested configuration"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested reasoning configuration: {detail}; "
+        'set model.reasoning.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_REASONING_NOT_APPLIED,
         retryable=False,
         config_recoverable=True,
         provider_retried=known_provider_retried,
@@ -1542,10 +1629,16 @@ def _chunk_from_event(
                 http_status=status_hint,
                 provider_retried=retried,
             )
+            reasoning_applied = _validated_reasoning_echo(
+                event.get("reasoning_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
+            )
             # The gateway's opaque turn_handle is the continuation handle the core stores.
             return TurnComplete(
                 generation_applied=applied,
                 schema_applied=schema_applied,
+                reasoning_applied=reasoning_applied,
                 response_id=_gateway_string(
                     event,
                     "turn_handle",

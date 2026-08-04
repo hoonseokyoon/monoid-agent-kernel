@@ -1049,11 +1049,12 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
     accepting the parameter and dropping it on the floor would satisfy a signature census and
     fix nothing.
 
-    Nine now, not six. Every validator that joined the wire afterwards inherited the same
-    obligation -- ``_gateway_reasoning_items`` with X-3's reasoning hop, and the two echo
-    validators, which were the pair the value-validator census turned up unregistered. The list
-    the conformance suite pins against is derived from "does it raise", so a tenth arrives here as
-    a failing census rather than as a quiet omission.
+    Ten now, not six. Every validator that joined the wire afterwards inherited the same
+    obligation -- ``_gateway_reasoning_items`` with X-3's reasoning hop, the two echo
+    validators the value-validator census turned up unregistered, and B1's
+    ``_validated_reasoning_echo``, which joined the censused way. The list the conformance
+    suite pins against is derived from "does it raise", so an eleventh arrives here as a
+    failing census rather than as a quiet omission.
     """
     from monoid_agent_kernel.providers.gateway import (
         _exact_gateway_bool,
@@ -1064,6 +1065,7 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
         _gateway_usage,
         _portable_gateway_payload,
         _validated_generation_echo,
+        _validated_reasoning_echo,
         _validated_schema_echo,
     )
 
@@ -1100,6 +1102,9 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
             "not an object", http_status=400
         ),
         "_validated_schema_echo": lambda: _validated_schema_echo("not a bool", http_status=400),
+        "_validated_reasoning_echo": lambda: _validated_reasoning_echo(
+            "not an object", http_status=400
+        ),
     }
 
     for name, raiser in raisers.items():

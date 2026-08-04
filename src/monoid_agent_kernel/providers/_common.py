@@ -14,7 +14,15 @@ from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
-    """Reasoning block for a model request: ``{}`` when default/off, else effort/summary."""
+    """Reasoning block for a model request: ``{}`` when default/off, else effort/summary.
+
+    Like its generation sibling below, this projection is also the gateway server's
+    ``reasoning_applied`` echo and the client checker's expected value, so the two sides of
+    that wire agree on the *shape* of "applied" by construction. Note the default config is
+    NOT the empty block here (``ReasoningConfig()`` projects ``{"effort": "medium"}``), which
+    is why "did the request use the feature" is answered by ``ReasoningConfig.is_default``
+    rather than by this payload's truthiness.
+    """
     payload: dict[str, Any] = {}
     if reasoning.effort != "default":
         payload["effort"] = reasoning.effort

@@ -14,6 +14,22 @@ from support.studio_harness import (
 pytestmark = pytest.mark.integration
 
 
+def test_studio_reasoning_policy_is_best_effort() -> None:
+    """Studio declares ``reasoning.on_unsupported="omit"`` — a policy pin, not an accident.
+
+    Its effort/summary knobs are display preferences and its default upstream is the offline
+    echo provider, which honestly declares no ``reasoning_support``. Under the default
+    ``"fail"`` the B1 ``reasoning_applied`` check refuses every offline turn; ``"omit"`` is
+    the documented way for an app that wants best-effort transport to say so, and a proving
+    upstream (the real OpenAI adapter behind the gateway) still emits and still proves.
+    """
+
+    config = _runtime_config_for([])
+    assert config.model.reasoning.on_unsupported == "omit"
+    # The display preferences stay what the settings chose.
+    assert config.model.reasoning.summary == "auto"
+
+
 def test_runtime_config_for_subset() -> None:
     # run.update_plan is always bound (observability); capability toggles add the rest.
     refs = {b.ref.tool_id for b in _runtime_config_for(["read"]).tools}
