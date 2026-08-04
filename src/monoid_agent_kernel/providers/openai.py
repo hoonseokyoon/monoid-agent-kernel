@@ -32,6 +32,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     TurnComplete,
     mark_provider_usage,
+    normalize_model_stream_chunk,
 )
 
 
@@ -1155,7 +1156,10 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     transports. Enumerated rather than assumed: ``normalize_usage`` refuses a malformed
     ``usage``, and ``_stop_reason_from_response`` walks ``incomplete_details``, ``output`` and
     each message's ``content``, so a final payload malformed in any of those is refused here on
-    a turn the provider already billed.
+    a turn the provider already billed. The assembled chunk is then normalized inside the same
+    guard -- ``TurnComplete`` itself validates nothing, so the ingress normalizer's strict pass
+    (a non-string ``id`` is the reachable case) would otherwise refuse it one step later,
+    outside the stamp.
 
     The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
     ``ModelAdapterError``, which is why the guard catches ``Exception``. Every consumer of the
@@ -1170,14 +1174,24 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     try:
         output_items = final_data.get("output") or []
         has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
-        return TurnComplete(
-            response_id=final_data.get("id"),
-            usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
-            # encrypted_content lives only on the final response object, so reasoning items
-            # are captured here (from response.completed) rather than the per-token deltas.
-            reasoning=_capture_reasoning_items(output_items),
-            stop_reason=_stop_reason_from_response(final_data, tool_calls_present=has_tool_calls),
-            provider_retried=provider_retried,
+        # Normalized INSIDE the guard, deliberately: ``TurnComplete`` itself validates nothing,
+        # so a field this construction copies raw (a non-string ``id`` is the reachable case)
+        # used to leave here successfully and be refused one step later by the ingress
+        # normalizer -- outside this ``try``, so the refusal carried no usage for a turn the
+        # provider already billed. Running the same normalization here moves every field's
+        # FIRST validation to where the stamp is; the downstream pass re-runs it idempotently.
+        return normalize_model_stream_chunk(
+            TurnComplete(
+                response_id=final_data.get("id"),
+                usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+                # encrypted_content lives only on the final response object, so reasoning items
+                # are captured here (from response.completed) rather than the per-token deltas.
+                reasoning=_capture_reasoning_items(output_items),
+                stop_reason=_stop_reason_from_response(
+                    final_data, tool_calls_present=has_tool_calls
+                ),
+                provider_retried=provider_retried,
+            )
         )
     except Exception as refused:
         mark_provider_usage(refused, usage_reported_by(final_data))

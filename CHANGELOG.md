@@ -7,6 +7,17 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the terminal chunk is validated where its stamp is
+
+- **The stream's end-of-turn payload is normalized inside the usage guard.** `TurnComplete`
+  itself validates nothing, so a field the terminal construction copies raw — a non-string `id`
+  is the reachable case — used to leave `_terminal_chunk` successfully and be refused one step
+  later by the ingress normalizer's strict pass, outside the guard: the refusal carried no usage,
+  and the receipt, the run's token budget and the gateway tenant meter recorded zero for a turn
+  the provider already billed. The same normalization now runs inside the guarded region, so
+  every field's *first* validation happens where the stamp is; the downstream pass re-runs it
+  idempotently, and the refusal arrives classified (`ModelAdapterError`) rather than raw.
+
 ### Fixed — a new keyword does not move the arguments that predate it
 
 - **`llm_gateway_provider` is keyword-only on every constructor it joined.** It landed

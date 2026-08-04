@@ -738,6 +738,31 @@ def test_a_refused_billed_terminal_payload_still_reports_the_tokens_it_burned(
     }
 
 
+def test_a_billed_terminal_payload_with_a_malformed_id_still_reports_its_cost() -> None:
+    """The refusal the INGRESS NORMALIZER raises must carry the payload's cost too.
+
+    ``TurnComplete`` validates nothing, so a non-string ``id`` used to leave ``_terminal_chunk``
+    successfully and be refused one step later by ``normalize_model_stream_chunk`` -- outside the
+    guard, so the refusal carried no usage and the receipt, the run budget and the gateway meter
+    all recorded zero for a billed turn. The chunk is normalized inside the guarded region now,
+    so the first validation of every field happens where the stamp is.
+    """
+
+    from monoid_agent_kernel.providers.base import (
+        ModelAdapterError,
+        normalize_model_stream_chunk,
+        provider_usage_of,
+    )
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(id=123)
+    with pytest.raises(ModelAdapterError) as refused:
+        normalize_model_stream_chunk(_terminal_chunk(payload, provider_retried=False))
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
+        "hint": "the ingress normalizer's rejection is the same act on the same billed payload",
+    }
+
+
 def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_counts() -> None:
     """The streamed twin of ``usage-details-not-an-object``, kept out of the table above.
 
