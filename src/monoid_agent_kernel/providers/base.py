@@ -1280,11 +1280,19 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     # common cases so the loop's branch still works — tool calls present → tool_calls, else stop.
     if stop_reason is None:
         stop_reason = "tool_calls" if tool_calls else "stop"
+    try:
+        # Provably a re-normalization: every chunk passed the ingress above, whose
+        # TurnComplete branch already ran normalize_usage. Guarded rather than deleted —
+        # removing normalization is a loosening-shaped edit, and a future path that reaches
+        # this fold with garbage must refuse in the ingress's classified voice, not raw.
+        normalized_usage = normalize_usage(usage) if usage else {}
+    except Exception as exc:
+        raise ModelAdapterError("model adapter returned a non-portable stream fragment") from exc
     return ModelTurn(
         response_id=response_id,
         final_text="".join(text_parts) if text_parts else None,
         tool_calls=tuple(tool_calls),
-        usage=normalize_usage(usage) if usage else {},
+        usage=normalized_usage,
         reasoning=reasoning,
         stop_reason=stop_reason,
         provider_retried=provider_retried,

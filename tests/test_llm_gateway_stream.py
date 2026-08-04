@@ -347,12 +347,13 @@ def test_gateway_adapter_raises_on_mid_stream_error_frame() -> None:
 # --- the terminal payload a refused stream was already billed for -------------------------
 #
 # The OpenAI adapter stamps what a refused end-of-turn payload cost (``_terminal_chunk``), and
-# every refusal in that region is a RAW ``ValueError``/``AttributeError``: the stream never runs
-# the one-shot mapping that raises ``ModelAdapterError``. Both consumers on THIS route read the
-# stamp off the escaping exception -- the tenant ledger and the SSE error frame -- and both were
-# gated on ``ModelAdapterError``, so a stream whose final payload is malformed charged the tenant
-# nothing, told the client nothing, and came back ``retryable=True``: an invitation to buy the
-# same tokens again.
+# since the chip classification every refusal in that region leaves as non-retryable
+# ``openai_bad_response`` -- the shapes that used to escape as RAW ``ValueError``/
+# ``AttributeError`` included. Both consumers on THIS route (the tenant ledger and the SSE
+# error frame) stayed type-agnostic through that change deliberately: they were widened for
+# the raw era, and a third-party upstream can still refuse raw. What the classification fixes
+# on this wire is the VERDICT: the raw shapes used to answer 500 ``retryable=True`` -- an
+# invitation to buy the same tokens again -- and now answer 502, non-retryable, with a name.
 
 _BILLED_TERMINAL_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
 
@@ -365,7 +366,8 @@ def _malformed_billed_terminal_payload() -> dict[str, Any]:
         "status": "completed",
         "usage": dict(_BILLED_TERMINAL_USAGE),
         # The terminal reader walks ``output`` for tool calls and for the stop reason, so a
-        # string there refuses with a raw ``AttributeError`` -- on a turn already generated.
+        # string there refuses (a raw ``AttributeError`` under the hood, classified on the way
+        # out) -- on a turn already generated.
         "output": "not-an-array",
     }
 
@@ -408,10 +410,28 @@ def test_a_stream_refused_on_its_terminal_payload_still_charges_the_tenant() -> 
         "hint": "the refusal carries what the stream already burned; the frame is the only "
         "carrier a streaming client has left",
     }
+    # The classified verdict on the frame: named, non-retryable -- the 500 retryable:true this
+    # shape used to answer told a streaming client to buy the same tokens again.
+    assert errors[0]["error_code"] == "openai_bad_response"
+    assert errors[0]["retryable"] is False
     assert gateway.tenant_usage("tenant_a")["total_tokens"] == 460, {
         "tenant_ledger": gateway.tenant_usage("tenant_a"),
         "hint": "the generator exits on the raise, before the success-path meter",
     }
+
+
+def test_the_assembler_refuses_a_malformed_streamed_usage_classified() -> None:
+    """The fold's last raw seam, pinned closed (born green via the internal ingress).
+
+    Every chunk ``assemble_streamed_turn`` folds passes ``normalize_model_stream_chunk``
+    first, so the fold's own ``normalize_usage`` re-run is provably re-normalizing validated
+    input today -- but the call is guarded anyway, because deleting normalization is a
+    loosening-shaped edit and a future path that reaches the fold with garbage must refuse in
+    the ingress's classified voice, never a raw ``ValueError``.
+    """
+
+    with pytest.raises(ModelAdapterError):
+        assemble_streamed_turn([TurnComplete(usage={"input_tokens": "many"})])  # type: ignore[dict-item]
 
 
 def test_the_client_behind_that_stream_reports_what_the_refusal_cost() -> None:

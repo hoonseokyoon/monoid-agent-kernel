@@ -759,7 +759,7 @@ def test_a_refused_billed_terminal_payload_still_reports_the_tokens_it_burned(
     from monoid_agent_kernel.providers.openai import _terminal_chunk
 
     payload = _billed_response_body(**_BILLED_TERMINAL_REFUSALS[shape])
-    with pytest.raises(Exception) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(payload, provider_retried=False)
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "malformed_shape": shape,
@@ -807,9 +807,42 @@ def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_co
     payload = _billed_response_body(
         usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
     )
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(payload, provider_retried=False)
+    assert refused.value.provider_error_code == "openai_bad_response"
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_a_raw_malformed_terminal_payload_is_refused_classified() -> None:
+    """The chip's streamed half: the argument-evaluation refusals arrive classified too.
+
+    ``normalize_model_stream_chunk`` runs INSIDE the guard since fa90590, but Python evaluates
+    the ``TurnComplete`` arguments before that call -- so ``normalize_usage``'s ``ValueError``
+    and the stop-reason walk's ``AttributeError`` still escaped raw, ahead of the normalizer.
+    The guard's classifying arm is what closes them.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(
+        usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _terminal_chunk(payload, provider_retried=True)
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+    assert isinstance(refused.value.__cause__, ValueError)
+
+    stop_reason_shape = _billed_response_body(
+        **_BILLED_TERMINAL_REFUSALS["malformed-incomplete-details"]
+    )
+    with pytest.raises(ModelAdapterError) as second:
+        _terminal_chunk(stop_reason_shape, provider_retried=False)
+    assert second.value.provider_error_code == "openai_bad_response"
+    assert isinstance(second.value.__cause__, AttributeError)
 
 
 def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -> None:
@@ -819,8 +852,9 @@ def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -
     from monoid_agent_kernel.providers.base import provider_usage_of
     from monoid_agent_kernel.providers.openai import _terminal_chunk
 
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(_billed_response_body(usage="nope"), provider_retried=False)
+    assert refused.value.provider_error_code == "openai_bad_response"
     assert provider_usage_of(refused.value) == {}
 
 

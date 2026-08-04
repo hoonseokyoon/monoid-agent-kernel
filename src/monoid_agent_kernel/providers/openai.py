@@ -1177,14 +1177,17 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     (a non-string ``id`` is the reachable case) would otherwise refuse it one step later,
     outside the stamp.
 
-    The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
-    ``ModelAdapterError``, which is why the guard catches ``Exception``. Every consumer of the
-    stamp reads it off the escaping exception whatever its type -- the receipt
-    (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the reference
-    gateway's tenant meter and both of its error writers, which used to inspect only a
-    ``ModelAdapterError`` and so skipped precisely this region. Stamping is still the whole of
-    the fix here: classifying these would change how the loop treats them, which is a separate
-    decision, and the carry no longer depends on making it.
+    Some refusals in this region are born raw -- ``normalize_usage`` and the stop-reason walk
+    raise ``ValueError``/``AttributeError`` while the ``TurnComplete`` arguments are still
+    being evaluated, ahead of the normalizer below -- which is why the guard catches
+    ``Exception``. The guard now also CLASSIFIES, for the same reasons as the body reader's
+    (see :func:`_parse_response`): a raw escape reached the loop's blanket wrapper unstamped
+    in-process, and the gateway's 500 arm answered ``retryable: true`` for a payload defect
+    over a hop. Every non-classified refusal leaves here as non-retryable
+    ``openai_bad_response`` with the raw cause chained; every consumer of the stamp -- the
+    receipt (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the
+    reference gateway's tenant meter and both of its error writers -- deliberately stays
+    type-agnostic regardless, because a third-party adapter can still refuse raw.
     """
 
     try:
@@ -1209,9 +1212,18 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
                 provider_retried=provider_retried,
             )
         )
-    except Exception as refused:
+    except ModelAdapterError as refused:
         mark_provider_usage(refused, usage_reported_by(final_data))
         raise
+    except Exception as raw:
+        refused = ModelAdapterError(
+            f"OpenAI returned a malformed terminal payload: {raw}",
+            provider_error_code="openai_bad_response",
+            retryable=False,
+            provider_retried=provider_retried,
+        )
+        mark_provider_usage(refused, usage_reported_by(final_data))
+        raise refused from raw
 
 
 def _coerce_response(response: object) -> dict[str, Any]:
