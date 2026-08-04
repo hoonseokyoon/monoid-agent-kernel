@@ -555,7 +555,9 @@ class StudioConfig:
     # the embedder seam: a ``provider_factory`` replaces the gateway's whole upstream, so the
     # derivation can only answer "do not tag" for it -- correct as a guess, and no way to be told
     # otherwise, which left an OpenAI-backed factory's reasoning round-trip silently dead.
-    llm_gateway_provider: str | None = None
+    # Keyword-only so the pre-existing positional order is preserved: ``stream_output_deltas``
+    # was the eleventh positional and must stay so.
+    llm_gateway_provider: str | None = field(default=None, kw_only=True)
     # Permit model-authored content to leave the run through Studio's private sidecar and passive
     # live stream. ``MONOID_OUTPUT_DELTAS`` is the deployment-wide permission gate on top. The
     # durable operation log stays compact either way, and provider streaming remains selected so

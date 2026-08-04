@@ -7,6 +7,18 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a new keyword does not move the arguments that predate it
+
+- **`llm_gateway_provider` is keyword-only on every constructor it joined.** It landed
+  mid-dataclass on `RunnerBackend`, `BackendLoopFactoryContext` and `StudioConfig`, beside the
+  URL it describes — which silently rebound every later positional argument: an embedder's
+  fifth positional `model_adapter_factory` was stored as the relayed-provider string and the
+  factory left unset, surfacing only when `resolve_relayed_provider` called `.strip()` on a
+  callable. `kw_only=True` keeps the field beside its sibling without moving anything that
+  predates it. (`GatewayModelAdapter.provider_name` was already appended last and is untouched.)
+  The positional signatures of all four constructors are now pinned append-only in
+  `test_public_surface.py`, so the next mid-insert fails a test instead of an embedder.
+
 ### Fixed — an early rejection reaches the client on all four reference servers, not one
 
 - **A response written before the request body was read was being discarded by a TCP reset.** A

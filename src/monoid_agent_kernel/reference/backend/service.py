@@ -380,7 +380,10 @@ class RunnerBackend:
     # ``ModelConfig`` one: it describes the deployment's transport, not the agent's config, and
     # ``ModelConfig`` feeds ``config_hash`` (a new field there would invalidate durable recovery
     # metadata for every existing run).
-    llm_gateway_provider: str | None = DEFAULT_RELAYED_PROVIDER
+    # Keyword-only so it can live beside the URL it describes without rebinding the positional
+    # arguments that predate it: an embedder's fifth positional was ``model_adapter_factory``
+    # and must stay so.
+    llm_gateway_provider: str | None = field(default=DEFAULT_RELAYED_PROVIDER, kw_only=True)
     model_adapter_factory: ModelAdapterFactory | None = None
     web_gateway_url: str | None = None
     allowed_apply_roots: tuple[Path, ...] = ()

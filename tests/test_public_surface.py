@@ -593,3 +593,112 @@ if blocked:
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_the_relayed_provider_fields_are_keyword_only() -> None:
+    """A field added to a shipped constructor must not rebind its positional arguments.
+
+    ``llm_gateway_provider`` (and the loop-factory context's provider accessor) landed
+    mid-dataclass, before fields embedders already pass positionally -- so an existing fifth
+    positional ``model_adapter_factory`` would be stored as the relayed-provider string and the
+    factory left unset, discovered only when ``resolve_relayed_provider`` calls ``.strip()`` on a
+    callable. Keyword-only keeps the new knob beside the URL it describes without moving any
+    argument that predates it.
+    """
+    import dataclasses
+
+    from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+
+    for cls, name in (
+        (RunnerBackend, "llm_gateway_provider"),
+        (BackendLoopFactoryContext, "llm_gateway_provider_provider"),
+        (StudioConfig, "llm_gateway_provider"),
+    ):
+        (fld,) = [f for f in dataclasses.fields(cls) if f.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must be keyword-only to preserve positional order"
+
+
+def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
+    """The behavioral half: the old positional shapes still mean what they meant.
+
+    ``RunnerBackend``'s fifth positional was ``model_adapter_factory`` and ``StudioConfig``'s
+    eleventh was ``stream_output_deltas``; both must still be.
+    """
+    from pathlib import Path as _Path
+
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+    from monoid_agent_kernel.reference._shared.tokens import TokenManager
+
+    def factory(*args: object, **kwargs: object) -> object:  # a stand-in adapter factory
+        raise AssertionError("never called")
+
+    backend = RunnerBackend(
+        _Path("runs"), TokenManager(secret=b"s" * 32), (_Path("."),), "http://gateway", factory
+    )
+    assert backend.model_adapter_factory is factory
+    assert backend.llm_gateway_provider == "openai"
+
+    studio = StudioConfig(
+        _Path("."), "127.0.0.1", 8799, "offline", _Path("runs"), None, False, True, None, None, False
+    )
+    assert studio.stream_output_deltas is False
+    assert studio.llm_gateway_provider is None
+
+
+def test_stable_constructor_positional_order_is_append_only() -> None:
+    """The positional signature of the shipped constructors is a compatibility surface.
+
+    A field inserted mid-dataclass silently rebinds every positional argument after it -- no
+    error, wrong object -- so growth must be appended or keyword-only. These literal pins make a
+    mid-insert fail here; a legitimate append changes only the tail, which is a conscious,
+    reviewable pin move. ``GatewayModelAdapter.provider_name`` is the one documented append.
+    """
+    import dataclasses
+
+    from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+    from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+
+    def positional(cls: type) -> tuple[str, ...]:
+        return tuple(f.name for f in dataclasses.fields(cls) if f.init and not f.kw_only)
+
+    assert positional(GatewayModelAdapter) == (
+        "config", "gateway_url", "token", "token_env", "token_file", "token_provider",
+        "provider_name",
+    )
+    assert positional(StudioConfig) == (
+        "workspace", "host", "port", "provider", "run_root", "skills_directory", "mcp",
+        "memory", "memory_directory", "env_file", "stream_output_deltas",
+    )
+    assert positional(BackendLoopFactoryContext) == (
+        "run_root_provider", "llm_gateway_url_provider", "web_gateway_url_provider",
+        "model_adapter_factory_provider", "token_manager_provider",
+        "llm_gateway_token_ttl_s_provider", "checkpoint_store_provider",
+        "emit_output_deltas_provider", "stream_model_calls_provider",
+        "model_content_file_provider", "model_stream_observer_factories_provider",
+        "extra_event_sink_factories_provider", "model_io_subscription_factories_provider",
+        "subagent_definitions_provider", "tool_providers_provider",
+        "context_providers_provider", "output_validators_provider",
+        "capability_broker_factory_provider", "outbox_sender_factory_provider",
+        "current_runtime_config", "record", "record_event", "persist_checkpoint_payload",
+    )
+    assert positional(RunnerBackend) == (
+        "run_root", "token_manager", "allowed_workspace_roots", "llm_gateway_url",
+        "model_adapter_factory", "web_gateway_url", "allowed_apply_roots", "run_token_ttl_s",
+        "llm_gateway_token_ttl_s", "web_gateway_token_ttl_s", "task_callback_token_ttl_s",
+        "idle_timeout_s", "max_session_lifetime_s", "max_turns", "task_wait_poll_s",
+        "max_consecutive_turn_failures", "turn_retry", "emit_output_deltas",
+        "stream_model_calls", "model_content_file", "model_stream_broker",
+        "subagent_definitions", "extra_event_sink_factories",
+        "model_io_subscription_factories", "tool_providers", "context_providers",
+        "output_validators", "capability_broker_factory", "outbox_sender_factory",
+        "outbox_max_attempts", "outbox_retry_base_s", "outbox_retry_factor",
+        "outbox_retry_cap_s", "max_recover_attempts", "lease_ttl_s", "watchdog_interval_s",
+        "max_message_bytes", "max_message_queue_depth", "max_concurrent_runs",
+        "checkpoint_store", "lease_store", "command_store", "command_queue_limit",
+        "command_claim_ttl_s",
+    )

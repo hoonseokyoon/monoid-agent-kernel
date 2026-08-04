@@ -52,7 +52,9 @@ class BackendLoopFactoryContext:
     # The upstream the gateway at that URL relays. Doubled word because the convention here is
     # ``<service field>_provider`` and the service field is ``llm_gateway_provider`` -- it is the
     # accessor for a *provider name*, not a provider of providers.
-    llm_gateway_provider_provider: Callable[[], str | None]
+    # Keyword-only for the same reason as the service field it accesses: inserted beside its
+    # URL sibling without rebinding the positional arguments that predate it.
+    llm_gateway_provider_provider: Callable[[], str | None] = field(kw_only=True)
     web_gateway_url_provider: Callable[[], str | None]
     model_adapter_factory_provider: Callable[[], ModelAdapterFactory | None]
     token_manager_provider: Callable[[], TokenManager]
