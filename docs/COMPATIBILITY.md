@@ -279,6 +279,16 @@ that separates — a *malformed* attribution is refused, while a *disagreeing* o
 means the envelope cannot be read, the second means it was read and says something the client did
 not expect, which is a fact about a deployment rather than a broken wire.
 
+One v0.21 change moves an existing wire *answer* rather than adding a key: when the reference
+gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
+now a non-retryable 502 `openai_bad_response` (carrying the billed `usage`), where the shapes
+that used to escape unclassified answered 400 `gateway_bad_request` or 500 with
+`retryable: true`. A client that retried on that 500 was re-buying tokens for a payload defect;
+a client that read the 400 as its own bad request was mis-remediating. Clients that follow the
+documented taxonomy (`retryable` / `config_recoverable` / `usage` off the envelope) need no
+change; only behavior keyed to those two literal statuses for this failure class does. Raw
+refusals from third-party adapters keep their previous arms and their stamped-usage carriage.
+
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
 request keys above it is written unconditionally, beside `retryable` and `provider_retried`,

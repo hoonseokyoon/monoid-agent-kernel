@@ -7,6 +7,32 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the OpenAI reader refuses in one classified voice, and the refusal still pays
+
+- **Every malformed-payload refusal in the OpenAI adapter's two stamped regions is now a
+  non-retryable `openai_bad_response`.** The body mapping and the stream-terminal construction
+  each refused in more than one type: most shapes were already `ModelAdapterError`, but
+  `normalize_usage` said "malformed usage" with a raw `ValueError` and the stop-reason walk
+  raised a raw `AttributeError` — on the terminal path even after the ingress normalizer moved
+  inside the guard, because Python evaluates the `TurnComplete` arguments first. The classifying
+  arms mint the classified error at the same seam that stamps the billed usage, chain the raw
+  cause, and change two real behaviors, both intended:
+  - **In-process, the billed tokens reach the run budget.** A raw escape hit the loop's blanket
+    wrapper, which re-minted it unstamped — so `total_usage`, the transcript record and
+    `metrics.updated` all said zero for a call the provider billed, and only the getattr-based
+    receipt kept the cost. Classified, the refusal takes the loop's `ModelAdapterError` arm.
+  - **Over the gateway hop, the answer is an honest 502.** The raw `ValueError` shapes answered
+    400 `gateway_bad_request` (claiming the *client's* request was bad, and reading as
+    config-shaped recoverable one hop out); the raw `AttributeError` shapes answered 500 with
+    `retryable: true` — an invitation to re-buy the same tokens for a payload defect. Both now
+    map through the classified arm to 502, non-retryable, still carrying the billed `usage`.
+- **The raw arms did not move.** The tenant meter and both gateway error writers stay
+  type-agnostic on purpose — a third-party adapter behind the gateway can still refuse raw with
+  a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
+  read-off-whatever-escaped property. `assemble_streamed_turn`'s bare `normalize_usage` re-run
+  (provably dead — every folded chunk passes the internal ingress first) is guarded in the
+  ingress's classified voice rather than deleted, with a pin stating the contract.
+
 ### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
 
 - **`reasoning_applied` is the third applied echo on `monoid.llm-turn.v1`.** A fail-closed
