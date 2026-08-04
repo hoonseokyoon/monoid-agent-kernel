@@ -6773,6 +6773,13 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # contract, and the response-envelope example that shows its shape.
         "relayed verbatim",
         '"reasoning": [{"type": "reasoning"',
+        # B1: the reasoning echo's two load-bearing sentences, anchored the same way and for
+        # the same reason -- the document said "reasoning_applied" several times the moment
+        # the feature landed, so the bare key name would be satisfied by any surviving
+        # mention. These phrases exist nowhere at the pre-B1 base and exactly once each now:
+        # the empty-object-is-proof rule, and the three-spellings disambiguation.
+        "empty object as a proof, not an absence",
+        "artifact array and echo object on the response",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

@@ -7,6 +7,42 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
+
+- **`reasoning_applied` is the third applied echo on `monoid.llm-turn.v1`.** A fail-closed
+  reasoning request used to be accepted unproven: the config crossed the hop (both request-side
+  seals), but nothing came back to say the upstream applied it, and `ReasoningConfig.
+  on_unsupported="fail"` governed nothing. The gateway server now echoes the exact forwarded
+  reasoning projection (`build_reasoning_payload` — the same one-projection rule as the
+  generation echo) on the response body and the terminal stream frame, derived from the new
+  `reasoning_support` adapter declaration, never from the request; the client validates it
+  beside its two siblings and enforces it at all three sites (sync, terminal frame, frameless
+  drain) as non-retryable, config-recoverable `gateway_reasoning_not_applied`. Fourth additive
+  key on an unchanged protocol identifier.
+- **The gate is `ReasoningConfig.is_default`, not payload truthiness.** The default reasoning
+  config projects a non-empty provider block (`{"effort": "medium"}`), so the generation gate
+  transcribed literally would have stamped an echo onto every default-config call and changed
+  the wire shape of traffic that configured nothing. `effort="default"` projects an *empty*
+  block that is still configured: the echo may legitimately be `{}`, and that empty proof is
+  what catches a hop that rebuilds `"medium"` out of an omitted effort.
+- **One knob per feature family.** The generation/schema pair keeps sharing
+  `generation.on_unsupported`; the reasoning echo, its checker, and the forwarding
+  `GatewayModelAdapter.reasoning_support` claim all read `reasoning.on_unsupported` — the
+  field the request wire already carried. A claim answered off another family's knob would
+  mint proof for a call whose own policy said best-effort. `reasoning_support(adapter,
+  config=None)` joins the exported fail-closed probe family; `OpenAIModelAdapter` declares it
+  unconditionally (it puts the block on the Responses body), the fakes deliberately do not.
+- **Two shipped callers state their real policy instead of inheriting a refusal.** Studio's
+  reasoning summary/effort are display preferences and its offline upstream honestly declares
+  no `reasoning_support` — under the inherited `"fail"` every offline turn would have been
+  refused. Studio and the messy-workspace scenario now set `reasoning.on_unsupported="omit"`
+  (pinned as a policy test); a proving upstream still emits the echo and still proves.
+- Census: the `KNOWN_GAPS` B1 entry is deleted and its `v0.21-track:B1` disposition token
+  retired with it; `reasoning_applied` joins every echo census (`APPLIED_ECHO_KEYS`
+  derivations, the wire key sets, the 7e refusal probes, the value-validator tables — now ten
+  status-forwarding validators — and the three-file `CARRIER_FILES` set that was pinned empty
+  while the gap was open).
+
 ### Fixed — the terminal chunk is validated where its stamp is
 
 - **The stream's end-of-turn payload is normalized inside the usage guard.** `TurnComplete`
@@ -710,8 +746,9 @@ out in commit messages and here.
   — so a wire-key rename that breaks the shipped UI fails a test that names the file.
 - **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
   one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
-  exist, so a rename rots the entry loudly) and a disposition — `burn-down`, `v0.21-track:B1`, or
-  `by-design`. The assertions encode today's reality exactly, so closing a gap *breaks* the suite
+  exist, so a rename rots the entry loudly) and a disposition — `burn-down` or `by-design`
+  (a third token, `v0.21-track:B1`, existed while that gap was registered and retired with its
+  only entry). The assertions encode today's reality exactly, so closing a gap *breaks* the suite
   and the fixer must update the expected set and delete the registry entry in the same change.
   A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
   each with the authority a census would take, its carrier count, and a one-line risk note — so

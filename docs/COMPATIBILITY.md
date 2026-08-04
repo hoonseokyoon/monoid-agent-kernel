@@ -215,12 +215,19 @@ Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `
 configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
 `\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
 The v0.21 `monoid.llm-turn.v1` writer adds `generation` and `output_schema` to the request and
-`generation_applied` / `schema_applied` to the response and terminal stream frame without
+`generation_applied` / `schema_applied` / `reasoning_applied` to the response and terminal
+stream frame without
 changing either protocol identifier (the `metadata_generation` precedent). Every new key is
 present only when the caller configured the feature, so traffic that does not use it keeps its
-exact previous wire shape. Version skew fails closed on the client: under the default
+exact previous wire shape (for `reasoning_applied`, "configured" means a non-default
+`ModelConfig.reasoning` — the codec-default config demands no proof, and the explicit
+`effort="default"` sentinel is configured and proven by an empty `{}` echo). Version skew
+fails closed on the client: under the default
 `generation.on_unsupported="fail"`, a server that does not echo is refused rather than allowed
-to silently discard parameters. Separately, `ModelConfig.to_json` emits its `generation` block
+to silently discard parameters; the reasoning proof is governed by its own family's
+`reasoning.on_unsupported` the same way, so a deployment that wants reasoning display
+preferences over a non-proving transport (the reference Studio's offline mode is one) states
+`"omit"` on that field rather than losing the fail-closed default elsewhere. Separately, `ModelConfig.to_json` emits its `generation` block
 only when configured — a generation-free runtime config keeps its pre-v0.21 `config_hash`, and
 a *configured* one intentionally does not verify across mixed-version backend-run recovery
 (configure generation only on a fully rolled fleet).
@@ -259,7 +266,12 @@ skew case reaches that refusal in a way worth naming: the same protocol uses a `
 the **request** body for the reasoning *config* object, so a third-party gateway that echoes
 request keys onto its response answers an array-valued key with an object and is refused. That is
 the correct outcome — the value is unusable for replay either way — but the cause is not obvious
-from the error, so check for a request echo before suspecting the upstream's artifacts.
+from the error, so check for a request echo before suspecting the upstream's artifacts. Since
+B1 there are **three** `reasoning*` spellings on this protocol — the request's config object,
+the response's artifact array, and the response's `reasoning_applied` echo object — and the
+last two ride the same envelopes with different shapes, so a generic echo-the-request gateway
+now trips the object/array mismatch in both directions; implement the three keys separately
+rather than by prefix.
 
 `provider` is held to the same rule by the same readers: absent is unknown and gates nothing, but
 present must be a string, and a non-string is `gateway_bad_response` on both transports. Note what
