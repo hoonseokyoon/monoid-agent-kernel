@@ -42,6 +42,20 @@ class ReasoningConfig:
     summary: ReasoningSummary = "off"
     on_unsupported: Literal["fail", "omit"] = "fail"
 
+    @property
+    def is_default(self) -> bool:
+        """Whether the caller configured reasoning at all — the gate the applied echo rides.
+
+        The generation twin can read its projected payload for this (every default field
+        projects to nothing), but the default reasoning config projects a non-empty provider
+        block (``{"effort": "medium"}``), so payload truthiness would claim every call
+        configured reasoning. Dataclass equality is the honest sentinel; the one thing it
+        cannot see — an explicit ``effort="medium"`` — is exactly as invisible as an explicit
+        ``temperature=None`` is to generation's gate.
+        """
+
+        return self == ReasoningConfig()
+
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ReasoningConfig:
         if payload is None:

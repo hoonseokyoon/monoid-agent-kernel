@@ -25,6 +25,7 @@ from monoid_agent_kernel.providers.base import (
     TurnComplete,
     generation_support,
     provider_usage_of,
+    reasoning_support,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
@@ -434,6 +435,87 @@ def test_a_forwarding_adapter_claims_only_while_it_is_enforcing() -> None:
         )
         == "native"
     )
+
+
+def test_reasoning_support_probe_is_opt_in_and_fail_closed() -> None:
+    assert reasoning_support(OpenAIModelAdapter(ModelConfig())) == "native"
+    assert reasoning_support(GatewayModelAdapter(config=ModelConfig())) == "native"
+    assert reasoning_support(FakeModelAdapter()) == "none"
+
+    class Vague:
+        reasoning_support = True
+
+    assert reasoning_support(Vague()) == "none"
+
+    class Hostile:
+        @property
+        def reasoning_support(self) -> str:
+            raise RuntimeError("boom")
+
+    # A declaration that raises is not a declaration; it must not take the call down either.
+    assert reasoning_support(Hostile()) == "none"
+
+
+def test_a_forwarding_adapter_reasoning_claim_follows_its_own_knob() -> None:
+    """The reasoning claim reads ``reasoning.on_unsupported``, not generation's.
+
+    One knob per feature family: the generation/schema pair deliberately shares
+    ``generation.on_unsupported``, but reasoning has its own fail/omit field -- already carried
+    on the request wire -- and a claim answered off a *different* family's policy would mint
+    proof for a call whose own policy said best-effort. The split configs below are the pin:
+    each claim follows its family's knob and ignores the other's.
+    """
+
+    reasoning_only = GatewayModelAdapter(
+        config=ModelConfig(
+            generation=GenerationConfig(on_unsupported="omit"),
+            reasoning=ReasoningConfig(on_unsupported="fail"),
+        )
+    )
+    assert reasoning_support(reasoning_only) == "native"
+    assert generation_support(reasoning_only) == "none"
+    assert structured_output_support(reasoning_only) == "none"
+
+    generation_only = GatewayModelAdapter(
+        config=ModelConfig(
+            generation=GenerationConfig(on_unsupported="fail"),
+            reasoning=ReasoningConfig(on_unsupported="omit"),
+        )
+    )
+    assert reasoning_support(generation_only) == "none"
+    assert generation_support(generation_only) == "native"
+    assert structured_output_support(generation_only) == "native"
+
+    # The per-call config wins over the standing one, same as the generation twin.
+    per_call = ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit"))
+    assert reasoning_support(reasoning_only, per_call) == "none"
+    assert reasoning_support(generation_only, ModelConfig()) == "native"
+
+    # OpenAI applies the reasoning block itself, so its claim is unconditional.
+    assert (
+        reasoning_support(
+            OpenAIModelAdapter(ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit")))
+        )
+        == "native"
+    )
+
+
+def test_reasoning_config_knows_when_it_is_default() -> None:
+    """The gate the echo rides on: a default block demands no proof, anything set does.
+
+    Unlike generation, the default reasoning config projects a NON-empty provider payload
+    (``{"effort": "medium"}``), so payload truthiness cannot mean "the caller configured
+    reasoning" -- dataclass equality is the only honest sentinel.
+    """
+
+    assert ReasoningConfig().is_default is True
+    assert ReasoningConfig(effort="default").is_default is False
+    assert ReasoningConfig(summary="auto").is_default is False
+    assert ReasoningConfig(on_unsupported="omit").is_default is False
+    # ...and the trap this property exists to avoid: the default still projects a payload.
+    from monoid_agent_kernel.providers._common import build_reasoning_payload
+
+    assert build_reasoning_payload(ReasoningConfig()) == {"effort": "medium"}
 
 
 def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None:

@@ -240,6 +240,21 @@ def generation_support(
     return _declared_support(adapter, "generation_support", config)
 
 
+def reasoning_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.reasoning` to the provider request.
+
+    The third member of the capability family above, same fail-closed rule, one difference
+    worth naming: a conditional declaration answers off ``reasoning.on_unsupported`` — its own
+    feature family's policy knob — where the generation/schema pair deliberately shares
+    ``generation.on_unsupported``. A reasoning claim read off another family's knob would mint
+    proof for a call whose own policy said best-effort.
+    """
+
+    return _declared_support(adapter, "reasoning_support", config)
+
+
 class ModelAdapter(Protocol):
     """The LLM seam: turn a :class:`ModelRequest` into a :class:`ModelTurn`.
 

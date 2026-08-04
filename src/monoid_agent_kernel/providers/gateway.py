@@ -226,6 +226,19 @@ class GatewayModelAdapter:
         effective = config or self.config
         return "native" if effective.generation.on_unsupported == "fail" else "none"
 
+    def reasoning_support(self, config: ModelConfig | None = None) -> str:
+        """The reasoning member of the claim family above, read off its own family's knob.
+
+        Same laundering rule as :meth:`structured_output_support` -- a forwarding hop claims
+        "native" only while it is enforcing -- but the policy it enforces reasoning under is
+        ``reasoning.on_unsupported``, not generation's. The two knobs are separate fields the
+        request wire already carries separately, so a claim answered off the wrong one would
+        report proof for a call whose own reasoning policy said best-effort.
+        """
+
+        effective = config or self.config
+        return "native" if effective.reasoning.on_unsupported == "fail" else "none"
+
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
         url = self._resolve_gateway_url(config)
