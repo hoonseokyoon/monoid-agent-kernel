@@ -1261,18 +1261,33 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     for index in order:
         slot = slots[index]
         raw = slot["args"].strip()
+        # Both refusals below are refusals of a turn the provider already produced and BILLED:
+        # the deltas were delivered and the terminal frame reported the cost, which the fold is
+        # still holding. The one-shot twin of this act pays through the OpenAI reader's stamping
+        # seam; unstamped here, a streamed turn was metered at zero at the tenant ledger and in
+        # the run's token budget. ``provider_retried`` rides along for the same reason it does
+        # on every other refusal: it is a fact about attempts already made. The meter skips an
+        # empty mapping, so a stream that reported no cost still invents none.
         try:
             arguments = loads_model_json_ingress(raw) if raw else {}
         except ValueError as exc:
-            raise ModelAdapterError(
+            unparsable = ModelAdapterError(
                 f"invalid streamed tool-call arguments for {slot['name']}",
                 provider_error_code="stream_bad_tool_args",
-            ) from exc
+                retryable=False,
+                provider_retried=provider_retried,
+            )
+            mark_provider_usage(unparsable, usage)
+            raise unparsable from exc
         if not isinstance(arguments, dict):
-            raise ModelAdapterError(
+            wrong_type = ModelAdapterError(
                 f"streamed tool-call arguments for {slot['name']} are not an object",
                 provider_error_code="stream_bad_tool_args",
+                retryable=False,
+                provider_retried=provider_retried,
             )
+            mark_provider_usage(wrong_type, usage)
+            raise wrong_type
         call_id = slot["id"] if slot["id"] is not None else ""
         name = slot["name"] if slot["name"] is not None else ""
         tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
@@ -1287,7 +1302,19 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         # this fold with garbage must refuse in the ingress's classified voice, not raw.
         normalized_usage = normalize_usage(usage) if usage else {}
     except Exception as exc:
-        raise ModelAdapterError("model adapter returned a non-portable stream fragment") from exc
+        # Classified the way the ingress classifies, flags included: an un-flagged refusal is
+        # read as terminal-or-retryable off whatever the defaults happen to be, and the retry
+        # fact the fold is already holding would be dropped. No usage stamp -- ``usage`` is
+        # itself the malformed key here, and the tolerance rule on a failure path is to record
+        # nothing rather than raise a second failure over the first. Unreachable through this
+        # function (the ingress above pre-normalizes every chunk), so what binds this shape is
+        # a source-level pin: test_the_folds_usage_renormalization_stays_structurally_guarded
+        # in tests/test_llm_gateway_stream.py.
+        raise ModelAdapterError(
+            "model adapter returned a non-portable stream fragment",
+            retryable=False,
+            provider_retried=provider_retried,
+        ) from exc
     return ModelTurn(
         response_id=response_id,
         final_text="".join(text_parts) if text_parts else None,

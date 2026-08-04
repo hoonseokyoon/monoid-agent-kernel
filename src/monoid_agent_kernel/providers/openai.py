@@ -31,6 +31,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_retried,
     mark_provider_usage,
     normalize_model_stream_chunk,
 )
@@ -1040,6 +1041,43 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
     return "stop"
 
 
+def _complete_billed_refusal(
+    refused: ModelAdapterError, payload: Any, *, provider_retried: bool
+) -> None:
+    """Finish classifying a refusal that was already minted, and stamp what it cost.
+
+    The shared arm of this adapter's two stamped regions (:func:`_parse_response` and
+    :func:`_terminal_chunk`). Both catch refusals raised somewhere below them -- roughly a
+    dozen sites in the body mapping, the ingress normalizer on the terminal path -- and those
+    sites are ordinary field validators that know their key and nothing else: they mint a bare
+    ``ModelAdapterError`` with no ``provider_error_code`` and no view of the HTTP exchange. So
+    the seam completes what the mint could not, in ONE place rather than at a dozen raise
+    sites, and it does so in one direction only:
+
+    * **Backfill, never overwrite.** An empty code left the class of failure unnamed, and one
+      hop out the reference gateway resolves ``exc.provider_error_code or GATEWAY_BAD_RESPONSE``
+      -- so the HOP's own wire was blamed for an UPSTREAM payload defect, and byte-identical
+      malformed bodies were classified differently per transport (this reader's explicit type
+      checks refuse typed and uncoded; the terminal reader's duck-typed walks refuse raw, which
+      the raw arm already coded). A refusal that DOES name a code knows something this seam
+      does not, and keeps it.
+    * **Upgrade, never downgrade.** ``provider_retried`` is a fact about attempts already made,
+      readable only from the exchange the caller saw; a refusal minted deeper down cannot know
+      it. It is added when the caller reports one and never cleared, because a failed audit
+      record that denies retries in exactly the case where they happened is worse than none.
+
+    The usage stamp reads leniently (:func:`usage_reported_by`), so a payload whose ``usage`` is
+    *itself* the malformed key records nothing rather than raising a second failure over the
+    first.
+    """
+
+    if not refused.provider_error_code:
+        refused.provider_error_code = "openai_bad_response"
+    if provider_retried:
+        mark_provider_retried(refused)
+    mark_provider_usage(refused, usage_reported_by(payload))
+
+
 def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
     """Map one Responses-API body to a :class:`ModelTurn`, stamping what a refusal cost.
 
@@ -1061,9 +1099,12 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
     stop-reason walk with an ``AttributeError``), and a raw escape had a real consumer cost --
     the loop's blanket wrapper re-minted it unstamped, so the run budget recorded zero
     in-process, and over a hop the raw arms answered 400 (claiming the CLIENT's request was
-    bad) or 500 ``retryable: true`` (inviting a re-buy of the same tokens). Every non-classified
-    refusal leaves here as non-retryable ``openai_bad_response`` with the raw cause chained;
-    the stamp reads leniently (:func:`usage_reported_by`), so a
+    bad) or 500 ``retryable: true`` (inviting a re-buy of the same tokens). EVERY refusal leaves
+    here as non-retryable ``openai_bad_response``, by both arms: the raw one mints it with the
+    cause chained, and the classified one backfills it onto the bare refusals the mapping's own
+    field validators raise (see :func:`_complete_billed_refusal` for why the completion runs in
+    one direction only). Both arms also carry the caller's ``provider_retried``, which no raise
+    site below can see. The stamp reads leniently (:func:`usage_reported_by`), so a
     body whose ``usage`` is *itself* the malformed key records nothing rather than raising a
     second failure over the first; well-formed bodies still normalize through the adapter's own
     parser below and are untouched by this.
@@ -1072,7 +1113,7 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
     try:
         return _response_to_turn(data, provider_retried=provider_retried)
     except ModelAdapterError as refused:
-        mark_provider_usage(refused, usage_reported_by(data))
+        _complete_billed_refusal(refused, data, provider_retried=provider_retried)
         raise
     except Exception as raw:
         refused = ModelAdapterError(
@@ -1183,8 +1224,11 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     ``Exception``. The guard now also CLASSIFIES, for the same reasons as the body reader's
     (see :func:`_parse_response`): a raw escape reached the loop's blanket wrapper unstamped
     in-process, and the gateway's 500 arm answered ``retryable: true`` for a payload defect
-    over a hop. Every non-classified refusal leaves here as non-retryable
-    ``openai_bad_response`` with the raw cause chained; every consumer of the stamp -- the
+    over a hop. EVERY refusal leaves here as non-retryable ``openai_bad_response`` carrying the
+    caller's ``provider_retried``: the raw arm mints it with the cause chained, and the
+    classified arm backfills it (:func:`_complete_billed_refusal`) onto the refusals that reach
+    it bare -- which is the named reachable case above, since the ingress normalizer refuses a
+    non-string ``id`` as an unnamed ``ModelAdapterError``. Every consumer of the stamp -- the
     receipt (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the
     reference gateway's tenant meter and both of its error writers -- deliberately stays
     type-agnostic regardless, because a third-party adapter can still refuse raw.
@@ -1213,7 +1257,7 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
             )
         )
     except ModelAdapterError as refused:
-        mark_provider_usage(refused, usage_reported_by(final_data))
+        _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
         raise
     except Exception as raw:
         refused = ModelAdapterError(

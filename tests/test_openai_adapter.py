@@ -664,6 +664,17 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
         "hint": "a refused turn was still generated and billed; the refusal is the only "
         "carrier left for its cost",
     }
+    # ...and it names the same code whichever key was malformed. Most shapes here were minted
+    # bare inside the mapping (``ModelAdapterError`` with no code at all), so one hop out the
+    # gateway resolved ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` and told the client
+    # the HOP's wire was bad for an UPSTREAM payload defect -- and byte-identical bodies got
+    # different codes on the two transports, since the duck-typed terminal reader refused some
+    # of these raw (coded) where this reader refuses them typed (uncoded).
+    assert refused.value.provider_error_code == "openai_bad_response", {
+        "malformed_shape": shape,
+        "named_itself": refused.value.provider_error_code,
+        "hint": "the classifying seam backfills the code onto refusals minted without one",
+    }
 
 
 def test_a_raw_malformed_billed_body_is_refused_classified() -> None:
@@ -790,6 +801,10 @@ def test_a_billed_terminal_payload_with_a_malformed_id_still_reports_its_cost() 
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "hint": "the ingress normalizer's rejection is the same act on the same billed payload",
     }
+    # The normalizer mints its refusal without a code, so this named reachable case reached the
+    # wire as the hop's own ``gateway_bad_response``; the seam backfills the same code every
+    # other refusal in this region carries.
+    assert refused.value.provider_error_code == "openai_bad_response"
 
 
 def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_counts() -> None:
@@ -843,6 +858,68 @@ def test_a_raw_malformed_terminal_payload_is_refused_classified() -> None:
         _terminal_chunk(stop_reason_shape, provider_retried=False)
     assert second.value.provider_error_code == "openai_bad_response"
     assert isinstance(second.value.__cause__, AttributeError)
+
+
+def test_a_classified_refusal_carries_the_retry_the_exchange_already_spent() -> None:
+    """Both seams, one rule: the arm that stamps the cost also completes the classification.
+
+    ``provider_retried`` is a fact about attempts already MADE, and only the caller knows it --
+    it is read off the HTTP exchange (``x-stainless-retry-count``), never off the body. The raw
+    arms of both regions passed it into the error they minted; the classified arms re-raised
+    the refusal untouched, so the ~12 shapes minted inside the mapping said "never retried"
+    about an exchange the SDK had already retried. A failed audit record that denies retries in
+    exactly the case where they happened is worse than no record.
+
+    Bound on both transports in one test on purpose: this asymmetry existed *because* a rule was
+    stated on one of two twin arms.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response, _terminal_chunk
+
+    # Sync: a malformed-but-TYPED shape, refused as a bare ``ModelAdapterError`` deep in the
+    # mapping -- the classified arm, not the raw one.
+    body = _billed_response_body(**_BILLED_BODY_REFUSALS["output-not-an-array"])
+    with pytest.raises(ModelAdapterError) as sync_side:
+        _parse_response(body, provider_retried=True)
+    assert sync_side.value.provider_error_code == "openai_bad_response"
+    assert sync_side.value.retryable is False
+    assert sync_side.value.provider_retried is True
+    assert provider_usage_of(sync_side.value) == _BILLED_RESPONSE_USAGE
+
+    # Streamed twin: the non-string ``id`` the terminal seam's docstring names as its reachable
+    # case, refused by the ingress normalizer inside the guard -- classified, and codeless.
+    with pytest.raises(ModelAdapterError) as stream_side:
+        _terminal_chunk(_billed_response_body(id=123), provider_retried=True)
+    assert stream_side.value.provider_error_code == "openai_bad_response"
+    assert stream_side.value.retryable is False
+    assert stream_side.value.provider_retried is True
+    assert provider_usage_of(stream_side.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_completing_a_refusals_class_never_weakens_what_it_already_said() -> None:
+    """The seam's two guards, stated directly: backfill only, upgrade only.
+
+    A refusal that already names a code knows something the seam does not, and
+    ``provider_retried=True`` is evidence that cannot be un-observed by a later caller who saw
+    no retry. Both halves are one-directional or the "completion" would be a downgrade.
+    """
+
+    from monoid_agent_kernel.providers.openai import _complete_billed_refusal
+
+    already_named = ModelAdapterError(
+        "refused with its own voice",
+        provider_error_code="openai_content_filter",
+        provider_retried=True,
+    )
+    _complete_billed_refusal(already_named, {}, provider_retried=False)
+    assert already_named.provider_error_code == "openai_content_filter"
+    assert already_named.provider_retried is True
+
+    bare = ModelAdapterError("refused bare")
+    _complete_billed_refusal(bare, {}, provider_retried=False)
+    assert bare.provider_error_code == "openai_bad_response"
+    assert bare.provider_retried is False
 
 
 def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -> None:

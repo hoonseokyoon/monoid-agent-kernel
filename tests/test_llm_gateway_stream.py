@@ -8,7 +8,9 @@ Async tests use asyncio.run from sync functions (no pytest-asyncio), matching th
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import io
 import json
 from pathlib import Path
@@ -421,17 +423,129 @@ def test_a_stream_refused_on_its_terminal_payload_still_charges_the_tenant() -> 
 
 
 def test_the_assembler_refuses_a_malformed_streamed_usage_classified() -> None:
-    """The fold's last raw seam, pinned closed (born green via the internal ingress).
+    """A malformed streamed usage is refused classified -- by the INGRESS, not by the guard.
 
-    Every chunk ``assemble_streamed_turn`` folds passes ``normalize_model_stream_chunk``
-    first, so the fold's own ``normalize_usage`` re-run is provably re-normalizing validated
-    input today -- but the call is guarded anyway, because deleting normalization is a
-    loosening-shaped edit and a future path that reaches the fold with garbage must refuse in
-    the ingress's classified voice, never a raw ``ValueError``.
+    Honest about which code answers: ``assemble_streamed_turn`` normalizes every chunk through
+    ``ModelStreamIngressNormalizer`` before folding it, and that pass refuses this payload. The
+    fold's own ``normalize_usage`` re-run downstream is therefore unreachable through the public
+    function, and this test would stay green with its guard deleted -- which is exactly why the
+    guard is bound structurally instead, by
+    ``test_the_folds_usage_renormalization_stays_structurally_guarded`` below. What this test
+    pins is the runtime claim it can actually make: the refusal is a ``ModelAdapterError``,
+    never a raw ``ValueError``, whichever pass caught it.
     """
 
     with pytest.raises(ModelAdapterError):
         assemble_streamed_turn([TurnComplete(usage={"input_tokens": "many"})])  # type: ignore[dict-item]
+
+
+def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
+    """The pin for code no input can reach: read the fold's own source and hold its shape.
+
+    The guard exists because deleting normalization is a loosening-shaped edit and a future
+    caller that reaches the fold around the ingress must refuse in the ingress's classified
+    voice. Nothing can drive it today, so a behavioral pin is impossible and a *source* pin is
+    the only honest binding -- the repo's census style, message-anchored so that deleting the
+    guard, or downgrading the classification it states, goes red.
+    """
+
+    tree = ast.parse(inspect.getsource(assemble_streamed_turn))
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "normalize_usage"
+            for statement in node.body
+            for inner in ast.walk(statement)
+        )
+    ]
+    assert len(guarded) == 1, {
+        "guarded_normalize_usage_calls": len(guarded),
+        "hint": "the fold's re-normalization lost its guard, or grew a second one",
+    }
+
+    minted = [
+        node
+        for handler in guarded[0].handlers
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "ModelAdapterError"
+    ]
+    assert len(minted) == 1, {
+        "hint": "the handler must refuse in the ingress's classified voice, never re-raise raw",
+    }
+    message = minted[0].exc.args[0]
+    assert isinstance(message, ast.Constant), {"hint": "the refusal's message anchors this pin"}
+    assert message.value == "model adapter returned a non-portable stream fragment"
+    # And it states the classification rather than leaving it to defaults: an un-flagged refusal
+    # that reached a client would be read as terminal-or-retryable by whatever the default was,
+    # and the retry fact the fold already knows would be dropped on the floor.
+    assert {keyword.arg for keyword in minted[0].exc.keywords} == {
+        "retryable",
+        "provider_retried",
+    }
+
+
+def test_a_streamed_tool_call_refusal_pays_for_the_turn_it_was_billed() -> None:
+    """The fold's own refusals are billed refusals: the deltas arrived, the provider charged.
+
+    ``assemble_streamed_turn`` is the streamed twin of ``_parse_response``, and the sync side
+    pays through that reader's stamping seam. Here the two ``stream_bad_tool_args`` raises --
+    a model emitting non-JSON function-call arguments is ordinary -- escaped with no usage and
+    no ``provider_retried``, though the fold is holding both by then. So a streamed turn the
+    provider generated and billed was metered at zero at the tenant ledger and in the run's
+    token budget, the one carrier left for its cost saying nothing.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    billed = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+    with pytest.raises(ModelAdapterError) as unparsable:
+        assemble_streamed_turn(
+            [
+                ToolCallDelta(
+                    index=0,
+                    id="c1",
+                    name="fs_read",
+                    arguments_fragment="{not json",
+                    provider_retried=True,
+                ),
+                TurnComplete(usage=dict(billed), provider_retried=True),
+            ]
+        )
+    assert unparsable.value.provider_error_code == "stream_bad_tool_args"
+    assert unparsable.value.retryable is False
+    assert unparsable.value.provider_retried is True
+    assert provider_usage_of(unparsable.value) == billed, {
+        "carried_by_the_refusal": provider_usage_of(unparsable.value),
+        "hint": "the deltas were delivered and the terminal frame reported the cost",
+    }
+
+    # The twin raise two lines below it, which decodes cleanly and is refused for its TYPE.
+    with pytest.raises(ModelAdapterError) as not_an_object:
+        assemble_streamed_turn(
+            [
+                ToolCallDelta(index=0, id="c1", name="fs_read", arguments_fragment="[1, 2]"),
+                TurnComplete(usage=dict(billed)),
+            ]
+        )
+    assert not_an_object.value.provider_error_code == "stream_bad_tool_args"
+    assert not_an_object.value.retryable is False
+    assert not_an_object.value.provider_retried is False
+    assert provider_usage_of(not_an_object.value) == billed
+
+    # And the counterweight the stamp needs: a stream that reported no cost invents none.
+    with pytest.raises(ModelAdapterError) as costless:
+        assemble_streamed_turn(
+            [ToolCallDelta(index=0, id="c1", name="fs_read", arguments_fragment="{not json")]
+        )
+    assert provider_usage_of(costless.value) == {}
 
 
 def test_the_client_behind_that_stream_reports_what_the_refusal_cost() -> None:

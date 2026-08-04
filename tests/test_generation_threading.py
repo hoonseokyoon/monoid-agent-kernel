@@ -1769,6 +1769,13 @@ def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_met
     with pytest.raises(ModelAdapterError) as refused:
         backend.handle_turn(_llm_token(manager), _turn_payload())
     assert provider_usage_of(refused.value) == _BILLED
+    # And it names ITS OWN failure on the way out. This shape is minted bare deep in the
+    # mapping, so the handler's ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` fallback
+    # told the client the HOP's wire was malformed for an UPSTREAM payload defect -- while the
+    # duck-typed terminal reader answered ``openai_bad_response`` for a byte-identical body.
+    # One class of defect, one code, whichever transport read it.
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert _model_error_status(refused.value) == HTTPStatus.BAD_GATEWAY
 
     envelope = _error_body(
         _model_error_status(refused.value),
