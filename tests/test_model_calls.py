@@ -411,6 +411,27 @@ def test_the_recorder_contains_its_own_write_failure(tmp_path: Path, monkeypatch
     recorder.close()
 
 
+def test_a_record_arriving_after_close_does_not_reopen_the_ledger(tmp_path: Path) -> None:
+    """Closing the recorder ends the ledger, rather than leaving a handle to be re-acquired.
+
+    The handle is opened lazily, so without an explicit closed state a late record silently
+    reopens the file the recorder just released -- leaking the descriptor past the lifetime that
+    owns it, and on Windows holding a lock on a run directory a caller is entitled to move or
+    delete. `ModelContentStore` refuses post-close work for the same reason; this is that rule for
+    the sibling artifact. Refused rather than failed: nothing here raises either.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_model_call(ModelCallReceipt())
+    recorder.close()
+
+    recorder.record_model_call(ModelCallReceipt())  # must not raise, and must not write
+
+    assert len(_records(recorder.run_dir)) == 1
+    assert recorder._model_calls_handle is None
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_the_ledger_switch_does_not_select_provider_streaming(
     tmp_path: Path,

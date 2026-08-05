@@ -360,6 +360,9 @@ class AgentRecorder:
     )
     _model_calls_handle: TextIO | None = field(default=None, init=False, repr=False)
     _model_calls_failed: bool = field(default=False, init=False, repr=False)
+    # Distinct from ``_failed``: the handle is opened lazily, so without a closed state a record
+    # arriving after ``close`` silently reopens the file the recorder just released.
+    _model_calls_closed: bool = field(default=False, init=False, repr=False)
     _model_calls_index: int = field(default=0, init=False, repr=False)
     _model_calls_lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -472,11 +475,11 @@ class AgentRecorder:
         caller; the recorder holds a lock because it is shared with tool and job threads.
         """
 
-        if not self.model_calls_file or self._model_calls_failed:
+        if not self.model_calls_file or self._model_calls_failed or self._model_calls_closed:
             return
         try:
             with self._model_calls_lock:
-                if self._model_calls_failed:
+                if self._model_calls_failed or self._model_calls_closed:
                     return
                 record = model_call_record(
                     receipt,
@@ -733,6 +736,9 @@ class AgentRecorder:
                     # not retain the other's descriptor, the same rule the transcript already has
                     # against the event bus above.
                     with self._model_calls_lock:
+                        # Marked closed under the same acquisition that takes the handle, so a
+                        # concurrent record cannot slip between the two and reopen the file.
+                        self._model_calls_closed = True
                         handle, self._model_calls_handle = self._model_calls_handle, None
                     if handle is not None:
                         try:
