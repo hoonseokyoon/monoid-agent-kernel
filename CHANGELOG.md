@@ -7,6 +7,35 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — the endpoint leaves the replay key and becomes recorded metadata
+
+- **`request_digest` no longer covers where a call was sent.** The destination was hashed into
+  the key on the reasoning that the same request answered by a different service is a different
+  call — true, and the wrong place to say it. The value is deliberately never recorded, so no
+  record could reconstruct the preimage: a key taken over it could not be recomputed, could not be
+  verified, and a miss could not be told apart from a defect. Two calls with identical content
+  now share a key regardless of which host answered.
+- **`ModelCallReceipt` gains four fields that say what the key alone could not.**
+  `destination_status` names which of the probe's outcomes happened — `not_declared` (the adapter
+  routes on config alone), `declined` (it answered with nothing), `resolved`, `unavailable` (the
+  probe raised), or `not_reached` (the call was refused first). `destination_digest` is keyed
+  under the per-process key, for the same reason `RedactionPolicy.digest` is and with the same
+  cost: it identifies a destination within one process, not across restarts. A hostname is drawn
+  from a small enough space that an unkeyed digest of one is a confirm-a-guess oracle, which is
+  the disclosure the never-record rule exists to prevent.
+- **`digest_status` and `digest_generation` end the empty string's four meanings.** An absent
+  `request_digest` used to mean any of: the payload could not be encoded, it exceeded the cap, the
+  call was refused before a key existed, or a `none`-mode policy removed one. A consumer holding a
+  keyless record could not tell a defect from a policy from a boundary.
+- **The probe stopped conflating "no destination" with "cannot resolve one".** Both answered `""`,
+  so an adapter that routes on config alone and a deployment whose resolver raises
+  deterministically — every call about to fail — minted the same valid-looking key. Tolerating the
+  raise is right; recording it as absence was not.
+- Red first: the destination separation now asserted on the receipt with the key held equal, the
+  three probe outcomes told apart, the round trip over the new fields, and the `none`-mode
+  narrowing. The round-trip test gained a companion that reads the dataclass, because enumerating
+  fields by construction leaves a new one covered in name only.
+
 ### Changed — the replay key is a declared field list, not a serialized config
 
 - **`request_digest` reads a hand-listed projection of `ModelConfig`, not `to_json()`.** Every

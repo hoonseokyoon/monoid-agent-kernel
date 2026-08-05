@@ -304,7 +304,7 @@ def test_a_non_finite_tool_schema_issues_no_replay_key() -> None:
     prompt digest is unaffected: tool definitions are deliberately outside it."""
 
     request = normalize_model_request(_request(None, dict(_NAN_SCHEMA)))
-    payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
+    payload = _request_payload(request, ModelConfig(), provider="fake")
 
     assert _digest(payload) == ""
     assert _digest(_prompt_payload(request)) != ""

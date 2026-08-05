@@ -399,6 +399,64 @@ def redacted_or_none(
         return None
 
 
+DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld")
+"""Why ``ModelCallReceipt.request_digest`` holds what it holds.
+
+``absent`` means no key was issued -- the payload could not be canonically encoded, or it exceeded
+the size cap. ``withheld`` means one was issued and a ``none``-mode policy removed it. ``not_reached``
+means the call was refused before a key was computed at all. Those were one value before, and a
+consumer holding a keyless record could not tell a defect from a policy from a boundary.
+"""
+
+DESTINATION_STATUSES = (
+    "not_reached",
+    "not_declared",
+    "declined",
+    "resolved",
+    "unavailable",
+)
+"""Which of the destination probe's outcomes happened.
+
+``not_declared`` is an adapter that routes on config alone and never offered the member;
+``declined`` is one that offered it and answered with nothing; ``unavailable`` is one whose probe
+raised. That last is not a transient condition to shrug at: the shipped gateway resolver raises
+deterministically when no URL is configured anywhere, so ``unavailable`` is usually a deployment
+whose every call is about to fail. All three used to be the same empty string, and the collapse was
+invisible because each produced a key that looked fine.
+"""
+
+
+def destination_digest(value: str) -> str:
+    """An id for a call's destination, for a receipt to record *where* without recording *what*.
+
+    Keyed, under the same per-process key and for the same reason as :attr:`RedactionPolicy.digest`
+    -- read that docstring first, because the argument is identical and this preimage is weaker. A
+    hostname is drawn from a far smaller space than a redaction literal: an unkeyed digest of one is
+    a confirm-a-guess oracle for anyone holding a candidate list, which is the disclosure the
+    "hashed, never recorded" rule exists to prevent. Domain separation does not help; guessing is
+    not a collision.
+
+    The cost is the same cost: this identifies a destination **within one process**, not across
+    restarts. That is what a live receipt consumer needs -- "are these two calls going to different
+    places" -- and it is not what a durable corpus needs. A record that must be joined after a
+    restart needs a deployment-supplied key, which is a deployment-time secret rather than a kernel
+    default, and choosing that is deliberately left to whoever first persists these receipts.
+    """
+
+    return canonical_hmac_sha256({"destination": value}, _DIGEST_KEY) if value else ""
+
+
+def _parsed_status(payload: Mapping[str, Any], key: str, allowed: tuple[str, ...]) -> str:
+    """Read a closed kernel enum: absent reads as the default, unknown is refused."""
+
+    raw = payload.get(key)
+    if raw is None:
+        return allowed[0]
+    if not isinstance(raw, str) or raw not in allowed:
+        raise WireValidationError(f"model call {key} must be one of {allowed}")
+    return raw
+
+
 @dataclass(frozen=True)
 class CapturePolicy:
     """How much of a model call one consumer may see.
@@ -633,6 +691,22 @@ class ModelCallReceipt:
     http_status: int | None = None
     redaction_digest: str = ""
     capture_downgrades: int = 0
+    # What the replay key was taken under, and whether one was issued at all. An empty
+    # ``request_digest`` used to be the answer to four different questions -- the payload could not
+    # be canonically encoded, it exceeded the size cap, the call was refused before a key was ever
+    # computed, or a ``none``-mode policy withheld it -- and nothing downstream could tell them
+    # apart. A consumer holding a keyless record could not say whether it was looking at a defect
+    # or at a policy.
+    digest_generation: str = ""
+    digest_status: str = "not_reached"
+    # Where the call was going, as a fact beside the key rather than inside it. The endpoint is
+    # deliberately never recorded in plaintext, which is exactly why hashing it into the replay key
+    # made that key unreproducible: nothing a record holds could reconstruct the preimage. The
+    # status names which of the four probe outcomes happened; the digest is keyed (see
+    # :func:`destination_digest`) so that comparing two calls stays possible without turning the
+    # receipt into a guessing oracle for an internal hostname.
+    destination_status: str = "not_reached"
+    destination_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.attempts < 0:
@@ -772,6 +846,10 @@ class ModelCallReceipt:
             "http_status": self.http_status,
             "redaction_digest": self.redaction_digest,
             "capture_downgrades": self.capture_downgrades,
+            "digest_generation": self.digest_generation,
+            "digest_status": self.digest_status,
+            "destination_status": self.destination_status,
+            "destination_digest": self.destination_digest,
         }
 
     @classmethod
@@ -805,6 +883,17 @@ class ModelCallReceipt:
             http_status=None if raw_status is None else parse_int(payload, "http_status"),
             redaction_digest=parse_str(payload, "redaction_digest"),
             capture_downgrades=parse_int(payload, "capture_downgrades"),
+            # Absent on every receipt written before these fields existed, which is legal and reads
+            # as the "we never got that far" default; present-but-mistyped is refused, like every
+            # other string here. The statuses are closed kernel enums rather than free strings --
+            # unlike ``stop_reason``, whose openness exists because a *provider* may add a value --
+            # so an unknown one is a bug in a writer, not a provider surprise to absorb.
+            digest_generation=parse_str(payload, "digest_generation"),
+            digest_status=_parsed_status(payload, "digest_status", DIGEST_STATUSES),
+            destination_status=_parsed_status(
+                payload, "destination_status", DESTINATION_STATUSES
+            ),
+            destination_digest=parse_str(payload, "destination_digest"),
         )
 
 
@@ -989,6 +1078,11 @@ def _receipt_for_subscription(
     }
     if mode == "none":
         changes.update(dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
+        # Say that the key was taken away rather than leaving the consumer to read the empty
+        # string as "there was never one". Only when there *was* one: overwriting ``absent`` with
+        # ``withheld`` would claim a policy removed a key that no policy ever saw.
+        if receipt.digest_status == "ok":
+            changes["digest_status"] = "withheld"
     return replace(receipt, **changes)
 
 

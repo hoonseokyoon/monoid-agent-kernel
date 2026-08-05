@@ -373,8 +373,13 @@ Four further opt-in protocols declare optional capability members:
   actually ran under rather than a default the call never used.
 - `AddressedModelAdapter.resolve_destination(config) -> str` — where a call under `config` would
   actually be sent. Two adapters holding identical configs can address different hosts, so the
-  destination is folded into the receipt's replay key; it is hashed and never recorded, so an
-  internal hostname stays internal. Raising is permitted and read as "unknown".
+  receipt records that fact *beside* the replay key rather than inside it: a
+  `destination_status` naming which outcome the probe had (`not_declared` / `declined` /
+  `resolved` / `unavailable`, or `not_reached` when the call was refused first) and a keyed
+  `destination_digest` that lets two calls be compared. The value itself is never recorded, so an
+  internal hostname stays internal — which is precisely why it cannot be key material: a key taken
+  over a preimage no record may hold cannot be recomputed or diagnosed. Raising is permitted and is
+  reported as `unavailable`, distinct from an adapter that simply does not route by host.
 
 Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
 default, and behaves identically whether an adapter declares it or omits it, so the attributes are
@@ -559,7 +564,12 @@ definitions or generation settings change around it; `request_digest` covers the
 and is the exact replay key. Both are computed on the **raw** request, before any redaction or
 capture policy, so consumers on different policies agree on the identity of what the provider
 was sent. An empty digest means *no key was issued* (the payload could not be canonically
-encoded, or exceeded the size cap) and must never be read as a key.
+encoded, or exceeded the size cap) and must never be read as a key. `digest_status` says which
+of four things happened, because the empty string used to be the answer to all of them:
+`absent` (no key could be issued), `withheld` (one was, and a `none`-mode capture policy removed
+it), `not_reached` (the call was refused before a key was computed), and `ok`.
+`digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
+which rules produced it.
 
 **What the replay key is made of is a declared list, not a serialized object.** The model config
 enters as a hand-listed projection — the model name, the reasoning block, and the generation block

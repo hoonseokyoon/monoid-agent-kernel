@@ -45,9 +45,11 @@ _PRE_W5_CONFIG_HASH_DEFAULT_MODEL = (
     "182b10bcd89a7e08517a6022479ad2cf9b6e0c8cd269bfc2341c6ad5a041f792"
 )
 _PRE_W5_REQUEST_DIGEST = "54c2cb6d143ab5716cd942f584e34a3100d87dad5e85c48bfeadc767a43ed9c6"
-# Captured under `monoid.model-request-digest.v1` (W6-0). Regenerated only together with a tag bump.
+# Captured under `monoid.model-request-digest.v1` once W6-0 settled that generation's field set.
+# From here on it is regenerated **only together with a tag bump** -- establishing a generation and
+# moving one are different acts, and only the second is what this pin refuses.
 _GENERATION_1_REQUEST_DIGEST = (
-    "a577cb0c6964714e329668b88ede84029cf3208e4459f121c790b7d548ef5cbc"
+    "fbef341fd3f010b89d6d8343d3cbcb1bda2a180f5d6399f169c0c9d89cb34a01"
 )
 
 
@@ -207,7 +209,7 @@ def test_the_replay_key_generation_disowns_the_pre_w5_encoding() -> None:
     """
 
     request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
-    payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
+    payload = _request_payload(request, ModelConfig(), provider="fake")
 
     assert _digest(payload) != _PRE_W5_REQUEST_DIGEST
 
@@ -221,7 +223,7 @@ def test_a_generation_free_request_keeps_generation_1s_key() -> None:
     """
 
     request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
-    payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
+    payload = _request_payload(request, ModelConfig(), provider="fake")
 
     assert _digest(payload) == _GENERATION_1_REQUEST_DIGEST
 
@@ -232,7 +234,6 @@ def test_setting_generation_changes_the_request_digest() -> None:
         request,
         ModelConfig(generation=GenerationConfig(temperature=0.1)),
         provider="fake",
-        destination="",
     )
 
     assert _digest(configured) != _GENERATION_1_REQUEST_DIGEST

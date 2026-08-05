@@ -419,12 +419,21 @@ class AddressedModelAdapter(Protocol):
 
     An adapter may route by more than its :class:`ModelConfig` -- a per-instance override, an
     environment variable, a tenant-specific host -- so the config alone does not identify the
-    service that answered. A caller recording a call's identity asks for the resolved destination
-    and folds it into that identity; omitting the member means "the config is the whole story",
+    service that answered. A caller recording a call asks for the resolved destination and records
+    it *beside* the call's identity; omitting the member means "the config is the whole story",
     which is correct for an adapter that routes on config alone.
 
-    The value is hashed, never recorded, so an internal hostname stays internal. Raising is
-    permitted and treated as "unknown".
+    The value is never recorded in plaintext -- an internal hostname stays internal -- and it is
+    also not folded into the replay key, which is a change from what this member first existed for.
+    Hashing it into the key made that key unreproducible: nothing a record holds could reconstruct
+    a preimage the rules forbid recording, so a recorded key could not be recomputed, verified, or
+    diagnosed on a miss. What the caller records instead is a *status* naming which outcome this
+    probe had and a keyed digest of the value, which lets two calls be compared without the digest
+    becoming a guessing oracle for the host.
+
+    Raising is permitted and is reported as its own outcome rather than as "no destination" --
+    those are a broken deployment and a working one, and reading them as the same thing is what
+    the status exists to stop.
     """
 
     def resolve_destination(self, config: ModelConfig) -> str: ...

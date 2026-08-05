@@ -42,11 +42,11 @@ _REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
 
 
 def _key(model: ModelConfig, *, provider: str = "fake") -> str:
-    return _digest(_request_payload(_REQUEST, model, provider=provider, destination=""))
+    return _digest(_request_payload(_REQUEST, model, provider=provider))
 
 
 def _terms(model: ModelConfig) -> dict[str, object]:
-    payload = _request_payload(_REQUEST, model, provider="fake", destination="")
+    payload = _request_payload(_REQUEST, model, provider="fake")
     return dict(payload[_REQUEST_DIGEST_GENERATION])
 
 
@@ -64,7 +64,7 @@ def test_the_two_digests_cannot_share_a_key_space() -> None:
     """
 
     prompt = _prompt_payload(_REQUEST)
-    whole = _request_payload(_REQUEST, ModelConfig(), provider="fake", destination="")
+    whole = _request_payload(_REQUEST, ModelConfig(), provider="fake")
 
     assert set(prompt) == {_PROMPT_DIGEST_GENERATION}
     assert set(whole) == {_REQUEST_DIGEST_GENERATION}
@@ -168,6 +168,18 @@ class _Declaring:
 
 class _Silent:
     pass
+
+
+def test_the_endpoint_does_not_move_the_replay_key() -> None:
+    """Where a call was sent is not what it asked for.
+
+    The signature carries no `destination` at all now, so this states the property structurally:
+    the payload has no term a destination could occupy, and the terms it does have are the ones a
+    record can hold. The endpoint's own fact lives on the receipt, beside the key rather than
+    inside it.
+    """
+
+    assert "destination" not in _terms(ModelConfig())
 
 
 def test_a_gateway_relayed_openai_call_and_a_direct_openai_call_share_a_key() -> None:

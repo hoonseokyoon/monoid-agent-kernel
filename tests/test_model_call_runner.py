@@ -1382,16 +1382,19 @@ def test_a_container_hook_that_raises_costs_the_key_not_the_call(factory: Any) -
     assert _digest({"v": factory()}) == ""
 
 
-def test_the_replay_key_separates_calls_to_different_destinations() -> None:
-    """Two adapters with identical configs can address different services.
+def test_the_receipt_separates_calls_to_different_destinations_without_naming_them() -> None:
+    """Two adapters with identical configs can address different services -- and now say so.
 
-    `GatewayModelAdapter` lets a per-instance `gateway_url` outrank the config, so a config-only key
-    matched calls that went to different hosts and could return different answers. The destination
-    is hashed rather than recorded, so an internal hostname stays internal.
+    `GatewayModelAdapter` lets a per-instance `gateway_url` outrank the config, so two calls with
+    identical content can go to different hosts. That fact used to live *inside* the replay key,
+    where it made the key unreproducible: the destination is deliberately never recorded, so
+    nothing a record holds could reconstruct it and a miss could not even be diagnosed. It is now
+    beside the key instead -- a keyed digest a consumer can compare and no one can read a hostname
+    out of -- and the key itself describes only what was asked for.
     """
     config = ModelConfig(model="m", gateway_url="http://shared.invalid/x")
 
-    def keyed(url: str) -> str:
+    def observed(url: str) -> Any:
         adapter = GatewayModelAdapter(config=config, gateway_url=url, token="t")
         observer = RecordingObserver()
 
@@ -1405,21 +1408,27 @@ def test_the_replay_key_separates_calls_to_different_destinations() -> None:
                 ).acall(REQUEST)
 
         asyncio.run(run())
-        return observer.captures[0].receipt.request_digest
+        return observer.captures[0].receipt
 
-    first = keyed("http://tenant-a.invalid/x")
-    second = keyed("http://tenant-b.invalid/x")
+    first = observed("http://tenant-a.invalid/x")
+    second = observed("http://tenant-b.invalid/x")
 
-    assert first != second
-    assert first == keyed("http://tenant-a.invalid/x")
-    assert "tenant-a" not in first
+    assert first.request_digest == second.request_digest, "same request, same key"
+    assert first.destination_digest != second.destination_digest, "different service, said so"
+    assert first.destination_digest == observed("http://tenant-a.invalid/x").destination_digest
+    assert "tenant-a" not in first.destination_digest
+    assert first.destination_status == "resolved"
 
 
-def test_an_adapter_that_names_no_destination_still_gets_a_key() -> None:
-    """The member is opt-in, and a resolver that raises must not cost the call its key either.
+def test_an_adapter_that_names_no_destination_is_told_apart_from_one_that_cannot() -> None:
+    """Declining and failing are two facts, and `""` used to be the answer to both.
 
-    Refusing a key whenever the destination is unknown would refuse one for every adapter that
-    routes on config alone, which is most of them.
+    An adapter that routes on config alone has no destination concept; one whose resolver raises
+    is misconfigured and every call it makes is about to fail. `_resolve_gateway_url` raises
+    deterministically when no URL is configured anywhere, so this is not a transient-vs-absent
+    distinction -- it is a working deployment against a broken one, and both used to mint the same
+    valid-looking key. Neither costs the call its key: refusing one whenever the destination is
+    unknown would refuse one for every adapter that routes on config alone, which is most of them.
     """
 
     class Silent:
@@ -1436,12 +1445,19 @@ def test_an_adapter_that_names_no_destination_still_gets_a_key() -> None:
             del request
             return ModelTurn(final_text="answer")
 
-    async def key(adapter: Any) -> str:
+    async def receipt_for(adapter: Any) -> Any:
         _turn, receipt = await ModelCallRunner(adapter=adapter).acall(REQUEST)
-        return receipt.request_digest
+        return receipt
 
-    assert asyncio.run(key(Silent())) != ""
-    assert asyncio.run(key(Unroutable())) != ""
+    silent = asyncio.run(receipt_for(Silent()))
+    unroutable = asyncio.run(receipt_for(Unroutable()))
+
+    assert silent.request_digest != ""
+    assert unroutable.request_digest != ""
+    assert silent.destination_status == "not_declared"
+    assert unroutable.destination_status == "unavailable"
+    assert silent.destination_digest == ""
+    assert unroutable.destination_digest == ""
 
 
 def test_a_marker_shaped_string_is_ordinary_caller_text() -> None:
@@ -1562,7 +1578,7 @@ def test_an_absent_message_log_is_not_an_empty_one() -> None:
 
     assert _digest(_prompt_payload(absent)) != _digest(_prompt_payload(empty))
     keys = [
-        _digest(_request_payload(r, ModelConfig(), provider="p", destination="d"))
+        _digest(_request_payload(r, ModelConfig(), provider="p"))
         for r in (absent, empty)
     ]
     assert keys[0] != keys[1] and "" not in keys
@@ -2493,11 +2509,13 @@ def test_a_by_reference_call_shows_an_empty_message_log_not_a_null_one() -> None
     assert by_value.captures[0].content["previous_turn_handle"] == ""
 
 
-def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
+def test_a_resolver_that_answers_nothing_is_declined_not_absent() -> None:
     """The third way an adapter declines a destination: answering, with nothing.
 
-    Unguarded, `str(None)` puts the text `"None"` into the replay key -- a destination no adapter
-    has, shared by every adapter that returns `None`.
+    Unguarded, `str(None)` recorded the text `"None"` -- a destination no adapter has, shared by
+    every adapter that returns one. It is now `declined`, which is a different fact from the
+    `not_declared` of an adapter that never offered the member and from the `unavailable` of one
+    whose probe raised.
     """
 
     class Vague:
@@ -2513,15 +2531,13 @@ def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
         _turn, receipt = await ModelCallRunner(adapter=Vague()).acall(REQUEST)
         return receipt
 
-    # `provider="gateway"` rather than `""`: the key's provider slot is `resolved_provider_name`,
-    # which falls back to the config for an adapter that declares nothing. This test is about the
-    # destination probe, so it states the resolved value rather than restating the old default.
-    empty = _digest(_request_payload(REQUEST, ModelConfig(), provider="gateway", destination=""))
-    stringified = _digest(
-        _request_payload(REQUEST, ModelConfig(), provider="gateway", destination="None")
+    receipt = asyncio.run(run())
+    assert receipt.destination_status == "declined"
+    assert receipt.destination_digest == ""
+    # The key does not move with any of it: the endpoint left the payload entirely.
+    assert receipt.request_digest == _digest(
+        _request_payload(REQUEST, ModelConfig(), provider="gateway")
     )
-    assert asyncio.run(run()).request_digest == empty
-    assert empty != stringified, "the two must be distinguishable for this test to mean anything"
 
 
 def test_a_config_of_the_wrong_type_is_not_written_into_the_receipt() -> None:
@@ -2704,12 +2720,16 @@ def test_a_close_that_finishes_in_time_is_not_reported_as_abandoned(caplog: Any)
     assert not caplog.records, f"an ordinary close was reported as abandoned: {caplog.records}"
 
 
-def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> None:
-    """The probe is tolerant at the lookup, not only at the call.
+def test_a_probe_that_raises_on_lookup_is_unavailable_not_absent() -> None:
+    """The probe is tolerant at the lookup, not only at the call -- and now says which it was.
 
-    `resolve_destination` is opt-in, so an adapter may expose it as a property -- and a property that
-    raised took the whole call down, over a replay key. The sibling probes guarded the `getattr`;
+    `resolve_destination` is opt-in, so an adapter may expose it as a property, and a property that
+    raised took the whole call down over a replay key. The sibling probes guarded the `getattr`;
     this one guarded only the invocation, which is the half a `def` happens to exercise.
+
+    Tolerating it is right; recording it as "no destination" was not. That collapsed a working
+    deployment and a broken one into one answer, and the collapse was invisible because both
+    produced a key that looked fine.
     """
 
     class RaisingLookup:
@@ -2730,8 +2750,9 @@ def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> Non
     # See the sibling above on `provider="gateway"`: the slot resolves through the config when an
     # adapter declares nothing, and this adapter declares nothing but a raising property.
     assert receipt.request_digest == _digest(
-        _request_payload(REQUEST, ModelConfig(), provider="gateway", destination="")
+        _request_payload(REQUEST, ModelConfig(), provider="gateway")
     )
+    assert receipt.destination_status == "unavailable"
 
 
 def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_probe() -> None:

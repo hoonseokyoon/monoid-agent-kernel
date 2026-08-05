@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+from dataclasses import fields
 
 import pytest
 
@@ -202,6 +204,10 @@ def test_with_error_preserves_everything_else() -> None:
 
 
 def test_json_round_trip_preserves_every_field() -> None:
+    """Every field, enumerated by construction -- so a new one that is not added here leaves the
+    test green while its name becomes a lie. The guard below turns that failure mode into a
+    failing test."""
+
     receipt = ModelCallReceipt(
         context=InvocationContext(run_id="run_1", skill_id="lecture-note", traceparent=TRACEPARENT),
         model=ModelConfig(provider="openai", model="gpt-5.5", timeout_s=42),
@@ -220,9 +226,64 @@ def test_json_round_trip_preserves_every_field() -> None:
         http_status=429,
         redaction_digest="sha-policy",
         capture_downgrades=1,
+        digest_generation="monoid.model-request-digest.v1",
+        digest_status="ok",
+        destination_status="resolved",
+        destination_digest="sha-destination",
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt
+
+
+def test_the_round_trip_above_names_every_field_there_is() -> None:
+    """The enumeration is only a contract while it is complete.
+
+    `test_json_round_trip_preserves_every_field` builds a receipt by construction, so a field
+    added without touching it round-trips at its default and the test passes without covering it.
+    This reads the dataclass instead: every declared field must appear in the wire shape, and the
+    round trip above must set each one to something other than its default.
+    """
+
+    declared = {field_.name for field_ in fields(ModelCallReceipt)}
+    assert set(ModelCallReceipt().to_json()) == declared
+
+    source = inspect.getsource(test_json_round_trip_preserves_every_field)
+    missing = sorted(name for name in declared if f"{name}=" not in source)
+    assert missing == [], {
+        "never_exercised_by_the_round_trip": missing,
+        "hint": "a field the enumeration does not name is a field it does not cover",
+    }
+
+
+def test_a_receipt_that_never_reached_the_probe_says_so() -> None:
+    """The default is a fact, not a blank.
+
+    A call refused before dispatch -- cancelled, past its deadline, rejected at ingress -- gets a
+    receipt built before any key or probe happened. Defaulting those fields to `""` would have
+    reported "no destination" and "no key" for a call that never asked either question.
+    """
+
+    provisional = ModelCallReceipt()
+
+    assert provisional.digest_status == "not_reached"
+    assert provisional.destination_status == "not_reached"
+    assert provisional.request_digest == ""
+    assert provisional.digest_generation == ""
+
+
+@pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
+def test_an_unknown_status_is_refused_rather_than_absorbed(field_name: str) -> None:
+    """Closed kernel enums, unlike ``stop_reason``.
+
+    ``stop_reason`` is an open string because a *provider* may invent a fifth value and a receipt
+    must stay recordable. These two are written only by this kernel, so an unknown value is a bug
+    in a writer -- absorbing it would let a typo travel as data.
+    """
+
+    payload = ModelCallReceipt().to_json() | {field_name: "probably"}
+
+    with pytest.raises(WireValidationError, match=field_name):
+        ModelCallReceipt.from_json(payload)
 
 
 def test_an_unknown_stop_reason_survives_a_round_trip() -> None:

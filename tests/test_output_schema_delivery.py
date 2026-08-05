@@ -72,11 +72,11 @@ def test_schema_free_requests_keep_their_digest_and_schema_changes_it() -> None:
     # Read through the generation wrapper deliberately: asserting `"output_schema" not in free`
     # against the whole payload passes vacuously once the terms sit one level down, which is a
     # pin that has stopped checking what it names.
-    free = _request_payload(_request(), ModelConfig(), provider="fake", destination="")
+    free = _request_payload(_request(), ModelConfig(), provider="fake")
     assert "output_schema" not in free[_REQUEST_DIGEST_GENERATION]
 
     constrained = _request_payload(
-        _request(output_schema=dict(_SCHEMA)), ModelConfig(), provider="fake", destination=""
+        _request(output_schema=dict(_SCHEMA)), ModelConfig(), provider="fake"
     )
     assert constrained[_REQUEST_DIGEST_GENERATION]["output_schema"] == _SCHEMA
     assert _digest(constrained) != _digest(free)

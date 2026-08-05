@@ -48,6 +48,7 @@ from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normal
 from monoid_agent_kernel.core.model_io import (
     ModelCallReceipt,
     ModelIOSubscription,
+    destination_digest,
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -288,7 +289,7 @@ def _model_identity(model: ModelConfig) -> dict[str, Any]:
 
 
 def _request_payload(
-    request: ModelRequest, model: ModelConfig, *, provider: str, destination: str
+    request: ModelRequest, model: ModelConfig, *, provider: str
 ) -> dict[str, Any]:
     """The whole request, as the thing `request_digest` identifies -- the replay key.
 
@@ -303,16 +304,20 @@ def _request_payload(
     with a gateway built without one; reading only the config would separate a direct call from a
     gateway relaying the same upstream, which is exactly the pair a corpus wants to share a key.
 
-    `destination` is here because the same request answered by a different service is a different
-    call. It is hashed and never recorded, so an internal hostname stays internal, and it is empty
-    for an adapter that does not expose one -- see `AddressedModelAdapter`.
+    **The destination is not here, and its absence is the point.** Where a call was sent used to be
+    hashed in, on the reasoning that the same request answered by a different service is a different
+    call -- which is true, and was the wrong place to say it. The value is deliberately never
+    recorded, so no record could reconstruct the preimage: a key taken over it could not be
+    recomputed, could not be verified, and a miss could not be told from a defect. It is now a fact
+    beside the key (`ModelCallReceipt.destination_status` and `destination_digest`), where it can be
+    compared without being disclosed. The distinction it used to draw was not lost; it moved from an
+    opaque hash into something a consumer can actually read.
     """
 
     terms = _prompt_terms(request)
     terms["tools"] = [_tool_payload(spec) for spec in request.tools]
     terms["model"] = _model_identity(model)
     terms["provider"] = provider
-    terms["destination"] = destination
     # Omit-when-absent (the W5 digest stability rule): a schema-free request keeps the
     # replay key it had before this field existed; setting a schema changes the key, which
     # is correct -- constrained and unconstrained calls are different requests.
@@ -540,7 +545,7 @@ class ModelCallRunner:
         if request.model is not None:
             normalized = normalize_model_config(request.model) or ModelConfig()
             return normalized, normalized
-        # Tolerant of a raising probe for the reason `_destination` gives: a replay key is
+        # Tolerant of a raising probe for the reason `_resolved_destination` gives: a replay key is
         # bookkeeping, and an adapter that cannot answer must not thereby lose its call. Plain
         # `getattr(..., None)` swallowed only `AttributeError`, so a `config` property that raised
         # anything else took the whole call down.
@@ -557,25 +562,34 @@ class ModelCallRunner:
             return normalized, normalized
         return ModelConfig(), None
 
-    def _destination(self, model: ModelConfig, adapter: Any) -> str:
-        """Where this adapter would send a call under `model`, or `""` if it does not say.
+    def _resolved_destination(self, model: ModelConfig, adapter: Any) -> tuple[str, str]:
+        """Where this adapter would send a call under `model`, and WHICH outcome that was.
 
-        Probed and tolerant of failure for the same reason every other probe here is: a replay key
-        is bookkeeping, and an adapter that cannot answer must not thereby lose its call.
+        Probed and tolerant of failure for the same reason every other probe here is: bookkeeping,
+        and an adapter that cannot answer must not thereby lose its call.
 
         The `getattr` is inside the `try`, not before it. Tolerating only the *call* left the
         *lookup* undefended, so an adapter exposing `resolve_destination` as a property that raised
         still lost its call -- the one shape the rule above exists to rule out, surviving in the
         probe the other two were written to imitate.
+
+        Returning a status alongside the value is the fix for what tolerance used to cost. Three
+        outcomes answered `""`: an adapter with no destination concept, one that answered with
+        nothing, and one whose probe raised. The third is not a shrug -- the shipped gateway
+        resolver raises *deterministically* when no URL is configured anywhere, so it usually means
+        a deployment whose every call is about to fail. All three produced a valid-looking key that
+        could not be told from the others, which is exactly the shape `_digest`'s own docstring
+        rules out for itself: refusing is safe, but a fabricated answer returns the wrong call.
         """
 
         try:
             resolve = getattr(adapter, "resolve_destination", None)
             if not callable(resolve):
-                return ""
-            return normalize_unicode_scalars(str(resolve(model) or ""))
+                return "", "not_declared"
+            value = normalize_unicode_scalars(str(resolve(model) or ""))
         except Exception:
-            return ""
+            return "", "unavailable"
+        return (value, "resolved") if value else ("", "declined")
 
     def _token(self) -> CancellationToken | None:
         return (
@@ -698,27 +712,33 @@ class ModelCallRunner:
                 if dispatch_model is not None:
                     request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
+                where, destination_status = self._resolved_destination(model, adapter)
+                request_digest = _digest(
+                    _request_payload(
+                        request,
+                        model,
+                        # The RESOLVED provider, not the raw declaration `provider_name` records
+                        # above: the key must say who actually served the call. Declaration-only
+                        # collided a fake adapter with a gateway built without one -- both declare
+                        # nothing -- and `ModelConfig.provider` alone separated a direct call from
+                        # a gateway relaying the same upstream, which is the one pair a corpus
+                        # wants sharing a key. It also normalizes, which matters here because
+                        # `provider` is the only `ModelConfig` field with no ingress validation.
+                        provider=resolved_provider_name(adapter, model) or "",
+                    )
+                )
                 receipt = replace(
                     receipt,
                     context=normalized_context,
                     model=model,
                     prompt_digest=_digest(_prompt_payload(request)),
-                    request_digest=_digest(
-                        _request_payload(
-                            request,
-                            model,
-                            # The RESOLVED provider, not the raw declaration `provider_name`
-                            # records above: the key must say who actually served the call.
-                            # Declaration-only collided a fake adapter with a gateway built
-                            # without one -- both declare nothing -- and `ModelConfig.provider`
-                            # alone separated a direct call from a gateway relaying the same
-                            # upstream, which is the one pair a corpus wants sharing a key.
-                            # It also normalizes, which matters here because `provider` is the
-                            # only `ModelConfig` field with no ingress validation.
-                            provider=resolved_provider_name(adapter, model) or "",
-                            destination=self._destination(model, adapter),
-                        )
-                    ),
+                    request_digest=request_digest,
+                    digest_generation=_REQUEST_DIGEST_GENERATION,
+                    # Read off the key rather than recomputed: the two cannot disagree about
+                    # whether one was issued if only one of them decides.
+                    digest_status="ok" if request_digest else "absent",
+                    destination_status=destination_status,
+                    destination_digest=destination_digest(where),
                 )
                 reached_adapter = True
                 turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
