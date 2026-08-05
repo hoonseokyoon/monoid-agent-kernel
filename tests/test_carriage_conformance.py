@@ -6809,6 +6809,11 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # the empty-object-is-proof rule, and the three-spellings disambiguation.
         "empty object as a proof, not an absence",
         "artifact array and echo object on the response",
+        # W6-0: the digest generation rule. The bare words "domain" and "generation" are all
+        # over this document, and even "generation change" predates W6-0 in the very rule this
+        # sentence replaces -- so the anchor is the clause that states the *mechanism*, which
+        # exists nowhere at 6f4b21b and exactly once now.
+        "carried as the single wrapper key",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

@@ -22,8 +22,20 @@ from monoid_agent_kernel.core.spec import (
 from monoid_agent_kernel.model_call import _digest, _request_payload
 from monoid_agent_kernel.providers.base import ModelRequest, normalize_model_config
 
-# Captured on develop @ v0.20.1 (6eb9fcf), before GenerationConfig existed. These literals
-# are the contract: regenerating them after a serialization change defeats the pin.
+# Captured on develop @ v0.20.1 (6eb9fcf), before GenerationConfig existed. The two families
+# below no longer share a serializer, so they no longer share a rule.
+#
+# The config hashes still pin `ModelConfig.to_json`, which still feeds
+# `AgentRuntimeConfig._json_payload` -> `config_hash` -> the durable comparison in
+# `core/durable_metadata.py`. For those, the literal IS the contract: regenerating them after a
+# serialization change defeats the pin.
+#
+# `_PRE_W5_REQUEST_DIGEST` no longer pins the replay key. W6-0 put the whole preimage under a
+# generation tag, so generation 1 deliberately does not reproduce it; it is kept unregenerated as
+# the *disowned* value and its test asserts the key space moved, which is what a generation tag is
+# for. The omit-when-absent job moved to `_GENERATION_1_REQUEST_DIGEST`, whose operating rule
+# replaces "never regenerate": it is regenerated **only together with a tag bump**. A change that
+# moves that literal without moving the tag is the change the pin exists to stop.
 _PRE_W5_CONFIG_HASH_NO_MODEL = "83dab782014d676f0b646421a32c2e41b2befc06efd620d7ae9afd22cb0c3b2c"
 _PRE_W5_CONFIG_HASH_DEFAULT_MODEL = (
     "182b10bcd89a7e08517a6022479ad2cf9b6e0c8cd269bfc2341c6ad5a041f792"
@@ -176,11 +188,20 @@ def test_config_hash_is_unchanged_for_generation_free_configs() -> None:
     assert with_model.config_hash == _PRE_W5_CONFIG_HASH_DEFAULT_MODEL
 
 
-def test_request_digest_is_unchanged_for_generation_free_requests() -> None:
+def test_the_replay_key_generation_disowns_the_pre_w5_encoding() -> None:
+    """W6-0 put the whole preimage under a generation tag, so generation 1 does not reproduce it.
+
+    This literal used to be the replay key's stability pin. Regenerating it was forbidden and
+    still is -- so it is kept unregenerated and its assertion inverted. Disowning a key space
+    is exactly what a generation tag is for, and the tag is what makes the move visible
+    instead of silent. The omit-when-absent job it used to carry moved to
+    ``_GENERATION_1_REQUEST_DIGEST``.
+    """
+
     request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
     payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
 
-    assert _digest(payload) == _PRE_W5_REQUEST_DIGEST
+    assert _digest(payload) != _PRE_W5_REQUEST_DIGEST
 
 
 def test_setting_generation_changes_the_request_digest() -> None:

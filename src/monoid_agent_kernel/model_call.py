@@ -57,6 +57,7 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelStreamIngressNormalizer,
@@ -87,8 +88,36 @@ ShouldAbort = Callable[[], bool]
 """Polled once per streamed chunk, after it has been delivered. See `ModelCallRunner.acall`."""
 
 
-def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
+_PROMPT_DIGEST_GENERATION = namespaced_id("model-prompt-digest.v1")
+_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
+"""The domain each digest is taken in, and the generation of the rules that produced it.
+
+Domain separation on the *whole* preimage, applied in the payload builders rather than in
+:func:`_digest` -- the same place :func:`core.model_io.content_digest` applies its shape key, and
+for the same reason. Two jobs, one tag:
+
+* **The two digests stop sharing a key space.** Their separation used to be incidental:
+  :func:`_request_payload` starts from the prompt terms and adds keys that are always present, so a
+  request payload could not *happen* to equal a prompt payload. That is a property of today's field
+  lists, not a rule, and it would have ended the first time one of those added keys became
+  conditional.
+* **A rules change is announced instead of silent.** `docs/CONTRACTS.md` states it as the second
+  stability rule: adding an omitted-when-unset field is not a generation change, but changing what
+  the payload is made of is, and a generation change takes the domain with it. Bumping `.v1` to
+  `.v2` disowns every key recorded under the old rules in one edit, which is the only honest way to
+  retire a corpus that a change has invalidated.
+
+Not inside :func:`_digest`: that function's contract is "the canonical-JSON digest of `payload`",
+its tests are about the encoder, and a prefix fed to the hasher would bypass `_CANONICAL_ENCODER`
+and break the twin invariant the comment beside it guards.
+"""
+
+
+def _prompt_terms(request: ModelRequest) -> dict[str, Any]:
     """The assembled prompt, as the thing `prompt_digest` identifies.
+
+    Returned unwrapped so :func:`_request_payload` can build on it without nesting a domain inside
+    a domain; :func:`_prompt_payload` is the wrapped form that is actually hashed.
 
     Tool definitions and generation settings are deliberately absent: the question this digest
     answers is "did the model see the same conversation twice", which must stay true when a tool is
@@ -114,6 +143,12 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
         "previous_turn_handle": request.previous_turn_handle,
         "observations": [observation.to_json() for observation in request.observations],
     }
+
+
+def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
+    """:func:`_prompt_terms` in its own digest domain. See :data:`_PROMPT_DIGEST_GENERATION`."""
+
+    return {_PROMPT_DIGEST_GENERATION: _prompt_terms(request)}
 
 
 # Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
@@ -214,17 +249,17 @@ def _request_payload(
     `AddressedModelAdapter`.
     """
 
-    payload = _prompt_payload(request)
-    payload["tools"] = [_tool_payload(spec) for spec in request.tools]
-    payload["model"] = model.to_json()
-    payload["provider"] = provider
-    payload["destination"] = destination
+    terms = _prompt_terms(request)
+    terms["tools"] = [_tool_payload(spec) for spec in request.tools]
+    terms["model"] = model.to_json()
+    terms["provider"] = provider
+    terms["destination"] = destination
     # Omit-when-absent (the W5 digest stability rule): a schema-free request keeps the
     # replay key it had before this field existed; setting a schema changes the key, which
     # is correct -- constrained and unconstrained calls are different requests.
     if request.output_schema is not None:
-        payload["output_schema"] = request.output_schema
-    return payload
+        terms["output_schema"] = request.output_schema
+    return {_REQUEST_DIGEST_GENERATION: terms}
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:

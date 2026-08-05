@@ -567,10 +567,14 @@ Two rules keep digests stable across kernel versions:
    in the digest payload only when configured, so a request that does not use them keeps the
    digest it had before the field existed. Setting one changes the digest — deliberately, since
    the request's meaning changed.
-2. **Canonicalization changes are generation changes.** If the digest's encoding rules
-   themselves ever change, the digest domain gains a version tag (domain separation), rather
-   than letting two incompatible encodings collide in one key space. Adding an omitted-when-unset
-   field is *not* a generation change.
+2. **Canonicalization changes are generation changes.** Each digest is taken in its own named
+   domain, carried as the single wrapper key of the payload that is hashed:
+   `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`. Changing what the
+   payload is made of — not merely adding an omitted-when-unset field, which is *not* a
+   generation change — bumps that tag, so two incompatible rule sets can never collide in one
+   key space and a corpus a change has invalidated is disowned in one edit rather than silently.
+   The two digests are separated by their domains rather than by their field lists happening to
+   differ, which is why neither can be read as the other.
 
 #### AgentLoop model-I/O subscriptions
 

@@ -7,6 +7,29 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — both model-call digests name their own domain
+
+- **Each digest is now taken in a named domain carried as the payload's single wrapper key:
+  `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`.** Every digest value
+  moves once, deliberately; no field joined or left the payload in this change. Two jobs, one
+  tag. The digests stop sharing a key space by *accident* — the request payload starts from the
+  prompt terms and adds keys that happen to be unconditional, so it could not happen to equal a
+  prompt payload, which is a property of today's field lists rather than a rule. And a rules
+  change is now announced: bumping `.v1` to `.v2` disowns a corpus the change invalidated in one
+  edit, instead of letting two incompatible encodings collide in one key space.
+- **The tag is applied in the payload builders, not in the hasher.** Same place
+  `content_digest` applies its shape key. A prefix fed to the hasher would bypass the canonical
+  encoder and break the twin invariant that keeps it byte-identical to `canonical_sha256`.
+- **`_PRE_W5_REQUEST_DIGEST` is disowned rather than regenerated.** Its file forbids
+  regenerating it, and that is right, so the literal stays and its assertion inverts: generation
+  1 must *not* reproduce the pre-W5 encoding. The pre-W5 `config_hash` literals are untouched —
+  `ModelConfig.to_json` did not change, so durable recovery across versions is unaffected.
+- This is the last change at which giving `prompt_digest` a domain is free: nothing persists it
+  today, and a later track records model calls to disk.
+- Census: the digest-generation rule's mechanism clause joins `EXTRA_CARRIERS` for
+  `docs/CONTRACTS.md`, anchored on the phrase rather than the key words — "domain" and
+  "generation change" both predate this change in the very rule the sentence replaces.
+
 ### Fixed — the third group's newly-covered members are named, and stale sentences retire
 
 - **`docs/COMPATIBILITY.md`'s "the third group did not move at all" is scoped and corrected.**
