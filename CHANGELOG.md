@@ -7,6 +7,36 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the raw arms pay what the turn already cost
+
+- **A connection that drops *after* the OpenAI stream's terminal response reports what that
+  turn cost.** The rule "a refusal carries the billed cost" was bound to the classified arm of
+  `astream_turn`'s guard and not to the raw arm two lines below it — and the raw arm is exactly
+  where this case lands: a stream can go on emitting frames after `response.completed`, and the
+  SDK translates transport failures into `APIConnectionError` only up to the response headers,
+  so a drop while the *body* streams arrives as a raw `httpx.ReadError`/`ReadTimeout`/
+  `RemoteProtocolError`. The counts were already captured and the error left with `usage: {}`,
+  so the receipt, the run's token budget and (across a hop) the tenant ledger all recorded zero
+  for a turn the provider generated and billed. A drop *before* the terminal frame still carries
+  nothing: mid-stream usage is genuinely unknowable. Retryability is unchanged — a dropped
+  socket is honestly retryable, and only the lost cost was the defect.
+- **The blocking path's twin, on both of its arms.** `next_turn`'s raw arm is reachable with a
+  billed body already parsed — the client's own `close()` runs in an inner `finally` and an
+  exception there *replaces* the call's outcome — and its classified arm was handing the
+  completion seam `None` unconditionally, discarding a readable cost whenever the refusal was
+  `_coerce_response`'s: that reader is `dict`-only while `usage_reported_by` accepts any
+  `Mapping`, so a Mapping-but-not-`dict` response is refused for its container and perfectly
+  readable for its cost. Both arms now read one expression (`_readable_payload`) over the two
+  phases of the body read, pre-initialized so a failure before either phase answers with the
+  provider's failure rather than a `NameError`.
+- **The gateway client stops under-counting a stream the hop already metered.** Both of
+  `astream_turn`'s `httpx.HTTPError` handlers — the per-attempt one and the client-lifecycle one
+  that catches a pool teardown — minted `gateway_network_error` with an empty stamp, so a drop
+  *after* the terminal frame was indistinguishable on the wire from a drop before it. The drain
+  now retains what the stream reported spending (reset per attempt, beside `saw_terminal`) and
+  every mint carries it through the same guarded helper. `retryable` and `error_code` are
+  untouched on both branches.
+
 ### Fixed — the pin binds values, the sweep covers the family, four sentences stop over-claiming
 
 - **The fold-guard structural pin had its verdicts inverted.** It compared only the keyword

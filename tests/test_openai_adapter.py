@@ -8,7 +8,7 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -371,8 +371,15 @@ class _UnsetRequestResponse:
         raise RuntimeError("The request instance has not been set on this response.")
 
 
-def _stub_sync_openai(monkeypatch: pytest.MonkeyPatch, raw: object) -> None:
-    """Patch ``openai.OpenAI`` with a client offering both call surfaces, like the SDK."""
+def _stub_sync_openai(
+    monkeypatch: pytest.MonkeyPatch, raw: object, *, close_error: Exception | None = None
+) -> None:
+    """Patch ``openai.OpenAI`` with a client offering both call surfaces, like the SDK.
+
+    ``close_error`` models the exit path the wrapper's own docstring names: the call owns its
+    client, the ``finally`` tears the pool down, and a teardown that raises *replaces* the
+    outcome of a body that already parsed.
+    """
 
     pytest.importorskip("openai")
 
@@ -390,7 +397,8 @@ def _stub_sync_openai(monkeypatch: pytest.MonkeyPatch, raw: object) -> None:
         responses = _Responses()
 
         def close(self) -> None:
-            return None
+            if close_error is not None:
+                raise close_error
 
     monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: _Client())
 
@@ -1165,3 +1173,153 @@ def test_naming_a_refusal_tolerates_a_type_that_refuses_the_attribute() -> None:
     refusing = _ReadOnlyCode("a third-party adapter's own refusal")
     _complete_billed_refusal(refusing, {}, provider_retried=True)  # type: ignore[arg-type]
     assert refusing.provider_error_code == ""
+
+
+# --- the RAW arms of the same two trys pay what the turn already cost ---------------------
+#
+# The completion arm of each call path carries the cost; the raw arm beside it -- the same
+# ``try``, one line down -- minted its error and threw the payload away. Both raw arms are
+# reachable AFTER a billed body is in hand: the stream keeps emitting frames past
+# ``response.completed`` and the connection can drop there (``_connection_error_code``'s own
+# docstring names that lane), and the sync call's pool teardown runs in a ``finally`` after the
+# body has parsed. A network drop is honestly retryable and stays so; what was wrong is only
+# that the turn's cost went with it.
+
+
+class _DroppedAsyncStream(_FakeAsyncStream):
+    """A stream that keeps emitting after ``response.completed`` and then drops mid-body.
+
+    The SDK translates transport failures into ``APIConnectionError`` only up to the response
+    headers, so a drop while the BODY streams arrives as the raw ``httpx`` family instead --
+    which is exactly the lane that reaches the adapter's classifier with a terminal payload
+    already captured.
+    """
+
+    def __init__(
+        self, events: list[Any], error: Exception, response: object | None = None
+    ) -> None:
+        super().__init__(events, response)
+        self._error = error
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise self._error from None
+
+
+def _terminal_event() -> Any:
+    return SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(model_dump=lambda: _billed_response_body()),
+    )
+
+
+def test_a_drop_after_the_streams_terminal_response_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streamed raw arm: the counts were captured, then the connection went.
+
+    The classified arm two lines above stamps this same ``final_data``; the raw one beside it
+    minted a network error with nothing, so a turn the provider generated and billed was metered
+    at zero by the receipt, the run's budget and the tenant ledger behind it.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_async_openai(
+        monkeypatch,
+        _DroppedAsyncStream(
+            [_terminal_event()], httpx.ReadError("the connection dropped mid-body")
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _drain(_adapter())
+
+    assert provider_usage_of(dropped.value) == _BILLED_RESPONSE_USAGE
+    # The classification itself is untouched: a drop is a drop, and waiting is still the remedy.
+    assert dropped.value.provider_error_code == "openai_network_error"
+    assert dropped.value.retryable is True
+
+
+def test_a_drop_before_the_terminal_response_invents_no_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight: mid-stream usage is genuinely unknowable, so nothing is claimed."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_async_openai(
+        monkeypatch,
+        _DroppedAsyncStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="half an ans")],
+            httpx.ReadTimeout("the connection stopped answering"),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _drain(_adapter())
+
+    assert provider_usage_of(dropped.value) == {}
+    assert dropped.value.provider_error_code == "openai_timeout"
+
+
+def test_a_teardown_that_fails_after_a_billed_body_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync raw arm: ``data`` is bound, and the ``finally``'s close is what failed.
+
+    The client's own lifecycle is inside this call's failure surface deliberately, so a pool
+    teardown that raises replaces the outcome of a body that already parsed -- and the
+    replacement carried none of the cost the body reported.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_billed_response_body(), SimpleNamespace(request=_RequestWithRetryCount("0"))),
+        close_error=RuntimeError("the connection pool teardown failed"),
+    )
+    with pytest.raises(ModelAdapterError) as failed:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert provider_usage_of(failed.value) == _BILLED_RESPONSE_USAGE
+
+
+class _FakeRawMappingTurn:
+    """A raw wrapper whose ``parse()`` yields a Mapping that is not a ``dict``.
+
+    ``_coerce_response`` is ``dict``-only and refuses it; ``usage_reported_by`` accepts any
+    Mapping. So the body is READABLE for its cost by the very seam that refused it -- and the
+    sync completion arm was handing that seam ``None`` unconditionally.
+    """
+
+    def __init__(self, data: dict[str, Any], http_response: object) -> None:
+        self._data = MappingProxyType(data)
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        return self._data
+
+
+def test_a_coerce_refusal_off_a_readable_mapping_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync classified arm: refusing the CONTAINER is not refusing to read the cost."""
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawMappingTurn(
+            _billed_response_body(), SimpleNamespace(request=_RequestWithRetryCount("2"))
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE

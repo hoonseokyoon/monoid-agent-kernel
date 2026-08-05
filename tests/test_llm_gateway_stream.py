@@ -1351,3 +1351,165 @@ def test_neither_loop_assigns_its_own_retry_verdict_over_the_wires(monkeypatch: 
         "the streamed loop overwrote the gateway's own retry"
     )
     assert assemble_streamed_turn(streamed).provider_retried is True
+
+
+# --- a drop AFTER the terminal frame is a drop the hop already metered --------------------
+#
+# `gateway_network_error` is minted the same way whether the connection went before the
+# terminal frame or after it, and the two are not the same call: after it, the hop has already
+# reported what the turn cost and metered it against the tenant. The refusal is the only carrier
+# left -- no turn is assembled and no chunk survives the raise -- so an unstamped mint made the
+# outer receipt and the run's token budget under-count a turn that really was bought.
+
+_DROPPED_STREAM_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+
+def _dropping_stream_client(httpx: Any, *, lines: list[str], drop: Exception) -> Any:
+    """An `AsyncClient` whose committed stream yields `lines` and then loses the connection."""
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            for line in lines:
+                yield line
+            raise drop
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    return _Client
+
+
+def _dropping_adapter(monkeypatch: Any, httpx: Any, *, lines: list[str], drop: Exception) -> Any:
+    monkeypatch.setattr(
+        httpx, "AsyncClient", _dropping_stream_client(httpx, lines=lines, drop=drop)
+    )
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    return GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+
+def test_a_stream_drop_after_the_terminal_frame_reports_what_the_hop_metered(
+    monkeypatch: Any,
+) -> None:
+    """The terminal frame arrived, the counts are in hand, and then the socket went."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter = _dropping_adapter(
+        monkeypatch,
+        httpx,
+        lines=[
+            'data: {"type":"text_delta","text":"hi"}',
+            "",
+            'data: {"type":"turn_complete","response_id":"turn_1","usage":'
+            '{"input_tokens":120,"output_tokens":340,"total_tokens":460}}',
+            "",
+        ],
+        drop=httpx.RemoteProtocolError("the peer closed the connection mid-body"),
+    )
+
+    with pytest.raises(ModelAdapterError) as dropped:
+        _stream(adapter)
+
+    assert provider_usage_of(dropped.value) == _DROPPED_STREAM_USAGE, {
+        "carried_by_the_refusal": provider_usage_of(dropped.value),
+        "hint": "drop-after-terminal is indistinguishable from drop-before on the wire it mints",
+    }
+    # The classification is untouched: a committed stream cannot be replayed, so it stays
+    # terminal, and it is still a network failure.
+    assert dropped.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert dropped.value.retryable is False
+
+
+def test_a_stream_drop_before_the_terminal_frame_invents_no_cost(monkeypatch: Any) -> None:
+    """The counterweight: what the deltas cost is unknowable until the frame says so."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter = _dropping_adapter(
+        monkeypatch,
+        httpx,
+        lines=['data: {"type":"text_delta","text":"half an ans"}', ""],
+        drop=httpx.RemoteProtocolError("the peer closed the connection mid-body"),
+    )
+
+    with pytest.raises(ModelAdapterError) as dropped:
+        _stream(adapter)
+
+    assert provider_usage_of(dropped.value) == {}
+    assert dropped.value.provider_error_code == GATEWAY_NETWORK_ERROR
+
+
+def test_a_pool_teardown_after_the_terminal_frame_reports_what_the_hop_metered(
+    monkeypatch: Any,
+) -> None:
+    """The client-lifecycle handler is the same mint one scope out, and the same loss.
+
+    The stream drains cleanly, the terminal frame reports its cost, and the `__aexit__` that
+    tears the pool down is what raises -- outside the per-attempt handler, into the arm that
+    classifies the client's own lifecycle.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            yield (
+                'data: {"type":"turn_complete","response_id":"turn_1","usage":'
+                '{"input_tokens":120,"output_tokens":340,"total_tokens":460}}'
+            )
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            raise httpx.CloseError("pool teardown failed")
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(adapter)
+
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert provider_usage_of(caught.value) == _DROPPED_STREAM_USAGE

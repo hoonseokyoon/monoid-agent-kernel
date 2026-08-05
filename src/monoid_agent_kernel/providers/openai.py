@@ -356,6 +356,14 @@ class OpenAIModelAdapter:
         # until the exchange commits, which is exactly true of a call that never reached the
         # provider.
         retried = False
+        # Bound for the same reason, and they answer the question BOTH handlers below ask: what
+        # did this call already cost. ``response`` is whatever ``parse()`` handed back and
+        # ``data`` the mapping read out of it, so at most one of them is readable at any point
+        # in the block -- and a failure before either assignment must not replace the provider's
+        # failure with a ``NameError``. ``None`` for both is exactly true of a call that never
+        # reached a body, which :func:`usage_reported_by` reads as "nothing reported".
+        response: Any = None
+        data: dict[str, Any] | None = None
         try:
             payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
@@ -393,9 +401,10 @@ class OpenAIModelAdapter:
             # own ``gateway_bad_response``. Same seam the region uses, so the code and the retry
             # cannot differ by which line inside this call raised. Backfill-only, so the refusals
             # that DO name themselves (``_classified_payload``'s ``unserializable_request``, the
-            # by-reference ``unsupported_request_shape``) pass through untouched. No payload to
-            # read a cost from: the failure here is that there is no readable body.
-            _complete_billed_refusal(refused, None, provider_retried=retried)
+            # by-reference ``unsupported_request_shape``) pass through untouched.
+            _complete_billed_refusal(
+                refused, _readable_payload(data, response), provider_retried=retried
+            )
             raise
         except Exception as exc:
             # Map provider API errors (e.g. a 400 for an unsupported reasoning effort) to a
@@ -404,7 +413,17 @@ class OpenAIModelAdapter:
             # ``retried`` is handed in rather than re-derived: this arm also catches exceptions
             # the SDK never raised (``raw.parse()``), which carry no exchange for the classifier's
             # own probe to read.
-            raise _model_error_from_openai(exc, known_provider_retried=retried) from exc
+            #
+            # And it pays what the turn already cost, exactly like the classified arm above it.
+            # The two arms bracket ONE block: a client ``close()`` that raises inside the inner
+            # ``finally`` runs after a billed body has parsed and *replaces* that call's outcome,
+            # so this arm is reachable with the whole cost in hand -- and minted it empty, which
+            # is a paid turn metered at zero by the receipt, the run's budget and the tenant
+            # ledger behind it. The classification is untouched: a dropped connection is honestly
+            # retryable, and only the lost cost was the defect.
+            failed = _model_error_from_openai(exc, known_provider_retried=retried)
+            mark_provider_usage(failed, usage_reported_by(_readable_payload(data, response)))
+            raise failed from exc
         return _parse_response(data, provider_retried=retried)
 
     async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
@@ -572,9 +591,20 @@ class OpenAIModelAdapter:
             _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
             raise
         except Exception as exc:
-            raise _model_error_from_openai(
-                exc, known_provider_retried=provider_retried
-            ) from exc
+            # The raw arm of the same ``try``, and it reads the same cost source. A stream can
+            # go on emitting frames after ``response.completed``, so the connection drop this
+            # arm classifies (``_connection_error_code``'s docstring names the lane: the SDK
+            # translates transport failures only up to the response headers, and a drop while
+            # the BODY streams arrives here as a raw ``httpx.ReadError``/``ReadTimeout``/
+            # ``RemoteProtocolError``) is reachable with the terminal payload already captured.
+            # The classified arm two lines above stamps that payload; this one minted its error
+            # empty, so a turn the provider generated and billed was metered at zero everywhere
+            # behind it. Lenient, like every other read of this source: a drop BEFORE the
+            # terminal frame reads as nothing, because mid-stream usage is genuinely unknowable.
+            # Retryability is untouched -- waiting really is the remedy for a dropped socket.
+            dropped = _model_error_from_openai(exc, known_provider_retried=provider_retried)
+            mark_provider_usage(dropped, usage_reported_by(final_data))
+            raise dropped from exc
 
         # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
         # needs nothing from the client, and a consumer that stops at it holds a suspended
@@ -1339,6 +1369,25 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
         )
         mark_provider_usage(refused, usage_reported_by(final_data))
         raise refused from raw
+
+
+def _readable_payload(data: Any, response: Any) -> Any:
+    """The best cost source the one-shot call has, whichever phase of it failed.
+
+    One expression for both of ``next_turn``'s handlers, because "what did this call already
+    cost" is one question and an answer written twice is one that eventually differs. The body
+    read has two phases and each leaves a different carrier behind: ``data`` once the mapping
+    exists, and before that whatever ``parse()`` returned. Preferring ``data`` is not
+    arbitrary -- it is the same object once both are set, and it is the only one of the two the
+    *success* path reads.
+
+    The second half matters on its own: ``_coerce_response`` is ``dict``-only while
+    :func:`usage_reported_by` accepts any ``Mapping``, so a response that is a Mapping-but-not-
+    dict is refused for its container and still perfectly readable for its cost. Handing the
+    completion seam ``None`` there discarded a cost the very same object was carrying.
+    """
+
+    return data if data is not None else response
 
 
 def _coerce_response(response: object) -> dict[str, Any]:

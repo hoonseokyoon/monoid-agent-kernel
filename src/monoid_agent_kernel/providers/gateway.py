@@ -416,6 +416,14 @@ class GatewayModelAdapter:
         # Bound before the client exists, because the client's own lifecycle can fail: `__aexit__`
         # raises after the loop, where a loop-local would still be unbound if no attempt reached it.
         committed = False
+        # What this attempt's stream has already reported spending, for the same reason and read
+        # by the same handler. A drop AFTER the terminal frame is not the same call as a drop
+        # before it: the hop has metered the turn against the tenant by then, and the network
+        # error minted below is the only carrier left -- no turn is assembled and no chunk
+        # survives the raise -- so an empty stamp made every budget behind this client
+        # under-count a turn that really was bought. Empty is the honest reading before the
+        # frame arrives, which is what a pre-commit failure leaves it at.
+        reported_usage: dict[str, int] = {}
         try:
             # One client for the whole call, not one per attempt. Constructing it is synchronous and
             # not cheap -- measured at ~285ms warm here, and the event loop is unavailable for all of
@@ -463,6 +471,7 @@ class GatewayModelAdapter:
                         )
                     committed = False  # reset per attempt; see the binding above the loop
                     saw_terminal = False
+                    reported_usage = {}  # reset per attempt, beside the two flags it travels with
                     # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
                     # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
                     # expiry (see the field), and a backoff is exactly where a token crosses that
@@ -491,6 +500,14 @@ class GatewayModelAdapter:
                                 # the marker above, so the two cannot disagree.
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
+                                # Retained off whatever chunk reports one, rather than off the
+                                # terminal type alone: the terminal frame is the only carrier
+                                # today, and a vocabulary that grows a second one must not have
+                                # to remember this line. Falsy (absent, or an empty mapping)
+                                # keeps what the stream has already said.
+                                chunk_usage = getattr(chunk, "usage", None)
+                                if chunk_usage:
+                                    reported_usage = dict(chunk_usage)
                                 # The terminal frame is the streaming twin of the sync check in
                                 # ``next_turn`` -- both transports enforce or neither does.
                                 if isinstance(chunk, TurnComplete):
@@ -561,18 +578,28 @@ class GatewayModelAdapter:
                     except _StreamRetry as retry_signal:
                         last_error = retry_signal.error
                     except httpx.HTTPError as exc:
+                        # Both mints carry what this attempt already reported spending, stamped
+                        # by the one guarded helper every other carrier of the fact uses. The
+                        # committed branch is where it is reachable -- the terminal frame lands
+                        # inside the drain above -- and the pre-commit branch stamps the same
+                        # way rather than reasoning about which branch can see a cost: the
+                        # value is empty there, and ``mark_provider_usage`` writes nothing for
+                        # an empty one, so one rule covers both and neither can drift.
                         if committed:
                             # The stream already started; replaying would duplicate deltas. Terminal.
-                            raise ModelAdapterError(
+                            interrupted = ModelAdapterError(
                                 f"LLM gateway stream interrupted: {exc}",
                                 provider_error_code=GATEWAY_NETWORK_ERROR,
                                 retryable=False,
-                            ) from exc
+                            )
+                            mark_provider_usage(interrupted, reported_usage)
+                            raise interrupted from exc
                         error = ModelAdapterError(
                             f"LLM gateway stream connection error: {exc}",
                             provider_error_code=GATEWAY_NETWORK_ERROR,
                             retryable=True,
                         )
+                        mark_provider_usage(error, reported_usage)
                         if not _should_retry(error, attempt, max_attempts, retry.retry_on):
                             raise error from exc
                         last_error = error
@@ -596,6 +623,11 @@ class GatewayModelAdapter:
             #
             # `committed` draws the same line the in-loop handler draws: once deltas have gone out,
             # replaying would duplicate them, so a late failure is terminal rather than retryable.
+            #
+            # It carries the cost for the same reason the in-loop handler does, and this is the
+            # arm where a fully-drained turn ends up: the stream completes, the terminal frame
+            # reports what the hop metered, and the `__aexit__` that tears the pool down is what
+            # raises. Same guarded stamp, same emptiness rule.
             error = ModelAdapterError(
                 f"LLM gateway stream interrupted: {exc}"
                 if committed
@@ -603,6 +635,7 @@ class GatewayModelAdapter:
                 provider_error_code=GATEWAY_NETWORK_ERROR,
                 retryable=not committed,
             )
+            mark_provider_usage(error, reported_usage)
             _stamp_retry(error, attempt)
             raise error from exc
         # Same marking as the sync path. Stream retries are all pre-commit, so an error
