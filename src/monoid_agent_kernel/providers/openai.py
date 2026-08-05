@@ -931,11 +931,15 @@ def _model_error_from_openai(
 
     ``known_provider_retried`` is the retry fact the CALLING scope already read off the exchange,
     named the way the gateway validators name theirs. It is an upgrade only, never a downgrade:
-    this function's own probe answers from the exception, and an exception that never came from
-    the SDK carries no exchange at all -- a ``ValueError`` out of ``raw.parse()`` after two SDK
-    retries is the reachable case, and it was recorded as a clean single attempt because the arm
-    threw away the value it was holding. Whichever source can see the retry wins; neither can
-    clear what the other observed."""
+    this function's own probe answers from the exception, and the exceptions that reach here
+    after the exchange committed cannot answer for themselves. Two reachable shapes, one per
+    call path: a client ``close()`` raising in the teardown ``finally``, which never came from
+    the SDK and carries no exchange at all; and a mid-stream transport drop, whose ``request``
+    is an ``httpx`` property that *raises* when unset, so the probe reads it as no retry. Both
+    were recorded as clean single attempts while the calling scope was holding the true value.
+    (The body-read failures that used to arrive here now leave the body-read guard as
+    ``openai_bad_response``, carrying that same value themselves.) Whichever source can see the
+    retry wins; neither can clear what the other observed."""
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
         # The streaming path raises a bare APIError whose status lives on .response (or nowhere).

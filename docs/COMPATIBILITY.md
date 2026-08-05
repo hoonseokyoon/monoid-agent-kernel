@@ -303,12 +303,29 @@ and no amount of resending the same call fixes a payload the upstream produced. 
 stops a second kind of bleeding at the same time: `retryable: true` invited a client to re-buy
 exactly the tokens the defect had already spent.
 
-The third group did not move at all. The shapes that already answered 502
-`gateway_bad_response` — refusals minted without a code of their own, roughly a dozen of them —
-were already `retryable: false` and already terminal for this client. Their `error_code` changed
-and nothing else did: same status, same `retryable` / `config_recoverable`, same billed `usage`,
-same verdict from `_recoverable_turn_error`. What they gained is an honest attribution, not a
-new recoverability, and a client keyed to anything but the code sees no change from them.
+The third group changed its name, and some of its members gained a key. The shapes that already
+answered 502 `gateway_bad_response` — refusals minted without a code of their own — were already
+`retryable: false` and already terminal for this client, and none of them moved: same status,
+same `retryable` / `config_recoverable`, same verdict from `_recoverable_turn_error`. Read that
+as two sub-groups, because only the first is a pure rename:
+
+- The roughly a dozen raised **inside** the adapter's two stamped regions (the body mapping and
+  the stream-terminal construction) were already carrying their billed `usage` and their
+  `provider_retried` before v0.21. For these, `error_code` changed and nothing else did — an
+  honest attribution, not a new recoverability, and a client keyed to anything but the code sees
+  no change.
+- The ones raised **around** those regions joined the group in v0.21 and gained more than a
+  name: the stream's per-frame field validators and the blocking path's `_coerce_response` used
+  to escape with no cost and no retry evidence at all, and both now travel the same completion
+  seam. So their 502 body can carry `provider_retried: true` where it always said `false`, and
+  it can carry a `usage` object where it previously had **no `usage` key at all** — the writer
+  omits that key when the failure cost nothing, so a turn the upstream billed for is a wire
+  *shape* change on these shapes, not just a value change. A client that sums `usage` across
+  failures will now count tokens on calls it used to count as free. That is the correction: they
+  really were billed.
+
+Both sub-groups keep `retryable: false` and the same terminal verdict, so nothing about
+recoverability moved for either.
 
 If you implement this answer in your own gateway, write `"retryable": false` **and** the
 `error_code` explicitly into the 502 body. The client derives each of those from the status line
@@ -321,7 +338,11 @@ conjunction; write both anyway, so the body states its verdict instead of leavin
 a default derived from the status line.
 
 Raw refusals from third-party adapters keep their previous arms and their stamped-usage
-carriage.
+carriage, and v0.21 adds one field to them: both gateway error writers now read
+`provider_retried` off the escaping exception on **every** arm rather than on the
+`ModelAdapterError` arm alone, so an adapter that retried and then refused in its own exception
+type reports `provider_retried: true` where the body always said `false`. The key was already
+written unconditionally, so this is a value change on an existing key, not a shape change.
 
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the

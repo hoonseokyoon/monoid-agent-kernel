@@ -7,6 +7,32 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the third group's newly-covered members are named, and stale sentences retire
+
+- **`docs/COMPATIBILITY.md`'s "the third group did not move at all" is scoped and corrected.**
+  It was true of the dozen refusals raised *inside* the adapter's two stamped regions, which
+  already carried their `usage` and `provider_retried` before v0.21 — for those the `error_code`
+  changed and nothing else did. It was false of the members v0.21 *added* to that group (the
+  stream's per-frame field validators and the blocking path's `_coerce_response`): those gained
+  `provider_retried` and gained a `usage` object where the body previously had **no `usage` key
+  at all**, since the writer omits it when the failure cost nothing. That is a wire-shape change
+  on those shapes, and it is now stated as one — a client summing `usage` across failures will
+  count tokens on calls it used to count as free, which is the correction. Neither sub-group
+  moved on recoverability. The third-party-adapter paragraph beside it now names the one field
+  those raw refusals gained too.
+- **The gateway meter's comment stops naming the shipped adapter as its reason.** `_meter_failure`
+  still catches `Exception` rather than `ModelAdapterError`, but "every refusal in the OpenAI
+  stream's terminal region is a raw `ValueError`/`AttributeError`" has not been true since that
+  region learned to re-mint its raw refusals classified. The real remaining reason is the one
+  the wide guard was always worth having for: the provider seam is pluggable, and a third-party
+  adapter's refusals are its own to name.
+- **`_model_error_from_openai`'s docstring names the shapes that actually reach it.** Its
+  `known_provider_retried` example was a `raw.parse()` failure, which now leaves the body-read
+  guard classified and carrying that value itself. The upgrade still matters for the two shapes
+  that arrive after the exchange committed — a client teardown that raises, and a mid-stream
+  transport drop whose `httpx` `request` property raises when read — and those are what it names
+  now. Two changelog entries earlier in this section are scoped the same way.
+
 ### Fixed — a truncated stream refuses instead of settling, and the body-read phase speaks the one code
 
 - **An OpenAI stream that ends without `response.completed`/`response.incomplete` is refused,
@@ -190,7 +216,12 @@ out in commit messages and here.
   takes a `known_provider_retried` upgrade (the spelling the gateway validators already use):
   whichever source can see the retry wins, neither can clear what the other observed. The
   locals it reads are pre-initialized, so a `create()` that raises cannot answer with a
-  `NameError` instead of the provider's failure.
+  `NameError` instead of the provider's failure. (That `raw.parse()` example is history rather
+  than a description of HEAD: the body-read failures it names now leave their own guard as
+  `openai_bad_response` — see "the body-read phase speaks the one code" — carrying the same
+  value. The upgrade still matters for the two shapes that reach the classifier after the
+  exchange committed: a client teardown that raises, and a mid-stream transport drop whose
+  `request` property raises when read.)
 - **The stream's terminal reader gets the one-shot reader's coerce twin.** It read
   `if response is not None and hasattr(response, "model_dump")` with no else, where the sync
   twin reads `model_dump() if hasattr(...) else _coerce_response(response)` — which *accepts* a
@@ -228,10 +259,12 @@ out in commit messages and here.
     config-shaped recoverable one hop out); the raw `AttributeError` shapes answered 500 with
     `retryable: true` — an invitation to re-buy the same tokens for a payload defect. Both now
     map through the classified arm to 502, non-retryable, still carrying the billed `usage`.
-- **The raw arms did not move.** The tenant meter and both gateway error writers stay
-  type-agnostic on purpose — a third-party adapter behind the gateway can still refuse raw with
-  a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
-  read-off-whatever-escaped property. `assemble_streamed_turn`'s bare `normalize_usage` re-run
+- **The raw arms stayed type-agnostic.** The tenant meter and both gateway error writers keep
+  reading whatever escapes, on purpose — a third-party adapter behind the gateway can still
+  refuse raw with a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
+  read-off-whatever-escaped property. (The writers gained one field later in this same release:
+  see "the retry fact rides every lane that learned it", which reads `provider_retried` off the
+  escaping exception on every arm rather than on the `ModelAdapterError` arm alone.) `assemble_streamed_turn`'s bare `normalize_usage` re-run
   (provably dead — every folded chunk passes the internal ingress first) is guarded in the
   ingress's classified voice rather than deleted. It is bound *structurally*: the behavioral
   test for this shape is intercepted by the ingress and never reaches the guard, so deleting

@@ -404,15 +404,16 @@ class LlmGatewayBackend:
         """Charge the tenant for what an ESCAPING failure already cost, then let it escape.
 
         Both transports' failure arms come through here instead of reading the stamp for
-        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The adapter
-        that first sees the provider's billed body stamps refusals of more than one type:
-        ``normalize_usage`` says "malformed usage" with a raw ``ValueError``, and *every* refusal
-        in the OpenAI stream's terminal region is a raw ``ValueError``/``AttributeError``, because
-        that path folds deltas and reads end-of-turn metadata directly rather than running the
-        one-shot mapping that classifies. Gated on ``ModelAdapterError``, this meter read the
-        stamp on exactly the failures that had already been classified and skipped the ones that
-        had not -- so an upstream whose final payload is malformed charged the tenant nothing for
-        a turn it had generated and billed, on the transport where that shape actually occurs.
+        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The stamp
+        does not belong to a type, and the wide guard is what keeps this meter from depending on
+        one. The shipped OpenAI adapter is no longer the reason: its refusals all leave
+        classified now, including the ones its terminal region raises raw internally (the guard
+        there re-mints them as ``openai_bad_response``). A THIRD-PARTY adapter is -- the whole
+        provider seam is pluggable, its refusals are its own to name, and one that refuses in a
+        bare ``ValueError``/``AttributeError`` after a billed body is exactly what the kernel's
+        own reader used to do. Gated on ``ModelAdapterError``, this meter would read the stamp on
+        the failures that happened to be classified and skip the ones that were not -- charging
+        the tenant nothing for a turn the upstream had generated and billed.
 
         Meter and re-raise: nothing is swallowed and nothing is reclassified here, so what
         escapes is what arrived. ``provider_usage_of`` reads ``{}`` for an unbilled failure and
