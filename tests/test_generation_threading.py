@@ -9,7 +9,7 @@ path, and the reference gateway server echo. If one survives, the binding is bro
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -44,6 +44,7 @@ from monoid_agent_kernel.reference.llm_gateway.service import (
     LlmGatewayBackend,
     LlmGatewayTurnRequest,
     _applied_echoes,
+    _parse_turn_request,
     _upstream_model_config,
 )
 
@@ -696,6 +697,110 @@ def test_reasoning_config_knows_when_it_is_default() -> None:
     from monoid_agent_kernel.providers._common import build_reasoning_payload
 
     assert build_reasoning_payload(ReasoningConfig()) == {"effort": "medium"}
+
+
+@dataclass(frozen=True)
+class _TenantReasoningConfig(ReasoningConfig):
+    """An extension subclass: every kernel field at its default, one field of its own.
+
+    The kernel supports these deliberately -- every validator gates on ``isinstance`` and
+    ``providers/base._copy_with_fields`` exists so normalization does not call an extension's
+    narrower constructor -- so the gate must answer about the config, not about its class.
+    """
+
+    tenant_profile: str = "balanced"
+
+
+@dataclass(frozen=True)
+class _TenantGenerationConfig(GenerationConfig):
+    """The generation twin of the probe above."""
+
+    tenant_profile: str = "balanced"
+
+
+def test_a_config_subclass_at_the_kernel_defaults_is_default() -> None:
+    """``is_default`` asks about the fields on the wire, not about the class holding them.
+
+    Generated dataclass ``__eq__`` is class-exact, so ``self == ReasoningConfig()`` was False
+    for a subclass with every kernel field at its default -- and the fields it added are
+    invisible to ``build_reasoning_payload``, so the WIRE it produces is byte-identical to the
+    plain config's. The client then computed ``is_default=False`` and demanded proof of
+    ``{"effort": "medium"}`` while the server, which only ever sees that wire, rebuilt a plain
+    config, computed ``is_default=True`` and emitted no echo. Every turn refused, and nothing
+    server-side could fix it.
+    """
+
+    from monoid_agent_kernel.providers._common import build_reasoning_payload
+
+    assert _TenantReasoningConfig().is_default is True, {
+        "hint": "class-exact equality: a config identical on every field the wire carries",
+    }
+    assert build_reasoning_payload(_TenantReasoningConfig()) == build_reasoning_payload(
+        ReasoningConfig()
+    )
+    # An extension field is not a kernel setting: changing it cannot make a config configured,
+    # because nothing downstream of the gate can see it.
+    assert _TenantReasoningConfig(tenant_profile="thorough").is_default is True
+
+    # ...and no loosening: a kernel field that IS set stays non-default on the subclass too.
+    assert _TenantReasoningConfig(effort="low").is_default is False
+    assert _TenantReasoningConfig(summary="auto").is_default is False
+    assert _TenantReasoningConfig(on_unsupported="omit").is_default is False
+
+
+def test_a_generation_config_subclass_keeps_the_config_hash_it_had() -> None:
+    """The generation twin, whose consumer is the ``to_json`` gate rather than an echo.
+
+    ``ModelConfig.to_json`` emits the ``generation`` key only when the block is not default, and
+    that dict feeds the request digest, the runtime-config semantic hash durable recovery
+    compares across restarts, and the gateway wire. Class-exact equality made an
+    all-defaults subclass emit the key -- so an extension changed the config hash while
+    changing nothing the hash is about.
+    """
+
+    assert _TenantGenerationConfig().is_default is True
+    assert "generation" not in ModelConfig(generation=_TenantGenerationConfig()).to_json()
+    assert ModelConfig(generation=_TenantGenerationConfig()).to_json() == ModelConfig().to_json()
+
+    assert _TenantGenerationConfig(temperature=0.2).is_default is False
+    assert "generation" in ModelConfig(generation=_TenantGenerationConfig(temperature=0.2)).to_json()
+
+
+def test_a_reasoning_config_subclass_is_not_refused_across_a_real_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The end-to-end shape of the defect: the two sides answered the gate differently.
+
+    Both halves are the real ones. The server's echo comes from ``_applied_echoes`` reading the
+    config it rebuilt from the WIRE -- which is where the subclass is lost, and where its
+    ``is_default`` verdict is therefore taken about a plain config. The client's refusal comes
+    from ``GatewayModelAdapter.next_turn``'s own enforcement site, holding the subclass. A
+    declaring upstream makes this a turn that SHOULD pass.
+    """
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    client_config = ModelConfig(
+        reasoning=_TenantReasoningConfig(), gateway_url="http://gateway.test"
+    )
+    # The wire the client sends, read back the way the server's codec reads it.
+    wire = GatewayModelAdapter(config=client_config)._payload(_request(client_config))
+    served = _parse_turn_request(_turn_payload(reasoning=wire["reasoning"]))
+    assert type(served.reasoning) is ReasoningConfig, {
+        "hint": "the subclass cannot survive the wire -- that is the whole point of the split",
+    }
+    echoes = _applied_echoes(
+        served, OpenAIModelAdapter(ModelConfig()), _upstream_model_config(served)
+    )
+
+    monkeypatch.setattr(
+        gateway_module, "urlopen", lambda *_a, **_k: _FakeHttpResponse(_served_turn(echoes))
+    )
+    turn = GatewayModelAdapter(config=client_config).next_turn(_request(client_config))
+    assert turn.final_text == "ok", {
+        "server_echoes": echoes,
+        "hint": "client and server must answer is_default the same way about one config",
+    }
 
 
 def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None:

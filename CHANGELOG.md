@@ -7,6 +7,27 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — `is_default` reads the fields, not the class
+
+- **`ReasoningConfig.is_default` and `GenerationConfig.is_default` now compare the fields the
+  base class declares, not `self == Config()`.** Generated dataclass `__eq__` is class-exact, so
+  a public extension subclass with *every kernel field at its default* was never "default" — and
+  the kernel supports such subclasses deliberately (every validator gates on `isinstance`, and
+  `providers/base._copy_with_fields` exists so normalization need not call an extension's
+  narrower constructor). The consequence was a hop nobody could fix from either end: the client
+  computed `is_default=False` and demanded proof of `{"effort": "medium"}`, while the server —
+  which only ever sees the wire, and `to_json` emits base fields only — rebuilt a plain
+  `ReasoningConfig`, computed `is_default=True`, emitted no `reasoning_applied`, and every turn
+  was refused `gateway_reasoning_not_applied` even against a declaring upstream. Extension fields
+  are invisible to `build_reasoning_payload`, `build_generation_payload` and `to_json`, so they
+  are invisible to the gate: one rule, stated once in `_matches_the_kernel_defaults`.
+- **The generation twin was the same defect with a serialization consumer.**
+  `ModelConfig.to_json` emits the `generation` key only when the block is not default, and that
+  dict feeds the request digest, the runtime-config semantic hash durable recovery compares
+  across restarts, and the gateway wire — so an all-defaults extension silently changed the
+  config hash while changing nothing the hash is about. Nothing is loosened in either direction:
+  a kernel field that *is* set stays non-default on a subclass exactly as it does on the base.
+
 ### Fixed — the completion seam covers the whole adapter, not two regions of it
 
 - **Every refusal that leaves the OpenAI adapter's two call paths is completed, not just the
