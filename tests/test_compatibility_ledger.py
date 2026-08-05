@@ -29,6 +29,7 @@ from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.external_agent_envelope import EXTERNAL_AGENT_ENVELOPE_VERSION
 from monoid_agent_kernel.core.inbox import INBOX_PROTOCOL_VERSION
 from monoid_agent_kernel.core.manifest import MANIFEST_SCHEMA_VERSION
+from monoid_agent_kernel.core.model_calls import MODEL_CALLS_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.outbox import OUTBOX_REQUEST_VERSION
 from monoid_agent_kernel.core.packages import (
@@ -42,6 +43,7 @@ from monoid_agent_kernel.core.schemas import (
     EVENT_SCHEMA,
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
+    MODEL_CALLS_RECORD_SCHEMA,
     MODEL_CONTENT_RECORD_SCHEMA,
     PACKAGE_SCHEMA,
     PUBLIC_JOB_SCHEMA,
@@ -90,7 +92,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 41
+    assert len(artifacts) == 42
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -127,6 +129,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "backend-run": RUN_METADATA_SCHEMA_VERSION,
         "event": EVENT_SCHEMA_VERSION,
         "model-content": MODEL_CONTENT_SCHEMA_VERSION,
+        "model-calls": MODEL_CALLS_SCHEMA_VERSION,
         "manifest": MANIFEST_SCHEMA_VERSION,
         "workspace-base": WORKSPACE_BASE_SCHEMA_VERSION,
         "workspace-index": WORKSPACE_INDEX_SCHEMA_VERSION,
@@ -198,6 +201,10 @@ def test_json_schema_reader_versions_match_registry() -> None:
         "proposal-package": PACKAGE_SCHEMA,
         "approval": APPROVAL_SCHEMA,
         "apply-result": APPLY_RESULT_SCHEMA,
+        # Single-namespace, unlike every neighbour: the ledger has never existed under the legacy
+        # prefix, so its schema uses a literal enum rather than ``schema_version_property``. This
+        # map is what refuses the mismatch if someone reaches for the helper later.
+        "model-calls": MODEL_CALLS_RECORD_SCHEMA,
     }
 
     for key, schema in schemas.items():
