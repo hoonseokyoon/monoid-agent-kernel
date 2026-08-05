@@ -3,8 +3,12 @@
 The omission and stability pins encode W5's compatibility contract (dx-note
 2026-08-02-w5-implementation-plan.md): a config that never sets a generation value must
 serialize byte-identically to one that predates the field, because ``ModelConfig.to_json``
-feeds the request digest (replay key), the runtime-config semantic hash (durable recovery),
-and the gateway wire all at once.
+feeds the runtime-config semantic hash that durable recovery compares across restarts.
+
+W6-0 narrowed that sentence. The replay key no longer reads ``to_json`` -- it reads
+``_model_identity``, a hand-listed projection -- and the gateway wire never did, building its
+block field by field. So the omission rule now holds in two places for two reasons, and this
+file pins both: ``config_hash`` through the serializer, the replay key through the projection.
 """
 
 from __future__ import annotations
@@ -41,6 +45,10 @@ _PRE_W5_CONFIG_HASH_DEFAULT_MODEL = (
     "182b10bcd89a7e08517a6022479ad2cf9b6e0c8cd269bfc2341c6ad5a041f792"
 )
 _PRE_W5_REQUEST_DIGEST = "54c2cb6d143ab5716cd942f584e34a3100d87dad5e85c48bfeadc767a43ed9c6"
+# Captured under `monoid.model-request-digest.v1` (W6-0). Regenerated only together with a tag bump.
+_GENERATION_1_REQUEST_DIGEST = (
+    "a577cb0c6964714e329668b88ede84029cf3208e4459f121c790b7d548ef5cbc"
+)
 
 
 # --- fail-closed ingress -------------------------------------------------------------
@@ -204,6 +212,20 @@ def test_the_replay_key_generation_disowns_the_pre_w5_encoding() -> None:
     assert _digest(payload) != _PRE_W5_REQUEST_DIGEST
 
 
+def test_a_generation_free_request_keeps_generation_1s_key() -> None:
+    """The omit-when-absent job, carried forward under the current generation.
+
+    Same property the pre-W5 literal used to hold: a request that never configures a sampling
+    control keeps the key it had before the block existed. What changed is the rule for moving
+    the literal -- it moves with a tag bump and only with one.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+    payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
+
+    assert _digest(payload) == _GENERATION_1_REQUEST_DIGEST
+
+
 def test_setting_generation_changes_the_request_digest() -> None:
     request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
     configured = _request_payload(
@@ -213,7 +235,7 @@ def test_setting_generation_changes_the_request_digest() -> None:
         destination="",
     )
 
-    assert _digest(configured) != _PRE_W5_REQUEST_DIGEST
+    assert _digest(configured) != _GENERATION_1_REQUEST_DIGEST
 
 
 # --- direct-Python normalization threading --------------------------------------------

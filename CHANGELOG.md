@@ -7,6 +7,37 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — the replay key is a declared field list, not a serialized config
+
+- **`request_digest` reads a hand-listed projection of `ModelConfig`, not `to_json()`.** Every
+  consumer of that serializer used to be a co-author of the replay key: a field added to
+  `ModelConfig` for any reason rekeyed the entire corpus, and `ModelRetryConfig` is scheduled to
+  gain one, so this was not hypothetical. The list encodes one rule — what the provider is asked
+  for goes in the key, how the call is carried does not.
+- **`timeout_s`, `retry` and `gateway_url` left the key.** None of them reaches a provider; the
+  gateway wire has always emitted only model/reasoning/generation because each hop owns its own
+  transport policy. Their presence was inherited from `to_json` emitting everything, not chosen,
+  and it meant raising a timeout or widening a retry set silently invalidated every recorded key
+  on a fleet. `ModelConfig.to_json` itself is unchanged, so `config_hash` and durable recovery
+  are unaffected.
+- **The key's `provider` term is now the provider that actually served the call** —
+  `resolved_provider_name`, the adapter's declaration else the config's. A gateway relaying an
+  upstream and a direct call to the same upstream now share a key, which is the pair a replay
+  corpus most wants to share one; reading only the declaration would have collided a fake adapter
+  with a gateway built without one, and reading only the config would have separated the pair.
+  It also normalizes, which matters because `provider` is the only `ModelConfig` field with no
+  ingress validation.
+- **The projection is hand-listed all the way down.** Listing only `ModelConfig`'s own fields and
+  calling `reasoning.to_json()` would have moved the rekey hazard one level deeper rather than
+  closing it.
+- Red first: a parameterized transport-policy matrix (five non-default configs), the projection's
+  shape, and the relayed-equals-direct key. The inclusion matrix and the declare-nothing pair are
+  guards — green before and after — stating what must not have been dropped while the exclusions
+  were made. A literal alone cannot see conditional inclusion, which is why both are matrices.
+- `_GENERATION_1_REQUEST_DIGEST` carries the omit-when-absent job forward under the current
+  generation, and its operating rule replaces "never regenerate": it moves only together with a
+  tag bump.
+
 ### Changed — both model-call digests name their own domain
 
 - **Each digest is now taken in a named domain carried as the payload's single wrapper key:

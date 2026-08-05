@@ -304,9 +304,10 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "applied-echo",
         "generation",
         "core/spec.py:ModelConfig",
-        "to_json omits a default generation block by design: this dict feeds the request digest "
-        "and the runtime-config semantic hash, so a never-configured block must serialize "
-        "byte-identically to a config predating the field",
+        "to_json omits a default generation block by design: this dict feeds the runtime-config "
+        "semantic hash, so a never-configured block must serialize byte-identically to a config "
+        "predating the field. The replay key holds the same omission but no longer through this "
+        "serializer -- W6-0 gave it a hand-listed projection (model_call._model_identity)",
         "by-design",
     ),
     CarriageGap(
@@ -412,7 +413,9 @@ FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
         "model/reasoning/generation), so each hop owns its own transport policy — the client's "
         "timeout bounds the call to the gateway, the server's bounds the call to the provider. "
         "The test that separates 'must ride' from 'per-hop' is whether a default silently "
-        "*overrides a caller's stated intent*, which is exactly why on_unsupported was added",
+        "*overrides a caller's stated intent*, which is exactly why on_unsupported was added. "
+        "W6-0 made the replay key agree with the wire on this: model_call._model_identity omits "
+        "timeout_s/retry/gateway_url, so an ops change to per-hop policy no longer rekeys a corpus",
         "by-design",
     ),
     FutureFamily(

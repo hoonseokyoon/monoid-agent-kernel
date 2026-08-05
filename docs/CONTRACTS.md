@@ -561,12 +561,24 @@ capture policy, so consumers on different policies agree on the identity of what
 was sent. An empty digest means *no key was issued* (the payload could not be canonically
 encoded, or exceeded the size cap) and must never be read as a key.
 
+**What the replay key is made of is a declared list, not a serialized object.** The model config
+enters as a hand-listed projection — the model name, the reasoning block, and the generation block
+when configured — rather than as `ModelConfig.to_json()`. `timeout_s`, `retry` and `gateway_url`
+are absent: none of them reaches a provider (the gateway wire emits only model/reasoning/generation
+and each hop owns its own transport policy), so an operational change to how a call is carried does
+not invalidate keys describing what was asked. The `provider` term is the provider that actually
+served the call — the adapter's declaration, else the config's — so a gateway relaying an upstream
+and a direct call to the same upstream share a key, while two adapters that declare nothing are
+still told apart.
+
 Two rules keep digests stable across kernel versions:
 
 1. **Additive request fields are omitted when unset.** `generation` and `output_schema` appear
    in the digest payload only when configured, so a request that does not use them keeps the
    digest it had before the field existed. Setting one changes the digest — deliberately, since
-   the request's meaning changed.
+   the request's meaning changed. The projection restates this rule rather than inheriting it
+   from the serializer, so a field added to `ModelConfig` for an unrelated reason cannot rekey a
+   corpus by accident.
 2. **Canonicalization changes are generation changes.** Each digest is taken in its own named
    domain, carried as the single wrapper key of the payload that is hashed:
    `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`. Changing what the

@@ -69,6 +69,7 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
+    resolved_provider_name,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -232,6 +233,60 @@ def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
+def _model_identity(model: ModelConfig) -> dict[str, Any]:
+    """The model config as the replay key sees it: a declared list, never a serialized object.
+
+    `model.to_json()` used to go in whole, which made every consumer of that serializer a
+    co-author of the replay key. A field added to `ModelConfig` for any reason rekeyed the entire
+    corpus -- and `ModelRetryConfig` is scheduled to gain one, so this was not a hypothetical.
+    The rule the list encodes:
+
+        what the provider is asked for goes in the key; how the call is carried does not.
+
+    So `timeout_s`, `retry` and `gateway_url` are absent. None of them reaches a provider: the
+    gateway wire emits only model/reasoning/generation, and each hop owns its own transport
+    policy. Their presence in the key was inherited from `to_json` emitting everything, not
+    chosen, and it meant an ops change nobody thinks of as a contract change silently invalidated
+    every recorded key on a fleet.
+
+    Hand-listed all the way down, not just at the top: calling `reasoning.to_json()` here would
+    move the same rekey hazard one level deeper, where the next added field would find it.
+
+    `on_unsupported` is the one genuine close call, in both blocks. It is a client *acceptance*
+    policy -- it cannot change what a provider returns, only whether the client keeps the answer --
+    which argues transport. It goes in anyway because it rides the wire: the reference gateway
+    rebuilds an upstream config from it, so a hop set to `omit` really can send a different
+    upstream request than one set to `fail`. `_tool_payload` states the governing asymmetry: an
+    over-sensitive replay key costs a miss and a re-run, an under-sensitive one hands back the
+    wrong call.
+
+    Known limit, inherited rather than introduced: for an adapter exposing no `config`,
+    `_effective_model` substitutes `ModelConfig()`, so this projects the default model name for a
+    call that ran under something else. The receipt cannot say "unknown" and that is a limit of
+    the field, not a distinction being drawn -- but this list now *promises* these fields identify
+    the request, which the whole-object serialization never did explicitly.
+    """
+
+    identity: dict[str, Any] = {
+        "model": model.model,
+        "reasoning": {
+            "effort": model.reasoning.effort,
+            "summary": model.reasoning.summary,
+            "on_unsupported": model.reasoning.on_unsupported,
+        },
+    }
+    # Omit-when-absent, the same rule and the same reason as `output_schema` below: a config that
+    # never set a sampling control keeps the key it had before the block existed.
+    if not model.generation.is_default:
+        identity["generation"] = {
+            "temperature": model.generation.temperature,
+            "top_p": model.generation.top_p,
+            "max_output_tokens": model.generation.max_output_tokens,
+            "on_unsupported": model.generation.on_unsupported,
+        }
+    return identity
+
+
 def _request_payload(
     request: ModelRequest, model: ModelConfig, *, provider: str, destination: str
 ) -> dict[str, Any]:
@@ -239,19 +294,23 @@ def _request_payload(
 
     `model` is the *effective* config, resolved by the caller, not `request.model`. The request's is
     optional and the shipped adapters fall back to their own, so hashing `request.model or
-    ModelConfig()` gave two calls on differently-configured adapters the same replay key.
+    ModelConfig()` gave two calls on differently-configured adapters the same replay key. It enters
+    through `_model_identity` rather than as `to_json()`; see there for what that list excludes.
 
-    `provider` and `destination` are here because the same request answered by a different service
-    is a different call. A config alone does not identify the service: an adapter may route by a
-    per-instance override or an environment variable, so two adapters holding identical configs can
-    address different hosts. `destination` is hashed and never recorded, so an internal hostname
-    stays internal, and it is empty for an adapter that does not expose one -- see
-    `AddressedModelAdapter`.
+    `provider` is the provider that ACTUALLY served the call -- `resolved_provider_name`, the
+    adapter's declaration else the config's -- because that is what decides whether two identical
+    requests get the same kind of answer. Reading only the declaration would collide a fake adapter
+    with a gateway built without one; reading only the config would separate a direct call from a
+    gateway relaying the same upstream, which is exactly the pair a corpus wants to share a key.
+
+    `destination` is here because the same request answered by a different service is a different
+    call. It is hashed and never recorded, so an internal hostname stays internal, and it is empty
+    for an adapter that does not expose one -- see `AddressedModelAdapter`.
     """
 
     terms = _prompt_terms(request)
     terms["tools"] = [_tool_payload(spec) for spec in request.tools]
-    terms["model"] = model.to_json()
+    terms["model"] = _model_identity(model)
     terms["provider"] = provider
     terms["destination"] = destination
     # Omit-when-absent (the W5 digest stability rule): a schema-free request keeps the
@@ -648,7 +707,15 @@ class ModelCallRunner:
                         _request_payload(
                             request,
                             model,
-                            provider=provider,
+                            # The RESOLVED provider, not the raw declaration `provider_name`
+                            # records above: the key must say who actually served the call.
+                            # Declaration-only collided a fake adapter with a gateway built
+                            # without one -- both declare nothing -- and `ModelConfig.provider`
+                            # alone separated a direct call from a gateway relaying the same
+                            # upstream, which is the one pair a corpus wants sharing a key.
+                            # It also normalizes, which matters here because `provider` is the
+                            # only `ModelConfig` field with no ingress validation.
+                            provider=resolved_provider_name(adapter, model) or "",
                             destination=self._destination(model, adapter),
                         )
                     ),

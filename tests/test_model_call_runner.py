@@ -2513,8 +2513,13 @@ def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
         _turn, receipt = await ModelCallRunner(adapter=Vague()).acall(REQUEST)
         return receipt
 
-    empty = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination=""))
-    stringified = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination="None"))
+    # `provider="gateway"` rather than `""`: the key's provider slot is `resolved_provider_name`,
+    # which falls back to the config for an adapter that declares nothing. This test is about the
+    # destination probe, so it states the resolved value rather than restating the old default.
+    empty = _digest(_request_payload(REQUEST, ModelConfig(), provider="gateway", destination=""))
+    stringified = _digest(
+        _request_payload(REQUEST, ModelConfig(), provider="gateway", destination="None")
+    )
     assert asyncio.run(run()).request_digest == empty
     assert empty != stringified, "the two must be distinguishable for this test to mean anything"
 
@@ -2722,8 +2727,10 @@ def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> Non
 
     turn, receipt = asyncio.run(run())
     assert turn.final_text == "answer"
+    # See the sibling above on `provider="gateway"`: the slot resolves through the config when an
+    # adapter declares nothing, and this adapter declares nothing but a raising property.
     assert receipt.request_digest == _digest(
-        _request_payload(REQUEST, ModelConfig(), provider="", destination="")
+        _request_payload(REQUEST, ModelConfig(), provider="gateway", destination="")
     )
 
 
