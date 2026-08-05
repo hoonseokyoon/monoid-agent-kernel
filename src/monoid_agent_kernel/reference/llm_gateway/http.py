@@ -104,12 +104,24 @@ def make_llm_gateway_handler(
             # zero for a turn the upstream generated and billed. ``_error_body`` omits the key
             # when it is empty, so the arms that never carry a cost keep their exact wire shape.
             usage = provider_usage_of(exc)
+            # Its sibling fact, read the same way and in the same place, because it belongs to
+            # a type no more than the cost does. ``mark_provider_retried`` stamps an arbitrary
+            # ``BaseException`` -- the gateway client's own ``_stamp_retry`` documents exactly
+            # that -- so an upstream adapter that retried and then refused in a raw
+            # ``ValueError``/``AttributeError`` is carrying the flag on every arm below, and
+            # only the ``ModelAdapterError`` arm passed it. The receipt one hop out then
+            # recorded a clean single attempt for a call that had demonstrably retried, on the
+            # one carrier a failed call leaves behind -- while the cost of those same attempts
+            # rode the same body. Read leniently, like the stamp's own reader: a type that
+            # refuses the attribute reports no retry rather than crashing this writer.
+            retried = bool(getattr(exc, "provider_retried", False))
             if isinstance(exc, PermissionDenied):
                 self._write_error(
                     HTTPStatus.UNAUTHORIZED,
                     str(exc),
                     error_code=GATEWAY_AUTH_ERROR,
                     retryable=False,
+                    provider_retried=retried,
                     usage=usage,
                 )
             elif isinstance(exc, ModelAdapterError):
@@ -120,7 +132,7 @@ def make_llm_gateway_handler(
                     error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                     retryable=exc.retryable,
                     config_recoverable=exc.config_recoverable,
-                    provider_retried=exc.provider_retried,
+                    provider_retried=retried,
                     usage=usage,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
@@ -129,6 +141,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    provider_retried=retried,
                     usage=usage,
                 )
             elif isinstance(exc, ValueError):
@@ -137,6 +150,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=GATEWAY_BAD_REQUEST,
                     retryable=False,
+                    provider_retried=retried,
                     usage=usage,
                 )
             elif isinstance(exc, NativeAgentError):
@@ -145,6 +159,7 @@ def make_llm_gateway_handler(
                     str(exc),
                     error_code=getattr(exc, "error_code", GATEWAY_BAD_REQUEST),
                     retryable=False,
+                    provider_retried=retried,
                     usage=usage,
                 )
             else:
@@ -153,6 +168,7 @@ def make_llm_gateway_handler(
                     redact_internal_error(_LOGGER, self, exc),
                     error_code=GATEWAY_SERVER_ERROR,
                     retryable=True,
+                    provider_retried=retried,
                     usage=usage,
                 )
 
@@ -295,6 +311,11 @@ def _error_body(
 def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict[str, Any]:
     """Mid-stream error as an SSE frame, carrying ``_error_body``'s fields so the client maps it
     back to a ModelAdapterError identically to a non-200 response."""
+    # Both facts read once above the branch, exactly as ``_write_exception`` reads them and for
+    # the same reason: neither belongs to a type. See that writer for why the retry flag is
+    # readable on a raw refusal, and read leniently there too.
+    usage = provider_usage_of(exc)
+    retried = bool(getattr(exc, "provider_retried", False))
     if isinstance(exc, ModelAdapterError):
         return {
             "type": "error",
@@ -304,8 +325,8 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
                 error_code=exc.provider_error_code or GATEWAY_BAD_RESPONSE,
                 retryable=exc.retryable,
                 config_recoverable=exc.config_recoverable,
-                provider_retried=exc.provider_retried,
-                usage=provider_usage_of(exc),
+                provider_retried=retried,
+                usage=usage,
             ),
         }
     return {
@@ -315,13 +336,15 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
         # end-of-turn payload fails with a RAW ``ValueError``/``AttributeError`` -- the one shape
         # this arm exists for -- and that is a refusal of a turn the upstream already generated
         # and billed. Without the key, the only carrier a streaming client has says the call was
-        # free, and ``retryable=True`` below then invites it to buy the same tokens again.
+        # free, and ``retryable=True`` below then invites it to buy the same tokens again. The
+        # attempts that cost it ride the same body, for the same reason.
         **_error_body(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             redact_internal_error(_LOGGER, handler, exc),
             error_code=GATEWAY_SERVER_ERROR,
             retryable=True,
-            usage=provider_usage_of(exc),
+            provider_retried=retried,
+            usage=usage,
         ),
     }
 

@@ -146,6 +146,7 @@ from monoid_agent_kernel.providers._common import normalize_usage, usage_reporte
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ToolCall,
+    mark_provider_retried,
     mark_provider_usage,
     provider_usage_of,
 )
@@ -288,17 +289,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "the one RunCheckpoint field no branch of the validator inspects; the codec owns the "
         "version envelope, so this is the documented exclusion rather than a hole -- pinned so "
         "a SECOND unvalidated field cannot join it quietly",
-        "by-design",
-    ),
-    # --- by-design provenance splits ---------------------------------------------------
-    CarriageGap(
-        "applied-echo",
-        "provider_retried",
-        "providers/gateway.py:GatewayModelAdapter",
-        "the frameless-stream check reads the client's own attempt>1 while the framed check "
-        "reads chunk.provider_retried: by design, because a stream with no terminal frame "
-        "carries no server-side retry evidence to read, and the client's own attempt count is "
-        "the only true thing left to say",
         "by-design",
     ),
     # --- by-design: asserted and explained, never "fixed" ------------------------------
@@ -2556,6 +2546,45 @@ def test_2a_stream_error_frame_is_the_body_plus_a_type_tag() -> None:
     }
     assert frame["type"] == "error"
     assert {key: value for key, value in frame.items() if key != "type"} == _maximal_error_body()
+
+
+def test_2a_both_writers_read_the_retry_off_a_raw_refusal_the_way_they_read_the_cost() -> None:
+    """The stamp does not belong to a type — and neither writer was reading it that way.
+
+    ``provider_usage_of`` is read ONCE above the branch in both writers, on the stated rule that
+    an adapter refusing in a raw ``ValueError``/``AttributeError`` has burned tokens as readily
+    as one refusing in a ``ModelAdapterError``. ``provider_retried`` sat inside the
+    ``ModelAdapterError`` arm alone, though ``mark_provider_retried`` stamps any
+    ``BaseException`` and the gateway client's own ``_stamp_retry`` documents exactly that. So a
+    third-party adapter that retried and then refused raw was reported one hop out as a clean
+    single attempt, on the one carrier a failed call has left — while the cost of those same
+    attempts rode the same body.
+    """
+
+    raw = ValueError("the upstream adapter refused its provider's payload")
+    mark_provider_retried(raw)
+    mark_provider_usage(raw, {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460})
+
+    written, status = _write_exception_body(raw)
+    framed = _stream_error_frame(_StreamFrameHandler(), raw)
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert written["provider_retried"] is True, {
+        "body": written,
+        "hint": "the flag is readable on this exception and only the typed arm passed it",
+    }
+    assert framed["provider_retried"] is True, {
+        "frame": framed,
+        "hint": "the streamed twin of the same omission",
+    }
+    # Read once above the branch means the two facts travel together, whichever arm answers.
+    assert written["usage"] == framed["usage"] == provider_usage_of(raw)
+
+    # The counterweight: an unstamped raw refusal claims neither.
+    plain = ValueError("refused before the provider was reached")
+    unstamped, _status = _write_exception_body(plain)
+    assert unstamped["provider_retried"] is False
+    assert "usage" not in unstamped
 
 
 def test_2a_usage_is_omitted_when_the_failure_cost_nothing() -> None:

@@ -1323,3 +1323,71 @@ def test_a_coerce_refusal_off_a_readable_mapping_still_reports_its_cost(
     assert refused.value.provider_error_code == "openai_bad_response"
     assert refused.value.provider_retried is True
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+# --- the retry a call the run ABANDONS can still report -----------------------------------
+#
+# Every other carrier of ``provider_retried`` belongs to an outcome: a turn, a chunk, an
+# exception this adapter raised. A call the run abandons mid-flight -- a deadline landing while
+# the body parses or the stream drains -- produces none of them, and the receipt is built from
+# the ``RunTimeout``/``RunCancelled`` the race raised, which the adapter never touched. The
+# gateway adapter reports into the channel that crosses that abandonment
+# (``report_provider_retried``, at both of its retry sites); this adapter learned the same fact
+# off the exchange and told nobody, so the identical race recorded a clean single attempt on
+# one adapter and the truth on the other.
+
+
+def test_the_sync_path_reports_a_retry_the_run_may_never_see_an_outcome_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    with collect_retry_reports() as progress:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert progress.retried is True, {
+        "hint": "the SDK's own retry loop ran and the channel that survives abandonment "
+        "heard nothing",
+    }
+
+
+def test_the_streamed_path_reports_a_retry_on_the_same_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            _stream_events(), response=SimpleNamespace(request=_RequestWithRetryCount("1"))
+        ),
+    )
+    with collect_retry_reports() as progress:
+        _drain(_adapter())
+
+    assert progress.retried is True
+
+
+def test_an_unretried_call_reports_nothing_on_either_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight: the channel reports what happened, never that a call was made."""
+
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("0"))),
+    )
+    with collect_retry_reports() as sync_progress:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+    assert sync_progress.retried is False
+
+    _stub_async_openai(monkeypatch, _FakeAsyncStream(_stream_events()))
+    with collect_retry_reports() as stream_progress:
+        _drain(_adapter())
+    assert stream_progress.retried is False

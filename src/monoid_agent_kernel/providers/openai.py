@@ -35,6 +35,7 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_retried,
     mark_provider_usage,
     normalize_model_stream_chunk,
+    report_provider_retried,
 )
 
 
@@ -385,6 +386,17 @@ class OpenAIModelAdapter:
                 except TypeError:
                     raw = raw_calls.create(**payload)
                 retried = _provider_retried_by_the_sdk(getattr(raw, "http_response", None))
+                # Reported the moment it is learned, on the channel that crosses abandonment.
+                # Every other carrier of this fact belongs to an OUTCOME -- the turn returned
+                # below, or the exception the handlers mint -- and a run that abandons this
+                # call mid-flight (a deadline landing while the body parses) reads neither: the
+                # receipt is built from the ``RunTimeout``/``RunCancelled`` the race raised,
+                # which this adapter never touched. ``GatewayModelAdapter`` reports at both of
+                # its own retry sites for exactly that reason, so the identical race recorded a
+                # clean single attempt on this adapter and the truth on that one. Inert outside
+                # a runner, and it says nothing when there is nothing to say.
+                if retried:
+                    report_provider_retried()
                 response = raw.parse()
                 data = (
                     response.model_dump()
@@ -490,6 +502,13 @@ class OpenAIModelAdapter:
                 # for the hop the probe cannot make itself: a stand-in stream with no
                 # ``response`` truthfully answers "no retry".
                 provider_retried = _provider_retried_by_the_sdk(getattr(stream, "response", None))
+                # The blocking twin's report, at this path's own learn site: a stream abandoned
+                # while it drains yields no terminal chunk and raises no adapter exception, so
+                # the chunk stamp above is not a carrier the run can read either. See
+                # ``next_turn`` for why the channel exists and why the gateway adapter reports
+                # on it.
+                if provider_retried:
+                    report_provider_retried()
 
                 async for event in stream:
                     etype = getattr(event, "type", "")

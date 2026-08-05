@@ -1067,6 +1067,44 @@ def test_a_stream_without_a_terminal_frame_still_streams_plain_traffic(
     assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
 
 
+def test_a_frameless_refusal_carries_the_retry_its_own_deltas_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry fact rides every frame precisely so a frameless stream can still report it.
+
+    The framed check reads ``chunk.provider_retried`` — the wire's fact combined with this
+    client's own attempt count — while the frameless one read ``attempt > 1`` alone, so a
+    server-side retry on a stream that never reaches its terminal frame was recorded as a clean
+    single attempt on the one carrier left. The server stamps every frame for exactly this
+    shape, and the drain was throwing it away.
+    """
+
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = _sse_adapter(
+        monkeypatch,
+        config,
+        ['data: {"type":"text_delta","text":"unproven answer","provider_retried":true}', ""],
+    )
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert rejected.value.provider_retried is True, {
+        "hint": "the wire said the gateway's own backend retried; the frameless branch "
+        "answered from the client's attempt count alone",
+    }
+
+    # The counterweight: a wire that claims nothing is answered honestly, on the same shape.
+    silent = _terminal_frameless_adapter(monkeypatch, config)
+    with pytest.raises(ModelAdapterError) as quiet:
+        _drain(silent, _request(config))
+    assert quiet.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert quiet.value.provider_retried is False
+
+
 # --- the proof question is per call, not per adapter ------------------------------------
 
 

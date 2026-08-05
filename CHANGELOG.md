@@ -7,6 +7,37 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the retry fact rides every lane that learned it
+
+- **The frameless-stream checks read the retry the wire reported.** The gateway server stamps
+  `provider_retried` on *every* frame precisely so the fact survives a stream that never reaches
+  its terminal frame — and the client's frameless branch was the one reader ignoring it, passing
+  `attempt > 1` (its own retry loop, and nothing else) to all three checkers while the
+  terminal-frame site beside it passes `chunk.provider_retried`, which is the wire's fact
+  combined with the client's. So a gateway backend that retried and then sent a body ending
+  before its terminal frame was refused with a receipt claiming a clean single attempt — on the
+  one carrier a refused turn has left. The drain now retains what the frames said (reset per
+  attempt, beside `saw_terminal`) and the branch reads the same conjunction the framed one does.
+  The conformance ledger's by-design entry for this asymmetry retires with it: the premise it
+  rested on — "a stream with no terminal frame carries no server-side retry evidence to read" —
+  was simply not true of the wire the server writes.
+- **Both reference-gateway error writers read the flag off any exception, like the cost beside
+  it.** `_write_exception` reads `provider_usage_of(exc)` once above the branch on the stated
+  rule that the stamp does not belong to a type, then passed `provider_retried` on the
+  `ModelAdapterError` arm alone — though `mark_provider_retried` stamps an arbitrary
+  `BaseException` (the gateway client's own `_stamp_retry` documents exactly that), so an
+  upstream adapter that retried and then refused in a raw `ValueError`/`AttributeError` was
+  carrying a readable flag that nothing read. `_stream_error_frame` had the same shape. Both now
+  read it once above the branch, leniently, and pass it on every arm.
+- **The OpenAI adapter reports its SDK's retries on the channel that survives abandonment.** It
+  learns the fact off the exchange on both paths and stamped it onto outcomes only — the turn,
+  the chunks, the exceptions it mints — so a call the run abandons mid-flight (a deadline
+  landing while the body parses or the stream drains) produced none of them and the receipt,
+  built from the `RunTimeout`/`RunCancelled` the race raised, recorded a clean single attempt.
+  `GatewayModelAdapter` reports at both of its own retry sites for exactly that reason, so the
+  identical race told the truth on one adapter and not the other. One `report_provider_retried`
+  at each learn site, when there is something to report.
+
 ### Fixed — the permission-policy adoption gate reads fields, not the class
 
 - **`LoopBootstrapper` adopts the operator's `spec.permission_policy` whichever class carries

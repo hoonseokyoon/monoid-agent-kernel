@@ -472,6 +472,13 @@ class GatewayModelAdapter:
                     committed = False  # reset per attempt; see the binding above the loop
                     saw_terminal = False
                     reported_usage = {}  # reset per attempt, beside the two flags it travels with
+                    # The wire's own retry fact, retained for the frameless branch below. The
+                    # server stamps ``provider_retried`` on EVERY frame precisely so it survives
+                    # a stream that never reaches its terminal frame -- and that branch was the
+                    # one reader ignoring it, answering from this client's attempt count alone.
+                    # Reset per attempt for the reason the two above are: it describes THIS
+                    # attempt's stream, not the call.
+                    saw_retried = False
                     # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
                     # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
                     # expiry (see the field), and a backoff is exactly where a token crosses that
@@ -508,6 +515,12 @@ class GatewayModelAdapter:
                                 chunk_usage = getattr(chunk, "usage", None)
                                 if chunk_usage:
                                     reported_usage = dict(chunk_usage)
+                                # Read off the stamped chunk, so it is the wire's fact combined
+                                # with this client's own attempt -- exactly what the framed
+                                # check below reads. Sticky: one frame reporting a retry is the
+                                # whole answer, and a later frame cannot un-say it.
+                                if chunk.provider_retried:
+                                    saw_retried = True
                                 # The terminal frame is the streaming twin of the sync check in
                                 # ``next_turn`` -- both transports enforce or neither does.
                                 if isinstance(chunk, TurnComplete):
@@ -554,17 +567,26 @@ class GatewayModelAdapter:
                             # so run them with nothing once the drain is complete. Traffic
                             # that configures neither knob keeps the pre-W5 tolerance for a
                             # frameless stream: both checks pass when nothing was requested.
+                            #
+                            # The retry fact is the same conjunction the framed site reads --
+                            # the wire's, OR this client's own attempt count. Reading
+                            # ``attempt > 1`` alone was the one place that treated an absent
+                            # TERMINAL frame as an absent stream: the server stamps every frame,
+                            # so a body that dropped before its terminal one still SAID the
+                            # gateway's backend had retried, and this refusal is the only
+                            # carrier left to say it.
+                            retried_here = saw_retried or attempt > 1
                             _check_generation_applied(
                                 build_generation_payload(config.generation),
                                 config.generation.on_unsupported,
                                 None,
-                                known_provider_retried=attempt > 1,
+                                known_provider_retried=retried_here,
                             )
                             _check_schema_applied(
                                 request.output_schema is not None,
                                 config.generation.on_unsupported,
                                 None,
-                                known_provider_retried=attempt > 1,
+                                known_provider_retried=retried_here,
                             )
                             _check_reasoning_applied(
                                 None
@@ -572,7 +594,7 @@ class GatewayModelAdapter:
                                 else build_reasoning_payload(config.reasoning),
                                 config.reasoning.on_unsupported,
                                 None,
-                                known_provider_retried=attempt > 1,
+                                known_provider_retried=retried_here,
                             )
                         return
                     except _StreamRetry as retry_signal:
