@@ -1139,6 +1139,30 @@ def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -
         pass
 
 
+def mark_provider_error_code(error: BaseException, code: str) -> None:
+    """Name the class of failure on an escaping error that was minted without one.
+
+    A refusal raised by a field validator deep inside a reader knows its key and nothing else, so
+    it mints a bare ``ModelAdapterError``; one hop out the reference gateway resolves
+    ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` and blames the HOP's wire for an upstream
+    payload defect. Backfill only: a refusal that DOES name a code knows something the caller
+    completing it does not, and keeps it.
+
+    The guarded-setattr sibling of :func:`mark_provider_retried` and :func:`mark_provider_usage`,
+    for the same reason and in one copy for the same reason: an exception type that refuses the
+    attribute (``__slots__``) simply stays unnamed rather than replacing the provider's failure
+    with an ``AttributeError`` raised *inside* an except-handler. The read is inside the guard
+    too -- a third-party subclass may expose the name as a property that raises.
+    """
+
+    try:
+        if getattr(error, "provider_error_code", None):
+            return
+        error.provider_error_code = code  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def provider_usage_of(error: BaseException) -> dict[str, int]:
     """Read back what :func:`mark_provider_usage` stamped, as clean non-negative counts.
 

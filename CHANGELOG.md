@@ -7,6 +7,47 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the completion seam covers the whole adapter, not two regions of it
+
+- **Every refusal that leaves the OpenAI adapter's two call paths is completed, not just the
+  ones raised inside its two stamped regions.** The classifying seam was bound to
+  `_parse_response` and `_terminal_chunk`, so the code *between and around* them still refused
+  bare: the stream's per-frame field validators (`_provider_string`,
+  `_first_provider_string` — a `response.output_item.added` with no `call_id`/`id` is the
+  reachable case) and the sync path's `_coerce_response`. Those escaped through
+  `except ModelAdapterError: raise` with an empty `provider_error_code`, so one hop out the
+  reference gateway resolved them to its own `gateway_bad_response` — the wrong-wire-blamed
+  502 the seam exists to stop — while the *same helper* called one function deeper answered
+  `openai_bad_response`. Both arms are completion arms now, running the one
+  `_complete_billed_refusal` implementation. Backfill-only still holds, so the request-shaped
+  refusals inside the same region (`unserializable_request`, `unsupported_request_shape`) keep
+  their own code and their own remedy.
+- **A refusal after the terminal frame carries the cost it was billed.** A stream goes on
+  emitting frames after `response.completed`, so the streamed completion arm stamps from the
+  terminal payload when one has arrived and records nothing when it has not — mid-stream usage
+  is genuinely unknowable, and a lenient read invents none.
+- **The retry the call already spent stops being re-derived from the exception.** Both
+  `except Exception` arms rebuilt the fact with `_provider_retried_by_the_sdk(exc)`, which reads
+  the HTTP exchange — and an exception the SDK never raised carries none, so a `raw.parse()`
+  failure after two SDK retries was recorded as a clean single attempt. `_model_error_from_openai`
+  takes a `known_provider_retried` upgrade (the spelling the gateway validators already use):
+  whichever source can see the retry wins, neither can clear what the other observed. The
+  locals it reads are pre-initialized, so a `create()` that raises cannot answer with a
+  `NameError` instead of the provider's failure.
+- **The stream's terminal reader gets the one-shot reader's coerce twin.** It read
+  `if response is not None and hasattr(response, "model_dump")` with no else, where the sync
+  twin reads `model_dump() if hasattr(...) else _coerce_response(response)` — which *accepts* a
+  plain mapping and *refuses* anything else. The stream discarded both: a billed streamed turn
+  whose terminal response is a mapping reported SUCCESS with zero usage (run budget, receipt and
+  tenant ledger all recording a free call, the captured reasoning dropped), and an unreadable one
+  was not refused at all. Unreachable through the shipped SDK, which always returns a model;
+  reachable through every stand-in and wrapper.
+- **The seam's third mutation joins its two siblings.** The code stamp was a bare `setattr`
+  beside two guarded helpers; `providers/base.py` now owns `mark_provider_error_code` next to
+  `mark_provider_retried` and `mark_provider_usage`, one copy of the rule they state — a type
+  that refuses the attribute stays unnamed rather than replacing the provider's failure with an
+  `AttributeError` raised inside the except-handler.
+
 ### Fixed — the OpenAI reader refuses in one classified voice, and the refusal still pays
 
 - **Every malformed-payload refusal in the OpenAI adapter's two stamped regions is now a
