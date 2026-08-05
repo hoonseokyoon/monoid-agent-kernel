@@ -1292,6 +1292,15 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         # the run's token budget. ``provider_retried`` rides along for the same reason it does
         # on every other refusal: it is a fact about attempts already made. The meter skips an
         # empty mapping, so a stream that reported no cost still invents none.
+        #
+        # The CODE, though, deliberately does not converge with that seam's. The OpenAI reader
+        # backfills ``openai_bad_response`` onto its bare refusals; these two keep
+        # ``stream_bad_tool_args``, and this module never speaks a provider's name -- the fold
+        # is reached by every adapter, including third-party ones whose provider it cannot know.
+        # So one class of defect really does carry two codes across the sync/streamed pair, and
+        # that is the intended answer rather than an unbound twin: the ingress voice attributes
+        # the *shape* of the failure, the adapter voice attributes its *source*. Recorded here
+        # because a silent cell in a twin census reads as an oversight to the next reviewer.
         try:
             arguments = loads_model_json_ingress(raw) if raw else {}
         except ValueError as exc:
@@ -1326,9 +1335,13 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         # this fold with garbage must refuse in the ingress's classified voice, not raw.
         normalized_usage = normalize_usage(usage) if usage else {}
     except Exception as exc:
-        # Classified the way the ingress classifies, flags included: an un-flagged refusal is
-        # read as terminal-or-retryable off whatever the defaults happen to be, and the retry
-        # fact the fold is already holding would be dropped. No usage stamp -- ``usage`` is
+        # Classified the way the ingress classifies, flags included. The constructor's defaults
+        # are deterministic, not arbitrary -- ``retryable`` is False and ``provider_retried`` is
+        # False -- so the two keywords do different work: ``retryable=False`` restates the
+        # default where a reader would otherwise have to go look it up, while
+        # ``provider_retried`` is the one fact the fold is holding that a default would throw
+        # away, since a stream the SDK re-sent would report a clean single attempt. No usage
+        # stamp -- ``usage`` is
         # itself the malformed key here, and the tolerance rule on a failure path is to record
         # nothing rather than raise a second failure over the first. Unreachable through this
         # function (the ingress above pre-normalizes every chunk), so what binds this shape is

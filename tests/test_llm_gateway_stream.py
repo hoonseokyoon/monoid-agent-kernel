@@ -439,17 +439,15 @@ def test_the_assembler_refuses_a_malformed_streamed_usage_classified() -> None:
         assemble_streamed_turn([TurnComplete(usage={"input_tokens": "many"})])  # type: ignore[dict-item]
 
 
-def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
-    """The pin for code no input can reach: read the fold's own source and hold its shape.
+def _assert_the_fold_guard_binds_its_refusal(source: str) -> None:
+    """The body of the pin below, over source text so a mutation can be shown to move it.
 
-    The guard exists because deleting normalization is a loosening-shaped edit and a future
-    caller that reaches the fold around the ingress must refuse in the ingress's classified
-    voice. Nothing can drive it today, so a behavioral pin is impossible and a *source* pin is
-    the only honest binding -- the repo's census style, message-anchored so that deleting the
-    guard, or downgrading the classification it states, goes red.
+    A structural pin is only worth its cost if the edits it exists to catch actually turn it
+    red, and the only way to demonstrate that without editing the repo is to run the pin
+    against a mutated copy of the same source. Hence the split.
     """
 
-    tree = ast.parse(inspect.getsource(assemble_streamed_turn))
+    tree = ast.parse(source)
     guarded = [
         node
         for node in ast.walk(tree)
@@ -482,13 +480,102 @@ def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
     message = minted[0].exc.args[0]
     assert isinstance(message, ast.Constant), {"hint": "the refusal's message anchors this pin"}
     assert message.value == "model adapter returned a non-portable stream fragment"
-    # And it states the classification rather than leaving it to defaults: an un-flagged refusal
-    # that reached a client would be read as terminal-or-retryable by whatever the default was,
-    # and the retry fact the fold already knows would be dropped on the floor.
-    assert {keyword.arg for keyword in minted[0].exc.keywords} == {
-        "retryable",
-        "provider_retried",
+
+    # The VALUES, not the key names. Comparing the name set alone had its verdicts exactly
+    # inverted against the two edits that matter: flipping ``retryable=False`` to ``True`` --
+    # the loosening this pin's own docstring claims to catch -- left the set unchanged and
+    # stayed GREEN, while adding a legitimate third keyword changed the set and went RED. So a
+    # superset test for presence, and an expression test for what each one actually says.
+    bound = {keyword.arg: keyword.value for keyword in minted[0].exc.keywords}
+    assert {"retryable", "provider_retried"} <= set(bound), {
+        "bound_keywords": sorted(name for name in bound if name),
+        "hint": "an un-flagged refusal drops the classification and the fold's retry fact",
     }
+    retryable = bound["retryable"]
+    assert isinstance(retryable, ast.Constant) and retryable.value is False, {
+        "retryable_is": ast.unparse(retryable),
+        "hint": "a payload defect is not something a retry clears; this must stay a literal False",
+    }
+    retried = bound["provider_retried"]
+    assert isinstance(retried, ast.Name) and retried.id == "provider_retried", {
+        "provider_retried_is": ast.unparse(retried),
+        "hint": "the retry fact must be CARRIED from the fold, not restated as a literal",
+    }
+
+
+def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
+    """The pin for code no input can reach: read the fold's own source and hold its shape.
+
+    The guard exists because deleting normalization is a loosening-shaped edit and a future
+    caller that reaches the fold around the ingress must refuse in the ingress's classified
+    voice. Nothing can drive it today, so a behavioral pin is impossible and a *source* pin is
+    the only honest binding -- the repo's census style, message-anchored so that deleting the
+    guard, or downgrading the classification it states, goes red.
+    """
+
+    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(assemble_streamed_turn))
+
+
+def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
+    """Prove the pin above, by mutating the source it reads rather than the repo.
+
+    A structural pin cannot be trusted on its wording: it is a claim about which edits turn it
+    red, and that claim is testable. This one earned the check -- the name-set comparison it
+    replaces was GREEN on the loosening it advertised and RED on a strengthening, which is the
+    worst of both directions.
+    """
+
+    source = inspect.getsource(assemble_streamed_turn)
+    _assert_the_fold_guard_binds_its_refusal(source)  # unmutated: green
+
+    def _mutant(old: str, new: str) -> str:
+        mutated = source.replace(old, new)
+        assert mutated != source, {"hint": "the mutation did not apply; the anchor moved"}
+        return mutated
+
+    loosened = _mutant(
+        '"model adapter returned a non-portable stream fragment",\n            retryable=False,',
+        '"model adapter returned a non-portable stream fragment",\n            retryable=True,',
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(loosened)
+
+    restated = _mutant(
+        "provider_retried=provider_retried,\n        ) from exc",
+        "provider_retried=False,\n        ) from exc",
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(restated)
+
+    # Deleting the guard is still the primary edit this pin exists for.
+    lines = source.splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "try:" and "normalize_usage" in "\n".join(lines[index : index + 8])
+    )
+    end = next(
+        index
+        for index, line in enumerate(lines[start:], start)
+        if line.strip().startswith("return ModelTurn(")
+    )
+    guardless = "\n".join(
+        lines[:start]
+        + ["    normalized_usage = normalize_usage(usage) if usage else {}"]
+        + lines[end:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(guardless)
+
+    # ...and STRENGTHENING must pass. The old pin failed here, which is how a pin teaches the
+    # next author to weaken it instead of adding to it.
+    _assert_the_fold_guard_binds_its_refusal(
+        _mutant(
+            "            provider_retried=provider_retried,\n        ) from exc",
+            "            provider_retried=provider_retried,\n"
+            '            provider_error_code="stream_bad_usage",\n        ) from exc',
+        )
+    )
 
 
 def test_a_streamed_tool_call_refusal_pays_for_the_turn_it_was_billed() -> None:

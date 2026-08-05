@@ -7,6 +7,35 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the pin binds values, the sweep covers the family, four sentences stop over-claiming
+
+- **The fold-guard structural pin had its verdicts inverted.** It compared only the keyword
+  *names* on the refusal it parses, so mutating `retryable=False` to `True` — the exact
+  loosening its own docstring claims to catch — left the name set unchanged and stayed green,
+  while adding a legitimate third keyword changed the set and went red. It now asserts the
+  values (a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact) with the name set tested as a superset, and a companion test mutates the source in
+  memory to show the pin moving on each edit it claims to catch.
+- **The shipped-runtime-config sweep replays the whole proof family.** It drove only
+  `_check_reasoning_applied`, but `generation.on_unsupported` governs two more checkers with the
+  identical shipped-refusal shape. All three are now derived exactly as the three real
+  enforcement sites derive them and replayed against a silent upstream. Born green — neither
+  shipped config sets a sampling control, and a runtime config cannot carry an output schema —
+  which is what an enumeration-breadth pin is for.
+- **Four sentences corrected against the code they describe.** `docs/COMPATIBILITY.md` now
+  attributes the park→terminal move to *both* answers that made it (the 400 lost its
+  recoverable status range; the 500's `retryable: true`, which `AgentLoop` reads *before* the
+  status, became `false`) and states plainly that the ~13 already-502 shapes changed their name
+  and nothing else — same status, same flags, same `usage`, same verdict. Its gateway-author
+  guidance now says three attempts (two retries) per `model.retry.max_attempts`, and derives the
+  bare-502 re-buy from the conjunction that actually causes it: a body omitting **both**
+  `retryable` and `error_code`, since `_should_retry` needs the derived flag *and* a code in
+  `retry_on`. This changelog no longer claims the `stream_bad_tool_args` raises became
+  non-retryable — `ModelAdapterError.retryable` already defaulted to `False`, so that keyword is
+  a no-op made legible. And the sync/streamed code asymmetry (`openai_bad_response` vs
+  `stream_bad_tool_args`) is recorded at the raise sites as the deliberate provider-neutrality
+  it is, so the next twin census reads a decision instead of a silent cell.
+
 ### Fixed — `is_default` reads the fields, not the class
 
 - **`ReasoningConfig.is_default` and `GenerationConfig.is_default` now compare the fields the
@@ -101,7 +130,11 @@ out in commit messages and here.
   test for this shape is intercepted by the ingress and never reaches the guard, so deleting
   the guard left the suite green;
   `test_the_folds_usage_renormalization_stays_structurally_guarded` parses the fold and holds
-  the try/handler shape, the refusal's message and the classification it states.
+  the try/handler shape, the refusal's message, and the VALUE each classification keyword
+  binds — a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact — with the keyword set tested as a superset so strengthening the refusal passes and only
+  weakening it fails. A companion test mutates that source in memory and shows the pin moving on
+  each edit it claims to catch.
 - **The fold's own tool-call refusals pay for the turn they were billed for.** Both
   `stream_bad_tool_args` raises in `assemble_streamed_turn` — a model emitting non-JSON
   function-call arguments is ordinary — escaped with no usage stamp and no `provider_retried`,
@@ -109,7 +142,9 @@ out in commit messages and here.
   OpenAI reader's stamping seam, so a *streamed* turn the provider generated and billed was
   metered at zero at the tenant ledger and in the run's token budget while its sync twin was
   not. `providers/base.py` stays provider-neutral: the refusals keep their own
-  `stream_bad_tool_args` code, now non-retryable and carrying the retry the stream reported.
+  `stream_bad_tool_args` code. What actually changed is the usage stamp and `provider_retried`;
+  `retryable=False` is now written explicitly, but `ModelAdapterError.retryable` already
+  defaults to `False`, so that is a no-op made legible rather than a behavior change.
 
 ### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
 

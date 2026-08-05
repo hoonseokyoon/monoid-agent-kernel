@@ -1878,7 +1878,11 @@ def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_met
     # mapping, so the handler's ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` fallback
     # told the client the HOP's wire was malformed for an UPSTREAM payload defect -- while the
     # duck-typed terminal reader answered ``openai_bad_response`` for a byte-identical body.
-    # One class of defect, one code, whichever transport read it.
+    # One class of defect, one code, whichever of the OPENAI ADAPTER's OWN readers read it.
+    # Scoped there deliberately, and not to every transport: ``providers/base.py`` is
+    # provider-neutral by design, so the streamed tool-args refusal it raises keeps
+    # ``stream_bad_tool_args`` rather than backfilling to this adapter's code. That asymmetry
+    # is a decision, not a gap -- see the note at those raise sites.
     assert refused.value.provider_error_code == "openai_bad_response"
     assert _model_error_status(refused.value) == HTTPStatus.BAD_GATEWAY
 

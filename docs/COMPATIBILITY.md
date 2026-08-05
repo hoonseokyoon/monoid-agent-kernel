@@ -289,25 +289,36 @@ retried on that 500 was re-buying tokens for a payload defect; a client that rea
 own bad request was mis-remediating; and one malformed body answered two different codes
 depending on which transport read it.
 
-Read the 400 → 502 half literally, because this kernel's own client does. `AgentLoop`
-(`_recoverable_turn_error`) treats **any** 4xx as a *recoverable* turn failure — the turn fails,
-the session survives, the caller can fix and resend — and an un-flagged 5xx as terminal. So this
-failure class moves from a park to a terminal run failure: a `failure.json` and a terminal
-session where a client previously got a suspension it could resume from. That direction is
-intended. It converges the hop with in-process behavior, where a malformed upstream payload has
-always ended the run, and no amount of resending the same call fixes a payload the upstream
-produced. On that half a client classifying off the envelope's `retryable` /
-`config_recoverable` / `usage` reads the same three values it read before (`false` / `false` /
-the billed counts); clients keyed to the literal status range — including this one — see a park
-become terminal. The 500 half changes the envelope too, and in the direction that stops the
-bleeding: `retryable` was `true` and is now `false`, so the client stops re-buying the tokens.
+Read the recoverability move literally, because this kernel's own client does. `AgentLoop`
+(`_recoverable_turn_error`) reads `retryable` **first**, then `config_recoverable`, and only
+then the status range — treating any 4xx as a *recoverable* turn failure (the turn fails, the
+session survives, the caller can fix and resend) and an un-flagged 5xx as terminal. **Both**
+answers that moved therefore move from a park to a terminal run failure, by different routes:
+the 400 was recoverable on its status range and its replacement is a 5xx outside that range,
+and the 500 was recoverable on `retryable: true` alone — which is now `false`, so the flag that
+carried it no longer does. Either way a client that previously got a suspension it could resume
+from now gets a `failure.json` and a terminal session. That direction is intended. It converges
+the hop with in-process behavior, where a malformed upstream payload has always ended the run,
+and no amount of resending the same call fixes a payload the upstream produced. The 500 half
+stops a second kind of bleeding at the same time: `retryable: true` invited a client to re-buy
+exactly the tokens the defect had already spent.
+
+The third group did not move at all. The shapes that already answered 502
+`gateway_bad_response` — refusals minted without a code of their own, roughly a dozen of them —
+were already `retryable: false` and already terminal for this client. Their `error_code` changed
+and nothing else did: same status, same `retryable` / `config_recoverable`, same billed `usage`,
+same verdict from `_recoverable_turn_error`. What they gained is an honest attribution, not a
+new recoverability, and a client keyed to anything but the code sees no change from them.
 
 If you implement this answer in your own gateway, write `"retryable": false` **and** the
-`error_code` explicitly into the 502 body. The client's error reader derives `retryable` from
-the status line only when the key is absent, and a bare 502 derives `retryable: true` under
-error code `gateway_server_error`, which is in the default `model.retry.retry_on` — so a body
-that omits the key is retried three times and re-buys exactly the tokens this change exists to
-stop paying for.
+`error_code` explicitly into the 502 body. The client derives each of those from the status line
+only when its own key is absent, and its retry gate (`_should_retry`) needs both: a bare 502
+derives `retryable: true` *and* the error code `gateway_server_error`, which is in the default
+`model.retry.retry_on`. So a body omitting **both** keys is re-sent until
+`model.retry.max_attempts` (3) is spent — three attempts, two retries — re-buying exactly the
+tokens this change exists to stop paying for. Writing either key alone already breaks that
+conjunction; write both anyway, so the body states its verdict instead of leaving half of it to
+a default derived from the status line.
 
 Raw refusals from third-party adapters keep their previous arms and their stamped-usage
 carriage.
