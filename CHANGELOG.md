@@ -7,6 +7,28 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the permission-policy adoption gate reads fields, not the class
+
+- **`LoopBootstrapper` adopts the operator's `spec.permission_policy` whichever class carries
+  the loop's own.** The gate asked `loop.permission_policy == PermissionPolicy()`, and a
+  generated dataclass `__eq__` is class-exact — the third unbound site of the exact rule
+  `ReasoningConfig`/`GenerationConfig` were fixed for. A deployment's extension subclass with
+  both pattern tuples empty therefore answered "the caller configured this", so the operator's
+  `deny_patterns`/`redact_patterns` were silently **not** adopted and the loop enforced the
+  empty policy at every `self.permission_policy` site — while the subagent sites read
+  `self.spec.permission_policy` directly, leaving half a run honouring the operator's lists and
+  half not. Such subclasses reach the gate intact by design: the spec validator gates on
+  `isinstance`. `PermissionPolicy` now answers `is_default` off the two fields it declares, and
+  the bootstrap asks that instead. Adoption is still for defaults only: a policy with a kernel
+  field set — on the base class or on a subclass — is a configured policy and is never
+  overwritten.
+- **One rule, one home.** `matches_the_kernel_defaults` moved to `_policy_util` because
+  `core.spec` imports `permissions` and the two cannot import each other; that module imports
+  nothing of the package, so it is the one place all three gates can reach. The rationale is
+  the same on all three, said in the terms each one guards: extension fields are invisible to
+  the projection for the model configs and invisible to enforcement for the policy, so they
+  must be invisible to the gate.
+
 ### Fixed — the raw arms pay what the turn already cost
 
 - **A connection that drops *after* the OpenAI stream's terminal response reports what that

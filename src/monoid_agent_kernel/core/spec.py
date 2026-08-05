@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import uuid
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from monoid_agent_kernel._policy_util import matches_the_kernel_defaults
 from monoid_agent_kernel.core.content import (
     ContentPart,
     TextPart,
@@ -36,36 +37,6 @@ def _model_choice(value: Any, field_name: str, choices: tuple[str, ...]) -> Any:
     return value
 
 
-def _matches_the_kernel_defaults(config: Any, base: type) -> bool:
-    """Whether every field ``base`` DECLARES is still at its default on ``config``.
-
-    The shared body of the two ``is_default`` gates, and the reason neither of them is
-    ``self == type(self)()``: a generated dataclass ``__eq__`` is class-exact, so a public
-    extension subclass with every kernel field at its default compared unequal to the base
-    default and was read as "the caller configured this". The kernel supports such subclasses
-    deliberately -- every validator gates on ``isinstance`` and
-    ``providers/base._copy_with_fields`` exists so normalization does not have to call an
-    extension's narrower constructor -- so a gate that answers about the CLASS answers a
-    question nobody asked.
-
-    Fields are read off ``base`` rather than off ``type(config)``, and that asymmetry is the
-    point rather than an accident: the projections these gates guard
-    (``build_reasoning_payload``, ``build_generation_payload``, ``ReasoningConfig.to_json``)
-    emit only the base's fields, so an extension field is invisible to every wire, digest and
-    echo downstream. Something invisible to the projection must be invisible to the gate too,
-    or the two sides of one hop answer differently about a byte-identical request -- which is
-    exactly what happened: the client computed "configured" from the subclass and demanded an
-    echo, the server rebuilt a plain config from the wire, computed "default", sent none, and
-    every turn was refused with no server-side fix available.
-    """
-
-    defaults = base()
-    return all(
-        getattr(config, declared.name) == getattr(defaults, declared.name)
-        for declared in fields(base)
-    )
-
-
 @dataclass(frozen=True)
 class ReasoningConfig:
     effort: ReasoningEffort = "medium"
@@ -84,11 +55,11 @@ class ReasoningConfig:
         as invisible as an explicit ``temperature=None`` is to generation's gate.
 
         Read over the fields this class declares, never over ``type(self)``'s: see
-        :func:`_matches_the_kernel_defaults` for why an extension's own fields must be as
+        :func:`matches_the_kernel_defaults` for why an extension's own fields must be as
         invisible here as they already are to ``to_json`` and ``build_reasoning_payload``.
         """
 
-        return _matches_the_kernel_defaults(self, ReasoningConfig)
+        return matches_the_kernel_defaults(self, ReasoningConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ReasoningConfig:
@@ -226,14 +197,14 @@ class GenerationConfig:
         """Whether the caller set any sampling control — the gate ``ModelConfig.to_json`` reads.
 
         The same field-based rule as the reasoning twin, and for the same reason
-        (:func:`_matches_the_kernel_defaults`). Its consumer is a serialization gate rather than
+        (:func:`matches_the_kernel_defaults`). Its consumer is a serialization gate rather than
         an echo, so a class-exact answer here made an all-defaults extension emit the
         ``generation`` key — changing the request digest, the runtime-config semantic hash that
         durable recovery compares across restarts, and the gateway wire, while changing nothing
         any of them is about.
         """
 
-        return _matches_the_kernel_defaults(self, GenerationConfig)
+        return matches_the_kernel_defaults(self, GenerationConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> GenerationConfig:

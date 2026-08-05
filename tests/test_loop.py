@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,6 +24,7 @@ from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop, _recoverable_turn_error
+from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
 from monoid_agent_kernel.providers.fake import (
     FakeModelAdapter,
@@ -2691,3 +2694,122 @@ def test_the_reasoning_the_wire_carries_stops_growing_with_the_conversation(
     assert len([m for m in durable if "reasoning" in m]) == 3
     # The last request sees the longest log; its reasoning payload is still nothing.
     assert all("reasoning" not in m for m in (adapter.requests[-1].messages or ()))
+
+
+# --- the operator's policy reaches the loop, whatever class carries the loop's own ---------
+#
+# The bootstrap adopts ``spec.permission_policy`` only when the loop is still carrying a
+# default one, and it asked that question with ``==`` against ``PermissionPolicy()``. A
+# generated dataclass ``__eq__`` is class-exact, so a public extension subclass with every
+# kernel field at its default answered "not default" -- and the operator's deny/redact patterns
+# were then silently not adopted. The kernel supports such subclasses deliberately (the spec
+# validator gates on ``isinstance``), so this is a security control lost to a class check: the
+# loop enforced the empty policy at every ``self.permission_policy`` site while the subagent
+# sites two thousand lines away read ``self.spec.permission_policy`` directly -- half the run
+# honouring the operator's policy and half not.
+
+
+@dataclass(frozen=True)
+class _TenantPermissionPolicy(PermissionPolicy):
+    """A deployment's extension of the policy dataclass: kernel fields, plus one of its own."""
+
+    tenant_id: str = ""
+
+
+def _denied_read_loop(
+    tmp_path: Path, *, loop_policy: PermissionPolicy, spec_policy: PermissionPolicy
+) -> tuple[Any, MemoryEventSink]:
+    """One run that tries to read two files, under whichever policy the bootstrap settles on."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    (workspace / ".env").write_text("operator secret", encoding="utf-8")
+    (workspace / "tenant.txt").write_text("tenant secret", encoding="utf-8")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(
+                    fake_tool_call("fs_read", {"path": ".env"}, "call_env"),
+                    fake_tool_call("fs_read", {"path": "tenant.txt"}, "call_tenant"),
+                ),
+            ),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    sink = MemoryEventSink()
+    result = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace,
+            run_root=tmp_path / "runs",
+            permission_policy=spec_policy,
+        ),
+        model_adapter=adapter,
+        permission_policy=loop_policy,
+        runtime_config_provider=_provider(),
+        event_sinks=(sink,),
+    ).run_once("read both")
+    return result, sink
+
+
+def _denied_call_ids(sink: MemoryEventSink) -> list[str]:
+    return [
+        event.data["call_id"]
+        for event in sink.events
+        if event.type == "tool.call.failed" and event.data.get("error_code") == "permission_denied"
+    ]
+
+
+def test_the_operator_policy_is_adopted_over_an_extension_at_the_kernel_defaults(
+    tmp_path: Path,
+) -> None:
+    """Every kernel field default means default, whichever class declares the extra ones."""
+
+    _result, sink = _denied_read_loop(
+        tmp_path,
+        loop_policy=_TenantPermissionPolicy(tenant_id="acme"),
+        spec_policy=PermissionPolicy(deny_patterns=(".env",)),
+    )
+
+    assert _denied_call_ids(sink) == ["call_env"], {
+        "denied": _denied_call_ids(sink),
+        "hint": "the operator's spec policy was not adopted, so the loop enforced nothing",
+    }
+
+
+def test_a_configured_extension_policy_is_not_overwritten_by_the_spec(tmp_path: Path) -> None:
+    """The counterweight, and the half the class check got right: adoption is for defaults only.
+
+    A subclass that *does* set a kernel field is a configured policy, and the loop's own
+    argument outranks the spec's exactly as it always has for a plain one.
+    """
+
+    _result, sink = _denied_read_loop(
+        tmp_path,
+        loop_policy=_TenantPermissionPolicy(deny_patterns=("tenant.txt",), tenant_id="acme"),
+        spec_policy=PermissionPolicy(deny_patterns=(".env",)),
+    )
+
+    assert _denied_call_ids(sink) == ["call_tenant"], {
+        "denied": _denied_call_ids(sink),
+        "hint": "adoption overwrote a policy the caller had configured",
+    }
+
+
+def test_the_policy_gate_reads_the_two_kernel_fields_and_nothing_else() -> None:
+    """The third member of the ``is_default`` family, pinned directly like its two siblings.
+
+    An extension field is invisible to enforcement — ``check_paths`` and the redaction readers
+    match ``deny_patterns`` and ``redact_patterns`` and nothing else — so it must be invisible
+    to the gate. A kernel field that *is* set stays non-default on a subclass exactly as it does
+    on the base.
+    """
+
+    assert PermissionPolicy().is_default is True
+    assert PermissionPolicy(deny_patterns=(".env",)).is_default is False
+    assert PermissionPolicy(redact_patterns=("*.key",)).is_default is False
+
+    assert _TenantPermissionPolicy().is_default is True
+    assert _TenantPermissionPolicy(tenant_id="acme").is_default is True
+    assert _TenantPermissionPolicy(deny_patterns=(".env",), tenant_id="acme").is_default is False
+    assert _TenantPermissionPolicy(redact_patterns=("*.key",)).is_default is False
