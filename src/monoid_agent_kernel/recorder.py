@@ -456,54 +456,64 @@ class AgentRecorder:
 
         Three containment layers, each for a failure the run must survive. The record is built and
         encoded before the handle is touched, so a caller's hostile ``InvocationContext.attributes``
-        costs its own line rather than the run. A write error disables the handle rather than
-        retrying: a partial write may have torn the current line, and appending after it would glue
-        the next record onto the remnant and lose both. And nothing here raises — an answer the
-        provider has already been paid for is not discarded because a disk filled up.
+        costs its own line rather than the run — and does not consume an index, since the counter
+        advances only for a line that reached the file. A write error disables the handle rather
+        than retrying: a partial write may have torn the current line, and appending after it would
+        glue the next record onto the remnant and lose both. And nothing here raises, whoever calls
+        it: an answer the provider has already been paid for is not discarded because a disk filled
+        up, and this method's guarantee must not depend on ``ModelCallRunner._record`` also having
+        one.
+
+        Reserving the index and writing the line happen under **one** acquisition. Split across
+        two, concurrent callers read the same counter and write two records claiming one index,
+        which silently defeats the only thing ``call_index`` is for — noticing that a best-effort
+        append-only file dropped something — and defeats it in the direction that reads as
+        "nothing was lost". That the loop happens to call this sequentially is a property of one
+        caller; the recorder holds a lock because it is shared with tool and job threads.
         """
 
         if not self.model_calls_file or self._model_calls_failed:
             return
         try:
             with self._model_calls_lock:
-                index = self._model_calls_index
-            record = model_call_record(
-                receipt,
-                run_id=self.run_id,
-                root_run_id=self.root_run_id or self.run_id,
-                call_index=index,
-                recorded_at=utc_timestamp(),
-            )
-            # Normalized here rather than inside ``_write_jsonl``'s repair path, so an unencodable
-            # value is refused before a handle is opened for it.
-            line = json.dumps(
-                normalize_json_ingress(record),
-                ensure_ascii=False,
-                sort_keys=True,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            line.encode("utf-8")
+                if self._model_calls_failed:
+                    return
+                record = model_call_record(
+                    receipt,
+                    run_id=self.run_id,
+                    root_run_id=self.root_run_id or self.run_id,
+                    call_index=self._model_calls_index,
+                    recorded_at=utc_timestamp(),
+                )
+                # Normalized and encoded before a handle is touched, so an unencodable value is
+                # refused rather than half-written.
+                line = json.dumps(
+                    normalize_json_ingress(record),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                line.encode("utf-8")
+                if self._append_model_call(line):
+                    self._model_calls_index += 1
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
-            _LOGGER.debug("model call record could not be built", exc_info=True)
-            return
-        self._append_model_call(line)
+            _LOGGER.debug("model call record could not be written", exc_info=True)
 
-    def _append_model_call(self, line: str) -> None:
-        with self._model_calls_lock:
-            if self._model_calls_failed:
-                return
-            handle = self._ensure_model_calls_handle_locked()
-            if handle is None:
-                return
-            try:
-                handle.write(line + "\n")
-                handle.flush()
-            except (OSError, UnicodeError):
-                self._model_calls_failed = True
-                _LOGGER.debug("model call ledger append failed", exc_info=True)
-                return
-            self._model_calls_index += 1
+    def _append_model_call(self, line: str) -> bool:
+        """Write one encoded line. Caller holds ``_model_calls_lock``; returns whether it landed."""
+
+        handle = self._ensure_model_calls_handle_locked()
+        if handle is None:
+            return False
+        try:
+            handle.write(line + "\n")
+            handle.flush()
+        except (OSError, UnicodeError):
+            self._model_calls_failed = True
+            _LOGGER.debug("model call ledger append failed", exc_info=True)
+            return False
+        return True
 
     def _ensure_model_calls_handle_locked(self) -> TextIO | None:
         if self._model_calls_handle is not None:

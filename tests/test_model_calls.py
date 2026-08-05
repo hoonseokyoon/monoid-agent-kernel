@@ -348,6 +348,69 @@ def test_a_reopened_run_appends_to_the_ledger_it_already_has(tmp_path: Path) -> 
     assert records[0]["recorded_at"] <= records[1]["recorded_at"]
 
 
+def _standalone_recorder(tmp_path: Path) -> Any:
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    return AgentRecorder(tmp_path / "runs", "run-1", model_calls_file=True, status_file=False)
+
+
+def test_concurrent_records_never_share_a_call_index(tmp_path: Path) -> None:
+    """Reserving the index and writing the line are one operation, not two.
+
+    `call_index` has exactly one job -- letting a reader notice that a best-effort append-only file
+    dropped something -- and two records sharing an index defeats it silently, in the direction
+    that reads as "nothing was lost". The recorder takes a lock precisely because it is shared with
+    tool and job threads, so "the loop calls this sequentially" is not a guarantee this method may
+    rely on: it is a property of one caller.
+    """
+    import threading
+
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    recorder = _standalone_recorder(tmp_path)
+    start = threading.Barrier(8)
+
+    def write() -> None:
+        start.wait()
+        for _ in range(20):
+            recorder.record_model_call(ModelCallReceipt())
+
+    threads = [threading.Thread(target=write) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    recorder.close()
+
+    indices = [record["call_index"] for record in _records(recorder.run_dir)]
+
+    assert len(indices) == 160
+    assert sorted(indices) == list(range(160))
+
+
+def test_the_recorder_contains_its_own_write_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    """The promise is the recorder's, not the runner's.
+
+    ``record_model_call`` is public and its docstring says nothing here raises. Proving that only
+    through a run leans on ``ModelCallRunner._record``'s own guard -- so the promise would survive
+    a refactor that removed it from the recorder, and only fail for whoever calls the recorder
+    directly.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel import recorder as recorder_module
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise OSError("disk is full")
+
+    monkeypatch.setattr(recorder_module.AgentRecorder, "_append_model_call", explode)
+    recorder = _standalone_recorder(tmp_path)
+
+    recorder.record_model_call(ModelCallReceipt())  # must not raise
+
+    recorder.close()
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_the_ledger_switch_does_not_select_provider_streaming(
     tmp_path: Path,
