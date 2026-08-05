@@ -7,6 +7,20 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the identity projection cannot go back to reflecting over `ModelConfig`
+
+- **A structural pin over `_model_identity`'s own source asserts it reflects over nothing** — no
+  `to_json`, no `fields`/`asdict`/`vars`/`getattr`, and every attribute it reads is on a declared
+  allowlist. This is the one claim no behavioural test can make: a matrix says which fields move
+  the key, not *how* the projection decided, and a reflective implementation would satisfy every
+  matrix while re-opening the hazard the hand-listing closed.
+- **The pin is itself tested.** A companion mutates the source three ways — reading a transport
+  field, returning `to_json()`, adding a timeout term — and asserts the pin turns red on each,
+  because a structural pin's claim about which edits it catches is a claim that can be wrong.
+- **One more pin states an ordering nothing else would notice:** the replay key is taken after
+  `normalize_model_request`, so normalization is key material. Every other test builds its payload
+  from an already-normalized request and would stay green if that order flipped.
+
 ### Changed — the endpoint leaves the replay key and becomes recorded metadata
 
 - **`request_digest` no longer covers where a call was sent.** The destination was hashed into

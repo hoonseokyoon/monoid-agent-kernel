@@ -21,6 +21,10 @@ parameterized matrices rather than a single golden value.
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 
 from monoid_agent_kernel.core.spec import (
@@ -32,7 +36,9 @@ from monoid_agent_kernel.core.spec import (
 from monoid_agent_kernel.model_call import (
     _PROMPT_DIGEST_GENERATION,
     _REQUEST_DIGEST_GENERATION,
+    ModelCallRunner,
     _digest,
+    _model_identity,
     _prompt_payload,
     _request_payload,
 )
@@ -217,3 +223,93 @@ def test_two_adapters_that_declare_nothing_are_still_told_apart_by_their_configu
     assert resolved_provider_name(_Silent(), gateway) == "gateway"
     assert resolved_provider_name(_Declaring(), gateway) == "openai"
     assert _key(fake, provider="fake") != _key(gateway, provider="gateway")
+
+
+# --- the projection reflects over nothing ----------------------------------------------
+#
+# The one claim no behavioural test can express. A matrix says which fields move the key; it
+# cannot say *how* the projection decided, and a reflective implementation would satisfy every
+# matrix above while re-opening the hazard the hand-listing closed. Split over source text --
+# rather than reading the repo directly -- so the mutation test below can show the pin moves.
+
+
+_PROJECTION_ALLOWLIST = {
+    "model",
+    "reasoning",
+    "generation",
+    "effort",
+    "summary",
+    "on_unsupported",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "is_default",
+}
+
+
+def _assert_the_projection_reflects_over_nothing(source: str) -> None:
+    tree = ast.parse(textwrap.dedent(source))
+
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    } | {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    reflective = called & {"to_json", "asdict", "vars", "fields", "getattr", "dir"}
+    assert reflective == set(), {
+        "reflective_calls": sorted(reflective),
+        "hint": "a serialized or enumerated config makes every field a co-author of the key",
+    }
+
+    read = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+    }
+    assert read <= _PROJECTION_ALLOWLIST, {
+        "outside_the_allowlist": sorted(read - _PROJECTION_ALLOWLIST),
+        "hint": "a term the key covers must be listed here, deliberately",
+    }
+
+
+def test_the_request_identity_projection_is_hand_listed() -> None:
+    _assert_the_projection_reflects_over_nothing(inspect.getsource(_model_identity))
+
+
+def test_the_projection_pin_moves_on_the_edits_it_claims_to_catch() -> None:
+    """A structural pin is a claim about which edits turn it red, and that claim is testable."""
+
+    source = inspect.getsource(_model_identity)
+    _assert_the_projection_reflects_over_nothing(source)
+
+    def _mutant(old: str, new: str) -> str:
+        mutated = source.replace(old, new)
+        assert mutated != source, {"hint": "the mutation did not apply; the anchor moved"}
+        return mutated
+
+    for old, new in (
+        ('"model": model.model,', '"model": model.gateway_url,'),
+        ('"model": model.model,', '"model": model.to_json(),'),
+        ('"effort": model.reasoning.effort,', '"timeout_s": model.timeout_s,'),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_the_projection_reflects_over_nothing(_mutant(old, new))
+
+
+def test_the_replay_key_is_taken_after_normalization() -> None:
+    """Order, not content: the key covers the normalized request, so normalization is key material.
+
+    Nothing else in this file would notice if that order flipped -- every test here builds its own
+    payload from an already-normalized request. A change to `normalize_model_request` silently
+    rekeys every recorded call, and this is the only place that says so.
+    """
+
+    source = inspect.getsource(ModelCallRunner.acall)
+    normalized_at = source.index("request = normalize_model_request(request)")
+    keyed_at = source.index("_request_payload(")
+
+    assert normalized_at < keyed_at, "the key must cover the request the adapter is handed"
