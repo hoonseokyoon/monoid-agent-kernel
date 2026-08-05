@@ -397,12 +397,43 @@ class OpenAIModelAdapter:
                 # a runner, and it says nothing when there is nothing to say.
                 if retried:
                     report_provider_retried()
-                response = raw.parse()
-                data = (
-                    response.model_dump()
-                    if hasattr(response, "model_dump")
-                    else _coerce_response(response)
-                )
+                # The BODY READ, in its own narrow guard. It is the third of this adapter's
+                # three body-read sites and the only one whose raw failures were still
+                # anonymous: :func:`_parse_response` and :func:`_terminal_chunk` each mint
+                # ``openai_bad_response`` for a raw failure of the same kind, and the
+                # ``_coerce_response`` on the very next line answers that code too -- while a
+                # truncated or undecodable 200 escaped to the outer arm as
+                # ``unclassified_provider_error``, which names no class of failure and offers
+                # no remedy. Enumerated rather than assumed: ``LegacyAPIResponse.parse`` reads
+                # ``response.json()`` on a JSON content type (a ``json.JSONDecodeError``, i.e.
+                # a ``ValueError``, on an incomplete body), validates the model
+                # (``APIResponseValidationError``, whose 200 status the classifier cannot use),
+                # and touches ``response.text`` (``httpx.ResponseNotRead``) -- every one of
+                # them a statement that the BODY could not be read.
+                try:
+                    response = raw.parse()
+                    data = (
+                        response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else _coerce_response(response)
+                    )
+                except ModelAdapterError:
+                    # ``_coerce_response`` keeps its own voice; the outer completion arm
+                    # backfills the code and the cost onto it exactly as before.
+                    raise
+                except Exception as unreadable:
+                    if _connection_error_code(unreadable) is not None:
+                        # "Unreadable" and "unreachable" are different answers with different
+                        # remedies -- a payload defect is terminal, a dropped connection is
+                        # retryable -- so the connection family goes back to the classifier
+                        # rather than being renamed here.
+                        raise
+                    raise ModelAdapterError(
+                        f"OpenAI returned an unreadable response body: {unreadable}",
+                        provider_error_code="openai_bad_response",
+                        retryable=False,
+                        provider_retried=retried,
+                    ) from unreadable
             finally:
                 if call_owned:
                     client.close()
@@ -459,6 +490,11 @@ class OpenAIModelAdapter:
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}
+        # Whether a terminal response was CAPTURED, asked as a fact about the stream rather than
+        # about the contents of ``final_data``: a terminal payload that happens to be empty is
+        # still a stream that ended properly, and the two questions must not be conflated. The
+        # gateway's streamed twin spells its own version of this ``saw_terminal``.
+        saw_terminal_response = False
         # Bound before the request for the reason ``stream`` is: the terminal chunk below is
         # built outside the classified block, and it must read a defined name however early the
         # block exited. False until the stream commits, which is exactly true of a call that
@@ -586,6 +622,27 @@ class OpenAIModelAdapter:
                                 if hasattr(response, "model_dump")
                                 else _coerce_response(response)
                             )
+                            saw_terminal_response = True
+
+                # A body that simply STOPS is not a settled turn. Without this, a stream that
+                # ended by clean EOF with no ``response.completed``/``response.incomplete`` left
+                # ``final_data`` empty and the terminal chunk built below synthesized
+                # ``stop_reason="stop"`` with zero usage -- so half an answer ("The answer is 42
+                # and the reason") reached the loop as a complete one, settled, and metered as a
+                # free call. The one-shot twin already refuses exactly this: a truncated 200
+                # fails its body read and is classified. Inside the ``try`` deliberately, so the
+                # completion arm below owns the code and the retry the way it owns every other
+                # refusal on this path; no usage stamp, because a stream that never reported a
+                # cost has none to read. A consumer that ABANDONS the stream throws
+                # ``GeneratorExit`` at a yield above and never arrives here, which is right --
+                # that call has an outcome of its own.
+                if not saw_terminal_response:
+                    raise ModelAdapterError(
+                        "OpenAI stream ended without a terminal response",
+                        provider_error_code="openai_bad_response",
+                        retryable=False,
+                        provider_retried=provider_retried,
+                    )
             finally:
                 # The response is released per call, whether or not this call owns the client.
                 # Leaving an `async for` does not close the iterator it drove, and closing the

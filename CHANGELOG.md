@@ -7,6 +7,30 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — a truncated stream refuses instead of settling, and the body-read phase speaks the one code
+
+- **An OpenAI stream that ends without `response.completed`/`response.incomplete` is refused,
+  not settled.** A body that stopped by clean EOF left `final_data` empty and the terminal chunk
+  built after the drain synthesized `stop_reason="stop"` with zero usage — so half an answer
+  reached the loop as a complete one, settled, and metered as a free call. The one-shot twin
+  already refuses exactly this condition: a truncated 200 fails its body read and is classified.
+  Now both do, as a non-retryable `openai_bad_response` carrying the call's `provider_retried`
+  and no invented cost. Asked as a fact about the *stream* (a terminal response was captured)
+  rather than about the contents of the payload, so an empty terminal body is still a stream
+  that ended properly. A consumer that abandons the stream mid-flight is unaffected — its
+  `GeneratorExit` never reaches the check, and that call has an outcome of its own.
+- **The body-read phase answers `openai_bad_response` like the adapter's other two.** `raw.parse()`
+  plus the model dump/coerce is the third body-read site, and the only one whose raw failures
+  still escaped as `unclassified_provider_error` — while `_parse_response` and `_terminal_chunk`
+  both mint `openai_bad_response` for the same kind of failure, and the `_coerce_response` on
+  the very next line already answered it. Enumerated rather than assumed: `LegacyAPIResponse.parse`
+  reads `response.json()` on a JSON content type (a `json.JSONDecodeError` on an incomplete
+  body), validates the model (`APIResponseValidationError`, whose 200 status the classifier
+  cannot use), and touches `response.text` (`httpx.ResponseNotRead`) — every one of them a
+  statement that the body could not be read. The narrow guard routes the connection family back
+  to the classifier first, because "unreadable" and "unreachable" are different answers with
+  different remedies: a payload defect is terminal, a dropped connection is retryable.
+
 ### Fixed — the retry fact rides every lane that learned it
 
 - **The frameless-stream checks read the retry the wire reported.** The gateway server stamps

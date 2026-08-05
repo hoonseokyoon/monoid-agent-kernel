@@ -8,6 +8,7 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 from __future__ import annotations
 
 import asyncio
+import json
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -1391,3 +1392,134 @@ def test_an_unretried_call_reports_nothing_on_either_path(
     with collect_retry_reports() as stream_progress:
         _drain(_adapter())
     assert stream_progress.retried is False
+
+
+# --- a stream that simply stops is not a settled turn -------------------------------------
+#
+# The one-shot path REFUSES a truncated body: an undecodable 200 fails the body read and is
+# classified. The stream had no such rule -- a body that ends by clean EOF without
+# ``response.completed``/``response.incomplete`` leaves ``final_data`` empty, and the terminal
+# chunk built after the drain synthesized ``stop_reason="stop"`` with zero usage. So half an
+# answer was presented to the loop as a complete one, settled, and recorded as a free call.
+
+
+def test_a_stream_that_ends_without_a_terminal_response_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two deltas and then the body stops: the sync twin refuses this, and now so does this."""
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            [
+                SimpleNamespace(type="response.output_text.delta", delta="The answer is 42 "),
+                SimpleNamespace(type="response.output_text.delta", delta="and the reason"),
+            ],
+            response=SimpleNamespace(request=_RequestWithRetryCount("2")),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as truncated:
+        _drain(_adapter())
+
+    assert truncated.value.provider_error_code == "openai_bad_response"
+    assert truncated.value.retryable is False
+    assert truncated.value.provider_retried is True
+
+
+def test_a_stream_that_reaches_its_terminal_response_settles_as_it_always_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight, on both terminal spellings: a healthy stream is untouched."""
+
+    for terminal in ("response.completed", "response.incomplete"):
+        _stub_async_openai(
+            monkeypatch,
+            _FakeAsyncStream(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="ok"),
+                    SimpleNamespace(
+                        type=terminal,
+                        response=SimpleNamespace(model_dump=lambda: _billed_response_body()),
+                    ),
+                ]
+            ),
+        )
+        chunks = _drain(_adapter())
+        assert [type(chunk) for chunk in chunks] == [TextDelta, TurnComplete]
+        assert chunks[-1].usage == _BILLED_RESPONSE_USAGE
+
+
+# --- the body-read phase speaks the adapter's one payload-defect code ---------------------
+
+
+class _FakeRawUndecodableTurn:
+    """A raw wrapper whose ``parse()`` fails the way a truncated 200 body fails.
+
+    ``LegacyAPIResponse.parse`` calls ``response.json()`` on a JSON content type, so an
+    incomplete body raises ``json.JSONDecodeError`` -- a ``ValueError`` -- out of the body read.
+    """
+
+    def __init__(self, http_response: object) -> None:
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        raise json.JSONDecodeError("Unterminated string", '{"id": "resp_1", "outp', 22)
+
+
+def test_an_undecodable_body_is_refused_in_the_adapters_own_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 1-of-3 body-read site whose raw failures were still anonymous.
+
+    ``_parse_response`` and ``_terminal_chunk`` both mint ``openai_bad_response`` for a raw
+    body-read failure, and the very next line's ``_coerce_response`` refusal answers the same
+    code -- while a truncated or undecodable 200 answered ``unclassified_provider_error``, which
+    names no class of failure at all and carries no remedy.
+    """
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawUndecodableTurn(SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+
+
+class _FakeRawDroppedTurn:
+    """A raw wrapper whose ``parse()`` touches the network and finds it gone."""
+
+    def __init__(self, http_response: object, error: Exception) -> None:
+        self.http_response = http_response
+        self._error = error
+
+    def parse(self) -> object:
+        raise self._error
+
+
+def test_a_connection_failure_while_reading_the_body_keeps_its_network_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight the split needs: "unreadable" and "unreachable" are different answers.
+
+    A payload defect is terminal and the caller's provider is broken; a dropped connection is
+    retryable and waiting is the remedy. The narrow guard routes the connection family back to
+    the classifier rather than renaming it.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawDroppedTurn(
+            SimpleNamespace(request=_RequestWithRetryCount("0")),
+            httpx.ReadTimeout("the body stopped arriving"),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert dropped.value.provider_error_code == "openai_timeout"
+    assert dropped.value.retryable is True
