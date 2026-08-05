@@ -9,7 +9,7 @@ path, and the reference gateway server echo. If one survives, the binding is bro
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -24,7 +24,9 @@ from monoid_agent_kernel.providers.base import (
     ModelTurn,
     TurnComplete,
     generation_support,
+    mark_provider_usage,
     provider_usage_of,
+    reasoning_support,
     structured_output_support,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
@@ -42,11 +44,15 @@ from monoid_agent_kernel.reference.llm_gateway.service import (
     LlmGatewayBackend,
     LlmGatewayTurnRequest,
     _applied_echoes,
+    _parse_turn_request,
     _upstream_model_config,
 )
 
 _SET = GenerationConfig(temperature=0.2, top_p=0.9, max_output_tokens=256)
 _SET_WIRE = {"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 256}
+
+_REASONING_SET = ReasoningConfig(effort="high", summary="auto")
+_REASONING_SET_WIRE = {"effort": "high", "summary": "auto"}
 
 
 def _request(config: ModelConfig) -> ModelRequest:
@@ -325,6 +331,7 @@ def _recording_backend(
         class Adapter:
             if upstream_applies:
                 generation_support = "native"
+                reasoning_support = "native"
 
             def next_turn(self, request):
                 return ModelTurn(
@@ -391,6 +398,181 @@ def test_gateway_service_stream_terminal_frame_echoes_too() -> None:
     assert "generation_applied" not in plain[-1]
 
 
+# --- B1: the reasoning echo --------------------------------------------------------------
+
+
+def test_gateway_service_echoes_reasoning_applied_per_upstream_support() -> None:
+    backend, manager, _ = _recording_backend()
+    result = backend.handle_turn(
+        _llm_token(manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+    )
+    assert result["reasoning_applied"] == _REASONING_SET_WIRE
+
+    # An upstream that does not declare produces no proof, and absence is the refusal signal.
+    silent, silent_manager, _ = _recording_backend(upstream_applies=False)
+    unproven = silent.handle_turn(
+        _llm_token(silent_manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+    )
+    assert "reasoning_applied" not in unproven
+
+    # A default-reasoning request demands no proof: pre-B1 traffic keeps its wire shape.
+    assert "reasoning_applied" not in backend.handle_turn(_llm_token(manager), _turn_payload())
+
+
+def test_gateway_service_stream_terminal_frame_echoes_reasoning_applied_too() -> None:
+    backend, manager, _ = _recording_backend()
+    frames = list(
+        backend.handle_turn_stream(
+            _llm_token(manager), _turn_payload(reasoning=dict(_REASONING_SET_WIRE))
+        )
+    )
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert terminal["reasoning_applied"] == _REASONING_SET_WIRE
+
+    plain = list(backend.handle_turn_stream(_llm_token(manager), _turn_payload()))
+    assert "reasoning_applied" not in plain[-1]
+
+
+def test_the_default_effort_sentinel_still_demands_proof() -> None:
+    """``effort="default"`` projects an EMPTY forwarded block — but it is a configured value,
+    so the empty block is exactly what must come back. This is the value-drift catcher: a hop
+    that rebuilt ``"medium"`` out of an omitted effort forwards ``{"effort": "medium"}``, and
+    a boolean echo could never see the difference."""
+
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    backend, manager, _ = _recording_backend()
+    result = backend.handle_turn(
+        _llm_token(manager), _turn_payload(reasoning={"effort": "default"})
+    )
+    assert result["reasoning_applied"] == {}
+
+    # The client half of the same corner: {} is proven only by {}, never by absence.
+    _check_reasoning_applied({}, "fail", {})
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_reasoning_applied({}, "fail", None)
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    with pytest.raises(ModelAdapterError):
+        _check_reasoning_applied({}, "fail", {"effort": "medium"})
+
+
+def test_check_reasoning_applied_matrix() -> None:
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    # Unconfigured (None): nothing to prove, whatever the wire says.
+    _check_reasoning_applied(None, "fail", None)
+    _check_reasoning_applied(None, "fail", dict(_REASONING_SET_WIRE))
+
+    # Proven: the echoed block is the forwarded block, key for key.
+    _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", dict(_REASONING_SET_WIRE))
+
+    # Absent under "fail" is the older-gateway case: refused, and recoverably so.
+    with pytest.raises(ModelAdapterError) as rejected:
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", None)
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert rejected.value.retryable is False
+    assert rejected.value.config_recoverable is True
+
+    # A mismatching echo is not proof either.
+    with pytest.raises(ModelAdapterError):
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", {"effort": "medium"})
+
+    # "omit" is the documented way to accept a best-effort transport.
+    _check_reasoning_applied(dict(_REASONING_SET_WIRE), "omit", None)
+
+    # Wire shape is not a policy question: malformed refuses before any policy branch.
+    with pytest.raises(ModelAdapterError) as bad:
+        _check_reasoning_applied(None, "omit", [1, 2])
+    assert bad.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
+def test_next_turn_rejects_a_server_that_never_echoes_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reasoning twin of the old-server simulation, governed by reasoning's OWN knob."""
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    monkeypatch.setattr(
+        gateway_module, "urlopen", lambda *_a, **_k: _FakeHttpResponse(_served_turn())
+    )
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = GatewayModelAdapter(config=config)
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        adapter.next_turn(_request(config))
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    # The refusal happens after a complete, billed answer: it carries the turn's usage.
+    assert provider_usage_of(rejected.value) == {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    omit = ModelConfig(
+        reasoning=ReasoningConfig(effort="high", summary="auto", on_unsupported="omit"),
+        gateway_url="http://gateway.test",
+    )
+    assert GatewayModelAdapter(config=omit).next_turn(_request(omit)).final_text == "ok"
+
+    monkeypatch.setattr(
+        gateway_module,
+        "urlopen",
+        lambda *_a, **_k: _FakeHttpResponse(
+            _served_turn({"reasoning_applied": dict(_REASONING_SET_WIRE)})
+        ),
+    )
+    assert GatewayModelAdapter(config=config).next_turn(_request(config)).final_text == "ok"
+
+
+def test_turn_complete_frame_carries_and_validates_the_reasoning_echo() -> None:
+    frame = {
+        "type": "turn_complete",
+        "turn_handle": "turn_1",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "stop_reason": "stop",
+        "reasoning_applied": dict(_REASONING_SET_WIRE),
+    }
+    chunk = _chunk_from_event(frame)
+    assert isinstance(chunk, TurnComplete)
+    assert chunk.reasoning_applied == _REASONING_SET_WIRE
+
+    without = _chunk_from_event({**frame, "reasoning_applied": None})
+    assert isinstance(without, TurnComplete)
+    assert without.reasoning_applied is None
+
+    with pytest.raises(ModelAdapterError) as bad:
+        _chunk_from_event({**frame, "reasoning_applied": [1, 2]})
+    assert bad.value.provider_error_code == GATEWAY_BAD_RESPONSE
+
+
+def test_a_stream_without_a_terminal_frame_refuses_unproven_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = _terminal_frameless_adapter(monkeypatch, config)
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+
+    tolerant = ModelConfig(
+        reasoning=ReasoningConfig(effort="high", on_unsupported="omit"),
+        gateway_url="http://gateway.test",
+    )
+    chunks = _drain(_terminal_frameless_adapter(monkeypatch, tolerant), _request(tolerant))
+    assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
+
+
 def test_generation_support_probe_is_opt_in_and_fail_closed() -> None:
     assert generation_support(OpenAIModelAdapter(ModelConfig())) == "native"
     assert generation_support(GatewayModelAdapter(config=ModelConfig())) == "native"
@@ -436,13 +618,198 @@ def test_a_forwarding_adapter_claims_only_while_it_is_enforcing() -> None:
     )
 
 
+def test_reasoning_support_probe_is_opt_in_and_fail_closed() -> None:
+    assert reasoning_support(OpenAIModelAdapter(ModelConfig())) == "native"
+    assert reasoning_support(GatewayModelAdapter(config=ModelConfig())) == "native"
+    assert reasoning_support(FakeModelAdapter()) == "none"
+
+    class Vague:
+        reasoning_support = True
+
+    assert reasoning_support(Vague()) == "none"
+
+    class Hostile:
+        @property
+        def reasoning_support(self) -> str:
+            raise RuntimeError("boom")
+
+    # A declaration that raises is not a declaration; it must not take the call down either.
+    assert reasoning_support(Hostile()) == "none"
+
+
+def test_a_forwarding_adapter_reasoning_claim_follows_its_own_knob() -> None:
+    """The reasoning claim reads ``reasoning.on_unsupported``, not generation's.
+
+    One knob per feature family: the generation/schema pair deliberately shares
+    ``generation.on_unsupported``, but reasoning has its own fail/omit field -- already carried
+    on the request wire -- and a claim answered off a *different* family's policy would mint
+    proof for a call whose own policy said best-effort. The split configs below are the pin:
+    each claim follows its family's knob and ignores the other's.
+    """
+
+    reasoning_only = GatewayModelAdapter(
+        config=ModelConfig(
+            generation=GenerationConfig(on_unsupported="omit"),
+            reasoning=ReasoningConfig(on_unsupported="fail"),
+        )
+    )
+    assert reasoning_support(reasoning_only) == "native"
+    assert generation_support(reasoning_only) == "none"
+    assert structured_output_support(reasoning_only) == "none"
+
+    generation_only = GatewayModelAdapter(
+        config=ModelConfig(
+            generation=GenerationConfig(on_unsupported="fail"),
+            reasoning=ReasoningConfig(on_unsupported="omit"),
+        )
+    )
+    assert reasoning_support(generation_only) == "none"
+    assert generation_support(generation_only) == "native"
+    assert structured_output_support(generation_only) == "native"
+
+    # The per-call config wins over the standing one, same as the generation twin.
+    per_call = ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit"))
+    assert reasoning_support(reasoning_only, per_call) == "none"
+    assert reasoning_support(generation_only, ModelConfig()) == "native"
+
+    # OpenAI applies the reasoning block itself, so its claim is unconditional.
+    assert (
+        reasoning_support(
+            OpenAIModelAdapter(ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit")))
+        )
+        == "native"
+    )
+
+
+def test_reasoning_config_knows_when_it_is_default() -> None:
+    """The gate the echo rides on: a default block demands no proof, anything set does.
+
+    Unlike generation, the default reasoning config projects a NON-empty provider payload
+    (``{"effort": "medium"}``), so payload truthiness cannot mean "the caller configured
+    reasoning" -- dataclass equality is the only honest sentinel.
+    """
+
+    assert ReasoningConfig().is_default is True
+    assert ReasoningConfig(effort="default").is_default is False
+    assert ReasoningConfig(summary="auto").is_default is False
+    assert ReasoningConfig(on_unsupported="omit").is_default is False
+    # ...and the trap this property exists to avoid: the default still projects a payload.
+    from monoid_agent_kernel.providers._common import build_reasoning_payload
+
+    assert build_reasoning_payload(ReasoningConfig()) == {"effort": "medium"}
+
+
+@dataclass(frozen=True)
+class _TenantReasoningConfig(ReasoningConfig):
+    """An extension subclass: every kernel field at its default, one field of its own.
+
+    The kernel supports these deliberately -- every validator gates on ``isinstance`` and
+    ``providers/base._copy_with_fields`` exists so normalization does not call an extension's
+    narrower constructor -- so the gate must answer about the config, not about its class.
+    """
+
+    tenant_profile: str = "balanced"
+
+
+@dataclass(frozen=True)
+class _TenantGenerationConfig(GenerationConfig):
+    """The generation twin of the probe above."""
+
+    tenant_profile: str = "balanced"
+
+
+def test_a_config_subclass_at_the_kernel_defaults_is_default() -> None:
+    """``is_default`` asks about the fields on the wire, not about the class holding them.
+
+    Generated dataclass ``__eq__`` is class-exact, so ``self == ReasoningConfig()`` was False
+    for a subclass with every kernel field at its default -- and the fields it added are
+    invisible to ``build_reasoning_payload``, so the WIRE it produces is byte-identical to the
+    plain config's. The client then computed ``is_default=False`` and demanded proof of
+    ``{"effort": "medium"}`` while the server, which only ever sees that wire, rebuilt a plain
+    config, computed ``is_default=True`` and emitted no echo. Every turn refused, and nothing
+    server-side could fix it.
+    """
+
+    from monoid_agent_kernel.providers._common import build_reasoning_payload
+
+    assert _TenantReasoningConfig().is_default is True, {
+        "hint": "class-exact equality: a config identical on every field the wire carries",
+    }
+    assert build_reasoning_payload(_TenantReasoningConfig()) == build_reasoning_payload(
+        ReasoningConfig()
+    )
+    # An extension field is not a kernel setting: changing it cannot make a config configured,
+    # because nothing downstream of the gate can see it.
+    assert _TenantReasoningConfig(tenant_profile="thorough").is_default is True
+
+    # ...and no loosening: a kernel field that IS set stays non-default on the subclass too.
+    assert _TenantReasoningConfig(effort="low").is_default is False
+    assert _TenantReasoningConfig(summary="auto").is_default is False
+    assert _TenantReasoningConfig(on_unsupported="omit").is_default is False
+
+
+def test_a_generation_config_subclass_keeps_the_config_hash_it_had() -> None:
+    """The generation twin, whose consumer is the ``to_json`` gate rather than an echo.
+
+    ``ModelConfig.to_json`` emits the ``generation`` key only when the block is not default, and
+    that dict feeds the request digest, the runtime-config semantic hash durable recovery
+    compares across restarts, and the gateway wire. Class-exact equality made an
+    all-defaults subclass emit the key -- so an extension changed the config hash while
+    changing nothing the hash is about.
+    """
+
+    assert _TenantGenerationConfig().is_default is True
+    assert "generation" not in ModelConfig(generation=_TenantGenerationConfig()).to_json()
+    assert ModelConfig(generation=_TenantGenerationConfig()).to_json() == ModelConfig().to_json()
+
+    assert _TenantGenerationConfig(temperature=0.2).is_default is False
+    assert "generation" in ModelConfig(generation=_TenantGenerationConfig(temperature=0.2)).to_json()
+
+
+def test_a_reasoning_config_subclass_is_not_refused_across_a_real_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The end-to-end shape of the defect: the two sides answered the gate differently.
+
+    Both halves are the real ones. The server's echo comes from ``_applied_echoes`` reading the
+    config it rebuilt from the WIRE -- which is where the subclass is lost, and where its
+    ``is_default`` verdict is therefore taken about a plain config. The client's refusal comes
+    from ``GatewayModelAdapter.next_turn``'s own enforcement site, holding the subclass. A
+    declaring upstream makes this a turn that SHOULD pass.
+    """
+
+    import monoid_agent_kernel.providers.gateway as gateway_module
+
+    client_config = ModelConfig(
+        reasoning=_TenantReasoningConfig(), gateway_url="http://gateway.test"
+    )
+    # The wire the client sends, read back the way the server's codec reads it.
+    wire = GatewayModelAdapter(config=client_config)._payload(_request(client_config))
+    served = _parse_turn_request(_turn_payload(reasoning=wire["reasoning"]))
+    assert type(served.reasoning) is ReasoningConfig, {
+        "hint": "the subclass cannot survive the wire -- that is the whole point of the split",
+    }
+    echoes = _applied_echoes(
+        served, OpenAIModelAdapter(ModelConfig()), _upstream_model_config(served)
+    )
+
+    monkeypatch.setattr(
+        gateway_module, "urlopen", lambda *_a, **_k: _FakeHttpResponse(_served_turn(echoes))
+    )
+    turn = GatewayModelAdapter(config=client_config).next_turn(_request(client_config))
+    assert turn.final_text == "ok", {
+        "server_echoes": echoes,
+        "hint": "client and server must answer is_default the same way about one config",
+    }
+
+
 def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None:
     request = LlmGatewayTurnRequest(
         protocol="monoid.llm-turn.v1",
         model="gpt-5.5",
         system_prompt="sys",
         tools=(),
-        reasoning=ReasoningConfig(),
+        reasoning=ReasoningConfig(effort="high", on_unsupported="omit"),
         generation=GenerationConfig(temperature=0.2, on_unsupported="omit"),
         output_schema={"type": "object"},
     )
@@ -452,9 +819,12 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     echoes = _applied_echoes(request, upstream, _upstream_model_config(request))
     assert "generation_applied" not in echoes
     assert echoes["schema_applied"] is False
+    # The reasoning twin: the inner hop admitted it was not proving, so no fresh echo.
+    assert "reasoning_applied" not in echoes
 
     proving_request = replace(
         request,
+        reasoning=_REASONING_SET,
         generation=GenerationConfig(temperature=0.2),
         output_schema={"type": "object"},
     )
@@ -466,6 +836,7 @@ def test_a_chained_gateway_does_not_mint_proof_the_inner_hop_never_had() -> None
     )
     assert proven["generation_applied"] == {"temperature": 0.2}
     assert proven["schema_applied"] is True
+    assert proven["reasoning_applied"] == _REASONING_SET_WIRE
 
 
 def test_gateway_service_never_asserts_application_from_the_request() -> None:
@@ -475,16 +846,29 @@ def test_gateway_service_never_asserts_application_from_the_request() -> None:
     sampling parameters no model ever saw."""
 
     backend, manager, _ = _recording_backend(upstream_applies=False)
-    payload = _turn_payload(generation=dict(_SET_WIRE))
+    payload = _turn_payload(
+        generation=dict(_SET_WIRE), reasoning=dict(_REASONING_SET_WIRE)
+    )
 
     assert "generation_applied" not in backend.handle_turn(_llm_token(manager), payload)
     frames = list(backend.handle_turn_stream(_llm_token(manager), payload))
     assert "generation_applied" not in frames[-1]
+    assert "reasoning_applied" not in backend.handle_turn(_llm_token(manager), payload)
+    assert "reasoning_applied" not in frames[-1]
 
     # ...and the client refuses that turn under the default policy, on both transports.
     with pytest.raises(ModelAdapterError) as rejected:
         _check_generation_applied(_SET_WIRE, "fail", None)
     assert rejected.value.provider_error_code == GATEWAY_GENERATION_NOT_APPLIED
+
+    from monoid_agent_kernel.providers.gateway import (
+        GATEWAY_REASONING_NOT_APPLIED,
+        _check_reasoning_applied,
+    )
+
+    with pytest.raises(ModelAdapterError) as unproven_reasoning:
+        _check_reasoning_applied(dict(_REASONING_SET_WIRE), "fail", None)
+    assert unproven_reasoning.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
 
 
 @pytest.mark.parametrize("policy", ("fail", "omit"))
@@ -681,6 +1065,44 @@ def test_a_stream_without_a_terminal_frame_still_streams_plain_traffic(
     adapter = _terminal_frameless_adapter(monkeypatch, config)
     chunks = _drain(adapter, _request(config))
     assert any(getattr(chunk, "text", "") == "unproven answer" for chunk in chunks)
+
+
+def test_a_frameless_refusal_carries_the_retry_its_own_deltas_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry fact rides every frame precisely so a frameless stream can still report it.
+
+    The framed check reads ``chunk.provider_retried`` — the wire's fact combined with this
+    client's own attempt count — while the frameless one read ``attempt > 1`` alone, so a
+    server-side retry on a stream that never reaches its terminal frame was recorded as a clean
+    single attempt on the one carrier left. The server stamps every frame for exactly this
+    shape, and the drain was throwing it away.
+    """
+
+    from monoid_agent_kernel.providers.gateway import GATEWAY_REASONING_NOT_APPLIED
+
+    config = ModelConfig(reasoning=_REASONING_SET, gateway_url="http://gateway.test")
+    adapter = _sse_adapter(
+        monkeypatch,
+        config,
+        ['data: {"type":"text_delta","text":"unproven answer","provider_retried":true}', ""],
+    )
+
+    with pytest.raises(ModelAdapterError) as rejected:
+        _drain(adapter, _request(config))
+
+    assert rejected.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert rejected.value.provider_retried is True, {
+        "hint": "the wire said the gateway's own backend retried; the frameless branch "
+        "answered from the client's attempt count alone",
+    }
+
+    # The counterweight: a wire that claims nothing is answered honestly, on the same shape.
+    silent = _terminal_frameless_adapter(monkeypatch, config)
+    with pytest.raises(ModelAdapterError) as quiet:
+        _drain(silent, _request(config))
+    assert quiet.value.provider_error_code == GATEWAY_REASONING_NOT_APPLIED
+    assert quiet.value.provider_retried is False
 
 
 # --- the proof question is per call, not per adapter ------------------------------------
@@ -1173,6 +1595,7 @@ _TERMINAL_FRAME_REFUSALS: dict[str, dict] = {
     "stop_reason": {"stop_reason": 7},
     "turn_handle": {"turn_handle": 7},
     "generation_applied": {"generation_applied": [1, 2]},
+    "reasoning_applied": {"reasoning_applied": [1, 2]},
     "provider_retried": {"provider_retried": "yes"},
 }
 
@@ -1489,6 +1912,17 @@ def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_met
     with pytest.raises(ModelAdapterError) as refused:
         backend.handle_turn(_llm_token(manager), _turn_payload())
     assert provider_usage_of(refused.value) == _BILLED
+    # And it names ITS OWN failure on the way out. This shape is minted bare deep in the
+    # mapping, so the handler's ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` fallback
+    # told the client the HOP's wire was malformed for an UPSTREAM payload defect -- while the
+    # duck-typed terminal reader answered ``openai_bad_response`` for a byte-identical body.
+    # One class of defect, one code, whichever of the OPENAI ADAPTER's OWN readers read it.
+    # Scoped there deliberately, and not to every transport: ``providers/base.py`` is
+    # provider-neutral by design, so the streamed tool-args refusal it raises keeps
+    # ``stream_bad_tool_args`` rather than backfilling to this adapter's code. That asymmetry
+    # is a decision, not a gap -- see the note at those raise sites.
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert _model_error_status(refused.value) == HTTPStatus.BAD_GATEWAY
 
     envelope = _error_body(
         _model_error_status(refused.value),
@@ -1505,19 +1939,21 @@ def test_a_body_the_openai_reader_refuses_still_reaches_the_envelope_and_the_met
 
 # --- and the refusals that are not ``ModelAdapterError`` at all ---------------------------
 #
-# The source reader's seam catches ``Exception`` because the mapping refuses in more than one
-# type: ``normalize_usage`` says "malformed usage" with a raw ``ValueError``. So does every
-# refusal in the streamed twin's terminal region. The stamp rode those exceptions from the day
-# it shipped -- and NO consumer on the gateway route would read it, because the tenant meter and
-# both error writers were gated on ``ModelAdapterError``. A stamp nothing reads is not a fix.
+# The shipped OpenAI reader classifies every refusal in its stamped regions now, but the meter
+# and both error writers deliberately stay type-agnostic: a THIRD-PARTY adapter behind this
+# gateway can still refuse its own provider's billed body in whatever type it likes, and a
+# consumer gated back down to ``ModelAdapterError`` would silently stop reading those stamps --
+# the exact regression the widened readers exist to prevent. The raw probes below therefore
+# drive a hand-stamped raw exception; the shipped reader's shapes get their own classified
+# probes beside them.
 
 
 def _billed_body_with_unreadable_usage_details() -> dict:
     """A billed Responses body whose ``usage`` detail block is malformed.
 
-    The one shape in the source reader's region that refuses with a raw ``ValueError``: the
-    counts themselves are perfectly readable (the lenient reader takes them), and it is the
-    nested ``input_tokens_details`` object that ``normalize_usage`` rejects.
+    The shape whose refusal was born raw (``normalize_usage``'s ``ValueError`` on the nested
+    detail block): the counts themselves are perfectly readable (the lenient reader takes
+    them). The classifying seam now hands it out as ``openai_bad_response``.
     """
 
     return {
@@ -1531,7 +1967,7 @@ def _billed_body_with_unreadable_usage_details() -> dict:
 def _refusing_upstream_backend() -> tuple[LlmGatewayBackend, TokenManager]:
     from monoid_agent_kernel.providers.openai import _parse_response
 
-    class _RawRefusal:
+    class _ClassifiedRefusal:
         def next_turn(self, request: ModelRequest) -> ModelTurn:
             del request
             return _parse_response(_billed_body_with_unreadable_usage_details())
@@ -1540,14 +1976,36 @@ def _refusing_upstream_backend() -> tuple[LlmGatewayBackend, TokenManager]:
     return (
         LlmGatewayBackend(
             token_manager=manager,
-            provider_adapter_factory=lambda _claims, _config: _RawRefusal(),
+            provider_adapter_factory=lambda _claims, _config: _ClassifiedRefusal(),
+        ),
+        manager,
+    )
+
+
+def _hand_stamped_raw_backend() -> tuple[LlmGatewayBackend, TokenManager]:
+    """An upstream that refuses RAW with a stamped cost -- the third-party-adapter shape."""
+
+    class _RawThirdPartyRefusal:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            raw = ValueError("third-party adapter refused its provider's billed body")
+            mark_provider_usage(raw, dict(_BILLED))
+            raise raw
+
+    manager = _token_manager()
+    return (
+        LlmGatewayBackend(
+            token_manager=manager,
+            provider_adapter_factory=lambda _claims, _config: _RawThirdPartyRefusal(),
         ),
         manager,
     )
 
 
 def test_a_raw_refusal_off_a_billed_body_still_charges_the_tenant() -> None:
-    backend, manager = _refusing_upstream_backend()
+    """The failure meter reads the stamp off whatever escaped, not off one type."""
+
+    backend, manager = _hand_stamped_raw_backend()
 
     with pytest.raises(ValueError) as refused:
         backend.handle_turn(_llm_token(manager), _turn_payload())
@@ -1562,12 +2020,33 @@ def test_a_raw_refusal_off_a_billed_body_still_charges_the_tenant() -> None:
     }
 
 
-def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
-    """Through the shipped HTTP handler, because the arm it lands in is not the classified one.
+def test_the_openai_readers_refusal_arrives_classified_at_the_gateway() -> None:
+    """The shipped source reader's end of the same chain, now in one classified voice.
 
-    A raw ``ValueError`` is a 400 ``gateway_bad_request`` here, and the client behind it reads
-    ``usage`` off the body it gets -- so an arm that omits the key is a hop that reports zero for
-    a turn the upstream billed, exactly like the classified arm did before it carried one.
+    The same billed body used to escape this hop as a raw ``ValueError``; the seam hands it
+    out as ``openai_bad_response`` with the stamp intact, and the tenant meter still moves.
+    """
+
+    backend, manager = _refusing_upstream_backend()
+
+    with pytest.raises(ModelAdapterError) as refused:
+        backend.handle_turn(_llm_token(manager), _turn_payload())
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert provider_usage_of(refused.value) == _BILLED
+    assert backend.tenant_usage("tenant_a")["total_tokens"] == 460
+
+
+def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
+    """Through the shipped HTTP handler: a classified payload defect is a 502 that still pays.
+
+    Before the classification this landed on the raw ``ValueError`` arm as a 400
+    ``gateway_bad_request`` -- a status that claims the CLIENT's request was bad and reads as
+    config-shaped -- while the raw ``AttributeError`` shapes landed on the 500 arm with
+    ``retryable: true``, inviting a client to re-buy the same tokens. ``openai_bad_response``
+    with no status and no config remedy maps to 502 BAD_GATEWAY, non-retryable, which is what
+    a malformed upstream answer is; the billed ``usage`` rides the envelope either way and the
+    client rebuilds the stamp from it.
     """
 
     from support.http import serving
@@ -1591,12 +2070,49 @@ def test_the_wire_answer_for_that_refusal_carries_the_cost_too() -> None:
             urlopen(request, timeout=10)
         body = json.loads(answered.value.read().decode("utf-8"))
 
-    assert answered.value.code == 400
+    assert answered.value.code == 502
+    assert body["error_code"] == "openai_bad_response"
+    assert body["retryable"] is False
     assert body["usage"] == _BILLED, {
         "wire_body": body,
-        "hint": "the unclassified arms of the error writers carry the stamp like the "
-        "classified one, or the hop loses what the call cost",
+        "hint": "a refused-but-billed turn owes its cost on the wire whatever the arm",
     }
     # And the client rebuilds it: the stamp survives the hop rather than stopping at the wire.
+    rebuilt = _error_from_status_body(502, json.dumps(body))
+    assert provider_usage_of(rebuilt) == _BILLED
+    assert rebuilt.retryable is False
+
+
+def test_the_wire_answer_for_a_raw_third_party_refusal_keeps_its_arm() -> None:
+    """The raw arms did not move: a genuinely-raw upstream still answers 400 with its cost.
+
+    The 400 ``ValueError`` arm and its stamped-usage carriage exist for adapters this repo
+    does not ship; classifying the shipped reader must not have quietly retired them.
+    """
+
+    from support.http import serving
+
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+
+    backend, manager = _hand_stamped_raw_backend()
+    server = create_llm_gateway_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        request = Request(
+            f"{base_url}/internal/llm/turns",
+            data=json.dumps(_turn_payload()).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {_llm_token(manager)}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as answered:
+            urlopen(request, timeout=10)
+        body = json.loads(answered.value.read().decode("utf-8"))
+
+    assert answered.value.code == 400
+    assert body["error_code"] == "gateway_bad_request"
+    assert body["usage"] == _BILLED
     rebuilt = _error_from_status_body(400, json.dumps(body))
     assert provider_usage_of(rebuilt) == _BILLED

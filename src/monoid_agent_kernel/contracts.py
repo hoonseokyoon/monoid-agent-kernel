@@ -152,6 +152,7 @@ from monoid_agent_kernel.validated_call import (
 # are importable from here rather than from a provider module.
 from monoid_agent_kernel.providers.base import (
     generation_support,
+    reasoning_support,
     structured_output_support,
 )
 
@@ -387,6 +388,7 @@ __all__ = [
     "AttemptStarted",
     "structured_output_support",
     "generation_support",
+    "reasoning_support",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

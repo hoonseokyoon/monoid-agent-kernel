@@ -31,8 +31,11 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_error_code,
+    mark_provider_retried,
     mark_provider_usage,
     normalize_model_stream_chunk,
+    report_provider_retried,
 )
 
 
@@ -187,6 +190,9 @@ class OpenAIModelAdapter:
     # Puts ``ModelConfig.generation`` on the Responses API request body, so a transport in
     # front of this adapter may honestly report those parameters as applied.
     generation_support: ClassVar[str] = "native"
+    # Puts ``ModelConfig.reasoning`` on the Responses API request body the same way, so the
+    # same transport may report the reasoning block as applied.
+    reasoning_support: ClassVar[str] = "native"
     # Identifies which provider's reasoning artifacts this adapter produces, so the loop tags
     # the captured reasoning block and replay only happens against a matching model.
     provider_name: ClassVar[str] = "openai"
@@ -344,6 +350,21 @@ class OpenAIModelAdapter:
         # the rule is one rule. The payload build sits inside for the same reason: its
         # ``json.dumps`` of observations and tool arguments is part of this call's failure
         # surface too, and outside the boundary it escaped as a raw ``TypeError``.
+        #
+        # Bound before the request for the reason ``astream_turn``'s twin is: both handlers below
+        # read it, and a ``create()`` that raises never reaches the assignment inside the block --
+        # so an unbound local would replace the provider's failure with a ``NameError``. False
+        # until the exchange commits, which is exactly true of a call that never reached the
+        # provider.
+        retried = False
+        # Bound for the same reason, and they answer the question BOTH handlers below ask: what
+        # did this call already cost. ``response`` is whatever ``parse()`` handed back and
+        # ``data`` the mapping read out of it, so at most one of them is readable at any point
+        # in the block -- and a failure before either assignment must not replace the provider's
+        # failure with a ``NameError``. ``None`` for both is exactly true of a call that never
+        # reached a body, which :func:`usage_reported_by` reads as "nothing reported".
+        response: Any = None
+        data: dict[str, Any] | None = None
         try:
             payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
@@ -365,22 +386,87 @@ class OpenAIModelAdapter:
                 except TypeError:
                     raw = raw_calls.create(**payload)
                 retried = _provider_retried_by_the_sdk(getattr(raw, "http_response", None))
-                response = raw.parse()
-                data = (
-                    response.model_dump()
-                    if hasattr(response, "model_dump")
-                    else _coerce_response(response)
-                )
+                # Reported the moment it is learned, on the channel that crosses abandonment.
+                # Every other carrier of this fact belongs to an OUTCOME -- the turn returned
+                # below, or the exception the handlers mint -- and a run that abandons this
+                # call mid-flight (a deadline landing while the body parses) reads neither: the
+                # receipt is built from the ``RunTimeout``/``RunCancelled`` the race raised,
+                # which this adapter never touched. ``GatewayModelAdapter`` reports at both of
+                # its own retry sites for exactly that reason, so the identical race recorded a
+                # clean single attempt on this adapter and the truth on that one. Inert outside
+                # a runner, and it says nothing when there is nothing to say.
+                if retried:
+                    report_provider_retried()
+                # The BODY READ, in its own narrow guard. It is the third of this adapter's
+                # three body-read sites and the only one whose raw failures were still
+                # anonymous: :func:`_parse_response` and :func:`_terminal_chunk` each mint
+                # ``openai_bad_response`` for a raw failure of the same kind, and the
+                # ``_coerce_response`` on the very next line answers that code too -- while a
+                # truncated or undecodable 200 escaped to the outer arm as
+                # ``unclassified_provider_error``, which names no class of failure and offers
+                # no remedy. Enumerated rather than assumed: ``LegacyAPIResponse.parse`` reads
+                # ``response.json()`` on a JSON content type (a ``json.JSONDecodeError``, i.e.
+                # a ``ValueError``, on an incomplete body), validates the model
+                # (``APIResponseValidationError``, whose 200 status the classifier cannot use),
+                # and touches ``response.text`` (``httpx.ResponseNotRead``) -- every one of
+                # them a statement that the BODY could not be read.
+                try:
+                    response = raw.parse()
+                    data = (
+                        response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else _coerce_response(response)
+                    )
+                except ModelAdapterError:
+                    # ``_coerce_response`` keeps its own voice; the outer completion arm
+                    # backfills the code and the cost onto it exactly as before.
+                    raise
+                except Exception as unreadable:
+                    if _connection_error_code(unreadable) is not None:
+                        # "Unreadable" and "unreachable" are different answers with different
+                        # remedies -- a payload defect is terminal, a dropped connection is
+                        # retryable -- so the connection family goes back to the classifier
+                        # rather than being renamed here.
+                        raise
+                    raise ModelAdapterError(
+                        f"OpenAI returned an unreadable response body: {unreadable}",
+                        provider_error_code="openai_bad_response",
+                        retryable=False,
+                        provider_retried=retried,
+                    ) from unreadable
             finally:
                 if call_owned:
                     client.close()
-        except ModelAdapterError:
+        except ModelAdapterError as refused:
+            # A COMPLETION arm, not a pass-through. The block above refuses in more places than
+            # the stamped region it wraps -- ``_coerce_response`` mints "unsupported OpenAI
+            # response object" bare -- and a bare refusal is resolved one hop out as the HOP's
+            # own ``gateway_bad_response``. Same seam the region uses, so the code and the retry
+            # cannot differ by which line inside this call raised. Backfill-only, so the refusals
+            # that DO name themselves (``_classified_payload``'s ``unserializable_request``, the
+            # by-reference ``unsupported_request_shape``) pass through untouched.
+            _complete_billed_refusal(
+                refused, _readable_payload(data, response), provider_retried=retried
+            )
             raise
         except Exception as exc:
             # Map provider API errors (e.g. a 400 for an unsupported reasoning effort) to a
             # classified ModelAdapterError so the gateway returns the real status (4xx, not a
             # generic 500) and the kernel can treat it as recoverable. Never echo the raw body.
-            raise _model_error_from_openai(exc) from exc
+            # ``retried`` is handed in rather than re-derived: this arm also catches exceptions
+            # the SDK never raised (``raw.parse()``), which carry no exchange for the classifier's
+            # own probe to read.
+            #
+            # And it pays what the turn already cost, exactly like the classified arm above it.
+            # The two arms bracket ONE block: a client ``close()`` that raises inside the inner
+            # ``finally`` runs after a billed body has parsed and *replaces* that call's outcome,
+            # so this arm is reachable with the whole cost in hand -- and minted it empty, which
+            # is a paid turn metered at zero by the receipt, the run's budget and the tenant
+            # ledger behind it. The classification is untouched: a dropped connection is honestly
+            # retryable, and only the lost cost was the defect.
+            failed = _model_error_from_openai(exc, known_provider_retried=retried)
+            mark_provider_usage(failed, usage_reported_by(_readable_payload(data, response)))
+            raise failed from exc
         return _parse_response(data, provider_retried=retried)
 
     async def astream_turn(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
@@ -404,6 +490,11 @@ class OpenAIModelAdapter:
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}
+        # Whether a terminal response was CAPTURED, asked as a fact about the stream rather than
+        # about the contents of ``final_data``: a terminal payload that happens to be empty is
+        # still a stream that ended properly, and the two questions must not be conflated. The
+        # gateway's streamed twin spells its own version of this ``saw_terminal``.
+        saw_terminal_response = False
         # Bound before the request for the reason ``stream`` is: the terminal chunk below is
         # built outside the classified block, and it must read a defined name however early the
         # block exited. False until the stream commits, which is exactly true of a call that
@@ -447,6 +538,13 @@ class OpenAIModelAdapter:
                 # for the hop the probe cannot make itself: a stand-in stream with no
                 # ``response`` truthfully answers "no retry".
                 provider_retried = _provider_retried_by_the_sdk(getattr(stream, "response", None))
+                # The blocking twin's report, at this path's own learn site: a stream abandoned
+                # while it drains yields no terminal chunk and raises no adapter exception, so
+                # the chunk stamp above is not a carrier the run can read either. See
+                # ``next_turn`` for why the channel exists and why the gateway adapter reports
+                # on it.
+                if provider_retried:
+                    report_provider_retried()
 
                 async for event in stream:
                     etype = getattr(event, "type", "")
@@ -507,8 +605,44 @@ class OpenAIModelAdapter:
                         # length/refusal. Without it a truncated/refused stream would report a
                         # normal "stop".
                         response = getattr(event, "response", None)
-                        if response is not None and hasattr(response, "model_dump"):
-                            final_data = response.model_dump()
+                        if response is not None:
+                            # The one-shot reader's terminal read, spelled the same way: a
+                            # pydantic model dumps, a plain mapping is ACCEPTED as-is, and
+                            # anything else is REFUSED (``_coerce_response``). The ``and
+                            # hasattr(...)`` this replaces silently dropped both of the latter
+                            # two -- so a billed streamed turn whose terminal response is a
+                            # mapping reported SUCCESS with zero usage (the run budget, the
+                            # receipt and the tenant ledger all recording a free call, the
+                            # captured reasoning gone), and an unreadable one was not refused at
+                            # all. Not reachable through the shipped SDK, which always hands
+                            # back a model; reachable through every stand-in and wrapper, which
+                            # is precisely the population the sync twin already guards against.
+                            final_data = (
+                                response.model_dump()
+                                if hasattr(response, "model_dump")
+                                else _coerce_response(response)
+                            )
+                            saw_terminal_response = True
+
+                # A body that simply STOPS is not a settled turn. Without this, a stream that
+                # ended by clean EOF with no ``response.completed``/``response.incomplete`` left
+                # ``final_data`` empty and the terminal chunk built below synthesized
+                # ``stop_reason="stop"`` with zero usage -- so half an answer ("The answer is 42
+                # and the reason") reached the loop as a complete one, settled, and metered as a
+                # free call. The one-shot twin already refuses exactly this: a truncated 200
+                # fails its body read and is classified. Inside the ``try`` deliberately, so the
+                # completion arm below owns the code and the retry the way it owns every other
+                # refusal on this path; no usage stamp, because a stream that never reported a
+                # cost has none to read. A consumer that ABANDONS the stream throws
+                # ``GeneratorExit`` at a yield above and never arrives here, which is right --
+                # that call has an outcome of its own.
+                if not saw_terminal_response:
+                    raise ModelAdapterError(
+                        "OpenAI stream ended without a terminal response",
+                        provider_error_code="openai_bad_response",
+                        retryable=False,
+                        provider_retried=provider_retried,
+                    )
             finally:
                 # The response is released per call, whether or not this call owns the client.
                 # Leaving an `async for` does not close the iterator it drove, and closing the
@@ -520,10 +654,33 @@ class OpenAIModelAdapter:
                 await _release_response_stream(stream)
                 if call_owned:
                     await client.close()
-        except ModelAdapterError:
+        except ModelAdapterError as refused:
+            # The streamed twin of ``next_turn``'s completion arm, and the region it covers is
+            # the larger one: every field validator in the event loop above
+            # (``_provider_string``, ``_first_provider_string``) mints bare, one frame at a
+            # time, so a malformed ``response.output_item.added`` was answered 502
+            # ``gateway_bad_response`` over the hop while the byte-identical malformation inside
+            # ``_terminal_chunk`` answered ``openai_bad_response``. ``final_data`` is the cost
+            # source when the terminal frame already arrived -- the reachable billed case, since
+            # a stream can go on emitting frames after ``response.completed`` -- and reads as
+            # nothing when it did not, because mid-stream usage is genuinely unknowable.
+            _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
             raise
         except Exception as exc:
-            raise _model_error_from_openai(exc) from exc
+            # The raw arm of the same ``try``, and it reads the same cost source. A stream can
+            # go on emitting frames after ``response.completed``, so the connection drop this
+            # arm classifies (``_connection_error_code``'s docstring names the lane: the SDK
+            # translates transport failures only up to the response headers, and a drop while
+            # the BODY streams arrives here as a raw ``httpx.ReadError``/``ReadTimeout``/
+            # ``RemoteProtocolError``) is reachable with the terminal payload already captured.
+            # The classified arm two lines above stamps that payload; this one minted its error
+            # empty, so a turn the provider generated and billed was metered at zero everywhere
+            # behind it. Lenient, like every other read of this source: a drop BEFORE the
+            # terminal frame reads as nothing, because mid-stream usage is genuinely unknowable.
+            # Retryability is untouched -- waiting really is the remedy for a dropped socket.
+            dropped = _model_error_from_openai(exc, known_provider_retried=provider_retried)
+            mark_provider_usage(dropped, usage_reported_by(final_data))
+            raise dropped from exc
 
         # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
         # needs nothing from the client, and a consumer that stops at it holds a suspended
@@ -765,10 +922,24 @@ def _connection_error_code(exc: Exception) -> str | None:
     return None
 
 
-def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
+def _model_error_from_openai(
+    exc: Exception, *, known_provider_retried: bool = False
+) -> ModelAdapterError:
     """Classify an OpenAI SDK exception into a ModelAdapterError carrying the provider HTTP status
     and error code, so downstream (gateway HTTP mapping, kernel classification, core recoverability,
-    the UI) can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII."""
+    the UI) can reason about it. Uses a synthetic, body-free message to avoid leaking prompt/PII.
+
+    ``known_provider_retried`` is the retry fact the CALLING scope already read off the exchange,
+    named the way the gateway validators name theirs. It is an upgrade only, never a downgrade:
+    this function's own probe answers from the exception, and the exceptions that reach here
+    after the exchange committed cannot answer for themselves. Two reachable shapes, one per
+    call path: a client ``close()`` raising in the teardown ``finally``, which never came from
+    the SDK and carries no exchange at all; and a mid-stream transport drop, whose ``request``
+    is an ``httpx`` property that *raises* when unset, so the probe reads it as no retry. Both
+    were recorded as clean single attempts while the calling scope was holding the true value.
+    (The body-read failures that used to arrive here now leave the body-read guard as
+    ``openai_bad_response``, carrying that same value themselves.) Whichever source can see the
+    retry wins; neither can clear what the other observed."""
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
         # The streaming path raises a bare APIError whose status lives on .response (or nowhere).
@@ -782,8 +953,11 @@ def _model_error_from_openai(exc: Exception) -> ModelAdapterError:
     param = body.get("param") if isinstance(body, dict) else None
     param_detail = f", param={param}" if isinstance(param, str) and param else ""
     # Facts about the call rather than about its class, so every branch below states them: the
-    # remedy (config vs. another attempt) and the attempts the SDK already spent.
-    retried = _provider_retried_by_the_sdk(exc)
+    # remedy (config vs. another attempt) and the attempts the SDK already spent. Two sources for
+    # the second fact, ``or``-ed rather than preferred: the exception carries the exchange on the
+    # SDK's own failure lanes, and the caller carries it on the lanes where the exception is not
+    # the SDK's at all.
+    retried = _provider_retried_by_the_sdk(exc) or known_provider_retried
 
     if isinstance(status, int) and 400 <= status < 500:
         retryable = (
@@ -1037,6 +1211,54 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
     return "stop"
 
 
+def _complete_billed_refusal(
+    refused: ModelAdapterError, payload: Any, *, provider_retried: bool
+) -> None:
+    """Finish classifying a refusal that was already minted, and stamp what it cost.
+
+    The shared arm of every classified-refusal handler this adapter has: the two stamped
+    regions (:func:`_parse_response` and :func:`_terminal_chunk`) and the two call paths that
+    bracket them (``next_turn`` and ``astream_turn``, whose own ``except ModelAdapterError``
+    arms route here). All four catch refusals raised somewhere below them -- roughly a dozen
+    sites in the body mapping, the ingress normalizer on the terminal path, the per-frame field
+    validators in the stream's event loop, ``_coerce_response`` on the sync one -- and those
+    sites are ordinary field validators that know their key and nothing else: they mint a bare
+    ``ModelAdapterError`` with no ``provider_error_code`` and no view of the HTTP exchange. So
+    the seam completes what the mint could not, in ONE place rather than at a dozen raise
+    sites -- and the region boundaries are deliberately NOT the seam's boundaries, because a
+    completion bound to two regions of an adapter answers a different code for the same helper
+    depending on which line called it. It does so in one direction only:
+
+    * **Backfill, never overwrite.** An empty code left the class of failure unnamed, and one
+      hop out the reference gateway resolves ``exc.provider_error_code or GATEWAY_BAD_RESPONSE``
+      -- so the HOP's own wire was blamed for an UPSTREAM payload defect, and byte-identical
+      malformed bodies were classified differently per transport (this reader's explicit type
+      checks refuse typed and uncoded; the terminal reader's duck-typed walks refuse raw, which
+      the raw arm already coded). A refusal that DOES name a code knows something this seam
+      does not, and keeps it.
+    * **Upgrade, never downgrade.** ``provider_retried`` is a fact about attempts already made,
+      readable only from the exchange the caller saw; a refusal minted deeper down cannot know
+      it. It is added when the caller reports one and never cleared, because a failed audit
+      record that denies retries in exactly the case where they happened is worse than none.
+
+    The usage stamp reads leniently (:func:`usage_reported_by`), so a payload whose ``usage`` is
+    *itself* the malformed key records nothing rather than raising a second failure over the
+    first -- and ``payload`` is deliberately typed ``Any``: the two bracketing arms have no
+    parsed body to offer (the sync one hands ``None``, the streamed one whatever terminal frame
+    had arrived), and "no readable payload" must mean "no cost recorded", not a second failure.
+
+    All three mutations go through the guarded helpers in ``providers/base.py``, which is one
+    copy of the rule those helpers state: a third-party ``ModelAdapterError`` subclass with
+    ``__slots__`` refuses the attribute, and an ``AttributeError`` raised *inside* an
+    except-handler would replace the provider's failure with this seam's own.
+    """
+
+    mark_provider_error_code(refused, "openai_bad_response")
+    if provider_retried:
+        mark_provider_retried(refused)
+    mark_provider_usage(refused, usage_reported_by(payload))
+
+
 def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
     """Map one Responses-API body to a :class:`ModelTurn`, stamping what a refusal cost.
 
@@ -1053,10 +1275,17 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
 
     One seam around the whole mapping rather than a stamp per raise site: the rule is about the
     payload, not about which key of it turned out to be malformed, and twelve stamps is twelve
-    chances to miss the thirteenth. ``Exception`` rather than ``ModelAdapterError`` because the
-    mapping refuses in more than one type -- ``normalize_usage`` says "malformed usage" with a
-    ``ValueError`` -- and a rule bound to one of two ways the same act is spelled is the shape
-    this codebase keeps re-earning. The stamp reads leniently (:func:`usage_reported_by`), so a
+    chances to miss the thirteenth. The seam also CLASSIFIES: the mapping refuses in more than
+    one type (``normalize_usage`` says "malformed usage" with a raw ``ValueError``, the
+    stop-reason walk with an ``AttributeError``), and a raw escape had a real consumer cost --
+    the loop's blanket wrapper re-minted it unstamped, so the run budget recorded zero
+    in-process, and over a hop the raw arms answered 400 (claiming the CLIENT's request was
+    bad) or 500 ``retryable: true`` (inviting a re-buy of the same tokens). EVERY refusal leaves
+    here as non-retryable ``openai_bad_response``, by both arms: the raw one mints it with the
+    cause chained, and the classified one backfills it onto the bare refusals the mapping's own
+    field validators raise (see :func:`_complete_billed_refusal` for why the completion runs in
+    one direction only). Both arms also carry the caller's ``provider_retried``, which no raise
+    site below can see. The stamp reads leniently (:func:`usage_reported_by`), so a
     body whose ``usage`` is *itself* the malformed key records nothing rather than raising a
     second failure over the first; well-formed bodies still normalize through the adapter's own
     parser below and are untouched by this.
@@ -1064,9 +1293,18 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
 
     try:
         return _response_to_turn(data, provider_retried=provider_retried)
-    except Exception as refused:
-        mark_provider_usage(refused, usage_reported_by(data))
+    except ModelAdapterError as refused:
+        _complete_billed_refusal(refused, data, provider_retried=provider_retried)
         raise
+    except Exception as raw:
+        refused = ModelAdapterError(
+            f"OpenAI returned a malformed response body: {raw}",
+            provider_error_code="openai_bad_response",
+            retryable=False,
+            provider_retried=provider_retried,
+        )
+        mark_provider_usage(refused, usage_reported_by(data))
+        raise refused from raw
 
 
 def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelTurn:
@@ -1161,14 +1399,20 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     (a non-string ``id`` is the reachable case) would otherwise refuse it one step later,
     outside the stamp.
 
-    The refusals in this region are raw ``ValueError``/``AttributeError`` rather than
-    ``ModelAdapterError``, which is why the guard catches ``Exception``. Every consumer of the
-    stamp reads it off the escaping exception whatever its type -- the receipt
-    (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the reference
-    gateway's tenant meter and both of its error writers, which used to inspect only a
-    ``ModelAdapterError`` and so skipped precisely this region. Stamping is still the whole of
-    the fix here: classifying these would change how the loop treats them, which is a separate
-    decision, and the carry no longer depends on making it.
+    Some refusals in this region are born raw -- ``normalize_usage`` and the stop-reason walk
+    raise ``ValueError``/``AttributeError`` while the ``TurnComplete`` arguments are still
+    being evaluated, ahead of the normalizer below -- which is why the guard catches
+    ``Exception``. The guard now also CLASSIFIES, for the same reasons as the body reader's
+    (see :func:`_parse_response`): a raw escape reached the loop's blanket wrapper unstamped
+    in-process, and the gateway's 500 arm answered ``retryable: true`` for a payload defect
+    over a hop. EVERY refusal leaves here as non-retryable ``openai_bad_response`` carrying the
+    caller's ``provider_retried``: the raw arm mints it with the cause chained, and the
+    classified arm backfills it (:func:`_complete_billed_refusal`) onto the refusals that reach
+    it bare -- which is the named reachable case above, since the ingress normalizer refuses a
+    non-string ``id`` as an unnamed ``ModelAdapterError``. Every consumer of the stamp -- the
+    receipt (``ModelCallReceipt.with_error``), the run's token budget, and, one hop out, the
+    reference gateway's tenant meter and both of its error writers -- deliberately stays
+    type-agnostic regardless, because a third-party adapter can still refuse raw.
     """
 
     try:
@@ -1193,9 +1437,37 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
                 provider_retried=provider_retried,
             )
         )
-    except Exception as refused:
-        mark_provider_usage(refused, usage_reported_by(final_data))
+    except ModelAdapterError as refused:
+        _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
         raise
+    except Exception as raw:
+        refused = ModelAdapterError(
+            f"OpenAI returned a malformed terminal payload: {raw}",
+            provider_error_code="openai_bad_response",
+            retryable=False,
+            provider_retried=provider_retried,
+        )
+        mark_provider_usage(refused, usage_reported_by(final_data))
+        raise refused from raw
+
+
+def _readable_payload(data: Any, response: Any) -> Any:
+    """The best cost source the one-shot call has, whichever phase of it failed.
+
+    One expression for both of ``next_turn``'s handlers, because "what did this call already
+    cost" is one question and an answer written twice is one that eventually differs. The body
+    read has two phases and each leaves a different carrier behind: ``data`` once the mapping
+    exists, and before that whatever ``parse()`` returned. Preferring ``data`` is not
+    arbitrary -- it is the same object once both are set, and it is the only one of the two the
+    *success* path reads.
+
+    The second half matters on its own: ``_coerce_response`` is ``dict``-only while
+    :func:`usage_reported_by` accepts any ``Mapping``, so a response that is a Mapping-but-not-
+    dict is refused for its container and still perfectly readable for its cost. Handing the
+    completion seam ``None`` there discarded a cost the very same object was carrying.
+    """
+
+    return data if data is not None else response
 
 
 def _coerce_response(response: object) -> dict[str, Any]:

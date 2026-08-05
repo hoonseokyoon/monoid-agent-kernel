@@ -5,7 +5,7 @@
     "provider": "gateway",
     "model": "gpt-5.5",
     "gateway_url": "http://127.0.0.1:8080/internal/llm/turns",
-    "reasoning": {"effort": "low", "summary": "off"}
+    "reasoning": {"effort": "low", "summary": "off", "on_unsupported": "omit"}
   },
   "prompt": {
     "persona_segments": ["Edit files conservatively and explain the proposed changes briefly."],

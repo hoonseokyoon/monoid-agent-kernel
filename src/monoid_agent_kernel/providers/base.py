@@ -240,6 +240,21 @@ def generation_support(
     return _declared_support(adapter, "generation_support", config)
 
 
+def reasoning_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.reasoning` to the provider request.
+
+    The third member of the capability family above, same fail-closed rule, one difference
+    worth naming: a conditional declaration answers off ``reasoning.on_unsupported`` — its own
+    feature family's policy knob — where the generation/schema pair deliberately shares
+    ``generation.on_unsupported``. A reasoning claim read off another family's knob would mint
+    proof for a call whose own policy said best-effort.
+    """
+
+    return _declared_support(adapter, "reasoning_support", config)
+
+
 class ModelAdapter(Protocol):
     """The LLM seam: turn a :class:`ModelRequest` into a :class:`ModelTurn`.
 
@@ -519,6 +534,11 @@ class TurnComplete:
     # ``output_schema`` to an upstream that natively enforces it. A sibling key, not a member
     # of the generation echo -- changing an existing key's shape is how old clients break.
     schema_applied: bool | None = None
+    # The reasoning member of the echo family (v0.21 B1): the forwarded reasoning block, in
+    # the generation echo's shape because reasoning has values a client can compare. ``{}`` is
+    # a real proof (``effort="default"`` forwards an empty block), so only ``None`` means the
+    # wire never mentioned it.
+    reasoning_applied: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -533,6 +553,8 @@ class TurnComplete:
             payload["generation_applied"] = dict(self.generation_applied)
         if self.schema_applied is not None:
             payload["schema_applied"] = self.schema_applied
+        if self.reasoning_applied is not None:
+            payload["reasoning_applied"] = dict(self.reasoning_applied)
         return payload
 
 
@@ -1117,6 +1139,30 @@ def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -
         pass
 
 
+def mark_provider_error_code(error: BaseException, code: str) -> None:
+    """Name the class of failure on an escaping error that was minted without one.
+
+    A refusal raised by a field validator deep inside a reader knows its key and nothing else, so
+    it mints a bare ``ModelAdapterError``; one hop out the reference gateway resolves
+    ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` and blames the HOP's wire for an upstream
+    payload defect. Backfill only: a refusal that DOES name a code knows something the caller
+    completing it does not, and keeps it.
+
+    The guarded-setattr sibling of :func:`mark_provider_retried` and :func:`mark_provider_usage`,
+    for the same reason and in one copy for the same reason: an exception type that refuses the
+    attribute (``__slots__``) simply stays unnamed rather than replacing the provider's failure
+    with an ``AttributeError`` raised *inside* an except-handler. The read is inside the guard
+    too -- a third-party subclass may expose the name as a property that raises.
+    """
+
+    try:
+        if getattr(error, "provider_error_code", None):
+            return
+        error.provider_error_code = code  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def provider_usage_of(error: BaseException) -> dict[str, int]:
     """Read back what :func:`mark_provider_usage` stamped, as clean non-negative counts.
 
@@ -1239,18 +1285,42 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     for index in order:
         slot = slots[index]
         raw = slot["args"].strip()
+        # Both refusals below are refusals of a turn the provider already produced and BILLED:
+        # the deltas were delivered and the terminal frame reported the cost, which the fold is
+        # still holding. The one-shot twin of this act pays through the OpenAI reader's stamping
+        # seam; unstamped here, a streamed turn was metered at zero at the tenant ledger and in
+        # the run's token budget. ``provider_retried`` rides along for the same reason it does
+        # on every other refusal: it is a fact about attempts already made. The meter skips an
+        # empty mapping, so a stream that reported no cost still invents none.
+        #
+        # The CODE, though, deliberately does not converge with that seam's. The OpenAI reader
+        # backfills ``openai_bad_response`` onto its bare refusals; these two keep
+        # ``stream_bad_tool_args``, and this module never speaks a provider's name -- the fold
+        # is reached by every adapter, including third-party ones whose provider it cannot know.
+        # So one class of defect really does carry two codes across the sync/streamed pair, and
+        # that is the intended answer rather than an unbound twin: the ingress voice attributes
+        # the *shape* of the failure, the adapter voice attributes its *source*. Recorded here
+        # because a silent cell in a twin census reads as an oversight to the next reviewer.
         try:
             arguments = loads_model_json_ingress(raw) if raw else {}
         except ValueError as exc:
-            raise ModelAdapterError(
+            unparsable = ModelAdapterError(
                 f"invalid streamed tool-call arguments for {slot['name']}",
                 provider_error_code="stream_bad_tool_args",
-            ) from exc
+                retryable=False,
+                provider_retried=provider_retried,
+            )
+            mark_provider_usage(unparsable, usage)
+            raise unparsable from exc
         if not isinstance(arguments, dict):
-            raise ModelAdapterError(
+            wrong_type = ModelAdapterError(
                 f"streamed tool-call arguments for {slot['name']} are not an object",
                 provider_error_code="stream_bad_tool_args",
+                retryable=False,
+                provider_retried=provider_retried,
             )
+            mark_provider_usage(wrong_type, usage)
+            raise wrong_type
         call_id = slot["id"] if slot["id"] is not None else ""
         name = slot["name"] if slot["name"] is not None else ""
         tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
@@ -1258,11 +1328,35 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     # common cases so the loop's branch still works — tool calls present → tool_calls, else stop.
     if stop_reason is None:
         stop_reason = "tool_calls" if tool_calls else "stop"
+    try:
+        # Provably a re-normalization: every chunk passed the ingress above, whose
+        # TurnComplete branch already ran normalize_usage. Guarded rather than deleted —
+        # removing normalization is a loosening-shaped edit, and a future path that reaches
+        # this fold with garbage must refuse in the ingress's classified voice, not raw.
+        normalized_usage = normalize_usage(usage) if usage else {}
+    except Exception as exc:
+        # Classified the way the ingress classifies, flags included. The constructor's defaults
+        # are deterministic, not arbitrary -- ``retryable`` is False and ``provider_retried`` is
+        # False -- so the two keywords do different work: ``retryable=False`` restates the
+        # default where a reader would otherwise have to go look it up, while
+        # ``provider_retried`` is the one fact the fold is holding that a default would throw
+        # away, since a stream the SDK re-sent would report a clean single attempt. No usage
+        # stamp -- ``usage`` is
+        # itself the malformed key here, and the tolerance rule on a failure path is to record
+        # nothing rather than raise a second failure over the first. Unreachable through this
+        # function (the ingress above pre-normalizes every chunk), so what binds this shape is
+        # a source-level pin: test_the_folds_usage_renormalization_stays_structurally_guarded
+        # in tests/test_llm_gateway_stream.py.
+        raise ModelAdapterError(
+            "model adapter returned a non-portable stream fragment",
+            retryable=False,
+            provider_retried=provider_retried,
+        ) from exc
     return ModelTurn(
         response_id=response_id,
         final_text="".join(text_parts) if text_parts else None,
         tool_calls=tuple(tool_calls),
-        usage=normalize_usage(usage) if usage else {},
+        usage=normalized_usage,
         reasoning=reasoning,
         stop_reason=stop_reason,
         provider_retried=provider_retried,

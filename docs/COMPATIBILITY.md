@@ -215,12 +215,19 @@ Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `
 configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
 `\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
 The v0.21 `monoid.llm-turn.v1` writer adds `generation` and `output_schema` to the request and
-`generation_applied` / `schema_applied` to the response and terminal stream frame without
+`generation_applied` / `schema_applied` / `reasoning_applied` to the response and terminal
+stream frame without
 changing either protocol identifier (the `metadata_generation` precedent). Every new key is
 present only when the caller configured the feature, so traffic that does not use it keeps its
-exact previous wire shape. Version skew fails closed on the client: under the default
+exact previous wire shape (for `reasoning_applied`, "configured" means a non-default
+`ModelConfig.reasoning` — the codec-default config demands no proof, and the explicit
+`effort="default"` sentinel is configured and proven by an empty `{}` echo). Version skew
+fails closed on the client: under the default
 `generation.on_unsupported="fail"`, a server that does not echo is refused rather than allowed
-to silently discard parameters. Separately, `ModelConfig.to_json` emits its `generation` block
+to silently discard parameters; the reasoning proof is governed by its own family's
+`reasoning.on_unsupported` the same way, so a deployment that wants reasoning display
+preferences over a non-proving transport (the reference Studio's offline mode is one) states
+`"omit"` on that field rather than losing the fail-closed default elsewhere. Separately, `ModelConfig.to_json` emits its `generation` block
 only when configured — a generation-free runtime config keeps its pre-v0.21 `config_hash`, and
 a *configured* one intentionally does not verify across mixed-version backend-run recovery
 (configure generation only on a fully rolled fleet).
@@ -259,13 +266,83 @@ skew case reaches that refusal in a way worth naming: the same protocol uses a `
 the **request** body for the reasoning *config* object, so a third-party gateway that echoes
 request keys onto its response answers an array-valued key with an object and is refused. That is
 the correct outcome — the value is unusable for replay either way — but the cause is not obvious
-from the error, so check for a request echo before suspecting the upstream's artifacts.
+from the error, so check for a request echo before suspecting the upstream's artifacts. Since
+B1 there are **three** `reasoning*` spellings on this protocol — the request's config object,
+the response's artifact array, and the response's `reasoning_applied` echo object — and the
+last two ride the same envelopes with different shapes, so a generic echo-the-request gateway
+now trips the object/array mismatch in both directions; implement the three keys separately
+rather than by prefix.
 
 `provider` is held to the same rule by the same readers: absent is unknown and gates nothing, but
 present must be a string, and a non-string is `gateway_bad_response` on both transports. Note what
 that separates — a *malformed* attribution is refused, while a *disagreeing* one is not: the first
 means the envelope cannot be read, the second means it was read and says something the client did
 not expect, which is a fact about a deployment rather than a broken wire.
+
+One v0.21 change moves an existing wire *answer* rather than adding a key: when the reference
+gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
+now a non-retryable 502 `openai_bad_response` (carrying the billed `usage`), where the shapes
+that used to escape unclassified answered 400 `gateway_bad_request` or 500 with
+`retryable: true`, and the shapes refused without a code of their own answered 502
+`gateway_bad_response` — the hop's own wire named for an upstream payload defect. A client that
+retried on that 500 was re-buying tokens for a payload defect; a client that read the 400 as its
+own bad request was mis-remediating; and one malformed body answered two different codes
+depending on which transport read it.
+
+Read the recoverability move literally, because this kernel's own client does. `AgentLoop`
+(`_recoverable_turn_error`) reads `retryable` **first**, then `config_recoverable`, and only
+then the status range — treating any 4xx as a *recoverable* turn failure (the turn fails, the
+session survives, the caller can fix and resend) and an un-flagged 5xx as terminal. **Both**
+answers that moved therefore move from a park to a terminal run failure, by different routes:
+the 400 was recoverable on its status range and its replacement is a 5xx outside that range,
+and the 500 was recoverable on `retryable: true` alone — which is now `false`, so the flag that
+carried it no longer does. Either way a client that previously got a suspension it could resume
+from now gets a `failure.json` and a terminal session. That direction is intended. It converges
+the hop with in-process behavior, where a malformed upstream payload has always ended the run,
+and no amount of resending the same call fixes a payload the upstream produced. The 500 half
+stops a second kind of bleeding at the same time: `retryable: true` invited a client to re-buy
+exactly the tokens the defect had already spent.
+
+The third group changed its name, and some of its members gained a key. The shapes that already
+answered 502 `gateway_bad_response` — refusals minted without a code of their own — were already
+`retryable: false` and already terminal for this client, and none of them moved: same status,
+same `retryable` / `config_recoverable`, same verdict from `_recoverable_turn_error`. Read that
+as two sub-groups, because only the first is a pure rename:
+
+- The roughly a dozen raised **inside** the adapter's two stamped regions (the body mapping and
+  the stream-terminal construction) were already carrying their billed `usage` and their
+  `provider_retried` before v0.21. For these, `error_code` changed and nothing else did — an
+  honest attribution, not a new recoverability, and a client keyed to anything but the code sees
+  no change.
+- The ones raised **around** those regions joined the group in v0.21 and gained more than a
+  name: the stream's per-frame field validators and the blocking path's `_coerce_response` used
+  to escape with no cost and no retry evidence at all, and both now travel the same completion
+  seam. So their 502 body can carry `provider_retried: true` where it always said `false`, and
+  it can carry a `usage` object where it previously had **no `usage` key at all** — the writer
+  omits that key when the failure cost nothing, so a turn the upstream billed for is a wire
+  *shape* change on these shapes, not just a value change. A client that sums `usage` across
+  failures will now count tokens on calls it used to count as free. That is the correction: they
+  really were billed.
+
+Both sub-groups keep `retryable: false` and the same terminal verdict, so nothing about
+recoverability moved for either.
+
+If you implement this answer in your own gateway, write `"retryable": false` **and** the
+`error_code` explicitly into the 502 body. The client derives each of those from the status line
+only when its own key is absent, and its retry gate (`_should_retry`) needs both: a bare 502
+derives `retryable: true` *and* the error code `gateway_server_error`, which is in the default
+`model.retry.retry_on`. So a body omitting **both** keys is re-sent until
+`model.retry.max_attempts` (3) is spent — three attempts, two retries — re-buying exactly the
+tokens this change exists to stop paying for. Writing either key alone already breaks that
+conjunction; write both anyway, so the body states its verdict instead of leaving half of it to
+a default derived from the status line.
+
+Raw refusals from third-party adapters keep their previous arms and their stamped-usage
+carriage, and v0.21 adds one field to them: both gateway error writers now read
+`provider_retried` off the escaping exception on **every** arm rather than on the
+`ModelAdapterError` arm alone, so an adapter that retried and then refused in its own exception
+type reports `provider_retried: true` where the body always said `false`. The key was already
+written unconditionally, so this is a value change on an existing key, not a shape change.
 
 The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
 terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the

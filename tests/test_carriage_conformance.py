@@ -146,6 +146,7 @@ from monoid_agent_kernel.providers._common import normalize_usage, usage_reporte
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ToolCall,
+    mark_provider_retried,
     mark_provider_usage,
     provider_usage_of,
 )
@@ -193,7 +194,7 @@ class CarriageGap:
     disposition: str
 
 
-DISPOSITIONS = frozenset({"burn-down", "v0.21-track:B1", "by-design"})
+DISPOSITIONS = frozenset({"burn-down", "by-design"})
 
 KNOWN_GAPS: tuple[CarriageGap, ...] = (
     CarriageGap(
@@ -232,10 +233,14 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "close. Exactly the wire status usage and turn_handle already have on that shape, and "
         "tolerated the same way: the assembler reads () and raises nothing. A run continuing "
         "over a frameless hop re-derives nothing to replay, which is the loop's neutral case -- "
-        "it appends no reasoning block for an empty tuple. Deliberately NOT enforced as an "
-        "absence: a fail-closed proof for reasoning is the separate v0.21-track:B1 echo, and "
-        "inventing a metadata channel here would be a second protocol for one field. Asserted "
-        "by test_a_frameless_stream_reads_no_reasoning_and_does_not_fail "
+        "it appends no reasoning block for an empty tuple. The ARTIFACTS stay tolerated; the "
+        "PROOF does not: since B1 the frameless drain runs _check_reasoning_applied beside the "
+        "other two checkers, so a CONFIGURED fail-closed reasoning request now refuses on this "
+        "shape (absent frame = absent echo) while default-reasoning traffic keeps the "
+        "tolerance. Enforcing the artifact array itself as an absence would still be wrong -- "
+        "an upstream that produced no reasoning is indistinguishable from a frame that dropped "
+        "it, and inventing a metadata channel here would be a second protocol for one field. "
+        "Asserted by test_a_frameless_stream_reads_no_reasoning_and_does_not_fail "
         "(tests/test_llm_gateway_backend.py), which drives a real frameless SSE body through "
         "GatewayModelAdapter.astream_turn -- filtering the terminal frame out of a complete "
         "stream and calling the assembler by hand skips the drain that decides what a frameless "
@@ -286,27 +291,6 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "a SECOND unvalidated field cannot join it quietly",
         "by-design",
     ),
-    # --- by-design provenance splits ---------------------------------------------------
-    CarriageGap(
-        "applied-echo",
-        "provider_retried",
-        "providers/gateway.py:GatewayModelAdapter",
-        "the frameless-stream check reads the client's own attempt>1 while the framed check "
-        "reads chunk.provider_retried: by design, because a stream with no terminal frame "
-        "carries no server-side retry evidence to read, and the client's own attempt count is "
-        "the only true thing left to say",
-        "by-design",
-    ),
-    # --- W5 applied-echo protocol ------------------------------------------------------
-    CarriageGap(
-        "applied-echo",
-        "reasoning_applied",
-        "reference/llm_gateway/service.py:_applied_echoes",
-        "reasoning has the same fail/omit contract as generation (core/spec.py:ReasoningConfig "
-        "on_unsupported) and travels the same wire, but there is no echo, no support probe and "
-        "no client-side checker — a fail-closed reasoning request is accepted unproven",
-        "v0.21-track:B1",
-    ),
     # --- by-design: asserted and explained, never "fixed" ------------------------------
     CarriageGap(
         "suspension",
@@ -335,7 +319,7 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
     ),
     CarriageGap(
         "applied-echo",
-        "generation_applied/schema_applied",
+        "generation_applied/schema_applied/reasoning_applied",
         "reference/llm_gateway/http.py:_stream_error_frame",
         "error frames carry no applied-echoes by design: there is no turn to prove anything "
         "about, and a fail-closed client refuses on absence anyway",
@@ -1429,6 +1413,7 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_gateway_reasoning_items",
         "_validated_generation_echo",
         "_validated_schema_echo",
+        "_validated_reasoning_echo",
     }
 )
 
@@ -1551,6 +1536,7 @@ GATEWAY_WIRE_VALUE_VALIDATORS = frozenset(
         "_gateway_reasoning_items",
         "_validated_generation_echo",
         "_validated_schema_echo",
+        "_validated_reasoning_echo",
     }
 )
 
@@ -2562,6 +2548,45 @@ def test_2a_stream_error_frame_is_the_body_plus_a_type_tag() -> None:
     assert {key: value for key, value in frame.items() if key != "type"} == _maximal_error_body()
 
 
+def test_2a_both_writers_read_the_retry_off_a_raw_refusal_the_way_they_read_the_cost() -> None:
+    """The stamp does not belong to a type — and neither writer was reading it that way.
+
+    ``provider_usage_of`` is read ONCE above the branch in both writers, on the stated rule that
+    an adapter refusing in a raw ``ValueError``/``AttributeError`` has burned tokens as readily
+    as one refusing in a ``ModelAdapterError``. ``provider_retried`` sat inside the
+    ``ModelAdapterError`` arm alone, though ``mark_provider_retried`` stamps any
+    ``BaseException`` and the gateway client's own ``_stamp_retry`` documents exactly that. So a
+    third-party adapter that retried and then refused raw was reported one hop out as a clean
+    single attempt, on the one carrier a failed call has left — while the cost of those same
+    attempts rode the same body.
+    """
+
+    raw = ValueError("the upstream adapter refused its provider's payload")
+    mark_provider_retried(raw)
+    mark_provider_usage(raw, {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460})
+
+    written, status = _write_exception_body(raw)
+    framed = _stream_error_frame(_StreamFrameHandler(), raw)
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert written["provider_retried"] is True, {
+        "body": written,
+        "hint": "the flag is readable on this exception and only the typed arm passed it",
+    }
+    assert framed["provider_retried"] is True, {
+        "frame": framed,
+        "hint": "the streamed twin of the same omission",
+    }
+    # Read once above the branch means the two facts travel together, whichever arm answers.
+    assert written["usage"] == framed["usage"] == provider_usage_of(raw)
+
+    # The counterweight: an unstamped raw refusal claims neither.
+    plain = ValueError("refused before the provider was reached")
+    unstamped, _status = _write_exception_body(plain)
+    assert unstamped["provider_retried"] is False
+    assert "usage" not in unstamped
+
+
 def test_2a_usage_is_omitted_when_the_failure_cost_nothing() -> None:
     """By-design omit-when-empty: an error raised before a provider keeps its old wire shape."""
 
@@ -2882,6 +2907,8 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "turn_handle",
             "generation_applied",
             "schema_applied",
+            # B1's streamed twin, validated where its two echo siblings are.
+            "reasoning_applied",
             # X-3's streamed twin: the terminal frame is the only frame that carries them.
             "reasoning",
             # O1's streamed twin, read off the same frame for the same reason.
@@ -3213,6 +3240,7 @@ GATEWAY_STATUS_FORWARDING_VALIDATORS = (
     "_gateway_reasoning_items",
     "_validated_generation_echo",
     "_validated_schema_echo",
+    "_validated_reasoning_echo",
 )
 
 
@@ -3648,14 +3676,15 @@ def test_3d_a_bool_is_not_a_count_on_any_sibling() -> None:
 # --------------------------------------------------------------------------------------
 
 # reference/llm_gateway/service.py:_applied_echoes — the full key domain it can emit.
-APPLIED_ECHO_KEYS = frozenset({"generation_applied", "schema_applied"})
+APPLIED_ECHO_KEYS = frozenset({"generation_applied", "schema_applied", "reasoning_applied"})
 
 
 class _NativeEverything:
-    """An adapter declaring native support for both echoed features, so both keys are emitted."""
+    """An adapter declaring native support for every echoed feature, so every key is emitted."""
 
     generation_support = "native"
     structured_output_support = "native"
+    reasoning_support = "native"
 
     def next_turn(self, request: Any) -> Any:  # pragma: no cover - never called
         raise NotImplementedError
@@ -3673,7 +3702,7 @@ def _maximal_echo_request() -> LlmGatewayTurnRequest:
     )
 
 
-def test_4a_applied_echo_domain_is_generation_and_schema_only() -> None:
+def test_4a_the_applied_echo_domain_covers_all_three_features() -> None:
     request = _maximal_echo_request()
     config = ModelConfig(
         provider="openai",
@@ -3686,9 +3715,9 @@ def test_4a_applied_echo_domain_is_generation_and_schema_only() -> None:
         "missing": sorted(APPLIED_ECHO_KEYS - set(echoes)),
         "extra": sorted(set(echoes) - APPLIED_ECHO_KEYS),
     }
-    # Registered v0.21-track:B1 — reasoning has the same fail/omit contract and no echo.
-    assert request.reasoning.on_unsupported == "fail"
-    assert "reasoning_applied" not in echoes
+    # The v0.21-track:B1 gap this test used to register, closed: reasoning is the third
+    # proof, in the generation echo's shape (the forwarded block, comparable client-side).
+    assert echoes["reasoning_applied"] == {"effort": "high", "summary": "auto"}
 
 
 def test_4a_a_default_generation_block_is_absent_from_the_config_wire_by_design() -> None:
@@ -3741,10 +3770,12 @@ def test_4b_the_client_terminal_frame_reads_exactly_what_the_server_can_emit() -
             "stop_reason": "stop",
             "generation_applied": {"temperature": 0.5},
             "schema_applied": True,
+            "reasoning_applied": {"effort": "high"},
         }
     )
     assert chunk.generation_applied == {"temperature": 0.5}
     assert chunk.schema_applied is True
+    assert chunk.reasoning_applied == {"effort": "high"}
 
     read = {
         node.args[0].value
@@ -3777,7 +3808,9 @@ ECHO_ENFORCEMENT_SITES: dict[str, int] = {
     # Twice: once on the terminal frame, once on the frameless-stream fallback.
     "providers/gateway.py:GatewayModelAdapter.astream_turn": 2,
 }
-ECHO_CHECK_FUNCTIONS = frozenset({"_check_generation_applied", "_check_schema_applied"})
+ECHO_CHECK_FUNCTIONS = frozenset(
+    {"_check_generation_applied", "_check_schema_applied", "_check_reasoning_applied"}
+)
 
 
 def _echo_check_calls(function: _FunctionNode) -> list[str]:
@@ -4489,9 +4522,12 @@ GATEWAY_SUCCESS_BODY_KEYS = frozenset(
         "provider_retried",
         "generation_applied",
         "schema_applied",
+        # B1: the reasoning member of the echo family — the forwarded block, request-
+        # conditional like its two siblings.
+        "reasoning_applied",
         # X-3: the opaque provider-native reasoning items, present only when the upstream
         # produced some. Conditional on the ANSWER rather than on the request, which is what
-        # separates it from the two echoes beside it.
+        # separates it from the echoes beside it.
         "reasoning",
         # O1: whose artifacts those are -- the upstream the hop actually relayed, present only
         # when the upstream adapter declares it. A third conditionality (see
@@ -4508,6 +4544,7 @@ GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
         "provider_retried",
         "generation_applied",
         "schema_applied",
+        "reasoning_applied",
         "reasoning",
         "provider",
     }
@@ -4536,6 +4573,7 @@ class _EverythingAdapter:
 
     generation_support = "native"
     structured_output_support = "native"
+    reasoning_support = "native"
     provider_name = "acme"
 
     def next_turn(self, request: Any) -> ModelTurn:
@@ -4603,6 +4641,7 @@ def _maximal_turn_payload() -> dict[str, Any]:
         "system_prompt": "sys",
         "instruction": "do the thing",
         "generation": {"temperature": 0.5},
+        "reasoning": {"effort": "high", "summary": "auto"},
         "output_schema": {"type": "object"},
         "tools": [gateway_client._gateway_tool_schema(_maximal_tool_spec())],
     }
@@ -4638,15 +4677,14 @@ GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
     {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
 )
 # The keys that ride the wire only sometimes. THREE conditionalities, deliberately unified into
-# one set because the *wire* property is the same one: the two echoes appear only when the
+# one set because the *wire* property is the same one: the three echoes appear only when the
 # request asked for the feature (registered by-design on ``_applied_echoes``: traffic that
-# configures neither keeps its exact pre-W5 wire shape), ``reasoning`` appears only when the
+# configures none keeps its exact pre-W5 wire shape), ``reasoning`` appears only when the
 # upstream produced artifacts, and ``provider`` only when the upstream adapter DECLARES one --
 # request-conditional, answer-conditional, and upstream-conditional respectively. Widened by
 # union rather than by editing ``APPLIED_ECHO_KEYS``: that constant is the echo protocol's own
 # domain (family 4 diffs ``_applied_echoes`` against it), and folding a non-echo key into it
-# would report these as further applied-parameters proofs — which is the separate
-# v0.21-track:B1 gap, still open.
+# would report these as further applied-parameters proofs.
 GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS) | {"reasoning", "provider"}
 
 
@@ -4728,6 +4766,7 @@ def test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered() -> 
     assert {key: terminal[key] for key in APPLIED_ECHO_KEYS} == {
         "generation_applied": {"temperature": 0.5},
         "schema_applied": True,
+        "reasoning_applied": {"effort": "high", "summary": "auto"},
     }
 
 
@@ -4796,6 +4835,7 @@ def test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default(
 ADAPTER_PROBED_WIRE_KEYS: dict[str, str] = {
     "generation_support": "generation_applied",
     "structured_output_support": "schema_applied",
+    "reasoning_support": "reasoning_applied",
     "provider_name": "provider",
 }
 
@@ -4854,6 +4894,7 @@ def test_7b_the_maximal_upstream_declares_every_capability_the_writers_probe() -
 _ADAPTER_PROBE_READERS: dict[str, str] = {
     "generation_support": "generation_support",
     "structured_output_support": "structured_output_support",
+    "reasoning_support": "reasoning_support",
     "provider_name": "resolved_provider_name",
 }
 
@@ -4897,6 +4938,7 @@ TURN_COMPLETE_READS_R2 = frozenset(
         "stop_reason",
         "generation_applied",
         "schema_applied",
+        "reasoning_applied",
         "reasoning",
         "provider",
     }
@@ -5039,6 +5081,7 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
         "stop_reason": {"stop_reason": 7},
         "generation_applied": {"generation_applied": [1, 2]},
         "schema_applied": {"schema_applied": 7},
+        "reasoning_applied": {"reasoning_applied": [1, 2]},
         "reasoning": {"reasoning": "not-an-array"},
         "provider": {"provider": 7},
     },
@@ -6628,9 +6671,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "reference/llm_gateway/service.py",
         }
     ),
-    # The W5 echo pair. ``reasoning_applied`` is the registered v0.21-track:B1 gap and has no
-    # carrier at all yet — pinned empty, so the first file to carry it fails here and has to
-    # join the echo censuses above rather than arriving on one transport quietly.
+    # The applied-echo family: three fields, one carrier set — the wire type, the client's
+    # readers/checkers, and the server writer. ``reasoning_applied`` was pinned EMPTY while it
+    # was the registered v0.21-track:B1 gap, so the first carrier had to arrive through the
+    # echo censuses above rather than on one transport quietly; B1 closed it on all three
+    # files at once.
     "generation_applied": frozenset(
         {
             "providers/base.py",
@@ -6645,7 +6690,13 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "reference/llm_gateway/service.py",
         }
     ),
-    "reasoning_applied": frozenset(),
+    "reasoning_applied": frozenset(
+        {
+            "providers/base.py",
+            "providers/gateway.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
 }
 
 
@@ -6751,6 +6802,13 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # contract, and the response-envelope example that shows its shape.
         "relayed verbatim",
         '"reasoning": [{"type": "reasoning"',
+        # B1: the reasoning echo's two load-bearing sentences, anchored the same way and for
+        # the same reason -- the document said "reasoning_applied" several times the moment
+        # the feature landed, so the bare key name would be satisfied by any surviving
+        # mention. These phrases exist nowhere at the pre-B1 base and exactly once each now:
+        # the empty-object-is-proof rule, and the three-spellings disambiguation.
+        "empty object as a proof, not an absence",
+        "artifact array and echo object on the response",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

@@ -22,10 +22,15 @@ from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, Reasoni
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
-from monoid_agent_kernel.providers._common import build_generation_payload, normalize_usage
+from monoid_agent_kernel.providers._common import (
+    build_generation_payload,
+    build_reasoning_payload,
+    normalize_usage,
+)
 from monoid_agent_kernel.providers.base import (
     generation_support,
     provider_usage_of,
+    reasoning_support,
     resolved_provider_name,
     structured_output_support,
 )
@@ -399,15 +404,16 @@ class LlmGatewayBackend:
         """Charge the tenant for what an ESCAPING failure already cost, then let it escape.
 
         Both transports' failure arms come through here instead of reading the stamp for
-        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The adapter
-        that first sees the provider's billed body stamps refusals of more than one type:
-        ``normalize_usage`` says "malformed usage" with a raw ``ValueError``, and *every* refusal
-        in the OpenAI stream's terminal region is a raw ``ValueError``/``AttributeError``, because
-        that path folds deltas and reads end-of-turn metadata directly rather than running the
-        one-shot mapping that classifies. Gated on ``ModelAdapterError``, this meter read the
-        stamp on exactly the failures that had already been classified and skipped the ones that
-        had not -- so an upstream whose final payload is malformed charged the tenant nothing for
-        a turn it had generated and billed, on the transport where that shape actually occurs.
+        themselves, and both catch ``Exception`` rather than ``ModelAdapterError``. The stamp
+        does not belong to a type, and the wide guard is what keeps this meter from depending on
+        one. The shipped OpenAI adapter is no longer the reason: its refusals all leave
+        classified now, including the ones its terminal region raises raw internally (the guard
+        there re-mints them as ``openai_bad_response``). A THIRD-PARTY adapter is -- the whole
+        provider seam is pluggable, its refusals are its own to name, and one that refuses in a
+        bare ``ValueError``/``AttributeError`` after a billed body is exactly what the kernel's
+        own reader used to do. Gated on ``ModelAdapterError``, this meter would read the stamp on
+        the failures that happened to be classified and skip the ones that were not -- charging
+        the tenant nothing for a turn the upstream had generated and billed.
 
         Meter and re-raise: nothing is swallowed and nothing is reclassified here, so what
         escapes is what arrived. ``provider_usage_of`` reads ``{}`` for an unbilled failure and
@@ -505,14 +511,15 @@ def _applied_echoes(
 ) -> dict[str, Any]:
     """The applied-parameters proofs for one turn — built once, emitted by both transports.
 
-    Both echoes answer the same question, so both are derived the same way: **from what the
+    All three echoes answer the same question, so all are derived the same way: **from what the
     upstream adapter declared it does**, never from what the request asked for. A gateway that
     copied the requested block back would produce an exact match no matter what the upstream
     did with it — an offline echo adapter, a text-only backend, or any
     ``provider_adapter_factory`` that ignores ``ModelConfig.generation`` would all read as
     "applied", and the client's ``on_unsupported="fail"`` would accept sampling parameters that
-    were never sent to a model. Unproven is reported as unproven: the generation echo is simply
-    absent (which a fail-closed client refuses), and the schema echo is an explicit ``False``.
+    were never sent to a model. Unproven is reported as unproven: the generation and reasoning
+    echoes are simply absent (which a fail-closed client refuses), and the schema echo is an
+    explicit ``False``.
 
     ``config`` is the per-call config the upstream call runs under (``_upstream_model_config``),
     threaded into the probes because a declaration may be policy-conditional: a *chained*
@@ -521,8 +528,12 @@ def _applied_echoes(
     factory-built adapter mint proof for a call whose wire policy said ``"omit"`` — the exact
     copied-back-proof defect this function exists to rule out, one config-source hop later.
 
-    Both stay off the response entirely when the request did not use the feature, so traffic
-    that configures neither keeps its exact pre-W5 wire shape.
+    All three stay off the response entirely when the request did not use the feature, so
+    traffic that configures none keeps its exact pre-W5 wire shape. Reasoning's "did the
+    request use it" gate is ``is_default`` rather than the projected payload the other two
+    read, because the DEFAULT reasoning config projects a non-empty provider block
+    (``{"effort": "medium"}``) — and ``effort="default"`` projects an empty one that is still
+    a configured value, so ``reasoning_applied`` may legitimately be ``{}``.
     """
 
     echoes: dict[str, Any] = {}
@@ -531,6 +542,8 @@ def _applied_echoes(
         echoes["generation_applied"] = requested_generation
     if request.output_schema is not None:
         echoes["schema_applied"] = structured_output_support(adapter, config) == "native"
+    if not config.reasoning.is_default and reasoning_support(adapter, config) == "native":
+        echoes["reasoning_applied"] = build_reasoning_payload(config.reasoning)
     return echoes
 
 

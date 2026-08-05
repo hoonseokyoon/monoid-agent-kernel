@@ -34,7 +34,6 @@ from monoid_agent_kernel.core.tool_surface import (
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
-from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import resolved_provider_name
 from monoid_agent_kernel.public_view import (
     public_error_message,
@@ -94,10 +93,16 @@ class LoopBootstrapper:
 
     def bootstrap(self) -> _RunResources:
         loop = self._loop
-        if (
-            loop.permission_policy == PermissionPolicy()
-            and loop.spec.permission_policy != PermissionPolicy()
-        ):
+        # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
+        # class-exact, so a deployment's extension subclass with both pattern tuples empty read
+        # as "the caller configured this" and the operator's spec policy was silently not
+        # adopted -- leaving the loop enforcing the empty policy at every
+        # ``self.permission_policy`` site while the subagent sites read
+        # ``self.spec.permission_policy`` directly, so half the run honoured the operator's
+        # lists and half did not. Such a subclass reaches here intact by design (the spec
+        # validator gates on ``isinstance``). Same gate the two model configs use, spelled the
+        # same way: see ``PermissionPolicy.is_default``.
+        if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
         workspace = workspace_factory(loop.spec)

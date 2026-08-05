@@ -252,7 +252,13 @@ def _runtime_config(*, model: str, reasoning_effort: str) -> AgentRuntimeConfig:
         definition_id="messy-workspace-cleanup",
         model=ModelConfig(
             model=model,
-            reasoning=ReasoningConfig(effort=reasoning_effort),
+            # One config serves both modes, and fake mode's upstream honestly declares no
+            # reasoning_support -- under the default "fail" the reasoning_applied echo check
+            # would refuse every fake turn. This scenario scores workspace behavior, not
+            # transport proof, so it states the best-effort policy. Real mode's OpenAI upstream
+            # still emits the echo and the client still shape-validates it; what "omit" gives
+            # up is the enforcement -- a missing or mismatched echo is tolerated.
+            reasoning=ReasoningConfig(effort=reasoning_effort, on_unsupported="omit"),
         ),
         tools=(
             ToolBinding(binding_id="fs_tree", model_name="fs_tree", ref=RegistryToolRef("fs.tree")),

@@ -8,7 +8,8 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import json
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -371,8 +372,15 @@ class _UnsetRequestResponse:
         raise RuntimeError("The request instance has not been set on this response.")
 
 
-def _stub_sync_openai(monkeypatch: pytest.MonkeyPatch, raw: object) -> None:
-    """Patch ``openai.OpenAI`` with a client offering both call surfaces, like the SDK."""
+def _stub_sync_openai(
+    monkeypatch: pytest.MonkeyPatch, raw: object, *, close_error: Exception | None = None
+) -> None:
+    """Patch ``openai.OpenAI`` with a client offering both call surfaces, like the SDK.
+
+    ``close_error`` models the exit path the wrapper's own docstring names: the call owns its
+    client, the ``finally`` tears the pool down, and a teardown that raises *replaces* the
+    outcome of a body that already parsed.
+    """
 
     pytest.importorskip("openai")
 
@@ -390,7 +398,8 @@ def _stub_sync_openai(monkeypatch: pytest.MonkeyPatch, raw: object) -> None:
         responses = _Responses()
 
         def close(self) -> None:
-            return None
+            if close_error is not None:
+                raise close_error
 
     monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: _Client())
 
@@ -634,21 +643,19 @@ _BILLED_BODY_REFUSALS: dict[str, dict[str, Any]] = {
     "message-content-item-not-an-object": _message(["nope"]),
     "output-text-not-a-string": _message([{"type": "output_text", "text": 7}]),
     "response-id-not-a-string": {"id": 7},
-    # The one raise site in this region that is NOT a ``ModelAdapterError``: the counts
-    # themselves are readable (the lenient reader takes them) and the nested detail block is
-    # what ``normalize_usage`` rejects, with a raw ``ValueError``. It is why the stamp's seam
-    # catches ``Exception``, and -- until the gateway's meter and error writers were widened to
-    # match -- it was the shape whose stamp no consumer on that route would read.
+    # These two shapes used to refuse RAW (``normalize_usage``'s ``ValueError`` on the nested
+    # detail block; ``_stop_reason_from_response``'s ``AttributeError`` on a non-dict
+    # ``incomplete_details``) -- the classifying seam now hands every one of them out as the
+    # same ``openai_bad_response``, so the parametrized pin below holds one type for the whole
+    # table instead of naming exceptions to it.
     "usage-details-not-an-object": {
         "usage": {**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
     },
-}
-
-# The refusals above are ``ModelAdapterError`` unless named here. Recorded per shape rather
-# than widened for all of them: "the reader refuses in the classified type" is a pin worth
-# keeping on the twelve that do, and the exception to it is worth naming.
-_BILLED_BODY_REFUSAL_TYPES: dict[str, type[BaseException]] = {
-    "usage-details-not-an-object": ValueError,
+    "malformed-incomplete-details": {
+        "status": "incomplete",
+        "incomplete_details": "nope",
+        "output": [],
+    },
 }
 
 
@@ -658,7 +665,7 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
     from monoid_agent_kernel.providers.openai import _parse_response
 
     body = _billed_response_body(**_BILLED_BODY_REFUSALS[shape])
-    with pytest.raises(_BILLED_BODY_REFUSAL_TYPES.get(shape, ModelAdapterError)) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _parse_response(body)
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "malformed_shape": shape,
@@ -666,6 +673,48 @@ def test_a_refused_billed_response_body_still_reports_the_tokens_it_burned(shape
         "hint": "a refused turn was still generated and billed; the refusal is the only "
         "carrier left for its cost",
     }
+    # ...and it names the same code whichever key was malformed. Most shapes here were minted
+    # bare inside the mapping (``ModelAdapterError`` with no code at all), so one hop out the
+    # gateway resolved ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` and told the client
+    # the HOP's wire was bad for an UPSTREAM payload defect -- and byte-identical bodies got
+    # different codes on the two transports, since the duck-typed terminal reader refused some
+    # of these raw (coded) where this reader refuses them typed (uncoded).
+    assert refused.value.provider_error_code == "openai_bad_response", {
+        "malformed_shape": shape,
+        "named_itself": refused.value.provider_error_code,
+        "hint": "the classifying seam backfills the code onto refusals minted without one",
+    }
+
+
+def test_a_raw_malformed_billed_body_is_refused_classified() -> None:
+    """The chip's sync half: the shapes that refused raw arrive as ``openai_bad_response``.
+
+    A raw ``ValueError`` reached the loop's blanket wrapper (which dropped the usage stamp)
+    in-process, and the gateway's 400/500 arms over a hop -- the 500 arm even said
+    ``retryable: true`` for a payload defect, inviting a client to re-buy the same tokens.
+    Classified, the refusal keeps its stamp, names its code, and states non-retryability;
+    the raw cause stays chained for diagnosis.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    body = _billed_response_body(**_BILLED_BODY_REFUSALS["usage-details-not-an-object"])
+    with pytest.raises(ModelAdapterError) as refused:
+        _parse_response(body, provider_retried=True)
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+    assert isinstance(refused.value.__cause__, ValueError)
+
+    stop_reason_shape = _billed_response_body(
+        **_BILLED_BODY_REFUSALS["malformed-incomplete-details"]
+    )
+    with pytest.raises(ModelAdapterError) as second:
+        _parse_response(stop_reason_shape)
+    assert second.value.provider_error_code == "openai_bad_response"
+    assert isinstance(second.value.__cause__, AttributeError)
 
 
 def test_a_refusal_off_a_response_body_that_cost_nothing_stays_costless() -> None:
@@ -730,7 +779,7 @@ def test_a_refused_billed_terminal_payload_still_reports_the_tokens_it_burned(
     from monoid_agent_kernel.providers.openai import _terminal_chunk
 
     payload = _billed_response_body(**_BILLED_TERMINAL_REFUSALS[shape])
-    with pytest.raises(Exception) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(payload, provider_retried=False)
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "malformed_shape": shape,
@@ -761,6 +810,10 @@ def test_a_billed_terminal_payload_with_a_malformed_id_still_reports_its_cost() 
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE, {
         "hint": "the ingress normalizer's rejection is the same act on the same billed payload",
     }
+    # The normalizer mints its refusal without a code, so this named reachable case reached the
+    # wire as the hop's own ``gateway_bad_response``; the seam backfills the same code every
+    # other refusal in this region carries.
+    assert refused.value.provider_error_code == "openai_bad_response"
 
 
 def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_counts() -> None:
@@ -778,9 +831,104 @@ def test_a_terminal_payload_with_an_unreadable_usage_detail_still_reports_its_co
     payload = _billed_response_body(
         usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
     )
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(payload, provider_retried=False)
+    assert refused.value.provider_error_code == "openai_bad_response"
     assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_a_raw_malformed_terminal_payload_is_refused_classified() -> None:
+    """The chip's streamed half: the argument-evaluation refusals arrive classified too.
+
+    ``normalize_model_stream_chunk`` runs INSIDE the guard since fa90590, but Python evaluates
+    the ``TurnComplete`` arguments before that call -- so ``normalize_usage``'s ``ValueError``
+    and the stop-reason walk's ``AttributeError`` still escaped raw, ahead of the normalizer.
+    The guard's classifying arm is what closes them.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    payload = _billed_response_body(
+        usage={**_BILLED_RESPONSE_USAGE, "input_tokens_details": "nope"}
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _terminal_chunk(payload, provider_retried=True)
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+    assert isinstance(refused.value.__cause__, ValueError)
+
+    stop_reason_shape = _billed_response_body(
+        **_BILLED_TERMINAL_REFUSALS["malformed-incomplete-details"]
+    )
+    with pytest.raises(ModelAdapterError) as second:
+        _terminal_chunk(stop_reason_shape, provider_retried=False)
+    assert second.value.provider_error_code == "openai_bad_response"
+    assert isinstance(second.value.__cause__, AttributeError)
+
+
+def test_a_classified_refusal_carries_the_retry_the_exchange_already_spent() -> None:
+    """Both seams, one rule: the arm that stamps the cost also completes the classification.
+
+    ``provider_retried`` is a fact about attempts already MADE, and only the caller knows it --
+    it is read off the HTTP exchange (``x-stainless-retry-count``), never off the body. The raw
+    arms of both regions passed it into the error they minted; the classified arms re-raised
+    the refusal untouched, so the ~12 shapes minted inside the mapping said "never retried"
+    about an exchange the SDK had already retried. A failed audit record that denies retries in
+    exactly the case where they happened is worse than no record.
+
+    Bound on both transports in one test on purpose: this asymmetry existed *because* a rule was
+    stated on one of two twin arms.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response, _terminal_chunk
+
+    # Sync: a malformed-but-TYPED shape, refused as a bare ``ModelAdapterError`` deep in the
+    # mapping -- the classified arm, not the raw one.
+    body = _billed_response_body(**_BILLED_BODY_REFUSALS["output-not-an-array"])
+    with pytest.raises(ModelAdapterError) as sync_side:
+        _parse_response(body, provider_retried=True)
+    assert sync_side.value.provider_error_code == "openai_bad_response"
+    assert sync_side.value.retryable is False
+    assert sync_side.value.provider_retried is True
+    assert provider_usage_of(sync_side.value) == _BILLED_RESPONSE_USAGE
+
+    # Streamed twin: the non-string ``id`` the terminal seam's docstring names as its reachable
+    # case, refused by the ingress normalizer inside the guard -- classified, and codeless.
+    with pytest.raises(ModelAdapterError) as stream_side:
+        _terminal_chunk(_billed_response_body(id=123), provider_retried=True)
+    assert stream_side.value.provider_error_code == "openai_bad_response"
+    assert stream_side.value.retryable is False
+    assert stream_side.value.provider_retried is True
+    assert provider_usage_of(stream_side.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_completing_a_refusals_class_never_weakens_what_it_already_said() -> None:
+    """The seam's two guards, stated directly: backfill only, upgrade only.
+
+    A refusal that already names a code knows something the seam does not, and
+    ``provider_retried=True`` is evidence that cannot be un-observed by a later caller who saw
+    no retry. Both halves are one-directional or the "completion" would be a downgrade.
+    """
+
+    from monoid_agent_kernel.providers.openai import _complete_billed_refusal
+
+    already_named = ModelAdapterError(
+        "refused with its own voice",
+        provider_error_code="openai_content_filter",
+        provider_retried=True,
+    )
+    _complete_billed_refusal(already_named, {}, provider_retried=False)
+    assert already_named.provider_error_code == "openai_content_filter"
+    assert already_named.provider_retried is True
+
+    bare = ModelAdapterError("refused bare")
+    _complete_billed_refusal(bare, {}, provider_retried=False)
+    assert bare.provider_error_code == "openai_bad_response"
+    assert bare.provider_retried is False
 
 
 def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -> None:
@@ -790,8 +938,9 @@ def test_a_terminal_payload_whose_usage_is_the_malformed_key_invents_nothing() -
     from monoid_agent_kernel.providers.base import provider_usage_of
     from monoid_agent_kernel.providers.openai import _terminal_chunk
 
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ModelAdapterError) as refused:
         _terminal_chunk(_billed_response_body(usage="nope"), provider_retried=False)
+    assert refused.value.provider_error_code == "openai_bad_response"
     assert provider_usage_of(refused.value) == {}
 
 
@@ -804,3 +953,573 @@ def test_a_well_formed_terminal_payload_builds_the_chunk_it_always_did() -> None
     assert chunk.usage == _BILLED_RESPONSE_USAGE
     assert chunk.stop_reason == "tool_calls"
     assert chunk.provider_retried is True
+
+
+# --- the completion seam covers the whole adapter, not two regions of it -----------------
+#
+# ``_parse_response`` and ``_terminal_chunk`` are stamped REGIONS inside two call paths that
+# also refuse in the code between and around them: the stream's event loop mints a bare refusal
+# per malformed frame, and the sync path's ``_coerce_response`` refuses a response object it
+# cannot read. Both escaped through arms that re-raised untouched -- so the SAME helper
+# (``_first_provider_string``) answered ``openai_bad_response`` from inside the region and an
+# empty code from the loop three lines above it, and one hop out the empty ones resolved to the
+# HOP's own ``gateway_bad_response``: the wrong-wire-blamed symptom the seam exists to stop.
+
+
+class _OpaqueResponse:
+    """Neither a pydantic model (no ``model_dump``) nor a mapping -- what ``_coerce_response``
+    refuses, and what the stream's terminal reader used to discard in silence."""
+
+
+class _FakeRawOpaqueTurn:
+    """A raw-response wrapper whose ``parse()`` yields a response the reader cannot read."""
+
+    def __init__(self, http_response: object) -> None:
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        return _OpaqueResponse()
+
+
+class _FakeRawUnparsableTurn:
+    """A raw-response wrapper whose ``parse()`` fails -- after an exchange the SDK retried."""
+
+    def __init__(self, http_response: object) -> None:
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        raise ValueError("could not decode the response body")
+
+
+def _malformed_call_frame() -> Any:
+    """``response.output_item.added`` for a function_call carrying neither ``call_id`` nor ``id``.
+
+    Refused by ``_first_provider_string(required=True)`` as a BARE ``ModelAdapterError``, minted
+    in the stream's event loop -- outside both stamped regions.
+    """
+
+    return SimpleNamespace(
+        type="response.output_item.added",
+        output_index=0,
+        item=SimpleNamespace(type="function_call", call_id=None, id=None, name="fs_read"),
+    )
+
+
+def test_a_stream_loop_refusal_leaves_classified_and_reports_the_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) The event loop's own refusals are the adapter's refusals, and must speak its code.
+
+    Uncoded, this reached the reference gateway as ``exc.provider_error_code or
+    GATEWAY_BAD_RESPONSE`` -- a 502 naming the hop's wire for an upstream frame defect -- while
+    the byte-identical malformation one function deeper answered ``openai_bad_response``. The
+    retry the exchange already spent is bound at the top of this same scope and was dropped.
+    """
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            [_malformed_call_frame()],
+            response=SimpleNamespace(request=_RequestWithRetryCount("2")),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _drain(_adapter())
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.provider_retried is True
+
+
+def test_a_stream_loop_refusal_after_the_terminal_frame_still_pays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) A malformed frame that arrives AFTER ``response.completed`` is a BILLED refusal.
+
+    The terminal payload -- with the counts the provider charged for -- is already in hand by
+    then, so the refusal is the only carrier left for a cost that really was incurred.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    events = [
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(model_dump=lambda: _billed_response_body()),
+        ),
+        _malformed_call_frame(),
+    ]
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(events, response=SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _drain(_adapter())
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+def test_a_sync_coerce_refusal_leaves_classified_and_reports_the_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) ``_coerce_response`` mints bare, one line below the region that would have named it."""
+
+    _stub_sync_openai(
+        monkeypatch, _FakeRawOpaqueTurn(SimpleNamespace(request=_RequestWithRetryCount("2")))
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.provider_retried is True
+
+
+def test_a_sync_parse_failure_reports_the_retry_the_enclosing_scope_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(d) The raw arm re-derived the retry fact from the exception and discarded the right one.
+
+    ``_provider_retried_by_the_sdk`` reads the exchange, and a ``ValueError`` from ``parse()``
+    carries no exchange at all -- so a call the SDK re-sent twice was recorded as a clean single
+    attempt. The enclosing scope had already read the true value off ``raw.http_response``.
+    """
+
+    _stub_sync_openai(
+        monkeypatch, _FakeRawUnparsableTurn(SimpleNamespace(request=_RequestWithRetryCount("2")))
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_retried is True
+
+
+def test_a_streamed_terminal_response_gets_the_sync_readers_coerce_twin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(e) Both halves of the twin the stream never had.
+
+    The sync reader spells its terminal read ``model_dump() if hasattr(...) else
+    _coerce_response(response)``: a plain mapping is ACCEPTED, anything else is REFUSED. The
+    stream's ``if ... and hasattr(...)`` silently discarded both -- so a billed streamed turn
+    whose terminal response is a mapping reported SUCCESS with zero usage (the run budget, the
+    receipt and the tenant ledger all recording a free call, the captured reasoning dropped),
+    and an unreadable one was not refused at all.
+    """
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            [SimpleNamespace(type="response.completed", response=_billed_response_body())]
+        ),
+    )
+    chunks = _drain(_adapter())
+    assert [type(chunk) for chunk in chunks] == [TurnComplete]
+    assert chunks[-1].usage == _BILLED_RESPONSE_USAGE, {
+        "carried_by_the_terminal_chunk": chunks[-1].usage,
+        "hint": "a mapping the sync twin accepts must not be dropped on the floor here",
+    }
+    assert chunks[-1].response_id == "resp_1"
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            [SimpleNamespace(type="response.completed", response=_OpaqueResponse())]
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _drain(_adapter())
+    assert refused.value.provider_error_code == "openai_bad_response"
+
+
+def test_the_new_arms_backfill_and_never_overwrite_a_refusal_that_named_itself() -> None:
+    """The completion arms cover the REQUEST build too, and must leave its verdict alone.
+
+    ``_classified_payload`` and the by-reference refusal both sit inside the widened region and
+    both name themselves -- and neither is a bad *response*. Backfill-only is what keeps a
+    seam that now spans the whole call from re-labelling a config-shaped refusal as an upstream
+    payload defect, which would flip its remedy from "fix the request" to "the provider is
+    broken" one hop out.
+    """
+
+    adapter = _adapter()
+    unserializable = ModelRequest(
+        instruction="hi", system_prompt="", tools=(), output_schema={"enum": {1, 2}}
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        adapter.next_turn(unserializable)
+    assert refused.value.provider_error_code == "unserializable_request"
+    assert refused.value.config_recoverable is True
+
+
+def test_naming_a_refusal_tolerates_a_type_that_refuses_the_attribute() -> None:
+    """The seam's third mutation joins its two siblings behind a guarded helper.
+
+    ``mark_provider_retried`` and ``mark_provider_usage`` both tolerate an exception type that
+    will not take the attribute, and state why: this runs INSIDE an except-handler, so a write
+    that raises replaces the provider's failure with the seam's own. The code stamp was a bare
+    ``setattr`` beside them -- and the population it runs over is exactly the one the gateway's
+    type-agnostic readers exist for, a third-party adapter refusing in its own type.
+    """
+
+    from monoid_agent_kernel.providers.openai import _complete_billed_refusal
+
+    class _ReadOnlyCode(Exception):
+        """A third-party refusal whose code is a computed, read-only property."""
+
+        @property
+        def provider_error_code(self) -> str:
+            return ""
+
+    refusing = _ReadOnlyCode("a third-party adapter's own refusal")
+    _complete_billed_refusal(refusing, {}, provider_retried=True)  # type: ignore[arg-type]
+    assert refusing.provider_error_code == ""
+
+
+# --- the RAW arms of the same two trys pay what the turn already cost ---------------------
+#
+# The completion arm of each call path carries the cost; the raw arm beside it -- the same
+# ``try``, one line down -- minted its error and threw the payload away. Both raw arms are
+# reachable AFTER a billed body is in hand: the stream keeps emitting frames past
+# ``response.completed`` and the connection can drop there (``_connection_error_code``'s own
+# docstring names that lane), and the sync call's pool teardown runs in a ``finally`` after the
+# body has parsed. A network drop is honestly retryable and stays so; what was wrong is only
+# that the turn's cost went with it.
+
+
+class _DroppedAsyncStream(_FakeAsyncStream):
+    """A stream that keeps emitting after ``response.completed`` and then drops mid-body.
+
+    The SDK translates transport failures into ``APIConnectionError`` only up to the response
+    headers, so a drop while the BODY streams arrives as the raw ``httpx`` family instead --
+    which is exactly the lane that reaches the adapter's classifier with a terminal payload
+    already captured.
+    """
+
+    def __init__(
+        self, events: list[Any], error: Exception, response: object | None = None
+    ) -> None:
+        super().__init__(events, response)
+        self._error = error
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise self._error from None
+
+
+def _terminal_event() -> Any:
+    return SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(model_dump=lambda: _billed_response_body()),
+    )
+
+
+def test_a_drop_after_the_streams_terminal_response_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streamed raw arm: the counts were captured, then the connection went.
+
+    The classified arm two lines above stamps this same ``final_data``; the raw one beside it
+    minted a network error with nothing, so a turn the provider generated and billed was metered
+    at zero by the receipt, the run's budget and the tenant ledger behind it.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_async_openai(
+        monkeypatch,
+        _DroppedAsyncStream(
+            [_terminal_event()], httpx.ReadError("the connection dropped mid-body")
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _drain(_adapter())
+
+    assert provider_usage_of(dropped.value) == _BILLED_RESPONSE_USAGE
+    # The classification itself is untouched: a drop is a drop, and waiting is still the remedy.
+    assert dropped.value.provider_error_code == "openai_network_error"
+    assert dropped.value.retryable is True
+
+
+def test_a_drop_before_the_terminal_response_invents_no_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight: mid-stream usage is genuinely unknowable, so nothing is claimed."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_async_openai(
+        monkeypatch,
+        _DroppedAsyncStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="half an ans")],
+            httpx.ReadTimeout("the connection stopped answering"),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _drain(_adapter())
+
+    assert provider_usage_of(dropped.value) == {}
+    assert dropped.value.provider_error_code == "openai_timeout"
+
+
+def test_a_teardown_that_fails_after_a_billed_body_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync raw arm: ``data`` is bound, and the ``finally``'s close is what failed.
+
+    The client's own lifecycle is inside this call's failure surface deliberately, so a pool
+    teardown that raises replaces the outcome of a body that already parsed -- and the
+    replacement carried none of the cost the body reported.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_billed_response_body(), SimpleNamespace(request=_RequestWithRetryCount("0"))),
+        close_error=RuntimeError("the connection pool teardown failed"),
+    )
+    with pytest.raises(ModelAdapterError) as failed:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert provider_usage_of(failed.value) == _BILLED_RESPONSE_USAGE
+
+
+class _FakeRawMappingTurn:
+    """A raw wrapper whose ``parse()`` yields a Mapping that is not a ``dict``.
+
+    ``_coerce_response`` is ``dict``-only and refuses it; ``usage_reported_by`` accepts any
+    Mapping. So the body is READABLE for its cost by the very seam that refused it -- and the
+    sync completion arm was handing that seam ``None`` unconditionally.
+    """
+
+    def __init__(self, data: dict[str, Any], http_response: object) -> None:
+        self._data = MappingProxyType(data)
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        return self._data
+
+
+def test_a_coerce_refusal_off_a_readable_mapping_still_reports_its_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync classified arm: refusing the CONTAINER is not refusing to read the cost."""
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawMappingTurn(
+            _billed_response_body(), SimpleNamespace(request=_RequestWithRetryCount("2"))
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.provider_retried is True
+    assert provider_usage_of(refused.value) == _BILLED_RESPONSE_USAGE
+
+
+# --- the retry a call the run ABANDONS can still report -----------------------------------
+#
+# Every other carrier of ``provider_retried`` belongs to an outcome: a turn, a chunk, an
+# exception this adapter raised. A call the run abandons mid-flight -- a deadline landing while
+# the body parses or the stream drains -- produces none of them, and the receipt is built from
+# the ``RunTimeout``/``RunCancelled`` the race raised, which the adapter never touched. The
+# gateway adapter reports into the channel that crosses that abandonment
+# (``report_provider_retried``, at both of its retry sites); this adapter learned the same fact
+# off the exchange and told nobody, so the identical race recorded a clean single attempt on
+# one adapter and the truth on the other.
+
+
+def test_the_sync_path_reports_a_retry_the_run_may_never_see_an_outcome_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    with collect_retry_reports() as progress:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert progress.retried is True, {
+        "hint": "the SDK's own retry loop ran and the channel that survives abandonment "
+        "heard nothing",
+    }
+
+
+def test_the_streamed_path_reports_a_retry_on_the_same_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            _stream_events(), response=SimpleNamespace(request=_RequestWithRetryCount("1"))
+        ),
+    )
+    with collect_retry_reports() as progress:
+        _drain(_adapter())
+
+    assert progress.retried is True
+
+
+def test_an_unretried_call_reports_nothing_on_either_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight: the channel reports what happened, never that a call was made."""
+
+    from monoid_agent_kernel.providers.base import collect_retry_reports
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawTurn(_SUCCESS_DATA, SimpleNamespace(request=_RequestWithRetryCount("0"))),
+    )
+    with collect_retry_reports() as sync_progress:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+    assert sync_progress.retried is False
+
+    _stub_async_openai(monkeypatch, _FakeAsyncStream(_stream_events()))
+    with collect_retry_reports() as stream_progress:
+        _drain(_adapter())
+    assert stream_progress.retried is False
+
+
+# --- a stream that simply stops is not a settled turn -------------------------------------
+#
+# The one-shot path REFUSES a truncated body: an undecodable 200 fails the body read and is
+# classified. The stream had no such rule -- a body that ends by clean EOF without
+# ``response.completed``/``response.incomplete`` leaves ``final_data`` empty, and the terminal
+# chunk built after the drain synthesized ``stop_reason="stop"`` with zero usage. So half an
+# answer was presented to the loop as a complete one, settled, and recorded as a free call.
+
+
+def test_a_stream_that_ends_without_a_terminal_response_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two deltas and then the body stops: the sync twin refuses this, and now so does this."""
+
+    _stub_async_openai(
+        monkeypatch,
+        _FakeAsyncStream(
+            [
+                SimpleNamespace(type="response.output_text.delta", delta="The answer is 42 "),
+                SimpleNamespace(type="response.output_text.delta", delta="and the reason"),
+            ],
+            response=SimpleNamespace(request=_RequestWithRetryCount("2")),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as truncated:
+        _drain(_adapter())
+
+    assert truncated.value.provider_error_code == "openai_bad_response"
+    assert truncated.value.retryable is False
+    assert truncated.value.provider_retried is True
+
+
+def test_a_stream_that_reaches_its_terminal_response_settles_as_it_always_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight, on both terminal spellings: a healthy stream is untouched."""
+
+    for terminal in ("response.completed", "response.incomplete"):
+        _stub_async_openai(
+            monkeypatch,
+            _FakeAsyncStream(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="ok"),
+                    SimpleNamespace(
+                        type=terminal,
+                        response=SimpleNamespace(model_dump=lambda: _billed_response_body()),
+                    ),
+                ]
+            ),
+        )
+        chunks = _drain(_adapter())
+        assert [type(chunk) for chunk in chunks] == [TextDelta, TurnComplete]
+        assert chunks[-1].usage == _BILLED_RESPONSE_USAGE
+
+
+# --- the body-read phase speaks the adapter's one payload-defect code ---------------------
+
+
+class _FakeRawUndecodableTurn:
+    """A raw wrapper whose ``parse()`` fails the way a truncated 200 body fails.
+
+    ``LegacyAPIResponse.parse`` calls ``response.json()`` on a JSON content type, so an
+    incomplete body raises ``json.JSONDecodeError`` -- a ``ValueError`` -- out of the body read.
+    """
+
+    def __init__(self, http_response: object) -> None:
+        self.http_response = http_response
+
+    def parse(self) -> object:
+        raise json.JSONDecodeError("Unterminated string", '{"id": "resp_1", "outp', 22)
+
+
+def test_an_undecodable_body_is_refused_in_the_adapters_own_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 1-of-3 body-read site whose raw failures were still anonymous.
+
+    ``_parse_response`` and ``_terminal_chunk`` both mint ``openai_bad_response`` for a raw
+    body-read failure, and the very next line's ``_coerce_response`` refusal answers the same
+    code -- while a truncated or undecodable 200 answered ``unclassified_provider_error``, which
+    names no class of failure at all and carries no remedy.
+    """
+
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawUndecodableTurn(SimpleNamespace(request=_RequestWithRetryCount("2"))),
+    )
+    with pytest.raises(ModelAdapterError) as refused:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert refused.value.provider_error_code == "openai_bad_response"
+    assert refused.value.retryable is False
+    assert refused.value.provider_retried is True
+
+
+class _FakeRawDroppedTurn:
+    """A raw wrapper whose ``parse()`` touches the network and finds it gone."""
+
+    def __init__(self, http_response: object, error: Exception) -> None:
+        self.http_response = http_response
+        self._error = error
+
+    def parse(self) -> object:
+        raise self._error
+
+
+def test_a_connection_failure_while_reading_the_body_keeps_its_network_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight the split needs: "unreadable" and "unreachable" are different answers.
+
+    A payload defect is terminal and the caller's provider is broken; a dropped connection is
+    retryable and waiting is the remedy. The narrow guard routes the connection family back to
+    the classifier rather than renaming it.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    _stub_sync_openai(
+        monkeypatch,
+        _FakeRawDroppedTurn(
+            SimpleNamespace(request=_RequestWithRetryCount("0")),
+            httpx.ReadTimeout("the body stopped arriving"),
+        ),
+    )
+    with pytest.raises(ModelAdapterError) as dropped:
+        _adapter().next_turn(ModelRequest(instruction="hi", system_prompt="", tools=()))
+
+    assert dropped.value.provider_error_code == "openai_timeout"
+    assert dropped.value.retryable is True

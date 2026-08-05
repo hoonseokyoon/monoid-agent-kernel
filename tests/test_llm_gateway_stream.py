@@ -8,7 +8,9 @@ Async tests use asyncio.run from sync functions (no pytest-asyncio), matching th
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import io
 import json
 from pathlib import Path
@@ -347,12 +349,13 @@ def test_gateway_adapter_raises_on_mid_stream_error_frame() -> None:
 # --- the terminal payload a refused stream was already billed for -------------------------
 #
 # The OpenAI adapter stamps what a refused end-of-turn payload cost (``_terminal_chunk``), and
-# every refusal in that region is a RAW ``ValueError``/``AttributeError``: the stream never runs
-# the one-shot mapping that raises ``ModelAdapterError``. Both consumers on THIS route read the
-# stamp off the escaping exception -- the tenant ledger and the SSE error frame -- and both were
-# gated on ``ModelAdapterError``, so a stream whose final payload is malformed charged the tenant
-# nothing, told the client nothing, and came back ``retryable=True``: an invitation to buy the
-# same tokens again.
+# since the chip classification every refusal in that region leaves as non-retryable
+# ``openai_bad_response`` -- the shapes that used to escape as RAW ``ValueError``/
+# ``AttributeError`` included. Both consumers on THIS route (the tenant ledger and the SSE
+# error frame) stayed type-agnostic through that change deliberately: they were widened for
+# the raw era, and a third-party upstream can still refuse raw. What the classification fixes
+# on this wire is the VERDICT: the raw shapes used to answer 500 ``retryable=True`` -- an
+# invitation to buy the same tokens again -- and now answer 502, non-retryable, with a name.
 
 _BILLED_TERMINAL_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
 
@@ -365,7 +368,8 @@ def _malformed_billed_terminal_payload() -> dict[str, Any]:
         "status": "completed",
         "usage": dict(_BILLED_TERMINAL_USAGE),
         # The terminal reader walks ``output`` for tool calls and for the stop reason, so a
-        # string there refuses with a raw ``AttributeError`` -- on a turn already generated.
+        # string there refuses (a raw ``AttributeError`` under the hood, classified on the way
+        # out) -- on a turn already generated.
         "output": "not-an-array",
     }
 
@@ -408,10 +412,227 @@ def test_a_stream_refused_on_its_terminal_payload_still_charges_the_tenant() -> 
         "hint": "the refusal carries what the stream already burned; the frame is the only "
         "carrier a streaming client has left",
     }
+    # The classified verdict on the frame: named, non-retryable -- the 500 retryable:true this
+    # shape used to answer told a streaming client to buy the same tokens again.
+    assert errors[0]["error_code"] == "openai_bad_response"
+    assert errors[0]["retryable"] is False
     assert gateway.tenant_usage("tenant_a")["total_tokens"] == 460, {
         "tenant_ledger": gateway.tenant_usage("tenant_a"),
         "hint": "the generator exits on the raise, before the success-path meter",
     }
+
+
+def test_the_assembler_refuses_a_malformed_streamed_usage_classified() -> None:
+    """A malformed streamed usage is refused classified -- by the INGRESS, not by the guard.
+
+    Honest about which code answers: ``assemble_streamed_turn`` normalizes every chunk through
+    ``ModelStreamIngressNormalizer`` before folding it, and that pass refuses this payload. The
+    fold's own ``normalize_usage`` re-run downstream is therefore unreachable through the public
+    function, and this test would stay green with its guard deleted -- which is exactly why the
+    guard is bound structurally instead, by
+    ``test_the_folds_usage_renormalization_stays_structurally_guarded`` below. What this test
+    pins is the runtime claim it can actually make: the refusal is a ``ModelAdapterError``,
+    never a raw ``ValueError``, whichever pass caught it.
+    """
+
+    with pytest.raises(ModelAdapterError):
+        assemble_streamed_turn([TurnComplete(usage={"input_tokens": "many"})])  # type: ignore[dict-item]
+
+
+def _assert_the_fold_guard_binds_its_refusal(source: str) -> None:
+    """The body of the pin below, over source text so a mutation can be shown to move it.
+
+    A structural pin is only worth its cost if the edits it exists to catch actually turn it
+    red, and the only way to demonstrate that without editing the repo is to run the pin
+    against a mutated copy of the same source. Hence the split.
+    """
+
+    tree = ast.parse(source)
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "normalize_usage"
+            for statement in node.body
+            for inner in ast.walk(statement)
+        )
+    ]
+    assert len(guarded) == 1, {
+        "guarded_normalize_usage_calls": len(guarded),
+        "hint": "the fold's re-normalization lost its guard, or grew a second one",
+    }
+
+    minted = [
+        node
+        for handler in guarded[0].handlers
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "ModelAdapterError"
+    ]
+    assert len(minted) == 1, {
+        "hint": "the handler must refuse in the ingress's classified voice, never re-raise raw",
+    }
+    message = minted[0].exc.args[0]
+    assert isinstance(message, ast.Constant), {"hint": "the refusal's message anchors this pin"}
+    assert message.value == "model adapter returned a non-portable stream fragment"
+
+    # The VALUES, not the key names. Comparing the name set alone had its verdicts exactly
+    # inverted against the two edits that matter: flipping ``retryable=False`` to ``True`` --
+    # the loosening this pin's own docstring claims to catch -- left the set unchanged and
+    # stayed GREEN, while adding a legitimate third keyword changed the set and went RED. So a
+    # superset test for presence, and an expression test for what each one actually says.
+    bound = {keyword.arg: keyword.value for keyword in minted[0].exc.keywords}
+    assert {"retryable", "provider_retried"} <= set(bound), {
+        "bound_keywords": sorted(name for name in bound if name),
+        "hint": "an un-flagged refusal drops the classification and the fold's retry fact",
+    }
+    retryable = bound["retryable"]
+    assert isinstance(retryable, ast.Constant) and retryable.value is False, {
+        "retryable_is": ast.unparse(retryable),
+        "hint": "a payload defect is not something a retry clears; this must stay a literal False",
+    }
+    retried = bound["provider_retried"]
+    assert isinstance(retried, ast.Name) and retried.id == "provider_retried", {
+        "provider_retried_is": ast.unparse(retried),
+        "hint": "the retry fact must be CARRIED from the fold, not restated as a literal",
+    }
+
+
+def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
+    """The pin for code no input can reach: read the fold's own source and hold its shape.
+
+    The guard exists because deleting normalization is a loosening-shaped edit and a future
+    caller that reaches the fold around the ingress must refuse in the ingress's classified
+    voice. Nothing can drive it today, so a behavioral pin is impossible and a *source* pin is
+    the only honest binding -- the repo's census style, message-anchored so that deleting the
+    guard, or downgrading the classification it states, goes red.
+    """
+
+    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(assemble_streamed_turn))
+
+
+def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
+    """Prove the pin above, by mutating the source it reads rather than the repo.
+
+    A structural pin cannot be trusted on its wording: it is a claim about which edits turn it
+    red, and that claim is testable. This one earned the check -- the name-set comparison it
+    replaces was GREEN on the loosening it advertised and RED on a strengthening, which is the
+    worst of both directions.
+    """
+
+    source = inspect.getsource(assemble_streamed_turn)
+    _assert_the_fold_guard_binds_its_refusal(source)  # unmutated: green
+
+    def _mutant(old: str, new: str) -> str:
+        mutated = source.replace(old, new)
+        assert mutated != source, {"hint": "the mutation did not apply; the anchor moved"}
+        return mutated
+
+    loosened = _mutant(
+        '"model adapter returned a non-portable stream fragment",\n            retryable=False,',
+        '"model adapter returned a non-portable stream fragment",\n            retryable=True,',
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(loosened)
+
+    restated = _mutant(
+        "provider_retried=provider_retried,\n        ) from exc",
+        "provider_retried=False,\n        ) from exc",
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(restated)
+
+    # Deleting the guard is still the primary edit this pin exists for.
+    lines = source.splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "try:" and "normalize_usage" in "\n".join(lines[index : index + 8])
+    )
+    end = next(
+        index
+        for index, line in enumerate(lines[start:], start)
+        if line.strip().startswith("return ModelTurn(")
+    )
+    guardless = "\n".join(
+        lines[:start]
+        + ["    normalized_usage = normalize_usage(usage) if usage else {}"]
+        + lines[end:]
+    )
+    with pytest.raises(AssertionError):
+        _assert_the_fold_guard_binds_its_refusal(guardless)
+
+    # ...and STRENGTHENING must pass. The old pin failed here, which is how a pin teaches the
+    # next author to weaken it instead of adding to it.
+    _assert_the_fold_guard_binds_its_refusal(
+        _mutant(
+            "            provider_retried=provider_retried,\n        ) from exc",
+            "            provider_retried=provider_retried,\n"
+            '            provider_error_code="stream_bad_usage",\n        ) from exc',
+        )
+    )
+
+
+def test_a_streamed_tool_call_refusal_pays_for_the_turn_it_was_billed() -> None:
+    """The fold's own refusals are billed refusals: the deltas arrived, the provider charged.
+
+    ``assemble_streamed_turn`` is the streamed twin of ``_parse_response``, and the sync side
+    pays through that reader's stamping seam. Here the two ``stream_bad_tool_args`` raises --
+    a model emitting non-JSON function-call arguments is ordinary -- escaped with no usage and
+    no ``provider_retried``, though the fold is holding both by then. So a streamed turn the
+    provider generated and billed was metered at zero at the tenant ledger and in the run's
+    token budget, the one carrier left for its cost saying nothing.
+    """
+
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    billed = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+    with pytest.raises(ModelAdapterError) as unparsable:
+        assemble_streamed_turn(
+            [
+                ToolCallDelta(
+                    index=0,
+                    id="c1",
+                    name="fs_read",
+                    arguments_fragment="{not json",
+                    provider_retried=True,
+                ),
+                TurnComplete(usage=dict(billed), provider_retried=True),
+            ]
+        )
+    assert unparsable.value.provider_error_code == "stream_bad_tool_args"
+    assert unparsable.value.retryable is False
+    assert unparsable.value.provider_retried is True
+    assert provider_usage_of(unparsable.value) == billed, {
+        "carried_by_the_refusal": provider_usage_of(unparsable.value),
+        "hint": "the deltas were delivered and the terminal frame reported the cost",
+    }
+
+    # The twin raise two lines below it, which decodes cleanly and is refused for its TYPE.
+    with pytest.raises(ModelAdapterError) as not_an_object:
+        assemble_streamed_turn(
+            [
+                ToolCallDelta(index=0, id="c1", name="fs_read", arguments_fragment="[1, 2]"),
+                TurnComplete(usage=dict(billed)),
+            ]
+        )
+    assert not_an_object.value.provider_error_code == "stream_bad_tool_args"
+    assert not_an_object.value.retryable is False
+    assert not_an_object.value.provider_retried is False
+    assert provider_usage_of(not_an_object.value) == billed
+
+    # And the counterweight the stamp needs: a stream that reported no cost invents none.
+    with pytest.raises(ModelAdapterError) as costless:
+        assemble_streamed_turn(
+            [ToolCallDelta(index=0, id="c1", name="fs_read", arguments_fragment="{not json")]
+        )
+    assert provider_usage_of(costless.value) == {}
 
 
 def test_the_client_behind_that_stream_reports_what_the_refusal_cost() -> None:
@@ -1130,3 +1351,165 @@ def test_neither_loop_assigns_its_own_retry_verdict_over_the_wires(monkeypatch: 
         "the streamed loop overwrote the gateway's own retry"
     )
     assert assemble_streamed_turn(streamed).provider_retried is True
+
+
+# --- a drop AFTER the terminal frame is a drop the hop already metered --------------------
+#
+# `gateway_network_error` is minted the same way whether the connection went before the
+# terminal frame or after it, and the two are not the same call: after it, the hop has already
+# reported what the turn cost and metered it against the tenant. The refusal is the only carrier
+# left -- no turn is assembled and no chunk survives the raise -- so an unstamped mint made the
+# outer receipt and the run's token budget under-count a turn that really was bought.
+
+_DROPPED_STREAM_USAGE = {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460}
+
+
+def _dropping_stream_client(httpx: Any, *, lines: list[str], drop: Exception) -> Any:
+    """An `AsyncClient` whose committed stream yields `lines` and then loses the connection."""
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            for line in lines:
+                yield line
+            raise drop
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    return _Client
+
+
+def _dropping_adapter(monkeypatch: Any, httpx: Any, *, lines: list[str], drop: Exception) -> Any:
+    monkeypatch.setattr(
+        httpx, "AsyncClient", _dropping_stream_client(httpx, lines=lines, drop=drop)
+    )
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+    return GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+
+def test_a_stream_drop_after_the_terminal_frame_reports_what_the_hop_metered(
+    monkeypatch: Any,
+) -> None:
+    """The terminal frame arrived, the counts are in hand, and then the socket went."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter = _dropping_adapter(
+        monkeypatch,
+        httpx,
+        lines=[
+            'data: {"type":"text_delta","text":"hi"}',
+            "",
+            'data: {"type":"turn_complete","response_id":"turn_1","usage":'
+            '{"input_tokens":120,"output_tokens":340,"total_tokens":460}}',
+            "",
+        ],
+        drop=httpx.RemoteProtocolError("the peer closed the connection mid-body"),
+    )
+
+    with pytest.raises(ModelAdapterError) as dropped:
+        _stream(adapter)
+
+    assert provider_usage_of(dropped.value) == _DROPPED_STREAM_USAGE, {
+        "carried_by_the_refusal": provider_usage_of(dropped.value),
+        "hint": "drop-after-terminal is indistinguishable from drop-before on the wire it mints",
+    }
+    # The classification is untouched: a committed stream cannot be replayed, so it stays
+    # terminal, and it is still a network failure.
+    assert dropped.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert dropped.value.retryable is False
+
+
+def test_a_stream_drop_before_the_terminal_frame_invents_no_cost(monkeypatch: Any) -> None:
+    """The counterweight: what the deltas cost is unknowable until the frame says so."""
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter = _dropping_adapter(
+        monkeypatch,
+        httpx,
+        lines=['data: {"type":"text_delta","text":"half an ans"}', ""],
+        drop=httpx.RemoteProtocolError("the peer closed the connection mid-body"),
+    )
+
+    with pytest.raises(ModelAdapterError) as dropped:
+        _stream(adapter)
+
+    assert provider_usage_of(dropped.value) == {}
+    assert dropped.value.provider_error_code == GATEWAY_NETWORK_ERROR
+
+
+def test_a_pool_teardown_after_the_terminal_frame_reports_what_the_hop_metered(
+    monkeypatch: Any,
+) -> None:
+    """The client-lifecycle handler is the same mint one scope out, and the same loss.
+
+    The stream drains cleanly, the terminal frame reports its cost, and the `__aexit__` that
+    tears the pool down is what raises -- outside the per-attempt handler, into the arm that
+    classifies the client's own lifecycle.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):  # noqa: ANN202
+            yield (
+                'data: {"type":"turn_complete","response_id":"turn_1","usage":'
+                '{"input_tokens":120,"output_tokens":340,"total_tokens":460}}'
+            )
+            yield ""
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            raise httpx.CloseError("pool teardown failed")
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    adapter = GatewayModelAdapter(
+        config=ModelConfig(gateway_url="http://gateway.invalid"), token="t"
+    )
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(adapter)
+
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert provider_usage_of(caught.value) == _DROPPED_STREAM_USAGE

@@ -7,6 +7,335 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the third group's newly-covered members are named, and stale sentences retire
+
+- **`docs/COMPATIBILITY.md`'s "the third group did not move at all" is scoped and corrected.**
+  It was true of the dozen refusals raised *inside* the adapter's two stamped regions, which
+  already carried their `usage` and `provider_retried` before v0.21 — for those the `error_code`
+  changed and nothing else did. It was false of the members v0.21 *added* to that group (the
+  stream's per-frame field validators and the blocking path's `_coerce_response`): those gained
+  `provider_retried` and gained a `usage` object where the body previously had **no `usage` key
+  at all**, since the writer omits it when the failure cost nothing. That is a wire-shape change
+  on those shapes, and it is now stated as one — a client summing `usage` across failures will
+  count tokens on calls it used to count as free, which is the correction. Neither sub-group
+  moved on recoverability. The third-party-adapter paragraph beside it now names the one field
+  those raw refusals gained too.
+- **The gateway meter's comment stops naming the shipped adapter as its reason.** `_meter_failure`
+  still catches `Exception` rather than `ModelAdapterError`, but "every refusal in the OpenAI
+  stream's terminal region is a raw `ValueError`/`AttributeError`" has not been true since that
+  region learned to re-mint its raw refusals classified. The real remaining reason is the one
+  the wide guard was always worth having for: the provider seam is pluggable, and a third-party
+  adapter's refusals are its own to name.
+- **`_model_error_from_openai`'s docstring names the shapes that actually reach it.** Its
+  `known_provider_retried` example was a `raw.parse()` failure, which now leaves the body-read
+  guard classified and carrying that value itself. The upgrade still matters for the two shapes
+  that arrive after the exchange committed — a client teardown that raises, and a mid-stream
+  transport drop whose `httpx` `request` property raises when read — and those are what it names
+  now. Two changelog entries earlier in this section are scoped the same way.
+
+### Fixed — a truncated stream refuses instead of settling, and the body-read phase speaks the one code
+
+- **An OpenAI stream that ends without `response.completed`/`response.incomplete` is refused,
+  not settled.** A body that stopped by clean EOF left `final_data` empty and the terminal chunk
+  built after the drain synthesized `stop_reason="stop"` with zero usage — so half an answer
+  reached the loop as a complete one, settled, and metered as a free call. The one-shot twin
+  already refuses exactly this condition: a truncated 200 fails its body read and is classified.
+  Now both do, as a non-retryable `openai_bad_response` carrying the call's `provider_retried`
+  and no invented cost. Asked as a fact about the *stream* (a terminal response was captured)
+  rather than about the contents of the payload, so an empty terminal body is still a stream
+  that ended properly. A consumer that abandons the stream mid-flight is unaffected — its
+  `GeneratorExit` never reaches the check, and that call has an outcome of its own.
+- **The body-read phase answers `openai_bad_response` like the adapter's other two.** `raw.parse()`
+  plus the model dump/coerce is the third body-read site, and the only one whose raw failures
+  still escaped as `unclassified_provider_error` — while `_parse_response` and `_terminal_chunk`
+  both mint `openai_bad_response` for the same kind of failure, and the `_coerce_response` on
+  the very next line already answered it. Enumerated rather than assumed: `LegacyAPIResponse.parse`
+  reads `response.json()` on a JSON content type (a `json.JSONDecodeError` on an incomplete
+  body), validates the model (`APIResponseValidationError`, whose 200 status the classifier
+  cannot use), and touches `response.text` (`httpx.ResponseNotRead`) — every one of them a
+  statement that the body could not be read. The narrow guard routes the connection family back
+  to the classifier first, because "unreadable" and "unreachable" are different answers with
+  different remedies: a payload defect is terminal, a dropped connection is retryable.
+
+### Fixed — the retry fact rides every lane that learned it
+
+- **The frameless-stream checks read the retry the wire reported.** The gateway server stamps
+  `provider_retried` on *every* frame precisely so the fact survives a stream that never reaches
+  its terminal frame — and the client's frameless branch was the one reader ignoring it, passing
+  `attempt > 1` (its own retry loop, and nothing else) to all three checkers while the
+  terminal-frame site beside it passes `chunk.provider_retried`, which is the wire's fact
+  combined with the client's. So a gateway backend that retried and then sent a body ending
+  before its terminal frame was refused with a receipt claiming a clean single attempt — on the
+  one carrier a refused turn has left. The drain now retains what the frames said (reset per
+  attempt, beside `saw_terminal`) and the branch reads the same conjunction the framed one does.
+  The conformance ledger's by-design entry for this asymmetry retires with it: the premise it
+  rested on — "a stream with no terminal frame carries no server-side retry evidence to read" —
+  was simply not true of the wire the server writes.
+- **Both reference-gateway error writers read the flag off any exception, like the cost beside
+  it.** `_write_exception` reads `provider_usage_of(exc)` once above the branch on the stated
+  rule that the stamp does not belong to a type, then passed `provider_retried` on the
+  `ModelAdapterError` arm alone — though `mark_provider_retried` stamps an arbitrary
+  `BaseException` (the gateway client's own `_stamp_retry` documents exactly that), so an
+  upstream adapter that retried and then refused in a raw `ValueError`/`AttributeError` was
+  carrying a readable flag that nothing read. `_stream_error_frame` had the same shape. Both now
+  read it once above the branch, leniently, and pass it on every arm.
+- **The OpenAI adapter reports its SDK's retries on the channel that survives abandonment.** It
+  learns the fact off the exchange on both paths and stamped it onto outcomes only — the turn,
+  the chunks, the exceptions it mints — so a call the run abandons mid-flight (a deadline
+  landing while the body parses or the stream drains) produced none of them and the receipt,
+  built from the `RunTimeout`/`RunCancelled` the race raised, recorded a clean single attempt.
+  `GatewayModelAdapter` reports at both of its own retry sites for exactly that reason, so the
+  identical race told the truth on one adapter and not the other. One `report_provider_retried`
+  at each learn site, when there is something to report.
+
+### Fixed — the permission-policy adoption gate reads fields, not the class
+
+- **`LoopBootstrapper` adopts the operator's `spec.permission_policy` whichever class carries
+  the loop's own.** The gate asked `loop.permission_policy == PermissionPolicy()`, and a
+  generated dataclass `__eq__` is class-exact — the third unbound site of the exact rule
+  `ReasoningConfig`/`GenerationConfig` were fixed for. A deployment's extension subclass with
+  both pattern tuples empty therefore answered "the caller configured this", so the operator's
+  `deny_patterns`/`redact_patterns` were silently **not** adopted and the loop enforced the
+  empty policy at every `self.permission_policy` site — while the subagent sites read
+  `self.spec.permission_policy` directly, leaving half a run honouring the operator's lists and
+  half not. Such subclasses reach the gate intact by design: the spec validator gates on
+  `isinstance`. `PermissionPolicy` now answers `is_default` off the two fields it declares, and
+  the bootstrap asks that instead. Adoption is still for defaults only: a policy with a kernel
+  field set — on the base class or on a subclass — is a configured policy and is never
+  overwritten.
+- **One rule, one home.** `matches_the_kernel_defaults` moved to `_policy_util` because
+  `core.spec` imports `permissions` and the two cannot import each other; that module imports
+  nothing of the package, so it is the one place all three gates can reach. The rationale is
+  the same on all three, said in the terms each one guards: extension fields are invisible to
+  the projection for the model configs and invisible to enforcement for the policy, so they
+  must be invisible to the gate.
+
+### Fixed — the raw arms pay what the turn already cost
+
+- **A connection that drops *after* the OpenAI stream's terminal response reports what that
+  turn cost.** The rule "a refusal carries the billed cost" was bound to the classified arm of
+  `astream_turn`'s guard and not to the raw arm two lines below it — and the raw arm is exactly
+  where this case lands: a stream can go on emitting frames after `response.completed`, and the
+  SDK translates transport failures into `APIConnectionError` only up to the response headers,
+  so a drop while the *body* streams arrives as a raw `httpx.ReadError`/`ReadTimeout`/
+  `RemoteProtocolError`. The counts were already captured and the error left with `usage: {}`,
+  so the receipt, the run's token budget and (across a hop) the tenant ledger all recorded zero
+  for a turn the provider generated and billed. A drop *before* the terminal frame still carries
+  nothing: mid-stream usage is genuinely unknowable. Retryability is unchanged — a dropped
+  socket is honestly retryable, and only the lost cost was the defect.
+- **The blocking path's twin, on both of its arms.** `next_turn`'s raw arm is reachable with a
+  billed body already parsed — the client's own `close()` runs in an inner `finally` and an
+  exception there *replaces* the call's outcome — and its classified arm was handing the
+  completion seam `None` unconditionally, discarding a readable cost whenever the refusal was
+  `_coerce_response`'s: that reader is `dict`-only while `usage_reported_by` accepts any
+  `Mapping`, so a Mapping-but-not-`dict` response is refused for its container and perfectly
+  readable for its cost. Both arms now read one expression (`_readable_payload`) over the two
+  phases of the body read, pre-initialized so a failure before either phase answers with the
+  provider's failure rather than a `NameError`.
+- **The gateway client stops under-counting a stream the hop already metered.** Both of
+  `astream_turn`'s `httpx.HTTPError` handlers — the per-attempt one and the client-lifecycle one
+  that catches a pool teardown — minted `gateway_network_error` with an empty stamp, so a drop
+  *after* the terminal frame was indistinguishable on the wire from a drop before it. The drain
+  now retains what the stream reported spending (reset per attempt, beside `saw_terminal`) and
+  every mint carries it through the same guarded helper. `retryable` and `error_code` are
+  untouched on both branches.
+
+### Fixed — the pin binds values, the sweep covers the family, four sentences stop over-claiming
+
+- **The fold-guard structural pin had its verdicts inverted.** It compared only the keyword
+  *names* on the refusal it parses, so mutating `retryable=False` to `True` — the exact
+  loosening its own docstring claims to catch — left the name set unchanged and stayed green,
+  while adding a legitimate third keyword changed the set and went red. It now asserts the
+  values (a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact) with the name set tested as a superset, and a companion test mutates the source in
+  memory to show the pin moving on each edit it claims to catch.
+- **The shipped-runtime-config sweep replays the whole proof family.** It drove only
+  `_check_reasoning_applied`, but `generation.on_unsupported` governs two more checkers with the
+  identical shipped-refusal shape. All three are now derived exactly as the three real
+  enforcement sites derive them and replayed against a silent upstream. Born green — neither
+  shipped config sets a sampling control, and a runtime config cannot carry an output schema —
+  which is what an enumeration-breadth pin is for.
+- **Four sentences corrected against the code they describe.** `docs/COMPATIBILITY.md` now
+  attributes the park→terminal move to *both* answers that made it (the 400 lost its
+  recoverable status range; the 500's `retryable: true`, which `AgentLoop` reads *before* the
+  status, became `false`) and states plainly that the ~13 already-502 shapes changed their name
+  and nothing else — same status, same flags, same `usage`, same verdict. Its gateway-author
+  guidance now says three attempts (two retries) per `model.retry.max_attempts`, and derives the
+  bare-502 re-buy from the conjunction that actually causes it: a body omitting **both**
+  `retryable` and `error_code`, since `_should_retry` needs the derived flag *and* a code in
+  `retry_on`. This changelog no longer claims the `stream_bad_tool_args` raises became
+  non-retryable — `ModelAdapterError.retryable` already defaulted to `False`, so that keyword is
+  a no-op made legible. And the sync/streamed code asymmetry (`openai_bad_response` vs
+  `stream_bad_tool_args`) is recorded at the raise sites as the deliberate provider-neutrality
+  it is, so the next twin census reads a decision instead of a silent cell.
+
+### Fixed — `is_default` reads the fields, not the class
+
+- **`ReasoningConfig.is_default` and `GenerationConfig.is_default` now compare the fields the
+  base class declares, not `self == Config()`.** Generated dataclass `__eq__` is class-exact, so
+  a public extension subclass with *every kernel field at its default* was never "default" — and
+  the kernel supports such subclasses deliberately (every validator gates on `isinstance`, and
+  `providers/base._copy_with_fields` exists so normalization need not call an extension's
+  narrower constructor). The consequence was a hop nobody could fix from either end: the client
+  computed `is_default=False` and demanded proof of `{"effort": "medium"}`, while the server —
+  which only ever sees the wire, and `to_json` emits base fields only — rebuilt a plain
+  `ReasoningConfig`, computed `is_default=True`, emitted no `reasoning_applied`, and every turn
+  was refused `gateway_reasoning_not_applied` even against a declaring upstream. Extension fields
+  are invisible to `build_reasoning_payload`, `build_generation_payload` and `to_json`, so they
+  are invisible to the gate: one rule, stated once in `_matches_the_kernel_defaults`.
+- **The generation twin was the same defect with a serialization consumer.**
+  `ModelConfig.to_json` emits the `generation` key only when the block is not default, and that
+  dict feeds the request digest, the runtime-config semantic hash durable recovery compares
+  across restarts, and the gateway wire — so an all-defaults extension silently changed the
+  config hash while changing nothing the hash is about. Nothing is loosened in either direction:
+  a kernel field that *is* set stays non-default on a subclass exactly as it does on the base.
+
+### Fixed — the completion seam covers the whole adapter, not two regions of it
+
+- **Every refusal that leaves the OpenAI adapter's two call paths is completed, not just the
+  ones raised inside its two stamped regions.** The classifying seam was bound to
+  `_parse_response` and `_terminal_chunk`, so the code *between and around* them still refused
+  bare: the stream's per-frame field validators (`_provider_string`,
+  `_first_provider_string` — a `response.output_item.added` with no `call_id`/`id` is the
+  reachable case) and the sync path's `_coerce_response`. Those escaped through
+  `except ModelAdapterError: raise` with an empty `provider_error_code`, so one hop out the
+  reference gateway resolved them to its own `gateway_bad_response` — the wrong-wire-blamed
+  502 the seam exists to stop — while the *same helper* called one function deeper answered
+  `openai_bad_response`. Both arms are completion arms now, running the one
+  `_complete_billed_refusal` implementation. Backfill-only still holds, so the request-shaped
+  refusals inside the same region (`unserializable_request`, `unsupported_request_shape`) keep
+  their own code and their own remedy.
+- **A refusal after the terminal frame carries the cost it was billed.** A stream goes on
+  emitting frames after `response.completed`, so the streamed completion arm stamps from the
+  terminal payload when one has arrived and records nothing when it has not — mid-stream usage
+  is genuinely unknowable, and a lenient read invents none.
+- **The retry the call already spent stops being re-derived from the exception.** Both
+  `except Exception` arms rebuilt the fact with `_provider_retried_by_the_sdk(exc)`, which reads
+  the HTTP exchange — and an exception the SDK never raised carries none, so a `raw.parse()`
+  failure after two SDK retries was recorded as a clean single attempt. `_model_error_from_openai`
+  takes a `known_provider_retried` upgrade (the spelling the gateway validators already use):
+  whichever source can see the retry wins, neither can clear what the other observed. The
+  locals it reads are pre-initialized, so a `create()` that raises cannot answer with a
+  `NameError` instead of the provider's failure. (That `raw.parse()` example is history rather
+  than a description of HEAD: the body-read failures it names now leave their own guard as
+  `openai_bad_response` — see "the body-read phase speaks the one code" — carrying the same
+  value. The upgrade still matters for the two shapes that reach the classifier after the
+  exchange committed: a client teardown that raises, and a mid-stream transport drop whose
+  `request` property raises when read.)
+- **The stream's terminal reader gets the one-shot reader's coerce twin.** It read
+  `if response is not None and hasattr(response, "model_dump")` with no else, where the sync
+  twin reads `model_dump() if hasattr(...) else _coerce_response(response)` — which *accepts* a
+  plain mapping and *refuses* anything else. The stream discarded both: a billed streamed turn
+  whose terminal response is a mapping reported SUCCESS with zero usage (run budget, receipt and
+  tenant ledger all recording a free call, the captured reasoning dropped), and an unreadable one
+  was not refused at all. Unreachable through the shipped SDK, which always returns a model;
+  reachable through every stand-in and wrapper.
+- **The seam's third mutation joins its two siblings.** The code stamp was a bare `setattr`
+  beside two guarded helpers; `providers/base.py` now owns `mark_provider_error_code` next to
+  `mark_provider_retried` and `mark_provider_usage`, one copy of the rule they state — a type
+  that refuses the attribute stays unnamed rather than replacing the provider's failure with an
+  `AttributeError` raised inside the except-handler.
+
+### Fixed — the OpenAI reader refuses in one classified voice, and the refusal still pays
+
+- **Every malformed-payload refusal in the OpenAI adapter's two stamped regions is now a
+  non-retryable `openai_bad_response`.** The body mapping and the stream-terminal construction
+  each refused in more than one type: most shapes were already `ModelAdapterError`, but
+  `normalize_usage` said "malformed usage" with a raw `ValueError` and the stop-reason walk
+  raised a raw `AttributeError` — on the terminal path even after the ingress normalizer moved
+  inside the guard, because Python evaluates the `TurnComplete` arguments first. The classifying
+  arms mint the classified error at the same seam that stamps the billed usage and chain the raw
+  cause; the arm that catches an already-typed refusal *backfills* the same code onto the bare
+  `ModelAdapterError`s the mapping's own field validators raise, and upgrades `provider_retried`
+  from the exchange the raise site cannot see — so the code is the whole class's, not the raw
+  arm's alone (backfill never overwrites a code a refusal already named, and the retry flag only
+  ever goes up). Two real behaviors change, both intended:
+  - **In-process, the billed tokens reach the run budget.** A raw escape hit the loop's blanket
+    wrapper, which re-minted it unstamped — so `total_usage`, the transcript record and
+    `metrics.updated` all said zero for a call the provider billed, and only the getattr-based
+    receipt kept the cost. Classified, the refusal takes the loop's `ModelAdapterError` arm.
+  - **Over the gateway hop, the answer is an honest 502.** The raw `ValueError` shapes answered
+    400 `gateway_bad_request` (claiming the *client's* request was bad, and reading as
+    config-shaped recoverable one hop out); the raw `AttributeError` shapes answered 500 with
+    `retryable: true` — an invitation to re-buy the same tokens for a payload defect. Both now
+    map through the classified arm to 502, non-retryable, still carrying the billed `usage`.
+- **The raw arms stayed type-agnostic.** The tenant meter and both gateway error writers keep
+  reading whatever escapes, on purpose — a third-party adapter behind the gateway can still
+  refuse raw with a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
+  read-off-whatever-escaped property. (The writers gained one field later in this same release:
+  see "the retry fact rides every lane that learned it", which reads `provider_retried` off the
+  escaping exception on every arm rather than on the `ModelAdapterError` arm alone.) `assemble_streamed_turn`'s bare `normalize_usage` re-run
+  (provably dead — every folded chunk passes the internal ingress first) is guarded in the
+  ingress's classified voice rather than deleted. It is bound *structurally*: the behavioral
+  test for this shape is intercepted by the ingress and never reaches the guard, so deleting
+  the guard left the suite green;
+  `test_the_folds_usage_renormalization_stays_structurally_guarded` parses the fold and holds
+  the try/handler shape, the refusal's message, and the VALUE each classification keyword
+  binds — a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact — with the keyword set tested as a superset so strengthening the refusal passes and only
+  weakening it fails. A companion test mutates that source in memory and shows the pin moving on
+  each edit it claims to catch.
+- **The fold's own tool-call refusals pay for the turn they were billed for.** Both
+  `stream_bad_tool_args` raises in `assemble_streamed_turn` — a model emitting non-JSON
+  function-call arguments is ordinary — escaped with no usage stamp and no `provider_retried`,
+  though the fold is holding both by then. The one-shot twin of that act pays through the
+  OpenAI reader's stamping seam, so a *streamed* turn the provider generated and billed was
+  metered at zero at the tenant ledger and in the run's token budget while its sync twin was
+  not. `providers/base.py` stays provider-neutral: the refusals keep their own
+  `stream_bad_tool_args` code. What actually changed is the usage stamp and `provider_retried`;
+  `retryable=False` is now written explicitly, but `ModelAdapterError.retryable` already
+  defaults to `False`, so that is a no-op made legible rather than a behavior change.
+
+### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
+
+- **`reasoning_applied` is the third applied echo on `monoid.llm-turn.v1`.** A fail-closed
+  reasoning request used to be accepted unproven: the config crossed the hop (both request-side
+  seals), but nothing came back to say the upstream applied it, and `ReasoningConfig.
+  on_unsupported="fail"` governed nothing. The gateway server now echoes the exact forwarded
+  reasoning projection (`build_reasoning_payload` — the same one-projection rule as the
+  generation echo) on the response body and the terminal stream frame, derived from the new
+  `reasoning_support` adapter declaration, never from the request; the client validates it
+  beside its two siblings and enforces it at all three sites (sync, terminal frame, frameless
+  drain) as non-retryable, config-recoverable `gateway_reasoning_not_applied`. Fifth additive
+  response-direction key on an unchanged protocol identifier, after `generation_applied`,
+  `schema_applied`, `reasoning` and `provider`.
+- **The gate is `ReasoningConfig.is_default`, not payload truthiness.** The default reasoning
+  config projects a non-empty provider block (`{"effort": "medium"}`), so the generation gate
+  transcribed literally would have stamped an echo onto every default-config call and changed
+  the wire shape of traffic that configured nothing. `effort="default"` projects an *empty*
+  block that is still configured: the echo may legitimately be `{}`, and that empty proof is
+  what catches a hop that rebuilds `"medium"` out of an omitted effort.
+- **One knob per feature family.** The generation/schema pair keeps sharing
+  `generation.on_unsupported`; the reasoning echo, its checker, and the forwarding
+  `GatewayModelAdapter.reasoning_support` claim all read `reasoning.on_unsupported` — the
+  field the request wire already carried. A claim answered off another family's knob would
+  mint proof for a call whose own policy said best-effort. `reasoning_support(adapter,
+  config=None)` joins the exported fail-closed probe family; `OpenAIModelAdapter` declares it
+  unconditionally (it puts the block on the Responses body), the fakes deliberately do not.
+- **All five shipped callers state their real policy instead of inheriting a refusal.**
+  Configuring any reasoning key makes a config non-default, so the client starts demanding
+  proof — and `on_unsupported` inherited `"fail"`, which refuses every turn against an
+  upstream that declares no `reasoning_support` (the shipped `--provider fake` echo adapter,
+  any pre-B1 gateway, most third-party factories). Studio, the messy-workspace scenario, the
+  full-stack scenario, the `monoid builder init` scaffold and `examples/runtime-config.json`
+  — the file README, `docs/CLI.md`, the first-skill tutorial and `docs/OBSERVABILITY.md` all
+  tell a reader to pass — now set `reasoning.on_unsupported="omit"`. Their effort/summary are
+  display-grade preferences, not transport proof. Pinned three ways, because they are three
+  kinds of caller: Studio by a policy test on its config builder, the two scenarios
+  behaviorally by their own offline runs, and the two JSON producers by a sweep that
+  *enumerates* every shipped runtime config (builder scaffold plus every `examples/*.json`
+  that parses as one) and replays the client's own check against a silent upstream — so the
+  next shipped config inherits the pin instead of repeating the defect. Read `"omit"` for
+  exactly what it gives up: a proving upstream still *emits* the echo and the client still
+  *shape-validates* it (a malformed `reasoning_applied` is refused `gateway_bad_response`
+  either way), but a missing or mismatched echo is tolerated — enforcement is the whole of
+  what the knob trades away.
+- Census: the `KNOWN_GAPS` B1 entry is deleted and its `v0.21-track:B1` disposition token
+  retired with it; `reasoning_applied` joins every echo census (`APPLIED_ECHO_KEYS`
+  derivations, the wire key sets, the 7e refusal probes, the value-validator tables — now ten
+  status-forwarding validators — and the three-file `CARRIER_FILES` set that was pinned empty
+  while the gap was open).
+
 ### Fixed — the terminal chunk is validated where its stamp is
 
 - **The stream's end-of-turn payload is normalized inside the usage guard.** `TurnComplete`
@@ -710,8 +1039,9 @@ out in commit messages and here.
   — so a wire-key rename that breaks the shipped UI fails a test that names the file.
 - **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
   one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
-  exist, so a rename rots the entry loudly) and a disposition — `burn-down`, `v0.21-track:B1`, or
-  `by-design`. The assertions encode today's reality exactly, so closing a gap *breaks* the suite
+  exist, so a rename rots the entry loudly) and a disposition — `burn-down` or `by-design`
+  (a third token, `v0.21-track:B1`, existed while that gap was registered and retired with its
+  only entry). The assertions encode today's reality exactly, so closing a gap *breaks* the suite
   and the fixer must update the expected set and delete the registry entry in the same change.
   A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
   each with the authority a census would take, its carrier count, and a one-line risk note — so

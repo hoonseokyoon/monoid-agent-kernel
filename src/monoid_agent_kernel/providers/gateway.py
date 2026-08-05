@@ -89,6 +89,7 @@ GATEWAY_AUTH_ERROR = "gateway_auth_error"
 GATEWAY_BAD_RESPONSE = "gateway_bad_response"
 GATEWAY_GENERATION_NOT_APPLIED = "gateway_generation_not_applied"
 GATEWAY_SCHEMA_NOT_APPLIED = "gateway_schema_not_applied"
+GATEWAY_REASONING_NOT_APPLIED = "gateway_reasoning_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
@@ -226,6 +227,19 @@ class GatewayModelAdapter:
         effective = config or self.config
         return "native" if effective.generation.on_unsupported == "fail" else "none"
 
+    def reasoning_support(self, config: ModelConfig | None = None) -> str:
+        """The reasoning member of the claim family above, read off its own family's knob.
+
+        Same laundering rule as :meth:`structured_output_support` -- a forwarding hop claims
+        "native" only while it is enforcing -- but the policy it enforces reasoning under is
+        ``reasoning.on_unsupported``, not generation's. The two knobs are separate fields the
+        request wire already carries separately, so a claim answered off the wrong one would
+        report proof for a call whose own reasoning policy said best-effort.
+        """
+
+        effective = config or self.config
+        return "native" if effective.reasoning.on_unsupported == "fail" else "none"
+
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         config = request.model or self.config
         url = self._resolve_gateway_url(config)
@@ -312,6 +326,14 @@ class GatewayModelAdapter:
                             data.get("schema_applied"),
                             known_provider_retried=turn.provider_retried,
                         )
+                        _check_reasoning_applied(
+                            None
+                            if config.reasoning.is_default
+                            else build_reasoning_payload(config.reasoning),
+                            config.reasoning.on_unsupported,
+                            data.get("reasoning_applied"),
+                            known_provider_retried=turn.provider_retried,
+                        )
                     except ModelAdapterError as unproven:
                         mark_provider_usage(unproven, turn.usage)
                         raise
@@ -394,6 +416,14 @@ class GatewayModelAdapter:
         # Bound before the client exists, because the client's own lifecycle can fail: `__aexit__`
         # raises after the loop, where a loop-local would still be unbound if no attempt reached it.
         committed = False
+        # What this attempt's stream has already reported spending, for the same reason and read
+        # by the same handler. A drop AFTER the terminal frame is not the same call as a drop
+        # before it: the hop has metered the turn against the tenant by then, and the network
+        # error minted below is the only carrier left -- no turn is assembled and no chunk
+        # survives the raise -- so an empty stamp made every budget behind this client
+        # under-count a turn that really was bought. Empty is the honest reading before the
+        # frame arrives, which is what a pre-commit failure leaves it at.
+        reported_usage: dict[str, int] = {}
         try:
             # One client for the whole call, not one per attempt. Constructing it is synchronous and
             # not cheap -- measured at ~285ms warm here, and the event loop is unavailable for all of
@@ -441,6 +471,14 @@ class GatewayModelAdapter:
                         )
                     committed = False  # reset per attempt; see the binding above the loop
                     saw_terminal = False
+                    reported_usage = {}  # reset per attempt, beside the two flags it travels with
+                    # The wire's own retry fact, retained for the frameless branch below. The
+                    # server stamps ``provider_retried`` on EVERY frame precisely so it survives
+                    # a stream that never reaches its terminal frame -- and that branch was the
+                    # one reader ignoring it, answering from this client's attempt count alone.
+                    # Reset per attempt for the reason the two above are: it describes THIS
+                    # attempt's stream, not the call.
+                    saw_retried = False
                     # Resolved per attempt, like the sync loop resolves it. Hoisted out of the loop
                     # it was the one thing a retry did not refresh: ``token_provider`` re-mints near
                     # expiry (see the field), and a backoff is exactly where a token crosses that
@@ -469,6 +507,20 @@ class GatewayModelAdapter:
                                 # the marker above, so the two cannot disagree.
                                 if attempt > 1:
                                     chunk = replace(chunk, provider_retried=True)
+                                # Retained off whatever chunk reports one, rather than off the
+                                # terminal type alone: the terminal frame is the only carrier
+                                # today, and a vocabulary that grows a second one must not have
+                                # to remember this line. Falsy (absent, or an empty mapping)
+                                # keeps what the stream has already said.
+                                chunk_usage = getattr(chunk, "usage", None)
+                                if chunk_usage:
+                                    reported_usage = dict(chunk_usage)
+                                # Read off the stamped chunk, so it is the wire's fact combined
+                                # with this client's own attempt -- exactly what the framed
+                                # check below reads. Sticky: one frame reporting a retry is the
+                                # whole answer, and a later frame cannot un-say it.
+                                if chunk.provider_retried:
+                                    saw_retried = True
                                 # The terminal frame is the streaming twin of the sync check in
                                 # ``next_turn`` -- both transports enforce or neither does.
                                 if isinstance(chunk, TurnComplete):
@@ -490,6 +542,14 @@ class GatewayModelAdapter:
                                             chunk.schema_applied,
                                             known_provider_retried=chunk.provider_retried,
                                         )
+                                        _check_reasoning_applied(
+                                            None
+                                            if config.reasoning.is_default
+                                            else build_reasoning_payload(config.reasoning),
+                                            config.reasoning.on_unsupported,
+                                            chunk.reasoning_applied,
+                                            known_provider_retried=chunk.provider_retried,
+                                        )
                                     except ModelAdapterError as unproven:
                                         mark_provider_usage(unproven, chunk.usage)
                                         raise
@@ -507,34 +567,61 @@ class GatewayModelAdapter:
                             # so run them with nothing once the drain is complete. Traffic
                             # that configures neither knob keeps the pre-W5 tolerance for a
                             # frameless stream: both checks pass when nothing was requested.
+                            #
+                            # The retry fact is the same conjunction the framed site reads --
+                            # the wire's, OR this client's own attempt count. Reading
+                            # ``attempt > 1`` alone was the one place that treated an absent
+                            # TERMINAL frame as an absent stream: the server stamps every frame,
+                            # so a body that dropped before its terminal one still SAID the
+                            # gateway's backend had retried, and this refusal is the only
+                            # carrier left to say it.
+                            retried_here = saw_retried or attempt > 1
                             _check_generation_applied(
                                 build_generation_payload(config.generation),
                                 config.generation.on_unsupported,
                                 None,
-                                known_provider_retried=attempt > 1,
+                                known_provider_retried=retried_here,
                             )
                             _check_schema_applied(
                                 request.output_schema is not None,
                                 config.generation.on_unsupported,
                                 None,
-                                known_provider_retried=attempt > 1,
+                                known_provider_retried=retried_here,
+                            )
+                            _check_reasoning_applied(
+                                None
+                                if config.reasoning.is_default
+                                else build_reasoning_payload(config.reasoning),
+                                config.reasoning.on_unsupported,
+                                None,
+                                known_provider_retried=retried_here,
                             )
                         return
                     except _StreamRetry as retry_signal:
                         last_error = retry_signal.error
                     except httpx.HTTPError as exc:
+                        # Both mints carry what this attempt already reported spending, stamped
+                        # by the one guarded helper every other carrier of the fact uses. The
+                        # committed branch is where it is reachable -- the terminal frame lands
+                        # inside the drain above -- and the pre-commit branch stamps the same
+                        # way rather than reasoning about which branch can see a cost: the
+                        # value is empty there, and ``mark_provider_usage`` writes nothing for
+                        # an empty one, so one rule covers both and neither can drift.
                         if committed:
                             # The stream already started; replaying would duplicate deltas. Terminal.
-                            raise ModelAdapterError(
+                            interrupted = ModelAdapterError(
                                 f"LLM gateway stream interrupted: {exc}",
                                 provider_error_code=GATEWAY_NETWORK_ERROR,
                                 retryable=False,
-                            ) from exc
+                            )
+                            mark_provider_usage(interrupted, reported_usage)
+                            raise interrupted from exc
                         error = ModelAdapterError(
                             f"LLM gateway stream connection error: {exc}",
                             provider_error_code=GATEWAY_NETWORK_ERROR,
                             retryable=True,
                         )
+                        mark_provider_usage(error, reported_usage)
                         if not _should_retry(error, attempt, max_attempts, retry.retry_on):
                             raise error from exc
                         last_error = error
@@ -558,6 +645,11 @@ class GatewayModelAdapter:
             #
             # `committed` draws the same line the in-loop handler draws: once deltas have gone out,
             # replaying would duplicate them, so a late failure is terminal rather than retryable.
+            #
+            # It carries the cost for the same reason the in-loop handler does, and this is the
+            # arm where a fully-drained turn ends up: the stream completes, the terminal frame
+            # reports what the hop metered, and the `__aexit__` that tears the pool down is what
+            # raises. Same guarded stamp, same emptiness rule.
             error = ModelAdapterError(
                 f"LLM gateway stream interrupted: {exc}"
                 if committed
@@ -565,6 +657,7 @@ class GatewayModelAdapter:
                 provider_error_code=GATEWAY_NETWORK_ERROR,
                 retryable=not committed,
             )
+            mark_provider_usage(error, reported_usage)
             _stamp_retry(error, attempt)
             raise error from exc
         # Same marking as the sync path. Stream retries are all pre-commit, so an error
@@ -1002,6 +1095,24 @@ def _validated_schema_echo(
     )
 
 
+def _validated_reasoning_echo(
+    applied: Any, *, http_status: int | None = None, provider_retried: bool = False
+) -> dict[str, Any] | None:
+    """The ``reasoning_applied`` sibling of :func:`_validated_generation_echo`, same rule --
+    an object like the generation echo, because reasoning's forwarded block has values the
+    client can compare, not just a yes/no like the schema's."""
+
+    if applied is None or isinstance(applied, dict):
+        return applied
+    raise ModelAdapterError(
+        "LLM gateway returned an invalid reasoning_applied echo: expected an object",
+        provider_error_code=GATEWAY_BAD_RESPONSE,
+        retryable=False,
+        http_status=http_status,
+        provider_retried=provider_retried,
+    )
+
+
 def _same_echoed_value(echoed: Any, requested: Any) -> bool:
     """One requested knob against its echo, without Python's cross-type numeric equality.
 
@@ -1082,11 +1193,15 @@ def _check_schema_applied(
 ) -> None:
     """The schema twin of :func:`_check_generation_applied`, same policy knob.
 
-    One ``on_unsupported`` governs both proofs deliberately: "how to treat a parameter the
-    transport cannot prove was applied" is one question, and two half-set knobs (fail for one,
-    omit for the other) would be a new surface for exactly the kind of asymmetry W5 exists to
-    close. ``applied`` is a tri-state: ``True`` proves it, ``False`` is the server saying its
-    upstream cannot enforce schemas, absent (``None``) is an older server.
+    One ``generation.on_unsupported`` governs the generation and schema proofs deliberately:
+    within one feature family, "how to treat a parameter the transport cannot prove was
+    applied" is one question, and two half-set knobs (fail for one, omit for the other) would
+    be a new surface for exactly the kind of asymmetry W5 exists to close. The rule is one
+    knob per feature family, not one knob for every proof: reasoning is a separate family
+    with its own ``reasoning.on_unsupported`` -- a field the request wire already carries
+    separately -- and :func:`_check_reasoning_applied` reads that one. ``applied`` is a
+    tri-state: ``True`` proves it, ``False`` is the server saying its upstream cannot enforce
+    schemas, absent (``None``) is an older server.
     """
 
     applied = _validated_schema_echo(applied, provider_retried=known_provider_retried)
@@ -1105,6 +1220,46 @@ def _check_schema_applied(
         f"LLM gateway did not apply the requested output schema: {detail}; "
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
+        retryable=False,
+        config_recoverable=True,
+        provider_retried=known_provider_retried,
+    )
+
+
+def _check_reasoning_applied(
+    requested: dict[str, Any] | None,
+    on_unsupported: str,
+    applied: Any,
+    *,
+    known_provider_retried: bool = False,
+) -> None:
+    """The reasoning member of the proof family, governed by ``reasoning.on_unsupported``.
+
+    ``requested`` is the exact forwarded block this client derives from its own config
+    (``build_reasoning_payload``), or ``None`` when the config is the default -- the one case
+    with nothing to prove. ``None`` and ``{}`` are different requests on purpose:
+    ``effort="default"`` projects an *empty* forwarded block, and that block must come back as
+    ``{}`` -- a hop that quietly rebuilt ``"medium"`` out of an omitted effort echoes
+    ``{"effort": "medium"}`` and fails the match, which is exactly the drift this proof exists
+    to catch. So the early return tests ``is None``, never truthiness.
+    """
+
+    applied = _validated_reasoning_echo(applied, provider_retried=known_provider_retried)
+    if requested is None:
+        return
+    if _generation_echo_matches(applied, requested):
+        return
+    if on_unsupported == "omit":
+        return
+    detail = (
+        "the gateway sent no reasoning_applied echo (older gateway?)"
+        if applied is None
+        else "the reasoning_applied echo does not match the requested configuration"
+    )
+    raise ModelAdapterError(
+        f"LLM gateway did not apply the requested reasoning configuration: {detail}; "
+        'set model.reasoning.on_unsupported="omit" to accept best-effort transport',
+        provider_error_code=GATEWAY_REASONING_NOT_APPLIED,
         retryable=False,
         config_recoverable=True,
         provider_retried=known_provider_retried,
@@ -1529,10 +1684,16 @@ def _chunk_from_event(
                 http_status=status_hint,
                 provider_retried=retried,
             )
+            reasoning_applied = _validated_reasoning_echo(
+                event.get("reasoning_applied"),
+                http_status=status_hint,
+                provider_retried=retried,
+            )
             # The gateway's opaque turn_handle is the continuation handle the core stores.
             return TurnComplete(
                 generation_applied=applied,
                 schema_applied=schema_applied,
+                reasoning_applied=reasoning_applied,
                 response_id=_gateway_string(
                     event,
                     "turn_handle",

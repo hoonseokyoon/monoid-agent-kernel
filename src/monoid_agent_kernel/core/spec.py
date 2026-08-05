@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from monoid_agent_kernel._policy_util import matches_the_kernel_defaults
 from monoid_agent_kernel.core.content import (
     ContentPart,
     TextPart,
@@ -41,6 +42,24 @@ class ReasoningConfig:
     effort: ReasoningEffort = "medium"
     summary: ReasoningSummary = "off"
     on_unsupported: Literal["fail", "omit"] = "fail"
+
+    @property
+    def is_default(self) -> bool:
+        """Whether the caller configured reasoning at all — the gate the applied echo rides.
+
+        The generation twin can read its projected payload for this (every default field
+        projects to nothing), but the default reasoning config projects a non-empty provider
+        block (``{"effort": "medium"}``), so payload truthiness would claim every call
+        configured reasoning. Field-by-field comparison against the defaults is the honest
+        sentinel; the one thing it cannot see — an explicit ``effort="medium"`` — is exactly
+        as invisible as an explicit ``temperature=None`` is to generation's gate.
+
+        Read over the fields this class declares, never over ``type(self)``'s: see
+        :func:`matches_the_kernel_defaults` for why an extension's own fields must be as
+        invisible here as they already are to ``to_json`` and ``build_reasoning_payload``.
+        """
+
+        return matches_the_kernel_defaults(self, ReasoningConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ReasoningConfig:
@@ -175,7 +194,17 @@ class GenerationConfig:
 
     @property
     def is_default(self) -> bool:
-        return self == GenerationConfig()
+        """Whether the caller set any sampling control — the gate ``ModelConfig.to_json`` reads.
+
+        The same field-based rule as the reasoning twin, and for the same reason
+        (:func:`matches_the_kernel_defaults`). Its consumer is a serialization gate rather than
+        an echo, so a class-exact answer here made an all-defaults extension emit the
+        ``generation`` key — changing the request digest, the runtime-config semantic hash that
+        durable recovery compares across restarts, and the gateway wire, while changing nothing
+        any of them is about.
+        """
+
+        return matches_the_kernel_defaults(self, GenerationConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> GenerationConfig:

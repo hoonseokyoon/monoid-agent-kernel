@@ -102,6 +102,7 @@ EXPECTED_CONTRACTS_ALL = [
     "AttemptStarted",
     "structured_output_support",
     "generation_support",
+    "reasoning_support",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
