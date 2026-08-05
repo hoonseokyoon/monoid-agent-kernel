@@ -432,6 +432,112 @@ def test_a_record_arriving_after_close_does_not_reopen_the_ledger(tmp_path: Path
     assert recorder._model_calls_handle is None
 
 
+def _plant_hardlink(link: Path, target: Path) -> None:
+    import os
+
+    try:
+        os.link(target, link)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+
+def _plant_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+
+@pytest.mark.parametrize("plant", [_plant_hardlink, _plant_symlink], ids=["hardlink", "symlink"])
+def test_a_planted_link_stops_the_ledger_instead_of_being_written_through(
+    tmp_path: Path,
+    plant: Any,
+) -> None:
+    """The ledger writes to a file this process made, or it writes nothing at all.
+
+    The handle is opened lazily, so between the run directory existing and the first receipt
+    arriving there is a window in which the ledger's pathname can be replaced -- and a reopened
+    durable run widens that window to "any time since the last activation". A plain ``open(path,
+    "a")`` follows a symlink, and a hard link is a second name for an inode anywhere on the volume,
+    so either one makes the agent append its own JSONL, with its own credentials, to a file
+    somebody else chose. The sibling ``model-content.jsonl`` verified this before appending; this
+    is that same rule, from the same function, for the second sidecar in the same directory.
+
+    Fail **closed**, not "skip this line": the reason a verified open refused is a property of the
+    path, so a retry on the next receipt only re-runs the same refusal. Setting the disable flag is
+    what makes the refusal terminal, exactly as a torn write does.
+
+    The witness at the end is load-bearing. "The outside file did not change" is a claim that passes
+    for free if the recorder was handed a receipt it could not have written anyway, so a second
+    recorder with an untouched directory records the *same* receipt and is asserted to produce a
+    line.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.jsonl"
+    target.write_bytes(b'{"kind":"not the agent\'s"}\n')
+    original = target.read_bytes()
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    plant(run_dir / MODEL_CALLS_FILENAME, target)
+
+    receipt = ModelCallReceipt()
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", model_calls_file=True, status_file=False)
+    recorder.record_model_call(receipt)
+
+    assert target.read_bytes() == original
+    assert recorder._model_calls_failed is True
+    assert recorder._model_calls_handle is None
+
+    # Terminal, not per-line: a second receipt must not re-attempt the same refused open.
+    recorder.record_model_call(receipt)
+    assert target.read_bytes() == original
+    assert recorder._model_calls_index == 0
+    recorder.close()
+
+    witness = AgentRecorder(tmp_path / "clean", "run-1", model_calls_file=True, status_file=False)
+    witness.record_model_call(receipt)
+    witness.close()
+    assert len(_records(witness.run_dir)) == 1
+
+
+def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_path: Path) -> None:
+    """A record torn by a crash costs its own line, never the next activation's first one.
+
+    Appending after a line with no trailing newline glues the remnant and the new record into one
+    unparseable line and loses **both**. The check now runs on the descriptor the verified open just
+    validated rather than by reopening the pathname, because a second ``open`` of the same name is a
+    second chance to be handed a different file; this pins that the property survived that move.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_model_call(ModelCallReceipt())
+    recorder.close()
+    ledger = recorder.run_dir / MODEL_CALLS_FILENAME
+    with ledger.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write('{"torn":')
+
+    reopened = AgentRecorder(
+        tmp_path / "runs",
+        "run-1",
+        model_calls_file=True,
+        status_file=False,
+        reopen=True,
+    )
+    reopened.record_model_call(ModelCallReceipt())
+    reopened.close()
+
+    lines = ledger.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == '{"torn":'
+    assert json.loads(lines[2])["call_index"] == 0
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_the_ledger_switch_does_not_select_provider_streaming(
     tmp_path: Path,

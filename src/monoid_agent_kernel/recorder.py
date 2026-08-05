@@ -24,6 +24,7 @@ from monoid_agent_kernel.core._util import (
     utc_timestamp,
     write_json_atomic,
 )
+from monoid_agent_kernel.core._verified_file import open_verified_append_text
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
@@ -426,10 +427,14 @@ class AgentRecorder:
         Writing the missing newline costs one byte and confines a torn write to the record it tore.
         Best-effort by design: if the file cannot be inspected, appending as before is no worse.
 
-        Taken as a parameter rather than hard-coded to the transcript because ``model_calls.jsonl``
-        reopens the same way and has the same exposure: a durable run appends to the ledger it
-        already has, so a torn tail from the activation that crashed would otherwise consume the
-        recovered activation's first record.
+        Path-and-handle rather than handle alone because the transcript's handle is opened in text
+        append mode and cannot be read through. That reopen is the weaker form of this check and the
+        reason ``model_calls.jsonl`` no longer uses it: ``open_verified_append_text`` isolates the
+        same torn tail on the descriptor it has already verified, so there is no second ``open`` of
+        a name that could by then be something else. The transcript is a v0.20 artifact opened
+        eagerly in ``__post_init__``, where refusing a planted path would fail the run outright
+        rather than one sidecar; moving it to the verified opener is a separate change with its own
+        failure policy to decide.
         """
         try:
             size = path.stat().st_size
@@ -519,19 +524,35 @@ class AgentRecorder:
         return True
 
     def _ensure_model_calls_handle_locked(self) -> TextIO | None:
+        """Open the ledger only if the path names a file this process is entitled to append to.
+
+        ``open(path, "a")`` is the wrong primitive here and was the defect. The handle is acquired
+        lazily, so between the run directory existing and the first receipt arriving there is a
+        window in which ``model_calls.jsonl`` can be replaced by a link -- and a reopened durable
+        run stretches that window across the whole gap since the last activation. A symlink is
+        followed; a hard link is a second name for an inode that can live anywhere on the volume.
+        Either one makes the agent append its own ledger, under its own credentials, to a file
+        somebody else chose.
+
+        The same function the ``model-content.jsonl`` writer uses, deliberately: two append-only
+        sidecars in one directory with one exposure is exactly the shape where a rule gets proven on
+        one site and forgotten on its twin. It also folds in the torn-tail isolation a durable
+        reopen needs, on the descriptor it just verified rather than by reopening the pathname.
+
+        A refusal disables the ledger rather than being retried, the same terminal treatment a torn
+        write gets: the reason a verified open said no is a property of the path, so the next
+        receipt would only re-run the identical refusal.
+        """
+
         if self._model_calls_handle is not None:
             return self._model_calls_handle
-        path = self.run_dir / MODEL_CALLS_FILENAME
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("a", encoding="utf-8", newline="\n")
-        except OSError:
+        handle = open_verified_append_text(self.run_dir / MODEL_CALLS_FILENAME)
+        if handle is None:
             self._model_calls_failed = True
-            _LOGGER.debug("model call ledger could not be opened", exc_info=True)
+            # No ``exc_info``: the verified opener reports a refusal by returning ``None``, and the
+            # refusal that matters most -- a planted link -- raises nothing at all.
+            _LOGGER.debug("model call ledger could not be safely opened")
             return None
-        # A durable run reopens the directory it already has and appends to this same file, so a
-        # tail torn by the activation that crashed would consume this activation's first record.
-        self._terminate_torn_tail(path, handle)
         self._model_calls_handle = handle
         return handle
 

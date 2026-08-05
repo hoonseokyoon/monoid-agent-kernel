@@ -399,10 +399,11 @@ private `model-content.jsonl` sidecar.
 from the model runner rather than from a `ModelIOObserver`, which is what lets it record failed
 calls: a failure publishes its receipt to the subscriptions and re-raises without stamping it on
 the exception, so a writer driven by the loop's return value would hold only successes. Writes are
-shielded three ways — an unencodable record costs its own line, a write error disables the handle
-so a torn line cannot consume the next record, and nothing raises into the call. The switch is
-independent of `stream_model_calls` and `model_content_file`; see `docs/CONTRACTS.md` for what a
-record deliberately cannot say.
+shielded four ways — the ledger opens only if its own path is a single-link regular file, never a
+symlink or hard link planted where a reopened run expects its artifact, an unencodable record costs
+its own line, a write error disables the handle so a torn line cannot consume the next record, and
+nothing raises into the call. The switch is independent of `stream_model_calls` and
+`model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say.
 
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains
