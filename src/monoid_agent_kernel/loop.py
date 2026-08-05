@@ -1003,6 +1003,11 @@ class AgentLoop:
     # Persist private streamed model content to ``model-content.jsonl``. The recorder owns the
     # file and returns a failure-shielded writer; public events/status remain content-free.
     model_content_file: bool = False
+    # Persist one metadata record per settled model call to ``model_calls.jsonl``. Independent of
+    # the content sidecar above and of ``stream_model_calls``: a ledger of what was called needs
+    # no provider streaming, and folding it into that selection would change cancellation and
+    # interrupt granularity for a run that asked only for receipts.
+    model_calls_file: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
@@ -3198,6 +3203,10 @@ class AgentLoop:
             emit_output_deltas=self.emit_output_deltas,
             stream_model_calls=self.stream_model_calls,
             model_content_file=self.model_content_file,
+            # Inherited like the content switch. The child builds its own recorder over its own
+            # run directory, so its ledger lands there rather than here -- which is why every
+            # record carries ``root_run_id``.
+            model_calls_file=self.model_calls_file,
             model_stream_observer_factories=self.model_stream_observer_factories,
         )
         child._capability_vault = self._capability_vault.fork_for_child()

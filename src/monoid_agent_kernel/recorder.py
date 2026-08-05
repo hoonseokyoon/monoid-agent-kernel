@@ -21,6 +21,7 @@ from monoid_agent_kernel.core._util import (
     canonical_sha256,
     read_text_resilient,
     sha256_bytes,
+    utc_timestamp,
     write_json_atomic,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
@@ -34,8 +35,9 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_value,
 )
 from monoid_agent_kernel.core.manifest import RunManifest
+from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME, model_call_record
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME, ModelContentStore
-from monoid_agent_kernel.core.model_io import content_digest, content_length
+from monoid_agent_kernel.core.model_io import ModelCallReceipt, content_digest, content_length
 from monoid_agent_kernel.core.model_stream import (
     NOOP_MODEL_STREAM_WRITER,
     ModelStreamContext,
@@ -338,6 +340,13 @@ class AgentRecorder:
     # Private authored-content sidecar. Opt-in keeps the v0.20 run-dir shape and embedders'
     # retention assumptions unchanged unless the caller explicitly enables the new channel.
     model_content_file: bool = False
+    # Private model-call ledger, opt-in for the same reason and appended after it so no positional
+    # caller of this constructor is rebound.
+    model_calls_file: bool = False
+    # The routing root this run belongs to, or empty when the recorder stands alone. Every ledger
+    # line carries it: a subagent records into its own run directory, so the root is the only
+    # thing that makes a run tree joinable without walking the parent's events first.
+    root_run_id: str = ""
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
@@ -345,6 +354,14 @@ class AgentRecorder:
     _model_content_store: ModelContentStore | None = field(default=None, init=False, repr=False)
     _model_content_store_failed: bool = field(default=False, init=False, repr=False)
     _model_content_store_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _model_calls_handle: TextIO | None = field(default=None, init=False, repr=False)
+    _model_calls_failed: bool = field(default=False, init=False, repr=False)
+    _model_calls_index: int = field(default=0, init=False, repr=False)
+    _model_calls_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
         repr=False,
@@ -387,6 +404,12 @@ class AgentRecorder:
         )
 
     def _terminate_torn_transcript_tail(self) -> None:
+        """Close off ``transcript.jsonl``'s torn last line. See :meth:`_terminate_torn_tail`."""
+
+        self._terminate_torn_tail(self.run_dir / "transcript.jsonl", self._transcript_file)
+
+    @staticmethod
+    def _terminate_torn_tail(path: Path, handle: TextIO) -> None:
         """Close off a torn last line so the next append is not glued onto it.
 
         ``transcript.jsonl`` gets no ``repair_event_log_tail_for_append`` the way ``events.jsonl``
@@ -399,23 +422,105 @@ class AgentRecorder:
 
         Writing the missing newline costs one byte and confines a torn write to the record it tore.
         Best-effort by design: if the file cannot be inspected, appending as before is no worse.
+
+        Taken as a parameter rather than hard-coded to the transcript because ``model_calls.jsonl``
+        reopens the same way and has the same exposure: a durable run appends to the ledger it
+        already has, so a torn tail from the activation that crashed would otherwise consume the
+        recovered activation's first record.
         """
-        path = self.run_dir / "transcript.jsonl"
         try:
             size = path.stat().st_size
             if size == 0:
                 return
-            with path.open("rb") as handle:
-                handle.seek(size - 1)
-                if handle.read(1) == b"\n":
+            with path.open("rb") as reader:
+                reader.seek(size - 1)
+                if reader.read(1) == b"\n":
                     return
-            self._transcript_file.write("\n")
-            self._transcript_file.flush()
+            handle.write("\n")
+            handle.flush()
         except OSError:
             return
 
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
+
+    def record_model_call(self, receipt: ModelCallReceipt) -> None:
+        """Append one settled call to the private ledger, shielding the run from every failure.
+
+        Handed to ``ModelCallRunner.receipt_sink``, so it runs for failed calls as well as
+        successful ones — the reason that seam exists rather than the loop's return value, which a
+        failure never reaches. A direct method rather than a ``ModelIOObserver``, for the reason
+        ``open_model_stream`` is one: the recorder owns its private artifacts and does not pretend
+        to implement the external observer API, whose ``CapturePolicy`` narrowing would strip the
+        digests this ledger exists to carry.
+
+        Three containment layers, each for a failure the run must survive. The record is built and
+        encoded before the handle is touched, so a caller's hostile ``InvocationContext.attributes``
+        costs its own line rather than the run. A write error disables the handle rather than
+        retrying: a partial write may have torn the current line, and appending after it would glue
+        the next record onto the remnant and lose both. And nothing here raises — an answer the
+        provider has already been paid for is not discarded because a disk filled up.
+        """
+
+        if not self.model_calls_file or self._model_calls_failed:
+            return
+        try:
+            with self._model_calls_lock:
+                index = self._model_calls_index
+            record = model_call_record(
+                receipt,
+                run_id=self.run_id,
+                root_run_id=self.root_run_id or self.run_id,
+                call_index=index,
+                recorded_at=utc_timestamp(),
+            )
+            # Normalized here rather than inside ``_write_jsonl``'s repair path, so an unencodable
+            # value is refused before a handle is opened for it.
+            line = json.dumps(
+                normalize_json_ingress(record),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            line.encode("utf-8")
+        except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
+            _LOGGER.debug("model call record could not be built", exc_info=True)
+            return
+        self._append_model_call(line)
+
+    def _append_model_call(self, line: str) -> None:
+        with self._model_calls_lock:
+            if self._model_calls_failed:
+                return
+            handle = self._ensure_model_calls_handle_locked()
+            if handle is None:
+                return
+            try:
+                handle.write(line + "\n")
+                handle.flush()
+            except (OSError, UnicodeError):
+                self._model_calls_failed = True
+                _LOGGER.debug("model call ledger append failed", exc_info=True)
+                return
+            self._model_calls_index += 1
+
+    def _ensure_model_calls_handle_locked(self) -> TextIO | None:
+        if self._model_calls_handle is not None:
+            return self._model_calls_handle
+        path = self.run_dir / MODEL_CALLS_FILENAME
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a", encoding="utf-8", newline="\n")
+        except OSError:
+            self._model_calls_failed = True
+            _LOGGER.debug("model call ledger could not be opened", exc_info=True)
+            return None
+        # A durable run reopens the directory it already has and appends to this same file, so a
+        # tail torn by the activation that crashed would consume this activation's first record.
+        self._terminate_torn_tail(path, handle)
+        self._model_calls_handle = handle
+        return handle
 
     def open_model_stream(self, context: ModelStreamContext) -> ModelStreamWriter:
         """Open the opt-in private content writer without exposing failures to the run."""
@@ -606,12 +711,24 @@ class AgentRecorder:
                 # once.
                 self._transcript_file.close()
             finally:
-                store = self._model_content_store
-                if store is not None:
-                    try:
-                        store.close()
-                    except Exception:  # noqa: BLE001 - private persistence is best-effort
-                        _LOGGER.debug("model content store close failed", exc_info=True)
+                try:
+                    store = self._model_content_store
+                    if store is not None:
+                        try:
+                            store.close()
+                        except Exception:  # noqa: BLE001 - private persistence is best-effort
+                            _LOGGER.debug("model content store close failed", exc_info=True)
+                finally:
+                    # Nested rather than sequential: one private artifact failing to close must
+                    # not retain the other's descriptor, the same rule the transcript already has
+                    # against the event bus above.
+                    with self._model_calls_lock:
+                        handle, self._model_calls_handle = self._model_calls_handle, None
+                    if handle is not None:
+                        try:
+                            handle.close()
+                        except OSError:
+                            _LOGGER.debug("model call ledger close failed", exc_info=True)
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
         payload: dict[str, Any] = {
