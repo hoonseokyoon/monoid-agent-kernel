@@ -2803,6 +2803,66 @@ def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_pro
     ], f"the adapter must be read exactly once per call, was read {len(reads)}x"
 
 
+def test_the_key_names_the_provider_the_receipt_records() -> None:
+    """One read of the declaration per call, for the same reason the adapter itself gets one.
+
+    The sibling above binds "one adapter per call" and stops there. The *declaration on that
+    adapter* was still read twice -- once for `ModelCallReceipt.provider_name`, once for the replay
+    key -- and a `provider_name` property that answers and then stops answering made the two
+    disagree. The receipt then said `openai` while the key had been taken under the config's
+    `gateway`, which is precisely the failure W6-0 exists to remove: a key whose preimage the
+    record cannot reconstruct cannot be recomputed, cannot be verified, and a miss cannot be told
+    apart from a defect.
+
+    The property is checked both ways round. Agreeing with a *stable* adapter's key is the part
+    that says which of the two values won -- an implementation that resolved both to the fallback
+    would agree with itself and still be wrong.
+    """
+
+    class OnceThenUnreadable:
+        """A declaration that answers the first read and raises after it -- a cached property
+        whose refresh fails, a proxy that loses its upstream, a lazily-resolved client."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def provider_name(self) -> str:
+            self.reads += 1
+            if self.reads > 1:
+                raise RuntimeError("declaration went unreadable")
+            return "openai"
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    class Stable:
+        provider_name = "openai"
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    request = replace(REQUEST, model=ModelConfig(provider="gateway"))
+
+    async def run(adapter: Any) -> Any:
+        return (await ModelCallRunner(adapter=adapter).acall(request))[1]
+
+    unstable = OnceThenUnreadable()
+    flickering = asyncio.run(run(unstable))
+    steady = asyncio.run(run(Stable()))
+
+    assert flickering.provider_name == "openai"
+    assert flickering.request_digest == steady.request_digest, (
+        "the key must name the provider the receipt records, not a second read of it"
+    )
+    assert flickering.request_digest == _digest(
+        _request_payload(request, ModelConfig(provider="gateway"), provider="openai")
+    )
+    assert unstable.reads == 1, f"the declaration was read {unstable.reads}x, must be once"
+
+
 def test_a_close_is_granted_the_grace_and_the_grace_is_read_live(caplog: Any) -> None:
     """Two halves of one rule: cleanup is *given* the interval, and the interval is the live one.
 

@@ -724,7 +724,15 @@ class ModelCallRunner:
                         # a gateway relaying the same upstream, which is the one pair a corpus
                         # wants sharing a key. It also normalizes, which matters here because
                         # `provider` is the only `ModelConfig` field with no ingress validation.
-                        provider=resolved_provider_name(adapter, model) or "",
+                        #
+                        # Resolved from the declaration THIS CALL ALREADY READ, handed in rather
+                        # than probed again. The adapter is read once per call for this reason
+                        # already; the declaration on it was still read twice, and a `provider_name`
+                        # that answers once and then raises made the two disagree -- the receipt
+                        # saying `openai` while the key had been taken under the config's `gateway`.
+                        # A key whose preimage the record contradicts is the exact defect that took
+                        # the destination out of this payload.
+                        provider=resolved_provider_name(adapter, model, declared=provider) or "",
                     )
                 )
                 receipt = replace(

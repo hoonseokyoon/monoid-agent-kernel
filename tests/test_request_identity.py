@@ -225,6 +225,28 @@ def test_two_adapters_that_declare_nothing_are_still_told_apart_by_their_configu
     assert _key(fake, provider="fake") != _key(gateway, provider="gateway")
 
 
+def test_a_handed_in_declaration_is_an_answer_even_when_it_is_nothing() -> None:
+    """Guard on the seam that stops the declaration being read twice.
+
+    The key's provider term is resolved from the declaration the call *already read*, so that a
+    `provider_name` which answers once and then stops cannot give the receipt one provider and the
+    key another. That requires a sentinel: `None` is a real answer -- a `GatewayModelAdapter` built
+    without a `provider_name` returns exactly that -- and it has to keep meaning "declares nothing,
+    use the config" rather than "I did not ask". Collapsing the sentinel to `None` would send those
+    callers back to the adapter for the second read the parameter exists to prevent.
+    """
+
+    from monoid_agent_kernel.providers.base import resolved_provider_name
+
+    gateway = ModelConfig(provider="gateway")
+
+    assert resolved_provider_name(_Declaring(), gateway, declared=None) == "gateway"
+    assert resolved_provider_name(_Declaring(), gateway, declared="") == "gateway"
+    assert resolved_provider_name(_Silent(), gateway, declared="openai") == "openai"
+    # Omitting it still probes, which is what every other caller of this expression relies on.
+    assert resolved_provider_name(_Declaring(), gateway) == "openai"
+
+
 # --- the projection reflects over nothing ----------------------------------------------
 #
 # The one claim no behavioural test can express. A matrix says which fields move the key; it

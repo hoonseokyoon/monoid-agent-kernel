@@ -354,7 +354,10 @@ Four further opt-in protocols declare optional capability members:
   names the provider on every observability surface that probes an adapter for one — via
   `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`
   (including when the declaration is unreadable — the tolerance path still falls back rather
-  than answering nothing),
+  than answering nothing). A caller that has already read the declaration passes it as `declared`
+  so it is not read a second time: one model call resolves it once, and the receipt's
+  `provider_name` and the provider term in its `request_digest` therefore cannot disagree even if
+  the adapter's property does not answer the same way twice.
   and feeds `ModelCallReceipt.provider_name`, the model-stream context's `provider`, and
   `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
   through the gateway is therefore attributed to the model that served it, with the transport

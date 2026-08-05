@@ -7,6 +7,21 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the replay key names the provider the receipt records
+
+- **The declaration is read once per call, not once per reader.** The adapter itself has been read
+  once per call for a while, precisely so that one call cannot be answered by one adapter and
+  attributed to another. The `provider_name` *on* that adapter was still read twice — once for
+  `ModelCallReceipt.provider_name`, once for the key — and a property that answers and then stops
+  answering made the two disagree: the receipt said `openai` while the key had been taken under the
+  config's `gateway`. A key whose preimage the record contradicts cannot be recomputed and cannot
+  be verified, which is the exact defect that took the destination out of this payload.
+- **`resolved_provider_name` accepts the declaration a caller has already read.** One expression of
+  "declaration else config" still, rather than the rule restated at the call site; the runner now
+  hands in its own probe instead of having an identical one re-derived beside it. A sentinel, not
+  `None`: an adapter that declares `None` is answering "nothing, use the config", and that has to
+  stay distinguishable from "I did not ask".
+
 ### Fixed — an absent status no longer contradicts the digest it describes
 
 - **A receipt written before these fields existed keeps the key it recorded.** `from_json` read a

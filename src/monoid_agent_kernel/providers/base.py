@@ -357,7 +357,18 @@ class ProviderNamedModelAdapter(Protocol):
     def provider_name(self) -> str | None: ...
 
 
-def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | None:
+_UNREAD: Any = object()
+"""``declared`` was not supplied, so :func:`resolved_provider_name` reads it itself.
+
+A sentinel rather than ``None`` because ``None`` is a real answer from a declaring adapter -- a
+``GatewayModelAdapter`` built without one returns exactly that -- and it must keep meaning "declares
+nothing, use the config" rather than "I did not ask".
+"""
+
+
+def resolved_provider_name(
+    adapter: Any, config: ModelConfig | None, *, declared: Any = _UNREAD
+) -> str | None:
     """The provider that ACTUALLY serves a call: what the adapter declares, else the config's.
 
     One expression, because the answer is written to three surfaces that a reader compares --
@@ -373,9 +384,19 @@ def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | No
 
     Tolerant by construction: this feeds telemetry, and a third-party ``provider_name`` property
     that raises -- or whose ``str()`` does -- must not take a run down over an attribute nothing
-    branches on. Mirrors the defensive probe in ``ModelCallRunner``, including its
-    ``normalize_unicode_scalars``, so the receipt's own read of a declaration and this one are
-    byte-identical rather than merely equal on well-behaved strings.
+    branches on.
+
+    ``declared`` is a declaration the caller has **already read**, supplied so that this does not
+    read it a second time. Mirroring ``ModelCallRunner``'s defensive probe, including its
+    ``normalize_unicode_scalars``, made the two byte-identical on any value -- but only on a value
+    that does not change between reads. A ``provider_name`` property that answers once and then
+    raises gave the receipt ``openai`` and the replay key the config's ``gateway``, for one call, so
+    the key could no longer be reproduced from the record that describes it. Handing the read in
+    closes that by construction rather than by resemblance: the caller that records a declaration
+    and the key taken beside it now derive from one read.
+
+    Normalization is idempotent (it maps surrogates to U+FFFD and leaves everything else alone), so
+    a caller passing an already-normalized string gets that string back unchanged.
 
     Tolerance means "keep going", not "answer nothing": the declaration guard FALLS THROUGH to
     the config fallback rather than returning. It used to return ``None`` there, which made the
@@ -385,7 +406,8 @@ def resolved_provider_name(adapter: Any, config: ModelConfig | None) -> str | No
     """
 
     try:
-        declared = getattr(adapter, "provider_name", None)
+        if declared is _UNREAD:
+            declared = getattr(adapter, "provider_name", None)
         if declared:
             return normalize_unicode_scalars(str(declared))
     except Exception:
