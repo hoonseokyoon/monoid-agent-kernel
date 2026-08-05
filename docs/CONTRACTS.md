@@ -571,6 +571,15 @@ it), `not_reached` (the call was refused before a key was computed), and `ok`.
 `digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
 which rules produced it.
 
+A receipt written before those fields existed carries neither, and `from_json` reads the absence as
+`not_reached` only where nothing contradicts it: a payload whose `request_digest` is non-empty reads
+`ok`, and one whose `destination_digest` is non-empty reads `resolved`, because that is the only
+probe outcome producing a value. The alternative is a record that denies its own contents, which the
+next `to_json` makes permanent. `digest_generation` is *not* inferred alongside it — a legacy key was
+taken under rules the record cannot name, and empty is what stops a replay consumer treating it as
+reproducible. A status the payload actually states is kept verbatim even where it disagrees with its
+digest: that pair is a bug in the writer, not something to repair silently on read.
+
 **What the replay key is made of is a declared list, not a serialized object.** The model config
 enters as a hand-listed projection — the model name, the reasoning block, and the generation block
 when configured — rather than as `ModelConfig.to_json()`. `timeout_s`, `retry` and `gateway_url`

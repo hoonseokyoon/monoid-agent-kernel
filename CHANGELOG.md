@@ -7,6 +7,25 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — an absent status no longer contradicts the digest it describes
+
+- **A receipt written before these fields existed keeps the key it recorded.** `from_json` read a
+  missing `digest_status` as `not_reached` — "the call was refused before a key was computed" —
+  over a payload carrying a non-empty `request_digest`, so the record denied its own contents and
+  `to_json` wrote the denial back, making it permanent on the first read/write. A consumer asking
+  the status whether a replay key exists would have discarded a real one. A missing status is now
+  inferred from the digest it explains: non-empty `request_digest` reads `ok`.
+- **The same rule binds the destination pair**, where the same contradiction is manufacturable:
+  a non-empty `destination_digest` reads `resolved`, the only probe outcome that answers with a
+  value. One reader, both pairs — the split rule is how the first one got written.
+- **`digest_generation` is not inferred with it.** A legacy key was taken over a different payload,
+  so naming a generation for it would hand a replay consumer a key it cannot reproduce; empty is
+  the honest answer and is what makes `ok` safe. A status the payload *states* is kept verbatim
+  even where it disagrees with its digest — that pair is a bug in a writer, and repairing it on
+  read would hide the writer that has one.
+- Red first: both pairs parametrized over one test, plus the inference's two limits (silence only,
+  never over a statement; no value, no claim).
+
 ### Added — the identity projection cannot go back to reflecting over `ModelConfig`
 
 - **A structural pin over `_model_identity`'s own source asserts it reflects over nothing** — no

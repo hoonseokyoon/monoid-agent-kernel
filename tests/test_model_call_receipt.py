@@ -271,6 +271,75 @@ def test_a_receipt_that_never_reached_the_probe_says_so() -> None:
     assert provisional.digest_generation == ""
 
 
+@pytest.mark.parametrize(
+    ("status_field", "witness_field", "witnessed"),
+    (
+        ("digest_status", "request_digest", "ok"),
+        ("destination_status", "destination_digest", "resolved"),
+    ),
+)
+def test_an_absent_status_never_contradicts_the_digest_it_describes(
+    status_field: str, witness_field: str, witnessed: str
+) -> None:
+    """A receipt written before these fields existed keeps the answer it already recorded.
+
+    `not_reached` claims the call was refused *before* the value was ever computed. Read over a
+    payload that carries the value, that is not a cautious default -- it is a record denying its own
+    contents, and `to_json` writes the denial back, so the first read/write makes it permanent and a
+    consumer that asks the status whether a replay key exists throws away a real one.
+
+    Both pairs, because the reader is one rule and the shape is one shape: a digest that is there is
+    proof of the only outcome that produces it. `destination_digest` is non-empty on the `resolved`
+    arm alone -- `_resolved_destination` answers `""` for the other three -- so the same inference
+    is available and the same contradiction is manufacturable.
+    """
+
+    legacy = ModelCallReceipt().to_json()
+    for field_name in ("digest_status", "digest_generation", "destination_status"):
+        del legacy[field_name]
+    del legacy["destination_digest"]
+    legacy[witness_field] = "sha-witness"
+
+    parsed = ModelCallReceipt.from_json(legacy)
+
+    assert getattr(parsed, status_field) == witnessed
+    assert getattr(parsed, witness_field) == "sha-witness"
+    # Inferred from silence, never over a statement: a writer that says `not_reached` beside a
+    # digest is reporting a bug, and rewriting it to `ok` would hide the writer that has one.
+    assert (
+        getattr(
+            ModelCallReceipt.from_json(legacy | {status_field: "not_reached"}),
+            status_field,
+        )
+        == "not_reached"
+    )
+    # No value, no claim. `absent` and `not_reached` are not distinguishable on a legacy record and
+    # are not guessed at; the default stands wherever it contradicts nothing.
+    assert (
+        getattr(ModelCallReceipt.from_json(legacy | {witness_field: ""}), status_field)
+        == "not_reached"
+    )
+
+
+def test_a_legacy_key_is_never_promoted_to_a_generation_it_was_not_taken_in() -> None:
+    """The status says a key exists; the generation says which rules made it. Only one is inferable.
+
+    A pre-W6-0 key was taken over a different payload -- an endpoint inside it, a serialized config
+    rather than the projection -- so reading a generation onto it would hand a replay consumer a key
+    it cannot reproduce. Empty is the honest answer, and it is what makes `ok` safe to infer.
+    """
+
+    legacy = ModelCallReceipt().to_json()
+    for field_name in ("digest_status", "digest_generation"):
+        del legacy[field_name]
+    legacy["request_digest"] = "sha-request"
+
+    parsed = ModelCallReceipt.from_json(legacy)
+
+    assert parsed.digest_status == "ok"
+    assert parsed.digest_generation == ""
+
+
 @pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
 def test_an_unknown_status_is_refused_rather_than_absorbed(field_name: str) -> None:
     """Closed kernel enums, unlike ``stop_reason``.

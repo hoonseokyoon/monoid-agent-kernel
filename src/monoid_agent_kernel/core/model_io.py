@@ -446,12 +446,32 @@ def destination_digest(value: str) -> str:
     return canonical_hmac_sha256({"destination": value}, _DIGEST_KEY) if value else ""
 
 
-def _parsed_status(payload: Mapping[str, Any], key: str, allowed: tuple[str, ...]) -> str:
-    """Read a closed kernel enum: absent reads as the default, unknown is refused."""
+def _parsed_status(
+    payload: Mapping[str, Any],
+    key: str,
+    allowed: tuple[str, ...],
+    *,
+    witness: str,
+    witnessed: str,
+) -> str:
+    """Read a closed kernel enum: unknown is refused, and absent reads as the default *unless the
+    field it describes says otherwise*.
+
+    ``witness`` names the digest this status explains, and ``witnessed`` the one outcome that could
+    have produced a non-empty one. Both defaults are ``not_reached`` -- "the call was refused before
+    we got that far" -- which is the right reading of silence on a receipt written before these
+    fields existed, and the wrong reading of silence on one that carries the value. That record
+    would deny its own contents, ``to_json`` writes the denial back, and the first read/write makes
+    it permanent: a consumer asking the status whether a replay key exists would discard a real one.
+
+    Inferred from silence only. A payload that *states* a status keeps it verbatim even where it
+    contradicts its digest, because that combination is a bug in whatever wrote it and quietly
+    repairing it here would hide the writer that has one.
+    """
 
     raw = payload.get(key)
     if raw is None:
-        return allowed[0]
+        return witnessed if parse_str(payload, witness) else allowed[0]
     if not isinstance(raw, str) or raw not in allowed:
         raise WireValidationError(f"model call {key} must be one of {allowed}")
     return raw
@@ -883,15 +903,31 @@ class ModelCallReceipt:
             http_status=None if raw_status is None else parse_int(payload, "http_status"),
             redaction_digest=parse_str(payload, "redaction_digest"),
             capture_downgrades=parse_int(payload, "capture_downgrades"),
-            # Absent on every receipt written before these fields existed, which is legal and reads
-            # as the "we never got that far" default; present-but-mistyped is refused, like every
-            # other string here. The statuses are closed kernel enums rather than free strings --
-            # unlike ``stop_reason``, whose openness exists because a *provider* may add a value --
-            # so an unknown one is a bug in a writer, not a provider surprise to absorb.
+            # Absent on every receipt written before these fields existed, which is legal; the
+            # statuses then read as the "we never got that far" default *except* where the digest
+            # they describe is there to say otherwise (see :func:`_parsed_status`), and the
+            # generation stays empty because a legacy key was taken under rules this record cannot
+            # name. Present-but-mistyped is refused, like every other string here. The statuses are
+            # closed kernel enums rather than free strings -- unlike ``stop_reason``, whose openness
+            # exists because a *provider* may add a value -- so an unknown one is a bug in a writer,
+            # not a provider surprise to absorb.
             digest_generation=parse_str(payload, "digest_generation"),
-            digest_status=_parsed_status(payload, "digest_status", DIGEST_STATUSES),
+            digest_status=_parsed_status(
+                payload,
+                "digest_status",
+                DIGEST_STATUSES,
+                witness="request_digest",
+                witnessed="ok",
+            ),
             destination_status=_parsed_status(
-                payload, "destination_status", DESTINATION_STATUSES
+                payload,
+                "destination_status",
+                DESTINATION_STATUSES,
+                # The only arm that answers with a value: `not_declared`, `declined` and
+                # `unavailable` all produce an empty digest, so a non-empty one names `resolved`
+                # and nothing else.
+                witness="destination_digest",
+                witnessed="resolved",
             ),
             destination_digest=parse_str(payload, "destination_digest"),
         )
