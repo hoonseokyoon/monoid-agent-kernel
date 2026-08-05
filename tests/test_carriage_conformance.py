@@ -6572,6 +6572,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # Joined in the burn-down's durable batch: the park payload has a schema now, and
             # this is one of the fields it type-checks.
             "core/checkpoint.py",
+            # Joined in W6-1: the durable model-call ledger records the whole failure
+            # classification, so a keyless or failed call can be triaged from the artifact alone.
+            "core/model_calls.py",
             "core/model_content.py",
             "core/model_io.py",
             "core/model_stream.py",
@@ -6611,6 +6614,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "contracts.py",
             # Joined in the burn-down's durable batch: see config_recoverable above.
             "core/checkpoint.py",
+            # Joined in W6-1: see config_recoverable above. `attempts` and this are not the same
+            # fact, so a ledger carrying only the first would show a gateway's three internal
+            # retries as one clean call.
+            "core/model_calls.py",
             "core/model_io.py",
             # Joined in the carriage sweep, with core/projections.py and recorder.py: the two
             # status readers carry the parked fact and drop it at terminal, like the event.
@@ -6817,6 +6824,12 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # sentence replaces -- so the anchor is the clause that states the *mechanism*, which
         # exists nowhere at 6f4b21b and exactly once now.
         "carried as the single wrapper key",
+        # W6-1: the ledger's exclusion rule. Not "model_calls.jsonl" and not
+        # "destination_digest" -- the first would stay green after the paragraph explaining
+        # *why* the endpoint is absent is deleted, and the second appears in this document
+        # already. The anchor is the clause naming the hazard, absent at 41c8550 and present
+        # exactly once now.
+        "never the preimage of a digest it also records",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

@@ -113,6 +113,10 @@ class LoopBootstrapper:
             extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
             status_file=loop.status_file,
             model_content_file=loop.model_content_file,
+            model_calls_file=loop.model_calls_file,
+            # Resolved once here rather than per record: the recorder owns the whole ledger
+            # envelope, and this is the same proven-lineage root the model-stream context uses.
+            root_run_id=loop._validated_root_run_id(),
             reopen=loop._restoring,
         )
         model_stream_observers = loop._materialize_model_stream_observers()
@@ -174,6 +178,10 @@ class LoopBootstrapper:
             # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
             # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
             subscriptions=tuple(loop.model_io_subscriptions),
+            # A bound method, not a closure: the recorder already owns the run id, the root, the
+            # switch and the counter, so there is nothing for a closure to capture. Gated on both
+            # sides -- here and in the method -- the same way ``recorder.open_model_stream`` is.
+            receipt_sink=recorder.record_model_call if loop.model_calls_file else None,
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.

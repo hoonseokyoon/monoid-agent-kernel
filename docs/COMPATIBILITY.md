@@ -56,6 +56,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
+| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
@@ -195,6 +196,14 @@ its own `monoid.model-content.v1` identifier, and readers also accept the legacy
 `native-agent-runner.model-content.v1` namespace. When the sidecar is enabled during this
 compatibility window, settled text is written to both it and `transcript.jsonl`; hydration reads
 the sidecar first and falls back to the transcript for any unresolved digest.
+
+`model_calls.jsonl` is optional in the same way, and single-namespace: it has never existed under
+`native-agent-runner.*`, so `monoid.model-calls.v1` is the only accepted reader version. A record
+is a declared projection of the in-process `ModelCallReceipt` rather than its serialization, so
+the two shapes are deliberately not interchangeable — a recorded line does not round-trip through
+`ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.
+Adding a field to `ModelCallReceipt` therefore does not change this artifact; adding one *here*
+is a schema change like any other, because `additionalProperties` is false.
 
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,

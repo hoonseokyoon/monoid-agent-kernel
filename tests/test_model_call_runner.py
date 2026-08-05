@@ -18,6 +18,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
+    ModelCallReceipt,
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -3237,3 +3238,151 @@ def test_interruption_is_mid_turn_only_while_something_consumes_deltas() -> None
     # `StreamingAdapter.next_turn`, so the generator that would have been polled between chunks was
     # never entered -- the abort predicate is never consulted, and the call runs to completion.
     assert asyncio.run(without_consumer()).final_text == "one-shot fallback"
+
+
+# --- the receipt sink: a seam the caller's return value cannot reach ------------------------------
+
+
+class _RaisingAdapter:
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        raise ModelAdapterError(
+            "upstream refused",
+            provider_error_code="rate_limit",
+            retryable=True,
+            http_status=429,
+        )
+
+
+def test_a_failed_call_reaches_the_receipt_sink_the_caller_never_receives_one_from() -> None:
+    """The sink exists because `acall`'s return value is not a delivery channel for a failure.
+
+    A failed call publishes its receipt and then re-raises (see `acall`), and it does not stamp the
+    receipt onto the exception -- so the caller holding `turn, receipt = await runner.acall(...)`
+    gets an exception and nothing else. A durable ledger wired to that return value would record
+    only the calls that succeeded, which is the opposite of what an audit trail is for.
+
+    Both halves are asserted from one runner: the success arm proves the sink is not a
+    failure-only hook, and the failure arm proves the receipt carries the classification the
+    exception did.
+    """
+    recorded: list[ModelCallReceipt] = []
+    runner = ModelCallRunner(adapter=SyncAdapter(), receipt_sink=recorded.append)
+    turn, returned = asyncio.run(runner.acall(REQUEST))
+
+    assert turn.final_text == "answer"
+    assert [receipt.request_digest for receipt in recorded] == [returned.request_digest]
+    assert recorded[0].error_code == ""
+
+    failing = ModelCallRunner(adapter=_RaisingAdapter(), receipt_sink=recorded.append)
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(failing.acall(REQUEST))
+
+    assert len(recorded) == 2
+    failed = recorded[1]
+    assert failed.error_code != ""
+    assert failed.provider_error_code == "rate_limit"
+    assert failed.http_status == 429
+    assert failed.retryable is True
+    # The key is taken before dispatch, so a failed call is still identifiable -- which is the
+    # whole reason to record it beside the successful ones rather than in a separate lane.
+    assert failed.request_digest
+    assert failed.digest_status == "ok"
+
+
+def test_the_sink_is_handed_the_settled_receipt_and_not_the_one_before_dispatch() -> None:
+    """`capture_downgrades` is resolved by delivery, so recording before it is recording a zero.
+
+    `latency_ms` is stamped before delivery and `capture_downgrades` after it. A sink placed either
+    side of `dispatch_model_call` sees one of them unset, and the field that goes quiet is the one
+    that says a consumer was denied the content it asked for -- an audit record that always reads
+    "nothing was withheld" is worse than one that omits the question.
+    """
+    recorded: list[ModelCallReceipt] = []
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(),
+        # A policy that knows it *had* a redactor and no longer has one: the pipeline treats the
+        # missing machinery as a redaction failure and downgrades this consumer to `digest`.
+        subscriptions=(
+            ModelIOSubscription(
+                observer=observer,
+                policy=CapturePolicy(mode="redacted", restored_without_redactor=True),
+            ),
+        ),
+        receipt_sink=recorded.append,
+    )
+    _turn, returned = asyncio.run(runner.acall(REQUEST))
+
+    assert observer.captures[0].was_downgraded is True
+    assert returned.capture_downgrades == 1
+    assert len(recorded) == 1
+    assert recorded[0].capture_downgrades == 1
+    assert recorded[0].latency_ms == returned.latency_ms
+
+
+def test_a_raising_sink_does_not_fail_a_call_the_provider_was_paid_for() -> None:
+    """The containment rule observers already have, spelled for the sink.
+
+    A recorder that cannot write is not a reason to discard an answer the provider has already
+    billed for, and it is not a reason to reclassify a failure either: on the failure arm the
+    `ModelAdapterError` must escape carrying the taxonomy it arrived with, not whatever the sink
+    threw. That second half is the one a bare try/except around the call would not catch.
+    """
+
+    def explode(receipt: ModelCallReceipt) -> None:
+        del receipt
+        raise RuntimeError("ledger is on fire")
+
+    turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter(), receipt_sink=explode).acall(REQUEST)
+    )
+    assert turn.final_text == "answer"
+    assert receipt.error_code == ""
+
+    with pytest.raises(ModelAdapterError) as failure:
+        asyncio.run(ModelCallRunner(adapter=_RaisingAdapter(), receipt_sink=explode).acall(REQUEST))
+    assert failure.value.provider_error_code == "rate_limit"
+    assert failure.value.http_status == 429
+    assert failure.value.retryable is True
+
+
+def test_a_dispatch_that_raises_still_records_the_call_it_could_not_deliver(
+    monkeypatch: Any,
+) -> None:
+    """Recording is in a `finally`, not after the delivery it does not depend on.
+
+    `dispatch_model_call` contains its own observers, so this is a defence against the pipeline
+    itself breaking -- and the two call sites fail in opposite directions when it does. The failure
+    path publishes inside `contextlib.suppress(Exception)`, so a record placed after delivery is
+    lost with no trace; the success path publishes unguarded, so the same placement fails a paid
+    call. A naive "record after dispatch" implementation passes the success arm of every other test
+    in this section and dies here.
+    """
+    from monoid_agent_kernel import model_call as model_call_module
+
+    def explode(**kwargs: Any) -> Any:
+        del kwargs
+        raise RuntimeError("dispatch is broken")
+
+    monkeypatch.setattr(model_call_module, "dispatch_model_call", explode)
+    recorded: list[ModelCallReceipt] = []
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(),
+        subscriptions=(
+            ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+        ),
+        receipt_sink=recorded.append,
+    )
+
+    with pytest.raises(RuntimeError, match="dispatch is broken"):
+        asyncio.run(runner.acall(REQUEST))
+
+    # Delivery never happened, and the record still names the call.
+    assert observer.captures == []
+    assert len(recorded) == 1
+    assert recorded[0].request_digest
+    # The receipt a broken dispatch leaves behind is the pre-delivery one, so the count it could
+    # not resolve stays at its floor rather than being invented.
+    assert recorded[0].capture_downgrades == 0

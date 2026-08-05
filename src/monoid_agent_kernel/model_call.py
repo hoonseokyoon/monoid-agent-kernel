@@ -529,6 +529,24 @@ class ModelCallRunner:
     subscriptions still pays that; anyone trimming the cost should start there and not expect this
     field to gate it."""
 
+    receipt_sink: Callable[[ModelCallReceipt], None] | None = None
+    """Where a settled receipt is recorded, as opposed to *delivered*.
+
+    Separate from `subscriptions` rather than a subscription of its own, for three reasons. A
+    subscription is governed by a `CapturePolicy`, and the narrowing a `none`-mode policy applies
+    would strip the very digests a durable record exists to carry. Registering one would also defeat
+    the `if self.subscriptions` gate below, so every call would assemble `_call_content` and hash
+    every field of it to satisfy a consumer that reads none of that. And a kernel-owned recorder
+    inserting itself into the host's own observer list is a thing the host can see and close.
+
+    The reason a caller cannot do this from `acall`'s return value: a failed call publishes its
+    receipt and re-raises without stamping it on the exception, so the return value carries receipts
+    for successful calls only. A ledger built on it would record everything except the failures --
+    which are exactly what an audit trail is for.
+
+    Read once per call, like `subscriptions`, and expected not to raise; one that does is contained
+    the same way an observer is."""
+
     def _effective_model(
         self,
         request: ModelRequest,
@@ -832,14 +850,51 @@ class ModelCallRunner:
         *,
         elapsed_ms: int,
     ) -> ModelCallReceipt:
+        """Deliver the settled receipt to observers, then record it, on every exit.
+
+        Recording is in a `finally` because the two callers fail in opposite directions when
+        delivery raises. The failure path publishes inside `contextlib.suppress(Exception)`, so a
+        record placed after `dispatch_model_call` disappears with no trace; the success path
+        publishes unguarded, so the same placement fails a call the provider has already been paid
+        for. `dispatch_model_call` contains its own observers, so this is a defence against the
+        pipeline itself, not against a broken exporter.
+
+        The cost, stated rather than fixed: when delivery raises, the recorded receipt is the
+        pre-delivery one and `capture_downgrades` stays at the floor it was resolved to. Moving the
+        record earlier to make that deterministic would make it *always* zero, which is a worse
+        record -- a field that never reports a withheld capture reads as "nothing was withheld".
+        """
+
         timed = replace(receipt, latency_ms=elapsed_ms)
-        if not self.subscriptions:
-            return timed
-        return dispatch_model_call(
-            receipt=timed,
-            content=_call_content(request, turn),
-            subscriptions=self.subscriptions,
-        )
+        settled = timed
+        try:
+            if self.subscriptions:
+                settled = dispatch_model_call(
+                    receipt=timed,
+                    content=_call_content(request, turn),
+                    subscriptions=self.subscriptions,
+                )
+        finally:
+            self._record(settled)
+        return settled
+
+    def _record(self, receipt: ModelCallReceipt) -> None:
+        """Hand the receipt to `receipt_sink`, absorbing whatever it does.
+
+        The same containment `dispatch_model_call` gives an observer, and for a sharper version of
+        the same reason: a sink is typically a durable writer, so "the disk is full" must not
+        become "the answer is discarded" -- nor "this provider failure is now a RuntimeError",
+        which is what an unguarded call on the failure path would do to the taxonomy an escaping
+        `ModelAdapterError` carries.
+        """
+
+        sink = self.receipt_sink
+        if sink is None:
+            return
+        try:
+            sink(receipt)
+        except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
+            _LOGGER.debug("model call receipt sink failed", exc_info=True)
 
     async def _adrive(
         self,

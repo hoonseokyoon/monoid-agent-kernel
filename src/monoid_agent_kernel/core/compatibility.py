@@ -264,6 +264,24 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         ),
     ),
     _monoid_artifact(
+        "model-calls.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=(
+            "core/schemas.py:MODEL_CALLS_RECORD_SCHEMA",
+            "core/model_calls.py:MODEL_CALLS_SCHEMA_VERSION",
+        ),
+        # No legacy namespace: this artifact has never existed under native-agent-runner.*, and
+        # advertising a reader for records that cannot exist is a false compatibility claim.
+        legacy_reader=False,
+        notes=(
+            "Optional private run-dir ledger of settled model calls, one record per call including "
+            "failed ones. Metadata and the replay key only: a record is a declared projection of "
+            "ModelCallReceipt rather than its serialization, so it never carries request or "
+            "response content, the configured endpoint, or the per-process destination digest."
+        ),
+    ),
+    _monoid_artifact(
         "manifest.v1",
         kind="durable",
         reader_policy="json-schema",

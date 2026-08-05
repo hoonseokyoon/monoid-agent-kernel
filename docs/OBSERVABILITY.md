@@ -17,6 +17,9 @@ The run-directory artifact set is:
 - `transcript.jsonl`: private debug/replay transcript with full tool payloads
 - `model-content.jsonl`: optional private model-stream sidecar with output/reasoning segments and
   settled text (`monoid.model-content.v1`)
+- `model_calls.jsonl`: optional private ledger of settled model calls, one record per call
+  including failed ones — metadata, taxonomy, and the replay key, no content
+  (`monoid.model-calls.v1`)
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
   non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
   from the `session.state.changed` event). While a run is parked on a recoverable turn failure
@@ -391,6 +394,16 @@ created for every activation and subagent, and observer failures remain isolated
 call. `model_content_file=True` adds a writer owned by the run recorder and persists
 `stream_opened`, `stream_segment`, `stream_closed`, and `settled_text` records to the optional
 private `model-content.jsonl` sidecar.
+
+`model_calls_file=True` adds a second recorder-owned writer, for `model_calls.jsonl`. It is fed
+from the model runner rather than from a `ModelIOObserver`, which is what lets it record failed
+calls: a failure publishes its receipt to the subscriptions and re-raises without stamping it on
+the exception, so a writer driven by the loop's return value would hold only successes. Writes are
+shielded four ways — the ledger opens only if its own path is a single-link regular file, never a
+symlink or hard link planted where a reopened run expects its artifact, an unencodable record costs
+its own line, a write error disables the handle so a torn line cannot consume the next record, and
+nothing raises into the call. The switch is independent of `stream_model_calls` and
+`model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say.
 
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains

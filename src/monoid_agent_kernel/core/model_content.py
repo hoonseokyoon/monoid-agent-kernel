@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, BinaryIO, Literal, TextIO, TypeAlias
 
 from monoid_agent_kernel.core._util import utc_timestamp
+from monoid_agent_kernel.core._verified_file import (
+    VerifiedFileIdentity,
+    file_identity,
+    open_verified_append_text,
+    open_verified_regular_fd,
+    verified_file_is_safe,
+)
 from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
     normalize_json_ingress,
@@ -95,12 +102,10 @@ class ModelContentReadResult:
         object.__setattr__(self, "settled_texts", dict(self.settled_texts))
 
 
-@dataclass(frozen=True)
-class ModelContentFileIdentity:
-    """Stable identity for one verified sidecar inode."""
-
-    device: int
-    inode: int
+# The sidecar was the first artifact to need a verified inode identity, so the name it was given
+# is this module's. The type itself is not about model content and now lives beside the verified
+# open that produces it; this alias keeps the sidecar-local vocabulary readable.
+ModelContentFileIdentity = VerifiedFileIdentity
 
 
 @dataclass(frozen=True)
@@ -328,7 +333,7 @@ class ModelContentStore:
             identity: ModelContentFileIdentity | None = None
             if self._handle is not None:
                 try:
-                    identity = _file_identity(os.fstat(self._handle.fileno()))
+                    identity = file_identity(os.fstat(self._handle.fileno()))
                 except (OSError, ValueError) as exc:
                     self._disabled = True
                     raise OSError("active model-content descriptor is unavailable") from exc
@@ -400,41 +405,14 @@ class ModelContentStore:
     def _ensure_handle_locked(self) -> TextIO | None:
         if self._handle is not None:
             return self._handle
-        descriptor: int | None = None
-        handle: TextIO | None = None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = _open_verified_regular_fd(
-                self.path,
-                os.O_RDWR | os.O_CREAT | os.O_APPEND,
-            )
-            if descriptor is None:
-                self._disabled = True
-                return None
-            size = os.fstat(descriptor).st_size
-            torn_tail = False
-            if size:
-                os.lseek(descriptor, size - 1, os.SEEK_SET)
-                torn_tail = os.read(descriptor, 1) != b"\n"
-            handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
-            descriptor = None  # owned by ``handle`` from here
-            if torn_tail:
-                handle.write("\n")
-                handle.flush()
-            self._handle = handle
-        except (OSError, ValueError):
+        # Refusal is terminal. The verified open declines a planted link or a special file, which is
+        # a property of the path rather than a transient, so retrying on the next segment only
+        # re-runs the same refusal.
+        handle = open_verified_append_text(self.path)
+        if handle is None:
             self._disabled = True
-            self._handle = None
-            if handle is not None:
-                try:
-                    handle.close()
-                except OSError:
-                    pass
-            elif descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+            return None
+        self._handle = handle
         return self._handle
 
 
@@ -788,19 +766,11 @@ def _model_content_file_path(path: Path) -> Path:
 def model_content_file_is_safe(path: Path, *, allow_missing: bool = True) -> bool:
     """Whether a sidecar path is absent or an ordinary file, without following links.
 
-    A missing file is safe for the lazy writer to create unless ``allow_missing`` is false. Existing
-    links, directories, FIFOs, devices, and other special files fail closed for readers and writers.
+    The sidecar-named entry point for :func:`verified_file_is_safe`, kept because Studio calls it
+    by this name; the rule it applies belongs to every run-directory artifact, not to this one.
     """
 
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return allow_missing
-    except OSError:
-        return False
-    # A hard link is also an indirection across the run-directory boundary: appending here mutates
-    # the same inode through every other name. Sidecars are process-created single-link artifacts.
-    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    return verified_file_is_safe(path, allow_missing=allow_missing)
 
 
 def model_content_file_identity(
@@ -821,7 +791,7 @@ def model_content_file_identity(
         raise OSError("model-content sidecar metadata is unavailable") from exc
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise OSError("model-content sidecar is not a verified single-link regular file")
-    return _file_identity(metadata)
+    return file_identity(metadata)
 
 
 def model_content_file_matches_identity(
@@ -836,47 +806,6 @@ def model_content_file_matches_identity(
         return False
 
 
-def _file_identity(metadata: os.stat_result) -> ModelContentFileIdentity:
-    return ModelContentFileIdentity(device=metadata.st_dev, inode=metadata.st_ino)
-
-
-def _open_verified_regular_fd(
-    path: Path,
-    flags: int,
-    *,
-    expected_identity: ModelContentFileIdentity | None = None,
-) -> int | None:
-    """Open ``path`` without accepting a link/special-file swap before the first I/O."""
-
-    if not model_content_file_is_safe(path):
-        return None
-    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags, 0o666)
-    except OSError:
-        return None
-    try:
-        opened = os.fstat(descriptor)
-        named = path.lstat()
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(named.st_mode)
-            or opened.st_nlink != 1
-            or named.st_nlink != 1
-            or not os.path.samestat(opened, named)
-            or (expected_identity is not None and _file_identity(opened) != expected_identity)
-        ):
-            os.close(descriptor)
-            return None
-    except OSError:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        return None
-    return descriptor
-
-
 def open_model_content_for_read(
     path: Path,
     *,
@@ -885,7 +814,7 @@ def open_model_content_for_read(
     """Open the fixed sidecar for a verified, no-indirection binary read."""
 
     path = _model_content_file_path(path)
-    descriptor = _open_verified_regular_fd(
+    descriptor = open_verified_regular_fd(
         path,
         os.O_RDONLY,
         expected_identity=expected_identity,

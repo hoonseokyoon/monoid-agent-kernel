@@ -11,7 +11,13 @@ from jsonschema import Draft202012Validator
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.model_calls import (
+    MODEL_CALL_KIND,
+    MODEL_CALLS_FILENAME,
+    MODEL_CALLS_SCHEMA_VERSION,
+)
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_io import DESTINATION_STATUSES, DIGEST_STATUSES
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
@@ -931,6 +937,135 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
     ]
 }
 
+# The private model-call ledger. A literal single-element enum rather than
+# ``schema_version_property``: that helper emits the legacy namespace beside the current one, and
+# this artifact has never existed under it — advertising a reader for records that cannot exist is
+# a false compatibility claim, and the ledger's own reader-version pin refuses it.
+_MODEL_CALL_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["provider", "model", "reasoning"],
+    "properties": {
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "reasoning": {
+            "type": "object",
+            "required": ["effort", "summary", "on_unsupported"],
+            "properties": {
+                "effort": {"type": "string"},
+                "summary": {"type": "string"},
+                "on_unsupported": {"enum": ["fail", "omit"]},
+            },
+            "additionalProperties": False,
+        },
+        # Omitted when the caller configured no sampling control, which is why it is not required.
+        "generation": {
+            "type": "object",
+            "required": ["temperature", "top_p", "max_output_tokens", "on_unsupported"],
+            "properties": {
+                "temperature": {"type": ["number", "null"]},
+                "top_p": {"type": ["number", "null"]},
+                "max_output_tokens": {"type": ["integer", "null"]},
+                "on_unsupported": {"enum": ["fail", "omit"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "schema_version",
+        "kind",
+        "run_id",
+        "root_run_id",
+        "call_index",
+        "recorded_at",
+        "context",
+        "model",
+        "provider_name",
+        "prompt_digest",
+        "request_digest",
+        "digest_generation",
+        "digest_status",
+        "destination_status",
+        "stop_reason",
+        "usage",
+        "latency_ms",
+        "attempts",
+        "provider_retried",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "http_status",
+        "capture_downgrades",
+    ],
+    "properties": {
+        "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
+        "kind": {"const": MODEL_CALL_KIND},
+        "run_id": {"type": "string", "minLength": 1},
+        "root_run_id": {"type": "string", "minLength": 1},
+        "call_index": {"type": "integer", "minimum": 0},
+        "recorded_at": {"type": "string", "pattern": "Z$"},
+        "context": {
+            "type": "object",
+            "required": [
+                "run_id",
+                "skill_id",
+                "skill_digest",
+                "step_id",
+                "attempt",
+                "batch_id",
+                "item_id",
+                "case_id",
+                "traceparent",
+                "tracestate",
+                "attributes",
+            ],
+            "properties": {
+                "run_id": {"type": "string"},
+                "skill_id": {"type": "string"},
+                "skill_digest": {"type": "string"},
+                "step_id": {"type": "string"},
+                "attempt": {"type": "integer", "minimum": 1},
+                "batch_id": {"type": "string"},
+                "item_id": {"type": "string"},
+                "case_id": {"type": "string"},
+                "traceparent": {"type": "string"},
+                "tracestate": {"type": "string"},
+                "attributes": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "model": _MODEL_CALL_CONFIG_SCHEMA,
+        "provider_name": {"type": "string"},
+        # Empty is a valid answer and ``digest_status`` says which of the four reasons it is, so
+        # the pattern admits both the key and its absence rather than requiring one.
+        "prompt_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+        "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+        "digest_generation": {"type": "string"},
+        "digest_status": {"enum": list(DIGEST_STATUSES)},
+        "destination_status": {"enum": list(DESTINATION_STATUSES)},
+        "stop_reason": {"type": "string"},
+        "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "latency_ms": {"type": "integer", "minimum": 0},
+        "attempts": {"type": "integer", "minimum": 0},
+        "provider_retried": {"type": "boolean"},
+        "error_code": {"type": "string"},
+        "provider_error_code": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
+        "http_status": {"type": ["integer", "null"]},
+        "capture_downgrades": {"type": "integer", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
+
 PROPOSAL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
@@ -1324,6 +1459,12 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     if model_content_path.exists():
         _validate_jsonl_file(model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues)
         _validate_settled_text_digests(model_content_path, issues)
+    # Optional like the content sidecar beside it, and for the same reason: it exists only for a
+    # run that asked for it, so its absence is a configuration, not a defect. There is no digest
+    # recomputation pass to go with it -- the ledger holds no content-addressed field.
+    model_calls_path = run_dir / MODEL_CALLS_FILENAME
+    if model_calls_path.exists():
+        _validate_jsonl_file(model_calls_path, MODEL_CALLS_RECORD_SCHEMA, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
