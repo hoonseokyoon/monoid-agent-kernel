@@ -340,6 +340,37 @@ def test_a_legacy_key_is_never_promoted_to_a_generation_it_was_not_taken_in() ->
     assert parsed.digest_generation == ""
 
 
+@pytest.mark.parametrize(
+    ("status_field", "witness_field"),
+    (
+        ("digest_status", "request_digest"),
+        ("destination_status", "destination_digest"),
+    ),
+)
+def test_an_explicit_null_status_is_a_malformed_value_not_an_absent_field(
+    status_field: str, witness_field: str
+) -> None:
+    """A key that is *there* holding `null` is a corrupt record, not a legacy one.
+
+    Every other string on this receipt already draws that line -- `parse_str` separates a missing
+    key from a present one holding the wrong type, and `http_status` is nullable only because it is
+    declared `int | None`. Reading `null` as absence would admit the corrupt record, hand it a
+    status inferred from its digest that it never carried, and let `to_json` write that back out as
+    a stated one.
+    """
+
+    stated_null = ModelCallReceipt().to_json() | {status_field: None}
+
+    # With a digest to infer from -- the case where absence and null diverge, and where reading
+    # null as absence fabricates a status rather than merely defaulting one.
+    with pytest.raises(WireValidationError, match=status_field):
+        ModelCallReceipt.from_json(stated_null | {witness_field: "sha-witness"})
+
+    # And with nothing to infer from: the refusal is about the value, not about the inference.
+    with pytest.raises(WireValidationError, match=status_field):
+        ModelCallReceipt.from_json(stated_null)
+
+
 @pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
 def test_an_unknown_status_is_refused_rather_than_absorbed(field_name: str) -> None:
     """Closed kernel enums, unlike ``stop_reason``.

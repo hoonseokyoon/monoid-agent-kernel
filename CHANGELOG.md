@@ -23,8 +23,14 @@ out in commit messages and here.
   the honest answer and is what makes `ok` safe. A status the payload *states* is kept verbatim
   even where it disagrees with its digest — that pair is a bug in a writer, and repairing it on
   read would hide the writer that has one.
+- **Silence is a key that is not there.** The reader asked `payload.get(key) is None`, which reads a
+  key *present and holding `null`* as an absent one. That was harmless while both landed on the
+  default and stopped being harmless the moment absence began to infer: a corrupt record would have
+  been admitted, handed a status inferred from its digest that it never carried, and had `to_json`
+  write that back out as a stated one. `null` is now refused, like every other string on the
+  receipt — `http_status` is nullable only because it is declared `int | None`.
 - Red first: both pairs parametrized over one test, plus the inference's two limits (silence only,
-  never over a statement; no value, no claim).
+  never over a statement; no value, no claim) and the null refusal at both witness states.
 
 ### Added — the identity projection cannot go back to reflecting over `ModelConfig`
 

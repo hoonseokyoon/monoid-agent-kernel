@@ -454,8 +454,8 @@ def _parsed_status(
     witness: str,
     witnessed: str,
 ) -> str:
-    """Read a closed kernel enum: unknown is refused, and absent reads as the default *unless the
-    field it describes says otherwise*.
+    """Read a closed kernel enum: unknown is refused, and a *missing key* reads as the default
+    unless the field it describes says otherwise.
 
     ``witness`` names the digest this status explains, and ``witnessed`` the one outcome that could
     have produced a non-empty one. Both defaults are ``not_reached`` -- "the call was refused before
@@ -467,11 +467,18 @@ def _parsed_status(
     Inferred from silence only. A payload that *states* a status keeps it verbatim even where it
     contradicts its digest, because that combination is a bug in whatever wrote it and quietly
     repairing it here would hide the writer that has one.
+
+    Silence is a key that is not there -- ``key not in payload``, not ``payload.get(key) is None``.
+    A key present and holding ``null`` is a corrupt record, and every other string on this receipt
+    already refuses one (``parse_str`` separates missing from present-and-mistyped; ``http_status``
+    is nullable only because it is declared ``int | None``). Conflating the two was harmless while
+    both landed on the default and stopped being harmless the moment absence began to infer: it
+    would have handed a malformed payload a status it never carried.
     """
 
-    raw = payload.get(key)
-    if raw is None:
+    if key not in payload:
         return witnessed if parse_str(payload, witness) else allowed[0]
+    raw = payload[key]
     if not isinstance(raw, str) or raw not in allowed:
         raise WireValidationError(f"model call {key} must be one of {allowed}")
     return raw
