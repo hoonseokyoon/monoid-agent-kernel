@@ -6824,6 +6824,12 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # sentence replaces -- so the anchor is the clause that states the *mechanism*, which
         # exists nowhere at 6f4b21b and exactly once now.
         "carried as the single wrapper key",
+        # W6-1: the ledger's exclusion rule. Not "model_calls.jsonl" and not
+        # "destination_digest" -- the first would stay green after the paragraph explaining
+        # *why* the endpoint is absent is deleted, and the second appears in this document
+        # already. The anchor is the clause naming the hazard, absent at 41c8550 and present
+        # exactly once now.
+        "never the preimage of a digest it also records",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

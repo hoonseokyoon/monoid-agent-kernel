@@ -7,6 +7,37 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — a private ledger of the model calls a run made
+
+- **`AgentLoop.model_calls_file=True` writes `model_calls.jsonl`**, one `monoid.model-calls.v1`
+  record per settled model call. Opt-in, so an existing run directory keeps its shape; optional
+  for readers; validated by `monoid validate` when present. Registered as the 42nd public
+  compatibility artifact.
+- **Failed calls are in it.** The record is fed from a new `ModelCallRunner.receipt_sink` rather
+  than from the loop's return value, because a failed call publishes its receipt and re-raises
+  without stamping it on the exception — a ledger built on the return value would have recorded
+  only the successes, which is the opposite of what an audit trail is for. It is also not a
+  `ModelIOObserver`: a `CapturePolicy` narrowing would strip the very digests the ledger carries,
+  and registering a kernel-owned recorder in the host's observer list would make every call
+  assemble and hash content that nothing reads.
+- **A record is a declared projection, not a serialized receipt.** `ModelCallReceipt.to_json()`
+  emits `model.to_json()`, and `ModelConfig.to_json()` emits `gateway_url` — the field the gateway
+  adapter resolves its destination from. Serializing the receipt would have written the preimage of
+  `destination_digest` in the adjacent field of the same line, and because that digest is keyed
+  under a per-process secret, one such line makes every other digest in the file confirmable. The
+  shipped scaffold configures a `gateway_url`, so this would have been line one of a new agent's
+  first run.
+- **`destination_digest` is not recorded; `destination_status` is.** A per-process key written to a
+  file that outlives the process names one destination two ways across a recovery, which reads as a
+  deployment change that never happened. A durable form needs a deployment-supplied key, and that
+  choice is still open. `redaction_digest` is absent for an independent reason: it is set only by
+  the per-subscription capture narrowing, so on this seam it is always empty, and recording it
+  would state "no redaction rules were applied" on lines where a redacted consumer applied rules.
+- **`call_index` and `root_run_id` are the writer's, not the receipt's.** The receipt carries no
+  wall clock, no ordinal, and no proven run identity — `context.run_id` is a caller's claim. A
+  subagent inherits the switch and records into its own run directory, so `root_run_id` is what
+  makes a run tree joinable.
+
 ### Fixed — the replay key names the provider the receipt records
 
 - **The declaration is read once per call, not once per reader.** The adapter itself has been read

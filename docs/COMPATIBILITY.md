@@ -197,6 +197,14 @@ its own `monoid.model-content.v1` identifier, and readers also accept the legacy
 compatibility window, settled text is written to both it and `transcript.jsonl`; hydration reads
 the sidecar first and falls back to the transcript for any unresolved digest.
 
+`model_calls.jsonl` is optional in the same way, and single-namespace: it has never existed under
+`native-agent-runner.*`, so `monoid.model-calls.v1` is the only accepted reader version. A record
+is a declared projection of the in-process `ModelCallReceipt` rather than its serialization, so
+the two shapes are deliberately not interchangeable — a recorded line does not round-trip through
+`ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.
+Adding a field to `ModelCallReceipt` therefore does not change this artifact; adding one *here*
+is a schema change like any other, because `additionalProperties` is false.
+
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,
 hosted tasks, continuation handle, runtime limits, and blob references. Keep that previous-version

@@ -683,6 +683,39 @@ flush point for currently buffered segments while a stream remains open. Ordinar
 remain side-effect free. A `stream_closed` record carries the boolean `retryable` signal; readers
 treat its absence as `false` for records written before that field was introduced.
 
+`AgentLoop.model_calls_file=True` writes the optional private `model_calls.jsonl` ledger: one
+`monoid.model-calls.v1` record of kind `model_call` per settled call, **including failed ones**.
+Existing run directories may omit the file, and it is independent of `model_content_file` and
+`stream_model_calls` — a ledger of what was called selects no provider streaming. A subagent
+inherits the switch and records into its own run directory, so every record carries `root_run_id`
+as the join key for a run tree.
+
+A record is a **declared projection** of `ModelCallReceipt`, not its serialization, and does not
+round-trip back through `ModelCallReceipt.from_json`: that reader would fill `timeout_s`,
+`gateway_url` and `retry` with defaults and produce a receipt asserting a transport policy the
+call never ran under. Four consequences follow from the projection being declared rather than
+derived:
+
+- The configured endpoint is absent. `ModelConfig.to_json()` emits `gateway_url` and the gateway
+  adapter resolves its destination from that same field, so a serialized receipt would write the
+  endpoint in the clear beside the digest that conceals it. The rule the ledger holds is that a
+  record carries statuses and digests but
+  never the preimage of a digest it also records — and because `destination_digest` is keyed
+  under a per-process secret, one such line would make every other digest in the file confirmable.
+- `destination_digest` is therefore absent as well, while `destination_status` is recorded. The
+  digest identifies a destination within one process; the file outlives that process, so a durable
+  copy would name one destination two ways across a recovery and read as a deployment change that
+  never happened. The status names which of the four probe outcomes happened and stays true.
+- `redaction_digest` is absent. It is a per-subscription fact set only by the capture narrowing, so
+  on the recording seam it is always empty; writing it would state "no redaction rules were
+  applied" on lines where a redacted consumer applied rules.
+- Transport policy (`timeout_s`, `retry`) and the derived `succeeded` / `trace_id` / `span_id`
+  properties are absent. The derivations' inputs — `error_code` and `traceparent` — are recorded.
+
+`call_index` counts within one activation and restarts at zero when a durable run reopens its
+directory and appends to the ledger it already has. It is a gap detector, not a join key: a
+restart is self-evident because the index drops while `recorded_at` advances.
+
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
 and inherited by in-process descendants, producing one passive root-multiplexed presentation
