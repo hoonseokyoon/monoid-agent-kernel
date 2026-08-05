@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.model_io import ModelCallReceipt
+from monoid_agent_kernel.core.model_io import (
+    DESTINATION_STATUSES,
+    DIGEST_STATUSES,
+    ModelCallReceipt,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import WireValidationError
 from monoid_agent_kernel.errors import ModelAdapterError, RunCancelled
@@ -369,6 +373,50 @@ def test_an_explicit_null_status_is_a_malformed_value_not_an_absent_field(
     # And with nothing to infer from: the refusal is about the value, not about the inference.
     with pytest.raises(WireValidationError, match=status_field):
         ModelCallReceipt.from_json(stated_null)
+
+
+@pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
+def test_a_status_the_reader_would_refuse_cannot_be_constructed(field_name: str) -> None:
+    """A receipt cannot be born unreadable by its own class.
+
+    `from_json` refused a non-member and `to_json` emitted one, so `ModelCallReceipt(
+    digest_status="okay")` wrote an audit record this same class rejects on the way back in. A
+    record that can be written and not read fails in the consumer, long after the writer that
+    caused it is gone -- and the writer is the only place the mistake is fixable.
+
+    `ModelCallCapture.__post_init__` already refuses a `mode` outside `CAPTURE_MODES`; these two
+    were the closed enums on this side of the file that did not. Constructor and reader now share
+    one function, so the two cannot drift back apart.
+    """
+
+    with pytest.raises(WireValidationError, match=field_name):
+        ModelCallReceipt(**{field_name: "okay"})
+
+    # `replace` re-runs `__post_init__`, and it is the path the subscription narrowing and
+    # `with_error` both take -- a rule the direct constructor alone enforced would miss them.
+    with pytest.raises(WireValidationError, match=field_name):
+        replace(ModelCallReceipt(), **{field_name: "okay"})
+
+
+def test_each_status_field_admits_exactly_its_own_vocabulary() -> None:
+    """The refusal must not be stricter than the enum, and must not accept the other one's.
+
+    One helper now serves both fields, which is precisely the shape that lets a transposed
+    argument pass every "a bad value is refused" test: `not_reached` is a member of both sets, so
+    a swapped pair would still refuse `"okay"` and still accept the default.
+    """
+
+    for value in DIGEST_STATUSES:
+        assert ModelCallReceipt(digest_status=value).digest_status == value
+    for value in DESTINATION_STATUSES:
+        assert ModelCallReceipt(destination_status=value).destination_status == value
+
+    for value in set(DESTINATION_STATUSES) - set(DIGEST_STATUSES):
+        with pytest.raises(WireValidationError, match="digest_status"):
+            ModelCallReceipt(digest_status=value)
+    for value in set(DIGEST_STATUSES) - set(DESTINATION_STATUSES):
+        with pytest.raises(WireValidationError, match="destination_status"):
+            ModelCallReceipt(destination_status=value)
 
 
 @pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))

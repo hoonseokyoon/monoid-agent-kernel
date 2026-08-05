@@ -580,6 +580,8 @@ taken under rules the record cannot name, and empty is what stops a replay consu
 reproducible. A status the payload actually states is kept verbatim even where it disagrees with its
 digest: that pair is a bug in the writer, not something to repair silently on read. Silence means the
 key is absent; a key present and holding `null` is refused, like every other string on the receipt.
+Both enums are closed at construction as well as on the wire, through the same check, so a receipt
+cannot be built that its own reader would reject.
 
 **What the replay key is made of is a declared list, not a serialized object.** The model config
 enters as a hand-listed projection — the model name, the reasoning block, and the generation block

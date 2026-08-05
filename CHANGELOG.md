@@ -29,8 +29,19 @@ out in commit messages and here.
   been admitted, handed a status inferred from its digest that it never carried, and had `to_json`
   write that back out as a stated one. `null` is now refused, like every other string on the
   receipt — `http_status` is nullable only because it is declared `int | None`.
+- **A receipt can no longer be born unreadable by its own class.** `from_json` refused a status
+  outside its enum while `to_json` emitted one, so `ModelCallReceipt(digest_status="okay")` wrote
+  an audit record this same class rejects on the way back in — a failure that surfaces in the
+  consumer, long after the writer that caused it is gone. `__post_init__` now refuses both closed
+  enums through the same function the reader uses, so the two cannot drift apart;
+  `ModelCallCapture` has always refused a `mode` outside `CAPTURE_MODES` this way, and these were
+  the pair that did not.
 - Red first: both pairs parametrized over one test, plus the inference's two limits (silence only,
-  never over a statement; no value, no claim) and the null refusal at both witness states.
+  never over a statement; no value, no claim), the null refusal at both witness states, and the
+  constructor refusal through `replace` as well as direct construction. One more pin holds each
+  field to its *own* vocabulary, because a single helper serving two enums is exactly the shape
+  where a transposed argument passes every "a bad value is refused" test — `not_reached` is a
+  member of both sets.
 
 ### Added — the identity projection cannot go back to reflecting over `ModelConfig`
 

@@ -446,6 +446,21 @@ def destination_digest(value: str) -> str:
     return canonical_hmac_sha256({"destination": value}, _DIGEST_KEY) if value else ""
 
 
+def _validated_status(value: Any, key: str, allowed: tuple[str, ...]) -> str:
+    """Refuse a closed kernel enum's non-member, wherever the value entered.
+
+    One function for the constructor and the reader, because they used to disagree: `from_json`
+    refused a non-member while `to_json` happily emitted one, so ``ModelCallReceipt(
+    digest_status="okay")`` wrote an audit record this same class rejects on the way back in. A
+    record that can be written and not read fails in the consumer, long after the writer that
+    caused it is gone -- and the writer is the only place the mistake was ever fixable.
+    """
+
+    if not isinstance(value, str) or value not in allowed:
+        raise WireValidationError(f"model call {key} must be one of {allowed}")
+    return value
+
+
 def _parsed_status(
     payload: Mapping[str, Any],
     key: str,
@@ -478,10 +493,7 @@ def _parsed_status(
 
     if key not in payload:
         return witnessed if parse_str(payload, witness) else allowed[0]
-    raw = payload[key]
-    if not isinstance(raw, str) or raw not in allowed:
-        raise WireValidationError(f"model call {key} must be one of {allowed}")
-    return raw
+    return _validated_status(payload[key], key, allowed)
 
 
 @dataclass(frozen=True)
@@ -742,6 +754,15 @@ class ModelCallReceipt:
             raise ValueError("model call latency_ms must not be negative")
         if self.capture_downgrades < 0:
             raise ValueError("model call capture_downgrades must not be negative")
+        # The two closed enums, refused here as well as on the wire and through the same function.
+        # `from_json` rejected a non-member while `to_json` emitted one, so this class could write
+        # an audit record it would not read back -- a failure that surfaces in the consumer, long
+        # after the writer that caused it. `ModelCallCapture` has always refused a `mode` outside
+        # `CAPTURE_MODES` in its own `__post_init__`; these two were the pair that did not.
+        # `replace` re-runs this, which is what puts the subscription narrowing and `with_error`
+        # under the same rule rather than only the direct constructor.
+        _validated_status(self.digest_status, "digest_status", DIGEST_STATUSES)
+        _validated_status(self.destination_status, "destination_status", DESTINATION_STATUSES)
         for key, value in self.usage.items():
             # ``type(value) is not int`` rather than ``isinstance``: the same "what is a
             # countable int" its four sibling readers spell (``provider_usage_of``,
