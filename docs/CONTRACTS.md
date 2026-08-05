@@ -354,7 +354,10 @@ Four further opt-in protocols declare optional capability members:
   names the provider on every observability surface that probes an adapter for one — via
   `resolved_provider_name(adapter, config)`, which is `provider_name` else `ModelConfig.provider`
   (including when the declaration is unreadable — the tolerance path still falls back rather
-  than answering nothing),
+  than answering nothing). A caller that has already read the declaration passes it as `declared`
+  so it is not read a second time: one model call resolves it once, and the receipt's
+  `provider_name` and the provider term in its `request_digest` therefore cannot disagree even if
+  the adapter's property does not answer the same way twice.
   and feeds `ModelCallReceipt.provider_name`, the model-stream context's `provider`, and
   `run.started`'s `model_provider` (and so every OTel `gen_ai.provider.name`). A call routed
   through the gateway is therefore attributed to the model that served it, with the transport
@@ -373,8 +376,13 @@ Four further opt-in protocols declare optional capability members:
   actually ran under rather than a default the call never used.
 - `AddressedModelAdapter.resolve_destination(config) -> str` — where a call under `config` would
   actually be sent. Two adapters holding identical configs can address different hosts, so the
-  destination is folded into the receipt's replay key; it is hashed and never recorded, so an
-  internal hostname stays internal. Raising is permitted and read as "unknown".
+  receipt records that fact *beside* the replay key rather than inside it: a
+  `destination_status` naming which outcome the probe had (`not_declared` / `declined` /
+  `resolved` / `unavailable`, or `not_reached` when the call was refused first) and a keyed
+  `destination_digest` that lets two calls be compared. The value itself is never recorded, so an
+  internal hostname stays internal — which is precisely why it cannot be key material: a key taken
+  over a preimage no record may hold cannot be recomputed or diagnosed. Raising is permitted and is
+  reported as `unavailable`, distinct from an adapter that simply does not route by host.
 
 Implementing them is never required. The loop probes each attribute with `getattr` and a neutral
 default, and behaves identically whether an adapter declares it or omits it, so the attributes are
@@ -559,18 +567,51 @@ definitions or generation settings change around it; `request_digest` covers the
 and is the exact replay key. Both are computed on the **raw** request, before any redaction or
 capture policy, so consumers on different policies agree on the identity of what the provider
 was sent. An empty digest means *no key was issued* (the payload could not be canonically
-encoded, or exceeded the size cap) and must never be read as a key.
+encoded, or exceeded the size cap) and must never be read as a key. `digest_status` says which
+of four things happened, because the empty string used to be the answer to all of them:
+`absent` (no key could be issued), `withheld` (one was, and a `none`-mode capture policy removed
+it), `not_reached` (the call was refused before a key was computed), and `ok`.
+`digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
+which rules produced it.
+
+A receipt written before those fields existed carries neither, and `from_json` reads a *missing key*
+as `not_reached` only where nothing contradicts it: a payload whose `request_digest` is non-empty reads
+`ok`, and one whose `destination_digest` is non-empty reads `resolved`, because that is the only
+probe outcome producing a value. The alternative is a record that denies its own contents, which the
+next `to_json` makes permanent. `digest_generation` is *not* inferred alongside it — a legacy key was
+taken under rules the record cannot name, and empty is what stops a replay consumer treating it as
+reproducible. A status the payload actually states is kept verbatim even where it disagrees with its
+digest: that pair is a bug in the writer, not something to repair silently on read. Silence means the
+key is absent; a key present and holding `null` is refused, like every other string on the receipt.
+Both enums are closed at construction as well as on the wire, through the same check, so a receipt
+cannot be built that its own reader would reject.
+
+**What the replay key is made of is a declared list, not a serialized object.** The model config
+enters as a hand-listed projection — the model name, the reasoning block, and the generation block
+when configured — rather than as `ModelConfig.to_json()`. `timeout_s`, `retry` and `gateway_url`
+are absent: none of them reaches a provider (the gateway wire emits only model/reasoning/generation
+and each hop owns its own transport policy), so an operational change to how a call is carried does
+not invalidate keys describing what was asked. The `provider` term is the provider that actually
+served the call — the adapter's declaration, else the config's — so a gateway relaying an upstream
+and a direct call to the same upstream share a key, while two adapters that declare nothing are
+still told apart.
 
 Two rules keep digests stable across kernel versions:
 
 1. **Additive request fields are omitted when unset.** `generation` and `output_schema` appear
    in the digest payload only when configured, so a request that does not use them keeps the
    digest it had before the field existed. Setting one changes the digest — deliberately, since
-   the request's meaning changed.
-2. **Canonicalization changes are generation changes.** If the digest's encoding rules
-   themselves ever change, the digest domain gains a version tag (domain separation), rather
-   than letting two incompatible encodings collide in one key space. Adding an omitted-when-unset
-   field is *not* a generation change.
+   the request's meaning changed. The projection restates this rule rather than inheriting it
+   from the serializer, so a field added to `ModelConfig` for an unrelated reason cannot rekey a
+   corpus by accident.
+2. **Canonicalization changes are generation changes.** Each digest is taken in its own named
+   domain, carried as the single wrapper key of the payload that is hashed:
+   `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`. Changing what the
+   payload is made of — not merely adding an omitted-when-unset field, which is *not* a
+   generation change — bumps that tag, so two incompatible rule sets can never collide in one
+   key space and a corpus a change has invalidated is disowned in one edit rather than silently.
+   The two digests are separated by their domains rather than by their field lists happening to
+   differ, which is why neither can be read as the other.
 
 #### AgentLoop model-I/O subscriptions
 

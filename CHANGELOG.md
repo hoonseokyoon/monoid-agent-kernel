@@ -7,6 +7,154 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the replay key names the provider the receipt records
+
+- **The declaration is read once per call, not once per reader.** The adapter itself has been read
+  once per call for a while, precisely so that one call cannot be answered by one adapter and
+  attributed to another. The `provider_name` *on* that adapter was still read twice — once for
+  `ModelCallReceipt.provider_name`, once for the key — and a property that answers and then stops
+  answering made the two disagree: the receipt said `openai` while the key had been taken under the
+  config's `gateway`. A key whose preimage the record contradicts cannot be recomputed and cannot
+  be verified, which is the exact defect that took the destination out of this payload.
+- **`resolved_provider_name` accepts the declaration a caller has already read.** One expression of
+  "declaration else config" still, rather than the rule restated at the call site; the runner now
+  hands in its own probe instead of having an identical one re-derived beside it. A sentinel, not
+  `None`: an adapter that declares `None` is answering "nothing, use the config", and that has to
+  stay distinguishable from "I did not ask".
+
+### Fixed — an absent status no longer contradicts the digest it describes
+
+- **A receipt written before these fields existed keeps the key it recorded.** `from_json` read a
+  missing `digest_status` as `not_reached` — "the call was refused before a key was computed" —
+  over a payload carrying a non-empty `request_digest`, so the record denied its own contents and
+  `to_json` wrote the denial back, making it permanent on the first read/write. A consumer asking
+  the status whether a replay key exists would have discarded a real one. A missing status is now
+  inferred from the digest it explains: non-empty `request_digest` reads `ok`.
+- **The same rule binds the destination pair**, where the same contradiction is manufacturable:
+  a non-empty `destination_digest` reads `resolved`, the only probe outcome that answers with a
+  value. One reader, both pairs — the split rule is how the first one got written.
+- **`digest_generation` is not inferred with it.** A legacy key was taken over a different payload,
+  so naming a generation for it would hand a replay consumer a key it cannot reproduce; empty is
+  the honest answer and is what makes `ok` safe. A status the payload *states* is kept verbatim
+  even where it disagrees with its digest — that pair is a bug in a writer, and repairing it on
+  read would hide the writer that has one.
+- **Silence is a key that is not there.** The reader asked `payload.get(key) is None`, which reads a
+  key *present and holding `null`* as an absent one. That was harmless while both landed on the
+  default and stopped being harmless the moment absence began to infer: a corrupt record would have
+  been admitted, handed a status inferred from its digest that it never carried, and had `to_json`
+  write that back out as a stated one. `null` is now refused, like every other string on the
+  receipt — `http_status` is nullable only because it is declared `int | None`.
+- **A receipt can no longer be born unreadable by its own class.** `from_json` refused a status
+  outside its enum while `to_json` emitted one, so `ModelCallReceipt(digest_status="okay")` wrote
+  an audit record this same class rejects on the way back in — a failure that surfaces in the
+  consumer, long after the writer that caused it is gone. `__post_init__` now refuses both closed
+  enums through the same function the reader uses, so the two cannot drift apart;
+  `ModelCallCapture` has always refused a `mode` outside `CAPTURE_MODES` this way, and these were
+  the pair that did not.
+- Red first: both pairs parametrized over one test, plus the inference's two limits (silence only,
+  never over a statement; no value, no claim), the null refusal at both witness states, and the
+  constructor refusal through `replace` as well as direct construction. One more pin holds each
+  field to its *own* vocabulary, because a single helper serving two enums is exactly the shape
+  where a transposed argument passes every "a bad value is refused" test — `not_reached` is a
+  member of both sets.
+
+### Added — the identity projection cannot go back to reflecting over `ModelConfig`
+
+- **A structural pin over `_model_identity`'s own source asserts it reflects over nothing** — no
+  `to_json`, no `fields`/`asdict`/`vars`/`getattr`, and every attribute it reads is on a declared
+  allowlist. This is the one claim no behavioural test can make: a matrix says which fields move
+  the key, not *how* the projection decided, and a reflective implementation would satisfy every
+  matrix while re-opening the hazard the hand-listing closed.
+- **The pin is itself tested.** A companion mutates the source three ways — reading a transport
+  field, returning `to_json()`, adding a timeout term — and asserts the pin turns red on each,
+  because a structural pin's claim about which edits it catches is a claim that can be wrong.
+- **One more pin states an ordering nothing else would notice:** the replay key is taken after
+  `normalize_model_request`, so normalization is key material. Every other test builds its payload
+  from an already-normalized request and would stay green if that order flipped.
+
+### Changed — the endpoint leaves the replay key and becomes recorded metadata
+
+- **`request_digest` no longer covers where a call was sent.** The destination was hashed into
+  the key on the reasoning that the same request answered by a different service is a different
+  call — true, and the wrong place to say it. The value is deliberately never recorded, so no
+  record could reconstruct the preimage: a key taken over it could not be recomputed, could not be
+  verified, and a miss could not be told apart from a defect. Two calls with identical content
+  now share a key regardless of which host answered.
+- **`ModelCallReceipt` gains four fields that say what the key alone could not.**
+  `destination_status` names which of the probe's outcomes happened — `not_declared` (the adapter
+  routes on config alone), `declined` (it answered with nothing), `resolved`, `unavailable` (the
+  probe raised), or `not_reached` (the call was refused first). `destination_digest` is keyed
+  under the per-process key, for the same reason `RedactionPolicy.digest` is and with the same
+  cost: it identifies a destination within one process, not across restarts. A hostname is drawn
+  from a small enough space that an unkeyed digest of one is a confirm-a-guess oracle, which is
+  the disclosure the never-record rule exists to prevent.
+- **`digest_status` and `digest_generation` end the empty string's four meanings.** An absent
+  `request_digest` used to mean any of: the payload could not be encoded, it exceeded the cap, the
+  call was refused before a key existed, or a `none`-mode policy removed one. A consumer holding a
+  keyless record could not tell a defect from a policy from a boundary.
+- **The probe stopped conflating "no destination" with "cannot resolve one".** Both answered `""`,
+  so an adapter that routes on config alone and a deployment whose resolver raises
+  deterministically — every call about to fail — minted the same valid-looking key. Tolerating the
+  raise is right; recording it as absence was not.
+- Red first: the destination separation now asserted on the receipt with the key held equal, the
+  three probe outcomes told apart, the round trip over the new fields, and the `none`-mode
+  narrowing. The round-trip test gained a companion that reads the dataclass, because enumerating
+  fields by construction leaves a new one covered in name only.
+
+### Changed — the replay key is a declared field list, not a serialized config
+
+- **`request_digest` reads a hand-listed projection of `ModelConfig`, not `to_json()`.** Every
+  consumer of that serializer used to be a co-author of the replay key: a field added to
+  `ModelConfig` for any reason rekeyed the entire corpus, and `ModelRetryConfig` is scheduled to
+  gain one, so this was not hypothetical. The list encodes one rule — what the provider is asked
+  for goes in the key, how the call is carried does not.
+- **`timeout_s`, `retry` and `gateway_url` left the key.** None of them reaches a provider; the
+  gateway wire has always emitted only model/reasoning/generation because each hop owns its own
+  transport policy. Their presence was inherited from `to_json` emitting everything, not chosen,
+  and it meant raising a timeout or widening a retry set silently invalidated every recorded key
+  on a fleet. `ModelConfig.to_json` itself is unchanged, so `config_hash` and durable recovery
+  are unaffected.
+- **The key's `provider` term is now the provider that actually served the call** —
+  `resolved_provider_name`, the adapter's declaration else the config's. A gateway relaying an
+  upstream and a direct call to the same upstream now share a key, which is the pair a replay
+  corpus most wants to share one; reading only the declaration would have collided a fake adapter
+  with a gateway built without one, and reading only the config would have separated the pair.
+  It also normalizes, which matters because `provider` is the only `ModelConfig` field with no
+  ingress validation.
+- **The projection is hand-listed all the way down.** Listing only `ModelConfig`'s own fields and
+  calling `reasoning.to_json()` would have moved the rekey hazard one level deeper rather than
+  closing it.
+- Red first: a parameterized transport-policy matrix (five non-default configs), the projection's
+  shape, and the relayed-equals-direct key. The inclusion matrix and the declare-nothing pair are
+  guards — green before and after — stating what must not have been dropped while the exclusions
+  were made. A literal alone cannot see conditional inclusion, which is why both are matrices.
+- `_GENERATION_1_REQUEST_DIGEST` carries the omit-when-absent job forward under the current
+  generation, and its operating rule replaces "never regenerate": it moves only together with a
+  tag bump.
+
+### Changed — both model-call digests name their own domain
+
+- **Each digest is now taken in a named domain carried as the payload's single wrapper key:
+  `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`.** Every digest value
+  moves once, deliberately; no field joined or left the payload in this change. Two jobs, one
+  tag. The digests stop sharing a key space by *accident* — the request payload starts from the
+  prompt terms and adds keys that happen to be unconditional, so it could not happen to equal a
+  prompt payload, which is a property of today's field lists rather than a rule. And a rules
+  change is now announced: bumping `.v1` to `.v2` disowns a corpus the change invalidated in one
+  edit, instead of letting two incompatible encodings collide in one key space.
+- **The tag is applied in the payload builders, not in the hasher.** Same place
+  `content_digest` applies its shape key. A prefix fed to the hasher would bypass the canonical
+  encoder and break the twin invariant that keeps it byte-identical to `canonical_sha256`.
+- **`_PRE_W5_REQUEST_DIGEST` is disowned rather than regenerated.** Its file forbids
+  regenerating it, and that is right, so the literal stays and its assertion inverts: generation
+  1 must *not* reproduce the pre-W5 encoding. The pre-W5 `config_hash` literals are untouched —
+  `ModelConfig.to_json` did not change, so durable recovery across versions is unaffected.
+- This is the last change at which giving `prompt_digest` a domain is free: nothing persists it
+  today, and a later track records model calls to disk.
+- Census: the digest-generation rule's mechanism clause joins `EXTRA_CARRIERS` for
+  `docs/CONTRACTS.md`, anchored on the phrase rather than the key words — "domain" and
+  "generation change" both predate this change in the very rule the sentence replaces.
+
 ### Fixed — the third group's newly-covered members are named, and stale sentences retire
 
 - **`docs/COMPATIBILITY.md`'s "the third group did not move at all" is scoped and corrected.**

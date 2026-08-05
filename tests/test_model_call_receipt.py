@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+from dataclasses import fields, replace
 
 import pytest
 
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.model_io import ModelCallReceipt
+from monoid_agent_kernel.core.model_io import (
+    DESTINATION_STATUSES,
+    DIGEST_STATUSES,
+    ModelCallReceipt,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import WireValidationError
 from monoid_agent_kernel.errors import ModelAdapterError, RunCancelled
@@ -202,6 +208,10 @@ def test_with_error_preserves_everything_else() -> None:
 
 
 def test_json_round_trip_preserves_every_field() -> None:
+    """Every field, enumerated by construction -- so a new one that is not added here leaves the
+    test green while its name becomes a lie. The guard below turns that failure mode into a
+    failing test."""
+
     receipt = ModelCallReceipt(
         context=InvocationContext(run_id="run_1", skill_id="lecture-note", traceparent=TRACEPARENT),
         model=ModelConfig(provider="openai", model="gpt-5.5", timeout_s=42),
@@ -220,9 +230,208 @@ def test_json_round_trip_preserves_every_field() -> None:
         http_status=429,
         redaction_digest="sha-policy",
         capture_downgrades=1,
+        digest_generation="monoid.model-request-digest.v1",
+        digest_status="ok",
+        destination_status="resolved",
+        destination_digest="sha-destination",
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt
+
+
+def test_the_round_trip_above_names_every_field_there_is() -> None:
+    """The enumeration is only a contract while it is complete.
+
+    `test_json_round_trip_preserves_every_field` builds a receipt by construction, so a field
+    added without touching it round-trips at its default and the test passes without covering it.
+    This reads the dataclass instead: every declared field must appear in the wire shape, and the
+    round trip above must set each one to something other than its default.
+    """
+
+    declared = {field_.name for field_ in fields(ModelCallReceipt)}
+    assert set(ModelCallReceipt().to_json()) == declared
+
+    source = inspect.getsource(test_json_round_trip_preserves_every_field)
+    missing = sorted(name for name in declared if f"{name}=" not in source)
+    assert missing == [], {
+        "never_exercised_by_the_round_trip": missing,
+        "hint": "a field the enumeration does not name is a field it does not cover",
+    }
+
+
+def test_a_receipt_that_never_reached_the_probe_says_so() -> None:
+    """The default is a fact, not a blank.
+
+    A call refused before dispatch -- cancelled, past its deadline, rejected at ingress -- gets a
+    receipt built before any key or probe happened. Defaulting those fields to `""` would have
+    reported "no destination" and "no key" for a call that never asked either question.
+    """
+
+    provisional = ModelCallReceipt()
+
+    assert provisional.digest_status == "not_reached"
+    assert provisional.destination_status == "not_reached"
+    assert provisional.request_digest == ""
+    assert provisional.digest_generation == ""
+
+
+@pytest.mark.parametrize(
+    ("status_field", "witness_field", "witnessed"),
+    (
+        ("digest_status", "request_digest", "ok"),
+        ("destination_status", "destination_digest", "resolved"),
+    ),
+)
+def test_an_absent_status_never_contradicts_the_digest_it_describes(
+    status_field: str, witness_field: str, witnessed: str
+) -> None:
+    """A receipt written before these fields existed keeps the answer it already recorded.
+
+    `not_reached` claims the call was refused *before* the value was ever computed. Read over a
+    payload that carries the value, that is not a cautious default -- it is a record denying its own
+    contents, and `to_json` writes the denial back, so the first read/write makes it permanent and a
+    consumer that asks the status whether a replay key exists throws away a real one.
+
+    Both pairs, because the reader is one rule and the shape is one shape: a digest that is there is
+    proof of the only outcome that produces it. `destination_digest` is non-empty on the `resolved`
+    arm alone -- `_resolved_destination` answers `""` for the other three -- so the same inference
+    is available and the same contradiction is manufacturable.
+    """
+
+    legacy = ModelCallReceipt().to_json()
+    for field_name in ("digest_status", "digest_generation", "destination_status"):
+        del legacy[field_name]
+    del legacy["destination_digest"]
+    legacy[witness_field] = "sha-witness"
+
+    parsed = ModelCallReceipt.from_json(legacy)
+
+    assert getattr(parsed, status_field) == witnessed
+    assert getattr(parsed, witness_field) == "sha-witness"
+    # Inferred from silence, never over a statement: a writer that says `not_reached` beside a
+    # digest is reporting a bug, and rewriting it to `ok` would hide the writer that has one.
+    assert (
+        getattr(
+            ModelCallReceipt.from_json(legacy | {status_field: "not_reached"}),
+            status_field,
+        )
+        == "not_reached"
+    )
+    # No value, no claim. `absent` and `not_reached` are not distinguishable on a legacy record and
+    # are not guessed at; the default stands wherever it contradicts nothing.
+    assert (
+        getattr(ModelCallReceipt.from_json(legacy | {witness_field: ""}), status_field)
+        == "not_reached"
+    )
+
+
+def test_a_legacy_key_is_never_promoted_to_a_generation_it_was_not_taken_in() -> None:
+    """The status says a key exists; the generation says which rules made it. Only one is inferable.
+
+    A pre-W6-0 key was taken over a different payload -- an endpoint inside it, a serialized config
+    rather than the projection -- so reading a generation onto it would hand a replay consumer a key
+    it cannot reproduce. Empty is the honest answer, and it is what makes `ok` safe to infer.
+    """
+
+    legacy = ModelCallReceipt().to_json()
+    for field_name in ("digest_status", "digest_generation"):
+        del legacy[field_name]
+    legacy["request_digest"] = "sha-request"
+
+    parsed = ModelCallReceipt.from_json(legacy)
+
+    assert parsed.digest_status == "ok"
+    assert parsed.digest_generation == ""
+
+
+@pytest.mark.parametrize(
+    ("status_field", "witness_field"),
+    (
+        ("digest_status", "request_digest"),
+        ("destination_status", "destination_digest"),
+    ),
+)
+def test_an_explicit_null_status_is_a_malformed_value_not_an_absent_field(
+    status_field: str, witness_field: str
+) -> None:
+    """A key that is *there* holding `null` is a corrupt record, not a legacy one.
+
+    Every other string on this receipt already draws that line -- `parse_str` separates a missing
+    key from a present one holding the wrong type, and `http_status` is nullable only because it is
+    declared `int | None`. Reading `null` as absence would admit the corrupt record, hand it a
+    status inferred from its digest that it never carried, and let `to_json` write that back out as
+    a stated one.
+    """
+
+    stated_null = ModelCallReceipt().to_json() | {status_field: None}
+
+    # With a digest to infer from -- the case where absence and null diverge, and where reading
+    # null as absence fabricates a status rather than merely defaulting one.
+    with pytest.raises(WireValidationError, match=status_field):
+        ModelCallReceipt.from_json(stated_null | {witness_field: "sha-witness"})
+
+    # And with nothing to infer from: the refusal is about the value, not about the inference.
+    with pytest.raises(WireValidationError, match=status_field):
+        ModelCallReceipt.from_json(stated_null)
+
+
+@pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
+def test_a_status_the_reader_would_refuse_cannot_be_constructed(field_name: str) -> None:
+    """A receipt cannot be born unreadable by its own class.
+
+    `from_json` refused a non-member and `to_json` emitted one, so `ModelCallReceipt(
+    digest_status="okay")` wrote an audit record this same class rejects on the way back in. A
+    record that can be written and not read fails in the consumer, long after the writer that
+    caused it is gone -- and the writer is the only place the mistake is fixable.
+
+    `ModelCallCapture.__post_init__` already refuses a `mode` outside `CAPTURE_MODES`; these two
+    were the closed enums on this side of the file that did not. Constructor and reader now share
+    one function, so the two cannot drift back apart.
+    """
+
+    with pytest.raises(WireValidationError, match=field_name):
+        ModelCallReceipt(**{field_name: "okay"})
+
+    # `replace` re-runs `__post_init__`, and it is the path the subscription narrowing and
+    # `with_error` both take -- a rule the direct constructor alone enforced would miss them.
+    with pytest.raises(WireValidationError, match=field_name):
+        replace(ModelCallReceipt(), **{field_name: "okay"})
+
+
+def test_each_status_field_admits_exactly_its_own_vocabulary() -> None:
+    """The refusal must not be stricter than the enum, and must not accept the other one's.
+
+    One helper now serves both fields, which is precisely the shape that lets a transposed
+    argument pass every "a bad value is refused" test: `not_reached` is a member of both sets, so
+    a swapped pair would still refuse `"okay"` and still accept the default.
+    """
+
+    for value in DIGEST_STATUSES:
+        assert ModelCallReceipt(digest_status=value).digest_status == value
+    for value in DESTINATION_STATUSES:
+        assert ModelCallReceipt(destination_status=value).destination_status == value
+
+    for value in set(DESTINATION_STATUSES) - set(DIGEST_STATUSES):
+        with pytest.raises(WireValidationError, match="digest_status"):
+            ModelCallReceipt(digest_status=value)
+    for value in set(DIGEST_STATUSES) - set(DESTINATION_STATUSES):
+        with pytest.raises(WireValidationError, match="destination_status"):
+            ModelCallReceipt(destination_status=value)
+
+
+@pytest.mark.parametrize("field_name", ("digest_status", "destination_status"))
+def test_an_unknown_status_is_refused_rather_than_absorbed(field_name: str) -> None:
+    """Closed kernel enums, unlike ``stop_reason``.
+
+    ``stop_reason`` is an open string because a *provider* may invent a fifth value and a receipt
+    must stay recordable. These two are written only by this kernel, so an unknown value is a bug
+    in a writer -- absorbing it would let a typo travel as data.
+    """
+
+    payload = ModelCallReceipt().to_json() | {field_name: "probably"}
+
+    with pytest.raises(WireValidationError, match=field_name):
+        ModelCallReceipt.from_json(payload)
 
 
 def test_an_unknown_stop_reason_survives_a_round_trip() -> None:

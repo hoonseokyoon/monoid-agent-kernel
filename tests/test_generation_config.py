@@ -3,8 +3,12 @@
 The omission and stability pins encode W5's compatibility contract (dx-note
 2026-08-02-w5-implementation-plan.md): a config that never sets a generation value must
 serialize byte-identically to one that predates the field, because ``ModelConfig.to_json``
-feeds the request digest (replay key), the runtime-config semantic hash (durable recovery),
-and the gateway wire all at once.
+feeds the runtime-config semantic hash that durable recovery compares across restarts.
+
+W6-0 narrowed that sentence. The replay key no longer reads ``to_json`` -- it reads
+``_model_identity``, a hand-listed projection -- and the gateway wire never did, building its
+block field by field. So the omission rule now holds in two places for two reasons, and this
+file pins both: ``config_hash`` through the serializer, the replay key through the projection.
 """
 
 from __future__ import annotations
@@ -22,13 +26,31 @@ from monoid_agent_kernel.core.spec import (
 from monoid_agent_kernel.model_call import _digest, _request_payload
 from monoid_agent_kernel.providers.base import ModelRequest, normalize_model_config
 
-# Captured on develop @ v0.20.1 (6eb9fcf), before GenerationConfig existed. These literals
-# are the contract: regenerating them after a serialization change defeats the pin.
+# Captured on develop @ v0.20.1 (6eb9fcf), before GenerationConfig existed. The two families
+# below no longer share a serializer, so they no longer share a rule.
+#
+# The config hashes still pin `ModelConfig.to_json`, which still feeds
+# `AgentRuntimeConfig._json_payload` -> `config_hash` -> the durable comparison in
+# `core/durable_metadata.py`. For those, the literal IS the contract: regenerating them after a
+# serialization change defeats the pin.
+#
+# `_PRE_W5_REQUEST_DIGEST` no longer pins the replay key. W6-0 put the whole preimage under a
+# generation tag, so generation 1 deliberately does not reproduce it; it is kept unregenerated as
+# the *disowned* value and its test asserts the key space moved, which is what a generation tag is
+# for. The omit-when-absent job moved to `_GENERATION_1_REQUEST_DIGEST`, whose operating rule
+# replaces "never regenerate": it is regenerated **only together with a tag bump**. A change that
+# moves that literal without moving the tag is the change the pin exists to stop.
 _PRE_W5_CONFIG_HASH_NO_MODEL = "83dab782014d676f0b646421a32c2e41b2befc06efd620d7ae9afd22cb0c3b2c"
 _PRE_W5_CONFIG_HASH_DEFAULT_MODEL = (
     "182b10bcd89a7e08517a6022479ad2cf9b6e0c8cd269bfc2341c6ad5a041f792"
 )
 _PRE_W5_REQUEST_DIGEST = "54c2cb6d143ab5716cd942f584e34a3100d87dad5e85c48bfeadc767a43ed9c6"
+# Captured under `monoid.model-request-digest.v1` once W6-0 settled that generation's field set.
+# From here on it is regenerated **only together with a tag bump** -- establishing a generation and
+# moving one are different acts, and only the second is what this pin refuses.
+_GENERATION_1_REQUEST_DIGEST = (
+    "fbef341fd3f010b89d6d8343d3cbcb1bda2a180f5d6399f169c0c9d89cb34a01"
+)
 
 
 # --- fail-closed ingress -------------------------------------------------------------
@@ -176,11 +198,34 @@ def test_config_hash_is_unchanged_for_generation_free_configs() -> None:
     assert with_model.config_hash == _PRE_W5_CONFIG_HASH_DEFAULT_MODEL
 
 
-def test_request_digest_is_unchanged_for_generation_free_requests() -> None:
-    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
-    payload = _request_payload(request, ModelConfig(), provider="fake", destination="")
+def test_the_replay_key_generation_disowns_the_pre_w5_encoding() -> None:
+    """W6-0 put the whole preimage under a generation tag, so generation 1 does not reproduce it.
 
-    assert _digest(payload) == _PRE_W5_REQUEST_DIGEST
+    This literal used to be the replay key's stability pin. Regenerating it was forbidden and
+    still is -- so it is kept unregenerated and its assertion inverted. Disowning a key space
+    is exactly what a generation tag is for, and the tag is what makes the move visible
+    instead of silent. The omit-when-absent job it used to carry moved to
+    ``_GENERATION_1_REQUEST_DIGEST``.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+    payload = _request_payload(request, ModelConfig(), provider="fake")
+
+    assert _digest(payload) != _PRE_W5_REQUEST_DIGEST
+
+
+def test_a_generation_free_request_keeps_generation_1s_key() -> None:
+    """The omit-when-absent job, carried forward under the current generation.
+
+    Same property the pre-W5 literal used to hold: a request that never configures a sampling
+    control keeps the key it had before the block existed. What changed is the rule for moving
+    the literal -- it moves with a tag bump and only with one.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+    payload = _request_payload(request, ModelConfig(), provider="fake")
+
+    assert _digest(payload) == _GENERATION_1_REQUEST_DIGEST
 
 
 def test_setting_generation_changes_the_request_digest() -> None:
@@ -189,10 +234,9 @@ def test_setting_generation_changes_the_request_digest() -> None:
         request,
         ModelConfig(generation=GenerationConfig(temperature=0.1)),
         provider="fake",
-        destination="",
     )
 
-    assert _digest(configured) != _PRE_W5_REQUEST_DIGEST
+    assert _digest(configured) != _GENERATION_1_REQUEST_DIGEST
 
 
 # --- direct-Python normalization threading --------------------------------------------

@@ -199,9 +199,11 @@ class GenerationConfig:
         The same field-based rule as the reasoning twin, and for the same reason
         (:func:`matches_the_kernel_defaults`). Its consumer is a serialization gate rather than
         an echo, so a class-exact answer here made an all-defaults extension emit the
-        ``generation`` key — changing the request digest, the runtime-config semantic hash that
-        durable recovery compares across restarts, and the gateway wire, while changing nothing
-        any of them is about.
+        ``generation`` key — changing the runtime-config semantic hash that durable recovery
+        compares across restarts, and the gateway wire, while changing nothing either of them is
+        about. Two gates read this property now: ``ModelConfig.to_json`` above, and the replay
+        key's own projection (``model_call._model_identity``), which restates the omission rather
+        than inheriting it.
         """
 
         return matches_the_kernel_defaults(self, GenerationConfig)
@@ -373,9 +375,11 @@ class ModelConfig:
             "retry": self.retry.to_json(),
         }
         # The one key emitted only when configured, unlike every sibling: this dict feeds the
-        # request digest (replay key), the runtime-config semantic hash (durable recovery
-        # compares it across versions), and the gateway wire, so a never-configured block must
-        # serialize byte-identically to a config that predates the field.
+        # runtime-config semantic hash (durable recovery compares it across versions), so a
+        # never-configured block must serialize byte-identically to a config that predates the
+        # field. The replay key holds the same rule for the same reason but no longer through
+        # here -- W6-0 gave it a hand-listed projection (`model_call._model_identity`), so this
+        # serializer stopped being a co-author of every recorded key.
         if not self.generation.is_default:
             payload["generation"] = self.generation.to_json()
         return payload

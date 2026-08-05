@@ -48,6 +48,7 @@ from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normal
 from monoid_agent_kernel.core.model_io import (
     ModelCallReceipt,
     ModelIOSubscription,
+    destination_digest,
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -57,6 +58,7 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
+from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelStreamIngressNormalizer,
@@ -68,6 +70,7 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
+    resolved_provider_name,
 )
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -87,8 +90,36 @@ ShouldAbort = Callable[[], bool]
 """Polled once per streamed chunk, after it has been delivered. See `ModelCallRunner.acall`."""
 
 
-def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
+_PROMPT_DIGEST_GENERATION = namespaced_id("model-prompt-digest.v1")
+_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
+"""The domain each digest is taken in, and the generation of the rules that produced it.
+
+Domain separation on the *whole* preimage, applied in the payload builders rather than in
+:func:`_digest` -- the same place :func:`core.model_io.content_digest` applies its shape key, and
+for the same reason. Two jobs, one tag:
+
+* **The two digests stop sharing a key space.** Their separation used to be incidental:
+  :func:`_request_payload` starts from the prompt terms and adds keys that are always present, so a
+  request payload could not *happen* to equal a prompt payload. That is a property of today's field
+  lists, not a rule, and it would have ended the first time one of those added keys became
+  conditional.
+* **A rules change is announced instead of silent.** `docs/CONTRACTS.md` states it as the second
+  stability rule: adding an omitted-when-unset field is not a generation change, but changing what
+  the payload is made of is, and a generation change takes the domain with it. Bumping `.v1` to
+  `.v2` disowns every key recorded under the old rules in one edit, which is the only honest way to
+  retire a corpus that a change has invalidated.
+
+Not inside :func:`_digest`: that function's contract is "the canonical-JSON digest of `payload`",
+its tests are about the encoder, and a prefix fed to the hasher would bypass `_CANONICAL_ENCODER`
+and break the twin invariant the comment beside it guards.
+"""
+
+
+def _prompt_terms(request: ModelRequest) -> dict[str, Any]:
     """The assembled prompt, as the thing `prompt_digest` identifies.
+
+    Returned unwrapped so :func:`_request_payload` can build on it without nesting a domain inside
+    a domain; :func:`_prompt_payload` is the wrapped form that is actually hashed.
 
     Tool definitions and generation settings are deliberately absent: the question this digest
     answers is "did the model see the same conversation twice", which must stay true when a tool is
@@ -114,6 +145,12 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
         "previous_turn_handle": request.previous_turn_handle,
         "observations": [observation.to_json() for observation in request.observations],
     }
+
+
+def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
+    """:func:`_prompt_terms` in its own digest domain. See :data:`_PROMPT_DIGEST_GENERATION`."""
+
+    return {_PROMPT_DIGEST_GENERATION: _prompt_terms(request)}
 
 
 # Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
@@ -197,34 +234,96 @@ def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
+def _model_identity(model: ModelConfig) -> dict[str, Any]:
+    """The model config as the replay key sees it: a declared list, never a serialized object.
+
+    `model.to_json()` used to go in whole, which made every consumer of that serializer a
+    co-author of the replay key. A field added to `ModelConfig` for any reason rekeyed the entire
+    corpus -- and `ModelRetryConfig` is scheduled to gain one, so this was not a hypothetical.
+    The rule the list encodes:
+
+        what the provider is asked for goes in the key; how the call is carried does not.
+
+    So `timeout_s`, `retry` and `gateway_url` are absent. None of them reaches a provider: the
+    gateway wire emits only model/reasoning/generation, and each hop owns its own transport
+    policy. Their presence in the key was inherited from `to_json` emitting everything, not
+    chosen, and it meant an ops change nobody thinks of as a contract change silently invalidated
+    every recorded key on a fleet.
+
+    Hand-listed all the way down, not just at the top: calling `reasoning.to_json()` here would
+    move the same rekey hazard one level deeper, where the next added field would find it.
+
+    `on_unsupported` is the one genuine close call, in both blocks. It is a client *acceptance*
+    policy -- it cannot change what a provider returns, only whether the client keeps the answer --
+    which argues transport. It goes in anyway because it rides the wire: the reference gateway
+    rebuilds an upstream config from it, so a hop set to `omit` really can send a different
+    upstream request than one set to `fail`. `_tool_payload` states the governing asymmetry: an
+    over-sensitive replay key costs a miss and a re-run, an under-sensitive one hands back the
+    wrong call.
+
+    Known limit, inherited rather than introduced: for an adapter exposing no `config`,
+    `_effective_model` substitutes `ModelConfig()`, so this projects the default model name for a
+    call that ran under something else. The receipt cannot say "unknown" and that is a limit of
+    the field, not a distinction being drawn -- but this list now *promises* these fields identify
+    the request, which the whole-object serialization never did explicitly.
+    """
+
+    identity: dict[str, Any] = {
+        "model": model.model,
+        "reasoning": {
+            "effort": model.reasoning.effort,
+            "summary": model.reasoning.summary,
+            "on_unsupported": model.reasoning.on_unsupported,
+        },
+    }
+    # Omit-when-absent, the same rule and the same reason as `output_schema` below: a config that
+    # never set a sampling control keeps the key it had before the block existed.
+    if not model.generation.is_default:
+        identity["generation"] = {
+            "temperature": model.generation.temperature,
+            "top_p": model.generation.top_p,
+            "max_output_tokens": model.generation.max_output_tokens,
+            "on_unsupported": model.generation.on_unsupported,
+        }
+    return identity
+
+
 def _request_payload(
-    request: ModelRequest, model: ModelConfig, *, provider: str, destination: str
+    request: ModelRequest, model: ModelConfig, *, provider: str
 ) -> dict[str, Any]:
     """The whole request, as the thing `request_digest` identifies -- the replay key.
 
     `model` is the *effective* config, resolved by the caller, not `request.model`. The request's is
     optional and the shipped adapters fall back to their own, so hashing `request.model or
-    ModelConfig()` gave two calls on differently-configured adapters the same replay key.
+    ModelConfig()` gave two calls on differently-configured adapters the same replay key. It enters
+    through `_model_identity` rather than as `to_json()`; see there for what that list excludes.
 
-    `provider` and `destination` are here because the same request answered by a different service
-    is a different call. A config alone does not identify the service: an adapter may route by a
-    per-instance override or an environment variable, so two adapters holding identical configs can
-    address different hosts. `destination` is hashed and never recorded, so an internal hostname
-    stays internal, and it is empty for an adapter that does not expose one -- see
-    `AddressedModelAdapter`.
+    `provider` is the provider that ACTUALLY served the call -- `resolved_provider_name`, the
+    adapter's declaration else the config's -- because that is what decides whether two identical
+    requests get the same kind of answer. Reading only the declaration would collide a fake adapter
+    with a gateway built without one; reading only the config would separate a direct call from a
+    gateway relaying the same upstream, which is exactly the pair a corpus wants to share a key.
+
+    **The destination is not here, and its absence is the point.** Where a call was sent used to be
+    hashed in, on the reasoning that the same request answered by a different service is a different
+    call -- which is true, and was the wrong place to say it. The value is deliberately never
+    recorded, so no record could reconstruct the preimage: a key taken over it could not be
+    recomputed, could not be verified, and a miss could not be told from a defect. It is now a fact
+    beside the key (`ModelCallReceipt.destination_status` and `destination_digest`), where it can be
+    compared without being disclosed. The distinction it used to draw was not lost; it moved from an
+    opaque hash into something a consumer can actually read.
     """
 
-    payload = _prompt_payload(request)
-    payload["tools"] = [_tool_payload(spec) for spec in request.tools]
-    payload["model"] = model.to_json()
-    payload["provider"] = provider
-    payload["destination"] = destination
+    terms = _prompt_terms(request)
+    terms["tools"] = [_tool_payload(spec) for spec in request.tools]
+    terms["model"] = _model_identity(model)
+    terms["provider"] = provider
     # Omit-when-absent (the W5 digest stability rule): a schema-free request keeps the
     # replay key it had before this field existed; setting a schema changes the key, which
     # is correct -- constrained and unconstrained calls are different requests.
     if request.output_schema is not None:
-        payload["output_schema"] = request.output_schema
-    return payload
+        terms["output_schema"] = request.output_schema
+    return {_REQUEST_DIGEST_GENERATION: terms}
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
@@ -446,7 +545,7 @@ class ModelCallRunner:
         if request.model is not None:
             normalized = normalize_model_config(request.model) or ModelConfig()
             return normalized, normalized
-        # Tolerant of a raising probe for the reason `_destination` gives: a replay key is
+        # Tolerant of a raising probe for the reason `_resolved_destination` gives: a replay key is
         # bookkeeping, and an adapter that cannot answer must not thereby lose its call. Plain
         # `getattr(..., None)` swallowed only `AttributeError`, so a `config` property that raised
         # anything else took the whole call down.
@@ -463,25 +562,34 @@ class ModelCallRunner:
             return normalized, normalized
         return ModelConfig(), None
 
-    def _destination(self, model: ModelConfig, adapter: Any) -> str:
-        """Where this adapter would send a call under `model`, or `""` if it does not say.
+    def _resolved_destination(self, model: ModelConfig, adapter: Any) -> tuple[str, str]:
+        """Where this adapter would send a call under `model`, and WHICH outcome that was.
 
-        Probed and tolerant of failure for the same reason every other probe here is: a replay key
-        is bookkeeping, and an adapter that cannot answer must not thereby lose its call.
+        Probed and tolerant of failure for the same reason every other probe here is: bookkeeping,
+        and an adapter that cannot answer must not thereby lose its call.
 
         The `getattr` is inside the `try`, not before it. Tolerating only the *call* left the
         *lookup* undefended, so an adapter exposing `resolve_destination` as a property that raised
         still lost its call -- the one shape the rule above exists to rule out, surviving in the
         probe the other two were written to imitate.
+
+        Returning a status alongside the value is the fix for what tolerance used to cost. Three
+        outcomes answered `""`: an adapter with no destination concept, one that answered with
+        nothing, and one whose probe raised. The third is not a shrug -- the shipped gateway
+        resolver raises *deterministically* when no URL is configured anywhere, so it usually means
+        a deployment whose every call is about to fail. All three produced a valid-looking key that
+        could not be told from the others, which is exactly the shape `_digest`'s own docstring
+        rules out for itself: refusing is safe, but a fabricated answer returns the wrong call.
         """
 
         try:
             resolve = getattr(adapter, "resolve_destination", None)
             if not callable(resolve):
-                return ""
-            return normalize_unicode_scalars(str(resolve(model) or ""))
+                return "", "not_declared"
+            value = normalize_unicode_scalars(str(resolve(model) or ""))
         except Exception:
-            return ""
+            return "", "unavailable"
+        return (value, "resolved") if value else ("", "declined")
 
     def _token(self) -> CancellationToken | None:
         return (
@@ -604,19 +712,41 @@ class ModelCallRunner:
                 if dispatch_model is not None:
                     request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
+                where, destination_status = self._resolved_destination(model, adapter)
+                request_digest = _digest(
+                    _request_payload(
+                        request,
+                        model,
+                        # The RESOLVED provider, not the raw declaration `provider_name` records
+                        # above: the key must say who actually served the call. Declaration-only
+                        # collided a fake adapter with a gateway built without one -- both declare
+                        # nothing -- and `ModelConfig.provider` alone separated a direct call from
+                        # a gateway relaying the same upstream, which is the one pair a corpus
+                        # wants sharing a key. It also normalizes, which matters here because
+                        # `provider` is the only `ModelConfig` field with no ingress validation.
+                        #
+                        # Resolved from the declaration THIS CALL ALREADY READ, handed in rather
+                        # than probed again. The adapter is read once per call for this reason
+                        # already; the declaration on it was still read twice, and a `provider_name`
+                        # that answers once and then raises made the two disagree -- the receipt
+                        # saying `openai` while the key had been taken under the config's `gateway`.
+                        # A key whose preimage the record contradicts is the exact defect that took
+                        # the destination out of this payload.
+                        provider=resolved_provider_name(adapter, model, declared=provider) or "",
+                    )
+                )
                 receipt = replace(
                     receipt,
                     context=normalized_context,
                     model=model,
                     prompt_digest=_digest(_prompt_payload(request)),
-                    request_digest=_digest(
-                        _request_payload(
-                            request,
-                            model,
-                            provider=provider,
-                            destination=self._destination(model, adapter),
-                        )
-                    ),
+                    request_digest=request_digest,
+                    digest_generation=_REQUEST_DIGEST_GENERATION,
+                    # Read off the key rather than recomputed: the two cannot disagree about
+                    # whether one was issued if only one of them decides.
+                    digest_status="ok" if request_digest else "absent",
+                    destination_status=destination_status,
+                    destination_digest=destination_digest(where),
                 )
                 reached_adapter = True
                 turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
