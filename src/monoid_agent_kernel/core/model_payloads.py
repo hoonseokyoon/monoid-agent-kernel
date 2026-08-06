@@ -1,6 +1,7 @@
 """What one model call's content may say about itself once it is written down.
 
-``model_payloads.jsonl`` (plus its ``model_payloads/`` chunk directory) is the private
+``model_payloads.jsonl`` (plus a ``model_payloads/`` chunk directory, created only once some
+value is too large to sit on a JSONL line) is the private
 run-directory replay corpus: the request preimage each ``request_digest`` was taken over, and the
 settled turn that answered it. W6-2 (dx-note ``2026-08-02-v0.21-contract-replay-scope.md``
 §Track B, decisions 4/5/6/8). It is the content-bearing sibling of ``model_calls.jsonl`` --
@@ -15,9 +16,10 @@ that reaches disk, so a run whose disk is full loses a record rather than an ans
 **A request record is a recipe, not a copy, and the recipe is verified.** The bytes that matter
 are the exact bytes the replay key was hashed over. A record stores them as a payload tree whose
 liftable values -- every value at least as large as the reference that would replace it, per tool
-definition and per message -- are replaced by content-addressed chunk references, so the ~98% of a
-preimage that repeats across calls (tool definitions, measured on the shipped default surface) is
-stored once per run, and so is every message a growing conversation resends.
+definition, per message and per observation -- are replaced by content-addressed chunk references,
+so the ~97% of a first-turn preimage that repeats across calls (tool definitions: 17,210 of 17,782
+bytes on the shipped default surface, and any real conversation only lowers the share) is stored
+once per run, and so is every message a growing conversation resends.
 Reassembly replaces each reference with its chunk's decoded value, re-encodes the whole through
 ``CANONICAL_JSON_ENCODER`` -- the same instance the digest hashed through, shared by identity,
 never a settings twin -- and must reproduce the preimage byte for byte. The writer performs that
@@ -227,10 +229,13 @@ MARKER_ENCODED_BYTES = len(
     CANONICAL_JSON_ENCODER.encode({PAYLOAD_CHUNK_REF_KEY: "0" * 64}).encode("utf-8")
 )
 
-# The terms whose *elements* are the dedup unit rather than the term itself. Both grow by appending
-# and are resent whole every turn, so keying the block would key it by its own length: the sha
-# would change every turn, nothing would ever be reused, and a hundred-turn run would store the
-# history a hundred times. Per element, turn N+1 re-references turn N's chunks and adds one.
+# The terms whose *elements* are the dedup unit rather than the term itself. ``tools`` and
+# ``messages`` are the load-bearing pair: both are resent whole every turn, so keying the block
+# would key it by its own length -- the sha would change every turn, nothing would ever be reused,
+# and a hundred-turn run would store the history a hundred times. Per element, turn N+1
+# re-references turn N's chunks and adds one. ``observations`` is a per-turn delta rather than a
+# growing log, so it deduplicates far less; it is elementwise for the within-turn half of the same
+# argument -- one oversized tool result should not drag its siblings onto the JSONL line with it.
 _ELEMENTWISE_TERMS = ("tools", "messages", "observations")
 
 

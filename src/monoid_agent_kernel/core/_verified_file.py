@@ -8,11 +8,18 @@ anyone's permissions -- so either one silently turns "append a line to my own ar
 real wherever a run directory can be touched between runs, which includes every reopened durable
 run.
 
-The rule these functions enforce is therefore not "the path looks right" but "the bytes I am about
-to write go to a single-link regular file, and to the same inode I just verified": ``O_NOFOLLOW``
-where the platform has it, ``lstat`` before the open for the platforms that do not, ``S_ISREG`` and
-``st_nlink == 1`` on both the named entry and the opened descriptor, and ``os.path.samestat`` to
-close the window between them.
+The rule these functions enforce is therefore not "the path looks right" but "the bytes I touch
+belong to a regular file in a real directory, and to the same inode I just verified":
+``O_NOFOLLOW`` where the platform has it, ``lstat`` before the open for the platforms that do not,
+``S_ISREG`` on both the named entry and the opened descriptor, ``os.path.samestat`` to close the
+window between them, and -- since a run directory has subdirectories now -- a parent that is a
+directory rather than a link wearing one's shape.
+
+``st_nlink == 1`` is part of that rule only for the artifacts these functions *append to*: a hard
+link is a second name for an inode a writer is about to mutate. It is deliberately not required of
+a content-addressed chunk, which nothing mutates and whose bytes the reader authenticates by
+hashing them -- requiring it there would fail every hardlink-deduplicated archive of a run
+directory.
 
 These primitives were written for ``model-content.jsonl`` and live here because they were never
 about that artifact. ``model_calls.jsonl`` is the second append-only sidecar in the same directory
@@ -183,8 +190,9 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
     no size bound, so a content-addressed name planted by anyone with write access to the directory
     turns a validation pass into an arbitrary read, a hang, or an out-of-memory.
 
-    ``None`` for every refusal -- a link, a special file, a file larger than ``max_bytes``, an I/O
-    error. The caller re-hashes what it gets, which is what makes the *content* trustworthy; this
+    ``None`` for every refusal -- a symlink, a special file, a redirected parent directory, a file
+    larger than ``max_bytes``, an I/O error. A *hard* link is accepted; see
+    :func:`verified_file_is_safe`. The caller re-hashes what it gets, which is what makes the *content* trustworthy; this
     function is only responsible for the bytes having come from a file the run directory owns.
     """
 
@@ -222,7 +230,7 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
 def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """Create one write-once content-addressed file, or report that it could not be done.
 
-    The write-once half: if ``path`` already holds a single-link regular file, nothing is written
+    The write-once half: if ``path`` already holds a regular file, nothing is written
     and the answer is ``True`` -- content addressing means an existing file with this name is this
     content, and :func:`read_verified_bytes` re-hashes what it reads, so a lie planted under the
     right name is caught at resolution rather than trusted here. A name that exists as anything

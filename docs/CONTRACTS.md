@@ -570,8 +570,13 @@ was sent. An empty digest means *no key was issued* (the payload could not be ca
 encoded, or exceeded the size cap) and must never be read as a key. `digest_status` says which
 of five things happened, because the empty string used to be the answer to all of them:
 `absent` (canonical JSON could not carry the payload — a defect in the payload), `too_large`
-(the payload exceeded `MAX_MODEL_PAYLOAD_BYTES` — an operational condition, answered by raising
-the cap; the cap is the wire's own bound, so a request that can be sent can be keyed), `withheld`
+(the payload exceeded `MAX_MODEL_PAYLOAD_BYTES`). The cap is set to the same number as the
+default `max_message_log_bytes`, but it bounds one call's whole identity payload — system prompt,
+tool definitions, instruction and observations included — while the run limit sums only the
+message log and the resolved-wire guard runs only for a multimodal adapter, so a request can pass
+every run limit and still be refused a key. What the shared number buys is that such a call is
+*named* rather than reported as `absent`, not that the case is gone; the cap is a build-time
+constant, and a `too_large` call contributes no request record to the corpus at all), `withheld`
 (a key was issued and a `none`-mode capture policy removed it), `not_reached` (the call was
 refused before a key was computed), and `ok`.
 `digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
@@ -753,14 +758,15 @@ call records its request and no response; the ledger line carries its taxonomy. 
 canonical encoder cannot carry, or one past `MAX_MODEL_PAYLOAD_BYTES`, costs its own record a
 typed `unrecorded_reason` — never a truncation.
 
-Media is *present*, and an operator sizing or classifying this artifact should read that first.
-When the adapter declares `supports_multimodal` the loop resolves by-reference attachments into
-inline bytes **before** it builds the request, so the preimage — and therefore the request record —
-carries the image itself, base64 and all. It is the largest thing this artifact holds and one more
-reason it is content-classified. The exception is the `observations` term, which is hashed as the
-tool returned it and so keeps whatever reference the tool produced; a `workspace:` reference is not
-content-addressed, so re-reading one later can yield different bytes under a digest that has not
-changed.
+Whether media is *present* depends on the adapter, and an operator sizing or classifying this
+artifact should read that first. When the adapter declares `supports_multimodal` the loop resolves
+by-reference attachments into inline bytes **before** it builds the request, so the preimage — and
+therefore the request record — carries the image itself, base64 and all: the largest thing this
+artifact can hold, and one more reason it is content-classified. A text-only adapter never reaches
+that resolution, so its corpus carries references and no image bytes. The `observations` term is
+by-reference either way, because it is hashed as the tool returned it; a `workspace:` reference is
+not content-addressed, so re-reading one later can yield different bytes under a digest that has
+not changed.
 
 Two deliberate absences. `ModelTurn.raw` is not recorded: it has no shape contract and no
 consumer outside the provider layer, so a replayed turn answers `raw={}` — an honest statement

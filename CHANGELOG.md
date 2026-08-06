@@ -9,35 +9,36 @@ out in commit messages and here.
 
 ### Added — a private replay corpus for the calls the ledger indexes
 
-- **`AgentLoop.model_payload_file=True` writes `model_payloads.jsonl` plus a `model_payloads/`
-  chunk directory** — the 43rd public compatibility artifact (`monoid.model-payloads.v1`): the
+- **`AgentLoop.model_payload_file=True` writes `model_payloads.jsonl`, plus a `model_payloads/`
+  chunk directory once some single value exceeds 256 KiB** — the 43rd public compatibility artifact (`monoid.model-payloads.v1`): the
   request preimage each `request_digest` was hashed over, and the settled response body
   (`response_id`, `final_text`, `tool_calls`, `reasoning`, `usage`, `stop_reason`,
   `provider_retried`). Opt-in, independent of every other switch, inherited by subagents,
   validated — including full reassembly — by `monoid validate`.
 - **A request record is a verified recipe.** Every value at least as large as the reference that
   would replace it becomes a content-addressed chunk — per tool definition (so a mid-run surface
-  change re-records one definition, not twenty-eight; the tool block is ~98% of a default-surface
-  preimage) and per message (so a growing by-value conversation re-references what it already
-  recorded instead of storing the whole history again every turn). Chunks past 256 KiB move to the
+  change re-records one definition, not twenty-eight; the tool block is ~97% of a first-turn
+  default-surface preimage), per message (so a growing by-value conversation re-references what it
+  already recorded instead of storing the whole history again every turn), and per observation. Chunks past 256 KiB move to the
   chunk directory, and the writer reassembles and compares against the digest *before* writing,
   falling back to a verbatim, never-walked payload when anything disagrees. Data shaped like a
   chunk reference cannot reach that fallback: a reference is a fixed size, so a lookalike is
   always large enough to be lifted into a chunk, where reassembly never re-walks it. `ModelTurn.raw` is deliberately not
   recorded (a replayed turn answers `raw={}`); `reasoning` deliberately is, encrypted entries
   included, because the loop re-injects it into the next turn.
-- **`digest_status` gains `too_large`, and the digest cap becomes the wire's bound.** The band
-  between the old 4 MiB digest cap and the 8,000,000-byte message-log bound used to ship calls
-  that transmitted successfully and silently had no replay key; one shared constant
-  (`MAX_MODEL_PAYLOAD_BYTES`) now gates the key, the recorded request, and the recorded response,
-  and an oversized payload is a named operational condition rather than an unexplained `absent`.
-  Raising the cap only turns refusals into keys — digests under the old cap are unchanged.
+- **`digest_status` gains `too_large`, and one constant now gates the key, the recorded request
+  and the recorded response.** The band between the old 4 MiB digest cap and the 8,000,000-byte
+  message-log bound used to ship calls that transmitted successfully and silently had no replay
+  key. `MAX_MODEL_PAYLOAD_BYTES` closes that band and makes an oversized payload a *named*
+  condition rather than an unexplained `absent` — it does not make the case impossible, because
+  it bounds the whole identity payload while the run limits bound only the message log. Digests
+  under the old cap are unchanged.
 - **`monoid validate` no longer quotes a content-bearing record back at you.** jsonschema builds
   its message out of the instance, so one line of `model_payloads.jsonl` or `model-content.jsonl`
   that matches no schema branch used to print a whole conversation — or a whole system prompt, for
   a chunk record — to the terminal and into `--json` output. Both artifacts pin a literal
-  single-element `schema_version` enum, so the first version bump would have done it to every line
-  of every retained run directory. The failing keyword and the path are reported; the value is not.
+  `schema_version` enum of v1 spellings only, so the first version bump would have done it to
+  every line of every retained run directory. The failing keyword and the path are reported; the value is not.
 - **`SettledModelCall` is exported from `monoid_agent_kernel.contracts`**, beside the
   `ModelCallRunner` whose `settled_sink` takes it.
 - **Unreleased-seam supersession: `ModelCallRunner.receipt_sink` is replaced by `settled_sink`**,

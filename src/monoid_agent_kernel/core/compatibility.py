@@ -295,7 +295,7 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         notes=(
             "Optional private run-dir replay corpus: request preimages as verified reassembly "
             "recipes (every value at least as large as the reference replacing it becomes a "
-            "chunk, per tool definition and per message; offloaded to a "
+            "chunk, per tool definition, per message and per observation; offloaded to a "
             "content-addressed model_payloads/ directory past 256 KiB) plus settled response "
             "bodies. Content-classified, unlike the ledger it joins: preimages carry the "
             "conversation and tool definitions, responses carry model output and reasoning. "

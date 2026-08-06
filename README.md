@@ -253,8 +253,8 @@ can also opt into `model_calls.jsonl`, a private ledger of one metadata record p
 call — including the failed ones — carrying timings, token usage, failure taxonomy and the replay
 key, and no content. A third opt-in, `model_payloads.jsonl`, records the content half for replay:
 the exact request bytes each replay key was hashed over (stored as verified reassembly recipes,
-deduplicated per tool definition and per message) and the settled response bodies, reasoning
-included.
+deduplicated per tool definition, per message and per observation) and the settled response
+bodies, reasoning included.
 `MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
 egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
 integrations can still opt into the legacy durable `model.output.delta` and

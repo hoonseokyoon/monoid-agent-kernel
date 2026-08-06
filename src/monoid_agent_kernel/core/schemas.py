@@ -1680,7 +1680,7 @@ def _validate_object(
     ``monoid validate``'s issues go to a terminal and into ``--json`` output, so an unmatched line
     of ``model_payloads.jsonl`` or ``model-content.jsonl`` would republish a conversation, or a
     whole system prompt, out of the private run directory. The trigger is not an attack but the
-    compatibility policy: both artifacts pin a literal single-element ``schema_version`` enum, so
+    compatibility policy: both artifacts pin a literal ``schema_version`` enum of v1 spellings only, so
     the first version bump makes every line of every retained run directory fail at once. The
     failing keyword and the path locate the problem; the value is the payload.
     """

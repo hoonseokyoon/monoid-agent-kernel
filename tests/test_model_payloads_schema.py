@@ -6,8 +6,9 @@ that **reassembles to the exact bytes the replay key was taken over** -- re-enco
 compare. Everything else here defends that property:
 
   1. the round-trip tests (unicode, floats, nesting, the by-reference request shape),
-  2. the marker-collision fallback (data shaped like a chunk reference cannot poison a record,
-     because the writer verifies before writing and falls back to a verbatim payload),
+  2. the size rule that keeps marker-shaped caller data out of the recipe entirely (a reference is
+     a fixed size, so a lookalike is always lifted into a chunk and never re-walked), with the
+     verified verbatim fallback behind it for a preimage the recipe shape does not fit,
   3. the encoder-identity pin (the digest and the chunks are encoded by the same object, so the
      twin cannot drift),
   4. the writer/schema key agreement, in both directions, per record kind.
@@ -35,6 +36,7 @@ from monoid_agent_kernel.core.model_payloads import (
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
+    MARKER_ENCODED_BYTES,
     PAYLOAD_CHUNK_REF_KEY,
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     chunk_marker,
@@ -45,6 +47,7 @@ from monoid_agent_kernel.core.model_payloads import (
     response_record_body,
     split_request_payload,
 )
+from monoid_agent_kernel.core import schemas
 from monoid_agent_kernel.core.schemas import MODEL_PAYLOADS_RECORD_SCHEMA, validate_run_dir
 from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig
 from monoid_agent_kernel.model_call import _request_payload, _tool_payload
@@ -178,20 +181,26 @@ def test_a_message_smaller_than_a_reference_stays_inline_and_a_bigger_one_is_lif
     """The threshold is what an indirection costs, so it is the point below which one cannot pay
     for itself. (Whether a lifted chunk then stays in the JSONL line or moves to the directory is
     the recorder's separate `PAYLOAD_OFFLOAD_THRESHOLD_BYTES` decision.)"""
-    small_preimage, small_digest = _preimage_of(_request(), _MODEL)
-    big_text = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 1024)
-    big_preimage, big_digest = _preimage_of(
-        _request(messages=({"role": "user", "content": big_text},)), _MODEL
-    )
+    # Straddle the threshold itself rather than clearing it by three orders of magnitude: a
+    # message one byte under must stay inline and one byte over must lift, or a regression that
+    # moves MARKER_ENCODED_BYTES anywhere at all goes unnoticed.
+    overhead = len(CANONICAL_JSON_ENCODER.encode({"role": "user", "content": ""}).encode("utf-8"))
+    under = {"role": "user", "content": "u" * (MARKER_ENCODED_BYTES - overhead - 1)}
+    over = {"role": "user", "content": "o" * (MARKER_ENCODED_BYTES - overhead)}
+    assert len(CANONICAL_JSON_ENCODER.encode(under).encode("utf-8")) == MARKER_ENCODED_BYTES - 1
+    assert len(CANONICAL_JSON_ENCODER.encode(over).encode("utf-8")) == MARKER_ENCODED_BYTES
+
+    small_preimage, small_digest = _preimage_of(_request(messages=(under,)), _MODEL)
+    big_preimage, big_digest = _preimage_of(_request(messages=(over,)), _MODEL)
 
     small = split_request_payload(small_preimage, small_digest)
     big = split_request_payload(big_preimage, big_digest)
 
     assert small is not None and big is not None
-    assert small.payload["monoid.model-request-digest.v1"]["messages"] == [
-        {"role": "user", "content": "hello"}
+    assert small.payload["monoid.model-request-digest.v1"]["messages"] == [under]
+    assert big.payload["monoid.model-request-digest.v1"]["messages"] == [
+        chunk_marker(hashlib.sha256(CANONICAL_JSON_ENCODER.encode(over).encode("utf-8")).hexdigest())
     ]
-    assert len(set(big.chunks) - set(small.chunks)) == 1
     assert (
         reassemble_request_preimage(big.payload, big.chunks.__getitem__, refs=True) == big_preimage
     )
@@ -544,18 +553,21 @@ def test_a_chunk_reference_naming_a_path_is_refused_before_anything_is_opened(
             **_ENVELOPE,
         ),
     )
-    opened: list[str] = []
-    real_read_bytes = Path.read_bytes
+    # Spy the reader the validator actually calls. `Path.read_bytes` was the pre-fix route and is
+    # no longer on it, so watching that would have watched nothing -- the escape would sail past a
+    # green test.
+    asked: list[str] = []
+    real_reader = schemas.read_verified_bytes
 
-    def spy(self: Path) -> bytes:
-        opened.append(str(self))
-        return real_read_bytes(self)
+    def spy(path: Path, *, max_bytes: int) -> bytes | None:
+        asked.append(str(path))
+        return real_reader(path, max_bytes=max_bytes)
 
-    monkeypatch.setattr(Path, "read_bytes", spy)
+    monkeypatch.setattr(schemas, "read_verified_bytes", spy)
 
     issues = validate_run_dir(run_dir)
 
-    assert [path for path in opened if str(run_dir) not in path] == []
+    assert [path for path in asked if str(run_dir) not in path] == []
     # Both branches still report the record; refusing the name must not cost the diagnosis.
     assert len([issue for issue in issues if issue.path.startswith(MODEL_PAYLOADS_FILENAME)]) == 2
 
@@ -787,7 +799,7 @@ def test_a_record_that_matches_no_branch_is_reported_without_reprinting_itself(
 
 
 def test_the_other_content_artifact_is_redacted_too(tmp_path: Path) -> None:
-    """`model-content.jsonl` carries the same class of value and the same literal version enum, and
+    """`model-content.jsonl` carries the same class of value behind a literal v1-only version enum, and
     the code binds both. Binding the test to one of the two is the twin miss the comment beside the
     code warns about."""
     from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
