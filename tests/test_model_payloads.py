@@ -489,33 +489,7 @@ def _offloadable_call() -> tuple[bytes, str, str]:
     return preimage, digest, sha
 
 
-@pytest.mark.parametrize("link_kind", ["hardlink", "symlink"])
-def test_a_link_planted_at_a_chunk_name_is_refused_not_reported_as_stored(
-    tmp_path: Path, link_kind: str
-) -> None:
-    """Content-addressed names are the *most* predictable names in the run directory -- the same
-    surface yields the same sha on every run -- so the write-once short-circuit is exactly where an
-    indirection gets planted. Answering "already stored" there means the chunk is never written,
-    never retried (write-once), and every reader resolves whoever's bytes the link names, while the
-    arm believes it succeeded. The JSONL twin has refused this since W6-1; this is the file writer.
-    """
-    preimage, digest, sha = _offloadable_call()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    target = outside / "someone-elses.bin"
-    target.write_bytes(b"theirs")
-    run_dir = tmp_path / "runs" / "run-1"
-    (run_dir / MODEL_PAYLOADS_DIRNAME).mkdir(parents=True)
-    planted = run_dir / MODEL_PAYLOADS_DIRNAME / sha
-    if link_kind == "hardlink":
-        os.link(target, planted)
-    else:
-        try:
-            os.symlink(target, planted)
-        except OSError as error:
-            pytest.skip(f"file symlinks are unavailable: {error}")
-    recorder = _standalone_recorder(tmp_path)
-
+def _record_offloadable(recorder: AgentRecorder, preimage: bytes, digest: str) -> None:
     recorder.record_settled_call(
         SettledModelCall(
             receipt=ModelCallReceipt(
@@ -528,13 +502,101 @@ def test_a_link_planted_at_a_chunk_name_is_refused_not_reported_as_stored(
     )
     recorder.close()
 
+
+def test_a_symlink_planted_at_a_chunk_name_stops_the_corpus_not_the_run(tmp_path: Path) -> None:
+    """Content-addressed names are the *most* predictable names in the run directory -- the same
+    surface yields the same sha on every run -- so the write-once short-circuit is exactly where an
+    indirection gets planted. A symlink is an escape out of the run directory, and the writer is
+    the only party that can see it as one: `path.exists()` follows it and answered "already
+    stored" for a chunk that was never written."""
+    preimage, digest, sha = _offloadable_call()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.bin"
+    target.write_bytes(b"theirs")
+    run_dir = tmp_path / "runs" / "run-1"
+    (run_dir / MODEL_PAYLOADS_DIRNAME).mkdir(parents=True)
+    try:
+        os.symlink(target, run_dir / MODEL_PAYLOADS_DIRNAME / sha)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    recorder = _standalone_recorder(tmp_path)
+
+    _record_offloadable(recorder, preimage, digest)
+
     assert target.read_bytes() == b"theirs"
     assert recorder._model_payloads_failed is True
-    records = _records(run_dir)
     # No record may reference a chunk that was never stored -- and the response half of the same
     # call must not append either: its ``request_digest`` would name a request record that can
     # now never exist, and the arm has already declared itself terminal.
-    assert records == []
+    assert _records(run_dir) == []
+    assert (run_dir / MODEL_CALLS_FILENAME).exists()
+
+
+def test_a_hardlink_planted_at_a_chunk_name_is_caught_where_the_bytes_are_read(
+    tmp_path: Path,
+) -> None:
+    """A hard link is not an escape -- it is a second name for a real inode in this directory --
+    so the writer cannot tell it from a chunk it stored earlier, and must not try: a link *count*
+    is exactly what a hardlink-deduplicated archive of a run directory changes. What authenticates
+    a content-addressed file is its hash, and the party that can check it is the reader."""
+    preimage, digest, sha = _offloadable_call()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.bin"
+    target.write_bytes(b"theirs")
+    run_dir = tmp_path / "runs" / "run-1"
+    (run_dir / MODEL_PAYLOADS_DIRNAME).mkdir(parents=True)
+    os.link(target, run_dir / MODEL_PAYLOADS_DIRNAME / sha)
+    recorder = _standalone_recorder(tmp_path)
+
+    _record_offloadable(recorder, preimage, digest)
+
+    assert target.read_bytes() == b"theirs"
+    assert [
+        issue.message
+        for issue in validate_run_dir(run_dir)
+        if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+    ] == ["request payload cannot be reassembled"]
+
+
+def test_a_hardlink_deduplicated_archive_still_validates(tmp_path: Path) -> None:
+    """`cp -al`, `rsync --link-dest` and every dedup-restoring backup raise a chunk's link count.
+    Refusing a multiply-linked file on the read path turned that into a corpus-wide integrity
+    failure on a run directory nothing had touched."""
+    preimage, digest, _sha = _offloadable_call()
+    recorder = _standalone_recorder(tmp_path)
+    _record_offloadable(recorder, preimage, digest)
+    chunk_dir = recorder.run_dir / MODEL_PAYLOADS_DIRNAME
+    stored = next(iter(chunk_dir.iterdir()))
+    os.link(stored, tmp_path / "archived-copy.bin")
+
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+
+
+def test_an_indirection_planted_at_the_chunk_directory_is_refused(tmp_path: Path) -> None:
+    """The final path component was the only one the file primitives checked, and the corpus added
+    a subdirectory. `mkdir(exist_ok=True)` asks `is_dir()`, which follows -- so a link planted at
+    `model_payloads/` accepted every chunk write and sent model content out of the run directory,
+    with the writer told it had succeeded."""
+    preimage, digest, _sha = _offloadable_call()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    try:
+        os.symlink(outside, run_dir / MODEL_PAYLOADS_DIRNAME, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    recorder = _standalone_recorder(tmp_path)
+
+    _record_offloadable(recorder, preimage, digest)
+
+    assert list(outside.iterdir()) == []
+    assert recorder._model_payloads_failed is True
     assert (run_dir / MODEL_CALLS_FILENAME).exists()
 
 

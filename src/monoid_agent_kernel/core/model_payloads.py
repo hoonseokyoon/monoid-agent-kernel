@@ -146,25 +146,53 @@ def _encoded(value: Any) -> bytes:
     return CANONICAL_JSON_ENCODER.encode(value).encode("utf-8")
 
 
-def _filled(value: Any, resolve_chunk: Callable[[str], bytes]) -> Any:
+class _ResolutionBudget:
+    """How many resolved bytes one reassembly may still spend.
+
+    Per *chunk* is not a bound on a reassembly: references are cheap and repeatable, so a payload
+    holding one reference three thousand times expands a half-megabyte file into gigabytes. A
+    faithful record reassembles to its preimage, which is at most
+    :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, so this ceiling can only
+    ever stop a record that was never going to verify.
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, total: int) -> None:
+        self.remaining = total
+
+    def spend(self, amount: int) -> None:
+        self.remaining -= amount
+        if self.remaining < 0:
+            raise ValueError("reassembly exceeds the payload ceiling")
+
+
+def _filled(value: Any, resolve_chunk: Callable[[str], bytes], budget: _ResolutionBudget) -> Any:
     """``value`` with every chunk reference replaced by its chunk's decoded value.
 
-    Recursive, and deliberately allowed to raise: a missing chunk, undecodable chunk bytes, or a
-    structure too deep to walk are all "this recipe cannot be reassembled", which every caller
-    treats as refusal (the writer falls back, the validator reports an issue).
+    Recursive, and deliberately allowed to raise: a missing chunk, undecodable chunk bytes, a
+    structure too deep to walk, and an expansion past the budget are all "this recipe cannot be
+    reassembled", which every caller treats as refusal (the writer falls back, the validator
+    reports an issue).
     """
 
     if _is_marker(value):
-        return json.loads(resolve_chunk(value[PAYLOAD_CHUNK_REF_KEY]).decode("utf-8"))
+        chunk = resolve_chunk(value[PAYLOAD_CHUNK_REF_KEY])
+        budget.spend(len(chunk))
+        return json.loads(chunk.decode("utf-8"))
     if isinstance(value, dict):
-        return {key: _filled(item, resolve_chunk) for key, item in value.items()}
+        return {key: _filled(item, resolve_chunk, budget) for key, item in value.items()}
     if isinstance(value, list):
-        return [_filled(item, resolve_chunk) for item in value]
+        return [_filled(item, resolve_chunk, budget) for item in value]
     return value
 
 
 def reassemble_request_preimage(
-    payload_value: Any, resolve_chunk: Callable[[str], bytes], *, refs: bool
+    payload_value: Any,
+    resolve_chunk: Callable[[str], bytes],
+    *,
+    refs: bool,
+    max_bytes: int = MAX_MODEL_PAYLOAD_BYTES,
 ) -> bytes:
     """The exact preimage bytes a request record stands for.
 
@@ -177,11 +205,16 @@ def reassemble_request_preimage(
 
     ``refs=False`` skips the walk entirely: a verbatim payload is encoded as it stands, so data
     shaped like a chunk reference is never resolved. May raise; see :func:`_filled`.
+
+    ``max_bytes`` bounds the *total* expansion, not one chunk: the per-read ceiling belongs to the
+    file primitive, and a corpus that arrives from elsewhere can reference one modest chunk
+    thousands of times. A faithful record cannot exceed it, because it reassembles to a preimage
+    that was itself bounded by the same constant.
     """
 
     if not refs:
         return _encoded(payload_value)
-    return _encoded(_filled(payload_value, resolve_chunk))
+    return _encoded(_filled(payload_value, resolve_chunk, _ResolutionBudget(max_bytes)))
 
 
 # What one indirection costs: a chunk reference encodes to exactly this many bytes whatever it

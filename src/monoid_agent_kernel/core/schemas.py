@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import best_match
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
@@ -1688,12 +1689,42 @@ def _validate_object(
     for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
         suffix = ".".join(str(part) for part in error.path)
         issue_path = f"{label}.{suffix}" if suffix else label
-        message = (
-            f"does not satisfy the {error.validator} constraint"
-            if redact_instance
-            else error.message
+        if not redact_instance:
+            issues.append(ValidationIssue(issue_path, error.message))
+            continue
+        # Both redacted schemas are a bare top-level ``oneOf``, so the outer error is always
+        # ``oneOf`` at the root: reporting the keyword alone would give a maintainer one identical
+        # line per record and no way to tell a version bump from a truncated write. Descend to the
+        # branch the record *claims* to be -- its ``kind`` is a schema literal, so naming it costs
+        # nothing -- and report that branch's keyword and path. Both come from the schema and the
+        # instance's key structure, never from a value. ``best_match`` alone is not enough here:
+        # its relevance heuristic picks whichever branch failed shallowest, which for a bumped
+        # ``schema_version`` is a *different* kind's missing-required error.
+        detail = best_match(_discriminated_errors(payload, schema) or error.context or [error])
+        detail = detail if detail is not None else error
+        location = detail.json_path
+        where = "" if location in ("$", "") else f" at {location}"
+        issues.append(
+            ValidationIssue(issue_path, f"does not satisfy the {detail.validator} constraint{where}")
         )
-        issues.append(ValidationIssue(issue_path, message))
+
+
+def _discriminated_errors(payload: Any, schema: dict[str, Any]) -> list[Any]:
+    """The errors of the ``oneOf`` branch ``payload``'s ``kind`` names, if it names one.
+
+    The two content artifacts discriminate their branches with ``{"kind": {"const": ...}}``, which
+    is exactly the information a redacted report may use: it is a schema literal, and it is the
+    difference between "this record is broken somehow" and "this record's ``schema_version`` is
+    from a version you do not read".
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    kind = payload.get("kind")
+    for branch in schema.get("oneOf", ()):
+        if branch.get("properties", {}).get("kind", {}).get("const") == kind:
+            return list(Draft202012Validator(branch).iter_errors(payload))
+    return []
 
 
 def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]) -> None:

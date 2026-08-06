@@ -23,6 +23,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
@@ -759,19 +760,73 @@ def test_a_record_that_matches_no_branch_is_reported_without_reprinting_itself(
     `schema_version` enum, so the first version bump makes every line of every retained run
     directory match no branch at once."""
     secret = "the tenant's confidential prompt text"
-    _write_run_payloads(
-        tmp_path,
-        {
-            **chunk_record(secret.encode("utf-8"), **_ENVELOPE),
-            "schema_version": "monoid.model-payloads.v2",
-        },
+    intact = chunk_record(secret.encode("utf-8"), **_ENVELOPE)
+    cases = {
+        "version bump": {**intact, "schema_version": "monoid.model-payloads.v2"},
+        "extra property": {**intact, "surprise": secret},
+        "wrong type": {**intact, "text": 5},
+    }
+    reported = {}
+    for name, record in cases.items():
+        run_dir = tmp_path / name.replace(" ", "-")
+        run_dir.mkdir()
+        _write_run_payloads(run_dir, record)
+        reported[name] = [
+            issue.message
+            for issue in validate_run_dir(run_dir)
+            if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        ]
+
+    assert all(messages for messages in reported.values()), reported
+    assert all(secret not in message for messages in reported.values() for message in messages)
+    # Redacting must not flatten the diagnosis. Both schemas are a bare top-level `oneOf`, so
+    # reporting the outer keyword alone gives one identical line for every failure mode -- and a
+    # version bump makes every line of a retained run directory fail at once.
+    assert len({tuple(messages) for messages in reported.values()}) == len(cases), reported
+    assert reported["version bump"] == ["does not satisfy the enum constraint at $.schema_version"]
+
+
+def test_the_other_content_artifact_is_redacted_too(tmp_path: Path) -> None:
+    """`model-content.jsonl` carries the same class of value and the same literal version enum, and
+    the code binds both. Binding the test to one of the two is the twin miss the comment beside the
+    code warns about."""
+    from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+
+    secret = "the tenant's confidential message text"
+    (tmp_path / MODEL_CONTENT_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": "monoid.model-content.v2",
+                "kind": "settled_text",
+                "text": secret,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
 
     issues = [
-        issue for issue in validate_run_dir(tmp_path)
-        if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        issue
+        for issue in validate_run_dir(tmp_path)
+        if issue.path.startswith(MODEL_CONTENT_FILENAME)
     ]
 
-    assert issues, "an unmatched record must still be reported"
+    assert issues
     assert all(secret not in issue.message for issue in issues)
-    assert all("oneOf" in issue.message for issue in issues)
+
+
+def test_reassembly_stops_expanding_at_the_payload_ceiling() -> None:
+    """A per-read ceiling is not a bound on a reassembly: references are cheap and repeatable, so a
+    payload naming one modest chunk thousands of times expands a half-megabyte corpus into
+    gigabytes inside `monoid validate`. A faithful record cannot hit the ceiling, because it
+    reassembles to a preimage the same constant already bounded."""
+    chunk = CANONICAL_JSON_ENCODER.encode("x" * 10_000).encode("utf-8")
+    sha = hashlib.sha256(chunk).hexdigest()
+    payload = {"messages": [chunk_marker(sha)] * 50}
+
+    assert reassemble_request_preimage(payload, lambda _sha: chunk, refs=True)
+
+    with pytest.raises(ValueError):
+        reassemble_request_preimage(
+            payload, lambda _sha: chunk, refs=True, max_bytes=100_000
+        )

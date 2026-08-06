@@ -41,11 +41,20 @@ def file_identity(metadata: os.stat_result) -> VerifiedFileIdentity:
     return VerifiedFileIdentity(device=metadata.st_dev, inode=metadata.st_ino)
 
 
-def verified_file_is_safe(path: Path, *, allow_missing: bool = True) -> bool:
-    """Whether a path is absent or an ordinary single-link file, without following links.
+def verified_file_is_safe(
+    path: Path, *, allow_missing: bool = True, require_single_link: bool = True
+) -> bool:
+    """Whether a path is absent or an ordinary file this process may use, without following links.
 
     A missing file is safe for a lazy writer to create unless ``allow_missing`` is false. Existing
     links, directories, FIFOs, devices, and other special files fail closed for readers and writers.
+
+    ``require_single_link`` is the append artifacts' rule: a hard link is a second name for the
+    inode a writer is about to *mutate*, so an appender that accepted one would be writing into
+    somebody else's file. It does not follow for reading a **content-addressed** file, where the
+    bytes are authenticated by re-hashing them and the link count says nothing about them -- and
+    where insisting on it turns any hardlink-deduplicated archive of a run directory (``cp -al``,
+    ``rsync --link-dest``, a restored backup) into a corpus-wide integrity failure.
     """
 
     try:
@@ -54,10 +63,30 @@ def verified_file_is_safe(path: Path, *, allow_missing: bool = True) -> bool:
         return allow_missing
     except OSError:
         return False
-    # A hard link is also an indirection across the run-directory boundary: appending here mutates
-    # the same inode through every other name. These artifacts are process-created single-link
-    # files.
-    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    if not stat.S_ISREG(metadata.st_mode):
+        return False
+    return metadata.st_nlink == 1 or not require_single_link
+
+
+def verified_directory_is_safe(path: Path) -> bool:
+    """Whether ``path`` is absent or a real directory, not a redirection wearing one's shape.
+
+    The final path component was the only one the file primitives checked, and a run directory has
+    subdirectories now. ``Path.mkdir(exist_ok=True)`` asks ``is_dir()``, which *follows*, so a
+    symlink -- or a Windows junction, which needs no privilege to create -- planted at
+    ``model_payloads/`` accepted every chunk write and sent it out of the run directory, with the
+    writer told it had succeeded.
+    """
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if getattr(metadata, "st_reparse_tag", 0):
+        return False  # a junction lstats as a directory; only the tag distinguishes it
+    return stat.S_ISDIR(metadata.st_mode)
 
 
 def open_verified_regular_fd(
@@ -65,10 +94,11 @@ def open_verified_regular_fd(
     flags: int,
     *,
     expected_identity: VerifiedFileIdentity | None = None,
+    require_single_link: bool = True,
 ) -> int | None:
     """Open ``path`` without accepting a link/special-file swap before the first I/O."""
 
-    if not verified_file_is_safe(path):
+    if not verified_file_is_safe(path, require_single_link=require_single_link):
         return None
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -81,8 +111,7 @@ def open_verified_regular_fd(
         if (
             not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(named.st_mode)
-            or opened.st_nlink != 1
-            or named.st_nlink != 1
+            or (require_single_link and (opened.st_nlink != 1 or named.st_nlink != 1))
             or not os.path.samestat(opened, named)
             or (expected_identity is not None and file_identity(opened) != expected_identity)
         ):
@@ -159,7 +188,11 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
     function is only responsible for the bytes having come from a file the run directory owns.
     """
 
-    descriptor = open_verified_regular_fd(path, os.O_RDONLY)
+    if not verified_directory_is_safe(path.parent):
+        return None
+    # Content-addressed, so the link count is not the reader's business: the caller re-hashes what
+    # it gets, and refusing a multiply-linked file would fail every hardlink-deduplicated archive.
+    descriptor = open_verified_regular_fd(path, os.O_RDONLY, require_single_link=False)
     if descriptor is None:
         return None
     try:
@@ -210,6 +243,8 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """
 
     try:
+        if not verified_directory_is_safe(path.parent):
+            return False
         try:
             existing: os.stat_result | None = path.lstat()
         except FileNotFoundError:
@@ -218,9 +253,16 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # ``path.exists()`` was the defect here, and it was the module docstring's own defect:
             # it follows a link, so a name planted at a predictable content-addressed sha reported
             # "already stored" for a chunk that was never written, and left every reader resolving
-            # whoever's bytes the link points at. An existing name is accepted only when it is the
-            # kind of file this function creates.
-            return stat.S_ISREG(existing.st_mode) and existing.st_nlink == 1
+            # whoever's bytes the link points at. An existing name is accepted only when it is a
+            # regular file -- no symlink, no FIFO, no directory.
+            #
+            # Not ``st_nlink == 1``, which is the *appenders'* rule: a second name for an inode
+            # this process is about to mutate is somebody else's file, but this function mutates
+            # nothing (``O_EXCL`` on a temp, then ``os.replace``), and a link count is what every
+            # hardlink-deduplicating archive of a run directory changes. A hard link here is a
+            # second name for a real file inside this directory, not an escape from it, and what
+            # authenticates a content-addressed file is its hash -- which the reader checks.
+            return stat.S_ISREG(existing.st_mode)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
         flags = (
