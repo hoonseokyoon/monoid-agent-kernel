@@ -26,7 +26,6 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
-import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +33,7 @@ from copy import copy
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
+from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     abandon_unwaited_call,
@@ -111,8 +111,9 @@ for the same reason. Two jobs, one tag:
   retire a corpus that a change has invalidated.
 
 Not inside :func:`_digest`: that function's contract is "the canonical-JSON digest of `payload`",
-its tests are about the encoder, and a prefix fed to the hasher would bypass `_CANONICAL_ENCODER`
-and break the twin invariant the comment beside it guards.
+its tests are about the encoder, and a prefix fed to the hasher would bypass
+`CANONICAL_JSON_ENCODER` and break the shared-instance invariant its comment in `core/_util.py`
+guards.
 """
 
 
@@ -154,16 +155,6 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     return {_PROMPT_DIGEST_GENERATION: _prompt_terms(request)}
 
 
-# The settings ``core._util.canonical_sha256`` serializes with, and the same object does the
-# encoding and the hashing here. A guard that checks one encoding while another does the hashing
-# is exactly how a payload once passed validation and then raised mid-hash.
-_CANONICAL_ENCODER = json.JSONEncoder(
-    ensure_ascii=False,
-    allow_nan=False,
-    sort_keys=True,
-    separators=(",", ":"),
-    check_circular=True,
-)
 
 
 @dataclass(frozen=True)
@@ -219,7 +210,7 @@ def _encoded_digest(payload: dict[str, Any]) -> _DigestResult:
     hasher = hashlib.sha256()
     encoded = 0
     try:
-        for chunk in _CANONICAL_ENCODER.iterencode(payload):
+        for chunk in CANONICAL_JSON_ENCODER.iterencode(payload):
             raw = chunk.encode("utf-8")
             encoded += len(raw)
             if encoded > MAX_MODEL_PAYLOAD_BYTES:

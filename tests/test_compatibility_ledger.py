@@ -30,6 +30,7 @@ from monoid_agent_kernel.core.external_agent_envelope import EXTERNAL_AGENT_ENVE
 from monoid_agent_kernel.core.inbox import INBOX_PROTOCOL_VERSION
 from monoid_agent_kernel.core.manifest import MANIFEST_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_SCHEMA_VERSION
+from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.outbox import OUTBOX_REQUEST_VERSION
 from monoid_agent_kernel.core.packages import (
@@ -44,6 +45,7 @@ from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
     MODEL_CALLS_RECORD_SCHEMA,
+    MODEL_PAYLOADS_RECORD_SCHEMA,
     MODEL_CONTENT_RECORD_SCHEMA,
     PACKAGE_SCHEMA,
     PUBLIC_JOB_SCHEMA,
@@ -92,7 +94,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 42
+    assert len(artifacts) == 43
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -130,6 +132,7 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "event": EVENT_SCHEMA_VERSION,
         "model-content": MODEL_CONTENT_SCHEMA_VERSION,
         "model-calls": MODEL_CALLS_SCHEMA_VERSION,
+        "model-payloads": MODEL_PAYLOADS_SCHEMA_VERSION,
         "manifest": MANIFEST_SCHEMA_VERSION,
         "workspace-base": WORKSPACE_BASE_SCHEMA_VERSION,
         "workspace-index": WORKSPACE_INDEX_SCHEMA_VERSION,
@@ -218,6 +221,14 @@ def test_json_schema_reader_versions_match_registry() -> None:
         tuple(variant["properties"]["schema_version"]["enum"])
         for variant in MODEL_CONTENT_RECORD_SCHEMA["oneOf"]
     } == {model_content.supported_readers}
+
+    # oneOf like model-content above; single-namespace like model-calls beside it.
+    model_payloads = compatibility_artifact("model-payloads")
+    assert model_payloads.reader_policy == "json-schema"
+    assert {
+        tuple(variant["properties"]["schema_version"]["enum"])
+        for variant in MODEL_PAYLOADS_RECORD_SCHEMA["oneOf"]
+    } == {model_payloads.supported_readers}
 
 
 def test_registry_source_locations_exist() -> None:

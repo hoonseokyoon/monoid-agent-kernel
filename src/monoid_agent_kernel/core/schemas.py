@@ -9,7 +9,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_calls import (
     MODEL_CALL_KIND,
@@ -17,6 +17,17 @@ from monoid_agent_kernel.core.model_calls import (
     MODEL_CALLS_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_payloads import (
+    MODEL_PAYLOADS_DIRNAME,
+    MODEL_PAYLOADS_FILENAME,
+    MODEL_PAYLOADS_SCHEMA_VERSION,
+    MODEL_REQUEST_KIND,
+    MODEL_RESPONSE_KIND,
+    PAYLOAD_CHUNK_KIND,
+    PAYLOAD_CHUNK_REF_KEY,
+    UNRECORDED_REASONS,
+    reassemble_request_preimage,
+)
 from monoid_agent_kernel.core.model_io import DESTINATION_STATUSES, DIGEST_STATUSES
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -1044,8 +1055,8 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         },
         "model": _MODEL_CALL_CONFIG_SCHEMA,
         "provider_name": {"type": "string"},
-        # Empty is a valid answer and ``digest_status`` says which of the four reasons it is, so
-        # the pattern admits both the key and its absence rather than requiring one.
+        # Empty is a valid answer and ``digest_status`` says which reason it is, so the
+        # pattern admits both the key and its absence rather than requiring one.
         "prompt_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
         "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
         "digest_generation": {"type": "string"},
@@ -1066,7 +1077,82 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+def _payloads_envelope(kind: str) -> dict[str, Any]:
+    return {
+        "schema_version": {"enum": [MODEL_PAYLOADS_SCHEMA_VERSION]},
+        "kind": {"const": kind},
+        "run_id": {"type": "string", "minLength": 1},
+        "root_run_id": {"type": "string", "minLength": 1},
+        "recorded_at": {"type": "string", "pattern": "Z$"},
+    }
+
+
+_PAYLOADS_ENVELOPE_KEYS = ["schema_version", "kind", "run_id", "root_run_id", "recorded_at"]
+
+# Three kinds under one namespace, discriminated the way MODEL_CONTENT_RECORD_SCHEMA's four are:
+# oneOf with a const kind per branch, additionalProperties refused per branch, and a literal
+# single-element schema_version enum because this artifact never existed under the legacy prefix
+# (the model-calls ledger states the same rule).
+MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": [*_PAYLOADS_ENVELOPE_KEYS, "sha256", "text"],
+            "properties": {
+                **_payloads_envelope(PAYLOAD_CHUNK_KIND),
+                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "text": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                *_PAYLOADS_ENVELOPE_KEYS,
+                "request_digest",
+                "digest_generation",
+                "refs",
+                "payload",
+            ],
+            "properties": {
+                **_payloads_envelope(MODEL_REQUEST_KIND),
+                # Never empty: a keyless call has nothing to file a preimage under, so the
+                # record simply does not exist (unlike the response branch below).
+                "request_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "digest_generation": {"type": "string", "minLength": 1},
+                "refs": {"type": "boolean"},
+                "payload": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                *_PAYLOADS_ENVELOPE_KEYS,
+                "call_index",
+                "request_digest",
+                "unrecorded_reason",
+                "response",
+            ],
+            "properties": {
+                **_payloads_envelope(MODEL_RESPONSE_KIND),
+                "call_index": {"type": "integer", "minimum": 0},
+                # Empty is legal here: the ledger line this index joins says why there was no
+                # key (its ``digest_status``), and this record still names the answer.
+                "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+                "unrecorded_reason": {"enum": list(UNRECORDED_REASONS)},
+                # The inline body, a chunk reference to an offloaded one, or null with
+                # ``unrecorded_reason`` saying why. Body keys are content, not contract, so the
+                # object arm stays open the way the request ``payload`` does.
+                "response": {"type": ["object", "null"]},
+            },
+            "additionalProperties": False,
+        },
+    ]
+}
+
 PROPOSAL_SCHEMA: dict[str, Any] = {
+
     "type": "object",
     "required": [
         "schema_version",
@@ -1465,6 +1551,14 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     model_calls_path = run_dir / MODEL_CALLS_FILENAME
     if model_calls_path.exists():
         _validate_jsonl_file(model_calls_path, MODEL_CALLS_RECORD_SCHEMA, issues)
+    # Optional for the same reason as its two sidecar siblings. Unlike the ledger, this one DOES
+    # get a recomputation pass: the corpus's whole contract is that every request record
+    # reassembles to the exact bytes its key was taken over, and a validator that only
+    # shape-checked would bless a corpus that cannot honor it.
+    model_payloads_path = run_dir / MODEL_PAYLOADS_FILENAME
+    if model_payloads_path.exists():
+        _validate_jsonl_file(model_payloads_path, MODEL_PAYLOADS_RECORD_SCHEMA, issues)
+        _validate_model_payload_digests(run_dir, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
@@ -1566,6 +1660,101 @@ def _validate_object(
         suffix = ".".join(str(part) for part in error.path)
         issue_path = f"{label}.{suffix}" if suffix else label
         issues.append(ValidationIssue(issue_path, error.message))
+
+
+def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]) -> None:
+    """Re-verify the corpus's self-verification: chunks hash to their names, request records
+    reassemble to the bytes their key was taken over, response references resolve.
+
+    Reads the file leniently -- lines the schema pass already reported are skipped here rather
+    than reported twice -- and treats every reassembly failure as an issue on the record that
+    cannot honor its digest, naming the line. Unreferenced files in the chunk directory are NOT
+    issues: a crashed write may orphan one, and garbage collection is a separate concern from
+    integrity (only what a record references must verify).
+    """
+
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    records: list[tuple[int, dict[str, Any]]] = []
+    chunks: dict[str, bytes] = {}
+    try:
+        lines = path.read_bytes().split(b"\n")
+    except OSError:
+        return
+    for index, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            payload = loads_json_ingress(raw_line.decode("utf-8"))
+        except Exception:
+            continue  # the schema pass already reported this line
+        if not isinstance(payload, dict):
+            continue
+        records.append((index, payload))
+        if payload.get("kind") == PAYLOAD_CHUNK_KIND:
+            text = payload.get("text")
+            sha = payload.get("sha256")
+            if not isinstance(text, str) or not isinstance(sha, str):
+                continue
+            data = text.encode("utf-8")
+            if sha256_bytes(data) != sha:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}", "chunk text does not match its sha256"
+                    )
+                )
+                continue
+            chunks[sha] = data
+
+    def resolve(sha: str) -> bytes:
+        if sha in chunks:
+            return chunks[sha]
+        data = (chunk_dir / sha).read_bytes()
+        if sha256_bytes(data) != sha:
+            raise ValueError(f"offloaded chunk {sha} does not match its name")
+        return data
+
+    for index, payload in records:
+        kind = payload.get("kind")
+        if kind == MODEL_REQUEST_KIND:
+            digest = payload.get("request_digest")
+            refs = payload.get("refs")
+            if not isinstance(digest, str) or not isinstance(refs, bool):
+                continue  # shape issues are the schema pass's report
+            try:
+                rebuilt = reassemble_request_preimage(
+                    payload.get("payload"), resolve, refs=refs
+                )
+            except Exception:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}", "request payload cannot be reassembled"
+                    )
+                )
+                continue
+            if sha256_bytes(rebuilt) != digest:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        "request payload does not reassemble to its request_digest",
+                    )
+                )
+        elif kind == MODEL_RESPONSE_KIND:
+            response = payload.get("response")
+            if (
+                isinstance(response, dict)
+                and set(response.keys()) == {PAYLOAD_CHUNK_REF_KEY}
+                and isinstance(response.get(PAYLOAD_CHUNK_REF_KEY), str)
+            ):
+                try:
+                    resolve(response[PAYLOAD_CHUNK_REF_KEY])
+                except Exception:
+                    issues.append(
+                        ValidationIssue(
+                            f"{path.name}:{index}",
+                            "response reference does not resolve to a recorded chunk",
+                        )
+                    )
 
 
 def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:

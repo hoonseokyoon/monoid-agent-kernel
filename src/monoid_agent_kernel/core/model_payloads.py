@@ -1,0 +1,357 @@
+"""What one model call's content may say about itself once it is written down.
+
+``model_payloads.jsonl`` (plus its ``model_payloads/`` chunk directory) is the private
+run-directory replay corpus: the request preimage each ``request_digest`` was taken over, and the
+settled turn that answered it. W6-2 (dx-note ``2026-08-02-v0.21-contract-replay-scope.md``
+§Track B, decisions 4/5/6/8). It is the content-bearing sibling of ``model_calls.jsonl`` --
+deliberately a **separate artifact**, because the ledger promises "metadata and the replay key
+and no content" and the two files have different keys: the ledger is a sequence (one line per
+call, ``call_index``), this corpus is mostly a set (one request record per digest, however many
+calls shared it).
+
+This module is pure. It splits, reassembles, and shapes records; the recorder owns every byte
+that reaches disk, so a run whose disk is full loses a record rather than an answer.
+
+**A request record is a recipe, not a copy, and the recipe is verified.** The bytes that matter
+are the exact bytes the replay key was hashed over. A record stores them as a payload tree whose
+extracted values -- each tool definition, the system prompt, any oversized message block -- are
+replaced by content-addressed chunk references, so the ~98% of a preimage that repeats across
+calls (tool definitions, measured on the shipped default surface) is stored once per run.
+Reassembly replaces each reference with its chunk's decoded value, re-encodes the whole through
+``CANONICAL_JSON_ENCODER`` -- the same instance the digest hashed through, shared by identity,
+never a settings twin -- and must reproduce the preimage byte for byte. The writer performs that
+reassembly *before* writing and falls back to a verbatim payload (``refs=False``) when it fails,
+so three failure classes are absorbed structurally rather than defended by argument: a broken
+decode/encode round-trip, caller data shaped like a chunk reference, and any splitting defect.
+A ``refs=False`` payload is never walked at all, which is what makes marker-shaped data inert.
+
+**The response side records the turn's declared fields and nothing else.** ``raw`` is absent by
+decision: it has no consumers outside the provider layer, no shape contract, and duplicates the
+parsed fields -- a replayed turn answers with ``raw={}``, which is an honest statement ("this is
+a replay") rather than a gap. ``reasoning`` is present *because* replay needs it: the loop
+re-injects it into the next by-value turn, so a corpus without it derails one turn after every
+replayed answer. Reasoning entries and the message text around them are model content; this whole
+artifact is content-classified, unlike the ledger beside it.
+
+Nothing here is truncated, ever. A response that cannot be canonically encoded, or that exceeds
+:data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, costs its own record a typed
+``unrecorded_reason`` -- the same doctrine as the replay key itself: refuse whole, never invent a
+partial identity.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
+from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
+from monoid_agent_kernel.identifiers import namespaced_id
+
+MODEL_PAYLOADS_SCHEMA_VERSION = namespaced_id("model-payloads.v1")
+MODEL_PAYLOADS_FILENAME = "model_payloads.jsonl"
+MODEL_PAYLOADS_DIRNAME = "model_payloads"
+
+# A chunk reference, as it appears inside a request payload or a response field: an object whose
+# single key is this namespaced id. Namespaced so a collision with real data is vanishingly rare
+# -- and *still* not trusted: the writer verifies reassembly before writing and falls back to a
+# verbatim payload, so a collision costs deduplication, never correctness.
+PAYLOAD_CHUNK_REF_KEY = namespaced_id("payload-chunk.v1")
+
+# Above this encoded size a value leaves the JSONL line: request-side, ``messages`` and
+# ``observations`` become chunks; recorder-side, a chunk this large lands in the directory
+# instead of an inline record. 256 KiB, Temporal's offload default for the same job.
+PAYLOAD_OFFLOAD_THRESHOLD_BYTES = 262_144
+
+PAYLOAD_CHUNK_KIND = "chunk"
+MODEL_REQUEST_KIND = "model_request"
+MODEL_RESPONSE_KIND = "model_response"
+
+# Why a response record carries no response. ``not_captured`` is a wiring statement -- the
+# payload file was enabled but the runner was not asked to keep preimage bytes -- kept distinct
+# because it names a configuration defect, not a payload property.
+UNRECORDED_REASONS = ("", "too_large", "unencodable", "not_captured")
+
+
+@dataclass(frozen=True)
+class SplitRequestPayload:
+    """A verified recipe for one request preimage.
+
+    ``refs=True`` means ``payload`` contains chunk references and ``chunks`` holds their bytes;
+    ``refs=False`` means ``payload`` is the decoded preimage verbatim and reassembly must not
+    walk it. Either way the constructor of this value has already proven that
+    :func:`reassemble_request_preimage` reproduces the original bytes.
+    """
+
+    payload: Any
+    chunks: dict[str, bytes] = field(default_factory=dict)
+    refs: bool = True
+
+
+@dataclass(frozen=True)
+class RecordedResponse:
+    """One settled turn as the corpus may record it, or the typed reason it may not.
+
+    ``encoded`` is the canonical encoding of ``value`` -- the bytes an offloaded response file
+    stores and hashes, kept beside the value so the recorder's size decision and the stored bytes
+    cannot diverge.
+    """
+
+    value: dict[str, Any] | None = None
+    encoded: bytes | None = None
+    unrecorded_reason: str = ""
+
+
+def chunk_marker(sha256: str) -> dict[str, str]:
+    """The reference object that stands where an extracted value stood."""
+
+    return {PAYLOAD_CHUNK_REF_KEY: sha256}
+
+
+def _is_marker(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and len(value) == 1
+        and PAYLOAD_CHUNK_REF_KEY in value
+        and isinstance(value[PAYLOAD_CHUNK_REF_KEY], str)
+    )
+
+
+def _encoded(value: Any) -> bytes:
+    return CANONICAL_JSON_ENCODER.encode(value).encode("utf-8")
+
+
+def _filled(value: Any, resolve_chunk: Callable[[str], bytes]) -> Any:
+    """``value`` with every chunk reference replaced by its chunk's decoded value.
+
+    Recursive, and deliberately allowed to raise: a missing chunk, undecodable chunk bytes, or a
+    structure too deep to walk are all "this recipe cannot be reassembled", which every caller
+    treats as refusal (the writer falls back, the validator reports an issue).
+    """
+
+    if _is_marker(value):
+        return json.loads(resolve_chunk(value[PAYLOAD_CHUNK_REF_KEY]).decode("utf-8"))
+    if isinstance(value, dict):
+        return {key: _filled(item, resolve_chunk) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_filled(item, resolve_chunk) for item in value]
+    return value
+
+
+def reassemble_request_preimage(
+    payload_value: Any, resolve_chunk: Callable[[str], bytes], *, refs: bool
+) -> bytes:
+    """The exact preimage bytes a request record stands for.
+
+    Value substitution followed by one canonical re-encoding -- never textual splicing of chunk
+    bytes into a template, which would make the result depend on how the recipe happened to be
+    stored rather than on what it means. Byte-identity with the original preimage holds because
+    the canonical encoder is deterministic and decode∘encode is the identity on its own output;
+    that is a *claim*, which is why the writer verifies it per record before writing and
+    ``validate_run_dir`` re-verifies it per record after.
+
+    ``refs=False`` skips the walk entirely: a verbatim payload is encoded as it stands, so data
+    shaped like a chunk reference is never resolved. May raise; see :func:`_filled`.
+    """
+
+    if not refs:
+        return _encoded(payload_value)
+    return _encoded(_filled(payload_value, resolve_chunk))
+
+
+def _extracted(terms: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """The terms with dedup/offload values lifted out, and the chunks that replaced them.
+
+    Extraction rules, by field:
+
+    * each element of ``tools`` and the ``system_prompt`` -- **always** (they are the dedup
+      targets: byte-identical across every call sharing a surface, and the tools block alone is
+      ~98% of a default-surface preimage). Except a literal ``null`` system prompt, which stays
+      inline: a chunk holding four bytes of ``null`` would be indirection with nothing deduped.
+    * ``messages`` and ``observations`` -- only past
+      :data:`PAYLOAD_OFFLOAD_THRESHOLD_BYTES` (they grow per turn and rarely repeat, so this is
+      offload, not dedup: it keeps a multimodal turn from putting megabytes on one JSONL line).
+
+    Per *tool*, not per tools-block: surfaces change mid-run (hot-swap, skill binding, quota),
+    and a block-level chunk would re-record all twenty-eight definitions because one left.
+    """
+
+    chunks: dict[str, bytes] = {}
+
+    def lifted(value: Any) -> dict[str, str]:
+        encoded = _encoded(value)
+        sha = sha256_bytes(encoded)
+        chunks[sha] = encoded
+        return chunk_marker(sha)
+
+    recipe = dict(terms)
+    tools = terms.get("tools")
+    if isinstance(tools, list):
+        recipe["tools"] = [lifted(tool) for tool in tools]
+    if terms.get("system_prompt") is not None:
+        recipe["system_prompt"] = lifted(terms["system_prompt"])
+    for name in ("messages", "observations"):
+        value = terms.get(name)
+        if value is not None and len(_encoded(value)) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
+            recipe[name] = lifted(value)
+    return recipe, chunks
+
+
+def split_request_payload(preimage: bytes, request_digest: str) -> SplitRequestPayload | None:
+    """A verified recipe for ``preimage``, or ``None`` when no verifiable record can exist.
+
+    Refuses -- rather than records -- twice. If ``request_digest`` is not the digest of
+    ``preimage``, the caller is asking for a record whose key contradicts its own bytes, and a
+    corpus entry that fails its own join is worse than an absent one. And if neither the
+    chunked recipe nor the verbatim fallback reassembles to ``preimage`` (the decode/encode
+    identity itself broken), nothing this function could write would survive
+    ``validate_run_dir``, so nothing is written. Both refusals are the `_digest` doctrine:
+    no fabricated identities.
+    """
+
+    if sha256_bytes(preimage) != request_digest:
+        return None
+    try:
+        value = json.loads(preimage.decode("utf-8"))
+    except Exception:
+        return None
+
+    tag = None
+    if isinstance(value, dict) and len(value) == 1:
+        tag = next(iter(value))
+    if tag is not None and isinstance(value[tag], dict):
+        try:
+            recipe_terms, chunks = _extracted(value[tag])
+            recipe = {tag: recipe_terms}
+            if chunks and reassemble_request_preimage(
+                recipe, chunks.__getitem__, refs=True
+            ) == preimage:
+                return SplitRequestPayload(payload=recipe, chunks=chunks, refs=True)
+        except Exception:
+            pass  # fall through to the verbatim shape; the reason does not change the answer
+
+    try:
+        if reassemble_request_preimage(value, _no_resolution, refs=False) == preimage:
+            return SplitRequestPayload(payload=value, chunks={}, refs=False)
+    except Exception:
+        pass
+    return None
+
+
+def _no_resolution(sha256: str) -> bytes:
+    raise LookupError(f"a refs=False payload resolves no chunks (asked for {sha256})")
+
+
+def response_record_body(turn: Any) -> RecordedResponse:
+    """One settled turn as a record body, or the typed reason there is none.
+
+    The field list is declared here, once, and ``raw`` is not on it (module docstring). A tool
+    call that does not carry the ``id``/``name``/``arguments`` triple -- the legacy
+    preserved-beside-a-settled-answer shape -- makes the whole response ``unencodable`` rather
+    than a bounded repr: the capture surface may describe such an entry, but a replay corpus
+    that recorded a description would replay a fabricated call.
+    """
+
+    try:
+        calls = []
+        for call in getattr(turn, "tool_calls", ()) or ():
+            call_id = getattr(call, "id", None)
+            name = getattr(call, "name", None)
+            arguments = getattr(call, "arguments", None)
+            if (
+                not isinstance(call_id, str)
+                or not isinstance(name, str)
+                or not isinstance(arguments, dict)
+            ):
+                return RecordedResponse(unrecorded_reason="unencodable")
+            calls.append({"id": call_id, "name": name, "arguments": arguments})
+        value: dict[str, Any] = {
+            "response_id": getattr(turn, "response_id", None),
+            "final_text": getattr(turn, "final_text", None),
+            "tool_calls": calls,
+            "reasoning": list(getattr(turn, "reasoning", ()) or ()),
+            "usage": dict(getattr(turn, "usage", {}) or {}),
+            "stop_reason": getattr(turn, "stop_reason", None),
+            "provider_retried": bool(getattr(turn, "provider_retried", False)),
+        }
+        encoded = _encoded(value)
+    except Exception:
+        return RecordedResponse(unrecorded_reason="unencodable")
+    if len(encoded) > MAX_MODEL_PAYLOAD_BYTES:
+        return RecordedResponse(unrecorded_reason="too_large")
+    return RecordedResponse(value=value, encoded=encoded)
+
+
+def _envelope(kind: str, *, run_id: str, root_run_id: str, recorded_at: str) -> dict[str, Any]:
+    return {
+        "schema_version": MODEL_PAYLOADS_SCHEMA_VERSION,
+        "kind": kind,
+        "run_id": run_id,
+        "root_run_id": root_run_id,
+        "recorded_at": recorded_at,
+    }
+
+
+def chunk_record(
+    chunk: bytes, *, run_id: str, root_run_id: str, recorded_at: str
+) -> dict[str, Any]:
+    """One inline chunk. ``text`` is the canonical JSON fragment verbatim -- chunk bytes are
+    always encoder output, so they are UTF-8 text and need no base64 detour; the sha is computed
+    here from the same bytes, so a record cannot be built already lying about its content."""
+
+    return {
+        **_envelope(PAYLOAD_CHUNK_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        "sha256": sha256_bytes(chunk),
+        "text": chunk.decode("utf-8"),
+    }
+
+
+def model_request_record(
+    payload_value: Any,
+    *,
+    refs: bool,
+    request_digest: str,
+    digest_generation: str,
+    run_id: str,
+    root_run_id: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """One request preimage, keyed by its digest. Set semantics: a run that issues the same
+    request twice writes this once, and the ledger's two lines both join to it. There is
+    deliberately no ``call_index`` here -- naming the call that happened to write first would
+    turn a set member into a sequence entry."""
+
+    return {
+        **_envelope(MODEL_REQUEST_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        "request_digest": request_digest,
+        "digest_generation": digest_generation,
+        "refs": refs,
+        "payload": payload_value,
+    }
+
+
+def model_response_record(
+    response: dict[str, Any] | None,
+    *,
+    call_index: int,
+    request_digest: str,
+    unrecorded_reason: str,
+    run_id: str,
+    root_run_id: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """One settled turn, keyed by the call that produced it. Sequence semantics: the same digest
+    answered twice is two of these, because models are not functions and the corpus records what
+    happened rather than deciding which answer is canonical (that policy is the replay adapter's,
+    W6-4). ``response`` is the inline body, a chunk reference to an offloaded one, or ``null``
+    with ``unrecorded_reason`` saying why. An empty ``request_digest`` is legal and joins the
+    ledger line whose ``digest_status`` names the reason."""
+
+    return {
+        **_envelope(MODEL_RESPONSE_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        "call_index": call_index,
+        "request_digest": request_digest,
+        "unrecorded_reason": unrecorded_reason,
+        "response": response,
+    }

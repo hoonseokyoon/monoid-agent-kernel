@@ -41,9 +41,12 @@ from monoid_agent_kernel.identifiers import namespaced_id
 MODEL_CALLS_SCHEMA_VERSION = namespaced_id("model-calls.v1")
 MODEL_CALLS_FILENAME = "model_calls.jsonl"
 
-# One record shape today. It is discriminated anyway, because W6-2 adds payload records to this
-# same file and a discriminator retrofitted onto records that already exist cannot be applied to
-# them. ``MODEL_CONTENT_RECORD_SCHEMA`` avoids the same problem by construction.
+# One record shape today, discriminated anyway: a discriminator retrofitted onto records that
+# already exist cannot be applied to them (``MODEL_CONTENT_RECORD_SCHEMA`` avoids the same
+# problem by construction). W6-2's payload records went to their own artifact rather than this
+# file -- this ledger promises "no content" and is keyed as a sequence, while the corpus is
+# content-classified and keyed largely as a set -- but the discriminator stays, because the next
+# record shape that DOES belong in a metadata ledger will need it just as much.
 MODEL_CALL_KIND = "model_call"
 
 

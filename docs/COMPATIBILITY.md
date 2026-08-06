@@ -57,6 +57,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
 | `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
+| `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
