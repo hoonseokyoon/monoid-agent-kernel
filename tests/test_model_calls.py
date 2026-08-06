@@ -25,6 +25,7 @@ from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.model_call import SettledModelCall
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 
 
@@ -373,7 +374,7 @@ def test_concurrent_records_never_share_a_call_index(tmp_path: Path) -> None:
     def write() -> None:
         start.wait()
         for _ in range(20):
-            recorder.record_model_call(ModelCallReceipt())
+            recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
 
     threads = [threading.Thread(target=write) for _ in range(8)]
     for thread in threads:
@@ -391,7 +392,7 @@ def test_concurrent_records_never_share_a_call_index(tmp_path: Path) -> None:
 def test_the_recorder_contains_its_own_write_failure(tmp_path: Path, monkeypatch: Any) -> None:
     """The promise is the recorder's, not the runner's.
 
-    ``record_model_call`` is public and its docstring says nothing here raises. Proving that only
+    ``record_settled_call`` is public and its docstring says nothing here raises. Proving that only
     through a run leans on ``ModelCallRunner._record``'s own guard -- so the promise would survive
     a refactor that removed it from the recorder, and only fail for whoever calls the recorder
     directly.
@@ -406,7 +407,7 @@ def test_the_recorder_contains_its_own_write_failure(tmp_path: Path, monkeypatch
     monkeypatch.setattr(recorder_module.AgentRecorder, "_append_model_call", explode)
     recorder = _standalone_recorder(tmp_path)
 
-    recorder.record_model_call(ModelCallReceipt())  # must not raise
+    recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))  # must not raise
 
     recorder.close()
 
@@ -423,10 +424,10 @@ def test_a_record_arriving_after_close_does_not_reopen_the_ledger(tmp_path: Path
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
 
     recorder = _standalone_recorder(tmp_path)
-    recorder.record_model_call(ModelCallReceipt())
+    recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
     recorder.close()
 
-    recorder.record_model_call(ModelCallReceipt())  # must not raise, and must not write
+    recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))  # must not raise, and must not write
 
     assert len(_records(recorder.run_dir)) == 1
     assert recorder._model_calls_handle is None
@@ -487,20 +488,20 @@ def test_a_planted_link_stops_the_ledger_instead_of_being_written_through(
 
     receipt = ModelCallReceipt()
     recorder = AgentRecorder(tmp_path / "runs", "run-1", model_calls_file=True, status_file=False)
-    recorder.record_model_call(receipt)
+    recorder.record_settled_call(SettledModelCall(receipt=receipt))
 
     assert target.read_bytes() == original
     assert recorder._model_calls_failed is True
     assert recorder._model_calls_handle is None
 
     # Terminal, not per-line: a second receipt must not re-attempt the same refused open.
-    recorder.record_model_call(receipt)
+    recorder.record_settled_call(SettledModelCall(receipt=receipt))
     assert target.read_bytes() == original
     assert recorder._model_calls_index == 0
     recorder.close()
 
     witness = AgentRecorder(tmp_path / "clean", "run-1", model_calls_file=True, status_file=False)
-    witness.record_model_call(receipt)
+    witness.record_settled_call(SettledModelCall(receipt=receipt))
     witness.close()
     assert len(_records(witness.run_dir)) == 1
 
@@ -517,7 +518,7 @@ def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_pat
     from monoid_agent_kernel.recorder import AgentRecorder
 
     recorder = _standalone_recorder(tmp_path)
-    recorder.record_model_call(ModelCallReceipt())
+    recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
     recorder.close()
     ledger = recorder.run_dir / MODEL_CALLS_FILENAME
     with ledger.open("a", encoding="utf-8", newline="\n") as handle:
@@ -530,7 +531,7 @@ def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_pat
         status_file=False,
         reopen=True,
     )
-    reopened.record_model_call(ModelCallReceipt())
+    reopened.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
     reopened.close()
 
     lines = ledger.read_text(encoding="utf-8").splitlines()

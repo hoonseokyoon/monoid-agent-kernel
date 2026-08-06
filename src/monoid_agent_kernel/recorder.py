@@ -38,7 +38,8 @@ from monoid_agent_kernel.core.lifecycle import (
 from monoid_agent_kernel.core.manifest import RunManifest
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME, model_call_record
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME, ModelContentStore
-from monoid_agent_kernel.core.model_io import ModelCallReceipt, content_digest, content_length
+from monoid_agent_kernel.model_call import SettledModelCall
+from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.model_stream import (
     NOOP_MODEL_STREAM_WRITER,
     ModelStreamContext,
@@ -452,12 +453,16 @@ class AgentRecorder:
     def transcript(self, item: dict[str, Any]) -> None:
         _write_jsonl(self._transcript_file, item)
 
-    def record_model_call(self, receipt: ModelCallReceipt) -> None:
-        """Append one settled call to the private ledger, shielding the run from every failure.
+    def record_settled_call(self, call: SettledModelCall) -> None:
+        """Record one settled call into the private sidecars, shielding the run from every failure.
 
-        Handed to ``ModelCallRunner.receipt_sink``, so it runs for failed calls as well as
+        Handed to ``ModelCallRunner.settled_sink``, so it runs for failed calls as well as
         successful ones — the reason that seam exists rather than the loop's return value, which a
-        failure never reaches. A direct method rather than a ``ModelIOObserver``, for the reason
+        failure never reaches. One entry point for however many files the recorder keeps per call
+        (today the ledger; the payload corpus joins it), because one delivery under one lock is
+        what keeps their per-call indices in agreement — two sink methods could only agree by
+        cooperation across two acquisitions, which is the index race this recorder already fixed
+        once internally. A direct method rather than a ``ModelIOObserver``, for the reason
         ``open_model_stream`` is one: the recorder owns its private artifacts and does not pretend
         to implement the external observer API, whose ``CapturePolicy`` narrowing would strip the
         digests this ledger exists to carry.
@@ -487,7 +492,7 @@ class AgentRecorder:
                 if self._model_calls_failed or self._model_calls_closed:
                     return
                 record = model_call_record(
-                    receipt,
+                    call.receipt,
                     run_id=self.run_id,
                     root_run_id=self.root_run_id or self.run_id,
                     call_index=self._model_calls_index,
