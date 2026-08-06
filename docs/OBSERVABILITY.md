@@ -20,6 +20,9 @@ The run-directory artifact set is:
 - `model_calls.jsonl`: optional private ledger of settled model calls, one record per call
   including failed ones — metadata, taxonomy, and the replay key, no content
   (`monoid.model-calls.v1`)
+- `model_payloads.jsonl` + `model_payloads/`: optional private replay corpus — request preimages
+  as verified reassembly recipes with per-tool deduplicated chunks, and settled response bodies
+  including provider reasoning (`monoid.model-payloads.v1`)
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
   non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
   from the `session.state.changed` event). While a run is parked on a recoverable turn failure
@@ -404,6 +407,13 @@ symlink or hard link planted where a reopened run expects its artifact, an unenc
 its own line, a write error disables the handle so a torn line cannot consume the next record, and
 nothing raises into the call. The switch is independent of `stream_model_calls` and
 `model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say.
+
+`model_payload_file=True` adds the third recorder-owned writer, for the replay corpus. It shares
+the ledger's per-call lock and index, so a response record and its ledger line name the same call
+by construction, and the two arms fail independently — a disk error in one file disables that
+file only. Chunk files are created write-once through the same verified-file primitives as the
+JSONL handles. The corpus, unlike the ledger, is content-classified; enable it with the same care
+as `model_content_file`.
 
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains

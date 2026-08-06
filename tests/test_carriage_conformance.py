@@ -6834,6 +6834,11 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # already. The anchor is the clause naming the hazard, absent at 41c8550 and present
         # exactly once now.
         "never the preimage of a digest it also records",
+        # W6-2: the corpus's reassembly contract. Not "model_payloads.jsonl" (stays green after
+        # the paragraph stating the byte-identity rule is deleted) and not "reassemble" alone
+        # (this suite and the validator prose would satisfy it). The anchor is the clause that
+        # states the contract, absent at 5ceaa93 and present exactly once now.
+        "reassembles to the exact bytes the key was taken over",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

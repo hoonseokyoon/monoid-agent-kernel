@@ -719,6 +719,40 @@ derived:
 directory and appends to the ledger it already has. It is a gap detector, not a join key: a
 restart is self-evident because the index drops while `recorded_at` advances.
 
+`AgentLoop.model_payload_file=True` writes the optional private replay corpus:
+`model_payloads.jsonl` (`monoid.model-payloads.v1`; kinds `chunk`, `model_request`,
+`model_response`) plus a `model_payloads/` directory of content-addressed files for values past
+256 KiB. It is independent of every other switch — in particular it does not join the streaming
+selection, so a corpus-only run keeps non-streamed cancellation granularity — and a subagent
+inherits it, recording into its own run directory with `root_run_id` as the join. Unlike the
+ledger beside it, this artifact is **content**: request records carry the conversation and the
+tool definitions, response records carry model output and provider reasoning artifacts, and the
+whole file inherits the run directory's private access boundary.
+
+A `model_request` record is a **recipe, not a copy**: each tool definition and the system prompt
+(and any message block past the offload threshold) is lifted out as a content-addressed chunk,
+and the record verifiably
+reassembles to the exact bytes the key was taken over — substitute each chunk's decoded value,
+re-encode through the canonical encoder, and the SHA-256 equals `request_digest`. The writer
+performs that reassembly *before* writing and falls back to a verbatim payload (`refs: false`,
+never walked) when anything disagrees, so caller data shaped like a chunk reference costs
+deduplication rather than correctness; `monoid validate` re-verifies every request record against
+its own digest. Records are set-keyed by digest — a run that issues the same request twice writes
+one request record, and both ledger lines join to it — while `model_response` records are
+sequence-keyed by `call_index`, because models are not functions: every answer is recorded, and
+choosing which one a replay returns is the replay adapter's policy, not the corpus's. A failed
+call records its request and no response; the ledger line carries its taxonomy. A response the
+canonical encoder cannot carry, or one past `MAX_MODEL_PAYLOAD_BYTES`, costs its own record a
+typed `unrecorded_reason` — never a truncation.
+
+Two deliberate absences. `ModelTurn.raw` is not recorded: it has no shape contract and no
+consumer outside the provider layer, so a replayed turn answers `raw={}` — an honest statement
+that this is a replay, not a gap. And the configured endpoint is absent here for the same
+structural reason as in the ledger: the preimage is built from the replay key's own projection,
+which excludes `gateway_url` by construction. `reasoning` *is* recorded, encrypted entries
+included, because the loop re-injects it into the next by-value turn — a corpus without it would
+derail one turn after every replayed answer.
+
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
 and inherited by in-process descendants, producing one passive root-multiplexed presentation

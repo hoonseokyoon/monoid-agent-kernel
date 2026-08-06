@@ -7,6 +7,35 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — a private replay corpus for the calls the ledger indexes
+
+- **`AgentLoop.model_payload_file=True` writes `model_payloads.jsonl` plus a `model_payloads/`
+  chunk directory** — the 43rd public compatibility artifact (`monoid.model-payloads.v1`): the
+  request preimage each `request_digest` was hashed over, and the settled response body
+  (`response_id`, `final_text`, `tool_calls`, `reasoning`, `usage`, `stop_reason`,
+  `provider_retried`). Opt-in, independent of every other switch, inherited by subagents,
+  validated — including full reassembly — by `monoid validate`.
+- **A request record is a verified recipe.** Each tool definition and the system prompt is a
+  content-addressed chunk (per tool, so a mid-run surface change re-records one definition, not
+  twenty-eight; on the shipped default surface the tool block is ~98% of a preimage), values past
+  256 KiB are offloaded to the chunk directory, and the writer reassembles and compares against
+  the digest *before* writing — falling back to a verbatim, never-walked payload when anything
+  disagrees, so data shaped like a chunk reference is inert. `ModelTurn.raw` is deliberately not
+  recorded (a replayed turn answers `raw={}`); `reasoning` deliberately is, encrypted entries
+  included, because the loop re-injects it into the next turn.
+- **`digest_status` gains `too_large`, and the digest cap becomes the wire's bound.** The band
+  between the old 4 MiB digest cap and the 8,000,000-byte message-log bound used to ship calls
+  that transmitted successfully and silently had no replay key; one shared constant
+  (`MAX_MODEL_PAYLOAD_BYTES`) now gates the key, the recorded request, and the recorded response,
+  and an oversized payload is a named operational condition rather than an unexplained `absent`.
+  Raising the cap only turns refusals into keys — digests under the old cap are unchanged.
+- **Unreleased-seam supersession: `ModelCallRunner.receipt_sink` is replaced by `settled_sink`**,
+  which receives a `SettledModelCall` (receipt + optional request preimage + turn). One delivery
+  per call is what lets the recorder keep the ledger and the corpus index-aligned under a single
+  lock acquisition; `capture_request_preimage` (default off) gates the preimage buffering so a
+  ledger-only run pays nothing. `AgentRecorder.record_model_call` is superseded by
+  `record_settled_call` the same way. Neither seam ever shipped in a release.
+
 ### Added — a private ledger of the model calls a run made
 
 - **`AgentLoop.model_calls_file=True` writes `model_calls.jsonl`**, one `monoid.model-calls.v1`
