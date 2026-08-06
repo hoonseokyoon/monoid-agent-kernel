@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
+    SplitRequestPayload,
     chunk_marker,
     chunk_record,
     model_request_record,
@@ -524,21 +526,43 @@ class AgentRecorder:
         if not ledger_wanted and not payloads_wanted:
             return
         try:
+            # Split before the lock, not under it. This is the only expensive thing either arm
+            # does -- a SHA pass, a decode, a per-value re-encode, and a full re-encode-and-compare
+            # of the whole preimage, measured at 100 ms for a 7.5 MB request -- and it is pure. The
+            # lock is shared with the ledger arm and with tool and job threads, so holding it
+            # across that work makes the corpus's cost the ledger's latency. The seen-set read is a
+            # fast path whose only stale outcome is one redundant split; the write side re-checks.
+            split = None
+            if (
+                payloads_wanted
+                and call.receipt.request_digest
+                and call.request_preimage is not None
+                and call.receipt.request_digest not in self._payload_request_digests
+            ):
+                split = split_request_payload(call.request_preimage, call.receipt.request_digest)
             with self._model_calls_lock:
                 index = self._model_calls_index
+                # One clock read for however many files record this call. ``call_index`` restarts
+                # at zero when a durable run reopens its directory, so it cannot join the ledger to
+                # the corpus across activations on its own; two independent reads of the clock
+                # cannot either, and can even match a *different* call's line. The pair is a join
+                # only if the pair comes from one reading.
+                recorded_at = utc_timestamp()
                 advanced = False
                 if (
                     self.model_calls_file
                     and not self._model_calls_failed
                     and not self._model_calls_closed
                 ):
-                    advanced = self._record_ledger_locked(call, index) or advanced
+                    advanced = self._record_ledger_locked(call, index, recorded_at) or advanced
                 if (
                     self.model_payload_file
                     and not self._model_payloads_failed
                     and not self._model_payloads_closed
                 ):
-                    advanced = self._record_payloads_locked(call, index) or advanced
+                    advanced = (
+                        self._record_payloads_locked(call, index, recorded_at, split) or advanced
+                    )
                 # One counter for however many files recorded this call, advanced when any of
                 # them did: the index identifies the CALL, so per-file write failures surface as
                 # holes in that file rather than as two files disagreeing about which call is
@@ -549,7 +573,9 @@ class AgentRecorder:
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
             _LOGGER.debug("model call record could not be written", exc_info=True)
 
-    def _record_ledger_locked(self, call: SettledModelCall, index: int) -> bool:
+    def _record_ledger_locked(
+        self, call: SettledModelCall, index: int, recorded_at: str
+    ) -> bool:
         """Build and append one ledger line. Caller holds ``_model_calls_lock``."""
 
         try:
@@ -558,7 +584,7 @@ class AgentRecorder:
                 run_id=self.run_id,
                 root_run_id=self.root_run_id or self.run_id,
                 call_index=index,
-                recorded_at=utc_timestamp(),
+                recorded_at=recorded_at,
             )
             # Normalized and encoded before a handle is touched, so an unencodable value is
             # refused rather than half-written.
@@ -575,25 +601,33 @@ class AgentRecorder:
             return False
         return self._append_model_call(line)
 
-    def _record_payloads_locked(self, call: SettledModelCall, index: int) -> bool:
+    def _record_payloads_locked(
+        self,
+        call: SettledModelCall,
+        index: int,
+        recorded_at: str,
+        split: SplitRequestPayload | None,
+    ) -> bool:
         """Record one call's corpus entries. Caller holds ``_model_calls_lock``.
 
         Request side first, response side second, chunks before the record that references them:
         a failure part-way leaves unreferenced chunks -- which the validator deliberately ignores
-        -- never a record whose references dangle. Returns whether a *response* record landed,
-        because that is the per-call line the shared index counts; request records are set-keyed
-        and deduplicated, so their presence says nothing about THIS call having been recorded.
+        -- never a record whose references dangle.
+
+        Returns whether this call has been *accounted for*, which is what the shared index counts.
+        A landed response line is one way; a failed call is the other, and it is not a write that
+        did not land -- there is no turn to record, the ledger line carries the taxonomy, and the
+        accounting is complete. Getting that wrong made ``call_index`` mean something different
+        depending on whether the ledger was switched on, because the ledger arm writes a line for
+        every call and so advanced the counter on the corpus's behalf.
 
         The split is verified before anything is written (``split_request_payload`` reassembles
         and compares), so the corpus cannot contain a request record that fails its own digest --
-        the validator re-proves per record what the writer proved per write.
-
-        Failed calls record their request side (what was asked is exactly as recordable) and no
-        response record: there is no turn, and the ledger line carries the failure taxonomy.
+        the validator re-proves per record what the writer proved per write. It arrives already
+        computed because it is expensive and pure; see the caller.
         """
 
         receipt = call.receipt
-        recorded_at = utc_timestamp()
         wrote_response = False
         envelope = {
             "run_id": self.run_id,
@@ -601,34 +635,31 @@ class AgentRecorder:
             "recorded_at": recorded_at,
         }
         try:
-            if (
-                receipt.request_digest
-                and call.request_preimage is not None
-                and receipt.request_digest not in self._payload_request_digests
-            ):
-                split = split_request_payload(call.request_preimage, receipt.request_digest)
-                if split is not None:
-                    landed = True
-                    for sha, chunk in split.chunks.items():
-                        if sha in self._payload_chunk_shas:
-                            continue
-                        if not self._store_payload_chunk_locked(sha, chunk, envelope):
-                            landed = False
-                            break
-                        self._payload_chunk_shas.add(sha)
-                    if landed:
-                        request_line = self._encoded_payload_line(
-                            model_request_record(
-                                split.payload,
-                                refs=split.refs,
-                                request_digest=receipt.request_digest,
-                                digest_generation=receipt.digest_generation,
-                                **envelope,
-                            )
+            if split is not None and receipt.request_digest not in self._payload_request_digests:
+                landed = True
+                for sha, chunk in split.chunks.items():
+                    if sha in self._payload_chunk_shas:
+                        continue
+                    if not self._store_payload_chunk_locked(sha, chunk, envelope):
+                        landed = False
+                        break
+                    self._payload_chunk_shas.add(sha)
+                if landed:
+                    request_line = self._encoded_payload_line(
+                        model_request_record(
+                            split.payload,
+                            refs=split.refs,
+                            request_digest=receipt.request_digest,
+                            digest_generation=receipt.digest_generation,
+                            **envelope,
                         )
-                        if request_line is not None and self._append_model_payload(request_line):
-                            self._payload_request_digests.add(receipt.request_digest)
-            if call.turn is not None:
+                    )
+                    if request_line is not None and self._append_model_payload(request_line):
+                        self._payload_request_digests.add(receipt.request_digest)
+            # Re-checked, because the request side can have gone terminal since the gate above:
+            # a response record written now would carry a ``request_digest`` naming a request
+            # record that can never exist, and would append to a handle the opener just refused.
+            if call.turn is not None and not self._model_payloads_failed:
                 recorded = response_record_body(call.turn)
                 response: dict | None
                 if recorded.value is not None and recorded.encoded is not None:
@@ -656,7 +687,7 @@ class AgentRecorder:
                     wrote_response = True
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
             _LOGGER.debug("model payload records could not be written", exc_info=True)
-        return wrote_response
+        return wrote_response or call.turn is None
 
     def _encoded_payload_line(self, record: dict[str, Any]) -> str | None:
         """Encode one corpus record, refusing rather than half-writing.
@@ -737,9 +768,17 @@ class AgentRecorder:
         """The corpus twin of ``_ensure_model_calls_handle_locked`` -- same verified open, same
         terminal refusal, same reason (see that docstring; the rule was extracted to
         ``core/_verified_file.py`` precisely so the second sidecar could not skip it). Also sweeps
-        crash-orphaned ``*.tmp`` files out of the chunk directory once per activation: they are
-        the write-once writer's only litter, and nothing else ever looks at them."""
+        crash-orphaned ``*.tmp`` files out of the chunk directory once per activation -- **this
+        process's** litter only: the temporary name carries its writer's pid because a durable run
+        reclaimed while its previous owner is still alive would otherwise have its in-flight chunk
+        deleted mid-write, failing that writer's ``os.replace`` and killing its corpus arm over
+        something it did not do."""
 
+        if self._model_payloads_failed:
+            # Terminal, not per-line. Two appends can reach this within one call, and a refusal is
+            # a property of the path: re-running the verified open is a second chance to be handed
+            # a different file, which is the substitution it exists to refuse.
+            return None
         if self._model_payloads_handle is not None:
             return self._model_payloads_handle
         handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
@@ -750,7 +789,7 @@ class AgentRecorder:
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
         try:
-            for orphan in chunk_dir.glob("*.tmp"):
+            for orphan in chunk_dir.glob(f"*.{os.getpid()}.*.tmp"):
                 try:
                     orphan.unlink()
                 except OSError:

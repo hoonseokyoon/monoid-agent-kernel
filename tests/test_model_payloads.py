@@ -19,13 +19,14 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
-from monoid_agent_kernel.core.model_io import ModelCallReceipt
+from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES, ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
+    PAYLOAD_CHUNK_REF_KEY,
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     reassemble_request_preimage,
     split_request_payload,
@@ -36,6 +37,7 @@ from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.model_call import SettledModelCall
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
+from monoid_agent_kernel import recorder as recorder_module
 from monoid_agent_kernel.recorder import AgentRecorder
 
 
@@ -224,8 +226,14 @@ def test_the_corpus_arm_failing_does_not_silence_the_ledger_arm(tmp_path: Path) 
     and the reverse direction holds too."""
     recorder = _standalone_recorder(tmp_path / "one")
     recorder._model_payloads_failed = True
+    # A call the corpus arm *would* record: an empty receipt with no turn writes nothing either
+    # way, so it could not tell a poisoned arm from an idle one.
     recorder.record_settled_call(
-        SettledModelCall(receipt=ModelCallReceipt(), request_preimage=None, turn=None)
+        SettledModelCall(
+            receipt=ModelCallReceipt(),
+            request_preimage=None,
+            turn=ModelTurn(response_id="r", final_text="answer"),
+        )
     )
     assert (recorder.run_dir / MODEL_CALLS_FILENAME).exists()
     assert not (recorder.run_dir / MODEL_PAYLOADS_FILENAME).exists()
@@ -308,6 +316,17 @@ def test_a_planted_link_stops_the_corpus_not_the_run(tmp_path: Path, link_kind: 
             turn=ModelTurn(response_id="r", final_text="answer"),
         )
     )
+    # Terminal, not per-line: a second record must not re-attempt the same refused open. (Its
+    # ledger twin has pinned exactly this since W6-1; the corpus asserted neither.)
+    assert recorder._model_payloads_failed is True
+    assert recorder._model_payloads_handle is None
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(),
+            turn=ModelTurn(response_id="r2", final_text="again"),
+        )
+    )
+    assert recorder._model_payloads_handle is None
     recorder.close()
 
     assert target.read_text(encoding="utf-8") == "theirs\n"
@@ -510,8 +529,172 @@ def test_a_link_planted_at_a_chunk_name_is_refused_not_reported_as_stored(
 
     assert target.read_bytes() == b"theirs"
     assert recorder._model_payloads_failed is True
-    corpus = run_dir / MODEL_PAYLOADS_FILENAME
-    records = _records(run_dir) if corpus.exists() else []
-    # No record may reference a chunk that was never stored.
-    assert _by_kind(records, MODEL_REQUEST_KIND) == []
+    records = _records(run_dir)
+    # No record may reference a chunk that was never stored -- and the response half of the same
+    # call must not append either: its ``request_digest`` would name a request record that can
+    # now never exist, and the arm has already declared itself terminal.
+    assert records == []
     assert (run_dir / MODEL_CALLS_FILENAME).exists()
+
+
+def _settled(index: int, *, failed: bool = False) -> SettledModelCall:
+    """One settled call, distinguishable by its answer, optionally a failed one (no turn)."""
+    return SettledModelCall(
+        receipt=ModelCallReceipt(provider_name="test-provider"),
+        request_preimage=None,
+        turn=None if failed else ModelTurn(response_id=f"r{index}", final_text=f"a{index}"),
+    )
+
+
+def test_the_index_names_the_call_whether_or_not_the_ledger_is_on(tmp_path: Path) -> None:
+    """A failed call writes no response record by design -- that is a complete accounting of it,
+    not a write that failed -- so the ordinal has to advance anyway. It only did so through the
+    ledger arm, which meant an unrelated switch renumbered every answer after the first failure,
+    and the corpus carries nothing that says which regime produced the file. Both arms on is the
+    half that was pinned; this drives the twin."""
+    indices = {}
+    for label, ledger in (("both", True), ("corpus-only", False)):
+        recorder = AgentRecorder(
+            tmp_path / label,
+            "run-1",
+            status_file=False,
+            model_calls_file=ledger,
+            model_payload_file=True,
+        )
+        recorder.record_settled_call(_settled(0))
+        recorder.record_settled_call(_settled(1, failed=True))
+        recorder.record_settled_call(_settled(2))
+        recorder.close()
+        responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+        indices[label] = [
+            (record["call_index"], record["response"]["final_text"]) for record in responses
+        ]
+
+    assert indices["both"] == [(0, "a0"), (2, "a2")]
+    assert indices["corpus-only"] == indices["both"]
+
+
+def test_a_ledger_line_and_its_response_record_are_stamped_by_the_same_clock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``call_index`` restarts at zero when a durable run reopens its directory, so on its own it
+    cannot join the two files across activations. The two arms record one call under one lock; if
+    they also read the clock once, the pair is a join.
+
+    The clock is stubbed to advance on every read: two real reads a microsecond apart can print
+    the same string, which would leave this test passing by luck on the very defect it names.
+    """
+    reads = iter(f"2026-08-07T00:00:0{index}Z" for index in range(9))
+    monkeypatch.setattr(recorder_module, "utc_timestamp", lambda: next(reads))
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(_settled(0))
+    recorder.close()
+
+    ledger = [
+        json.loads(line)
+        for line in (recorder.run_dir / MODEL_CALLS_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+
+    assert len(ledger) == len(responses) == 1
+    assert ledger[0]["recorded_at"] == responses[0]["recorded_at"]
+
+
+def test_the_same_request_is_recorded_once_however_many_calls_share_it(tmp_path: Path) -> None:
+    """Set semantics on the request side, sequence semantics on the response side -- the difference
+    the two record kinds exist to express. A run that re-issues an identical request (a loop-level
+    retry of the same turn) writes one request record and two responses."""
+    preimage, digest, _sha = _offloadable_call()
+    recorder = _standalone_recorder(tmp_path)
+    for index in (0, 1):
+        recorder.record_settled_call(
+            SettledModelCall(
+                receipt=ModelCallReceipt(
+                    request_digest=digest,
+                    digest_generation="monoid.model-request-digest.v1",
+                ),
+                request_preimage=preimage,
+                turn=ModelTurn(response_id=f"r{index}", final_text=f"a{index}"),
+            )
+        )
+    recorder.close()
+    records = _records(recorder.run_dir)
+
+    assert len(_by_kind(records, MODEL_REQUEST_KIND)) == 1
+    assert [record["call_index"] for record in _by_kind(records, MODEL_RESPONSE_KIND)] == [0, 1]
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+
+
+def test_a_response_past_the_offload_threshold_leaves_the_jsonl_line(tmp_path: Path) -> None:
+    """The response side's offload arm, which no test reached: a long answer belongs in the chunk
+    directory like any other oversized value, not on one line of the corpus."""
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(),
+            turn=ModelTurn(
+                response_id="r", final_text="y" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096)
+            ),
+        )
+    )
+    recorder.close()
+    responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+    stored = list((recorder.run_dir / MODEL_PAYLOADS_DIRNAME).iterdir())
+
+    assert len(responses) == 1
+    assert set(responses[0]["response"]) == {PAYLOAD_CHUNK_REF_KEY}
+    assert [one.name for one in stored] == [responses[0]["response"][PAYLOAD_CHUNK_REF_KEY]]
+    assert hashlib.sha256(stored[0].read_bytes()).hexdigest() == stored[0].name
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+
+
+def test_a_response_past_the_ceiling_is_recorded_as_a_typed_absence(tmp_path: Path) -> None:
+    """Refuse whole, never truncate -- and never silently drop the record either: the call happened,
+    so it gets a line saying why its answer is not in it."""
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(),
+            turn=ModelTurn(response_id="r", final_text="z" * (MAX_MODEL_PAYLOAD_BYTES + 1)),
+        )
+    )
+    recorder.close()
+    responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+
+    assert len(responses) == 1
+    assert responses[0]["response"] is None
+    assert responses[0]["unrecorded_reason"] == "too_large"
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+
+
+def test_the_orphan_sweep_leaves_another_writers_in_flight_temporary_alone(
+    tmp_path: Path,
+) -> None:
+    """The sweep collects this process's crash litter. A durable run reclaimed while its previous
+    owner is still alive would otherwise have its in-flight chunk deleted mid-write, which fails
+    that writer's ``os.replace`` and kills its corpus arm over something it did not do."""
+    recorder = _standalone_recorder(tmp_path)
+    chunk_dir = recorder.run_dir / MODEL_PAYLOADS_DIRNAME
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    theirs = chunk_dir / f"{'a' * 64}.{os.getpid() + 1}.beefbeefbeef.tmp"
+    theirs.write_bytes(b"in flight elsewhere")
+    mine = chunk_dir / f"{'b' * 64}.{os.getpid()}.deaddeaddead.tmp"
+    mine.write_bytes(b"my own crash litter")
+
+    recorder.record_settled_call(_settled(0))
+    recorder.close()
+
+    assert theirs.exists()
+    assert not mine.exists()
