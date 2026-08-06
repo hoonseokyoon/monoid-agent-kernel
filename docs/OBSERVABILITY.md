@@ -409,11 +409,16 @@ its own line, a write error disables the handle so a torn line cannot consume th
 nothing raises into the call. The switch is independent of `stream_model_calls` and
 `model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say.
 
-One operational note for both JSONL sidecars: they are opened as single-link regular files on
-purpose, because appending mutates an inode and a second name for it is somebody else's file. A
-backup or restore that hardlink-deduplicates a run directory (`cp -al`, `rsync --link-dest`)
-therefore stops both arms silently on the next activation — content-addressed chunk *files* are
-fine to link, the append-only logs are not. Copy those.
+One operational note for all three verified-append sidecars — `model-content.jsonl`,
+`model_calls.jsonl` and `model_payloads.jsonl`, named individually because a rule stated over "the
+sidecars" is a rule that reaches whichever ones the reader counts. Each is opened as a single-link
+regular file on purpose: appending mutates an inode, and a second name for it is somebody else's
+file. A backup or restore that hardlink-deduplicates a run directory (`cp -al`,
+`rsync --link-dest`) therefore disables all three silently on the next activation — no event, no
+warning, and `monoid validate` still reports the directory clean, because each artifact is
+optional. Content-addressed files under `model_payloads/` are safe to link; those three logs must
+be copied. (`transcript.jsonl` and `events.jsonl` are unaffected — they do not go through the
+verified opener.)
 
 `model_payload_file=True` adds the third recorder-owned writer, for the replay corpus. It shares
 the ledger's per-call lock and index, so a response record and its ledger line name the same call

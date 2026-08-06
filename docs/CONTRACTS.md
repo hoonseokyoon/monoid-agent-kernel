@@ -758,10 +758,16 @@ on the line. What joins a response record to its ledger line across that boundar
 pair — the two arms record one call under one lock and read the clock once, so `call_index` *and*
 `recorded_at` agree by construction. A failed
 call records its request — when a key was issued for it — and no response; the ledger line carries
-its taxonomy. A call refused a key (`not_reached`, `absent`, `too_large`) records no *request*: the
-preimage it would stand for has no key to be filed under. Its **answer is still recorded**, as a
-response record with an empty `request_digest` — so a keyless call is not a call whose content
-stays off disk, and this artifact's retention classification does not change with `digest_status`.
+its taxonomy. A call refused a key records no *request* either: the preimage it would stand for
+has no key to be filed under. Whether its **answer** is recorded depends on whether there was one,
+and the three keyless statuses differ:
+
+- `absent` and `too_large` are refusals of the *key*, not of the call — the request is sent, the
+  model answers, and that answer lands as a response record with an empty `request_digest`. So a
+  keyless call is not a call whose content stays off disk, and this artifact's retention
+  classification does not change with `digest_status`.
+- `not_reached` means the call was refused before a key was computed, so it never settles a turn
+  and contributes nothing to the corpus at all; the ledger line is its only trace.
 (`withheld` never appears on either sidecar: the capture narrowing that produces it builds a
 per-subscription copy, exactly as it does for `redaction_digest` above, and the recording seam sees
 the un-narrowed receipt.) A response the canonical encoder cannot carry, one past
