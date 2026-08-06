@@ -49,7 +49,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
-from monoid_agent_kernel.core.json_ingress import json_nesting_within_limit
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -254,15 +253,7 @@ def split_request_payload(preimage: bytes, request_digest: str) -> SplitRequestP
     if sha256_bytes(preimage) != request_digest:
         return None
     try:
-        text = preimage.decode("utf-8")
-        # The third refusal, and the one that is about the reader rather than the bytes: the
-        # ingress normalizer that built this payload is iterative and accepts a tool result deeper
-        # than the reader's lexical bound, so a record this deep would be one `validate_run_dir`
-        # cannot parse -- and therefore one whose digest it never re-verifies. The corpus does not
-        # contain what its own validator cannot read.
-        if not json_nesting_within_limit(text):
-            return None
-        value = json.loads(text)
+        value = json.loads(preimage.decode("utf-8"))
     except Exception:
         return None
 

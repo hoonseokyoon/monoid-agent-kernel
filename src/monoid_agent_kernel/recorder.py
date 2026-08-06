@@ -31,6 +31,7 @@ from monoid_agent_kernel.core._verified_file import (
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.json_ingress import (
+    json_nesting_within_limit,
     loads_json_ingress,
     normalize_json_ingress,
 )
@@ -528,7 +529,7 @@ class AgentRecorder:
         try:
             # Split before the lock, not under it. This is the only expensive thing either arm
             # does -- a SHA pass, a decode, a per-value re-encode, and a full re-encode-and-compare
-            # of the whole preimage, measured at 100 ms for a 7.5 MB request -- and it is pure. The
+            # of the whole preimage, measured at ~170 ms at the 8 MB ceiling -- and it is pure. The
             # lock is shared with the ledger arm and with tool and job threads, so holding it
             # across that work makes the corpus's cost the ledger's latency. The seen-set read is a
             # fast path whose only stale outcome is one redundant split; the write side re-checks.
@@ -539,7 +540,18 @@ class AgentRecorder:
                 and call.request_preimage is not None
                 and call.receipt.request_digest not in self._payload_request_digests
             ):
-                split = split_request_payload(call.request_preimage, call.receipt.request_digest)
+                try:
+                    split = split_request_payload(
+                        call.request_preimage, call.receipt.request_digest
+                    )
+                except Exception:  # noqa: BLE001 - the corpus arm's containment moved with its work
+                    # This ran inside ``_record_payloads_locked``'s handler until the split came
+                    # out of the lock, and the containment has to travel with it: a raise here --
+                    # a caller handing the sink a ``str`` preimage is enough, and this seam is
+                    # public -- would otherwise skip the ledger arm and the counter as well, so
+                    # the call would vanish from both files with no hole to show for it.
+                    _LOGGER.debug("model payload split failed", exc_info=True)
+                    split = None
             with self._model_calls_lock:
                 index = self._model_calls_index
                 # One clock read for however many files record this call. ``call_index`` restarts
@@ -696,6 +708,15 @@ class AgentRecorder:
         is decoded canonical-encoder output and a response body is a normalized turn's fields, so
         there is nothing left to normalize -- and a normalizer that ever *did* change a recipe
         value would break the byte-identity the corpus exists to keep.
+
+        The corpus does not contain what its own validator cannot read, and the thing the validator
+        reads is **this line** -- not the preimage, and not the response body. The bound belongs
+        here for the same reason: it is one function all three record kinds pass through, and the
+        two writers that tried to own it separately would each have had to guess the envelope's
+        depth. It costs a scan of a few kilobytes; scanning the preimage instead cost 80% of the
+        settle path and refused records that were perfectly readable, because a value deep enough
+        to matter is also large enough to be lifted into a chunk, where its brackets live inside a
+        JSON string and count for nothing.
         """
 
         try:
@@ -709,6 +730,9 @@ class AgentRecorder:
             line.encode("utf-8")
         except Exception:  # noqa: BLE001 - refusal is the containment
             _LOGGER.debug("model payload record could not be encoded", exc_info=True)
+            return None
+        if not json_nesting_within_limit(line):
+            _LOGGER.debug("model payload record is deeper than the corpus reader accepts")
             return None
         return line
 
@@ -768,11 +792,16 @@ class AgentRecorder:
         """The corpus twin of ``_ensure_model_calls_handle_locked`` -- same verified open, same
         terminal refusal, same reason (see that docstring; the rule was extracted to
         ``core/_verified_file.py`` precisely so the second sidecar could not skip it). Also sweeps
-        crash-orphaned ``*.tmp`` files out of the chunk directory once per activation -- **this
-        process's** litter only: the temporary name carries its writer's pid because a durable run
-        reclaimed while its previous owner is still alive would otherwise have its in-flight chunk
-        deleted mid-write, failing that writer's ``os.replace`` and killing its corpus arm over
-        something it did not do."""
+        orphaned ``*.tmp`` files out of the chunk directory once per activation -- **this process's**
+        only, because the temporary name carries its writer's pid and a durable run reclaimed while
+        its previous owner is still alive would otherwise have its in-flight chunk deleted
+        mid-write, failing that writer's ``os.replace`` and killing its corpus arm over something
+        it did not do. That scope is deliberately narrower than "crash litter": a process that dies
+        mid-write never reopens under the same pid, so its temporary outlives every sweep. What
+        this collects is an in-process reopen's own leftovers. Cross-process orphans are unreferenced
+        files in a content-addressed directory, which the validator ignores by design and which
+        belong to the collector W6-3 owns; identity cannot tell a dead writer from a live one, and
+        guessing wrong in the other direction is the failure above."""
 
         if self._model_payloads_failed:
             # Terminal, not per-line. Two appends can reach this within one call, and a refusal is

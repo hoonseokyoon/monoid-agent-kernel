@@ -31,12 +31,13 @@ from monoid_agent_kernel.core.model_payloads import (
     reassemble_request_preimage,
     split_request_payload,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.model_call import SettledModelCall
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
 from monoid_agent_kernel import recorder as recorder_module
 from monoid_agent_kernel.recorder import AgentRecorder
 
@@ -698,3 +699,68 @@ def test_the_orphan_sweep_leaves_another_writers_in_flight_temporary_alone(
 
     assert theirs.exists()
     assert not mine.exists()
+
+
+def _nested_arguments(depth: int) -> dict[str, Any]:
+    inner: Any = "leaf"
+    for _ in range(depth):
+        inner = {"n": inner}
+    return {"n": inner}
+
+
+def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: Path) -> None:
+    """The bound belongs to the recorded line, and the line is where all three record kinds meet.
+    Both adapters accept tool-call arguments just under the ingress limit, and the record envelope
+    adds levels on top -- so the response half could write a line `validate_run_dir` reports as
+    `invalid JSON` and then skips, leaving the rest of that line unverified. The request half was
+    bound and the response half was not."""
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(),
+            turn=ModelTurn(
+                response_id="r",
+                tool_calls=(ToolCall(id="c1", name="t", arguments=_nested_arguments(510)),),
+            ),
+        )
+    )
+    recorder.close()
+
+    corpus = recorder.run_dir / MODEL_PAYLOADS_FILENAME
+    for line in corpus.read_text(encoding="utf-8").splitlines() if corpus.exists() else []:
+        loads_json_ingress(line)  # every line the writer left must be one the reader can read
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+
+
+def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(tmp_path: Path) -> None:
+    """Moving the split out of the lock moved it out of the payload arm's containment too, so a
+    raise there skipped both arms and the counter -- no ledger line, no corpus record, and no hole,
+    which is the "reads as nothing was lost" shape the index rule exists against. The flag form of
+    corpus failure was pinned; the raise form was not."""
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(
+                request_digest="a" * 64, digest_generation="monoid.model-request-digest.v1"
+            ),
+            # A `str` where the split expects `bytes`: `sha256_bytes` raises before the function's
+            # own guard. An integrator drives this seam directly -- `SettledModelCall` is exported.
+            request_preimage="not bytes",  # type: ignore[arg-type]
+            turn=ModelTurn(response_id="r0", final_text="a0"),
+        )
+    )
+    recorder.record_settled_call(_settled(1))
+    recorder.close()
+
+    ledger = [
+        json.loads(line)
+        for line in (recorder.run_dir / MODEL_CALLS_FILENAME).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+
+    assert [record["call_index"] for record in ledger] == [0, 1]
+    assert [record["call_index"] for record in responses] == [0, 1]

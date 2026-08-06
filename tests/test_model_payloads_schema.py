@@ -26,6 +26,7 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
+from monoid_agent_kernel.core.json_ingress import json_nesting_within_limit
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
@@ -718,11 +719,13 @@ def test_a_pasted_instruction_does_not_land_whole_on_one_jsonl_line() -> None:
     assert len(json.dumps(record, ensure_ascii=False)) < 4096
 
 
-def test_a_preimage_deeper_than_the_readers_bound_is_refused_rather_than_recorded() -> None:
-    """`normalize_json_ingress` is iterative and accepts a tool result deeper than the reader's
-    lexical bound, so the writer could produce a record `validate_run_dir` cannot parse -- and a
-    line it cannot parse is a line whose digest it never checks. The corpus does not contain what
-    its own validator cannot read."""
+def test_a_deep_tool_result_still_gets_its_request_record() -> None:
+    """The corpus does not contain what its own validator cannot read -- but what the validator
+    reads is the recorded *line*, not the preimage, and the size rule lifts a deep value into a
+    chunk, where its brackets sit inside a JSON string and count for nothing. Bounding the preimage
+    instead refused a record that reassembles byte-for-byte and that `validate_run_dir` accepts
+    with no issues, and it refused it for every later call in the run, because a tool result stays
+    in the by-value message log."""
     deep: object = "leaf"
     for _ in range(600):
         deep = [deep]
@@ -730,7 +733,20 @@ def test_a_preimage_deeper_than_the_readers_bound_is_refused_rather_than_recorde
         _request(messages=({"role": "user", "content": deep},)), _MODEL
     )
 
-    assert split_request_payload(preimage, digest) is None
+    split = split_request_payload(preimage, digest)
+
+    assert split is not None
+    assert split.refs is True
+    assert reassemble_request_preimage(split.payload, split.chunks.__getitem__, refs=True) == preimage
+    # ... and the line the reader would parse is shallow, which is why the refusal was false.
+    record = model_request_record(
+        split.payload,
+        refs=True,
+        request_digest=digest,
+        digest_generation="monoid.model-request-digest.v1",
+        **_ENVELOPE,
+    )
+    assert json_nesting_within_limit(json.dumps(record, ensure_ascii=False))
 
 
 def test_a_record_that_matches_no_branch_is_reported_without_reprinting_itself(
