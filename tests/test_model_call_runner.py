@@ -30,9 +30,11 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
     _digest,
+    _encoded_digest,
     _prompt_payload,
     _request_payload,
 )
@@ -2046,14 +2048,16 @@ def test_a_truncated_payload_gets_no_replay_key_rather_than_a_misleading_one() -
     call. Refusing to issue a key is the safe half: the call still happens, it is just not
     replayable.
     """
+    # Sized past MAX_MODEL_PAYLOAD_BYTES -- the cap is the wire's since W6-2, so the old
+    # million-int payload (~6.9 MB) is now legitimately keyable and no longer exercises this.
     huge = ModelRequest(
-        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_000_100))},)
+        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_300_000))},)
     )
     huge_but_different = ModelRequest(
         instruction="hi",
         system_prompt="s",
         tools=(),
-        messages=({"v": list(range(1_000_099)) + [-999]},),
+        messages=({"v": list(range(1_299_999)) + [-999]},),
     )
 
     assert _digest(_prompt_payload(huge)) == ""
@@ -3386,3 +3390,51 @@ def test_a_dispatch_that_raises_still_records_the_call_it_could_not_deliver(
     # The receipt a broken dispatch leaves behind is the pre-delivery one, so the count it could
     # not resolve stays at its floor rather than being invented.
     assert recorded[0].capture_downgrades == 0
+
+
+# --- One size gate, three named refusals (W6-2) ---------------------------------------------------
+
+
+def test_a_payload_between_the_old_digest_cap_and_the_wire_cap_gets_a_key() -> None:
+    """4 MiB was the digest cap while 8,000,000 bytes was the message-log cap, so the band between
+    them shipped calls that transmitted successfully and silently had no replay key. One constant
+    now gates both: what can be sent can be keyed."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * (5 * 1024 * 1024), tools=())
+        )
+    )
+    assert receipt.request_digest != ""
+    assert receipt.digest_status == "ok"
+
+
+def test_a_payload_over_the_ceiling_is_a_named_condition_not_a_missing_key() -> None:
+    """`absent` used to cover both "cannot be encoded" (a defect in the payload) and "over the cap"
+    (an operational condition, answered by raising the cap or offloading). A consumer holding a
+    keyless record could not tell which one it was looking at."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * 8_000_001, tools=())
+        )
+    )
+    assert receipt.request_digest == ""
+    assert receipt.digest_status == "too_large"
+
+
+def test_an_unencodable_payload_is_still_absent_so_the_distinction_is_real() -> None:
+    """The split would be cosmetic if every refusal drifted to the new value."""
+    hostile = _encoded_digest({"v": 10**5000})
+    assert (hostile.digest, hostile.status) == ("", "absent")
+
+    oversized = _encoded_digest({"v": "x" * 8_000_001})
+    assert (oversized.digest, oversized.status) == ("", "too_large")
+
+
+def test_a_payload_under_the_old_cap_keeps_the_digest_it_always_had() -> None:
+    """Witness, not red: the cap moved up, which only turns refusals into keys. A payload that had
+    a digest under the old cap must keep it byte-for-byte, or the raise would rekey every recorded
+    corpus. Recomputed through `canonical_sha256` rather than compared to a golden constant, so the
+    thing pinned is the encoding itself."""
+    payload = _request_payload(REQUEST, ModelConfig(), provider="fake")
+
+    assert _digest(payload) == canonical_sha256(payload)

@@ -399,13 +399,24 @@ def redacted_or_none(
         return None
 
 
-DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld")
+# The one ceiling the digest gate and the payload-recording gate share: a request the wire can
+# carry can be keyed and recorded, and one it cannot is refused whole -- never truncated. Decimal,
+# matching ``AgentRunSpec.max_message_log_bytes`` (a different owner's knob, deliberately not
+# unified: that one bounds a run's message log, this one bounds one call's identity payload; they
+# agree on where "too large" begins so the band between them -- transmitted but unkeyed -- cannot
+# reopen). Raising this only turns refusals into keys; lowering it orphans every corpus recorded
+# above the new value, so it moves up or not at all.
+MAX_MODEL_PAYLOAD_BYTES = 8_000_000
+
+DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld", "too_large")
 """Why ``ModelCallReceipt.request_digest`` holds what it holds.
 
-``absent`` means no key was issued -- the payload could not be canonically encoded, or it exceeded
-the size cap. ``withheld`` means one was issued and a ``none``-mode policy removed it. ``not_reached``
-means the call was refused before a key was computed at all. Those were one value before, and a
-consumer holding a keyless record could not tell a defect from a policy from a boundary.
+``absent`` means no key was issued because canonical JSON could not carry the payload -- a defect
+in the payload. ``too_large`` means no key was issued because the payload exceeded
+:data:`MAX_MODEL_PAYLOAD_BYTES` -- an operational condition, answered by raising the cap, not a
+defect. The two were one value, and a consumer holding a keyless record could not tell whether to
+file a bug or resize a limit. ``withheld`` means a key was issued and a ``none``-mode policy
+removed it. ``not_reached`` means the call was refused before a key was computed at all.
 """
 
 DESTINATION_STATUSES = (

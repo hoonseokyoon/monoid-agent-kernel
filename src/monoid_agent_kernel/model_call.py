@@ -46,6 +46,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.model_io import (
+    MAX_MODEL_PAYLOAD_BYTES,
     ModelCallReceipt,
     ModelIOSubscription,
     destination_digest,
@@ -153,11 +154,6 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     return {_PROMPT_DIGEST_GENERATION: _prompt_terms(request)}
 
 
-# Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
-# request (base64 image parts ride in ``messages``) and far below the point where a deliberately
-# shared payload could expand without end.
-_MAX_DIGEST_BYTES = 4 * 1024 * 1024
-
 # The settings ``core._util.canonical_sha256`` serializes with, and the same object does the
 # encoding and the hashing here. A guard that checks one encoding while another does the hashing
 # is exactly how a payload once passed validation and then raised mid-hash.
@@ -170,8 +166,22 @@ _CANONICAL_ENCODER = json.JSONEncoder(
 )
 
 
-def _digest(payload: dict[str, Any]) -> str:
-    """The canonical-JSON digest of `payload`, or `""` when canonical JSON cannot carry it.
+@dataclass(frozen=True)
+class _DigestResult:
+    """What the encoder said about one payload: a key, or a named refusal.
+
+    ``status`` is the value ``ModelCallReceipt.digest_status`` records for the request key, minus
+    the two members only other actors can produce (``withheld`` is a capture policy's, and
+    ``not_reached`` is the boundary check's). The pair travels together so the two fields that
+    describe one decision cannot be computed twice and disagree.
+    """
+
+    digest: str = ""
+    status: str = "absent"
+
+
+def _encoded_digest(payload: dict[str, Any]) -> _DigestResult:
+    """The canonical-JSON digest of `payload`, or a named refusal when no key can be issued.
 
     Streamed through the standard encoder rather than normalized first. Four rounds of review went
     into a hand-written normalizer that reshaped anything into something hashable -- stringified
@@ -197,7 +207,13 @@ def _digest(payload: dict[str, Any]) -> str:
     statement about the payload.
 
     Output is capped so a payload built from shared references cannot expand without bound; passing
-    the cap also means no key, since a prefix would stand for the whole.
+    the cap also means no key, since a prefix would stand for the whole. The cap is
+    :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES` -- the wire's own bound --
+    because the band between a smaller digest cap and the wire once shipped calls that transmitted
+    successfully and silently had no replay key. Exceeding it is a *named* refusal (``too_large``),
+    distinct from ``absent``: an operator answers one by resizing a limit and the other by fixing a
+    payload, and a status that conflated them said neither. A refusal reports the first reason the
+    encoder hit; a payload both hostile and oversized is not diagnosed twice.
     """
 
     hasher = hashlib.sha256()
@@ -206,12 +222,24 @@ def _digest(payload: dict[str, Any]) -> str:
         for chunk in _CANONICAL_ENCODER.iterencode(payload):
             raw = chunk.encode("utf-8")
             encoded += len(raw)
-            if encoded > _MAX_DIGEST_BYTES:
-                return ""
+            if encoded > MAX_MODEL_PAYLOAD_BYTES:
+                return _DigestResult(status="too_large")
             hasher.update(raw)
     except Exception:
-        return ""
-    return hasher.hexdigest()
+        return _DigestResult(status="absent")
+    return _DigestResult(digest=hasher.hexdigest(), status="ok")
+
+
+def _digest(payload: dict[str, Any]) -> str:
+    """The canonical-JSON digest of `payload`, or `""` when no key was issued.
+
+    The refusal-collapsing view of :func:`_encoded_digest`, for the callers that only file or
+    compare keys -- the prompt digest has no status field to feed, and the tests that pin encoder
+    behavior pin it through here. The request-key path calls `_encoded_digest` directly, because
+    it must record *why* a key is missing, not just that it is.
+    """
+
+    return _encoded_digest(payload).digest
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
@@ -525,7 +553,7 @@ class ModelCallRunner:
     Identifying the call is not: `prompt_digest` and `request_digest` are computed on every call,
     before anything looks at this field, because they describe the call whether or not anyone is
     watching. That costs two canonical-JSON encodes and two SHA-256 passes over the serialized
-    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. An `AgentLoop` with no model-I/O
+    prompt per call, which is why `MAX_MODEL_PAYLOAD_BYTES` bounds it. An `AgentLoop` with no model-I/O
     subscriptions still pays that; anyone trimming the cost should start there and not expect this
     field to gate it."""
 
@@ -731,7 +759,7 @@ class ModelCallRunner:
                     request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
                 where, destination_status = self._resolved_destination(model, adapter)
-                request_digest = _digest(
+                digest_result = _encoded_digest(
                     _request_payload(
                         request,
                         model,
@@ -758,11 +786,12 @@ class ModelCallRunner:
                     context=normalized_context,
                     model=model,
                     prompt_digest=_digest(_prompt_payload(request)),
-                    request_digest=request_digest,
+                    request_digest=digest_result.digest,
                     digest_generation=_REQUEST_DIGEST_GENERATION,
-                    # Read off the key rather than recomputed: the two cannot disagree about
-                    # whether one was issued if only one of them decides.
-                    digest_status="ok" if request_digest else "absent",
+                    # Key and status arrive as one result object: the two fields describing one
+                    # encoder decision cannot be computed twice and disagree, and the encoder is
+                    # the only party that can tell `absent` from `too_large`.
+                    digest_status=digest_result.status,
                     destination_status=destination_status,
                     destination_digest=destination_digest(where),
                 )

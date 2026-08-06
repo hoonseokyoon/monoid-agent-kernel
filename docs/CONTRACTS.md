@@ -568,9 +568,12 @@ and is the exact replay key. Both are computed on the **raw** request, before an
 capture policy, so consumers on different policies agree on the identity of what the provider
 was sent. An empty digest means *no key was issued* (the payload could not be canonically
 encoded, or exceeded the size cap) and must never be read as a key. `digest_status` says which
-of four things happened, because the empty string used to be the answer to all of them:
-`absent` (no key could be issued), `withheld` (one was, and a `none`-mode capture policy removed
-it), `not_reached` (the call was refused before a key was computed), and `ok`.
+of five things happened, because the empty string used to be the answer to all of them:
+`absent` (canonical JSON could not carry the payload — a defect in the payload), `too_large`
+(the payload exceeded `MAX_MODEL_PAYLOAD_BYTES` — an operational condition, answered by raising
+the cap; the cap is the wire's own bound, so a request that can be sent can be keyed), `withheld`
+(a key was issued and a `none`-mode capture policy removed it), `not_reached` (the call was
+refused before a key was computed), and `ok`.
 `digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
 which rules produced it.
 
