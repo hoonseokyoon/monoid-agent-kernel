@@ -741,12 +741,26 @@ a fixed size, so anything that could be one is large enough to be lifted into a 
 resolved value is never re-walked. Records are set-keyed by digest — a run that issues the same request twice writes
 one request record, and both ledger lines join to it — while `model_response` records are
 sequence-keyed by `call_index`, because models are not functions: every answer is recorded, and
-choosing which one a replay returns is the replay adapter's policy, not the corpus's. A failed
+choosing which one a replay returns is the replay adapter's policy, not the corpus's. Both keys
+are **per activation**, like the ledger's: a durable reopen starts a fresh recorder, so a
+re-issued in-flight request appends a second (byte-identical) request record and `call_index`
+restarts at zero. What joins a response record to its ledger line across that boundary is the
+pair — the two arms record one call under one lock and read the clock once, so `call_index` *and*
+`recorded_at` agree by construction. A failed
 call records its request and no response; the ledger line carries its taxonomy. A response the
 canonical encoder cannot carry, or one past `MAX_MODEL_PAYLOAD_BYTES`, costs its own record a
 typed `unrecorded_reason` — never a truncation.
 
-Two deliberate absences. `ModelTurn.raw` is not recorded: it has no shape contract and no
+Three deliberate absences. Media is one, and it is the one a replay tool must plan around: the
+digest is taken over the *normalized* request, in which an attachment is a `blob:` or `workspace:`
+reference and the bytes live in the checkpoint blob store or the workspace — the adapter resolves
+them at wire-build time, after the key. So a multimodal request record carries the reference, not
+the image, and the corpus alone cannot reproduce what the provider was sent. A `blob:` reference
+is content-addressed and still resolvable beside the run; a `workspace:` one is not — the same
+path re-read later is different bytes under one digest, which is the one case where a faithful
+reassembly can stand for a request that no longer exists.
+
+`ModelTurn.raw` is not recorded: it has no shape contract and no
 consumer outside the provider layer, so a replayed turn answers `raw={}` — an honest statement
 that this is a replay, not a gap. And the configured endpoint is absent here for the same
 structural reason as in the ledger: the preimage is built from the replay key's own projection,

@@ -96,6 +96,9 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    # Writing a typed ``settled_sink`` needs the argument type, and every other type
+    # ``ModelCallRunner``'s public fields name is exported beside it.
+    "SettledModelCall",
     "ValidatedCallRunner",
     "ValidatedCallResult",
     "AttemptDeltaConsumer",

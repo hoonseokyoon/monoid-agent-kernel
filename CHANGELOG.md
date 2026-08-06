@@ -32,6 +32,14 @@ out in commit messages and here.
   (`MAX_MODEL_PAYLOAD_BYTES`) now gates the key, the recorded request, and the recorded response,
   and an oversized payload is a named operational condition rather than an unexplained `absent`.
   Raising the cap only turns refusals into keys — digests under the old cap are unchanged.
+- **`monoid validate` no longer quotes a content-bearing record back at you.** jsonschema builds
+  its message out of the instance, so one line of `model_payloads.jsonl` or `model-content.jsonl`
+  that matches no schema branch used to print a whole conversation — or a whole system prompt, for
+  a chunk record — to the terminal and into `--json` output. Both artifacts pin a literal
+  single-element `schema_version` enum, so the first version bump would have done it to every line
+  of every retained run directory. The failing keyword and the path are reported; the value is not.
+- **`SettledModelCall` is exported from `monoid_agent_kernel.contracts`**, beside the
+  `ModelCallRunner` whose `settled_sink` takes it.
 - **Unreleased-seam supersession: `ModelCallRunner.receipt_sink` is replaced by `settled_sink`**,
   which receives a `SettledModelCall` (receipt + optional request preimage + turn). One delivery
   per call is what lets the recorder keep the ledger and the corpus index-aligned under a single
@@ -45,7 +53,8 @@ out in commit messages and here.
   record per settled model call. Opt-in, so an existing run directory keeps its shape; optional
   for readers; validated by `monoid validate` when present. Registered as the 42nd public
   compatibility artifact.
-- **Failed calls are in it.** The record is fed from a new `ModelCallRunner.receipt_sink` rather
+- **Failed calls are in it.** The record is fed from a `ModelCallRunner` sink (`settled_sink`, as
+  superseded above) rather
   than from the loop's return value, because a failed call publishes its receipt and re-raises
   without stamping it on the exception — a ledger built on the return value would have recorded
   only the successes, which is the opposite of what an audit trail is for. It is also not a

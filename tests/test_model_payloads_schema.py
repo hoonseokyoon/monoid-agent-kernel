@@ -227,9 +227,11 @@ def test_a_recorded_request_never_carries_the_endpoint_it_is_keyed_beside() -> N
         chunk.decode("utf-8") for chunk in split.chunks.values()
     )
 
-    assert '"provider":"gateway"' in "".join(
-        CANONICAL_JSON_ENCODER.iterencode(record["payload"])
-    )
+    # The witness has to be a value only the model config could have supplied. `provider` cannot
+    # serve: `_preimage_of` passes it in literally, so the assertion would hold with the whole
+    # model block dropped from the projection -- which is exactly the regression it is here to
+    # catch. Its runtime sibling in `test_model_payloads.py` names the same trap.
+    assert '"model":"gpt-5.5"' in everything
     assert _ENDPOINT not in everything
 
 
@@ -729,3 +731,31 @@ def test_a_preimage_deeper_than_the_readers_bound_is_refused_rather_than_recorde
     )
 
     assert split_request_payload(preimage, digest) is None
+
+
+def test_a_record_that_matches_no_branch_is_reported_without_reprinting_itself(
+    tmp_path: Path,
+) -> None:
+    """`monoid validate` writes its issues to a terminal and into `--json` output, and jsonschema
+    builds its message out of the *instance* -- so an unmatched line would republish a whole
+    conversation, or a whole system prompt for a chunk record, out of the private run directory.
+    The trigger is the ordinary one, not an attack: this artifact pins a literal single-element
+    `schema_version` enum, so the first version bump makes every line of every retained run
+    directory match no branch at once."""
+    secret = "the tenant's confidential prompt text"
+    _write_run_payloads(
+        tmp_path,
+        {
+            **chunk_record(secret.encode("utf-8"), **_ENVELOPE),
+            "schema_version": "monoid.model-payloads.v2",
+        },
+    )
+
+    issues = [
+        issue for issue in validate_run_dir(tmp_path)
+        if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+    ]
+
+    assert issues, "an unmatched record must still be reported"
+    assert all(secret not in issue.message for issue in issues)
+    assert all("oneOf" in issue.message for issue in issues)

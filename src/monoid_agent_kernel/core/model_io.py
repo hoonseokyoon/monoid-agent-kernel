@@ -399,13 +399,15 @@ def redacted_or_none(
         return None
 
 
-# The one ceiling the digest gate and the payload-recording gate share: a request the wire can
-# carry can be keyed and recorded, and one it cannot is refused whole -- never truncated. Decimal,
-# matching ``AgentRunSpec.max_message_log_bytes`` (a different owner's knob, deliberately not
-# unified: that one bounds a run's message log, this one bounds one call's identity payload; they
-# agree on where "too large" begins so the band between them -- transmitted but unkeyed -- cannot
-# reopen). Raising this only turns refusals into keys; lowering it orphans every corpus recorded
-# above the new value, so it moves up or not at all.
+# The one ceiling the digest gate and the payload-recording gate share: whatever gets a key gets
+# recorded, and what exceeds it is refused whole -- never truncated. Decimal, agreeing with
+# ``AgentRunSpec.max_message_log_bytes`` so the two numbers cannot drift, but that knob is a
+# different owner's and measures a different thing: it sums a run's ``messages``, while this
+# bounds one call's whole identity payload -- system prompt, tool definitions, instruction and
+# observations included. So a request can still pass every run limit and exceed this; what the
+# shared number buys is that such a call is now a NAMED condition (``too_large``) rather than an
+# unexplained ``absent``, not that the case is gone. Raising this only turns refusals into keys;
+# lowering it orphans every corpus recorded above the new value, so it moves up or not at all.
 MAX_MODEL_PAYLOAD_BYTES = 8_000_000
 
 DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld", "too_large")

@@ -1549,7 +1549,11 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
         _validate_settled_text_digests(transcript_path, issues)
     model_content_path = run_dir / MODEL_CONTENT_FILENAME
     if model_content_path.exists():
-        _validate_jsonl_file(model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues)
+        # Both content-classified artifacts, so both redact: binding this on one of the two
+        # would be the twin miss this package keeps making.
+        _validate_jsonl_file(
+            model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues, redact_instance=True
+        )
         _validate_settled_text_digests(model_content_path, issues)
     # Optional like the content sidecar beside it, and for the same reason: it exists only for a
     # run that asked for it, so its absence is a configuration, not a defect. There is no digest
@@ -1563,7 +1567,9 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     # shape-checked would bless a corpus that cannot honor it.
     model_payloads_path = run_dir / MODEL_PAYLOADS_FILENAME
     if model_payloads_path.exists():
-        _validate_jsonl_file(model_payloads_path, MODEL_PAYLOADS_RECORD_SCHEMA, issues)
+        _validate_jsonl_file(
+            model_payloads_path, MODEL_PAYLOADS_RECORD_SCHEMA, issues, redact_instance=True
+        )
         _validate_model_payload_digests(run_dir, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
@@ -1659,13 +1665,35 @@ def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[Validat
 
 
 def _validate_object(
-    payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str
+    payload: Any,
+    schema: dict[str, Any],
+    issues: list[ValidationIssue],
+    label: str,
+    *,
+    redact_instance: bool = False,
 ) -> None:
+    """Report one object's schema errors, optionally without quoting the object back.
+
+    ``redact_instance`` is for the content-classified artifacts. jsonschema builds its message out
+    of the *instance* -- a top-level ``oneOf`` failure prints the whole record -- and
+    ``monoid validate``'s issues go to a terminal and into ``--json`` output, so an unmatched line
+    of ``model_payloads.jsonl`` or ``model-content.jsonl`` would republish a conversation, or a
+    whole system prompt, out of the private run directory. The trigger is not an attack but the
+    compatibility policy: both artifacts pin a literal single-element ``schema_version`` enum, so
+    the first version bump makes every line of every retained run directory fail at once. The
+    failing keyword and the path locate the problem; the value is the payload.
+    """
+
     validator = Draft202012Validator(schema)
     for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
         suffix = ".".join(str(part) for part in error.path)
         issue_path = f"{label}.{suffix}" if suffix else label
-        issues.append(ValidationIssue(issue_path, error.message))
+        message = (
+            f"does not satisfy the {error.validator} constraint"
+            if redact_instance
+            else error.message
+        )
+        issues.append(ValidationIssue(issue_path, message))
 
 
 def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]) -> None:
@@ -1771,7 +1799,13 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                     )
 
 
-def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
+def _validate_jsonl_file(
+    path: Path,
+    schema: dict[str, Any],
+    issues: list[ValidationIssue],
+    *,
+    redact_instance: bool = False,
+) -> None:
     # Decode per line and REPORT undecodable bytes, matching the twin ``_validate_event_file``.
     #
     # Strict whole-file decoding raised ``UnicodeDecodeError`` out of ``monoid validate`` — the
@@ -1801,7 +1835,9 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
             message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
-        _validate_object(payload, schema, issues, f"{path.name}:{index}")
+        _validate_object(
+            payload, schema, issues, f"{path.name}:{index}", redact_instance=redact_instance
+        )
 
 
 def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:
