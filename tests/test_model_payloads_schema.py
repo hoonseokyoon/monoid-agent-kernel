@@ -511,3 +511,144 @@ def test_validate_run_dir_reports_a_dangling_response_marker(tmp_path: Path) -> 
     )
 
     assert any(issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(tmp_path))
+
+
+def test_a_chunk_reference_naming_a_path_is_refused_before_anything_is_opened(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A chunk reference is a content-addressed *name*, and the reader has to re-establish that --
+    the writer's is always 64 hex, but a corpus arrives from wherever run directories arrive from.
+    Joined onto the chunk directory an absolute or `..`-relative string discards the base entirely,
+    so `monoid validate` would read a file the record chose: outside the run directory, unbounded,
+    or a FIFO that never returns. The hash check cannot defend it, because it happens after the
+    read."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_text("not the agent's to read", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    escape = str((outside / "victim.txt").resolve())
+    _write_run_payloads(
+        run_dir,
+        model_request_record(
+            {"monoid.model-request-digest.v1": {"system_prompt": chunk_marker(escape)}},
+            refs=True,
+            request_digest="a" * 64,
+            digest_generation="monoid.model-request-digest.v1",
+            **_ENVELOPE,
+        ),
+        model_response_record(
+            chunk_marker(escape),
+            call_index=0,
+            request_digest="a" * 64,
+            unrecorded_reason="",
+            **_ENVELOPE,
+        ),
+    )
+    opened: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def spy(self: Path) -> bytes:
+        opened.append(str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", spy)
+
+    issues = validate_run_dir(run_dir)
+
+    assert [path for path in opened if str(run_dir) not in path] == []
+    # Both branches still report the record; refusing the name must not cost the diagnosis.
+    assert len([issue for issue in issues if issue.path.startswith(MODEL_PAYLOADS_FILENAME)]) == 2
+
+
+def test_validate_run_dir_reports_a_request_record_that_no_longer_reassembles(
+    tmp_path: Path,
+) -> None:
+    """The artifact's headline promise, pinned where it is made. Every chunk here hashes correctly,
+    so the chunk-integrity check stays silent and only the reassembly comparison can speak."""
+    preimage, digest = _preimage_of(_request(), _MODEL)
+    split = split_request_payload(preimage, digest)
+    assert split is not None
+    assert split.refs is True
+    tampered = json.loads(json.dumps(split.payload))
+    terms = tampered["monoid.model-request-digest.v1"]
+    terms["tools"] = list(terms["tools"])[:-1]  # a definition the preimage had, dropped
+    records = [chunk_record(chunk, **_ENVELOPE) for chunk in split.chunks.values()]
+    records.append(
+        model_request_record(
+            tampered,
+            refs=True,
+            request_digest=digest,
+            digest_generation="monoid.model-request-digest.v1",
+            **_ENVELOPE,
+        )
+    )
+    _write_run_payloads(tmp_path, *records)
+
+    assert [
+        issue.message
+        for issue in validate_run_dir(tmp_path)
+        if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+    ] == ["request payload does not reassemble to its request_digest"]
+
+
+def test_validate_run_dir_catches_an_offloaded_chunk_that_does_not_match_its_name(
+    tmp_path: Path,
+) -> None:
+    """The directory twin of the inline chunk check. A content-addressed file is trusted by name by
+    every consumer, so the one reader that can disprove the name has to do it."""
+    big_text = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 1024)
+    preimage, digest = _preimage_of(
+        _request(messages=({"role": "user", "content": big_text},)), _MODEL
+    )
+    split = split_request_payload(preimage, digest)
+    assert split is not None
+    inline: list[dict[str, object]] = []
+    payload_dir = tmp_path / MODEL_PAYLOADS_DIRNAME
+    payload_dir.mkdir()
+    for sha, chunk in split.chunks.items():
+        if len(chunk) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
+            (payload_dir / sha).write_bytes(chunk[:-1] + b"Z")  # same name, other bytes
+        else:
+            inline.append(chunk_record(chunk, **_ENVELOPE))
+    inline.append(
+        model_request_record(
+            split.payload,
+            refs=True,
+            request_digest=digest,
+            digest_generation="monoid.model-request-digest.v1",
+            **_ENVELOPE,
+        )
+    )
+    _write_run_payloads(tmp_path, *inline)
+
+    assert any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(tmp_path)
+    )
+
+
+def test_validate_run_dir_never_walks_a_verbatim_payload(tmp_path: Path) -> None:
+    """`refs=False` is the writer's answer to marker-shaped caller data, and it is only an answer if
+    the reader honours it: walking a verbatim payload would resolve the lookalike and report a
+    perfectly faithful corpus as broken."""
+    lookalike = {PAYLOAD_CHUNK_REF_KEY: "0" * 64}
+    preimage, digest = _preimage_of(
+        _request(messages=({"role": "user", "content": [lookalike]},)), _MODEL
+    )
+    split = split_request_payload(preimage, digest)
+    assert split is not None
+    assert split.refs is False
+    _write_run_payloads(
+        tmp_path,
+        model_request_record(
+            split.payload,
+            refs=False,
+            request_digest=digest,
+            digest_generation="monoid.model-request-digest.v1",
+            **_ENVELOPE,
+        ),
+    )
+
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(tmp_path)
+    )

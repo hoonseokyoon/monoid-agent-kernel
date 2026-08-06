@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
@@ -27,6 +28,7 @@ from monoid_agent_kernel.core.model_payloads import (
     PAYLOAD_CHUNK_KIND,
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     reassemble_request_preimage,
+    split_request_payload,
 )
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -440,3 +442,70 @@ def test_the_whole_run_directory_validates_with_both_sidecars_on(tmp_path: Path)
     result = _loop(tmp_path, _Adapter()).run_once("hi")
 
     assert validate_run_dir(result.run_dir) == []
+
+
+def _offloadable_call() -> tuple[bytes, str, str]:
+    """A settled call whose request extracts exactly one chunk, and that chunk is directory-sized."""
+    payload = {
+        "monoid.model-request-digest.v1": {
+            "system_prompt": "s" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096),
+            "tools": [],
+            "messages": [],
+        }
+    }
+    preimage = CANONICAL_JSON_ENCODER.encode(payload).encode("utf-8")
+    digest = hashlib.sha256(preimage).hexdigest()
+    split = split_request_payload(preimage, digest)
+    assert split is not None
+    sha = next(
+        one for one, chunk in split.chunks.items() if len(chunk) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES
+    )
+    return preimage, digest, sha
+
+
+@pytest.mark.parametrize("link_kind", ["hardlink", "symlink"])
+def test_a_link_planted_at_a_chunk_name_is_refused_not_reported_as_stored(
+    tmp_path: Path, link_kind: str
+) -> None:
+    """Content-addressed names are the *most* predictable names in the run directory -- the same
+    surface yields the same sha on every run -- so the write-once short-circuit is exactly where an
+    indirection gets planted. Answering "already stored" there means the chunk is never written,
+    never retried (write-once), and every reader resolves whoever's bytes the link names, while the
+    arm believes it succeeded. The JSONL twin has refused this since W6-1; this is the file writer.
+    """
+    preimage, digest, sha = _offloadable_call()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.bin"
+    target.write_bytes(b"theirs")
+    run_dir = tmp_path / "runs" / "run-1"
+    (run_dir / MODEL_PAYLOADS_DIRNAME).mkdir(parents=True)
+    planted = run_dir / MODEL_PAYLOADS_DIRNAME / sha
+    if link_kind == "hardlink":
+        os.link(target, planted)
+    else:
+        try:
+            os.symlink(target, planted)
+        except OSError as error:
+            pytest.skip(f"file symlinks are unavailable: {error}")
+    recorder = _standalone_recorder(tmp_path)
+
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(
+                request_digest=digest,
+                digest_generation="monoid.model-request-digest.v1",
+            ),
+            request_preimage=preimage,
+            turn=ModelTurn(response_id="r", final_text="answer"),
+        )
+    )
+    recorder.close()
+
+    assert target.read_bytes() == b"theirs"
+    assert recorder._model_payloads_failed is True
+    corpus = run_dir / MODEL_PAYLOADS_FILENAME
+    records = _records(run_dir) if corpus.exists() else []
+    # No record may reference a chunk that was never stored.
+    assert _by_kind(records, MODEL_REQUEST_KIND) == []
+    assert (run_dir / MODEL_CALLS_FILENAME).exists()

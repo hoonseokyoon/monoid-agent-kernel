@@ -111,12 +111,29 @@ def chunk_marker(sha256: str) -> dict[str, str]:
     return {PAYLOAD_CHUNK_REF_KEY: sha256}
 
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def is_chunk_sha256(value: Any) -> bool:
+    """Whether ``value`` is the only thing a chunk reference is ever allowed to be.
+
+    Every reference this package writes is ``sha256_bytes`` output, and the schema pins that shape
+    on the ``chunk`` record's ``sha256`` field -- but a reference *inside* a payload is arbitrary
+    caller-adjacent JSON, and a corpus arrives from wherever run directories arrive from. The
+    constraint the writer holds by construction has to be re-established by every reader, because
+    the readers turn this string into a filename: joined onto a directory an absolute or
+    ``..``-relative string discards the base entirely. One predicate, both sides.
+    """
+
+    return isinstance(value, str) and len(value) == 64 and _HEX_DIGITS.issuperset(value)
+
+
 def _is_marker(value: Any) -> bool:
     return (
         isinstance(value, dict)
         and len(value) == 1
         and PAYLOAD_CHUNK_REF_KEY in value
-        and isinstance(value[PAYLOAD_CHUNK_REF_KEY], str)
+        and is_chunk_sha256(value[PAYLOAD_CHUNK_REF_KEY])
     )
 
 

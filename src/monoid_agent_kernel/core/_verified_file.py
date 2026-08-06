@@ -145,13 +145,56 @@ def open_verified_append_text(path: Path) -> TextIO | None:
         return None
 
 
+def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read one run-directory file this process is entitled to read, or refuse it entirely.
+
+    The reading twin of :func:`open_verified_append_text`, and it exists because the writer's
+    guarantees are worth nothing if the reader re-establishes none of them. ``Path.read_bytes`` was
+    the defect: it follows a link out of the run directory, it blocks forever on a FIFO, and it has
+    no size bound, so a content-addressed name planted by anyone with write access to the directory
+    turns a validation pass into an arbitrary read, a hang, or an out-of-memory.
+
+    ``None`` for every refusal -- a link, a special file, a file larger than ``max_bytes``, an I/O
+    error. The caller re-hashes what it gets, which is what makes the *content* trustworthy; this
+    function is only responsible for the bytes having come from a file the run directory owns.
+    """
+
+    descriptor = open_verified_regular_fd(path, os.O_RDONLY)
+    if descriptor is None:
+        return None
+    try:
+        if os.fstat(descriptor).st_size > max_bytes:
+            return None
+        blocks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, 1 << 20)
+            if not block:
+                return b"".join(blocks)
+            total += len(block)
+            if total > max_bytes:
+                # The size was checked above; a file still growing under us does not get to
+                # decide how much memory this pass uses.
+                return None
+            blocks.append(block)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """Create one write-once content-addressed file, or report that it could not be done.
 
-    The write-once half: if ``path`` already exists, nothing is written and the answer is ``True``
-    -- content addressing means an existing file with this name is this content, and the readers
-    that resolve these files re-hash what they read, so a lie planted under the right name is
-    caught at resolution rather than trusted here.
+    The write-once half: if ``path`` already holds a single-link regular file, nothing is written
+    and the answer is ``True`` -- content addressing means an existing file with this name is this
+    content, and :func:`read_verified_bytes` re-hashes what it reads, so a lie planted under the
+    right name is caught at resolution rather than trusted here. A name that exists as anything
+    *else* is refused instead: "already written" and "someone put an indirection here" are not the
+    same answer, and only a lstat can tell them apart.
 
     The verified half mirrors :func:`open_verified_append_text` for the *creation* path: the bytes
     land in a uniquely named temporary sibling opened with ``O_CREAT | O_EXCL | O_NOFOLLOW`` --
@@ -167,8 +210,17 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """
 
     try:
-        if path.exists():
-            return True
+        try:
+            existing: os.stat_result | None = path.lstat()
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            # ``path.exists()`` was the defect here, and it was the module docstring's own defect:
+            # it follows a link, so a name planted at a predictable content-addressed sha reported
+            # "already stored" for a chunk that was never written, and left every reader resolving
+            # whoever's bytes the link points at. An existing name is accepted only when it is the
+            # kind of file this function creates.
+            return stat.S_ISREG(existing.st_mode) and existing.st_nlink == 1
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
         flags = (

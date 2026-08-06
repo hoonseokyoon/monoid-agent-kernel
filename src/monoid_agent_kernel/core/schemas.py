@@ -26,9 +26,15 @@ from monoid_agent_kernel.core.model_payloads import (
     PAYLOAD_CHUNK_KIND,
     PAYLOAD_CHUNK_REF_KEY,
     UNRECORDED_REASONS,
+    is_chunk_sha256,
     reassemble_request_preimage,
 )
-from monoid_agent_kernel.core.model_io import DESTINATION_STATUSES, DIGEST_STATUSES
+from monoid_agent_kernel.core._verified_file import read_verified_bytes
+from monoid_agent_kernel.core.model_io import (
+    DESTINATION_STATUSES,
+    DIGEST_STATUSES,
+    MAX_MODEL_PAYLOAD_BYTES,
+)
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
 
@@ -1709,7 +1715,15 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
     def resolve(sha: str) -> bytes:
         if sha in chunks:
             return chunks[sha]
-        data = (chunk_dir / sha).read_bytes()
+        # A reference becomes a filename here, so this is where the writer's constraint has to be
+        # re-established: everything it writes is 64 hex, and an absolute or ``..``-relative string
+        # joined onto ``chunk_dir`` discards the base and names any file on the machine. The hash
+        # check below cannot stand in for it -- it happens after the read.
+        if not is_chunk_sha256(sha):
+            raise ValueError("chunk reference is not a content-addressed name")
+        data = read_verified_bytes(chunk_dir / sha, max_bytes=MAX_MODEL_PAYLOAD_BYTES)
+        if data is None:
+            raise ValueError(f"offloaded chunk {sha} is not a readable run-directory file")
         if sha256_bytes(data) != sha:
             raise ValueError(f"offloaded chunk {sha} does not match its name")
         return data
