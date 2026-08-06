@@ -411,11 +411,17 @@ def test_the_corpus_never_carries_the_configured_endpoint(tmp_path: Path) -> Non
     ledger_raw = (result.run_dir / MODEL_CALLS_FILENAME).read_text(encoding="utf-8")
     assert '"provider":"gateway"' in ledger_raw  # witness: the config reached the receipt
 
-    corpus = (result.run_dir / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8")
+    # Chunk text is a JSON *string* inside its record, so the raw file escapes every quote in it:
+    # searching the bytes would make the witness unfindable and the absence claim vacuous. Decode
+    # first, then look at everything the corpus can hand a consumer.
     chunk_dir = result.run_dir / MODEL_PAYLOADS_DIRNAME
-    everything = corpus + "".join(
-        stored.read_text(encoding="utf-8") for stored in chunk_dir.iterdir()
-    ) if chunk_dir.exists() else corpus
+    everything = "".join(
+        record["text"] if record.get("kind") == PAYLOAD_CHUNK_KIND else json.dumps(record)
+        for record in _records(result.run_dir)
+    ) + "".join(
+        stored.read_text(encoding="utf-8")
+        for stored in (chunk_dir.iterdir() if chunk_dir.exists() else ())
+    )
 
     # Witness: the preimage's model block really came from the config block that carries the
     # endpoint -- the resolved provider term cannot serve here, because the adapter's declared

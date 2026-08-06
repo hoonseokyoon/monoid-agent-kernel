@@ -729,15 +729,16 @@ ledger beside it, this artifact is **content**: request records carry the conver
 tool definitions, response records carry model output and provider reasoning artifacts, and the
 whole file inherits the run directory's private access boundary.
 
-A `model_request` record is a **recipe, not a copy**: each tool definition and the system prompt
-(and any message block past the offload threshold) is lifted out as a content-addressed chunk,
-and the record verifiably
+A `model_request` record is a **recipe, not a copy**: every value at least as large as the
+reference that would replace it is lifted out as a content-addressed chunk -- per tool definition
+and per message, because both are resent unchanged turn after turn -- and the record verifiably
 reassembles to the exact bytes the key was taken over — substitute each chunk's decoded value,
 re-encode through the canonical encoder, and the SHA-256 equals `request_digest`. The writer
 performs that reassembly *before* writing and falls back to a verbatim payload (`refs: false`,
-never walked) when anything disagrees, so caller data shaped like a chunk reference costs
-deduplication rather than correctness; `monoid validate` re-verifies every request record against
-its own digest. Records are set-keyed by digest — a run that issues the same request twice writes
+never walked) when anything disagrees; `monoid validate` re-verifies every request record against
+its own digest. Caller data shaped like a chunk reference does not reach that arm: a reference is
+a fixed size, so anything that could be one is large enough to be lifted into a chunk, and a
+resolved value is never re-walked. Records are set-keyed by digest — a run that issues the same request twice writes
 one request record, and both ledger lines join to it — while `model_response` records are
 sequence-keyed by `call_index`, because models are not functions: every answer is recorded, and
 choosing which one a replay returns is the replay adapter's policy, not the corpus's. A failed

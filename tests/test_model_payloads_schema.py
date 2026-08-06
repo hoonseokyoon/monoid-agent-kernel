@@ -45,7 +45,7 @@ from monoid_agent_kernel.core.model_payloads import (
 )
 from monoid_agent_kernel.core.schemas import MODEL_PAYLOADS_RECORD_SCHEMA, validate_run_dir
 from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig
-from monoid_agent_kernel.model_call import _request_payload
+from monoid_agent_kernel.model_call import _request_payload, _tool_payload
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
 from monoid_agent_kernel.tools.base import ToolSpec
 
@@ -111,9 +111,14 @@ def test_split_and_reassembly_return_the_exact_bytes_the_key_was_taken_over() ->
 
     assert split is not None
     assert split.refs is True
-    # Witness before absence-style claims elsewhere: the split genuinely extracted something.
-    # Two tools plus the system prompt, each its own chunk.
-    assert len(split.chunks) == 3
+    # Witness before absence-style claims elsewhere: the split genuinely extracted something, and
+    # a count alone would not say what. Each tool definition is its own chunk, by value.
+    terms = split.payload["monoid.model-request-digest.v1"]
+    assert all(set(entry) == {PAYLOAD_CHUNK_REF_KEY} for entry in terms["tools"])
+    assert {
+        CANONICAL_JSON_ENCODER.encode(_tool_payload(tool)).encode("utf-8")
+        for tool in _request().tools
+    } <= set(split.chunks.values())
     rebuilt = reassemble_request_preimage(split.payload, split.chunks.__getitem__, refs=True)
     assert rebuilt == preimage
     assert hashlib.sha256(rebuilt).hexdigest() == digest
@@ -131,8 +136,10 @@ def test_every_tool_is_its_own_chunk_so_one_surface_change_costs_one_chunk() -> 
 
     assert split_a is not None and split_b is not None
     shared = set(split_a.chunks) & set(split_b.chunks)
-    # fs.read's chunk and the system prompt's chunk survive the surface change.
-    assert len(shared) == 2
+    # fs.read's definition survives the surface change; fs.write's does not.
+    read_chunk = CANONICAL_JSON_ENCODER.encode(_tool_payload(_tool("fs.read"))).encode("utf-8")
+    assert read_chunk in {split_a.chunks[sha] for sha in shared}
+    assert len(set(split_a.chunks) - set(split_b.chunks)) == 1
 
 
 def test_a_null_system_prompt_stays_inline_rather_than_becoming_a_chunk_of_null() -> None:
@@ -141,7 +148,9 @@ def test_a_null_system_prompt_stays_inline_rather_than_becoming_a_chunk_of_null(
     split = split_request_payload(preimage, digest)
 
     assert split is not None
-    assert len(split.chunks) == 2  # the two tools; no chunk holding the four bytes of ``null``
+    # No chunk holding the four bytes of ``null``: the size rule declines it without an exception.
+    assert split.payload["monoid.model-request-digest.v1"]["system_prompt"] is None
+    assert b"null" not in set(split.chunks.values())
     rebuilt = reassemble_request_preimage(split.payload, split.chunks.__getitem__, refs=True)
     assert rebuilt == preimage
 
@@ -163,7 +172,10 @@ def test_the_by_reference_request_shape_round_trips() -> None:
     assert rebuilt == preimage
 
 
-def test_messages_stay_inline_below_the_offload_threshold_and_split_above_it() -> None:
+def test_a_message_smaller_than_a_reference_stays_inline_and_a_bigger_one_is_lifted() -> None:
+    """The threshold is what an indirection costs, so it is the point below which one cannot pay
+    for itself. (Whether a lifted chunk then stays in the JSONL line or moves to the directory is
+    the recorder's separate `PAYLOAD_OFFLOAD_THRESHOLD_BYTES` decision.)"""
     small_preimage, small_digest = _preimage_of(_request(), _MODEL)
     big_text = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 1024)
     big_preimage, big_digest = _preimage_of(
@@ -174,30 +186,13 @@ def test_messages_stay_inline_below_the_offload_threshold_and_split_above_it() -
     big = split_request_payload(big_preimage, big_digest)
 
     assert small is not None and big is not None
-    assert len(small.chunks) == 3  # tools + system prompt only
-    assert len(big.chunks) == 4  # ... plus the oversized messages
+    assert small.payload["monoid.model-request-digest.v1"]["messages"] == [
+        {"role": "user", "content": "hello"}
+    ]
+    assert len(set(big.chunks) - set(small.chunks)) == 1
     assert (
         reassemble_request_preimage(big.payload, big.chunks.__getitem__, refs=True) == big_preimage
     )
-
-
-def test_data_shaped_like_a_chunk_marker_falls_back_to_a_verbatim_payload() -> None:
-    """A caller's own data may look exactly like a reference. The writer cannot forbid that, so it
-    verifies the recipe before writing and falls back to `refs=False` -- a verbatim payload whose
-    reassembly never walks, so marker-shaped data is inert rather than resolved."""
-    lookalike = {PAYLOAD_CHUNK_REF_KEY: "0" * 64}
-    preimage, digest = _preimage_of(
-        _request(messages=({"role": "user", "content": [lookalike]},)), _MODEL
-    )
-
-    split = split_request_payload(preimage, digest)
-
-    assert split is not None
-    assert split.refs is False
-    assert split.chunks == {}
-    rebuilt = reassemble_request_preimage(split.payload, _no_chunks, refs=False)
-    assert rebuilt == preimage
-    assert hashlib.sha256(rebuilt).hexdigest() == digest
 
 
 def _no_chunks(sha: str) -> bytes:
@@ -628,22 +623,18 @@ def test_validate_run_dir_catches_an_offloaded_chunk_that_does_not_match_its_nam
 
 
 def test_validate_run_dir_never_walks_a_verbatim_payload(tmp_path: Path) -> None:
-    """`refs=False` is the writer's answer to marker-shaped caller data, and it is only an answer if
-    the reader honours it: walking a verbatim payload would resolve the lookalike and report a
-    perfectly faithful corpus as broken."""
-    lookalike = {PAYLOAD_CHUNK_REF_KEY: "0" * 64}
-    preimage, digest = _preimage_of(
-        _request(messages=({"role": "user", "content": [lookalike]},)), _MODEL
-    )
-    split = split_request_payload(preimage, digest)
-    assert split is not None
-    assert split.refs is False
+    """`refs=False` is only an answer if the reader honours it: walking a verbatim payload would
+    resolve the lookalike inside it and report a perfectly faithful corpus as broken. Built by
+    hand, because the writer can no longer be induced to emit one from caller data -- the file
+    format still permits it, and a reader answers to the file."""
+    verbatim = {"anything": [{PAYLOAD_CHUNK_REF_KEY: "0" * 64}]}
+    encoded = CANONICAL_JSON_ENCODER.encode(verbatim).encode("utf-8")
     _write_run_payloads(
         tmp_path,
         model_request_record(
-            split.payload,
+            verbatim,
             refs=False,
-            request_digest=digest,
+            request_digest=hashlib.sha256(encoded).hexdigest(),
             digest_generation="monoid.model-request-digest.v1",
             **_ENVELOPE,
         ),
@@ -652,3 +643,89 @@ def test_validate_run_dir_never_walks_a_verbatim_payload(tmp_path: Path) -> None
     assert not any(
         issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(tmp_path)
     )
+
+
+def _message(index: int) -> dict[str, object]:
+    return {"role": "user", "content": f"turn {index}: " + "detail " * 20}
+
+
+def test_a_growing_conversation_re_references_the_messages_it_already_recorded() -> None:
+    """Dedup is per *element* for the history exactly as it is for tools, and for the same reason:
+    a by-value conversation resends every earlier message every turn. Chunking the block as one
+    value keys it by the whole history, so the sha changes every turn and nothing is ever reused --
+    a hundred-turn run would write the history a hundred times, growing quadratically in the one
+    dimension a long run grows in."""
+    early, early_digest = _preimage_of(_request(messages=tuple(_message(i) for i in range(3))), _MODEL)
+    later, later_digest = _preimage_of(_request(messages=tuple(_message(i) for i in range(4))), _MODEL)
+    first = split_request_payload(early, early_digest)
+    second = split_request_payload(later, later_digest)
+    assert first is not None and second is not None
+
+    assert set(first.chunks) < set(second.chunks)
+    assert len(set(second.chunks) - set(first.chunks)) == 1  # one new message, one new chunk
+
+
+def test_a_value_big_enough_to_be_a_chunk_reference_is_never_left_inline() -> None:
+    """The verbatim fallback exists for marker-shaped caller data, and this is what makes it
+    unreachable *from* caller data: a reference encodes to a fixed size, so lifting every value at
+    least that large means a lookalike is always inside a chunk -- and reassembly never walks a
+    value it resolved. The collision costs one indirection that was already worth making."""
+    lookalike = {PAYLOAD_CHUNK_REF_KEY: "0" * 64}
+    preimage, digest = _preimage_of(
+        _request(messages=({"role": "user", "content": [lookalike]},)), _MODEL
+    )
+
+    split = split_request_payload(preimage, digest)
+
+    assert split is not None
+    assert split.refs is True
+    assert reassemble_request_preimage(split.payload, split.chunks.__getitem__, refs=True) == preimage
+
+
+def test_a_preimage_the_recipe_shape_does_not_fit_still_takes_the_verbatim_arm() -> None:
+    """The fallback is not dead code. It no longer triggers on marker-shaped caller data -- that is
+    the point of the size rule -- but a preimage that is not a single-key wrapper around a term
+    object extracts nothing, and a recipe with no references is a verbatim payload."""
+    preimage = CANONICAL_JSON_ENCODER.encode([1, 2, 3]).encode("utf-8")
+    digest = hashlib.sha256(preimage).hexdigest()
+
+    split = split_request_payload(preimage, digest)
+
+    assert split is not None
+    assert split.refs is False
+    assert split.chunks == {}
+    assert reassemble_request_preimage(split.payload, _no_chunks, refs=False) == preimage
+
+
+def test_a_pasted_instruction_does_not_land_whole_on_one_jsonl_line() -> None:
+    """Extraction is size-scoped, not field-scoped. The old rule named two fields, so a term it did
+    not name -- `instruction`, which is caller text -- put megabytes on one line on the happy
+    path."""
+    preimage, digest = _preimage_of(_request(instruction="p" * 3_000_000), _MODEL)
+    split = split_request_payload(preimage, digest)
+    assert split is not None
+
+    record = model_request_record(
+        split.payload,
+        refs=split.refs,
+        request_digest=digest,
+        digest_generation="monoid.model-request-digest.v1",
+        **_ENVELOPE,
+    )
+
+    assert len(json.dumps(record, ensure_ascii=False)) < 4096
+
+
+def test_a_preimage_deeper_than_the_readers_bound_is_refused_rather_than_recorded() -> None:
+    """`normalize_json_ingress` is iterative and accepts a tool result deeper than the reader's
+    lexical bound, so the writer could produce a record `validate_run_dir` cannot parse -- and a
+    line it cannot parse is a line whose digest it never checks. The corpus does not contain what
+    its own validator cannot read."""
+    deep: object = "leaf"
+    for _ in range(600):
+        deep = [deep]
+    preimage, digest = _preimage_of(
+        _request(messages=({"role": "user", "content": deep},)), _MODEL
+    )
+
+    assert split_request_payload(preimage, digest) is None

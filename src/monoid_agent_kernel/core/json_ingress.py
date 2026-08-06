@@ -211,6 +211,23 @@ def _enforce_json_nesting_limit(text: str, *, message: str) -> None:
             depth -= 1
 
 
+def json_nesting_within_limit(text: str) -> bool:
+    """Whether :func:`loads_json_ingress` would accept ``text``'s container depth.
+
+    For writers of artifacts this package also reads back. The lexical bound belongs to the reader,
+    so a writer that never asks it can emit a line no reader of the same file can parse -- and a
+    line a validator cannot parse is a line whose contents it never checks. Asking before writing
+    is what lets "every record is re-verified" be a property of the file rather than of the records
+    that happened to be shallow.
+    """
+
+    try:
+        _enforce_json_nesting_limit(text, message="JSON nesting exceeds the parser limit")
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
 def _exact_json_text(text: Any) -> str:
     """Return an exact ``str`` so subclasses cannot override the lexical scan."""
 

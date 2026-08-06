@@ -21,8 +21,8 @@ The run-directory artifact set is:
   including failed ones — metadata, taxonomy, and the replay key, no content
   (`monoid.model-calls.v1`)
 - `model_payloads.jsonl` + `model_payloads/`: optional private replay corpus — request preimages
-  as verified reassembly recipes with per-tool deduplicated chunks, and settled response bodies
-  including provider reasoning (`monoid.model-payloads.v1`)
+  as verified reassembly recipes whose chunks deduplicate per tool definition and per message, and
+  settled response bodies including provider reasoning (`monoid.model-payloads.v1`)
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
   non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
   from the `session.state.changed` event). While a run is parked on a recoverable turn failure

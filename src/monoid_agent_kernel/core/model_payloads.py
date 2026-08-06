@@ -14,16 +14,19 @@ that reaches disk, so a run whose disk is full loses a record rather than an ans
 
 **A request record is a recipe, not a copy, and the recipe is verified.** The bytes that matter
 are the exact bytes the replay key was hashed over. A record stores them as a payload tree whose
-extracted values -- each tool definition, the system prompt, any oversized message block -- are
-replaced by content-addressed chunk references, so the ~98% of a preimage that repeats across
-calls (tool definitions, measured on the shipped default surface) is stored once per run.
+liftable values -- every value at least as large as the reference that would replace it, per tool
+definition and per message -- are replaced by content-addressed chunk references, so the ~98% of a
+preimage that repeats across calls (tool definitions, measured on the shipped default surface) is
+stored once per run, and so is every message a growing conversation resends.
 Reassembly replaces each reference with its chunk's decoded value, re-encodes the whole through
 ``CANONICAL_JSON_ENCODER`` -- the same instance the digest hashed through, shared by identity,
 never a settings twin -- and must reproduce the preimage byte for byte. The writer performs that
 reassembly *before* writing and falls back to a verbatim payload (``refs=False``) when it fails,
-so three failure classes are absorbed structurally rather than defended by argument: a broken
-decode/encode round-trip, caller data shaped like a chunk reference, and any splitting defect.
-A ``refs=False`` payload is never walked at all, which is what makes marker-shaped data inert.
+so a broken decode/encode round-trip and any splitting defect are absorbed structurally rather
+than defended by argument. A ``refs=False`` payload is never walked at all. Caller data shaped
+like a chunk reference does not need that arm: a reference is a fixed size, so
+:data:`MARKER_ENCODED_BYTES` makes every lookalike large enough to be lifted into a chunk, and a
+resolved value is never re-walked.
 
 **The response side records the turn's declared fields and nothing else.** ``raw`` is absent by
 decision: it has no consumers outside the provider layer, no shape contract, and duplicates the
@@ -46,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
+from monoid_agent_kernel.core.json_ingress import json_nesting_within_limit
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -59,9 +63,11 @@ MODEL_PAYLOADS_DIRNAME = "model_payloads"
 # verbatim payload, so a collision costs deduplication, never correctness.
 PAYLOAD_CHUNK_REF_KEY = namespaced_id("payload-chunk.v1")
 
-# Above this encoded size a value leaves the JSONL line: request-side, ``messages`` and
-# ``observations`` become chunks; recorder-side, a chunk this large lands in the directory
-# instead of an inline record. 256 KiB, Temporal's offload default for the same job.
+# Above this encoded size a chunk leaves the JSONL line for a file of its own in the chunk
+# directory. Purely the recorder's storage decision -- *what* becomes a chunk is
+# ``MARKER_ENCODED_BYTES``'s question, and this one only asks where the chunk lives, so a
+# multimodal turn cannot put megabytes on one line. 256 KiB, Temporal's offload default for the
+# same job.
 PAYLOAD_OFFLOAD_THRESHOLD_BYTES = 262_144
 
 PAYLOAD_CHUNK_KIND = "chunk"
@@ -179,40 +185,56 @@ def reassemble_request_preimage(
     return _encoded(_filled(payload_value, resolve_chunk))
 
 
+# What one indirection costs: a chunk reference encodes to exactly this many bytes whatever it
+# points at, because its key is fixed and its value is a fixed-width sha. It is the extraction
+# threshold, and it earns that job twice. Below it a chunk cannot save anything. At or above it,
+# every value that could *be* a reference is lifted -- a reference is exactly this long -- and
+# reassembly never walks a value it resolved, so caller data shaped like a reference ends up inside
+# a chunk, inert, instead of forcing the whole payload onto the verbatim arm.
+MARKER_ENCODED_BYTES = len(
+    CANONICAL_JSON_ENCODER.encode({PAYLOAD_CHUNK_REF_KEY: "0" * 64}).encode("utf-8")
+)
+
+# The terms whose *elements* are the dedup unit rather than the term itself. Both grow by appending
+# and are resent whole every turn, so keying the block would key it by its own length: the sha
+# would change every turn, nothing would ever be reused, and a hundred-turn run would store the
+# history a hundred times. Per element, turn N+1 re-references turn N's chunks and adds one.
+_ELEMENTWISE_TERMS = ("tools", "messages", "observations")
+
+
 def _extracted(terms: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bytes]]:
-    """The terms with dedup/offload values lifted out, and the chunks that replaced them.
+    """The terms with their liftable values replaced by chunk references, and those chunks.
 
-    Extraction rules, by field:
+    One rule, size-scoped rather than field-scoped: lift every value whose canonical encoding is at
+    least :data:`MARKER_ENCODED_BYTES`. The field-scoped predecessor named ``tools``,
+    ``system_prompt``, ``messages`` and ``observations``, which left every term it did not name --
+    ``instruction`` is caller-pasted text -- able to put megabytes on one JSONL line on the happy
+    path, and left small values inline where a marker could hide.
 
-    * each element of ``tools`` and the ``system_prompt`` -- **always** (they are the dedup
-      targets: byte-identical across every call sharing a surface, and the tools block alone is
-      ~98% of a default-surface preimage). Except a literal ``null`` system prompt, which stays
-      inline: a chunk holding four bytes of ``null`` would be indirection with nothing deduped.
-    * ``messages`` and ``observations`` -- only past
-      :data:`PAYLOAD_OFFLOAD_THRESHOLD_BYTES` (they grow per turn and rarely repeat, so this is
-      offload, not dedup: it keeps a multimodal turn from putting megabytes on one JSONL line).
+    :data:`_ELEMENTWISE_TERMS` decides *what* a value is, not whether it is lifted. Per tool, not
+    per tools-block, because surfaces change mid-run (hot-swap, skill binding, quota) and a
+    block-level chunk would re-record all twenty-eight definitions because one left; per message
+    for the reason in that constant's comment.
 
-    Per *tool*, not per tools-block: surfaces change mid-run (hot-swap, skill binding, quota),
-    and a block-level chunk would re-record all twenty-eight definitions because one left.
+    A literal ``null`` system prompt falls out of the size rule rather than needing an exception:
+    four bytes of ``null`` is indirection with nothing deduped.
     """
 
     chunks: dict[str, bytes] = {}
 
-    def lifted(value: Any) -> dict[str, str]:
+    def lifted(value: Any) -> Any:
         encoded = _encoded(value)
+        if len(encoded) < MARKER_ENCODED_BYTES:
+            return value
         sha = sha256_bytes(encoded)
         chunks[sha] = encoded
         return chunk_marker(sha)
 
-    recipe = dict(terms)
-    tools = terms.get("tools")
-    if isinstance(tools, list):
-        recipe["tools"] = [lifted(tool) for tool in tools]
-    if terms.get("system_prompt") is not None:
-        recipe["system_prompt"] = lifted(terms["system_prompt"])
-    for name in ("messages", "observations"):
-        value = terms.get(name)
-        if value is not None and len(_encoded(value)) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
+    recipe: dict[str, Any] = {}
+    for name, value in terms.items():
+        if name in _ELEMENTWISE_TERMS and isinstance(value, list):
+            recipe[name] = [lifted(item) for item in value]
+        else:
             recipe[name] = lifted(value)
     return recipe, chunks
 
@@ -232,7 +254,15 @@ def split_request_payload(preimage: bytes, request_digest: str) -> SplitRequestP
     if sha256_bytes(preimage) != request_digest:
         return None
     try:
-        value = json.loads(preimage.decode("utf-8"))
+        text = preimage.decode("utf-8")
+        # The third refusal, and the one that is about the reader rather than the bytes: the
+        # ingress normalizer that built this payload is iterative and accepts a tool result deeper
+        # than the reader's lexical bound, so a record this deep would be one `validate_run_dir`
+        # cannot parse -- and therefore one whose digest it never re-verifies. The corpus does not
+        # contain what its own validator cannot read.
+        if not json_nesting_within_limit(text):
+            return None
+        value = json.loads(text)
     except Exception:
         return None
 

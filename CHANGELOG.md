@@ -15,12 +15,15 @@ out in commit messages and here.
   (`response_id`, `final_text`, `tool_calls`, `reasoning`, `usage`, `stop_reason`,
   `provider_retried`). Opt-in, independent of every other switch, inherited by subagents,
   validated — including full reassembly — by `monoid validate`.
-- **A request record is a verified recipe.** Each tool definition and the system prompt is a
-  content-addressed chunk (per tool, so a mid-run surface change re-records one definition, not
-  twenty-eight; on the shipped default surface the tool block is ~98% of a preimage), values past
-  256 KiB are offloaded to the chunk directory, and the writer reassembles and compares against
-  the digest *before* writing — falling back to a verbatim, never-walked payload when anything
-  disagrees, so data shaped like a chunk reference is inert. `ModelTurn.raw` is deliberately not
+- **A request record is a verified recipe.** Every value at least as large as the reference that
+  would replace it becomes a content-addressed chunk — per tool definition (so a mid-run surface
+  change re-records one definition, not twenty-eight; the tool block is ~98% of a default-surface
+  preimage) and per message (so a growing by-value conversation re-references what it already
+  recorded instead of storing the whole history again every turn). Chunks past 256 KiB move to the
+  chunk directory, and the writer reassembles and compares against the digest *before* writing,
+  falling back to a verbatim, never-walked payload when anything disagrees. Data shaped like a
+  chunk reference cannot reach that fallback: a reference is a fixed size, so a lookalike is
+  always large enough to be lifted into a chunk, where reassembly never re-walks it. `ModelTurn.raw` is deliberately not
   recorded (a replayed turn answers `raw={}`); `reasoning` deliberately is, encrypted entries
   included, because the loop re-injects it into the next turn.
 - **`digest_status` gains `too_large`, and the digest cap becomes the wire's bound.** The band
