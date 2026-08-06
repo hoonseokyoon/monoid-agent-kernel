@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 from support.runtime import runtime_config, runtime_provider
@@ -800,6 +801,7 @@ def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: P
             ),
         )
     )
+    recorder.record_settled_call(_settled(1))
     recorder.close()
 
     corpus = recorder.run_dir / MODEL_PAYLOADS_FILENAME
@@ -815,7 +817,10 @@ def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: P
     # chunk hides its depth inside a JSON string and could never have been refused.
     responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
     assert [(one["call_index"], one["response"], one["unrecorded_reason"]) for one in responses] == [
-        (0, None, "unencodable")
+        (0, None, "unencodable"),
+        # The second call proves the retried record consumed its ordinal: a dropped line left the
+        # counter where it was, so the next answer took index 0 over again.
+        (1, ANY, ""),
     ]
 
 
@@ -860,3 +865,12 @@ def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
 
     assert [record["call_index"] for record in ledger] == [0, 1]
     assert [record["call_index"] for record in responses] == [0, 1]
+    # ... and the corpus line it wrote satisfies the corpus's own schema. A digest that is not a
+    # digest joins nothing, so the honest value is the empty one the schema already blesses --
+    # writing the hostile value through would put a line in this file that its own validator
+    # rejects, which is the one thing the line encoder's doctrine forbids. (The ledger reports it;
+    # that arm's shape handling predates this artifact.)
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )

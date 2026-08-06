@@ -415,9 +415,11 @@ DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld", "too_large")
 
 ``absent`` means no key was issued because canonical JSON could not carry the payload -- a defect
 in the payload. ``too_large`` means no key was issued because the payload exceeded
-:data:`MAX_MODEL_PAYLOAD_BYTES` -- an operational condition, answered by raising the cap, not a
-defect. The two were one value, and a consumer holding a keyless record could not tell whether to
-file a bug or resize a limit. ``withheld`` means a key was issued and a ``none``-mode policy
+:data:`MAX_MODEL_PAYLOAD_BYTES` -- an operational condition rather than a defect, though not one an
+operator can configure their way out of: that constant is a build-time value, and it bounds the
+whole identity payload rather than the message log the run limits bound, so a request can pass
+every limit and still be refused a key. The two were one value, and a consumer holding a keyless
+record could not tell a payload to file a bug about from one to make smaller. ``withheld`` means a key was issued and a ``none``-mode policy
 removed it. ``not_reached`` means the call was refused before a key was computed at all.
 """
 

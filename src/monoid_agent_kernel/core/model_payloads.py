@@ -38,10 +38,11 @@ re-injects it into the next by-value turn, so a corpus without it derails one tu
 replayed answer. Reasoning entries and the message text around them are model content; this whole
 artifact is content-classified, unlike the ledger beside it.
 
-Nothing here is truncated, ever. A response that cannot be canonically encoded, or that exceeds
-:data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, costs its own record a typed
-``unrecorded_reason`` -- the same doctrine as the replay key itself: refuse whole, never invent a
-partial identity.
+Nothing here is truncated, ever. A response that cannot be canonically encoded, one that exceeds
+:data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, or one whose assembled record
+line the corpus reader could not parse back (the recorder's refusal, not this module's), costs its
+own record a typed ``unrecorded_reason`` -- the same doctrine as the replay key itself: refuse
+whole, never invent a partial identity.
 """
 
 from __future__ import annotations

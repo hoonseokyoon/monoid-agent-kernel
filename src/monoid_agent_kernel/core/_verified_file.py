@@ -11,9 +11,15 @@ run.
 The rule these functions enforce is therefore not "the path looks right" but "the bytes I touch
 belong to a regular file in a real directory, and to the same inode I just verified":
 ``O_NOFOLLOW`` where the platform has it, ``lstat`` before the open for the platforms that do not,
-``S_ISREG`` on both the named entry and the opened descriptor, ``os.path.samestat`` to close the
-window between them, and -- since a run directory has subdirectories now -- a parent that is a
-directory rather than a link wearing one's shape.
+``S_ISREG`` on both the named entry and the opened descriptor, and ``os.path.samestat`` to close
+the window between them.
+
+That rule covers the **final** component. The two chunk primitives also check their parent
+(:func:`verified_directory_is_safe`), because the corpus put a subdirectory inside the run
+directory and ``mkdir(exist_ok=True)`` follows a link planted at it. The append opener does not,
+because its parent *is* the run directory, and a symlinked run root is an ordinary deployment
+choice rather than an attack -- an indirection planted at the run directory itself is the
+deployment's boundary to defend, not this module's.
 
 ``st_nlink == 1`` is part of that rule only for the artifacts these functions *append to*: a hard
 link is a second name for an inode a writer is about to mutate. It is deliberately not required of
@@ -230,12 +236,13 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
 def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """Create one write-once content-addressed file, or report that it could not be done.
 
-    The write-once half: if ``path`` already holds a regular file, nothing is written
-    and the answer is ``True`` -- content addressing means an existing file with this name is this
-    content, and :func:`read_verified_bytes` re-hashes what it reads, so a lie planted under the
-    right name is caught at resolution rather than trusted here. A name that exists as anything
-    *else* is refused instead: "already written" and "someone put an indirection here" are not the
-    same answer, and only a lstat can tell them apart.
+    The write-once half: if ``path`` already holds a regular file **of exactly this length**,
+    nothing is written and the answer is ``True`` -- content addressing means a file of the right
+    name and the right size is almost certainly this content, and :func:`read_verified_bytes`
+    re-hashes what it reads, so the remaining lie is caught at resolution. Anything else under that
+    name is refused, and a refusal here is terminal for the caller's artifact: "already written",
+    "someone planted an indirection" and "these are not those bytes" are three different answers,
+    and stopping loudly beats handing a reader a reference to content that was never stored.
 
     The verified half mirrors :func:`open_verified_append_text` for the *creation* path: the bytes
     land in a uniquely named temporary sibling opened with ``O_CREAT | O_EXCL | O_NOFOLLOW`` --

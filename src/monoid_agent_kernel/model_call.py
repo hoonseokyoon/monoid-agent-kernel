@@ -200,11 +200,13 @@ def _encoded_digest(payload: dict[str, Any], *, want_preimage: bool = False) -> 
 
     Output is capped so a payload built from shared references cannot expand without bound; passing
     the cap also means no key, since a prefix would stand for the whole. The cap is
-    :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES` -- the wire's own bound --
-    because the band between a smaller digest cap and the wire once shipped calls that transmitted
-    successfully and silently had no replay key. Exceeding it is a *named* refusal (``too_large``),
-    distinct from ``absent``: an operator answers one by resizing a limit and the other by fixing a
-    payload, and a status that conflated them said neither. A refusal reports the first reason the
+    :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, set to the same number as
+    the default message-log bound so the band between a smaller digest cap and that bound -- which
+    once shipped calls that transmitted successfully and silently had no replay key -- cannot
+    reopen by drift. It is not the *wire's* bound: it covers the whole identity payload, so a
+    request can clear every run limit and still exceed it. Exceeding it is a *named* refusal
+    (``too_large``), distinct from ``absent``: one says the payload is too big to key, the other
+    says it is malformed, and a status that conflated them said neither. A refusal reports the first reason the
     encoder hit; a payload both hostile and oversized is not diagnosed twice.
     """
 

@@ -49,6 +49,7 @@ from monoid_agent_kernel.core.model_payloads import (
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     SplitRequestPayload,
     chunk_marker,
+    is_chunk_sha256,
     chunk_record,
     model_request_record,
     model_response_record,
@@ -643,6 +644,15 @@ class AgentRecorder:
         """
 
         receipt = call.receipt
+        # The join key as the corpus may state it. A digest that is not a digest joins nothing, and
+        # the schema says so (``^(|[0-9a-f]{64})$``); writing one through would put a line in this
+        # file that its own validator rejects, which is the one thing ``_encoded_payload_line``'s
+        # doctrine forbids. Empty is the honest value and already means "look at the ledger line's
+        # ``digest_status``" -- the request side cannot reach this, because a split only exists for
+        # a preimage that hashed to its digest.
+        joinable_digest = (
+            receipt.request_digest if is_chunk_sha256(receipt.request_digest) else ""
+        )
         wrote_response = False
         envelope = {
             "run_id": self.run_id,
@@ -694,7 +704,7 @@ class AgentRecorder:
                         model_response_record(
                             body,
                             call_index=index,
-                            request_digest=receipt.request_digest,
+                            request_digest=joinable_digest,
                             unrecorded_reason=reason,
                             **envelope,
                         )

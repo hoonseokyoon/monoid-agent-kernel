@@ -735,8 +735,11 @@ tool definitions, response records carry model output and provider reasoning art
 whole file inherits the run directory's private access boundary.
 
 A `model_request` record is a **recipe, not a copy**: every value at least as large as the
-reference that would replace it is lifted out as a content-addressed chunk -- per tool definition
-and per message, because both are resent unchanged turn after turn -- and the record verifiably
+reference that would replace it is lifted out as a content-addressed chunk -- per tool definition,
+per message and per observation. Tools and history are resent unchanged turn after turn, so those
+two carry the deduplication; observations are a per-turn delta, elementwise for the within-turn
+half of the argument, so one oversized tool result does not drag its siblings onto the line with
+it. The record verifiably
 reassembles to the exact bytes the key was taken over — substitute each chunk's decoded value,
 re-encode through the canonical encoder, and the SHA-256 equals `request_digest`. The writer
 performs that reassembly *before* writing and falls back to a verbatim payload (`refs: false`,
@@ -754,9 +757,13 @@ two records share a digest and a payload, not a line — every record carries it
 on the line. What joins a response record to its ledger line across that boundary is the
 pair — the two arms record one call under one lock and read the clock once, so `call_index` *and*
 `recorded_at` agree by construction. A failed
-call records its request and no response; the ledger line carries its taxonomy. A response the
-canonical encoder cannot carry, or one past `MAX_MODEL_PAYLOAD_BYTES`, costs its own record a
-typed `unrecorded_reason` — never a truncation.
+call records its request — when a key was issued for it — and no response; the ledger line carries
+its taxonomy. A call refused a key contributes nothing to the corpus at all: every keyless
+`digest_status` (`not_reached`, `absent`, `too_large`, and a `withheld` a policy removed) leaves
+the ledger line as that call's only trace. A response the canonical encoder cannot carry, one past
+`MAX_MODEL_PAYLOAD_BYTES`, or one whose assembled record line nests deeper than this artifact's own
+reader parses, costs its own record a typed `unrecorded_reason` — never a truncation, and never a
+dropped line.
 
 Whether media is *present* depends on the adapter, and an operator sizing or classifying this
 artifact should read that first. When the adapter declares `supports_multimodal` the loop resolves
