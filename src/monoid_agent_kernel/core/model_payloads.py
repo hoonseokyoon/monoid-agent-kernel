@@ -68,10 +68,12 @@ PAYLOAD_CHUNK_KIND = "chunk"
 MODEL_REQUEST_KIND = "model_request"
 MODEL_RESPONSE_KIND = "model_response"
 
-# Why a response record carries no response. ``not_captured`` is a wiring statement -- the
-# payload file was enabled but the runner was not asked to keep preimage bytes -- kept distinct
-# because it names a configuration defect, not a payload property.
-UNRECORDED_REASONS = ("", "too_large", "unencodable", "not_captured")
+# Why a response record carries no response. Deliberately only the reasons a writer can actually
+# produce: an early draft had a ``not_captured`` member for the request-side wiring gap (corpus
+# on, preimage capture off), but that gap belongs to the *request* record -- whose absence beside
+# a ledger line saying ``digest_status="ok"`` is the diagnosis -- and a response is built from
+# the turn, which needs no preimage. A vocabulary member no writer emits is a fail-open pin.
+UNRECORDED_REASONS = ("", "too_large", "unencodable")
 
 
 @dataclass(frozen=True)

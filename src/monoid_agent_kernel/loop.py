@@ -1008,6 +1008,14 @@ class AgentLoop:
     # no provider streaming, and folding it into that selection would change cancellation and
     # interrupt granularity for a run that asked only for receipts.
     model_calls_file: bool = False
+    # Persist request preimages and settled response bodies to ``model_payloads.jsonl`` (with a
+    # ``model_payloads/`` chunk directory) -- the replay corpus. Independent of the ledger switch
+    # above: either sidecar is meaningful alone, the two have different privacy classes (the
+    # ledger is metadata, the corpus is content), and this one is likewise deliberately NOT part
+    # of the ``wants_content_stream`` selection -- a run that asked only for a corpus must not
+    # have its cancellation and interrupt granularity changed by a streaming drive it never
+    # requested.
+    model_payload_file: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
@@ -3207,6 +3215,7 @@ class AgentLoop:
             # run directory, so its ledger lands there rather than here -- which is why every
             # record carries ``root_run_id``.
             model_calls_file=self.model_calls_file,
+            model_payload_file=self.model_payload_file,
             model_stream_observer_factories=self.model_stream_observer_factories,
         )
         child._capability_vault = self._capability_vault.fork_for_child()

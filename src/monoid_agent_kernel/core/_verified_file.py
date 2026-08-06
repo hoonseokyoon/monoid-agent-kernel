@@ -143,3 +143,59 @@ def open_verified_append_text(path: Path) -> TextIO | None:
             except OSError:
                 pass
         return None
+
+
+def write_verified_bytes_once(path: Path, data: bytes) -> bool:
+    """Create one write-once content-addressed file, or report that it could not be done.
+
+    The write-once half: if ``path`` already exists, nothing is written and the answer is ``True``
+    -- content addressing means an existing file with this name is this content, and the readers
+    that resolve these files re-hash what they read, so a lie planted under the right name is
+    caught at resolution rather than trusted here.
+
+    The verified half mirrors :func:`open_verified_append_text` for the *creation* path: the bytes
+    land in a uniquely named temporary sibling opened with ``O_CREAT | O_EXCL | O_NOFOLLOW`` --
+    exclusive creation cannot be redirected by a planted link, and a link planted at the temporary
+    name fails the open outright -- then take the final name via ``os.replace``, which replaces a
+    link *itself* rather than writing through it (the same shape the checkpoint store's blob
+    writer uses). A crash between the two leaves an orphaned ``*.tmp`` the owner sweeps at open,
+    never a half-written file under a content-addressed name that would poison every reader
+    trusting the name.
+
+    ``False`` is terminal for the artifact the caller is building, for the reason the append
+    opener's ``None`` is: the refusal is a property of the path.
+    """
+
+    try:
+        if path.exists():
+            return True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+        flags = (
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(temp, flags, 0o666)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+        except OSError:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            return False
+        try:
+            os.replace(temp, path)
+        except OSError:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            return False
+        return True
+    except OSError:
+        return False

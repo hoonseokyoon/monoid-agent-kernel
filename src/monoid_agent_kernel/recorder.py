@@ -24,7 +24,10 @@ from monoid_agent_kernel.core._util import (
     utc_timestamp,
     write_json_atomic,
 )
-from monoid_agent_kernel.core._verified_file import open_verified_append_text
+from monoid_agent_kernel.core._verified_file import (
+    open_verified_append_text,
+    write_verified_bytes_once,
+)
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
@@ -37,6 +40,17 @@ from monoid_agent_kernel.core.lifecycle import (
 )
 from monoid_agent_kernel.core.manifest import RunManifest
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME, model_call_record
+from monoid_agent_kernel.core.model_payloads import (
+    MODEL_PAYLOADS_DIRNAME,
+    MODEL_PAYLOADS_FILENAME,
+    PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
+    chunk_marker,
+    chunk_record,
+    model_request_record,
+    model_response_record,
+    response_record_body,
+    split_request_payload,
+)
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME, ModelContentStore
 from monoid_agent_kernel.model_call import SettledModelCall
 from monoid_agent_kernel.core.model_io import content_digest, content_length
@@ -349,6 +363,9 @@ class AgentRecorder:
     # line carries it: a subagent records into its own run directory, so the root is the only
     # thing that makes a run tree joinable without walking the parent's events first.
     root_run_id: str = ""
+    # Private replay corpus (request preimages + settled response bodies), opt-in like its two
+    # sidecar siblings and appended after them so no positional caller is rebound.
+    model_payload_file: bool = False
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
@@ -366,11 +383,20 @@ class AgentRecorder:
     # arriving after ``close`` silently reopens the file the recorder just released.
     _model_calls_closed: bool = field(default=False, init=False, repr=False)
     _model_calls_index: int = field(default=0, init=False, repr=False)
+    # One lock for every per-call sidecar: the ledger line and the payload records of one call
+    # must land under one acquisition or their shared ``call_index`` is only an aspiration.
     _model_calls_lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
         repr=False,
     )
+    _model_payloads_handle: TextIO | None = field(default=None, init=False, repr=False)
+    _model_payloads_failed: bool = field(default=False, init=False, repr=False)
+    _model_payloads_closed: bool = field(default=False, init=False, repr=False)
+    # Per-process dedup state. Empty again after a durable reopen, which makes duplicate chunk
+    # and request records legal-by-construction: content-addressed, so a duplicate is identical.
+    _payload_chunk_shas: set[str] = field(default_factory=set, init=False, repr=False)
+    _payload_request_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.run_dir = self.run_root / self.run_id
@@ -485,33 +511,197 @@ class AgentRecorder:
         caller; the recorder holds a lock because it is shared with tool and job threads.
         """
 
-        if not self.model_calls_file or self._model_calls_failed or self._model_calls_closed:
+        ledger_wanted = (
+            self.model_calls_file
+            and not self._model_calls_failed
+            and not self._model_calls_closed
+        )
+        payloads_wanted = (
+            self.model_payload_file
+            and not self._model_payloads_failed
+            and not self._model_payloads_closed
+        )
+        if not ledger_wanted and not payloads_wanted:
             return
         try:
             with self._model_calls_lock:
-                if self._model_calls_failed or self._model_calls_closed:
-                    return
-                record = model_call_record(
-                    call.receipt,
-                    run_id=self.run_id,
-                    root_run_id=self.root_run_id or self.run_id,
-                    call_index=self._model_calls_index,
-                    recorded_at=utc_timestamp(),
-                )
-                # Normalized and encoded before a handle is touched, so an unencodable value is
-                # refused rather than half-written.
-                line = json.dumps(
-                    normalize_json_ingress(record),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                )
-                line.encode("utf-8")
-                if self._append_model_call(line):
+                index = self._model_calls_index
+                advanced = False
+                if (
+                    self.model_calls_file
+                    and not self._model_calls_failed
+                    and not self._model_calls_closed
+                ):
+                    advanced = self._record_ledger_locked(call, index) or advanced
+                if (
+                    self.model_payload_file
+                    and not self._model_payloads_failed
+                    and not self._model_payloads_closed
+                ):
+                    advanced = self._record_payloads_locked(call, index) or advanced
+                # One counter for however many files recorded this call, advanced when any of
+                # them did: the index identifies the CALL, so per-file write failures surface as
+                # holes in that file rather than as two files disagreeing about which call is
+                # which. With a single sidecar enabled this is exactly the W6-1 rule (advance
+                # only for a line that reached the file).
+                if advanced:
                     self._model_calls_index += 1
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
             _LOGGER.debug("model call record could not be written", exc_info=True)
+
+    def _record_ledger_locked(self, call: SettledModelCall, index: int) -> bool:
+        """Build and append one ledger line. Caller holds ``_model_calls_lock``."""
+
+        try:
+            record = model_call_record(
+                call.receipt,
+                run_id=self.run_id,
+                root_run_id=self.root_run_id or self.run_id,
+                call_index=index,
+                recorded_at=utc_timestamp(),
+            )
+            # Normalized and encoded before a handle is touched, so an unencodable value is
+            # refused rather than half-written.
+            line = json.dumps(
+                normalize_json_ingress(record),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            line.encode("utf-8")
+        except Exception:  # noqa: BLE001 - a hostile context costs its own line, not the run
+            _LOGGER.debug("model call record could not be encoded", exc_info=True)
+            return False
+        return self._append_model_call(line)
+
+    def _record_payloads_locked(self, call: SettledModelCall, index: int) -> bool:
+        """Record one call's corpus entries. Caller holds ``_model_calls_lock``.
+
+        Request side first, response side second, chunks before the record that references them:
+        a failure part-way leaves unreferenced chunks -- which the validator deliberately ignores
+        -- never a record whose references dangle. Returns whether a *response* record landed,
+        because that is the per-call line the shared index counts; request records are set-keyed
+        and deduplicated, so their presence says nothing about THIS call having been recorded.
+
+        The split is verified before anything is written (``split_request_payload`` reassembles
+        and compares), so the corpus cannot contain a request record that fails its own digest --
+        the validator re-proves per record what the writer proved per write.
+
+        Failed calls record their request side (what was asked is exactly as recordable) and no
+        response record: there is no turn, and the ledger line carries the failure taxonomy.
+        """
+
+        receipt = call.receipt
+        recorded_at = utc_timestamp()
+        wrote_response = False
+        envelope = {
+            "run_id": self.run_id,
+            "root_run_id": self.root_run_id or self.run_id,
+            "recorded_at": recorded_at,
+        }
+        try:
+            if (
+                receipt.request_digest
+                and call.request_preimage is not None
+                and receipt.request_digest not in self._payload_request_digests
+            ):
+                split = split_request_payload(call.request_preimage, receipt.request_digest)
+                if split is not None:
+                    landed = True
+                    for sha, chunk in split.chunks.items():
+                        if sha in self._payload_chunk_shas:
+                            continue
+                        if not self._store_payload_chunk_locked(sha, chunk, envelope):
+                            landed = False
+                            break
+                        self._payload_chunk_shas.add(sha)
+                    if landed:
+                        request_line = self._encoded_payload_line(
+                            model_request_record(
+                                split.payload,
+                                refs=split.refs,
+                                request_digest=receipt.request_digest,
+                                digest_generation=receipt.digest_generation,
+                                **envelope,
+                            )
+                        )
+                        if request_line is not None and self._append_model_payload(request_line):
+                            self._payload_request_digests.add(receipt.request_digest)
+            if call.turn is not None:
+                recorded = response_record_body(call.turn)
+                response: dict | None
+                if recorded.value is not None and recorded.encoded is not None:
+                    if len(recorded.encoded) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
+                        sha = sha256_bytes(recorded.encoded)
+                        if self._store_payload_chunk_locked(sha, recorded.encoded, envelope):
+                            self._payload_chunk_shas.add(sha)
+                            response = chunk_marker(sha)
+                        else:
+                            return wrote_response
+                    else:
+                        response = recorded.value
+                else:
+                    response = None
+                response_line = self._encoded_payload_line(
+                    model_response_record(
+                        response,
+                        call_index=index,
+                        request_digest=receipt.request_digest,
+                        unrecorded_reason=recorded.unrecorded_reason,
+                        **envelope,
+                    )
+                )
+                if response_line is not None and self._append_model_payload(response_line):
+                    wrote_response = True
+        except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
+            _LOGGER.debug("model payload records could not be written", exc_info=True)
+        return wrote_response
+
+    def _encoded_payload_line(self, record: dict[str, Any]) -> str | None:
+        """Encode one corpus record, refusing rather than half-writing.
+
+        No ``normalize_json_ingress`` here, deliberately unlike the ledger line: a request recipe
+        is decoded canonical-encoder output and a response body is a normalized turn's fields, so
+        there is nothing left to normalize -- and a normalizer that ever *did* change a recipe
+        value would break the byte-identity the corpus exists to keep.
+        """
+
+        try:
+            line = json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            line.encode("utf-8")
+        except Exception:  # noqa: BLE001 - refusal is the containment
+            _LOGGER.debug("model payload record could not be encoded", exc_info=True)
+            return None
+        return line
+
+    def _store_payload_chunk_locked(
+        self, sha: str, chunk: bytes, envelope: dict[str, str]
+    ) -> bool:
+        """Store one chunk: inline record up to the offload threshold, directory file past it.
+
+        A directory-write failure is terminal for the corpus arm (``_model_payloads_failed``),
+        the same treatment a torn append gets: the run keeps its answer, the corpus stops rather
+        than accumulating records whose references dangle.
+        """
+
+        if len(chunk) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
+            target = self.run_dir / MODEL_PAYLOADS_DIRNAME / sha
+            if write_verified_bytes_once(target, chunk):
+                return True
+            self._model_payloads_failed = True
+            _LOGGER.debug("model payload chunk could not be stored")
+            return False
+        line = self._encoded_payload_line(chunk_record(chunk, **envelope))
+        if line is None:
+            return False
+        return self._append_model_payload(line)
 
     def _append_model_call(self, line: str) -> bool:
         """Write one encoded line. Caller holds ``_model_calls_lock``; returns whether it landed."""
@@ -527,6 +717,47 @@ class AgentRecorder:
             _LOGGER.debug("model call ledger append failed", exc_info=True)
             return False
         return True
+
+    def _append_model_payload(self, line: str) -> bool:
+        """Write one encoded corpus line. Caller holds ``_model_calls_lock``."""
+
+        handle = self._ensure_model_payloads_handle_locked()
+        if handle is None:
+            return False
+        try:
+            handle.write(line + "\n")
+            handle.flush()
+        except (OSError, UnicodeError):
+            self._model_payloads_failed = True
+            _LOGGER.debug("model payload append failed", exc_info=True)
+            return False
+        return True
+
+    def _ensure_model_payloads_handle_locked(self) -> TextIO | None:
+        """The corpus twin of ``_ensure_model_calls_handle_locked`` -- same verified open, same
+        terminal refusal, same reason (see that docstring; the rule was extracted to
+        ``core/_verified_file.py`` precisely so the second sidecar could not skip it). Also sweeps
+        crash-orphaned ``*.tmp`` files out of the chunk directory once per activation: they are
+        the write-once writer's only litter, and nothing else ever looks at them."""
+
+        if self._model_payloads_handle is not None:
+            return self._model_payloads_handle
+        handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
+        if handle is None:
+            self._model_payloads_failed = True
+            _LOGGER.debug("model payload corpus could not be safely opened")
+            return None
+        self._model_payloads_handle = handle
+        chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
+        try:
+            for orphan in chunk_dir.glob("*.tmp"):
+                try:
+                    orphan.unlink()
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return handle
 
     def _ensure_model_calls_handle_locked(self) -> TextIO | None:
         """Open the ledger only if the path names a file this process is entitled to append to.
@@ -761,16 +992,29 @@ class AgentRecorder:
                     # Nested rather than sequential: one private artifact failing to close must
                     # not retain the other's descriptor, the same rule the transcript already has
                     # against the event bus above.
-                    with self._model_calls_lock:
-                        # Marked closed under the same acquisition that takes the handle, so a
-                        # concurrent record cannot slip between the two and reopen the file.
-                        self._model_calls_closed = True
-                        handle, self._model_calls_handle = self._model_calls_handle, None
-                    if handle is not None:
-                        try:
-                            handle.close()
-                        except OSError:
-                            _LOGGER.debug("model call ledger close failed", exc_info=True)
+                    try:
+                        with self._model_calls_lock:
+                            # Marked closed under the same acquisition that takes the handle, so a
+                            # concurrent record cannot slip between the two and reopen the file.
+                            self._model_calls_closed = True
+                            handle, self._model_calls_handle = self._model_calls_handle, None
+                        if handle is not None:
+                            try:
+                                handle.close()
+                            except OSError:
+                                _LOGGER.debug("model call ledger close failed", exc_info=True)
+                    finally:
+                        # Fourth arm, nested for the same reason as the third: the corpus handle
+                        # must be released even when the ledger's close raised.
+                        with self._model_calls_lock:
+                            self._model_payloads_closed = True
+                            payloads_handle = self._model_payloads_handle
+                            self._model_payloads_handle = None
+                        if payloads_handle is not None:
+                            try:
+                                payloads_handle.close()
+                            except OSError:
+                                _LOGGER.debug("model payload corpus close failed", exc_info=True)
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
         payload: dict[str, Any] = {
