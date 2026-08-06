@@ -27,6 +27,7 @@ from monoid_agent_kernel.core._util import (
 )
 from monoid_agent_kernel.core._verified_file import (
     open_verified_append_text,
+    verified_directory_is_safe,
     write_verified_bytes_once,
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
@@ -534,24 +535,26 @@ class AgentRecorder:
             # across that work makes the corpus's cost the ledger's latency. The seen-set read is a
             # fast path whose only stale outcome is one redundant split; the write side re-checks.
             split = None
-            if (
-                payloads_wanted
-                and call.receipt.request_digest
-                and call.request_preimage is not None
-                and call.receipt.request_digest not in self._payload_request_digests
-            ):
-                try:
+            try:
+                # The *whole* block, not just the call. Containment has to cover everything that
+                # moved out of ``_record_payloads_locked``'s handler, and the guard is part of
+                # that: a receipt whose ``request_digest`` is unhashable raises on the seen-set
+                # test, one statement before the call. Either raise, uncontained, would skip the
+                # ledger arm and the counter too -- the call would vanish from both files with no
+                # hole to show for it. Both are reachable through the public sink, whose
+                # ``SettledModelCall`` is untyped at runtime.
+                if (
+                    payloads_wanted
+                    and call.receipt.request_digest
+                    and call.request_preimage is not None
+                    and call.receipt.request_digest not in self._payload_request_digests
+                ):
                     split = split_request_payload(
                         call.request_preimage, call.receipt.request_digest
                     )
-                except Exception:  # noqa: BLE001 - the corpus arm's containment moved with its work
-                    # This ran inside ``_record_payloads_locked``'s handler until the split came
-                    # out of the lock, and the containment has to travel with it: a raise here --
-                    # a caller handing the sink a ``str`` preimage is enough, and this seam is
-                    # public -- would otherwise skip the ledger arm and the counter as well, so
-                    # the call would vanish from both files with no hole to show for it.
-                    _LOGGER.debug("model payload split failed", exc_info=True)
-                    split = None
+            except Exception:  # noqa: BLE001 - one unrecordable corpus entry costs only the corpus
+                _LOGGER.debug("model payload split failed", exc_info=True)
+                split = None
             with self._model_calls_lock:
                 index = self._model_calls_index
                 # One clock read for however many files record this call. ``call_index`` restarts
@@ -686,15 +689,26 @@ class AgentRecorder:
                         response = recorded.value
                 else:
                     response = None
-                response_line = self._encoded_payload_line(
-                    model_response_record(
-                        response,
-                        call_index=index,
-                        request_digest=receipt.request_digest,
-                        unrecorded_reason=recorded.unrecorded_reason,
-                        **envelope,
+                def line_for(body: dict | None, reason: str) -> str | None:
+                    return self._encoded_payload_line(
+                        model_response_record(
+                            body,
+                            call_index=index,
+                            request_digest=receipt.request_digest,
+                            unrecorded_reason=reason,
+                            **envelope,
+                        )
                     )
-                )
+
+                response_line = line_for(response, recorded.unrecorded_reason)
+                if response_line is None:
+                    # The body itself is what the line encoder refused -- today only by being
+                    # nested deeper than the corpus reader parses. Dropping the record would say
+                    # the call never happened; the doctrine for a body this artifact cannot carry
+                    # is a record with a typed absence, and it is the same answer whether the body
+                    # was inline or offloaded (an offloaded one hides its depth inside a chunk, so
+                    # only the inline half could ever be refused -- an asymmetry with no reason).
+                    response_line = line_for(None, "unencodable")
                 if response_line is not None and self._append_model_payload(response_line):
                     wrote_response = True
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
@@ -817,6 +831,12 @@ class AgentRecorder:
             return None
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
+        if not verified_directory_is_safe(chunk_dir):
+            # The sweep unlinks, and it runs before the first write -- so it reaches the chunk
+            # directory ahead of the only other gate on it. ``Path.glob`` follows a redirection
+            # planted there, which would make this a delete primitive in a directory of somebody
+            # else's choosing.
+            return handle
         try:
             for orphan in chunk_dir.glob(f"*.{os.getpid()}.*.tmp"):
                 try:

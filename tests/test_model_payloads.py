@@ -533,13 +533,14 @@ def test_a_symlink_planted_at_a_chunk_name_stops_the_corpus_not_the_run(tmp_path
     assert (run_dir / MODEL_CALLS_FILENAME).exists()
 
 
-def test_a_hardlink_planted_at_a_chunk_name_is_caught_where_the_bytes_are_read(
+def test_a_hardlink_planted_at_a_chunk_name_is_refused_by_the_only_evidence_available(
     tmp_path: Path,
 ) -> None:
     """A hard link is not an escape -- it is a second name for a real inode in this directory --
-    so the writer cannot tell it from a chunk it stored earlier, and must not try: a link *count*
-    is exactly what a hardlink-deduplicated archive of a run directory changes. What authenticates
-    a content-addressed file is its hash, and the party that can check it is the reader."""
+    so a link *count* cannot be the test: that is exactly what a hardlink-deduplicated archive of a
+    run directory changes. The size can be, and it is the thing that separates the two cases. An
+    archive's link points at *these* bytes; a planted one almost never does, and refusing it here
+    keeps the loud write-time stop instead of deferring the discovery to whoever next validates."""
     preimage, digest, sha = _offloadable_call()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -553,27 +554,40 @@ def test_a_hardlink_planted_at_a_chunk_name_is_caught_where_the_bytes_are_read(
     _record_offloadable(recorder, preimage, digest)
 
     assert target.read_bytes() == b"theirs"
-    assert [
-        issue.message
-        for issue in validate_run_dir(run_dir)
-        if issue.path.startswith(MODEL_PAYLOADS_FILENAME)
-    ] == ["request payload cannot be reassembled"]
+    assert recorder._model_payloads_failed is True
+    assert _records(run_dir) == []
+    assert (run_dir / MODEL_CALLS_FILENAME).exists()
 
 
-def test_a_hardlink_deduplicated_archive_still_validates(tmp_path: Path) -> None:
+def test_a_hardlink_deduplicated_archive_survives_being_restored_and_resumed(
+    tmp_path: Path,
+) -> None:
     """`cp -al`, `rsync --link-dest` and every dedup-restoring backup raise a chunk's link count.
-    Refusing a multiply-linked file on the read path turned that into a corpus-wide integrity
-    failure on a run directory nothing had touched."""
+    Refusing a multiply-linked file turned that into a corpus-wide integrity failure on a run
+    directory nothing had touched -- on the read path, and again on the write path the moment the
+    restored run re-derived a chunk it already had."""
     preimage, digest, _sha = _offloadable_call()
-    recorder = _standalone_recorder(tmp_path)
-    _record_offloadable(recorder, preimage, digest)
-    chunk_dir = recorder.run_dir / MODEL_PAYLOADS_DIRNAME
-    stored = next(iter(chunk_dir.iterdir()))
+    first = _standalone_recorder(tmp_path)
+    _record_offloadable(first, preimage, digest)
+    stored = next(iter((first.run_dir / MODEL_PAYLOADS_DIRNAME).iterdir()))
     os.link(stored, tmp_path / "archived-copy.bin")
 
+    # The resumed activation has an empty seen-set, so it stores the same chunk again -- onto the
+    # name the archive just multiply-linked.
+    resumed = AgentRecorder(
+        tmp_path / "runs",
+        "run-1",
+        status_file=False,
+        model_calls_file=True,
+        model_payload_file=True,
+        reopen=True,
+    )
+    _record_offloadable(resumed, preimage, digest)
+
+    assert resumed._model_payloads_failed is False
     assert not any(
         issue.path.startswith(MODEL_PAYLOADS_FILENAME)
-        for issue in validate_run_dir(recorder.run_dir)
+        for issue in validate_run_dir(first.run_dir)
     )
 
 
@@ -795,9 +809,30 @@ def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: P
         issue.path.startswith(MODEL_PAYLOADS_FILENAME)
         for issue in validate_run_dir(recorder.run_dir)
     )
+    # ... and the call is still in the corpus. Dropping the line would say it never happened,
+    # where the doctrine for a body this artifact cannot carry is a typed absence -- the same
+    # answer an oversized one gets, and the same answer the offloaded twin would get, since a
+    # chunk hides its depth inside a JSON string and could never have been refused.
+    responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
+    assert [(one["call_index"], one["response"], one["unrecorded_reason"]) for one in responses] == [
+        (0, None, "unencodable")
+    ]
 
 
-def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        # A `str` where the split expects `bytes`: `sha256_bytes` raises inside the call.
+        pytest.param({"request_preimage": "not bytes"}, id="preimage"),
+        # An unhashable digest: the seen-set test raises one statement *before* the call, which is
+        # why containing the call alone was not enough. Nothing validates this field's type, and
+        # the seam is public -- `SettledModelCall` is exported from `contracts`.
+        pytest.param({"request_digest": ["a" * 64]}, id="digest"),
+    ],
+)
+def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
+    tmp_path: Path, hostile: dict[str, Any]
+) -> None:
     """Moving the split out of the lock moved it out of the payload arm's containment too, so a
     raise there skipped both arms and the counter -- no ledger line, no corpus record, and no hole,
     which is the "reads as nothing was lost" shape the index rule exists against. The flag form of
@@ -806,11 +841,10 @@ def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(tmp_path: Path)
     recorder.record_settled_call(
         SettledModelCall(
             receipt=ModelCallReceipt(
-                request_digest="a" * 64, digest_generation="monoid.model-request-digest.v1"
+                request_digest=hostile.get("request_digest", "a" * 64),  # type: ignore[arg-type]
+                digest_generation="monoid.model-request-digest.v1",
             ),
-            # A `str` where the split expects `bytes`: `sha256_bytes` raises before the function's
-            # own guard. An integrator drives this seam directly -- `SettledModelCall` is exported.
-            request_preimage="not bytes",  # type: ignore[arg-type]
+            request_preimage=hostile.get("request_preimage", b'{"a":1}'),  # type: ignore[arg-type]
             turn=ModelTurn(response_id="r0", final_text="a0"),
         )
     )

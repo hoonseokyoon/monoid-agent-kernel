@@ -155,7 +155,15 @@ class _ResolutionBudget:
     holding one reference three thousand times expands a half-megabyte file into gigabytes. A
     faithful record reassembles to its preimage, which is at most
     :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, so this ceiling can only
-    ever stop a record that was never going to verify.
+    ever stop a record that was never going to verify -- every lifted value's encoding is a
+    disjoint substring of the preimage, and a value referenced twice occupies its bytes twice
+    there too.
+
+    It counts *encoded* bytes, which is a proxy for the resident cost and not a measure of it:
+    a pathological structure (deeply empty containers) decodes to roughly twenty times its
+    serialized size, so the real peak at the ceiling is a couple of hundred megabytes rather than
+    eight. Bounded, per record, and freed between records -- which is the property that matters
+    here -- but the constant is not the number of bytes this will hold.
     """
 
     __slots__ = ("remaining",)

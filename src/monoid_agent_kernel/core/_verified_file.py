@@ -268,9 +268,15 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # this process is about to mutate is somebody else's file, but this function mutates
             # nothing (``O_EXCL`` on a temp, then ``os.replace``), and a link count is what every
             # hardlink-deduplicating archive of a run directory changes. A hard link here is a
-            # second name for a real file inside this directory, not an escape from it, and what
-            # authenticates a content-addressed file is its hash -- which the reader checks.
-            return stat.S_ISREG(existing.st_mode)
+            # second name for a real file inside this directory, not an escape from it.
+            #
+            # The size is checked instead, because it is the thing that actually separates the two
+            # cases: an archive's link points at *these bytes*, a planted one almost never does.
+            # Refusing on a mismatch keeps the loud write-time stop for the planted case rather
+            # than deferring it to whoever next runs a validator, and costs the archive case
+            # nothing. Equal size is not proof -- the reader still hashes -- but it is the only
+            # cheap evidence available before the bytes are read.
+            return stat.S_ISREG(existing.st_mode) and existing.st_size == len(data)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
         flags = (
