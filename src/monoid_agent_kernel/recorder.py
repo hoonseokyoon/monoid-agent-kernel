@@ -660,6 +660,13 @@ class AgentRecorder:
             "recorded_at": recorded_at,
         }
         try:
+            # ``digest_generation`` names the rules the key was taken under, and the schema needs
+            # a non-empty one. A recipe whose generation is unknown cannot be interpreted by any
+            # reader, and inventing a default would file it under rules it may not have followed --
+            # the ``_digest`` doctrine again. Refusing costs the request record; the response
+            # record and the ledger line still describe the call.
+            if not receipt.digest_generation:
+                split = None
             if split is not None and receipt.request_digest not in self._payload_request_digests:
                 landed = True
                 for sha, chunk in split.chunks.items():

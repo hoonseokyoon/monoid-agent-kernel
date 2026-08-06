@@ -1128,7 +1128,13 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
                 "request_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "digest_generation": {"type": "string", "minLength": 1},
                 "refs": {"type": "boolean"},
-                "payload": {"type": "object"},
+                # Deliberately untyped. The recipe arm always produces an object, but the
+                # verbatim arm exists for "a preimage the recipe shape does not fit", and a
+                # future digest generation need not wrap its terms at all. What makes a
+                # request record valid is that it reassembles to its digest, which
+                # ``_validate_model_payload_digests`` checks; a type here would reject a
+                # faithful record for the shape of bytes it is faithful to.
+                "payload": {},
             },
             "additionalProperties": False,
         },

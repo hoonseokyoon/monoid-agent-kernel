@@ -560,13 +560,21 @@ def test_a_hardlink_planted_at_a_chunk_name_is_refused_by_the_only_evidence_avai
     assert (run_dir / MODEL_CALLS_FILENAME).exists()
 
 
-def test_a_hardlink_deduplicated_archive_survives_being_restored_and_resumed(
+def test_a_hardlink_deduplicated_chunk_survives_being_restored_and_resumed(
     tmp_path: Path,
 ) -> None:
-    """`cp -al`, `rsync --link-dest` and every dedup-restoring backup raise a chunk's link count.
+    """A dedup-restoring backup (`cp -al`, `rsync --link-dest`) raises a chunk's link count.
     Refusing a multiply-linked file turned that into a corpus-wide integrity failure on a run
     directory nothing had touched -- on the read path, and again on the write path the moment the
-    restored run re-derived a chunk it already had."""
+    restored run re-derived a chunk it already had.
+
+    Scoped to the chunk *files*, which is where the relaxation applies. Link the append-only
+    sidecars the same way and the verified opener refuses them on purpose -- appending mutates, and
+    a second name for that inode is somebody else's file -- so a restore that hardlinks
+    `model_payloads.jsonl` or `model_calls.jsonl` silently stops both arms on resume. That is the
+    documented rule, not a gap; `docs/OBSERVABILITY.md` names it so an operator picks copies over
+    links for the JSONL half.
+    """
     preimage, digest, _sha = _offloadable_call()
     first = _standalone_recorder(tmp_path)
     _record_offloadable(first, preimage, digest)
@@ -874,3 +882,42 @@ def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
         issue.path.startswith(MODEL_PAYLOADS_FILENAME)
         for issue in validate_run_dir(recorder.run_dir)
     )
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param({"digest_generation": ""}, id="generation"),
+        pytest.param({"preimage": b"[1,2,3]"}, id="non-object-preimage"),
+    ],
+)
+def test_the_corpus_never_writes_a_line_its_own_schema_rejects(
+    tmp_path: Path, hostile: dict[str, Any]
+) -> None:
+    """The line encoder's doctrine, applied to the request record's other two constrained fields.
+    `digest_generation` has a `minLength`, so an empty one is a record no reader can interpret and
+    the recipe is refused. `payload` had a `type` that contradicted the writer's own documented
+    verbatim arm -- a preimage that is not an object is still a faithful preimage, and what makes
+    the record valid is that it reassembles."""
+    preimage = hostile.get("preimage", b'{"a":1}')
+    recorder = _standalone_recorder(tmp_path)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(
+                request_digest=hashlib.sha256(preimage).hexdigest(),
+                digest_generation=hostile.get(
+                    "digest_generation", "monoid.model-request-digest.v1"
+                ),
+            ),
+            request_preimage=preimage,
+            turn=ModelTurn(response_id="r", final_text="answer"),
+        )
+    )
+    recorder.close()
+
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+    requests = _by_kind(_records(recorder.run_dir), MODEL_REQUEST_KIND)
+    assert len(requests) == (0 if "digest_generation" in hostile else 1)
