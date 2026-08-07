@@ -367,22 +367,86 @@ def test_reinjected_reasoning_in_the_record_means_declare(tmp_path: Path) -> Non
 
 
 def test_reasoning_answers_with_no_reinjected_trace_mean_do_not_declare(tmp_path: Path) -> None:
-    """Shape (b): answers carry reasoning but no recorded request ever re-injected it -- the
-    undeclared-original shape (the shipped gateway default). Declaring here would make the
-    loop inject blocks the original preimages never had, so the adapter must not."""
+    """Shape (b): answers carry reasoning, and a recorded request that HAD a turn behind it
+    still carried no injected block -- the undeclared-original shape. Declaring here would
+    make the loop inject blocks the original preimages never had, so the adapter must not.
 
+    The assistant history is the whole evidence. The loop appends the block after a call, so
+    only a request with a turn in front of it could ever have carried one; a corpus of first
+    turns proves nothing either way (see the sibling test below).
+    """
+
+    reasoning = ({"type": "reasoning", "id": "opaque"},)
     _record(
         tmp_path,
         _OriginalAdapter(
-            [ModelTurn(final_text="x", reasoning=({"type": "reasoning", "id": "opaque"},))]
+            [
+                ModelTurn(final_text="x", reasoning=reasoning),
+                ModelTurn(final_text="y", reasoning=reasoning),
+            ]
         ),
-        [_request()],
+        [_request(), _request(messages=[{"role": "assistant", "content": "prior turn"}])],
     )
     adapter = _replay(tmp_path)
 
     assert getattr(adapter, "provider_name", None) is None
     turn = _call(adapter, _request())
-    assert turn.reasoning == ({"type": "reasoning", "id": "opaque"},)
+    assert turn.reasoning == reasoning
+
+
+def test_a_corpus_of_first_turns_cannot_testify_and_so_it_declares(tmp_path: Path) -> None:
+    """The undecidable case, and the horn the derivation has to pick.
+
+    Every recorded run settled in one turn, so no request could carry an injected block
+    whether the original declared or not. Reading that silence as "did not declare" breaks the
+    shipped gateway default outright: the gateway declares the RELAYED provider while
+    `ModelConfig.provider` names the transport, so the recorded key term is `openai` and a
+    non-declaring replay computes `gateway` -- every lookup misses, and the preflight refuses
+    a config and a corpus that are both correct.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="x", reasoning=({"type": "reasoning", "id": "opaque"},))],
+            provider_name="openai",
+        ),
+        [_request(model=ModelConfig(provider="gateway"))],
+    )
+    adapter = _replay(tmp_path)
+
+    assert getattr(adapter, "provider_name", None) == "openai"
+    assert _call(adapter, _request(model=ModelConfig(provider="gateway"))).final_text == "x"
+
+
+def test_history_without_a_reply_still_cannot_testify(tmp_path: Path) -> None:
+    """The witness is an assistant *reply*, not the presence of a message list.
+
+    A first call can carry prior user messages -- a session that queued two before the model
+    ever answered. No turn has happened, so no injected block could exist, and the corpus is
+    as silent as an empty history. Treating "has messages" as the witness would decline to
+    declare here and miss every lookup.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="x", reasoning=({"type": "reasoning", "id": "opaque"},))],
+            provider_name="openai",
+        ),
+        [
+            _request(
+                model=ModelConfig(provider="gateway"),
+                messages=[
+                    {"role": "user", "content": "first"},
+                    {"role": "user", "content": "and another"},
+                ],
+            )
+        ],
+    )
+    adapter = _replay(tmp_path)
+
+    assert getattr(adapter, "provider_name", None) == "openai"
 
 
 def test_an_explicit_provider_name_overrides_the_derivation(tmp_path: Path) -> None:

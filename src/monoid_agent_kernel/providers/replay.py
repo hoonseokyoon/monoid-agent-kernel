@@ -14,10 +14,20 @@ one, else its config's provider -- so the term alone cannot say whether the orig
 for a corpus whose original did not, and every second-turn preimage grows a reasoning block
 the recorded ones never had -- a silent 100% miss from turn two. So the adapter reads the
 evidence: recorded request messages carrying the injected block mean the original declared
-(declare); recorded answers carrying reasoning with no injected trace anywhere mean it did
-not (do not declare -- the key's provider term is then authored by the replay run's config,
-which the preflight checks); a corpus with no reasoning at all declares, because declaring
-is inert for injection and pins the key's provider term independent of the run config.
+(declare); recorded answers carrying reasoning where a recorded request *had a turn behind
+it* and still carried no injected trace mean it did not (do not declare -- the key's provider
+term is then authored by the replay run's config, which the preflight checks); anything else
+declares, because declaring is inert for injection and pins the key's provider term
+independent of the run config.
+
+That third branch includes the corpus that cannot testify. The block is appended *after* a
+call, so only a request with an assistant message in front of it could ever have carried one:
+a corpus whose every recorded run settled in a single turn is silent on the question, not
+evidence for the negative. Reading its silence as a refusal broke the shipped gateway default
+outright -- ``GatewayModelAdapter`` declares the relayed provider (``openai``) while
+``ModelConfig.provider`` names the transport (``gateway``), so the recorded key term is
+``openai`` and a non-declaring replay computes ``gateway``: every lookup in the run misses,
+and the preflight refuses a config and a corpus that are both correct.
 
 **Heterogeneous sources are rejected at construction.** One adapter serves one provider's
 answers; a family that mixed providers cannot exist under the kernel (children share the
@@ -96,6 +106,18 @@ def _is_injected_reasoning(message: Any) -> bool:
     return isinstance(block, Mapping) and "provider" in block and "items" in block
 
 
+def _is_assistant_message(message: Any) -> bool:
+    """A recorded request that already had a turn behind it.
+
+    The witness for whether the corpus can testify at all. The loop appends the reasoning
+    block *after* a call, so only a request with an assistant message in front of it could
+    ever have carried one -- a corpus of first turns is silent on the question, not evidence
+    for the negative.
+    """
+
+    return isinstance(message, Mapping) and message.get("role") == "assistant"
+
+
 def _is_media_block(part: Any) -> bool:
     """The neutral resolved media block (``core/media.py``'s base64 source shape)."""
 
@@ -158,6 +180,7 @@ class ReplayModelAdapter:
 
         providers: list[str] = []
         injected_reasoning = False
+        assistant_history = False
         media_seen = False
         for terms in corpus.request_terms_view():
             provider = terms.get("provider")
@@ -167,6 +190,8 @@ class ReplayModelAdapter:
             for message in messages if isinstance(messages, list) else ():
                 if _is_injected_reasoning(message):
                     injected_reasoning = True
+                if _is_assistant_message(message):
+                    assistant_history = True
                 content = message.get("content") if isinstance(message, Mapping) else None
                 if isinstance(content, list) and any(_is_media_block(part) for part in content):
                     media_seen = True
@@ -180,12 +205,20 @@ class ReplayModelAdapter:
             recorded = providers[0] if providers else None
             if injected_reasoning:
                 declared = recorded
-            elif any(body.get("reasoning") for body in corpus.response_bodies_view()):
-                # Answers carried reasoning and no recorded request ever re-injected it:
-                # the original did not declare, so neither may this adapter -- declaring
-                # would make the loop inject blocks the recorded preimages never had.
+            elif assistant_history and any(
+                body.get("reasoning") for body in corpus.response_bodies_view()
+            ):
+                # Answers carried reasoning, and a recorded request had a turn behind it in
+                # which the block would have appeared: the original did not declare, so
+                # neither may this adapter -- declaring would make the loop inject blocks the
+                # recorded preimages never had.
                 declared = None
             else:
+                # Including the corpus that cannot testify: every recorded request is a first
+                # turn, so no injected block could exist either way. Silence is not evidence
+                # for the negative, and reading it as one breaks the shipped gateway default,
+                # whose key term is the RELAYED provider ("openai") while the config names the
+                # transport ("gateway") -- declining there misses every lookup in the run.
                 declared = recorded
         else:
             declared = provider_name
