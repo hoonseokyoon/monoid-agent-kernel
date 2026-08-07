@@ -1042,9 +1042,7 @@ def test_backend_bounds_concurrent_runs(tmp_path: Path) -> None:
 
 def _jsonl_lines(path: Path) -> list[dict]:
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -1129,9 +1127,7 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
         llm_gateway_url="http://llm-gateway.internal/v1/turns",
         model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
             turns=[
-                ModelTurn(
-                    tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)
-                ),
+                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
                 # The approval starts as an async task and the model is consulted again with
                 # that observation, so the first activation makes TWO recorded calls before
                 # the session parks -- ledger indexes [0, 1].
