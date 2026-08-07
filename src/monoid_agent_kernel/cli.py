@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import time
 from dataclasses import replace
@@ -32,6 +33,7 @@ from monoid_agent_kernel.core.spec import (
     ModelConfig,
     RunLimits,
 )
+from monoid_agent_kernel.core.payload_gc import collect_payload_garbage
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.packages import (
     apply_package,
@@ -719,6 +721,90 @@ def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
         click.echo("ok")
     if issues:
         raise click.ClickException("run directory validation failed")
+
+
+@main.command("gc")
+@click.argument("run_dir_or_id", type=str)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
+@click.option(
+    "--min-age-s",
+    "min_age_s",
+    type=float,
+    default=86400.0,
+    show_default=True,
+    help="Never touch an entry younger than this many seconds.",
+)
+@click.option(
+    "--apply",
+    "apply_deletes",
+    is_flag=True,
+    help="Delete the candidates; the default only reports them.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+@click.pass_context
+def gc_command(
+    ctx: click.Context,
+    run_dir_or_id: str,
+    run_root: Path,
+    min_age_s: float,
+    apply_deletes: bool,
+    json_output: bool,
+) -> None:
+    """Collect a run's unreferenced replay-corpus chunks and dead write temporaries.
+
+    Report-only by default; --apply deletes. Never run this against a run whose writer may
+    still be alive -- liveness is the operator's knowledge, exactly as it is for validate.
+    Referenced chunks are protected by membership, not age; --min-age-s additionally protects
+    every recently written or recently adopted entry, whatever it is.
+    """
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    if not run_dir.is_dir():
+        # A typo'd run id must fail loudly, not come back as a clean empty report.
+        raise click.ClickException(f"run directory not found: {run_dir}")
+    report = collect_payload_garbage(run_dir, min_age_s=min_age_s, apply=apply_deletes)
+    # A refusal or a failed deletion exits non-zero so scripted sweeps notice -- via ctx.exit
+    # after the payload, never ClickException, whose Error line would land in the same stream
+    # and corrupt --json output (the builder validate precedent). Garbage merely *found* is
+    # exit 0: finding it is the verb working.
+    failed = (
+        report.chunk_dir_state == "unsafe"
+        or any(entry.classification == "unjudged" for entry in report.entries)
+        or any(entry.error for entry in report.entries)
+    )
+    if json_output:
+        click.echo(
+            json.dumps(
+                dataclasses.asdict(report), ensure_ascii=False, sort_keys=True, allow_nan=False
+            )
+        )
+    else:
+        click.echo(f"run_dir: {report.run_dir}")
+        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {report.corpus_state}")
+        click.echo(
+            f"mode: {'apply' if report.applied else 'report-only'}"
+            f"  min_age_s: {report.min_age_s:g}"
+        )
+        kept = sum(1 for entry in report.entries if entry.classification == "kept")
+        click.echo(f"kept: {kept}")
+        for entry in report.entries:
+            if entry.classification == "kept":
+                continue
+            # ``!r`` on purpose: these names are whoever-wrote-them's strings, quoted so they
+            # cannot typeset themselves into the report.
+            line = f"{entry.classification:>8} {entry.size:>10} {entry.name!r}"
+            if entry.deleted:
+                line += "  deleted"
+            if entry.error:
+                line += f"  [{entry.error}]"
+            click.echo(line)
+        if report.damaged_lines:
+            click.echo(f"damaged_lines: {', '.join(map(str, report.damaged_lines))}")
+        click.echo(f"candidate_bytes: {report.candidate_bytes}")
+        click.echo(f"reclaimed_bytes: {report.reclaimed_bytes}")
+    if failed:
+        ctx.exit(1)
 
 
 @main.group("package")

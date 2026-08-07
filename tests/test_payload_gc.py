@@ -15,7 +15,9 @@ import os
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core import schemas
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._verified_file import write_once_temp_stem
@@ -692,3 +694,85 @@ def test_a_redirected_chunk_directory_is_refused_untouched(tmp_path: Path) -> No
     assert report.chunk_dir_state == "unsafe"
     assert report.entries == ()
     assert (outside / ("2" * 64)).read_bytes() == b"theirs"
+
+
+# --- The CLI verb ---------------------------------------------------------------------------------
+
+
+def test_gc_json_report_round_trips(tmp_path: Path) -> None:
+    """The default invocation is a judgment, not an action: exit 0, machine-readable, and the
+    orphan it names is still on disk afterwards."""
+    run_dir, sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 512)
+    _backdate(orphan)
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["applied"] is False
+    assert payload["candidate_bytes"] == 512
+    assert payload["reclaimed_bytes"] == 0
+    entries = {entry["name"]: entry for entry in payload["entries"]}
+    assert entries["f" * 64]["classification"] == "orphan"
+    assert entries[sha]["classification"] == "kept"
+    assert orphan.exists()
+
+
+def test_gc_apply_deletes_and_reports_reclaimed_bytes(tmp_path: Path) -> None:
+    run_dir, sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 512)
+    _backdate(orphan)
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir), "--apply", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["applied"] is True and payload["reclaimed_bytes"] == 512
+    assert not orphan.exists()
+    assert (run_dir / MODEL_PAYLOADS_DIRNAME / sha).exists()
+    assert not any(
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(run_dir)
+    )
+
+
+def test_gc_exit_is_nonzero_but_stdout_stays_parseable_on_refusal(tmp_path: Path) -> None:
+    """Pins the ctx.exit choice: a refusal is exit 1 so scripted sweeps notice, and the payload
+    on stdout is still one parseable JSON document -- a ClickException here would append its
+    Error line into the same stream and corrupt it."""
+    chunk_dir = tmp_path / MODEL_PAYLOADS_DIRNAME
+    chunk_dir.mkdir()
+    (chunk_dir / ("9" * 64)).write_bytes(b"x" * 64)
+
+    result = CliRunner().invoke(main, ["gc", str(tmp_path), "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["corpus_state"] == "absent"
+    assert (chunk_dir / ("9" * 64)).exists()
+
+
+def test_gc_text_mode_quotes_untrusted_names_and_hides_nothing_deleted(tmp_path: Path) -> None:
+    """Foreign names are whoever-wrote-them's strings; the human rendering quotes them instead
+    of letting them typeset themselves into the report."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    odd = run_dir / MODEL_PAYLOADS_DIRNAME / "odd 'name'.txt"
+    odd.write_bytes(b"x")
+    _backdate(odd)
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert repr("odd 'name'.txt") in result.output
+    assert "reclaimed_bytes: 0" in result.output
+    assert odd.exists()
+
+
+def test_gc_on_a_missing_run_dir_is_a_click_error(tmp_path: Path) -> None:
+    """A typo'd run id must not come back as a clean empty report."""
+    result = CliRunner().invoke(main, ["gc", str(tmp_path / "nope")])
+
+    assert result.exit_code == 1
+    assert "Error" in result.output
