@@ -1235,7 +1235,18 @@ def backend_serve(
         model_calls_file=model_calls_file,
         model_payload_file=model_payload_file,
     )
-    server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
+    # The backend is built before the socket, so the region that releases it has to start before
+    # the socket too. `create_backend_server` binds, and a bound port or an unusable host is the
+    # everyday failure here -- with the release keyed to `serve_forever`, that failure returned a
+    # constructed backend to nobody, and reported itself as a bare `OSError` traceback rather than
+    # as the CLI error every other startup failure gets.
+    try:
+        server = create_backend_server(
+            runner_backend, host=host, port=port, admin_token=admin_token
+        )
+    except OSError as exc:
+        runner_backend.shutdown()
+        raise click.ClickException(f"could not listen on {host}:{port}: {exc}") from exc
     click.echo(f"Monoid backend listening on http://{host}:{port}")
     click.echo(
         f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}"
@@ -1248,7 +1259,10 @@ def backend_serve(
         click.echo("Monoid backend stopped")
     finally:
         server.server_close()
-        runner_backend.shutdown()  # stop the shared run loop + watchdog
+        # Releases the run loop and any leases this backend holds. It does not stop a watchdog:
+        # `start_watchdog` is opt-in and this command never starts one, which is what the old
+        # comment here claimed the opposite of.
+        runner_backend.shutdown()
 
 
 @main.group("llm-gateway")

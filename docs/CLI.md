@@ -236,12 +236,14 @@ Four things to know before turning the second one on.
 **It is content, and `--redact-path` does not reach it.** Path redaction masks the public event
 and status stream; private run artifacts keep real paths and contents, as `transcript.jsonl`
 already does. A workspace file your redaction policy hides from events is in the corpus in full
-if the model was shown it. `--deny-path` is different — denied content never reaches the model,
-so it never reaches the corpus either.
+if the model was shown it. `--deny-path` helps but does not cover this: it refuses tool and shell
+*path arguments*, and removes denied files from an isolated-copy shell workspace — a shell command
+that reads a denied file by other means still returns the bytes to the model, and from there to
+the corpus.
 
 **It grows with the conversation and nothing deletes it.** A turn's request is the whole
 conversation so far, so a long run's corpus lands in the same order of magnitude as its
-`transcript.jsonl` — roughly doubling a run directory in the measured case. Repeated content is
+`transcript.jsonl`, and enabling it can roughly double a run directory. Repeated content is
 stored once per activation (tool definitions, messages and observations are content-addressed),
 but there is no per-run cap and no retention verb: `monoid gc` collects only chunks *no record
 resolves*, so a healthy corpus is never collected. Deleting one means deleting the files.

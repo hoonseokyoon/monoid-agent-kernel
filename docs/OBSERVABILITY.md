@@ -418,14 +418,23 @@ sidecars" is a rule that reaches whichever ones the reader counts. Each is opene
 regular file on purpose: appending mutates an inode, and a second name for it is somebody else's
 file. A backup or restore that hardlink-deduplicates a run directory (`cp -al`,
 `rsync --link-dest`) therefore disables all three on the next activation. The run itself is
-unaffected — it completes, exits zero, and `monoid validate` still reports the directory clean,
-because each artifact is optional — so the refusal is announced instead: each writer logs one
-`WARNING` naming the artifact it will not write, once per activation, on
-`monoid_agent_kernel.recorder` (the ledger and the corpus) and
-`monoid_agent_kernel.model_content`. `WARNING` because these writers are opt-in: reaching that
-line means somebody asked for the artifact and is not getting it, and Python's last-resort
-handler delivers exactly that level to stderr for an operator who configured no logging.
-A stale artifact is the reason it matters — the refused file is left as it was, so what a reader
+unaffected — it completes and exits zero — and in that scenario `monoid validate` reports the
+directory clean, because the linked file is a valid earlier copy and each artifact is optional.
+(An arbitrary planted file is a different matter: validate then reports it as unparseable.)
+
+So the refusal is announced. Every transition into an artifact's terminal state — a refused open,
+a refused chunk, an append that may have torn its line, and, for `model-content.jsonl`, a
+descriptor that no longer matches its path — logs one `WARNING` naming the artifact, once per
+activation, on `monoid_agent_kernel.recorder` (all three artifacts, when the recorder is the one
+that gives up) and `monoid_agent_kernel.core.model_content` (when the content store is). A
+failure that costs a single record stays at `debug`; only the terminal transition is loud.
+`WARNING` because it means a run lost an artifact it was configured to produce, and because
+Python's last-resort handler delivers exactly that level to stderr for an operator who configured
+no logging. The message names the artifact and nothing else — the run id travels as the
+`monoid_run_id` field on the record, so an aggregator can key on it without every default stderr
+rendering carrying identifiers.
+
+A stale artifact is the reason it matters: the refused file is left as it was, so what a reader
 finds there afterwards is whatever the link pointed at, not this run's record.
 Content-addressed files under `model_payloads/` are safe to link; those three logs must
 be copied. (`transcript.jsonl` and `events.jsonl` are unaffected — they do not go through the

@@ -1177,6 +1177,11 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
     ledger_path = submission.run_dir / "model_calls.jsonl"
     assert eventually(lambda: len(first_adapter.requests) == 2)
     assert eventually(lambda: len(_jsonl_lines(ledger_path)) == 2)
+    # Structural, not hopeful: the first activation is stopped before the second exists, so the
+    # `[0, 1, 0]` sequence cannot be disturbed by it, and its append handle on the shared ledger
+    # is released before the takeover appends to the same file. `FakeModelAdapter` answers past
+    # its script instead of raising, so waiting on counts alone could never rule out a third call.
+    backend1.shutdown(drain=False)
 
     backend2 = RunnerBackend(
         run_root=run_root,
@@ -1191,30 +1196,29 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
         model_payload_file=True,
     )
     backend2.max_recover_attempts = 10_000
-    assert eventually(lambda: run_id in backend2.recover_runs() or run_id in backend2._records)
-    assert eventually(lambda: bool(pending_approval_tasks(backend2)))
-    task_id = pending_approval_tasks(backend2)[0]["task_id"]
-    backend2.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
+    try:
+        assert eventually(lambda: run_id in backend2.recover_runs() or run_id in backend2._records)
+        assert eventually(lambda: bool(pending_approval_tasks(backend2)))
+        task_id = pending_approval_tasks(backend2)[0]["task_id"]
+        backend2.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
 
-    assert eventually(lambda: len(_jsonl_lines(ledger_path)) >= 3)
-    backend2.cancel_run(run_id, token)
-    backend2.wait_for_run(run_id, timeout_s=20)
+        assert eventually(lambda: len(_jsonl_lines(ledger_path)) >= 3)
+        backend2.cancel_run(run_id, token)
+        backend2.wait_for_run(run_id, timeout_s=20)
 
-    ledger_lines = _jsonl_lines(ledger_path)
-    assert [line["call_index"] for line in ledger_lines] == [0, 1, 0]
-    assert all(len(line["request_digest"]) == 64 for line in ledger_lines)
-    request_records = [
-        record
-        for record in _jsonl_lines(submission.run_dir / "model_payloads.jsonl")
-        if record.get("kind") == "model_request"
-    ]
-    assert {record["request_digest"] for record in request_records} == {
-        line["request_digest"] for line in ledger_lines
-    }, "every activation's ledger line joins a recorded preimage"
-
-    # Both backends are constructed directly, so the autouse factory that drains and shuts down
-    # managed ones never sees them. Left running, backend1 keeps a loop thread, a parked session
-    # and an open append handle on the very ledger backend2 appended to -- which on Windows is
-    # what stops pytest from removing this test's tmp_path.
-    backend1.shutdown(drain=False)
-    backend2.shutdown(drain=False)
+        ledger_lines = _jsonl_lines(ledger_path)
+        assert [line["call_index"] for line in ledger_lines] == [0, 1, 0]
+        assert all(len(line["request_digest"]) == 64 for line in ledger_lines)
+        request_records = [
+            record
+            for record in _jsonl_lines(submission.run_dir / "model_payloads.jsonl")
+            if record.get("kind") == "model_request"
+        ]
+        assert {record["request_digest"] for record in request_records} == {
+            line["request_digest"] for line in ledger_lines
+        }, "every activation's ledger line joins a recorded preimage"
+    finally:
+        # In a `finally` because this is teardown, not a step: an earlier assertion failing would
+        # otherwise leave the handle open and turn one failed assertion into a failure plus a
+        # tmp_path removal error on Windows.
+        backend2.shutdown(drain=False)

@@ -33,18 +33,26 @@ out in commit messages and here.
 
 ### Fixed — a sidecar somebody asked for and did not get says so
 
-- **All three verified-append sidecars now log one `WARNING` naming the artifact they will not
-  write, instead of a `debug` line nobody sees.** Each fails closed when its path is not a file
-  this process may append to — a planted link, or the second name a hardlink-deduplicating
-  backup leaves behind — which is right, and was silent: the run exited zero, reported
-  `completed`, and `monoid validate` called the directory clean, because each artifact is
-  optional. Worse, the refused file keeps whatever was there, so a reader could find another
-  run's records under this run's name. `WARNING` because these writers are opt-in — reaching
-  that line means somebody asked — and because Python's last-resort handler delivers exactly
-  that level to stderr for an operator who configured no logging, which is the shape `monoid
-  run` runs in. Once per activation, since the refusal was already terminal. The rule is bound
-  at every verified-open refusal rather than at the recorder's log sites, because
-  `model-content.jsonl` owns its own open in `core/model_content.py`.
+- **Every transition into a sidecar's terminal state now logs one `WARNING` naming the artifact,
+  instead of a `debug` line nobody sees or, for `model-content.jsonl`, nothing at all.** These
+  writers fail closed when the path is not a file this process may append to (a planted link, or
+  the second name a hardlink-deduplicating backup leaves behind), when a chunk cannot be stored,
+  when an append may have torn its line, and — for the content store — when its descriptor stops
+  matching its path mid-run. All of that was silent: the run exited zero, reported `completed`,
+  and `monoid validate` called the directory clean, because each artifact is optional. Worse, the
+  refused file keeps whatever was there, so a reader could find another run's records under this
+  run's name; and the chunk case leaves the corpus file never created at all, which is
+  indistinguishable from never asking for it. `WARNING` because it means a run lost an artifact
+  it was configured to produce, and because Python's last-resort handler delivers exactly that
+  level to stderr for an operator who configured no logging, which is the shape `monoid run` runs
+  in. Once per activation: the flag and the announcement are one call, and every one of the
+  thirteen assignments goes through it, pinned by an AST census — a failure that costs a single
+  record stays at `debug`. The message names the artifact only; the run id travels as a
+  `monoid_run_id` field on the record.
+- **`monoid backend serve` releases its backend when the socket cannot be taken.** The release
+  was keyed to `serve_forever`, so a bound port — the everyday failure of this command, and one
+  that happens after the backend is constructed — returned a built backend to nobody and reported
+  itself as a bare `OSError` traceback instead of the CLI error every other startup failure gets.
 
 ### Added — the chunk directory's crash litter now has a collector
 

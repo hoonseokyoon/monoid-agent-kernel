@@ -79,8 +79,9 @@ default must be changed for production.
       and not served publicly. The same applies to the opt-in private sidecars when
       enabled — `model-content.jsonl`, `model_calls.jsonl`, and `model_payloads.jsonl`
       with its `model_payloads/` directory. Two of those three carry content
-      (`model_calls.jsonl` carries metadata only), and the replay corpus has no
-      shipped reader, so filesystem access is the only control over it.
+      (`model_calls.jsonl` carries metadata only), and no projection, hydration
+      path or HTTP route serves the replay corpus, so filesystem access is the
+      only control over it (`monoid validate` and `monoid gc` read it in place).
 - [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
       MCP servers, and untrusted processes cannot modify committed `events.jsonl`
       prefixes; the Reference warm offset index relies on this append-only boundary.

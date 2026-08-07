@@ -240,12 +240,14 @@ def test_studio_wires_content_permission_without_disabling_provider_streaming(
     # same `stream`, and keying the workspace on the value alone collided on the second.
     calls = itertools.count()
 
-    # The tuple carries EVERY backend switch that can put model content on disk or on a wire, not
-    # the ones that existed when it was written: `model_payload_file` is the second
-    # content-classified artifact on this dataclass, and a census that enumerates one of two is
-    # how a rule stops reaching the half nobody added. Studio sets neither of the two recording
-    # switches, so both tail entries are False in every row below -- which is the claim: turning
-    # Studio's egress toggle on grants live delivery and the content sidecar, never the corpus.
+    # The tuple carries every backend switch that selects a model-call artifact, not the ones that
+    # existed when it was written. `model_payload_file` is the one that matters for this test's
+    # subject: it is the second *content-classified* artifact on this dataclass, and a census that
+    # enumerates one of two is how a rule stops reaching the half nobody added. `model_calls_file`
+    # rides along for symmetry rather than for content -- a ledger record carries digests, usage
+    # and taxonomy, never a body. Studio sets neither recording switch, so both tail entries are
+    # False in every row below, which is the claim: turning Studio's egress toggle on grants live
+    # delivery and the content sidecar, never the corpus.
     def backend_stream_state(*, egress: bool) -> tuple[bool, bool, bool, bool, bool, bool]:
         workspace = tmp_path / f"ws-{egress}-{next(calls)}"
         workspace.mkdir()

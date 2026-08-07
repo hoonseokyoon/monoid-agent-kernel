@@ -1975,3 +1975,47 @@ def test_backend_serve_carries_the_recording_flags_to_the_backend(
         assert backend.model_payload_file is requested
     finally:
         backend.shutdown()
+
+
+def test_backend_serve_releases_the_backend_when_the_socket_cannot_be_taken(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bound port is the everyday failure of this command, and it happens after the backend is
+    built. With the release keyed to `serve_forever`, that path returned a constructed backend to
+    nobody and reported a bare `OSError` traceback instead of the CLI error every other startup
+    failure gets."""
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+
+    released: list[str] = []
+
+    class _Tracking(RunnerBackend):  # type: ignore[misc]
+        def shutdown(self, *args: object, **kwargs: object) -> object:
+            released.append("shutdown")
+            return super().shutdown(*args, **kwargs)
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.RunnerBackend", _Tracking)
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli.create_backend_server",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError(48, "address already in use")),
+    )
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "backend", "serve",
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+            "--ephemeral-token-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert released == ["shutdown"], "the constructed backend was never released"
+    assert not isinstance(result.exception, OSError), (
+        "the bind failure must be a reported CLI error, not a traceback"
+    )
+    assert "could not listen on" in result.output, result.output
