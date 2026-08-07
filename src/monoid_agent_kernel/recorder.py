@@ -628,7 +628,7 @@ class AgentRecorder:
 
         Request side first, response side second, chunks before the record that references them:
         a failure part-way leaves unreferenced chunks -- which the validator deliberately ignores
-        -- never a record whose references dangle.
+        and ``monoid gc`` reclaims -- never a record whose references dangle.
 
         Returns whether this call has been *accounted for*, which is what the shared index counts.
         A landed response line is one way; a failed call is the other, and it is not a write that
@@ -831,8 +831,9 @@ class AgentRecorder:
         mid-write never reopens under the same pid, so its temporary outlives every sweep. What
         this collects is an in-process reopen's own leftovers. Cross-process orphans are unreferenced
         files in a content-addressed directory, which the validator ignores by design and which
-        belong to the collector W6-3 owns; identity cannot tell a dead writer from a live one, and
-        guessing wrong in the other direction is the failure above."""
+        ``monoid gc`` collects -- offline, age-gated, on the operator's word that no writer is
+        live -- because identity cannot tell a dead writer from a live one, and guessing wrong in
+        the other direction is the failure above."""
 
         if self._model_payloads_failed:
             # Terminal, not per-line. Two appends can reach this within one call, and a refusal is

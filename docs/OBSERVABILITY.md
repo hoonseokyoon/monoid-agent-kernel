@@ -427,6 +427,23 @@ file only. Chunk files are created write-once through the same verified-file pri
 JSONL handles. The corpus, unlike the ledger, is content-classified; enable it with the same care
 as `model_content_file`.
 
+Chunk-directory hygiene is a separate verb. `monoid gc RUN_DIR` reports what no record in the
+corpus resolves — orphaned chunks from an interrupted write, dead `*.tmp` litter left by crashed
+writers in other processes — and `monoid gc RUN_DIR --apply` deletes it, exiting non-zero for
+refusals and failed deletions and zero for garbage merely found. Never run it beside a live
+writer of the same run directory: the writer takes no cross-process lock and nothing on disk can
+prove a writer dead, so liveness is the operator's knowledge, exactly as it is for
+`monoid validate`. Two belts bound the damage of a broken contract without licensing one: entries
+younger than `--min-age-s` (default one day) are never touched, and the write-once store
+refreshes a chunk's timestamps when a resumed run re-derives one it already holds, so recent use
+looks recent — an incremental archiver may answer that refreshed timestamp with one redundant
+re-copy, a copy and not a correctness cost. A corpus that is absent or unreadable beside stored
+chunks leaves them `unjudged` and untouched (a mutilated directory and a first-call crash whose
+very first chunk was directory-sized leave the same state); damaged corpus *lines* are the
+opposite case — no reader parses them, so what only they referenced is collected, and the report
+names the line numbers. Deletion never outruns the validator: `monoid validate` reports the same
+issues after a sweep as before it.
+
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains
 operation-level events. A reconnect hydrates completed content from the sidecar; retained v0.20 and

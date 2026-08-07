@@ -211,8 +211,12 @@ adds a third that is this artifact's whole contract: every `model_request` recor
 to the exact preimage of its `request_digest`, and `monoid validate` recomputes that per record —
 resolving chunk references from inline records and the `model_payloads/` directory, re-encoding,
 and comparing hashes. Unreferenced files in the chunk directory are not integrity issues (a
-crashed write may orphan one; garbage collection is a separate concern), but a referenced chunk
-that fails its hash, or a request record that does not reassemble, is. The record kinds share one
+crashed write may orphan one) — reclaiming them is `monoid gc`'s job: report-only by default,
+deletion under `--apply`, nothing younger than `--min-age-s` ever touched, and never run beside a
+live writer of the same run directory. A referenced chunk that fails its hash, or a request
+record that does not reassemble, is an integrity issue, and the collector preserves the
+validator's verdict by construction — it deletes only what no record resolves, so
+`monoid validate` reports the same issues after a sweep as before it. The record kinds share one
 `oneOf` schema the way `model-content.v1`'s four kinds do.
 
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new

@@ -268,9 +268,10 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     exclusive creation cannot be redirected by a planted link, and a link planted at the temporary
     name fails the open outright -- then take the final name via ``os.replace``, which replaces a
     link *itself* rather than writing through it (the same shape the checkpoint store's blob
-    writer uses). A crash between the two leaves an orphaned ``*.tmp`` the owner sweeps at open,
-    never a half-written file under a content-addressed name that would poison every reader
-    trusting the name.
+    writer uses). A crash between the two leaves an orphaned ``*.tmp`` -- swept at the owner's
+    next open under the same pid, and by ``monoid gc`` across pids, behind its age gate -- never
+    a half-written file under a content-addressed name that would poison every reader trusting
+    the name.
 
     ``False`` is terminal for the artifact the caller is building, for the reason the append
     opener's ``None`` is: the refusal is a property of the path.

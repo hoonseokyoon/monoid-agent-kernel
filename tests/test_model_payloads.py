@@ -822,7 +822,10 @@ def test_the_orphan_sweep_leaves_another_writers_in_flight_temporary_alone(
 ) -> None:
     """The sweep collects this process's crash litter. A durable run reclaimed while its previous
     owner is still alive would otherwise have its in-flight chunk deleted mid-write, which fails
-    that writer's ``os.replace`` and kills its corpus arm over something it did not do."""
+    that writer's ``os.replace`` and kills its corpus arm over something it did not do.
+    Cross-pid litter has its sanctioned deleter now -- ``monoid gc``, offline and age-gated
+    (``test_a_dead_writers_old_temp_goes_and_a_young_one_stays``) -- which is exactly why this
+    sweep never widens."""
     recorder = _standalone_recorder(tmp_path)
     chunk_dir = recorder.run_dir / MODEL_PAYLOADS_DIRNAME
     chunk_dir.mkdir(parents=True, exist_ok=True)

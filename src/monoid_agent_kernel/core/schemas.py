@@ -1740,8 +1740,10 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
     Reads the file leniently -- lines the schema pass already reported are skipped here rather
     than reported twice -- and treats every reassembly failure as an issue on the record that
     cannot honor its digest, naming the line. Unreferenced files in the chunk directory are NOT
-    issues: a crashed write may orphan one, and garbage collection is a separate concern from
-    integrity (only what a record references must verify).
+    issues: a crashed write may orphan one, and reclaiming it is ``monoid gc``'s job, not this
+    pass's -- integrity is only what a record references. The collector keeps the converse
+    promise (it deletes nothing this pass resolves), bound by a spy test over this function's
+    reader rather than by sharing its code.
     """
 
     path = run_dir / MODEL_PAYLOADS_FILENAME
