@@ -1931,3 +1931,47 @@ def test_cli_run_recording_flags_produce_the_sidecars(
     assert quiet.exit_code == 0, quiet.output
     assert not (run_root / "cli-quiet" / "model_calls.jsonl").exists()
     assert not (run_root / "cli-quiet" / "model_payloads.jsonl").exists()
+
+
+@pytest.mark.parametrize("requested", [True, False], ids=["asked", "omitted"])
+def test_backend_serve_carries_the_recording_flags_to_the_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requested: bool
+) -> None:
+    """A deployment is served, not run one-shot, so the deployment shape needs the flags too.
+
+    `monoid run` and the `RunnerBackend` field are two of the three surfaces the precedent this
+    wiring follows shipped together -- `--llm-gateway-provider` landed on `monoid run`, on
+    `monoid backend serve`, and as the field, because a switch reachable from two of three leaves
+    the served deployment with `monoid gc` and `monoid validate` and no way to produce what they
+    consume. Both parities are pinned: absent flags must leave the deployment recording nothing.
+    """
+    built: list[Any] = []
+
+    def capture(runner_backend, **_kwargs):
+        built.append(runner_backend)
+        raise KeyboardInterrupt  # stop before the socket; serve_forever is not under test
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.create_backend_server", capture)
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    argv = [
+        "backend", "serve",
+        "--run-root", str(tmp_path / "runs"),
+        "--workspace-root", str(workspace),
+        "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        "--ephemeral-token-secret",
+    ]
+    if requested:
+        argv += ["--model-calls-file", "--model-payload-file"]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert built, result.output
+    backend = built[0]
+    try:
+        assert backend.model_calls_file is requested
+        assert backend.model_payload_file is requested
+    finally:
+        backend.shutdown()

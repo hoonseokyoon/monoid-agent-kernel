@@ -1161,6 +1161,20 @@ def backend() -> None:
 )
 @click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
+    "--model-calls-file",
+    is_flag=True,
+    help="Record a per-call model ledger (model_calls.jsonl) in every run this backend serves.",
+)
+@click.option(
+    "--model-payload-file",
+    is_flag=True,
+    help=(
+        "Record the private replay corpus (model_payloads.jsonl plus its chunk directory) in "
+        "every run this backend serves. Carries request and response content for every tenant, "
+        "with no per-run override and no retention verb."
+    ),
+)
+@click.option(
     "--admin-token-env",
     type=str,
     default="MONOID_BACKEND_ADMIN_TOKEN",
@@ -1189,6 +1203,8 @@ def backend_serve(
     llm_gateway_url: str,
     llm_gateway_provider: str | None,
     web_gateway_url: str | None,
+    model_calls_file: bool,
+    model_payload_file: bool,
     admin_token_env: str,
     token_secret_env: str,
     ephemeral_token_secret: bool,
@@ -1215,6 +1231,8 @@ def backend_serve(
         llm_gateway_url=llm_gateway_url,
         llm_gateway_provider=llm_gateway_provider,
         web_gateway_url=web_gateway_url,
+        model_calls_file=model_calls_file,
+        model_payload_file=model_payload_file,
     )
     server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
     click.echo(f"Monoid backend listening on http://{host}:{port}")
