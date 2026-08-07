@@ -97,6 +97,10 @@ produces the other four. A reason outside this tuple is a contract change, not a
 # Bounds the message, not the comparison -- and a digest prefix is still content-free.
 _DIAGNOSED_TERMS = 4
 _DIGEST_PREFIX = 12
+_IDENTITY_TERMS = ("provider", "model")
+"""The terms a *config* change moves, named once so the two diagnoses agree about which they
+are: `identity_divergence` compares them by value across the whole corpus, and the term-by-term
+branch has to recognise them to say `identity_mismatch` rather than blame the conversation."""
 
 
 @dataclass(frozen=True)
@@ -651,11 +655,11 @@ class ReplayCorpus:
         )
         if divergence is not None:
             return ReplayMissReason(MISS_IDENTITY_MISMATCH, divergence)
-        return ReplayMissReason(MISS_ABSENT, self._closest_divergence(live_terms))
+        return self._closest_divergence(live_terms)
 
-    def _closest_divergence(self, live_terms: Mapping[str, Any]) -> str:
+    def _closest_divergence(self, live_terms: Mapping[str, Any]) -> ReplayMissReason:
         live_digests = {name: _term_digest(value) for name, value in live_terms.items()}
-        best: tuple[int, str, dict[str, str]] | None = None
+        best: tuple[int, str, dict[str, str], Mapping[str, Any]] | None = None
         for digest in self._requests:
             terms = self._request_terms(digest)
             if terms is None:
@@ -663,15 +667,37 @@ class ReplayCorpus:
             recorded = {name: _term_digest(value) for name, value in terms.items()}
             matches = sum(1 for name in live_digests if recorded.get(name) == live_digests[name])
             if best is None or matches > best[0]:
-                best = (matches, self._requests[digest].run_id, recorded)
+                best = (matches, self._requests[digest].run_id, recorded, terms)
         if best is None:
-            return "identity matches but the corpus holds no reassemblable request to compare"
-        _matches, run_id, recorded = best
+            return ReplayMissReason(
+                MISS_ABSENT,
+                "identity matches but the corpus holds no reassemblable request to compare",
+            )
+        _matches, run_id, recorded, recorded_terms = best
         diverging = sorted(
             name
             for name in set(live_digests) | set(recorded)
             if live_digests.get(name) != recorded.get(name)
         )
+        identity_terms = [name for name in _IDENTITY_TERMS if name in diverging]
+        if identity_terms:
+            # `identity_divergence` answered "some recorded identity matches this run", which
+            # is a different question from "the record this call would have used was recorded
+            # under it". In a union of identities the first is true and the second false, and
+            # the answer is a config change, not a diverged conversation -- so it earns the
+            # reason that says so, and names the identity in the plaintext the preflight uses.
+            # (Identity terms are config vocabulary the ledger already records in the clear;
+            # everything below this branch stays digests.)
+            clauses = [
+                f"{name} recorded {recorded_terms.get(name)!r}, computing {live_terms.get(name)!r}"
+                for name in identity_terms
+            ]
+            return ReplayMissReason(
+                MISS_IDENTITY_MISMATCH,
+                "this run's config reaches an identity the corpus recorded, but not the one "
+                f"the closest recorded request (run {run_id}) was recorded under: "
+                + "; ".join(clauses),
+            )
         named = diverging[:_DIAGNOSED_TERMS]
         clauses = [
             f"{name} live={live_digests.get(name, 'missing')[:_DIGEST_PREFIX]} "
@@ -679,9 +705,10 @@ class ReplayCorpus:
             for name in named
         ]
         more = f" and {len(diverging) - len(named)} more" if len(diverging) > len(named) else ""
-        return (
+        return ReplayMissReason(
+            MISS_ABSENT,
             "identity matches; diverging terms vs the closest recorded request "
-            f"(run {run_id}): " + "; ".join(clauses) + more
+            f"(run {run_id}): " + "; ".join(clauses) + more,
         )
 
     def _request_terms(self, digest: str) -> Mapping[str, Any] | None:

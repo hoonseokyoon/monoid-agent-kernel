@@ -415,6 +415,57 @@ def test_duplicate_request_records_keep_the_first(tmp_path: Path) -> None:
     assert [profile["model"] for profile in profiles] == [{"model": "m-first"}]
 
 
+def test_a_miss_whose_diverging_term_is_the_identity_says_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """`identity_divergence` answers "some recorded identity matches", which is not the same
+    question as "the record this call would have used was recorded under this identity".
+
+    In a union of two identities the run's config reaches one of them, so the preflight passes
+    with a warning and the whole-corpus check finds nothing -- and then a call recorded under
+    the *other* one misses. Today that lands in the term-by-term branch, which prefixes its
+    sentence with "identity matches" and then names `model` as the diverging term, in digest
+    form, while `provider_error_code` reads `absent`. Every one of those is the wrong answer:
+    an automation choosing between "fix the config" and "the conversation diverged" is told the
+    second, and an operator is told the identity is fine by the same sentence that says it is
+    not.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    # This run's config reaches `m-here`, so some recorded identity matches. The call it is
+    # about, though, was recorded under `m-elsewhere` -- that record is the closest one by
+    # every term except the identity itself.
+    here = {"instruction": "a different turn", "provider": "gateway", "model": {"model": "m-here"}}
+    elsewhere = {
+        "instruction": "shared",
+        "system_prompt": "sp",
+        "provider": "gateway",
+        "model": {"model": "m-elsewhere"},
+    }
+    live = dict(elsewhere, model={"model": "m-here"})
+    records = []
+    for terms in (here, elsewhere):
+        value = {_GEN: terms}
+        digest = sha256_bytes(model_payloads._encoded(value))
+        records.append(
+            model_request_record(
+                value, refs=False, request_digest=digest, digest_generation=_GEN, **_envelope()
+            )
+        )
+    _write_corpus(run_dir, records)
+    corpus = ReplayCorpus.load([run_dir])
+    assert len(corpus.identity_profiles()) == 2, "the union of two identities is the fixture"
+
+    miss = corpus.diagnose({_GEN: live}, generation=_GEN)
+
+    assert miss.reason == MISS_IDENTITY_MISMATCH
+    assert "identity matches" not in miss.detail
+    assert "m-elsewhere" in miss.detail and "m-here" in miss.detail, (
+        "the identity is config vocabulary the ledger already records in plaintext; naming it "
+        "by digest leaves the operator unable to read which model was expected"
+    )
+
+
 # --- typed misses ---------------------------------------------------------------------------
 
 
