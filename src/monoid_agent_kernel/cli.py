@@ -6,6 +6,7 @@ import json
 import time
 from dataclasses import replace
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -108,7 +109,7 @@ main.add_command(builder_group)
         "Load run-specific values from a JSON file (AgentRunSpec.to_json shape). "
         "When set, individual spec flags are ignored; runtime flags "
         "(runtime config, gateway URLs/tokens, --event-sink-module, --stream-json, "
-        "--no-status-file, --tool-module) still apply."
+        "--no-status-file, --tool-module, --model-calls-file, --model-payload-file) still apply."
     ),
 )
 @click.option("--agent-definition-file", type=click.Path(path_type=Path), default=None)
@@ -216,6 +217,29 @@ main.add_command(builder_group)
 @click.option(
     "--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function."
 )
+@click.option(
+    "--model-calls-file",
+    is_flag=True,
+    help="Record a per-call model ledger (model_calls.jsonl) in the run directory.",
+)
+@click.option(
+    "--model-payload-file",
+    is_flag=True,
+    help=(
+        "Record the private replay corpus (model_payloads.jsonl plus its chunk directory). "
+        "Carries request and response content in full, including what --redact-path masks from "
+        "events, and grows with the conversation with no retention verb. Verify with "
+        "`monoid validate RUN_DIR`; sweep its crash litter with `monoid gc RUN_DIR --apply`."
+    ),
+)
+@click.option(
+    "--model-content-file",
+    is_flag=True,
+    help=(
+        "Record the private model-content sidecar (model-content.jsonl): the streamed output and "
+        "reasoning text of each call. Content, like the replay corpus. Selects provider streaming."
+    ),
+)
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
 @click.pass_context
@@ -253,6 +277,9 @@ def run(
     web_gateway_token_env: str,
     web_gateway_token_file: Path | None,
     event_sink_module: tuple[str, ...],
+    model_calls_file: bool,
+    model_payload_file: bool,
+    model_content_file: bool,
     stream_json: bool,
     no_status_file: bool,
 ) -> None:
@@ -404,6 +431,9 @@ def run(
             context_providers=(skill_provider,) if skill_provider is not None else (),
             capability_broker=broker,
             event_sinks=tuple(extra_sinks),
+            model_calls_file=model_calls_file,
+            model_payload_file=model_payload_file,
+            model_content_file=model_content_file,
             status_file=not no_status_file,
             permission_policy=spec.permission_policy,
             runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
@@ -1109,6 +1139,41 @@ def backend() -> None:
     """Run the reference Monoid backend."""
 
 
+def _bind_or_report(
+    build: Callable[[], Any],
+    *,
+    host: str,
+    port: int,
+    release: Callable[[], Any] | None = None,
+) -> Any:
+    """Bind a server socket, or fail the way every other startup failure in this CLI fails.
+
+    Shared by all three ``serve`` commands. A bound port is the everyday failure of each of them
+    and it happens *after* the thing being served is constructed, so a per-command `try` around
+    `serve_forever` is one command too late: the constructed object goes to nobody and the
+    operator gets a bare traceback. Written once because the first version of this was bound on
+    `backend serve` alone while its two siblings, eighty and two hundred lines below, kept the
+    behaviour the commit message said had been fixed.
+
+    ``OverflowError`` is in the catch because `click`'s ``int`` accepts 99999 and the socket layer
+    rejects it with that, not with ``OSError`` -- measured. ``release`` failing must not replace
+    the bind failure the operator needs to read.
+    """
+
+    try:
+        return build()
+    except (OSError, OverflowError) as exc:
+        if release is not None:
+            try:
+                release()
+            except Exception as teardown:  # noqa: BLE001 - never replace the bind failure
+                # Demoted to a warning beside the real error, the way `_adapter_teardown` handles
+                # the same problem in this file. Fully silent, a failed release leaves a watchdog
+                # thread and whatever it holds with nothing to say so.
+                click.echo(f"warning: releasing the server failed: {teardown}", err=True)
+        raise click.ClickException(f"could not listen on {host}:{port}: {exc}") from exc
+
+
 @backend.command("serve")
 @click.option("--host", type=str, default="127.0.0.1", show_default=True)
 @click.option("--port", type=int, default=8765, show_default=True)
@@ -1143,6 +1208,30 @@ def backend() -> None:
 )
 @click.option("--web-gateway-url", type=str, default=None, help="Internal WebGateway base URL.")
 @click.option(
+    "--model-calls-file",
+    is_flag=True,
+    help="Record a per-call model ledger (model_calls.jsonl) in every run this backend serves.",
+)
+@click.option(
+    "--model-payload-file",
+    is_flag=True,
+    help=(
+        "Record the private replay corpus (model_payloads.jsonl plus its chunk directory) in "
+        "every run this backend serves. Carries request and response content for every tenant, "
+        "with no per-run override and no retention verb."
+    ),
+)
+@click.option(
+    "--model-content-file",
+    is_flag=True,
+    help=(
+        "Record the private model-content sidecar (model-content.jsonl) in every run this "
+        "backend serves. Content, and deployment-wide like the two above. Unlike them it also "
+        "selects provider streaming, so every tenant's model call moves to the streaming "
+        "dispatch."
+    ),
+)
+@click.option(
     "--admin-token-env",
     type=str,
     default="MONOID_BACKEND_ADMIN_TOKEN",
@@ -1171,6 +1260,9 @@ def backend_serve(
     llm_gateway_url: str,
     llm_gateway_provider: str | None,
     web_gateway_url: str | None,
+    model_calls_file: bool,
+    model_payload_file: bool,
+    model_content_file: bool,
     admin_token_env: str,
     token_secret_env: str,
     ephemeral_token_secret: bool,
@@ -1197,8 +1289,18 @@ def backend_serve(
         llm_gateway_url=llm_gateway_url,
         llm_gateway_provider=llm_gateway_provider,
         web_gateway_url=web_gateway_url,
+        model_calls_file=model_calls_file,
+        model_payload_file=model_payload_file,
+        model_content_file=model_content_file,
     )
-    server = create_backend_server(runner_backend, host=host, port=port, admin_token=admin_token)
+    server = _bind_or_report(
+        lambda: create_backend_server(
+            runner_backend, host=host, port=port, admin_token=admin_token
+        ),
+        host=host,
+        port=port,
+        release=runner_backend.shutdown,
+    )
     click.echo(f"Monoid backend listening on http://{host}:{port}")
     click.echo(
         f"allowed workspace roots: {', '.join(str(path.resolve()) for path in workspace_root)}"
@@ -1211,7 +1313,13 @@ def backend_serve(
         click.echo("Monoid backend stopped")
     finally:
         server.server_close()
-        runner_backend.shutdown()  # stop the shared run loop + watchdog
+        # Stops this backend's watchdog and closes its live-stream broker, if it has either --
+        # this command starts no watchdog and sets no broker, so today it is close to a no-op,
+        # kept because both are backend-owned and a future flag could turn one on. What it
+        # deliberately does NOT do: the run loop is process-shared and survives (stopping it here
+        # would break other backends in the process), and `drain=False` leaves parked sessions on
+        # it. Two earlier versions of this comment claimed otherwise in opposite directions.
+        runner_backend.shutdown()
 
 
 @main.group("llm-gateway")
@@ -1276,7 +1384,11 @@ def llm_gateway_serve(
     gateway = LlmGatewayBackend(
         token_manager=token_manager, provider_adapter_factory=provider_factory
     )
-    server = create_llm_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
+    server = _bind_or_report(
+        lambda: create_llm_gateway_server(gateway, host=host, port=port, admin_token=admin_token),
+        host=host,
+        port=port,
+    )
     click.echo(f"LLM gateway listening on http://{host}:{port}")
     click.echo("turn endpoint: /internal/llm/turns")
     try:
@@ -1396,7 +1508,11 @@ def web_gateway_serve(
         raise click.ClickException(str(exc)) from exc
 
     gateway = WebGatewayBackend(token_manager=token_manager, provider=web_provider)
-    server = create_web_gateway_server(gateway, host=host, port=port, admin_token=admin_token)
+    server = _bind_or_report(
+        lambda: create_web_gateway_server(gateway, host=host, port=port, admin_token=admin_token),
+        host=host,
+        port=port,
+    )
     click.echo(f"WebGateway listening on http://{host}:{port}")
     click.echo(f"provider: {provider}")
     click.echo(f"context provider: {context_provider}")

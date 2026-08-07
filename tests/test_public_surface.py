@@ -619,6 +619,14 @@ def test_the_relayed_provider_fields_are_keyword_only() -> None:
         (RunnerBackend, "llm_gateway_provider"),
         (BackendLoopFactoryContext, "llm_gateway_provider_provider"),
         (StudioConfig, "llm_gateway_provider"),
+        # The recording switches followed the same insertion, for the same reason: each sits
+        # beside the sidecar sibling whose semantics it shares rather than at the tail a
+        # positional append would force. Listed by name because the tuple pins below catch a
+        # dropped ``kw_only`` only as a confusing mid-tuple diff, and this says which rule broke.
+        (RunnerBackend, "model_calls_file"),
+        (RunnerBackend, "model_payload_file"),
+        (BackendLoopFactoryContext, "model_calls_file_provider"),
+        (BackendLoopFactoryContext, "model_payload_file_provider"),
     ):
         (fld,) = [f for f in dataclasses.fields(cls) if f.name == name]
         assert fld.kw_only, f"{cls.__name__}.{name} must be keyword-only to preserve positional order"

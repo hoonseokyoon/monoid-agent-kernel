@@ -9,6 +9,7 @@ independent recovery unit and reports an opened stream without a valid close as 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import threading
@@ -49,6 +50,10 @@ MODEL_CONTENT_FILENAME = "model-content.jsonl"
 DEFAULT_MODEL_CONTENT_BATCH_INTERVAL_S = 0.25
 DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
 _WINDOWS_REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+_LOGGER = logging.getLogger("monoid_agent_kernel.core.model_content")
+"""Named under ``core`` like every other logger in this package (``core.model_stream``,
+``core.sync_bridge``), so a deployment that quiets or routes ``monoid_agent_kernel.core`` reaches
+this one too."""
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
@@ -292,14 +297,14 @@ class ModelContentStore:
                 # longer prove a live descriptor/path identity, so explicit hydration retries.
                 return False
             if not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 return False
             writers = tuple(self._writers)
         for writer in writers:
             writer._flush_pending()
         with self._lock:
             if self._disabled or not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 return False
             return True
 
@@ -324,7 +329,7 @@ class ModelContentStore:
             if self._closing or self._closed:
                 return None
             if self._disabled or not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 raise OSError("active model-content descriptor no longer matches its path")
             # A writer stays active until its terminal append (or abandonment flush) completes and
             # unregisters it. Treating its earlier private ``_closed`` flag as authoritative would
@@ -335,10 +340,10 @@ class ModelContentStore:
                 try:
                     identity = file_identity(os.fstat(self._handle.fileno()))
                 except (OSError, ValueError) as exc:
-                    self._disabled = True
+                    self._disable_locked("its descriptor became unavailable")
                     raise OSError("active model-content descriptor is unavailable") from exc
             if stream_ids and identity is None:
-                self._disabled = True
+                self._disable_locked("a live writer lost its verified descriptor")
                 raise OSError("active model-content writer has no verified descriptor")
             return ActiveModelContentState(
                 store_count=1,
@@ -398,7 +403,7 @@ class ModelContentStore:
             except (OSError, UnicodeError):
                 # A partial write may have torn the current line.  Disable this handle so a later
                 # record cannot be glued to it; the next recorder instance isolates the tail.
-                self._disabled = True
+                self._disable_locked("an append failed and may have torn its line")
                 return False
         return True
 
@@ -410,10 +415,41 @@ class ModelContentStore:
         # re-runs the same refusal.
         handle = open_verified_append_text(self.path)
         if handle is None:
-            self._disabled = True
+            self._disable_locked("it could not be safely opened")
             return None
         self._handle = handle
         return self._handle
+
+    def _disable_locked(self, reason: str) -> None:
+        """Stop this store for good, and say so once. Caller holds ``_lock``.
+
+        This is the oldest of the three sidecar writers and the one that owns its own open, so a
+        rule bound where the *recorder* logs leaves it silent -- which is how it was written first.
+        Its terminal state has several doors, not one: a refused open, a torn append, three
+        detections that the file under the descriptor is no longer the file at the path, and two
+        that the descriptor itself is gone. The substitution ones are what the open-time check
+        refuses, noticed one moment later, and a reader cannot tell a truncated sidecar from a
+        complete one, so silence there is worse than at the door that was already loud.
+
+        The message names ``self.path.name`` -- the basename of the file this store was pointed
+        at, never the directory holding it. Hardcoding ``MODEL_CONTENT_FILENAME`` instead would
+        name a file that does not exist for a caller who chose another one. The guarantee is
+        exactly "a basename, not a path": for every shipped configuration that basename is the
+        sidecar filename, and a caller who points this class at a *directory* gets that
+        directory's name -- which is also a caller whose open is about to fail, since the
+        constructor stores the path verbatim while the registry key normalizes it.
+        """
+
+        if self._disabled:
+            return
+        self._disabled = True
+        artifact = self.path.name
+        _LOGGER.warning(
+            "%s: %s; this activation records no more of it",
+            artifact,
+            reason,
+            extra={"monoid_run_id": self.run_id, "monoid_artifact": artifact},
+        )
 
 
 class _ModelContentWriter:

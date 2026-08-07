@@ -63,6 +63,11 @@ class BackendLoopFactoryContext:
     emit_output_deltas_provider: Callable[[], bool]
     stream_model_calls_provider: Callable[[], bool]
     model_content_file_provider: Callable[[], bool]
+    # The ledger and replay-corpus switches, keyword-only for the same reason as
+    # ``llm_gateway_provider_provider`` above: inserted beside their sidecar sibling without
+    # rebinding the positional arguments that predate them.
+    model_calls_file_provider: Callable[[], bool] = field(kw_only=True)
+    model_payload_file_provider: Callable[[], bool] = field(kw_only=True)
     model_stream_observer_factories_provider: Callable[
         [str], tuple[ModelStreamObserverFactory, ...]
     ]
@@ -193,6 +198,8 @@ class BackendLoopFactory:
                 emit_output_deltas=self._context.emit_output_deltas_provider(),
                 stream_model_calls=self._context.stream_model_calls_provider(),
                 model_content_file=self._context.model_content_file_provider(),
+                model_calls_file=self._context.model_calls_file_provider(),
+                model_payload_file=self._context.model_payload_file_provider(),
                 model_stream_observer_factories=(
                     self._context.model_stream_observer_factories_provider(run_id)
                 ),

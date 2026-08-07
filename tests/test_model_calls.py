@@ -12,6 +12,7 @@ value would record only the calls that succeeded.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_FILENAME
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -505,6 +508,380 @@ def test_a_planted_link_stops_the_ledger_instead_of_being_written_through(
     witness.close()
     assert len(_records(witness.run_dir)) == 1
 
+
+@pytest.mark.parametrize("plant", [_plant_hardlink, _plant_symlink], ids=["hardlink", "symlink"])
+@pytest.mark.parametrize(
+    ("filename", "switch"),
+    [
+        (MODEL_CALLS_FILENAME, "model_calls_file"),
+        (MODEL_PAYLOADS_FILENAME, "model_payload_file"),
+        (MODEL_CONTENT_FILENAME, "model_content_file"),
+    ],
+    ids=["ledger", "corpus", "content"],
+)
+def test_a_refused_sidecar_says_so_at_warning_level(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, filename: str, switch: str, plant: Any
+) -> None:
+    """A sidecar nobody asked for is absent; a sidecar somebody asked for and did not get is a
+    fault, and the operator who asked has to be able to learn it.
+
+    Every one of these three writers fails closed on a refused verified open, which is right, and
+    then said so only at ``debug`` -- so the shape the refusal exists to catch (a link planted where
+    a reopened run expects its artifact, which is also what a hardlink-deduplicating backup leaves
+    behind) produced a run that exits zero, reports ``completed``, and writes nothing where the
+    operator asked for a record. `monoid validate` then reports the directory clean, because each
+    artifact is optional. Nothing anywhere said no.
+
+    Parametrized across all three because they are three copies of one rule, and this repository's
+    recurring defect is a rule bound on one of parallel halves. ``WARNING`` specifically: below it,
+    Python's last-resort handler drops the message, so a CLI operator who configured no logging --
+    the shape that runs `monoid run` -- would still see nothing.
+
+    Both planters, like the sibling refusal test above, because a single one whose guard is
+    ``pytest.skip`` takes the whole three-way census with it on a filesystem that declines it.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.model_stream import ModelStreamContext, ModelStreamDelta
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.jsonl"
+    target.write_bytes(b"{}\n")
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    plant(run_dir / filename, target)
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False, **{switch: True})
+    with caplog.at_level(logging.WARNING):
+        # TWICE, both arms. "Once per activation" is a claim about the second attempt, so a test
+        # that makes one attempt asserts it vacuously -- it would read `== 1` no matter how the
+        # door was written.
+        for attempt in range(2):
+            recorder.record_settled_call(
+                # A turn, so the corpus arm has an answer to record and actually reaches for its
+                # handle: an empty receipt gives the corpus nothing to write, and a refusal nobody
+                # reached is not the refusal under test.
+                SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="answer"))
+            )
+            writer = recorder.open_model_stream(
+                ModelStreamContext(
+                    run_id="run-1",
+                    root_run_id="run-1",
+                    turn_id=f"t{attempt}",
+                    stream_id=f"s{attempt}",
+                    step=attempt,
+                    provider="fake",
+                    model="m",
+                    started_at="2026-01-01T00:00:00Z",
+                )
+            )
+            writer.push(ModelStreamDelta("output", "answer"))
+    recorder.close()
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings, f"the refused {filename} never reached warning level"
+    named = [record for record in warnings if filename in record.getMessage()]
+    # Exactly one, across two attempts. This is the integration half of "once per activation": it
+    # is true here through four independent short-circuits, so no single regression can falsify
+    # it, which is why the door's own guard is pinned directly in
+    # ``test_the_door_is_what_makes_the_announcement_once_per_activation`` below -- there it is
+    # the only thing standing between one line and a line per record.
+    assert len(named) == 1, [record.getMessage() for record in warnings]
+    # The witness that this is a refusal and not merely a quiet run: nothing was written.
+    assert target.read_bytes() == b"{}\n"
+
+
+def test_a_chunk_the_store_refuses_says_so_like_the_files_beside_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The corpus dies at its chunk directory as readily as at its own file, and more quietly.
+
+    An offloaded value is stored *before* the record that references it, so a refusal here means
+    the corpus file is never even created -- there is nothing on disk to notice, which is strictly
+    worse for a reader than a refused open leaving a stale file behind. ``write_verified_bytes_once``
+    returns ``False`` for a planted name at the content-addressed path and for any ``OSError``
+    (ENOSPC, EACCES, a path the platform will not take), and its own contract calls that "terminal
+    for the caller's artifact, for the reason the append opener's ``None`` is".
+
+    So this is the same rule as the three verified-open refusals, one function over -- the shape
+    that has now been missed twice in this branch, which is why the disable is a single call that
+    cannot be made without announcing.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_DIRNAME
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    # Not a symlink: a plain file wearing the chunk directory's name needs no privilege, so this
+    # pin runs everywhere rather than skipping on the platform the project is developed on.
+    (run_dir / MODEL_PAYLOADS_DIRNAME).write_bytes(b"not a directory")
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", model_payload_file=True, status_file=False)
+    with caplog.at_level(logging.WARNING):
+        recorder.record_settled_call(
+            SettledModelCall(
+                receipt=ModelCallReceipt(),
+                turn=ModelTurn(final_text="x" * 300_000),  # past the offload threshold
+            )
+        )
+        recorder.record_settled_call(
+            SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="y" * 300_000))
+        )
+    recorder.close()
+
+    named = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and MODEL_PAYLOADS_FILENAME in record.getMessage()
+    ]
+    assert len(named) == 1, [record.getMessage() for record in caplog.records]
+    assert not (run_dir / MODEL_PAYLOADS_FILENAME).exists(), (
+        "the corpus file is never created on this route, which is why the log is the only signal"
+    )
+
+
+def test_the_door_is_what_makes_the_announcement_once_per_activation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Called straight, so the guard under test is the only one in the way.
+
+    Driven through a run, "exactly one warning" is true through four short-circuits -- two
+    wanted-predicates, the handle cache, and the door -- so removing any single one leaves the
+    count at one and a regression walks. Here the door is the only thing between one line and a
+    line per record, and the flags are what the recorder's own callers read, so the second half of
+    the assertion is that a second call is a no-op rather than merely a quiet one.
+    """
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    from monoid_agent_kernel.core.model_content import ModelContentStore
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False)
+    # The store's door is in this tuple because it is the one that is *re-entered*: once the
+    # store is disabled, `active_state()` calls it again on every call, and Studio's hydration
+    # calls that repeatedly. Its guard is therefore the load-bearing one, and it was the door
+    # this test originally left out -- the same twin-miss the repair it belongs to is named for.
+    store = ModelContentStore(tmp_path / "runs" / "run-1" / MODEL_CONTENT_FILENAME, run_id="run-1")
+    doors = (
+        (recorder._lose_model_calls_locked, MODEL_CALLS_FILENAME, recorder, "_model_calls_failed"),
+        (
+            recorder._lose_model_payloads_locked,
+            MODEL_PAYLOADS_FILENAME,
+            recorder,
+            "_model_payloads_failed",
+        ),
+        (
+            recorder._lose_model_content_locked,
+            MODEL_CONTENT_FILENAME,
+            recorder,
+            "_model_content_store_failed",
+        ),
+        (store._disable_locked, MODEL_CONTENT_FILENAME, store, "_disabled"),
+    )
+    with caplog.at_level(logging.WARNING):
+        for door, _artifact, _owner, _flag in doors[:3]:
+            for _ in range(3):
+                door("a reason")
+    recorder.close()
+
+    for _door, artifact, owner, flag in doors[:3]:
+        named = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.WARNING and artifact in record.getMessage()
+        ]
+        assert len(named) == 1, [record.getMessage() for record in caplog.records]
+        assert getattr(owner, flag) is True
+
+    # The store's door, on its own record set: it shares an artifact name with the recorder's
+    # third door, so it cannot be counted in the same pass.
+    caplog.clear()
+    store_door, store_artifact, store_owner, store_flag = doors[3]
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            store_door("a reason")
+    store.close()
+
+    named = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and store_artifact in record.getMessage()
+    ]
+    assert len(named) == 1, [record.getMessage() for record in caplog.records]
+    assert getattr(store_owner, store_flag) is True
+
+
+def test_the_announcement_carries_no_traceback_and_no_identifier(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What the line says goes to every embedder's stderr, so it names the artifact and stops.
+
+    A rendered traceback names the absolute run directory -- the run id, and whatever a deployment
+    calls the directories above it -- which is why the refusal sites carry no ``exc_info``. That
+    rule was written on one of them and then carried *past* by a level promotion on its neighbour,
+    so it is pinned here rather than left as a comment. Identifiers still travel, in ``extra``,
+    where an aggregator can key on them and the default rendering does not.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_id = "run-with-a-telling-name"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"{}\n")
+    _plant_hardlink(run_dir / MODEL_CALLS_FILENAME, outside)
+
+    recorder = AgentRecorder(tmp_path / "runs", run_id, model_calls_file=True, status_file=False)
+    with caplog.at_level(logging.WARNING):
+        recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
+    recorder.close()
+
+    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert record.exc_info is None, "a traceback here would print the absolute run directory"
+    rendered = logging.Formatter("%(message)s").format(record)
+    assert run_id not in rendered
+    assert str(tmp_path) not in rendered
+    assert MODEL_CALLS_FILENAME in rendered
+    # ...and the identifier is still available to anything that asks for it.
+    assert record.monoid_run_id == run_id
+
+
+def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other_way(
+    tmp_path: Path,
+) -> None:
+    """A census, because this rule has now been bound on a subset three times in one branch.
+
+    Each writer keeps one or more flags meaning "this artifact records nothing for the rest of the
+    activation". Setting one is exactly the event an operator needs told, so the assignment and the
+    announcement are a single call and the raw assignment appears only inside it.
+
+    Everything is derived and scoped to the class that owns the doors. The first version hand-listed
+    three flag names and missed the two ``_closed`` twins sitting in the same boolean; the second
+    derived them, but passed an empty artifact tuple for the content store, so the derivation ran on
+    one module and the other kept its hand-list. Scoping to the owning class is what makes the
+    derivation work for both -- ``_closed`` on ``ModelContentStore`` is a terminal latch, while the
+    identically-named flag on the per-stream writer beside it is not, and only the class boundary
+    tells them apart.
+    """
+    import ast
+
+    from monoid_agent_kernel import recorder as recorder_module
+    from monoid_agent_kernel.core import model_content as content_module
+
+    def owning_class(tree: ast.AST, name: str) -> ast.ClassDef:
+        found = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == name]
+        assert len(found) == 1, f"expected exactly one class {name}, found {len(found)}"
+        return found[0]
+
+    def methods(cls: ast.ClassDef) -> dict[str, tuple[int, int]]:
+        return {
+            n.name: (n.lineno, n.end_lineno or n.lineno)
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+
+    def self_attrs(node: ast.AST) -> set[str]:
+        return {
+            sub.attr
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Attribute)
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id == "self"
+        }
+
+    def written_true(cls: ast.ClassDef) -> set[str]:
+        latched: set[str] = set()
+        for node in ast.walk(cls):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                if node.value.value is True:
+                    for target in node.targets:
+                        latched |= self_attrs(target)
+        return latched
+
+    for module, class_name, doors, teardown in (
+        (
+            recorder_module,
+            "AgentRecorder",
+            (
+                "_lose_model_calls_locked",
+                "_lose_model_payloads_locked",
+                "_lose_model_content_locked",
+            ),
+            ("close",),
+        ),
+        (content_module, "ModelContentStore", ("_disable_locked",), ("close",)),
+    ):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        cls = owning_class(ast.parse(source), class_name)
+        owned = methods(cls)
+        for door in doors:
+            assert door in owned, f"{class_name} must funnel its disable through {door}"
+        for name in teardown:
+            assert name in owned, (
+                f"{class_name}.{name} is the teardown this census allows to latch a flag without "
+                f"announcing (normal termination is the one transition an operator must NOT be "
+                f"warned about). It was renamed or removed -- update the census deliberately."
+            )
+
+        # A terminal latch is an attribute a gate consults AND that this class sets to True. Both
+        # halves are derived: gates say which flags decide whether the artifact still records,
+        # `= True` says which of those are latches rather than transient reads. Method names are
+        # subtracted because `self._predicate()` inside a gate is a call, not a flag.
+        gated: set[str] = set()
+        for node in ast.walk(cls):
+            if isinstance(node, ast.BoolOp):
+                gated |= self_attrs(node)
+        flags = (gated & written_true(cls)) - set(owned)
+        assert flags, (
+            f"{class_name}: derived no terminal-latch flags, so this census proves nothing"
+        )
+
+        allowed = [owned[name] for name in (*doors, "__init__", *teardown) if name in owned]
+        writes: list[tuple[int, str]] = []
+        for node in ast.walk(cls):
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                if self_attrs(target) & flags and not any(
+                    lo <= node.lineno <= hi for lo, hi in allowed
+                ):
+                    writes.append((node.lineno, sorted(self_attrs(target) & flags)[0]))
+            # `setattr(self, "_flag", True)` and `object.__setattr__(self, "_flag", True)` reach
+            # the same state with no assignment node at all.
+            if isinstance(node, ast.Call) and any(
+                isinstance(arg, ast.Constant) and arg.value in flags for arg in node.args
+            ):
+                writes.append((node.lineno, "setattr-shaped call"))
+        class_lines = source.splitlines()[cls.lineno - 1 : (cls.end_lineno or cls.lineno)]
+        class_source = chr(10).join(class_lines)
+        assert "__dict__[" not in class_source and "vars(self)" not in class_source, (
+            f"{class_name} reaches an attribute through a mapping; the census cannot see that"
+        )
+        assert not writes, (
+            f"{class_name} writes a terminal-latch flag outside its announcing door at {writes}; "
+            f"every transition into that state must go through the door that speaks. "
+            f"Derived latches: {sorted(flags)}"
+        )
+
+        # Non-vacuity, PER DOOR and over real call nodes: an aggregate count lets one door lose
+        # every caller behind its siblings, and a substring count is satisfied by a comment.
+        for door in doors:
+            lo, hi = owned[door]
+            callers = [
+                node.lineno
+                for node in ast.walk(cls)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == door
+                and not (lo <= node.lineno <= hi)
+            ]
+            assert callers, f"{class_name}.{door} exists but nothing calls it"
 
 def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_path: Path) -> None:
     """A record torn by a crash costs its own line, never the next activation's first one.

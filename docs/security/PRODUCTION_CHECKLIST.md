@@ -76,11 +76,18 @@ default must be changed for production.
 - [ ] The public event stream is redacted; a redacting event sink masks
       secret-bearing tool args / shell commands.
 - [ ] Run directories, `transcript.jsonl`, and checkpoints are access-controlled
-      and not served publicly.
+      and not served publicly. The same applies to the opt-in private sidecars when
+      enabled — `model-content.jsonl`, `model_calls.jsonl`, and `model_payloads.jsonl`
+      with its `model_payloads/` directory. Two of those three carry content
+      (`model_calls.jsonl` carries metadata only), and no projection, hydration
+      path or HTTP route serves the replay corpus, so filesystem access is the
+      only control over it (`monoid validate` and `monoid gc` read it in place).
 - [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
       MCP servers, and untrusted processes cannot modify committed `events.jsonl`
       prefixes; the Reference warm offset index relies on this append-only boundary.
-- [ ] Retention policy for private artifacts is defined.
+- [ ] Retention policy for private artifacts is defined. Nothing in the kernel
+      deletes them: `monoid gc` collects only chunks no record resolves, so a healthy
+      replay corpus grows with the conversation until you remove it.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.
 

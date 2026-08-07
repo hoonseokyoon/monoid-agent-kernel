@@ -210,6 +210,60 @@ Three optional features on `monoid run`, each off unless its flag is set:
 See [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) and [SKILLS_DESIGN.md](SKILLS_DESIGN.md)
 for the design of these surfaces.
 
+## Recording model calls
+
+Three opt-in artifacts, off unless their flag is set, on both `monoid run` and
+`monoid backend serve`:
+
+- `--model-calls-file` — `model_calls.jsonl`, one metadata record per settled model call,
+  including the failed ones: timings, token usage, failure taxonomy and the replay key. It
+  carries no content and no endpoint.
+- `--model-payload-file` — `model_payloads.jsonl` plus a `model_payloads/` directory of
+  content-addressed chunks: the exact request bytes each replay key was hashed over, and the
+  settled response bodies with provider reasoning included.
+- `--model-content-file` — `model-content.jsonl`, the streamed output and reasoning text of each
+  call. Content, like the corpus. It also selects provider streaming, which the other two do not.
+
+```bash
+monoid run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --runtime-config-file examples/runtime-config.json \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --model-calls-file --model-payload-file
+```
+
+Four things to know before turning the second one on.
+
+**It is content, and `--redact-path` does not reach it.** Path redaction masks the public event
+and status stream; private run artifacts keep real paths and contents, as `transcript.jsonl`
+already does. A workspace file your redaction policy hides from events is in the corpus in full
+if the model was shown it. `--deny-path` helps but does not cover this: it refuses tool and shell
+*path arguments*, and removes denied files from an isolated-copy shell workspace — a shell command
+that reads a denied file by other means still returns the bytes to the model, and from there to
+the corpus.
+
+**It grows with the conversation and nothing deletes it.** A turn's request is the whole
+conversation so far, so a long run's corpus lands in the same order of magnitude as its
+`transcript.jsonl`, and enabling it can roughly double a run directory. Repeated content is
+stored once per activation (tool definitions, messages and observations are content-addressed),
+but there is no per-run cap and no retention verb: `monoid gc` collects only chunks *no record
+resolves*, so a healthy corpus is never collected. Deleting one means deleting the files.
+
+**Subagents inherit it, into their own directories.** A child run records into its own run
+directory beside the parent's, joined by `root_run_id`. `monoid validate` and `monoid gc` each
+take one run directory, so a run tree needs one invocation per member.
+
+**Verify with `monoid validate RUN_DIR`** — it re-checks every record against its schema and
+re-derives each request digest from the stored bytes, reporting issues rather than showing
+content. **Sweep crash litter with `monoid gc RUN_DIR --apply`**, never beside a live writer of
+the same directory. Both verbs are covered in
+[OBSERVABILITY.md](OBSERVABILITY.md), which also documents the hardlink hazard: a backup that
+deduplicates a run directory disables these writers on the next activation, and each says so with
+one `WARNING` naming the artifact it will not write. If you configured no logging, that line
+reaches stderr; if you configured some, the loggers are `monoid_agent_kernel.recorder` and
+`monoid_agent_kernel.core.model_content`.
+
 ## Streaming JSON
 
 For machine-readable real-time progress:

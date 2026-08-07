@@ -412,6 +412,19 @@ class RunnerBackend:
     # Optional private model-content sidecar. The embedding application decides the entitlement;
     # the backend only wires the resulting boolean into every root/recovered activation.
     model_content_file: bool = False
+    # The other two recording sidecars, carried the same way: the per-run model-call ledger
+    # (`model_calls.jsonl`) and the private replay corpus (`model_payloads.jsonl` plus its
+    # chunk directory). Keyword-only because the positional argument list that predates them
+    # is a pinned public surface, like ``llm_gateway_provider`` above.
+    #
+    # The embedding application decides the entitlement here too, with one difference worth
+    # stating: the corpus is content-classified like ``model_content_file``, but unlike it has no
+    # shipped reader -- no projection, no hydration, no HTTP route serves it -- so filesystem
+    # access to the run directory is the only control over it, and there is no retention verb.
+    # These are also deployment-wide: a multi-tenant backend records every tenant's runs or none,
+    # since ``BackendRunRequest`` carries no per-run override.
+    model_calls_file: bool = field(default=False, kw_only=True)
+    model_payload_file: bool = field(default=False, kw_only=True)
     # Process-local, root-multiplexed presentation channel. Its observer receives parent and child
     # model streams by their authoritative root lineage. Omit it to expose no live content API.
     model_stream_broker: LiveModelStreamBroker | None = None
@@ -616,6 +629,8 @@ class RunnerBackend:
                 emit_output_deltas_provider=lambda: self.emit_output_deltas,
                 stream_model_calls_provider=lambda: self.stream_model_calls,
                 model_content_file_provider=lambda: self.model_content_file,
+                model_calls_file_provider=lambda: self.model_calls_file,
+                model_payload_file_provider=lambda: self.model_payload_file,
                 model_stream_observer_factories_provider=lambda root_run_id: (
                     ()
                     if self.model_stream_broker is None

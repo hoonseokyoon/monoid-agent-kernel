@@ -495,6 +495,10 @@ def test_studio_without_async_transport_uses_one_shot_and_completes(
         assert server._backend.stream_model_calls is False
         assert server._backend.model_content_file is False
         assert server._backend.model_stream_broker is None
+        # The two recording switches belong in every enumeration of what Studio grants, not only
+        # in the one that happened to be edited when they were added.
+        assert server._backend.model_calls_file is False
+        assert server._backend.model_payload_file is False
 
         run_id = server.start_chat("one shot still works")["run_id"]
         settled = _wait_settled(server, run_id, 1)

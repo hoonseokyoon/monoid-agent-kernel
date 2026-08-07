@@ -254,7 +254,10 @@ call — including the failed ones — carrying timings, token usage, failure ta
 key, and no content. A third opt-in, `model_payloads.jsonl`, records the content half for replay:
 the exact request bytes each replay key was hashed over (stored as verified reassembly recipes,
 deduplicated per tool definition, per message and per observation) and the settled response
-bodies, reasoning included.
+bodies, reasoning included. Both are requested per run with `monoid run --model-calls-file` and
+`monoid run --model-payload-file`, per deployment with the same two flags on
+`monoid backend serve`, and directly by an embedder through the matching `AgentLoop` and
+`RunnerBackend` fields.
 `MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
 egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
 integrations can still opt into the legacy durable `model.output.delta` and

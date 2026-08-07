@@ -33,7 +33,11 @@ from monoid_agent_kernel.providers._common import (
     prune_dead_reasoning,
     reasoning_replay_window_start,
 )
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
@@ -1865,3 +1869,236 @@ def test_cli_run_refuses_an_adapter_offering_open_without_close(
     assert not isinstance(result.exception, AttributeError), (
         "the failure must be a reported CLI error, not a raw attribute lookup escaping the handler"
     )
+
+
+def test_cli_run_recording_flags_produce_the_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--model-calls-file`` / ``--model-payload-file`` are the CLI's halves of the switches
+    the backend carries as fields. Without them this CLI shipped ``monoid gc`` and ``monoid
+    validate`` -- consumer verbs -- while no ``monoid run`` invocation could produce the
+    artifacts they consume. The witness is the digest join, as in the backend twin: the
+    ledger line's 64-hex key must name the corpus request record beside it. And the flags
+    stay opt-in: the corpus is content-classified, so the second run pins that omitting them
+    writes neither file."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+    run_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-recording",
+            "--model-calls-file", "--model-payload-file",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_dir = run_root / "cli-recording"
+    ledger_lines = [
+        json.loads(line)
+        for line in (run_dir / "model_calls.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert ledger_lines, "the ledger flag reached the run"
+    digest = ledger_lines[0]["request_digest"]
+    assert len(digest) == 64
+    request_records = [
+        record
+        for record in (
+            json.loads(line)
+            for line in (run_dir / "model_payloads.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        if record.get("kind") == "model_request"
+    ]
+    assert [record["request_digest"] for record in request_records] == [digest]
+
+    quiet = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-quiet",
+        ],
+    )
+
+    assert quiet.exit_code == 0, quiet.output
+    assert not (run_root / "cli-quiet" / "model_calls.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model_payloads.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model-content.jsonl").exists()
+
+    # The third sidecar, whose flag landed with these two so that `monoid validate`'s
+    # model-content arm stops being a consumer with no producer. Driven by a *streaming* adapter,
+    # because this flag is the one with a side effect: it selects the streaming dispatch, and the
+    # non-streaming fake above produces a file with `stream_opened`/`stream_closed` and not one
+    # `stream_segment` -- so an existence check on that adapter pins the wiring and none of the
+    # behaviour the flag's own help advertises.
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeStreamingModelAdapter(
+            chunk_turns=[[TextDelta("streamed "), TextDelta("answer"), TurnComplete()]]
+        ),
+    )
+    content = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-content", "--model-content-file",
+        ],
+    )
+
+    assert content.exit_code == 0, content.output
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (run_root / "cli-content" / "model-content.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert "stream_segment" in kinds, kinds
+
+
+@pytest.mark.parametrize("requested", [True, False], ids=["asked", "omitted"])
+def test_backend_serve_carries_the_recording_flags_to_the_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requested: bool
+) -> None:
+    """A deployment is served, not run one-shot, so the deployment shape needs the flags too.
+
+    `monoid run` and the `RunnerBackend` field are two of the three surfaces the precedent this
+    wiring follows shipped together -- `--llm-gateway-provider` landed on `monoid run`, on
+    `monoid backend serve`, and as the field, because a switch reachable from two of three leaves
+    the served deployment with `monoid gc` and `monoid validate` and no way to produce what they
+    consume. Both parities are pinned: absent flags must leave the deployment recording nothing.
+    """
+    built: list[Any] = []
+
+    def capture(runner_backend, **_kwargs):
+        built.append(runner_backend)
+        raise KeyboardInterrupt  # stop before the socket; serve_forever is not under test
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.create_backend_server", capture)
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    argv = [
+        "backend", "serve",
+        "--run-root", str(tmp_path / "runs"),
+        "--workspace-root", str(workspace),
+        "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        "--ephemeral-token-secret",
+    ]
+    if requested:
+        argv += ["--model-calls-file", "--model-payload-file", "--model-content-file"]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert built, result.output
+    backend = built[0]
+    try:
+        # All three private sidecars, because a deployment reachable for two of them is the
+        # asymmetry this branch exists to close, and `monoid validate` re-checks all three.
+        assert backend.model_calls_file is requested
+        assert backend.model_payload_file is requested
+        assert backend.model_content_file is requested
+    finally:
+        backend.shutdown()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["backend", "serve"], ["llm-gateway", "serve"], ["web-gateway", "serve"]],
+    ids=["backend", "llm-gateway", "web-gateway"],
+)
+def test_every_serve_command_reports_a_bind_failure_as_a_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
+) -> None:
+    """Three commands, one rule. The first version of this fix was bound on `backend serve` alone
+    while its two siblings, eighty and two hundred lines below in the same file, kept the bare
+    traceback the commit message said had been removed -- and that message's own words were "the
+    CLI error *every other* startup failure gets".
+
+    Port 99999 rather than a genuinely bound socket, because that is the shape that escaped:
+    `click`'s `int` accepts it and the socket layer answers with `OverflowError`, not `OSError`,
+    so an `except OSError` catches nothing at all here.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in (
+        "MONOID_BACKEND_ADMIN_TOKEN",
+        "MONOID_LLM_GATEWAY_ADMIN_TOKEN",
+        "MONOID_WEB_GATEWAY_ADMIN_TOKEN",
+    ):
+        monkeypatch.setenv(name, "admin-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    argv = [*command, "--port", "99999", "--ephemeral-token-secret"]
+    if command[0] == "backend":
+        argv += [
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        ]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, (OSError, OverflowError)), (
+        f"the bind failure escaped as a traceback: {result.exception!r}"
+    )
+    assert "could not listen on" in result.output, result.output
+
+
+def test_backend_serve_releases_the_backend_when_the_socket_cannot_be_taken(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bound port is the everyday failure of this command, and it happens after the backend is
+    built. With the release keyed to `serve_forever`, that path returned a constructed backend to
+    nobody and reported a bare `OSError` traceback instead of the CLI error every other startup
+    failure gets."""
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+
+    released: list[str] = []
+
+    class _Tracking(RunnerBackend):  # type: ignore[misc]
+        def shutdown(self, *args: object, **kwargs: object) -> object:
+            released.append("shutdown")
+            return super().shutdown(*args, **kwargs)
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.RunnerBackend", _Tracking)
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli.create_backend_server",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError(48, "address already in use")),
+    )
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "backend", "serve",
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+            "--ephemeral-token-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert released == ["shutdown"], "the constructed backend was never released"
+    assert not isinstance(result.exception, OSError), (
+        "the bind failure must be a reported CLI error, not a traceback"
+    )
+    assert "could not listen on" in result.output, result.output

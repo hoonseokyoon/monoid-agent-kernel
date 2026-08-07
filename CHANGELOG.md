@@ -7,6 +7,65 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the recording switches are reachable from the shipped shapes
+
+- **`--model-calls-file`, `--model-payload-file` and `--model-content-file` on both `monoid run`
+  and `monoid backend serve`, and the matching keyword-only `RunnerBackend(model_calls_file=...,
+  model_payload_file=...)` fields.** The per-call ledger and the private replay corpus existed
+  only as `AgentLoop` keyword arguments — an embedder could record, no shipped shape could —
+  while the same CLI already shipped `monoid gc`, a consumer verb for an artifact nothing it ran
+  could produce, and `monoid validate`'s corpus arm beside it. Every surface lands together, as
+  `--llm-gateway-provider` did, because a switch reachable from two of three leaves the served
+  deployment with the consumer verbs and no producer — and `model-content.jsonl` is in the set
+  for that same reason, since `monoid validate` re-checks it too. The backend carries the
+  booleans exactly as it carries `model_content_file`: into the submitted run and into the
+  activation recovery rebuilds, pinned by the ledger's own activation-restart signature
+  (`call_index` back at zero, both zeros recorded). Each boolean is read when a host builds an
+  activation, so it describes the host, not the run — a run reclaimed by a node configured
+  differently records differently from there on. All three stay opt-in — two of them are
+  content-classified — and the omission half is pinned too: a run without the flags writes none
+  of them. Studio is deliberately not wired for the two recording switches; its egress toggle
+  grants live delivery and the content sidecar, never the corpus, and all three Studio censuses
+  now enumerate them so that stays true.
+- **Breaking, for direct constructors of an unsupported surface:**
+  `BackendLoopFactoryContext` gains two *required* keyword arguments,
+  `model_calls_file_provider` and `model_payload_file_provider`, following
+  `llm_gateway_provider_provider`. `reference.backend` declares itself outside the supported
+  public surface, and only `RunnerBackend` constructs this class in-tree, so nothing in a
+  supported configuration breaks; an embedder that assembles the context itself must add the two.
+  The `RunnerBackend` fields are keyword-only for the ordinary reason: its positional argument
+  list is pinned by `tests/test_public_surface.py`.
+
+### Fixed — a sidecar somebody asked for and did not get says so
+
+- **Every transition into a sidecar's terminal state now logs one `WARNING` naming the artifact,
+  instead of a `debug` line nobody sees or, for `model-content.jsonl`, nothing at all.** These
+  writers fail closed when the path is not a file this process may append to (a planted link, or
+  the second name a hardlink-deduplicating backup leaves behind), when a chunk cannot be stored,
+  when an append may have torn its line, and — for the content store — when its descriptor stops
+  matching its path mid-run. All of that was silent: the run exited zero, reported `completed`,
+  and `monoid validate` called the directory clean, because each artifact is optional. Worse, the
+  refused file keeps whatever was there, so a reader could find another run's records under this
+  run's name; and the chunk case leaves the corpus file never created at all, which is
+  indistinguishable from never asking for it. `WARNING` because it means a run lost an artifact
+  it was configured to produce, and because Python's last-resort handler delivers exactly that
+  level to stderr for an operator who configured no logging, which is the shape `monoid run` runs
+  in. Once per writer per activation: in each writer the flag and the announcement are one call,
+  the raw assignment appears only inside it, and an AST census derives the flag set from the gates
+  that read it and fails the file if any other site writes one. A failure that costs a single
+  record stays at `debug`, and a third-party stream observer that raises stays `debug` too — that
+  isolation is a different contract. The loggers are `monoid_agent_kernel.recorder` and
+  `monoid_agent_kernel.core.model_content` (renamed from `monoid_agent_kernel.model_content` so
+  that quieting `monoid_agent_kernel.core` reaches it); the message names the artifact only, with
+  `monoid_run_id` and `monoid_artifact` carried as record fields.
+  **For embedders: this is new output.** These lines did not exist below `debug` before, and
+  Python's last-resort handler puts `WARNING` on stderr when no logging is configured.
+- **Every `serve` command reports a bind failure as a CLI error.** `backend serve`,
+  `llm-gateway serve` and `web-gateway serve` all bind after constructing what they serve, so a
+  bound port ended in a bare traceback; `backend serve` additionally left the constructed backend
+  unreleased. `--port 99999` is part of this: click accepts it and the socket layer answers with
+  `OverflowError`, which an `OSError` handler does not catch.
+
 ### Added — the chunk directory's crash litter now has a collector
 
 - **`monoid gc RUN_DIR` reports what no record in a run's replay corpus resolves — orphaned
