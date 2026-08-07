@@ -427,6 +427,60 @@ file only. Chunk files are created write-once through the same verified-file pri
 JSONL handles. The corpus, unlike the ledger, is content-classified; enable it with the same care
 as `model_content_file`.
 
+Chunk-directory hygiene is a separate verb. `monoid gc RUN_DIR` reports what no record in the
+corpus resolves — orphaned chunks from an interrupted write, dead `*.tmp` litter left by crashed
+writers in other processes — and `monoid gc RUN_DIR --apply` deletes it, exiting non-zero for
+refusals and failed deletions, zero for garbage merely found, and 2 with no report at all and
+nothing swept when `--min-age-s` is unusable. Never run it beside a live
+writer of the same run directory: the writer takes no cross-process lock and nothing on disk can
+prove a writer dead, so liveness is the operator's knowledge, exactly as it is for
+`monoid validate`. Two belts bound the damage of a broken contract without licensing one: an
+entry whose age has not reached `--min-age-s` (default one day) is never touched, and the
+write-once store refreshes a chunk's timestamps whenever a writer accepts one that already exists
+— a resumed run re-deriving what it already holds is the common case — so recent use looks
+recent. Neither belt is a guarantee: the refresh is best-effort (a touch the platform refuses is
+swallowed, since the chunk is stored either way), and a writer that stalls past the gate between
+storing a chunk and appending the line referencing it outlives both. An incremental archiver may
+answer the refreshed timestamp with one redundant re-copy, a copy and not a correctness cost. The
+gate itself must be a finite, non-negative number of seconds; anything else is refused before the
+directory is read, because each unusable value breaks the belt a different way. A corpus that is absent or unreadable beside stored
+chunks leaves them `unjudged` and untouched (a mutilated directory and a first-call crash whose
+very first chunk was directory-sized leave the same state); damaged corpus *lines* are the
+opposite case — no reader parses them, so what only they referenced is collected, and the report
+names the line numbers (a count, plus the first hundred). Deletion never outruns the validator:
+`monoid validate` reports the same issues after a sweep as before it.
+
+`chunk_dir_state` names what the collector found where the chunk directory should be, and the
+values call for different responses: `ok`; `absent` (a run that never offloaded); `unsafe`
+(something is wearing the name that is not this run's directory — a symlink, a plain file, or a
+Windows junction, which needs no privilege to create and `lstat`s as an ordinary directory, so
+only its reparse tag tells it apart); `unreadable` (the platform declined, which on Windows is the
+everyday shape of an antivirus pass, the search indexer, or a sync engine); `unprovable` (the
+volume supplies no stable file ids — `st_ino` zero, as on FAT and some network redirectors — so
+no deletion here could be re-proved and none is attempted, in either mode); and `swapped` (the
+directory the gate approved was replaced before the pass finished, so every entry below it
+describes whatever was standing there at the time). `corpus_state` is `ok`, `absent`, or
+`unreadable`. Each entry carries a `classification`: `kept` (the keep-set names it), `orphan`
+(chunk-shaped and unresolvable), `temp` (a write-once temporary over a chunk-name stem), `foreign`
+(anything the writer demonstrably did not mint — never touched), or `unjudged` (chunk-shaped, but
+the corpus needed to judge it was absent or unreadable — never touched).
+
+`candidate_bytes` and `reclaimed_bytes` are both sizes, and only the second is a claim about the
+volume: it counts a file only when the sweep removed the inode's last name, so an orphan inside a
+hardlink-deduplicated archive reports `deleted` and reclaims nothing. Per entry, `reclaimed` says
+which one that was, so the two totals can always be reconciled. `swept_at` is the instant every
+`age_s` is measured against; the verb writes nothing to the run's `events.jsonl`, so the report it
+prints is the only record it leaves.
+
+Run one sweep at a time — two overlapping collectors leave the loser reporting a failure per entry
+although the directory reached the state it asked for. Point the verb at a *run* directory, not at
+a run root: a root is not a run, so it reports `absent` and exits 0, and a fleet sweep is a loop
+over its children. Subagents keep their own run directories as siblings of their parent's, named
+`<parent>.sub.<task>`, so a delegating run needs one sweep per member of the family. Note also
+that `_resolve_run_dir` prefers a path that exists in the working directory over `--run-root`, as
+it does for `validate` and `status`; the report echoes the absolute directory it swept, which is
+the one to check when a bare run id is passed.
+
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains
 operation-level events. A reconnect hydrates completed content from the sidecar; retained v0.20 and

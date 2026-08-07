@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
@@ -143,6 +143,54 @@ def _is_marker(value: Any) -> bool:
         and PAYLOAD_CHUNK_REF_KEY in value
         and is_chunk_sha256(value[PAYLOAD_CHUNK_REF_KEY])
     )
+
+
+def iter_chunk_references(value: Any) -> Iterator[str]:
+    """Every chunk sha ``value`` could let a reader resolve, by the writer's own predicate.
+
+    The walk is uniform -- request recipes, response bodies, ``refs=False`` verbatim payloads,
+    whole records -- because its consumer decides which directory files are garbage, and that
+    decision's two mistakes are not symmetric: naming a sha no reader resolves keeps a file
+    (bounded waste), while missing one a reader resolves deletes a referenced chunk, the one
+    corruption ``validate_run_dir`` refuses. So this deliberately names more than any resolver
+    walks -- a marker inside a verbatim payload is data to every reader and is still counted.
+    Markers are recognized by :func:`_is_marker`, the predicate reassembly resolves through, never
+    re-derived -- so a marker-shaped object carrying a malformed sha yields nothing, and it also
+    names nothing a content-addressed directory could hold. Strings are never parsed. Depth needs no budget of
+    its own: a record deeper than the ingress limit was refused by the writer and is unparseable
+    to every reader that could hand a record to this walker.
+    """
+
+    if _is_marker(value):
+        yield value[PAYLOAD_CHUNK_REF_KEY]
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from iter_chunk_references(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_chunk_references(item)
+
+
+def corpus_keep_set(records: Iterable[dict[str, Any]]) -> set[str]:
+    """The directory filenames ``records`` forbid a collector to remove.
+
+    The union of every walked reference, plus each ``chunk`` record's own ``sha256``. The latter
+    names an inline body rather than a file, and the writer cannot produce both under one name --
+    the same bytes land on one side of the offload threshold deterministically -- so counting it
+    can only over-keep: a same-named file would be an unreachable shadow (inline resolution
+    wins), and keeping a shadow is the cheap side of the asymmetry
+    :func:`iter_chunk_references` explains.
+    """
+
+    keep: set[str] = set()
+    for record in records:
+        keep.update(iter_chunk_references(record))
+        if record.get("kind") == PAYLOAD_CHUNK_KIND:
+            sha = record.get("sha256")
+            if is_chunk_sha256(sha):
+                keep.add(sha)
+    return keep
 
 
 def _encoded(value: Any) -> bytes:

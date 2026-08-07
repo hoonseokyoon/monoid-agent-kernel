@@ -7,6 +7,46 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the chunk directory's crash litter now has a collector
+
+- **`monoid gc RUN_DIR` reports what no record in a run's replay corpus resolves — orphaned
+  chunks from an interrupted write, dead write temporaries from other processes' crashed writers
+  — and `monoid gc RUN_DIR --apply` deletes it.** Report-only is the default because this is the
+  first deletion an operator can ask the kernel for (the recorder already unlinks its own
+  process's temporaries) and a chunk is an unrecoverable original: deletion is nominated by
+  keep-set membership (one whole-record walker, deliberately a superset of every resolver), gated
+  by `--min-age-s` (default one day; a gate that is not a finite, non-negative number of seconds
+  is refused before the directory is read), re-checked immediately before each unlink — same
+  directory the safety gate approved, still a regular file, still past the gate — and held to one
+  invariant, pinned on every fixture whose sweep runs to completion against a real corpus:
+  `monoid validate` reports exactly the same issues after a sweep as before it. Foreign entries (anything the corpus writer
+  demonstrably did not mint) are reported and never touched. Chunk-shaped files beside an absent
+  or unreadable corpus are `unjudged` and never touched, because a mutilated directory and a
+  first-call crash whose very first chunk was directory-sized leave the same state — the chunk
+  file lands before the corpus file's lazy create. Corpus lines no reader parses are named by
+  number in the report, and what only they referenced is collected: those references are
+  invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
+  failed deletions, zero for garbage merely found, and 2 — no report, nothing swept — for an
+  unusable `--min-age-s` or a missing run directory. A refusal includes a corpus the collector
+  could not read, whether or not any chunk-shaped file was there to carry it. `chunk_dir_state`
+  distinguishes `unsafe` (something is wearing the directory's name) from `unreadable` (the
+  platform declined), `unprovable` (a volume with no stable file ids, where no deletion could be
+  re-proved, so none is attempted in either mode) and `swapped` (the approved directory was
+  replaced mid-pass). `reclaimed_bytes` counts a file only when the
+  sweep removed its inode's last name, so an orphan inside a hardlink-deduplicated archive
+  reports as deleted and reclaims nothing; `candidate_bytes` is an upper bound, because a scan
+  cannot see a link count on every platform. `chunk_dir_state` separates `unsafe` (something is
+  wearing the directory's name) from `unreadable` (the platform declined), which call for
+  opposite responses. Never run it beside a live writer of the same
+  run directory; liveness is the operator's knowledge, as with `monoid validate`.
+- **Adoption now leaves a timestamp.** A writer accepting a chunk file that already exists — a
+  resumed run re-deriving what it already holds is the common case — takes the stored file
+  without rewriting a byte and, from this release, refreshes its times, which turns the
+  collector's age gate into a protocol about recent use rather than a guess about fresh writes.
+  Best-effort: a touch the platform refuses is swallowed, because the chunk is stored either way. The conformance evidence store's exists-hit reuse stays pinned
+  mtime-stable on purpose (no collector sweeps the evidence directory), and an incremental
+  archiver may answer the refreshed timestamp with one redundant re-copy.
+
 ### Added — a private replay corpus for the calls the ledger indexes
 
 - **`AgentLoop.model_payload_file=True` writes `model_payloads.jsonl`, plus a `model_payloads/`

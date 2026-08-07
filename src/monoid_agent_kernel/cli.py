@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import time
 from dataclasses import replace
@@ -32,6 +33,7 @@ from monoid_agent_kernel.core.spec import (
     ModelConfig,
     RunLimits,
 )
+from monoid_agent_kernel.core.payload_gc import UnusableAgeGate, collect_payload_garbage
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.packages import (
     apply_package,
@@ -719,6 +721,146 @@ def validate(run_dir_or_id: str, run_root: Path, json_output: bool) -> None:
         click.echo("ok")
     if issues:
         raise click.ClickException("run directory validation failed")
+
+
+@main.command("gc")
+@click.argument("run_dir_or_id", type=str)
+@click.option(
+    "--run-root", type=click.Path(path_type=Path), default=Path("runs"), show_default=True
+)
+@click.option(
+    "--min-age-s",
+    "min_age_s",
+    type=float,
+    default=86400.0,
+    show_default=True,
+    help="Never touch an entry younger than this many seconds.",
+)
+@click.option(
+    "--apply",
+    "apply_deletes",
+    is_flag=True,
+    help="Delete the candidates; the default only reports them.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON.")
+@click.pass_context
+def gc_command(
+    ctx: click.Context,
+    run_dir_or_id: str,
+    run_root: Path,
+    min_age_s: float,
+    apply_deletes: bool,
+    json_output: bool,
+) -> None:
+    """Collect a run's unreferenced replay-corpus chunks and dead write temporaries.
+
+    Report-only by default; --apply deletes. Never run this against a run whose writer may
+    still be alive -- liveness is the operator's knowledge, exactly as it is for validate.
+    Referenced chunks are protected by membership, not age; --min-age-s additionally spares
+    every entry whose recorded age has not reached it, whatever that entry is.
+    """
+    if not run_dir_or_id.strip():
+        # ``Path("")`` is ``Path(".")``, which exists and is a directory, so the guard below let
+        # an unset shell variable through and swept the working directory -- in exactly the
+        # scripted nightly sweep this verb is built for.
+        raise click.ClickException("a run directory or run id is required")
+    run_dir = _resolve_run_dir(run_dir_or_id, run_root)
+    if not run_dir.is_dir():
+        # A typo'd run id must fail loudly, not come back as a clean empty report.
+        raise click.ClickException(f"run directory not found: {run_dir}")
+    # Resolved before the sweep, and reported that way. ``_resolve_run_dir`` prefers a path that
+    # exists in the working directory over ``--run-root``, which the read-only sibling verbs can
+    # afford and a deleter cannot: an operator passing a bare run id deserves to see which
+    # directory actually lost files.
+    run_dir = run_dir.resolve()
+    try:
+        report = collect_payload_garbage(run_dir, min_age_s=min_age_s, apply=apply_deletes)
+    except UnusableAgeGate as exc:
+        # Click's FLOAT accepts "inf" and "nan", and a negative gate parses fine, so the option
+        # layer cannot refuse these on type alone. Refusing here -- before any output -- keeps a
+        # bad flag from sweeping first and only then failing to report what it swept. Caught by
+        # its own type, never by ``ValueError``: this neighbourhood raises those as control flow,
+        # and rendering a mid-sweep one as "bad --min-age-s" would blame the flag for deletions
+        # that had already happened.
+        raise click.BadParameter(str(exc), param_hint="--min-age-s") from exc
+    # A refusal or a failed deletion exits non-zero so scripted sweeps notice -- via ctx.exit
+    # after the payload, never ClickException, whose Error line joins the payload wherever the
+    # two streams merge (a `2>&1` pipeline, or the CliRunner harness that pins this) and leaves
+    # --json unparseable; the builder validate precedent. Garbage merely *found* is exit 0:
+    # finding it is the verb working.
+    failed = (
+        report.chunk_dir_state not in ("absent", "ok")
+        # A corpus the collector refused to read is a refusal in its own right, wherever the
+        # chunk directory stands: scoping this to ``chunk_dir_state == "ok"`` re-opened the very
+        # hole it was added to close, one state over -- a run that never offloaded (no chunk
+        # directory at all, the common shape, since offload needs a size threshold) reported
+        # ``corpus_state: unreadable`` and exited 0. ``unreadable`` and not ``!= "ok"``: an
+        # absent corpus is the ordinary state of a run that never enabled the artifact, and
+        # alarming on it made a swept-clean run alert forever.
+        or report.corpus_state == "unreadable"
+        # Still load-bearing with the clause above narrowed: an *absent* corpus also makes
+        # chunk-shaped files unjudgeable, and that is a fault when there are such files.
+        or any(entry.classification == "unjudged" for entry in report.entries)
+        or any(entry.error for entry in report.entries)
+    )
+    if json_output:
+        # ``ensure_ascii=True`` here, unlike every other payload this module prints: those carry
+        # values the kernel produced, this one carries directory entry names, which a filesystem
+        # may hand back with unpaired surrogates (POSIX surrogateescape for undecodable bytes,
+        # NTFS by permission). Emitted verbatim, such a name either fails to write to a strict
+        # UTF-8 stream -- the default for the piped consumer this mode exists for -- or gets
+        # substituted, silently renaming the file being reported. The text mode's ``!r`` is the
+        # same rule; this is its twin.
+        click.echo(
+            json.dumps(
+                dataclasses.asdict(report), ensure_ascii=True, sort_keys=True, allow_nan=False
+            )
+        )
+    else:
+        # Every string below that came from the filesystem is rendered ``!r``. The rule was
+        # written for ``entry.name`` and stated as if it covered the mode -- it did not reach
+        # ``run_dir``, whose surrogate-bearing spelling killed the whole text report *after* the
+        # sweep, losing the record of what had just been deleted. Enumerated here rather than
+        # summarized: ``run_dir`` and ``name`` are caller/filesystem text; ``error`` embeds a path
+        # under ``OSError.__str__``; the states and the numbers are ours.
+        click.echo(f"run_dir: {report.run_dir!r}")
+        click.echo(f"swept_at: {report.swept_at}")
+        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {report.corpus_state}")
+        click.echo(
+            f"mode: {'apply' if report.applied else 'report-only'}"
+            f"  min_age_s: {report.min_age_s!r}"
+        )
+        kept = sum(1 for entry in report.entries if entry.classification == "kept")
+        click.echo(f"kept: {kept}")
+        for entry in report.entries:
+            # A kept entry is not listed -- a healthy corpus would scroll -- but an error on one
+            # is still a fault the exit code reports, so it must not be the one thing the text
+            # mode silently drops.
+            if entry.classification == "kept" and not entry.error:
+                continue
+            # ``age_s`` is here because without it the default mode cannot say *why* an entry is
+            # or is not a candidate: a month-old orphan and one written a second ago rendered
+            # identically, and the gate is the only thing standing between them.
+            line = (
+                f"{entry.classification:>8} {entry.size:>10} {entry.age_s:>12.1f}s "
+                f"{entry.name!r}"
+            )
+            if entry.deleted:
+                line += f"  deleted (freed {entry.reclaimed})"
+            if entry.error:
+                line += f"  [{entry.error!r}]"
+            click.echo(line)
+        if report.damaged_line_count:
+            shown = ", ".join(map(str, report.damaged_lines))
+            more = report.damaged_line_count - len(report.damaged_lines)
+            click.echo(
+                f"damaged_lines ({report.damaged_line_count}): {shown}"
+                + (f", and {more} more" if more else "")
+            )
+        click.echo(f"candidate_bytes: {report.candidate_bytes}")
+        click.echo(f"reclaimed_bytes: {report.reclaimed_bytes}")
+    if failed:
+        ctx.exit(1)
 
 
 @main.group("package")

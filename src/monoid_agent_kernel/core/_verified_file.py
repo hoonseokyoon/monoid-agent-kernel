@@ -23,9 +23,9 @@ deployment's boundary to defend, not this module's.
 
 ``st_nlink == 1`` is part of that rule only for the artifacts these functions *append to*: a hard
 link is a second name for an inode a writer is about to mutate. It is deliberately not required of
-a content-addressed chunk, which nothing mutates and whose bytes the reader authenticates by
-hashing them -- requiring it there would fail every hardlink-deduplicated archive of a run
-directory.
+a content-addressed chunk, whose bytes nothing rewrites (adoption refreshes only its times; see
+:func:`write_verified_bytes_once`) and which the reader authenticates by re-hashing -- requiring
+it there would fail every hardlink-deduplicated archive of a run directory.
 
 These primitives were written for ``model-content.jsonl`` and live here because they were never
 about that artifact. ``model_calls.jsonl`` is the second append-only sidecar in the same directory
@@ -36,6 +36,7 @@ parallel sites and never bound on its twin. One function, both callers.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,23 @@ def verified_file_is_safe(
     return metadata.st_nlink == 1 or not require_single_link
 
 
+def directory_metadata_is_safe(metadata: os.stat_result) -> bool:
+    """Whether an ``lstat`` result describes a real directory rather than a redirection wearing
+    one's shape.
+
+    Split out from :func:`verified_directory_is_safe` so a caller that already holds the stat can
+    ask the question without a second ``lstat`` -- and, more importantly, without folding its own
+    ``OSError`` into the same ``False``. A boolean cannot tell "somebody planted this" apart from
+    "the platform declined to answer", and a caller that reports those differently (the collector
+    does; they call for opposite responses) has to keep the two questions separate. One authoring
+    site for the rule either way: the path-taking form below is this one plus a lookup.
+    """
+
+    if getattr(metadata, "st_reparse_tag", 0):
+        return False  # a junction lstats as a directory; only the tag distinguishes it
+    return stat.S_ISDIR(metadata.st_mode)
+
+
 def verified_directory_is_safe(path: Path) -> bool:
     """Whether ``path`` is absent or a real directory, not a redirection wearing one's shape.
 
@@ -89,6 +107,9 @@ def verified_directory_is_safe(path: Path) -> bool:
     symlink -- or a Windows junction, which needs no privilege to create -- planted at
     ``model_payloads/`` accepted every chunk write and sent it out of the run directory, with the
     writer told it had succeeded.
+
+    Fails closed on an unreadable path, which is right for a *writer* -- it declines to write --
+    and is why a reporting caller wants :func:`directory_metadata_is_safe` instead.
     """
 
     try:
@@ -97,9 +118,7 @@ def verified_directory_is_safe(path: Path) -> bool:
         return True
     except OSError:
         return False
-    if getattr(metadata, "st_reparse_tag", 0):
-        return False  # a junction lstats as a directory; only the tag distinguishes it
-    return stat.S_ISDIR(metadata.st_mode)
+    return directory_metadata_is_safe(metadata)
 
 
 def open_verified_regular_fd(
@@ -233,11 +252,41 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
             pass
 
 
+# The temporary-name shape ``write_verified_bytes_once`` mints, matched where it is minted. The
+# pid segment is matched, never trusted: pids are reused, so it identifies a writer's *naming*
+# and nothing about its liveness -- freshness is the caller's own filter.
+#
+# ``[0-9]`` rather than ``\d``, which in a Python regex accepts every Unicode decimal digit: an
+# Arabic-Indic pid matched a shape ``os.getpid()`` cannot produce, and matching here is a licence
+# to delete.
+_WRITE_ONCE_TEMP_NAME = re.compile(r"(.+)\.[0-9]+\.[0-9a-f]{12}\.tmp")
+
+
+def write_once_temp_stem(name: str) -> str | None:
+    """The stored name a :func:`write_verified_bytes_once` temporary was carrying bytes for, or
+    ``None`` when ``name`` was never one of its temporaries. One authoring site: this predicate
+    sits beside the f-string that mints the shape (``{name}.{pid}.{12 hex}.tmp``), so a collector
+    matching crash litter and the writer creating it cannot drift apart. What the stem *means* is
+    the caller's question -- this module does not know it stores content-addressed names.
+
+    Case-sensitive, deliberately, and therefore narrower than the recorder's own pid-scoped
+    ``Path.glob`` sweep, which folds case on Windows. A temporary whose name reached the directory
+    with any letter re-cased -- a restore through a case-mangling path -- is classified foreign
+    and never collected. That is the safe end of the asymmetry: the wider matcher is the one with
+    no age gate and no directory re-check behind it, and widening a *delete* predicate to accept
+    spellings the writer cannot mint is the wrong direction.
+    """
+
+    match = _WRITE_ONCE_TEMP_NAME.fullmatch(name)
+    return match.group(1) if match is not None else None
+
+
 def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """Create one write-once content-addressed file, or report that it could not be done.
 
     The write-once half: if ``path`` already holds a regular file **of exactly this length**,
-    nothing is written and the answer is ``True`` -- content addressing means a file of the right
+    no bytes are written, the accepted name's times are refreshed (adoption; the comment in the
+    body says why), and the answer is ``True`` -- content addressing means a file of the right
     name and the right size is almost certainly this content, and :func:`read_verified_bytes`
     re-hashes what it reads, so the remaining lie is caught at resolution. Anything else under that
     name is refused, and a refusal here is terminal for the caller's artifact: "already written",
@@ -249,9 +298,10 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     exclusive creation cannot be redirected by a planted link, and a link planted at the temporary
     name fails the open outright -- then take the final name via ``os.replace``, which replaces a
     link *itself* rather than writing through it (the same shape the checkpoint store's blob
-    writer uses). A crash between the two leaves an orphaned ``*.tmp`` the owner sweeps at open,
-    never a half-written file under a content-addressed name that would poison every reader
-    trusting the name.
+    writer uses). A crash between the two leaves an orphaned ``*.tmp`` -- swept at the owner's
+    next open under the same pid, and by ``monoid gc`` across pids, behind its age gate -- never
+    a half-written file under a content-addressed name that would poison every reader trusting
+    the name.
 
     ``False`` is terminal for the artifact the caller is building, for the reason the append
     opener's ``None`` is: the refusal is a property of the path.
@@ -272,8 +322,9 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # regular file -- no symlink, no FIFO, no directory.
             #
             # Not ``st_nlink == 1``, which is the *appenders'* rule: a second name for an inode
-            # this process is about to mutate is somebody else's file, but this function mutates
-            # nothing (``O_EXCL`` on a temp, then ``os.replace``), and a link count is what every
+            # this process is about to rewrite is somebody else's file, but this function rewrites
+            # no bytes (``O_EXCL`` on a temp, then ``os.replace``; the adoption touch below moves
+            # times only, an archive's other name included), and a link count is what every
             # hardlink-deduplicating archive of a run directory changes. A hard link here is a
             # second name for a real file inside this directory, not an escape from it.
             #
@@ -283,7 +334,32 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # than deferring it to whoever next runs a validator, and costs the archive case
             # nothing. Equal size is not proof -- the reader still hashes -- but it is the only
             # cheap evidence available before the bytes are read.
-            return stat.S_ISREG(existing.st_mode) and existing.st_size == len(data)
+            if not (stat.S_ISREG(existing.st_mode) and existing.st_size == len(data)):
+                return False
+            # Adoption leaves a timestamp. Accepting an existing name is the one write-path event
+            # age-based collection cannot otherwise see: a chunk orphaned by a crashed activation
+            # and re-derived by a resumed one is referenced from *now* with an mtime from days
+            # ago, indistinguishable from the garbage ``monoid gc --min-age-s`` deletes.
+            # Refreshing the times (never the bytes) on the accepted name is what makes that age
+            # gate a protocol about recent use rather than a guess about fresh writes.
+            # Deliberately unlike the conformance runner's ``_publish_content_addressed``, whose
+            # exists-hit reuse is pinned mtime-stable (``tests/conformance/
+            # test_runner_publication.py``): no collector sweeps the evidence directory, so
+            # stability is the useful property there. On a multiply-linked chunk the shared
+            # inode's times move too, which an incremental archiver may answer with one redundant
+            # re-copy -- that costs a copy, not correctness. By name, not by
+            # ``follow_symlinks=False`` or a descriptor: Windows CPython supports neither for
+            # ``utime`` (measured -- ``os.utime`` is in neither ``os.supports_follow_symlinks``
+            # nor ``os.supports_fd`` on 3.11), and the ``lstat`` above already proved the name a
+            # regular file. What remains is a same-instant swap redirecting a *time* touch -- no
+            # bytes move -- a strictly weaker residual than the unlink-after-glob the recorder's
+            # own temp sweep documents and accepts. Best-effort, because the chunk IS stored and
+            # ``True`` is the honest answer whether or not the touch landed.
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+            return True
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
         flags = (
