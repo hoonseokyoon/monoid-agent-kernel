@@ -128,26 +128,39 @@ def _envelope(run_id: str = "run-1") -> dict[str, str]:
 
 
 def _recorded_pair(
-    run_dir: Path, *, generation: str = _GEN, body: dict[str, Any] | None = None
+    run_dir: Path,
+    *,
+    generation: str = _GEN,
+    body: dict[str, Any] | None = None,
+    answers: list[str] | None = None,
 ) -> str:
-    """A hand-built, self-consistent request+response pair; returns the request digest."""
+    """A hand-built, self-consistent request + N answers; returns the request digest.
+
+    ``answers`` names the final texts when a test needs more than one recording under the key
+    -- the only shape in which a slot coordinate is distinguishable from the constant zero.
+    """
 
     preimage_value = {generation: {"instruction": "hand-built", "provider": "gateway"}}
     preimage = model_payloads._encoded(preimage_value)
     digest = sha256_bytes(preimage)
-    response = (
-        body
-        if body is not None
-        else {
-            "response_id": "r-hand",
-            "final_text": "hand answer",
+
+    def _body(final_text: str, response_id: str) -> dict[str, Any]:
+        return {
+            "response_id": response_id,
+            "final_text": final_text,
             "tool_calls": [],
             "reasoning": [],
             "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             "stop_reason": "stop",
             "provider_retried": False,
         }
-    )
+
+    if body is not None:
+        bodies = [body]
+    elif answers is not None:
+        bodies = [_body(text, f"r-{index}") for index, text in enumerate(answers)]
+    else:
+        bodies = [_body("hand answer", "r-hand")]
     _write_corpus(
         run_dir,
         [
@@ -158,12 +171,15 @@ def _recorded_pair(
                 digest_generation=generation,
                 **_envelope(),
             ),
-            model_response_record(
-                response,
-                call_index=0,
-                request_digest=digest,
-                unrecorded_reason="",
-                **_envelope(),
+            *(
+                model_response_record(
+                    response,
+                    call_index=index,
+                    request_digest=digest,
+                    unrecorded_reason="",
+                    **_envelope(),
+                )
+                for index, response in enumerate(bodies)
             ),
         ],
     )
@@ -297,19 +313,28 @@ def test_a_released_answer_is_handed_out_again_and_only_that_one(tmp_path: Path)
     because rewinding past a concurrent taker would hand one answer to two calls."""
 
     run_dir = tmp_path / "runs" / "run-1"
-    digest = _recorded_pair(run_dir)
+    digest = _recorded_pair(run_dir, answers=["first", "second"])
     corpus = ReplayCorpus.load([run_dir])
 
-    taken = corpus.consume(digest, generation=_GEN)
-    assert isinstance(taken, ReplayedResponse)
-    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayMissReason)
+    first = corpus.consume(digest, generation=_GEN)
+    second = corpus.consume(digest, generation=_GEN)
+    assert isinstance(first, ReplayedResponse) and isinstance(second, ReplayedResponse)
+    assert (first.slot, second.slot) == (0, 1)
 
-    corpus.release(digest, taken.slot)
-    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    corpus.release(digest, second.slot)
+    again = corpus.consume(digest, generation=_GEN)
 
-    stale = corpus.consume(digest, generation=_GEN)
-    corpus.release(digest, taken.slot - 1)  # a slot nobody is holding: refused
-    assert isinstance(stale, ReplayMissReason)
+    # Two answers, so "give back that slot" and "rewind to the start" are different acts. On a
+    # one-answer queue they are the same, which is why this test used to pass against a corpus
+    # that simply reset the cursor to zero.
+    assert isinstance(again, ReplayedResponse)
+    assert (again.slot, again.body["final_text"]) == (1, "second")
+
+    # And the concurrency clause: once another caller has moved, an older slot is not ours to
+    # give back -- rewinding then would hand one answer to two calls.
+    third = corpus.consume(digest, generation=_GEN)
+    corpus.release(digest, first.slot)
+    assert isinstance(third, ReplayMissReason)
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayMissReason)
 
 
@@ -641,8 +666,10 @@ def test_a_union_replays_across_run_directories_in_argument_order(tmp_path: Path
     assert set(corpus.run_ids()) == {"run-1", "run-2"}
 
 
-@pytest.mark.parametrize("spelling", ["identical", "dot-suffixed", "absolute"])
-def test_one_directory_named_twice_is_one_source(tmp_path: Path, spelling: str) -> None:
+@pytest.mark.parametrize("spelling", ["identical", "via-parent", "relative"])
+def test_one_directory_named_twice_is_one_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
     """Each answer once is a property of the *corpus*, not of the argument list.
 
     A directory reaches the union by more than one name routinely -- as a run id and as a
@@ -653,11 +680,19 @@ def test_one_directory_named_twice_is_one_source(tmp_path: Path, spelling: str) 
 
     run_dir = tmp_path / "runs" / "run-1"
     digest = _recorded_pair(run_dir)
+    if spelling == "relative":
+        monkeypatch.chdir(tmp_path)
     again = {
         "identical": run_dir,
-        "dot-suffixed": run_dir / ".",
-        "absolute": run_dir.resolve(),
+        "via-parent": run_dir.parent / ".." / "runs" / run_dir.name,
+        "relative": Path("runs") / "run-1",
     }[spelling]
+    if spelling != "identical":
+        # `pathlib` collapses a lone "." and `tmp_path` is already resolved, so the obvious
+        # spellings are the SAME STRING and a string-keyed dedupe would pass them. These two
+        # differ as text and name one file, which is the only version of this test that can
+        # tell the two implementations apart.
+        assert str(again) != str(run_dir)
 
     corpus = ReplayCorpus.load([run_dir, again])
 

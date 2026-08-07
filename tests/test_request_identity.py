@@ -31,6 +31,7 @@ import ast
 import asyncio
 import inspect
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -444,24 +445,35 @@ def test_the_lookup_reads_the_declaration_once() -> None:
 def test_model_call_reexports_the_same_objects() -> None:
     """`model_call` re-imports these names; identity is what rules out a quiet mirror.
 
-    The list is *derived* from the import statement, not written out here. A hand-listed
-    census covers the names its author was thinking about, which is how the shape this test
-    exists to catch survives inside the test itself: the first version named four of the nine
-    and left `_model_identity` -- which two other suites still reach through the old home --
-    free to regrow as a copy that every one of those suites would then be testing instead.
+    The list is derived from the **consumers**, not from `model_call`'s own import statement.
+    Two wrong versions preceded this one, and they failed in opposite directions. The first
+    hand-listed four of the nine names, leaving the rest free to regrow. The second derived
+    the list from the import block -- which is the artifact the mutation edits, so dropping a
+    name from it merely shrank the census and the mutant went green.
+
+    Deriving from what the tree actually reaches through `model_call` cannot be defeated that
+    way: four suites import digest functions through the old home
+    (`test_model_calls_schema`, `test_model_payloads_schema`, `test_generation_config`,
+    `test_tool_schema_delivery`), so a locally regrown copy still has to answer for the name
+    they use -- and if it did not, they would be testing the copy while production keys come
+    from `providers/_request_identity`.
     """
 
-    tree = ast.parse(inspect.getsource(model_call))
-    reexported = sorted(
-        alias.asname or alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "monoid_agent_kernel.providers._request_identity"
-        for alias in node.names
-    )
+    root = Path(model_call.__file__).parent.parent.parent
+    wanted: set[str] = set()
+    for path in (*root.joinpath("src").rglob("*.py"), *root.joinpath("tests").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - a tree we cannot read is not a claim
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "monoid_agent_kernel.model_call":
+                wanted |= {
+                    alias.name for alias in node.names if hasattr(_request_identity, alias.name)
+                }
 
-    assert reexported, "the re-export block moved; this census now covers nothing"
-    for name in reexported:
+    assert wanted, "nothing reaches the projection through model_call; this census is empty"
+    for name in sorted(wanted):
         assert getattr(model_call, name) is getattr(_request_identity, name), name
 
 

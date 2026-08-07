@@ -116,6 +116,7 @@ def _prepend_refused_answer(
     run_id: str = "run-1",
     body: Any = None,
     unrecorded_reason: str = "too_large",
+    after: int = 0,
 ) -> None:
     """Put an unusable record in front of the recorded answer, so slot 0 cannot be given back
     and slot 1 can.
@@ -140,10 +141,13 @@ def _prepend_refused_answer(
     )
     out: list[str] = []
     inserted = False
+    seen = 0
     for line in path.read_text(encoding="utf-8").splitlines():
-        if not inserted and json.loads(line).get("kind") == "model_response":
-            out.append(refused)
-            inserted = True
+        if json.loads(line).get("kind") == "model_response":
+            if not inserted and seen == after:
+                out.append(refused)
+                inserted = True
+            seen += 1
         out.append(line)
     assert inserted
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
@@ -724,3 +728,54 @@ def test_a_failed_live_serve_does_not_move_the_sequence(tmp_path: Path) -> None:
     )
     assert inner.calls == 2
     assert _call(adapter, _request()).final_text == "recovered"
+
+
+def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
+    """The release coordinate, driven where it can be wrong.
+
+    Every other test holds slot 0, and at slot 0 `release(digest, held)` and
+    `release(digest, 0)` agree -- so a `held` that is simply the constant zero passes them all
+    while, at any later slot, the guard `cursor == slot + 1` is false, nothing is given back,
+    and the parked turn's re-attempt is served the call AFTER the one it asked about.
+    """
+
+    digest, repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="first"),
+                ModelTurn(response_id="r-3", final_text="third"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    assert digest == repeat, "two identical calls are one key with two recorded answers"
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        after=1,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": None,
+            "tool_calls": [{"id": "c1", "name": "fs_list"}],  # no arguments: not a triple
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": None,
+            "provider_retried": False,
+        },
+    )
+    # A separate instance for the coordinate, because reaching past `_serve_miss` takes the
+    # slot without settling it and would move the sequence this test is about.
+    probe = _replay(tmp_path)
+    assert _call(probe, _request()).final_text == "first"
+    _outcome, held = probe._replayed_turn_or_miss(digest)
+    assert held == 1, "the slot the corpus is holding is the one it handed over, not zero"
+
+    adapter = _replay(tmp_path)
+    assert _call(adapter, _request()).final_text == "first"
+    for _ in range(2):
+        with pytest.raises(ReplayMiss) as caught:
+            _call(adapter, _request())
+        assert caught.value.provider_error_code == MISS_NOT_RECORDED
+        assert "third" not in str(caught.value)

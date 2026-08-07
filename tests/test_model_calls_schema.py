@@ -415,10 +415,14 @@ def test_the_ledger_does_not_share_the_replay_key_s_projection() -> None:
     # length of that move `from ..._request_identity import _model_identity as _mi` satisfied
     # every assertion here -- wrong module prefix for the first, and an `ast.alias` is neither
     # a Name nor an Attribute, so the imported name never reached the second.
-    forbidden = (
-        "monoid_agent_kernel.model_call",
-        "monoid_agent_kernel.providers._request_identity",
-    )
+    # The current home is *derived*, so a third move cannot silently empty this guard the way
+    # the first move emptied its predecessor. The old home stays listed by history: a ledger
+    # reaching for `model_call` is reaching for the projection wherever it re-exports from.
+    from monoid_agent_kernel.providers._request_identity import _model_identity
+
+    home = inspect.getmodule(_model_identity)
+    assert home is not None
+    forbidden = ("monoid_agent_kernel.model_call", home.__name__)
     assert not any(name.startswith(forbidden) for name in imported), {
         "imported": sorted(imported),
         "hint": "the ledger must not reach into the replay key's module",

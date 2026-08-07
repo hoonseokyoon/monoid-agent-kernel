@@ -21,6 +21,7 @@ from support.runtime import runtime_config, runtime_provider
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES, ModelCallReceipt
+from monoid_agent_kernel.core import model_payloads
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
@@ -114,7 +115,10 @@ def test_a_run_records_its_request_and_response_and_they_reassemble(tmp_path: Pa
     records = _records(result.run_dir)
     requests = _by_kind(records, MODEL_REQUEST_KIND)
     responses = _by_kind(records, MODEL_RESPONSE_KIND)
-    chunks = {record["sha256"]: record["text"].encode("utf-8") for record in _by_kind(records, PAYLOAD_CHUNK_KIND)}
+    chunks = {
+        record["sha256"]: record["text"].encode("utf-8")
+        for record in _by_kind(records, PAYLOAD_CHUNK_KIND)
+    }
 
     assert len(requests) == 1
     assert len(responses) == 1
@@ -137,9 +141,7 @@ def test_the_corpus_and_the_ledger_agree_on_which_call_is_which(tmp_path: Path) 
     result = _loop(tmp_path, _Adapter()).run_once("hi")
     ledger = [
         json.loads(line)
-        for line in (result.run_dir / MODEL_CALLS_FILENAME)
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in (result.run_dir / MODEL_CALLS_FILENAME).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     responses = _by_kind(_records(result.run_dir), MODEL_RESPONSE_KIND)
@@ -419,9 +421,7 @@ def test_the_corpus_never_carries_the_configured_endpoint(tmp_path: Path) -> Non
         runtime_config_provider=runtime_provider(
             runtime_config(
                 "run.finish",
-                model=ModelConfig(
-                    provider="gateway", model="gpt-witness", gateway_url=endpoint
-                ),
+                model=ModelConfig(provider="gateway", model="gpt-witness", gateway_url=endpoint),
             )
         ),
         model_calls_file=True,
@@ -595,8 +595,7 @@ def test_a_hardlink_deduplicated_chunk_survives_being_restored_and_resumed(
 
     assert resumed._model_payloads_failed is False
     assert not any(
-        issue.path.startswith(MODEL_PAYLOADS_FILENAME)
-        for issue in validate_run_dir(first.run_dir)
+        issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(first.run_dir)
     )
 
 
@@ -879,7 +878,9 @@ def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: P
     # answer an oversized one gets, and the same answer the offloaded twin would get, since a
     # chunk hides its depth inside a JSON string and could never have been refused.
     responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
-    assert [(one["call_index"], one["response"], one["unrecorded_reason"]) for one in responses] == [
+    assert [
+        (one["call_index"], one["response"], one["unrecorded_reason"]) for one in responses
+    ] == [
         (0, None, "unencodable"),
         # The second call proves the retried record consumed its ordinal: a dropped line left the
         # counter where it was, so the next answer took index 0 over again.
@@ -921,7 +922,9 @@ def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
 
     ledger = [
         json.loads(line)
-        for line in (recorder.run_dir / MODEL_CALLS_FILENAME).read_text(encoding="utf-8").splitlines()
+        for line in (recorder.run_dir / MODEL_CALLS_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line.strip()
     ]
     responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
@@ -976,3 +979,18 @@ def test_the_corpus_never_writes_a_line_its_own_schema_rejects(
     )
     requests = _by_kind(_records(recorder.run_dir), MODEL_REQUEST_KIND)
     assert len(requests) == (0 if "digest_generation" in hostile else 1)
+
+
+def test_the_recorded_turn_field_list_is_the_writer_s_own_key_set() -> None:
+    """The reader tells a recorded turn from any other JSON object by this list, and the
+    writer builds its body from the same one. Two lists that agree today is exactly what the
+    constant exists to prevent -- and the writer's own check cannot be the only binding,
+    because a check that lives inside `except Exception` turns drift into a silent
+    `unencodable` and `python -O` erases an assert outright.
+    """
+
+    recorded = model_payloads.response_record_body(ModelTurn(final_text="x"))
+
+    assert recorded.unrecorded_reason == ""
+    assert recorded.value is not None
+    assert tuple(sorted(recorded.value)) == tuple(sorted(model_payloads.RECORDED_TURN_FIELDS))

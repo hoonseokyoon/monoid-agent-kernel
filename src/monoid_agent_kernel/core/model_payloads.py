@@ -462,9 +462,10 @@ def split_request_payload(preimage: bytes, request_digest: str) -> SplitRequestP
         try:
             recipe_terms, chunks = _extracted(value[tag])
             recipe = {tag: recipe_terms}
-            if chunks and reassemble_request_preimage(
-                recipe, chunks.__getitem__, refs=True
-            ) == preimage:
+            if (
+                chunks
+                and reassemble_request_preimage(recipe, chunks.__getitem__, refs=True) == preimage
+            ):
                 return SplitRequestPayload(payload=recipe, chunks=chunks, refs=True)
         except Exception:
             pass  # fall through to the verbatim shape; the reason does not change the answer
@@ -531,10 +532,19 @@ def response_record_body(turn: Any) -> RecordedResponse:
             "stop_reason": getattr(turn, "stop_reason", None),
             "provider_retried": bool(getattr(turn, "provider_retried", False)),
         }
-        assert set(value) == set(RECORDED_TURN_FIELDS)
         encoded = _encoded(value)
     except Exception:
         return RecordedResponse(unrecorded_reason="unencodable")
+    if set(value) != set(RECORDED_TURN_FIELDS):
+        # Outside the try, and a raise rather than an assert. Inside, an AssertionError is an
+        # Exception like any other and drift would silently reclassify every recorded answer
+        # as ``unencodable`` -- a corpus that records nothing, surfacing much later as a replay
+        # miss blaming the corpus. And `python -O` erases an assert, so the rule the reader
+        # depends on would simply not exist in an optimized deployment.
+        raise RuntimeError(
+            "the recorded-turn field list and the body this function builds have drifted: "
+            f"{sorted(set(value) ^ set(RECORDED_TURN_FIELDS))}"
+        )
     if len(encoded) > MAX_MODEL_PAYLOAD_BYTES:
         return RecordedResponse(unrecorded_reason="too_large")
     return RecordedResponse(value=value, encoded=encoded)
@@ -558,7 +568,9 @@ def chunk_record(
     here from the same bytes, so a record cannot be built already lying about its content."""
 
     return {
-        **_envelope(PAYLOAD_CHUNK_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        **_envelope(
+            PAYLOAD_CHUNK_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at
+        ),
         "sha256": sha256_bytes(chunk),
         "text": chunk.decode("utf-8"),
     }
@@ -580,7 +592,9 @@ def model_request_record(
     turn a set member into a sequence entry."""
 
     return {
-        **_envelope(MODEL_REQUEST_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        **_envelope(
+            MODEL_REQUEST_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at
+        ),
         "request_digest": request_digest,
         "digest_generation": digest_generation,
         "refs": refs,
@@ -606,7 +620,9 @@ def model_response_record(
     ledger line whose ``digest_status`` names the reason."""
 
     return {
-        **_envelope(MODEL_RESPONSE_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at),
+        **_envelope(
+            MODEL_RESPONSE_KIND, run_id=run_id, root_run_id=root_run_id, recorded_at=recorded_at
+        ),
         "call_index": call_index,
         "request_digest": request_digest,
         "unrecorded_reason": unrecorded_reason,
