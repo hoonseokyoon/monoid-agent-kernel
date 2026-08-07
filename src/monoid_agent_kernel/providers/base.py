@@ -1128,6 +1128,30 @@ class ModelStreamIngressNormalizer:
         return [chunk for _sequence, chunk in pending]
 
 
+def portable_usage_value(value: Any) -> bool:
+    """Whether one usage count is a portable non-negative integer.
+
+    The rule the loop enforces when it sums a turn's usage, named here so the replay adapter
+    can enforce the *same* one on a recorded turn before it becomes a turn at all. Two copies
+    would disagree the day the rule changes, and the disagreement would surface as a corpus
+    that replays into a model error blamed on a model that was never called.
+
+    ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` and a boolean
+    token count is a provider bug, not a count of one.
+    """
+
+    return type(value) is int and value >= 0
+
+
+def unportable_usage_key(usage: Mapping[str, Any]) -> str | None:
+    """The first usage entry that is not portable, named -- or ``None`` when all of them are."""
+
+    for key, value in usage.items():
+        if not portable_usage_value(value):
+            return key
+    return None
+
+
 def mark_provider_retried(error: BaseException) -> None:
     """Record on an escaping error that the adapter's retry loop had already run.
 

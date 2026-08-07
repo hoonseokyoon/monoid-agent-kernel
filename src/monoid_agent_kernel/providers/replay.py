@@ -43,13 +43,19 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayMissReason,
     ReplayedResponse,
 )
+from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._request_identity import (
     _REQUEST_DIGEST_GENERATION,
     replay_lookup,
 )
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    ToolCall,
+    unportable_usage_key,
+)
 
 _AUTO: Any = object()
 """Derive from corpus evidence. Distinct from ``None``, which is an explicit non-answer."""
@@ -251,6 +257,16 @@ class ReplayModelAdapter:
 
         body = hit.body
         try:
+            missing = [name for name in RECORDED_TURN_FIELDS if name not in body]
+            if missing:
+                # Without this the answer below reconstructs into an *empty* turn, which the
+                # loop rejects as "neither final text nor tool calls" -- a `model_error` that
+                # kills the run and blames a model that was never called. A recorded turn
+                # carries every field the writer declares; anything else is not one.
+                raise ValueError(
+                    "the recorded answer is missing the fields a recorded turn carries "
+                    f"({', '.join(missing)})"
+                )
             calls: list[ToolCall] = []
             for call in body.get("tool_calls") or ():
                 if (
@@ -271,6 +287,12 @@ class ReplayModelAdapter:
             usage = body.get("usage") or {}
             if not isinstance(usage, Mapping):
                 raise ValueError("the recorded usage is not an object")
+            unportable = unportable_usage_key(usage)
+            if unportable is not None:
+                # The loop refuses these too, three layers down, as `model_bad_response` --
+                # a kill, reported against the adapter. Refusing here keeps a corrupt corpus
+                # inside the miss vocabulary, where the operator can act on it.
+                raise ValueError(f"the recorded usage {unportable} is not a non-negative integer")
             for name in ("response_id", "final_text", "stop_reason"):
                 if body.get(name) is not None and not isinstance(body.get(name), str):
                     raise ValueError(f"the recorded {name} is neither null nor a string")

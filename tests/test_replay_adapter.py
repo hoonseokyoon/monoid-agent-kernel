@@ -561,3 +561,58 @@ def test_serving_a_refused_call_live_moves_the_sequence_past_it(tmp_path: Path) 
 
     assert (first.final_text, inner.calls) == ("live answer", 1)
     assert (second.final_text, inner.calls) == ("recovered", 1)
+
+
+def test_a_body_that_is_not_a_recorded_turn_is_a_miss_not_an_empty_turn(tmp_path: Path) -> None:
+    """A JSON object is not a recorded answer. Reconstruction used to accept any dict, so a
+    corrupt or foreign body became `ModelTurn(final_text=None, tool_calls=())` -- which the
+    loop rejects as "neither final text nor tool calls": a `model_error` that kills the run
+    instead of parking it, and blames a model that was never called.
+    """
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    for body in ({}, {"surprise": 1}, {"final_text": "half a turn"}):
+        _prepend_refused_answer(tmp_path, digest, unrecorded_reason="", body=body)
+        with pytest.raises(ReplayMiss) as caught:
+            _call(_replay(tmp_path), _request())
+        assert caught.value.provider_error_code == MISS_NOT_RECORDED
+        assert caught.value.config_recoverable is True
+        assert "fields a recorded turn carries" in str(caught.value)
+
+
+@pytest.mark.parametrize("count", [-1, "ZZ", 1.0, True, {"nested": 1}])
+def test_a_recorded_count_the_loop_would_refuse_is_refused_here(tmp_path: Path, count: Any) -> None:
+    """Usage was the one reconstructed field checked for its container and not its contents,
+    so a corrupt count escaped the miss vocabulary and surfaced three layers down as
+    `model_bad_response` -- again a kill, again against the adapter rather than the corpus.
+    One predicate now decides portability for the loop and for this reader."""
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": "text",
+            "tool_calls": [],
+            "reasoning": [],
+            "usage": {"input_tokens": count},
+            "stop_reason": None,
+            "provider_retried": False,
+        },
+    )
+
+    with pytest.raises(ReplayMiss) as caught:
+        _call(_replay(tmp_path), _request())
+
+    assert caught.value.provider_error_code == MISS_NOT_RECORDED
+    assert "input_tokens is not a non-negative integer" in str(caught.value)

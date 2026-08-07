@@ -481,6 +481,24 @@ def _no_resolution(sha256: str) -> bytes:
     raise LookupError(f"a refs=False payload resolves no chunks (asked for {sha256})")
 
 
+RECORDED_TURN_FIELDS = (
+    "response_id",
+    "final_text",
+    "tool_calls",
+    "reasoning",
+    "usage",
+    "stop_reason",
+    "provider_retried",
+)
+"""Every field a recorded answer carries, declared once beside the writer that emits them.
+
+The reader needs the same list to tell a recorded turn from any other object that happens to
+be a JSON dict: without it, a corrupt or foreign body reconstructs into an *empty* turn, which
+the loop then rejects as a model error and blames on a model it never called.
+``response_record_body`` asserts it builds exactly these, so the two stay one list.
+"""
+
+
 def response_record_body(turn: Any) -> RecordedResponse:
     """One settled turn as a record body, or the typed reason there is none.
 
@@ -513,6 +531,7 @@ def response_record_body(turn: Any) -> RecordedResponse:
             "stop_reason": getattr(turn, "stop_reason", None),
             "provider_retried": bool(getattr(turn, "provider_retried", False)),
         }
+        assert set(value) == set(RECORDED_TURN_FIELDS)
         encoded = _encoded(value)
     except Exception:
         return RecordedResponse(unrecorded_reason="unencodable")
