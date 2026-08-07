@@ -36,6 +36,7 @@ parallel sites and never bound on its twin. One function, both callers.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -231,6 +232,23 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
             os.close(descriptor)
         except OSError:
             pass
+
+
+# The temporary-name shape ``write_verified_bytes_once`` mints, matched where it is minted. The
+# pid segment is matched, never trusted: pids are reused, so it identifies a writer's *naming*
+# and nothing about its liveness -- freshness is the caller's own filter.
+_WRITE_ONCE_TEMP_NAME = re.compile(r"(.+)\.\d+\.[0-9a-f]{12}\.tmp")
+
+
+def write_once_temp_stem(name: str) -> str | None:
+    """The stored name a :func:`write_verified_bytes_once` temporary was carrying bytes for, or
+    ``None`` when ``name`` was never one of its temporaries. One authoring site: this predicate
+    sits beside the f-string that mints the shape (``{name}.{pid}.{12 hex}.tmp``), so a collector
+    matching crash litter and the writer creating it cannot drift apart. What the stem *means* is
+    the caller's question -- this module does not know it stores content-addressed names."""
+
+    match = _WRITE_ONCE_TEMP_NAME.fullmatch(name)
+    return match.group(1) if match is not None else None
 
 
 def write_verified_bytes_once(path: Path, data: bytes) -> bool:
