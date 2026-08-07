@@ -12,6 +12,7 @@ value would record only the calls that succeeded.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -504,6 +505,79 @@ def test_a_planted_link_stops_the_ledger_instead_of_being_written_through(
     witness.record_settled_call(SettledModelCall(receipt=receipt))
     witness.close()
     assert len(_records(witness.run_dir)) == 1
+
+
+@pytest.mark.parametrize(
+    ("filename", "switch"),
+    [
+        (MODEL_CALLS_FILENAME, "model_calls_file"),
+        ("model_payloads.jsonl", "model_payload_file"),
+        ("model-content.jsonl", "model_content_file"),
+    ],
+    ids=["ledger", "corpus", "content"],
+)
+def test_a_refused_sidecar_says_so_at_warning_level(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, filename: str, switch: str
+) -> None:
+    """A sidecar nobody asked for is absent; a sidecar somebody asked for and did not get is a
+    fault, and the operator who asked has to be able to learn it.
+
+    Every one of these three writers fails closed on a refused verified open, which is right, and
+    then said so only at ``debug`` -- so the shape the refusal exists to catch (a link planted where
+    a reopened run expects its artifact, which is also what a hardlink-deduplicating backup leaves
+    behind) produced a run that exits zero, reports ``completed``, and writes nothing where the
+    operator asked for a record. `monoid validate` then reports the directory clean, because each
+    artifact is optional. Nothing anywhere said no.
+
+    Parametrized across all three because they are three copies of one rule, and this repository's
+    recurring defect is a rule bound on one of parallel halves. ``WARNING`` specifically: below it,
+    Python's last-resort handler drops the message, so a CLI operator who configured no logging --
+    the shape that runs `monoid run` -- would still see nothing.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.model_stream import ModelStreamContext, ModelStreamDelta
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.jsonl"
+    target.write_bytes(b"{}\n")
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    _plant_hardlink(run_dir / filename, target)
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False, **{switch: True})
+    with caplog.at_level(logging.WARNING):
+        recorder.record_settled_call(
+            # A turn, so the corpus arm has an answer to record and actually reaches for its
+            # handle: an empty receipt gives the corpus nothing to write, and a refusal nobody
+            # reached is not the refusal under test.
+            SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="answer"))
+        )
+        writer = recorder.open_model_stream(
+            ModelStreamContext(
+                run_id="run-1",
+                root_run_id="run-1",
+                turn_id="t1",
+                stream_id="s1",
+                step=0,
+                provider="fake",
+                model="m",
+                started_at="2026-01-01T00:00:00Z",
+            )
+        )
+        writer.push(ModelStreamDelta("output", "answer"))
+    recorder.close()
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings, f"the refused {filename} never reached warning level"
+    assert any(filename in record.getMessage() for record in warnings), (
+        f"the warning must name the artifact that was refused: "
+        f"{[record.getMessage() for record in warnings]}"
+    )
+    # The witness that this is a refusal and not merely a quiet run: nothing was written.
+    assert target.read_bytes() == b"{}\n"
 
 
 def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_path: Path) -> None:

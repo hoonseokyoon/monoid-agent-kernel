@@ -9,6 +9,7 @@ independent recovery unit and reports an opened stream without a valid close as 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import threading
@@ -49,6 +50,7 @@ MODEL_CONTENT_FILENAME = "model-content.jsonl"
 DEFAULT_MODEL_CONTENT_BATCH_INTERVAL_S = 0.25
 DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
 _WINDOWS_REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+_LOGGER = logging.getLogger("monoid_agent_kernel.model_content")
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
@@ -411,6 +413,14 @@ class ModelContentStore:
         handle = open_verified_append_text(self.path)
         if handle is None:
             self._disabled = True
+            # Said at WARNING, like the two sidecars in `recorder.py` that make the same refusal.
+            # This one is the reason that rule is stated as "every verified-open refusal" rather
+            # than "the recorder's": the store owns its own open, so a rule bound only where the
+            # recorder logs would have left the oldest of the three writers silent.
+            _LOGGER.warning(
+                "%s could not be safely opened; this run records no private model content",
+                self.path.name,
+            )
             return None
         self._handle = handle
         return self._handle

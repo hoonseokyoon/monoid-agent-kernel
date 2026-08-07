@@ -845,7 +845,10 @@ class AgentRecorder:
         handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
         if handle is None:
             self._model_payloads_failed = True
-            _LOGGER.debug("model payload corpus could not be safely opened")
+            _LOGGER.warning(
+                "%s could not be safely opened; this run records no replay corpus",
+                MODEL_PAYLOADS_FILENAME,
+            )
             return None
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
@@ -893,7 +896,18 @@ class AgentRecorder:
             self._model_calls_failed = True
             # No ``exc_info``: the verified opener reports a refusal by returning ``None``, and the
             # refusal that matters most -- a planted link -- raises nothing at all.
-            _LOGGER.debug("model call ledger could not be safely opened")
+            #
+            # ``warning``, not ``debug``, and the same on both sidecars beside it. These writers are
+            # opt-in, so reaching here means somebody asked for this artifact and is not getting it,
+            # while the run still exits zero and `monoid validate` still calls the directory clean
+            # (each artifact is optional). Below WARNING the last-resort handler drops the record
+            # entirely, so an operator who configured no logging -- `monoid run` -- would be told
+            # nothing at all. Terminal by the flag above, so this is once per activation, not per
+            # record.
+            _LOGGER.warning(
+                "%s could not be safely opened; this run records no model-call ledger",
+                MODEL_CALLS_FILENAME,
+            )
             return None
         self._model_calls_handle = handle
         return handle
@@ -923,7 +937,11 @@ class AgentRecorder:
                 )
             except Exception:  # noqa: BLE001 - private content persistence is best-effort
                 self._model_content_store_failed = True
-                _LOGGER.debug("model content store initialization failed", exc_info=True)
+                _LOGGER.warning(
+                    "%s could not be opened; this run records no private model content",
+                    MODEL_CONTENT_FILENAME,
+                    exc_info=True,
+                )
                 return None
         return self._model_content_store
 
