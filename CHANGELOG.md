@@ -7,6 +7,38 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
+
+- **`ReplayModelAdapter` and `ReplayMiss` (`monoid_agent_kernel.providers`), the corpus reader
+  behind them (`core/payload_replay.py`), and `monoid run --replay-from RUN_DIR_OR_ID`
+  (repeatable) with `--replay-fallthrough`.** A recorded run replays through the engine to the
+  same answer, and the replay run's own ledger recomputes the same request keys line for line —
+  the runner's recomputation is the proof. Answers replay in recorded order, each once; misses
+  are typed (`no_key` / `absent` / `not_recorded` / `identity_mismatch` / `exhausted` /
+  `generation_mismatch`), content-free, and park-shaped (`error_code: "replay_miss"`,
+  `retryable: false`, `config_recoverable: true`), so a session survives a miss and a one-shot
+  run promotes it to `failure.json`. Pure replay builds no live adapter — no gateway URL, no
+  token, no `--allow-direct-provider-api` — and a preflight refuses a run whose config cannot
+  match anything recorded, naming expected and actual. Provider impersonation is derived from
+  corpus evidence (declared originals re-inject reasoning into the record; undeclared ones do
+  not), heterogeneous-provider unions are rejected at construction, tools re-execute for real,
+  and every ledger line of a replay run carries `attributes.replay_from`. Known v1 limit,
+  documented: a spawning run's post-spawn parent turn cannot replay (the spawn observation
+  embeds per-run identifiers), though the children themselves replay from the family union.
+- **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
+  shares the exact functions the runner stamps receipts with; `model_call` re-imports every
+  name, so embedder imports and behavior are unchanged, and the identity pins moved with the
+  functions. A checked-in golden corpus now turns any composition change that forgets to bump
+  the digest generation into a failing test instead of a silently rekeyed fleet.
+
+### Changed
+
+- **`monoid validate` now reports a malformed response reference as its own integrity issue**
+  ("response reference is not a content-addressed name"). A single-key chunk-marker object
+  carrying a non-sha value is unmistakably writer-shaped corruption; it used to be skipped as
+  data (non-string values) or reported in resolution-failure vocabulary (string values). The
+  validator and the replay reader now interpret references through one shared trichotomy.
+
 ### Added — the recording switches are reachable from the shipped shapes
 
 - **`--model-calls-file`, `--model-payload-file` and `--model-content-file` on both `monoid run`

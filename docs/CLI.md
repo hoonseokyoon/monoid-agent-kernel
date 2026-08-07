@@ -264,6 +264,53 @@ one `WARNING` naming the artifact it will not write. If you configured no loggin
 reaches stderr; if you configured some, the loggers are `monoid_agent_kernel.recorder` and
 `monoid_agent_kernel.core.model_content`.
 
+## Replaying a recorded run
+
+`--replay-from RUN_DIR_OR_ID` serves every model call from a recorded corpus instead of a live
+provider. Pure replay builds no live adapter at all — no gateway URL, no token, no
+`--allow-direct-provider-api`, no provider gate — because an offline replay needs none of them:
+
+```bash
+monoid run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --runtime-config-file examples/runtime-config.json \
+  --replay-from runs/RUN_ID
+```
+
+**Only the model is replayed. Tools re-execute for real**, against your workspace, with real
+side effects — replay a run that deleted files and it deletes them again. A tool that answers
+differently than it did (a changed workspace, a clock, a network call) changes the next turn's
+request, and that turn misses: the diagnosis names the diverging terms (`observations`,
+`messages`) by name and digest, never by content.
+
+**The same conversation must carry the same key.** The replay key's model identity is authored
+by this run's runtime config — not by the corpus — so the config must match the recorded run.
+A config that cannot match anything recorded is refused before the run starts (the preflight
+names expected and actual, e.g. the model names); `--replay-fallthrough` softens that to a
+warning and serves misses from the live adapter this command would have built anyway
+(recording flags compose, so `--replay-from ... --model-payload-file` re-records what actually
+happened — the new-episodes shape).
+
+**Answers replay in recorded order, each once.** A request the original run made twice gets
+the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
+the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
+`provider_error_code` (`no_key`, `absent`, `not_recorded`, `identity_mismatch`, `exhausted`,
+`generation_mismatch`), checkpoints kept. Under a session driver the same miss parks the run
+(`config_recoverable: true`): fix the config or the sources and resend.
+
+**A run that spawned subagents is a family.** Children record into their own run directories,
+so name them too — `--replay-from` is repeatable — or the child's first call is the miss. With
+the union the child's calls replay; the parent's first *post-spawn* turn is a documented v1
+limit either way, because the spawn observation the model saw embeds per-run identifiers
+(`child_run_id`, `task_id`, `traceparent`) that a replay honestly cannot reproduce.
+
+**Provenance and privacy.** Every ledger line of a replay run carries
+`attributes.replay_from` (the source run ids, comma-joined), inherited by children. The corpus
+you replay from is content-classified — replaying somebody else's run directory means reading
+their conversation bytes — and the source is never written to: a replay run records into its
+own directory only.
+
 ## Streaming JSON
 
 For machine-readable real-time progress:

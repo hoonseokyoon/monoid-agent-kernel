@@ -239,6 +239,23 @@ def test_contracts_public_surface_is_intentional() -> None:
     assert contracts.__all__ == EXPECTED_CONTRACTS_ALL
 
 
+def test_providers_package_exports_are_intentional() -> None:
+    """Concrete adapters live in ``monoid_agent_kernel.providers``, never in ``contracts``
+    (the removed-names census below bans them there). This is that surface's own census:
+    the shipped adapters, plus the replay adapter with its typed miss beside it -- an
+    error a caller must catch belongs where the class that raises it is found."""
+
+    import monoid_agent_kernel.providers as providers
+
+    assert providers.__all__ == [
+        "FakeModelAdapter",
+        "GatewayModelAdapter",
+        "OpenAIModelAdapter",
+        "ReplayMiss",
+        "ReplayModelAdapter",
+    ]
+
+
 _OPTIONAL_ADAPTER_CAPABILITIES = ("supports_multimodal", "wire_image_encoding", "provider_name")
 
 

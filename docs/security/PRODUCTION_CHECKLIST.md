@@ -88,6 +88,10 @@ default must be changed for production.
 - [ ] Retention policy for private artifacts is defined. Nothing in the kernel
       deletes them: `monoid gc` collects only chunks no record resolves, so a healthy
       replay corpus grows with the conversation until you remove it.
+- [ ] `--replay-from` sources are as trusted as the workspace: replay re-executes
+      tools for real (side effects happen again), a foreign run directory is read
+      as content, and `--replay-fallthrough` turns misses into live, billed calls —
+      leave it off when the point is that no provider is contacted.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.
 

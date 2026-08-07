@@ -257,7 +257,10 @@ deduplicated per tool definition, per message and per observation) and the settl
 bodies, reasoning included. Both are requested per run with `monoid run --model-calls-file` and
 `monoid run --model-payload-file`, per deployment with the same two flags on
 `monoid backend serve`, and directly by an embedder through the matching `AgentLoop` and
-`RunnerBackend` fields.
+`RunnerBackend` fields. `monoid run --replay-from RUN_DIR` closes the loop: it serves a
+recorded corpus back as the model — offline, no provider configuration at all — replaying
+answers in recorded order while tools re-execute for real, and failing misses as a typed,
+content-free `replay_miss` unless `--replay-fallthrough` hands them to the live adapter.
 `MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
 egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
 integrations can still opt into the legacy durable `model.output.delta` and

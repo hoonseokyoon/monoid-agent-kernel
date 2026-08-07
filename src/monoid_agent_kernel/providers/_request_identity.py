@@ -75,8 +75,8 @@ def _prompt_terms(request: ModelRequest) -> dict[str, Any]:
     fields **are** the prompt. Hashing only `messages` made every by-reference continuation collide
     with every other, which is the ordinary case for a gateway client, not an edge one.
 
-    `messages` keeps `None` apart from `()`, because the wire does. Both shipped adapters select the
-    request shape with `messages is not None` -- an empty tuple sends an empty conversation and
+    `messages` keeps `None` apart from `()`, because the wire does. Both wire-writing shipped
+    adapters select the request shape with `messages is not None` -- an empty tuple sends an empty conversation and
     drops the instruction, `None` sends the instruction or the handle. `or ()` read the field for
     emptiness when the field's own meaning is presence, so two requests the provider answers
     differently were handed one replay key.

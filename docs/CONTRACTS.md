@@ -793,6 +793,57 @@ which excludes `gateway_url` by construction. `reasoning` *is* recorded, encrypt
 included, because the loop re-injects it into the next by-value turn — a corpus without it would
 derail one turn after every replayed answer.
 
+#### Replaying the corpus
+
+`ReplayModelAdapter` (`monoid_agent_kernel.providers`, W6-4b; `monoid run --replay-from` is its
+CLI face, [CLI.md](CLI.md)) serves `next_turn` from one or more recorded run directories and
+refuses everything it cannot prove. The contract:
+
+- **Selection is file order, each answer once.** The corpus records what happened; the adapter
+  hands answers back in that order. A record whose body was refused (`unrecorded_reason`) still
+  spends its slot — skipping it would hand answer N+1 to call N — and consuming it is a
+  `not_recorded` miss. Duplicate request records and a restarting `call_index` are the ordinary
+  durable-resume shape and collapse by digest, exactly as the previous section specifies.
+- **Misses are typed and content-free.** Six reasons, fixed: `no_key` (the live request could
+  not be keyed), `absent` (nothing recorded under the key — including the failed-original-call
+  shape, whose request record has no answer beside it), `not_recorded` (an answer slot exists
+  but cannot yield a turn), `identity_mismatch`, `exhausted`, `generation_mismatch`. Without a
+  fallthrough adapter a miss raises `ReplayMiss` — `error_code: "replay_miss"`, the sub-reason
+  in `provider_error_code`, `retryable: false`, `config_recoverable: true`, so it parks a
+  session and promotes to the failure record only when a one-shot facade closes. The message
+  names generations, config values (which the ledger already records in plaintext) and term
+  names with digests — never conversation content, and that is pinned adversarially on the
+  public `turn.failed` payload.
+- **The replay run's config authors the key's model identity** (the loop always sets
+  `request.model`), so the commonest total miss is a config that does not match the recording.
+  The CLI preflights exactly this comparison before the run starts, through the same function
+  the miss diagnosis uses.
+- **Impersonation is derived from evidence.** The corpus `provider` term is a resolved value
+  that cannot say whether the original adapter *declared* a provider, and the loop's reasoning
+  re-injection reads only the declaration — so the adapter declares when the recorded requests
+  carry re-injected reasoning blocks, refuses to declare when answers carry reasoning that no
+  recorded request re-injected, and declares (for key stability) when there is no reasoning at
+  all. Unions that recorded more than one provider are rejected at construction; a kernel-driven
+  family cannot produce one (children share the parent's adapter instance).
+- **Tools re-execute for real.** Only model answers are replayed; a tool that answers
+  differently than it did changes the next request and that turn misses `absent`, the diagnosis
+  naming the diverging terms. The same mechanism bounds families: children replay from the
+  union of their run directories (naming them is a requirement, not a convenience), and the
+  parent's first post-spawn turn is a documented v1 limit — the spawn observation embeds
+  per-run identifiers a replay honestly cannot reproduce, and fabricating them would be exactly
+  the invented identity the key doctrine forbids.
+- **Ledger deltas, two, both here on purpose:** the adapter declares no `resolve_destination`,
+  so a replay run's `destination_status` reads `not_declared` even when the original resolved;
+  and when the no-reasoning rule declares a provider an undeclared original did not, the replay
+  ledger's `provider_name` is non-empty where the original's was `""`.
+- **Sources are read, never written**, and they are content: replaying a foreign run directory
+  means reading that run's conversation bytes, so the corpus's privacy classification travels
+  with the replay. A replay run's own recording switches write into its own directory only.
+
+The generation rule above is what retires a corpus: a composition change bumps
+`monoid.model-request-digest.v1`, and every replay against the old recording answers
+`generation_mismatch` naming both tags instead of silently missing.
+
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
 and inherited by in-process descendants, producing one passive root-multiplexed presentation
