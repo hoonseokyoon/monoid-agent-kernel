@@ -22,6 +22,8 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
+from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_FILENAME
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -507,17 +509,18 @@ def test_a_planted_link_stops_the_ledger_instead_of_being_written_through(
     assert len(_records(witness.run_dir)) == 1
 
 
+@pytest.mark.parametrize("plant", [_plant_hardlink, _plant_symlink], ids=["hardlink", "symlink"])
 @pytest.mark.parametrize(
     ("filename", "switch"),
     [
         (MODEL_CALLS_FILENAME, "model_calls_file"),
-        ("model_payloads.jsonl", "model_payload_file"),
-        ("model-content.jsonl", "model_content_file"),
+        (MODEL_PAYLOADS_FILENAME, "model_payload_file"),
+        (MODEL_CONTENT_FILENAME, "model_content_file"),
     ],
     ids=["ledger", "corpus", "content"],
 )
 def test_a_refused_sidecar_says_so_at_warning_level(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, filename: str, switch: str
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, filename: str, switch: str, plant: Any
 ) -> None:
     """A sidecar nobody asked for is absent; a sidecar somebody asked for and did not get is a
     fault, and the operator who asked has to be able to learn it.
@@ -533,6 +536,9 @@ def test_a_refused_sidecar_says_so_at_warning_level(
     recurring defect is a rule bound on one of parallel halves. ``WARNING`` specifically: below it,
     Python's last-resort handler drops the message, so a CLI operator who configured no logging --
     the shape that runs `monoid run` -- would still see nothing.
+
+    Both planters, like the sibling refusal test above, because a single one whose guard is
+    ``pytest.skip`` takes the whole three-way census with it on a filesystem that declines it.
     """
     from monoid_agent_kernel.core.model_io import ModelCallReceipt
     from monoid_agent_kernel.core.model_stream import ModelStreamContext, ModelStreamDelta
@@ -545,39 +551,220 @@ def test_a_refused_sidecar_says_so_at_warning_level(
 
     run_dir = tmp_path / "runs" / "run-1"
     run_dir.mkdir(parents=True)
-    _plant_hardlink(run_dir / filename, target)
+    plant(run_dir / filename, target)
 
     recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False, **{switch: True})
     with caplog.at_level(logging.WARNING):
-        recorder.record_settled_call(
-            # A turn, so the corpus arm has an answer to record and actually reaches for its
-            # handle: an empty receipt gives the corpus nothing to write, and a refusal nobody
-            # reached is not the refusal under test.
-            SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="answer"))
-        )
-        writer = recorder.open_model_stream(
-            ModelStreamContext(
-                run_id="run-1",
-                root_run_id="run-1",
-                turn_id="t1",
-                stream_id="s1",
-                step=0,
-                provider="fake",
-                model="m",
-                started_at="2026-01-01T00:00:00Z",
+        # TWICE, both arms. "Once per activation" is a claim about the second attempt, so a test
+        # that makes one attempt asserts it vacuously -- it would read `== 1` no matter how the
+        # door was written.
+        for attempt in range(2):
+            recorder.record_settled_call(
+                # A turn, so the corpus arm has an answer to record and actually reaches for its
+                # handle: an empty receipt gives the corpus nothing to write, and a refusal nobody
+                # reached is not the refusal under test.
+                SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="answer"))
             )
-        )
-        writer.push(ModelStreamDelta("output", "answer"))
+            writer = recorder.open_model_stream(
+                ModelStreamContext(
+                    run_id="run-1",
+                    root_run_id="run-1",
+                    turn_id=f"t{attempt}",
+                    stream_id=f"s{attempt}",
+                    step=attempt,
+                    provider="fake",
+                    model="m",
+                    started_at="2026-01-01T00:00:00Z",
+                )
+            )
+            writer.push(ModelStreamDelta("output", "answer"))
     recorder.close()
 
     warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert warnings, f"the refused {filename} never reached warning level"
-    assert any(filename in record.getMessage() for record in warnings), (
-        f"the warning must name the artifact that was refused: "
-        f"{[record.getMessage() for record in warnings]}"
-    )
+    named = [record for record in warnings if filename in record.getMessage()]
+    # Exactly one, across two attempts. This is the integration half of "once per activation": it
+    # is true here through four independent short-circuits, so no single regression can falsify
+    # it, which is why the door's own guard is pinned directly in
+    # ``test_the_door_is_what_makes_the_announcement_once_per_activation`` below -- there it is
+    # the only thing standing between one line and a line per record.
+    assert len(named) == 1, [record.getMessage() for record in warnings]
     # The witness that this is a refusal and not merely a quiet run: nothing was written.
     assert target.read_bytes() == b"{}\n"
+
+
+def test_a_chunk_the_store_refuses_says_so_like_the_files_beside_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The corpus dies at its chunk directory as readily as at its own file, and more quietly.
+
+    An offloaded value is stored *before* the record that references it, so a refusal here means
+    the corpus file is never even created -- there is nothing on disk to notice, which is strictly
+    worse for a reader than a refused open leaving a stale file behind. ``write_verified_bytes_once``
+    returns ``False`` for a planted name at the content-addressed path and for any ``OSError``
+    (ENOSPC, EACCES, a path the platform will not take), and its own contract calls that "terminal
+    for the caller's artifact, for the reason the append opener's ``None`` is".
+
+    So this is the same rule as the three verified-open refusals, one function over -- the shape
+    that has now been missed twice in this branch, which is why the disable is a single call that
+    cannot be made without announcing.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_DIRNAME
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    # Not a symlink: a plain file wearing the chunk directory's name needs no privilege, so this
+    # pin runs everywhere rather than skipping on the platform the project is developed on.
+    (run_dir / MODEL_PAYLOADS_DIRNAME).write_bytes(b"not a directory")
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", model_payload_file=True, status_file=False)
+    with caplog.at_level(logging.WARNING):
+        recorder.record_settled_call(
+            SettledModelCall(
+                receipt=ModelCallReceipt(),
+                turn=ModelTurn(final_text="x" * 300_000),  # past the offload threshold
+            )
+        )
+        recorder.record_settled_call(
+            SettledModelCall(receipt=ModelCallReceipt(), turn=ModelTurn(final_text="y" * 300_000))
+        )
+    recorder.close()
+
+    named = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and MODEL_PAYLOADS_FILENAME in record.getMessage()
+    ]
+    assert len(named) == 1, [record.getMessage() for record in caplog.records]
+    assert not (run_dir / MODEL_PAYLOADS_FILENAME).exists(), (
+        "the corpus file is never created on this route, which is why the log is the only signal"
+    )
+
+
+def test_the_door_is_what_makes_the_announcement_once_per_activation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Called straight, so the guard under test is the only one in the way.
+
+    Driven through a run, "exactly one warning" is true through four short-circuits -- two
+    wanted-predicates, the handle cache, and the door -- so removing any single one leaves the
+    count at one and a regression walks. Here the door is the only thing between one line and a
+    line per record, and the flags are what the recorder's own callers read, so the second half of
+    the assertion is that a second call is a no-op rather than merely a quiet one.
+    """
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False)
+    doors = (
+        (recorder._lose_model_calls, MODEL_CALLS_FILENAME, "_model_calls_failed"),
+        (recorder._lose_model_payloads, MODEL_PAYLOADS_FILENAME, "_model_payloads_failed"),
+        (recorder._lose_model_content, MODEL_CONTENT_FILENAME, "_model_content_store_failed"),
+    )
+    with caplog.at_level(logging.WARNING):
+        for door, _artifact, _flag in doors:
+            for _ in range(3):
+                door("a reason")
+    recorder.close()
+
+    for _door, artifact, flag in doors:
+        named = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.WARNING and artifact in record.getMessage()
+        ]
+        assert len(named) == 1, [record.getMessage() for record in caplog.records]
+        assert getattr(recorder, flag) is True
+
+
+def test_the_announcement_carries_no_traceback_and_no_identifier(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What the line says goes to every embedder's stderr, so it names the artifact and stops.
+
+    A rendered traceback names the absolute run directory -- the run id, and whatever a deployment
+    calls the directories above it -- which is why the refusal sites carry no ``exc_info``. That
+    rule was written on one of them and then carried *past* by a level promotion on its neighbour,
+    so it is pinned here rather than left as a comment. Identifiers still travel, in ``extra``,
+    where an aggregator can key on them and the default rendering does not.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    run_id = "run-with-a-telling-name"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"{}\n")
+    _plant_hardlink(run_dir / MODEL_CALLS_FILENAME, outside)
+
+    recorder = AgentRecorder(tmp_path / "runs", run_id, model_calls_file=True, status_file=False)
+    with caplog.at_level(logging.WARNING):
+        recorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))
+    recorder.close()
+
+    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert record.exc_info is None, "a traceback here would print the absolute run directory"
+    rendered = logging.Formatter("%(message)s").format(record)
+    assert run_id not in rendered
+    assert str(tmp_path) not in rendered
+    assert MODEL_CALLS_FILENAME in rendered
+    # ...and the identifier is still available to anything that asks for it.
+    assert record.monoid_run_id == run_id
+
+
+def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other_way(
+    tmp_path: Path,
+) -> None:
+    """A census, because this rule has been bound on a subset twice in one branch.
+
+    Both writers keep a flag meaning "this artifact records nothing for the rest of the
+    activation". Setting one is exactly the event an operator needs told, so the assignment and
+    the announcement are one call and the raw assignment appears once per flag -- inside it. A
+    reviewer adding a new failure path cannot reach the terminal state without going through the
+    door that speaks.
+    """
+    import ast
+
+    from monoid_agent_kernel.core import model_content as content_module
+    from monoid_agent_kernel import recorder as recorder_module
+
+    for module, attributes, doors in (
+        (
+            recorder_module,
+            ("_model_calls_failed", "_model_payloads_failed", "_model_content_store_failed"),
+            ("_lose_model_calls", "_lose_model_payloads", "_lose_model_content"),
+        ),
+        (content_module, ("_disabled",), ("_disable_locked",)),
+    ):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        for door in doors:
+            assert door in functions, f"{module.__name__} must funnel its disable through {door}"
+        outside = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute)
+            and target.attr in attributes
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+            and not any(
+                door_node.lineno <= node.lineno <= (door_node.end_lineno or node.lineno)
+                for name, door_node in functions.items()
+                if name in doors
+            )
+        ]
+        assert not outside, (
+            f"{module.__name__} sets a terminal-disable flag outside its announcing door at "
+            f"lines {outside}; that is the silent-artifact defect this census exists to refuse"
+        )
 
 
 def test_a_reopened_ledger_isolates_the_tail_the_crashed_activation_tore(tmp_path: Path) -> None:

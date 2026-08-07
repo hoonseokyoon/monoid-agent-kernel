@@ -781,13 +781,58 @@ class AgentRecorder:
             target = self.run_dir / MODEL_PAYLOADS_DIRNAME / sha
             if write_verified_bytes_once(target, chunk):
                 return True
-            self._model_payloads_failed = True
-            _LOGGER.debug("model payload chunk could not be stored")
+            # A chunk lands before the record that references it, so this is the one disable that
+            # can leave the corpus file never created at all -- nothing on disk to notice, which is
+            # why it needs the loudest of them, not the quietest.
+            self._lose_model_payloads("a chunk could not be stored")
             return False
         line = self._encoded_payload_line(chunk_record(chunk, **envelope))
         if line is None:
             return False
         return self._append_model_payload(line)
+
+    def _lose_artifact(self, artifact: str, reason: str) -> None:
+        """Say, once, that an artifact this run was configured to produce stops here.
+
+        Every writer below keeps a flag meaning "this artifact records nothing for the rest of the
+        activation", reachable through a refused open, a refused chunk, and a torn append. Setting
+        one *is* the event an operator needs told -- the run still exits zero, and `monoid
+        validate` still calls the directory clean, because each artifact is optional -- so the
+        assignment and the announcement are one call, and the three doors below are the only places
+        the raw flag is written. A new failure path cannot reach the terminal state without going
+        through a door that speaks; a census test refuses the file if one ever does.
+
+        ``WARNING`` because the last-resort handler drops anything below it, so an operator who
+        configured no logging -- which is what `monoid run` is -- would otherwise be told nothing at
+        all. The message names the artifact and nothing else: identifiers travel in ``extra`` where
+        an aggregator can key on them, so the default stderr rendering stays free of the run id and
+        the paths around it, and no traceback is rendered here for the same reason.
+        """
+
+        _LOGGER.warning(
+            "%s: %s; this activation records no more of it",
+            artifact,
+            reason,
+            extra={"monoid_run_id": self.run_id, "monoid_artifact": artifact},
+        )
+
+    def _lose_model_calls(self, reason: str) -> None:
+        if self._model_calls_failed:
+            return
+        self._model_calls_failed = True
+        self._lose_artifact(MODEL_CALLS_FILENAME, reason)
+
+    def _lose_model_payloads(self, reason: str) -> None:
+        if self._model_payloads_failed:
+            return
+        self._model_payloads_failed = True
+        self._lose_artifact(MODEL_PAYLOADS_FILENAME, reason)
+
+    def _lose_model_content(self, reason: str) -> None:
+        if self._model_content_store_failed:
+            return
+        self._model_content_store_failed = True
+        self._lose_artifact(MODEL_CONTENT_FILENAME, reason)
 
     def _append_model_call(self, line: str) -> bool:
         """Write one encoded line. Caller holds ``_model_calls_lock``; returns whether it landed."""
@@ -799,8 +844,7 @@ class AgentRecorder:
             handle.write(line + "\n")
             handle.flush()
         except (OSError, UnicodeError):
-            self._model_calls_failed = True
-            _LOGGER.debug("model call ledger append failed", exc_info=True)
+            self._lose_model_calls("an append failed and may have torn its line")
             return False
         return True
 
@@ -814,8 +858,7 @@ class AgentRecorder:
             handle.write(line + "\n")
             handle.flush()
         except (OSError, UnicodeError):
-            self._model_payloads_failed = True
-            _LOGGER.debug("model payload append failed", exc_info=True)
+            self._lose_model_payloads("an append failed and may have torn its line")
             return False
         return True
 
@@ -844,11 +887,7 @@ class AgentRecorder:
             return self._model_payloads_handle
         handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
         if handle is None:
-            self._model_payloads_failed = True
-            _LOGGER.warning(
-                "%s could not be safely opened; this run records no replay corpus",
-                MODEL_PAYLOADS_FILENAME,
-            )
+            self._lose_model_payloads("it could not be safely opened")
             return None
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
@@ -889,25 +928,16 @@ class AgentRecorder:
         receipt would only re-run the identical refusal.
         """
 
+        if self._model_calls_failed:
+            # The corpus twin has always self-guarded, and the "once per activation" property was
+            # resting on the two callers above happening to check the flag first. It is the door's
+            # own business.
+            return None
         if self._model_calls_handle is not None:
             return self._model_calls_handle
         handle = open_verified_append_text(self.run_dir / MODEL_CALLS_FILENAME)
         if handle is None:
-            self._model_calls_failed = True
-            # No ``exc_info``: the verified opener reports a refusal by returning ``None``, and the
-            # refusal that matters most -- a planted link -- raises nothing at all.
-            #
-            # ``warning``, not ``debug``, and the same on both sidecars beside it. These writers are
-            # opt-in, so reaching here means somebody asked for this artifact and is not getting it,
-            # while the run still exits zero and `monoid validate` still calls the directory clean
-            # (each artifact is optional). Below WARNING the last-resort handler drops the record
-            # entirely, so an operator who configured no logging -- `monoid run` -- would be told
-            # nothing at all. Terminal by the flag above, so this is once per activation, not per
-            # record.
-            _LOGGER.warning(
-                "%s could not be safely opened; this run records no model-call ledger",
-                MODEL_CALLS_FILENAME,
-            )
+            self._lose_model_calls("it could not be safely opened")
             return None
         self._model_calls_handle = handle
         return handle
@@ -936,12 +966,12 @@ class AgentRecorder:
                     run_id=self.run_id,
                 )
             except Exception:  # noqa: BLE001 - private content persistence is best-effort
-                self._model_content_store_failed = True
-                _LOGGER.warning(
-                    "%s could not be opened; this run records no private model content",
-                    MODEL_CONTENT_FILENAME,
-                    exc_info=True,
-                )
+                # The detail stays at ``debug``. Promoting the level carried this ``exc_info`` up
+                # with it, and a rendered traceback names the absolute run directory -- run id and
+                # whatever the deployment's parents are called -- on the stderr of every embedder,
+                # which is the thing the sibling site twelve lines up refuses to do by name.
+                _LOGGER.debug("model content store initialization failed", exc_info=True)
+                self._lose_model_content("it could not be opened")
                 return None
         return self._model_content_store
 
