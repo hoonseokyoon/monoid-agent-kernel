@@ -216,6 +216,20 @@ main.add_command(builder_group)
 @click.option(
     "--event-sink-module", multiple=True, help="Load custom event sinks from path.py:function."
 )
+@click.option(
+    "--model-calls-file",
+    is_flag=True,
+    help="Record a per-call model ledger (model_calls.jsonl) in the run directory.",
+)
+@click.option(
+    "--model-payload-file",
+    is_flag=True,
+    help=(
+        "Record the private replay corpus (model_payloads.jsonl plus its chunk directory). "
+        "Carries request and response content; inspect with `monoid validate`, collect with "
+        "`monoid gc`."
+    ),
+)
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
 @click.pass_context
@@ -253,6 +267,8 @@ def run(
     web_gateway_token_env: str,
     web_gateway_token_file: Path | None,
     event_sink_module: tuple[str, ...],
+    model_calls_file: bool,
+    model_payload_file: bool,
     stream_json: bool,
     no_status_file: bool,
 ) -> None:
@@ -404,6 +420,8 @@ def run(
             context_providers=(skill_provider,) if skill_provider is not None else (),
             capability_broker=broker,
             event_sinks=tuple(extra_sinks),
+            model_calls_file=model_calls_file,
+            model_payload_file=model_payload_file,
             status_file=not no_status_file,
             permission_policy=spec.permission_policy,
             runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),

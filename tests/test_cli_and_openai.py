@@ -1865,3 +1865,69 @@ def test_cli_run_refuses_an_adapter_offering_open_without_close(
     assert not isinstance(result.exception, AttributeError), (
         "the failure must be a reported CLI error, not a raw attribute lookup escaping the handler"
     )
+
+
+def test_cli_run_recording_flags_produce_the_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--model-calls-file`` / ``--model-payload-file`` are the CLI's halves of the switches
+    the backend carries as fields. Without them this CLI shipped ``monoid gc`` and ``monoid
+    validate`` -- consumer verbs -- while no ``monoid run`` invocation could produce the
+    artifacts they consume. The witness is the digest join, as in the backend twin: the
+    ledger line's 64-hex key must name the corpus request record beside it. And the flags
+    stay opt-in: the corpus is content-classified, so the second run pins that omitting them
+    writes neither file."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+    run_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-recording",
+            "--model-calls-file", "--model-payload-file",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_dir = run_root / "cli-recording"
+    ledger_lines = [
+        json.loads(line)
+        for line in (run_dir / "model_calls.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert ledger_lines, "the ledger flag reached the run"
+    digest = ledger_lines[0]["request_digest"]
+    assert len(digest) == 64
+    request_records = [
+        record
+        for record in (
+            json.loads(line)
+            for line in (run_dir / "model_payloads.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        if record.get("kind") == "model_request"
+    ]
+    assert [record["request_digest"] for record in request_records] == [digest]
+
+    quiet = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-quiet",
+        ],
+    )
+
+    assert quiet.exit_code == 0, quiet.output
+    assert not (run_root / "cli-quiet" / "model_calls.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model_payloads.jsonl").exists()
