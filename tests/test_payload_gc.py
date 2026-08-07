@@ -3,8 +3,10 @@
 The collector's one fatal mistake is deleting a chunk some record still lets a reader resolve, so
 these tests bind its ingredients to the artifacts they must agree with: the reference walker to
 the writer that produces references and to the validator that resolves them, the temp-name
-predicate to the writer that authors temporary names, and (from the collector on) every deletion
-to ``validate_run_dir`` reporting exactly what it reported before.
+predicate to the writer that authors temporary names, and every sweep that runs to completion
+against a real corpus to ``validate_run_dir`` reporting exactly what it reported before. The
+exception is deliberate and named where it happens: a fixture that destroys the chunk directory
+mid-pass to prove the collector stops is a fixture whose verdict is *supposed* to change.
 """
 
 from __future__ import annotations
@@ -386,6 +388,7 @@ def test_a_young_orphan_is_spared_by_min_age(tmp_path: Path) -> None:
     run_dir, _sha = _recorded_run(tmp_path)
     orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("e" * 64)
     orphan.write_bytes(b"j" * 128)
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
@@ -393,6 +396,7 @@ def test_a_young_orphan_is_spared_by_min_age(tmp_path: Path) -> None:
     assert entry.classification == "orphan" and entry.deleted is False and entry.error == ""
     assert report.candidate_bytes == 0
     assert orphan.exists()
+    assert _issues(run_dir) == before
 
 
 def test_a_dead_writers_old_temp_goes_and_a_young_one_stays(tmp_path: Path) -> None:
@@ -406,6 +410,7 @@ def test_a_dead_writers_old_temp_goes_and_a_young_one_stays(tmp_path: Path) -> N
     _backdate(dead)
     fresh = chunk_dir / f"{'b' * 64}.{os.getpid() + 1}.{'1' * 12}.tmp"
     fresh.write_bytes(b"partial")
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
@@ -415,6 +420,7 @@ def test_a_dead_writers_old_temp_goes_and_a_young_one_stays(tmp_path: Path) -> N
     young = _entry(report, fresh.name)
     assert young.classification == "temp" and young.deleted is False
     assert fresh.exists()
+    assert _issues(run_dir) == before
 
 
 def test_foreign_entries_are_never_touched(tmp_path: Path) -> None:
@@ -443,6 +449,7 @@ def test_foreign_entries_are_never_touched(tmp_path: Path) -> None:
         foreign_names.append("d" * 64)
     except OSError:
         pass  # symlink privilege is optional; the other four shapes still cover the rule
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=0.0, apply=True)
 
@@ -453,6 +460,7 @@ def test_foreign_entries_are_never_touched(tmp_path: Path) -> None:
     # And they are not counted as reclaimable either: the counter answers "what would --apply
     # remove", so anything it names must be something --apply is allowed to remove.
     assert report.candidate_bytes == 0
+    assert _issues(run_dir) == before
 
 
 def test_chunks_referenced_only_by_damaged_lines_are_collectable_and_the_lines_are_named(
@@ -637,12 +645,14 @@ def test_a_hardlinked_orphan_is_deleted_without_touching_the_other_names_bytes(
     archive = tmp_path / "archive.bin"
     os.link(orphan, archive)
     _backdate(orphan)
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
     assert _entry(report, "7" * 64).deleted is True
     assert not orphan.exists()
     assert archive.read_bytes() == b"archived" * 64
+    assert _issues(run_dir) == before
 
 
 def test_one_undeletable_entry_costs_itself_not_the_sweep(
@@ -666,6 +676,7 @@ def test_one_undeletable_entry_costs_itself_not_the_sweep(
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", selective)
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
@@ -674,6 +685,7 @@ def test_one_undeletable_entry_costs_itself_not_the_sweep(
     assert _entry(report, "6" * 64).deleted is True
     assert stuck.exists() and not loose.exists()
     assert report.reclaimed_bytes == 32
+    assert _issues(run_dir) == before
 
 
 def test_report_mode_leaves_the_directory_byte_identical(tmp_path: Path) -> None:
@@ -691,6 +703,7 @@ def test_report_mode_leaves_the_directory_byte_identical(tmp_path: Path) -> None
         path.name: (path.lstat().st_size, path.lstat().st_mtime_ns)
         for path in chunk_dir.iterdir()
     }
+    before = _issues(run_dir)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=False)
 
@@ -702,6 +715,7 @@ def test_report_mode_leaves_the_directory_byte_identical(tmp_path: Path) -> None
         path.name: (path.lstat().st_size, path.lstat().st_mtime_ns)
         for path in chunk_dir.iterdir()
     } == snapshot
+    assert _issues(run_dir) == before
 
 
 def test_an_absent_chunk_dir_reports_empty_and_clean(tmp_path: Path) -> None:
@@ -912,6 +926,7 @@ def test_gc_apply_deletes_and_reports_reclaimed_bytes(tmp_path: Path) -> None:
     orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
     orphan.write_bytes(b"j" * 512)
     _backdate(orphan)
+    before = _issues(run_dir)
 
     result = CliRunner().invoke(main, ["gc", str(run_dir), "--apply", "--json"])
 
@@ -920,9 +935,7 @@ def test_gc_apply_deletes_and_reports_reclaimed_bytes(tmp_path: Path) -> None:
     assert payload["applied"] is True and payload["reclaimed_bytes"] == 512
     assert not orphan.exists()
     assert (run_dir / MODEL_PAYLOADS_DIRNAME / sha).exists()
-    assert not any(
-        issue.path.startswith(MODEL_PAYLOADS_FILENAME) for issue in validate_run_dir(run_dir)
-    )
+    assert _issues(run_dir) == before
 
 
 def test_gc_exit_is_nonzero_but_stdout_stays_parseable_on_refusal(tmp_path: Path) -> None:

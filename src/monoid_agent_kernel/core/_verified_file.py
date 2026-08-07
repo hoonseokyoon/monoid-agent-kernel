@@ -296,8 +296,9 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # regular file -- no symlink, no FIFO, no directory.
             #
             # Not ``st_nlink == 1``, which is the *appenders'* rule: a second name for an inode
-            # this process is about to mutate is somebody else's file, but this function mutates
-            # nothing (``O_EXCL`` on a temp, then ``os.replace``), and a link count is what every
+            # this process is about to rewrite is somebody else's file, but this function rewrites
+            # no bytes (``O_EXCL`` on a temp, then ``os.replace``; the adoption touch below moves
+            # times only, an archive's other name included), and a link count is what every
             # hardlink-deduplicating archive of a run directory changes. A hard link here is a
             # second name for a real file inside this directory, not an escape from it.
             #

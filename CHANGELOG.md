@@ -12,11 +12,14 @@ out in commit messages and here.
 - **`monoid gc RUN_DIR` reports what no record in a run's replay corpus resolves — orphaned
   chunks from an interrupted write, dead write temporaries from other processes' crashed writers
   — and `monoid gc RUN_DIR --apply` deletes it.** Report-only is the default because this is the
-  kernel's first run-directory deleter and a chunk is an unrecoverable original: deletion is
-  nominated by keep-set membership (one whole-record walker, deliberately a superset of every
-  resolver), gated by `--min-age-s` (default one day), re-checked by `lstat` immediately before
-  each unlink, and held to the invariant every fixture pins — `monoid validate` reports exactly
-  the same issues after a sweep as before it. Foreign entries (anything the corpus writer
+  first deletion an operator can ask the kernel for (the recorder already unlinks its own
+  process's temporaries) and a chunk is an unrecoverable original: deletion is nominated by
+  keep-set membership (one whole-record walker, deliberately a superset of every resolver), gated
+  by `--min-age-s` (default one day; a gate that is not a finite, non-negative number of seconds
+  is refused before the directory is read), re-checked immediately before each unlink — same
+  directory the safety gate approved, still a regular file, still past the gate — and held to one
+  invariant, pinned on every fixture whose sweep runs to completion against a real corpus:
+  `monoid validate` reports exactly the same issues after a sweep as before it. Foreign entries (anything the corpus writer
   demonstrably did not mint) are reported and never touched. Chunk-shaped files beside an absent
   or unreadable corpus are `unjudged` and never touched, because a mutilated directory and a
   first-call crash whose very first chunk was directory-sized leave the same state — the chunk
@@ -25,10 +28,11 @@ out in commit messages and here.
   invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
   failed deletions, zero for garbage merely found. Never run it beside a live writer of the same
   run directory; liveness is the operator's knowledge, as with `monoid validate`.
-- **Adoption now leaves a timestamp.** A resumed run re-deriving a chunk that already exists
-  accepts the stored file without rewriting a byte — and, from this release, refreshes its
-  times, which turns the collector's age gate into a protocol about recent use rather than a
-  guess about fresh writes. The conformance evidence store's exists-hit reuse stays pinned
+- **Adoption now leaves a timestamp.** A writer accepting a chunk file that already exists — a
+  resumed run re-deriving what it already holds is the common case — takes the stored file
+  without rewriting a byte and, from this release, refreshes its times, which turns the
+  collector's age gate into a protocol about recent use rather than a guess about fresh writes.
+  Best-effort: a touch the platform refuses is swallowed, because the chunk is stored either way. The conformance evidence store's exists-hit reuse stays pinned
   mtime-stable on purpose (no collector sweeps the evidence directory), and an incremental
   archiver may answer the refreshed timestamp with one redundant re-copy.
 

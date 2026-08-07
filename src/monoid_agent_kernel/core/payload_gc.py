@@ -12,11 +12,14 @@ thing ever deleted is what no record lets any reader resolve.
 Concurrency is a contract, not a mechanism: **never run this beside a live writer of the same run
 directory.** The writer takes no cross-process lock, and nothing on disk distinguishes a dead
 writer from a live one, so liveness is the operator's knowledge -- the same trust model
-``monoid validate`` runs under. Two belts make even a violated contract non-destructive for
-anything touched within their window: a candidate must be older than ``min_age_s``, and adoption
--- a resumed writer re-deriving a chunk that already exists -- refreshes the file's times
+``monoid validate`` runs under. Two belts narrow what a violated contract can cost: a candidate's
+age must have reached ``min_age_s``, and adoption -- any writer accepting a chunk file that
+already exists -- refreshes that file's times
 (:func:`~monoid_agent_kernel.core._verified_file.write_verified_bytes_once`), so recent use looks
-recent. The belts bound the damage of a broken contract; they are not permission to break it.
+recent. Neither is a guarantee. The second is best-effort by construction (a touch the platform
+refuses is swallowed, because the chunk *is* stored), and a writer that stalls past ``min_age_s``
+between storing a chunk and appending the line that references it outlives both. The belts bound
+the damage of a broken contract; they are not permission to break it.
 
 Judging chunk-shaped files needs the corpus. When ``model_payloads.jsonl`` is absent or cannot be
 opened as this run's own regular file, those files are reported ``unjudged`` and left alone: a
@@ -62,12 +65,15 @@ from monoid_agent_kernel.core.model_payloads import (
 class PayloadGcEntry:
     """One chunk-directory entry as the collector judged it.
 
-    ``classification``: ``kept`` (a record resolves it), ``orphan`` (chunk-shaped, nothing
-    resolves it), ``temp`` (the write-once temporary shape over a sha stem), ``foreign``
-    (anything else -- never touched), or ``unjudged`` (chunk-shaped, but the corpus needed to
-    judge it was absent or unreadable -- never touched). ``age_s`` is against the single clock
-    reading the whole pass used, and it is the quantity the ``min_age_s`` gate consumed.
-    ``error`` is empty unless an applied deletion failed or was withheld.
+    ``classification``: ``kept`` (the keep-set names it -- which is deliberately more than "a
+    record resolves it"; see :func:`~monoid_agent_kernel.core.model_payloads.corpus_keep_set`),
+    ``orphan`` (chunk-shaped, outside the keep-set, so no reader can resolve it), ``temp`` (the
+    write-once temporary shape over a sha stem), ``foreign`` (anything else -- never touched), or
+    ``unjudged`` (chunk-shaped, but the corpus needed to judge it was absent or unreadable --
+    never touched). ``age_s`` is against the single clock reading the whole pass used, and it is
+    the quantity the ``min_age_s`` gate consumed. ``error`` names whatever stopped this entry
+    from being handled as classified: a deletion that failed or was withheld, or -- in either
+    mode -- a scan whose ``stat`` raised.
     """
 
     name: str
@@ -175,9 +181,12 @@ def collect_payload_garbage(
     only when asked.
 
     ``apply=False`` judges and counts; ``apply=True`` also unlinks each candidate, re-checking
-    it by ``lstat`` immediately first -- still a regular file, still past the gate against the
-    same clock reading -- so a name that changed since the scan is withheld with a per-entry
-    error rather than deleted on stale evidence. A deletion the platform refuses (Windows holds
+    it by ``lstat`` immediately first -- still in the directory the gate approved, still a
+    regular file, still past the gate against the same clock reading -- so an entry that stopped
+    meeting those three tests since the scan is withheld with a per-entry error rather than
+    deleted on stale evidence. Those are the three things the re-check can see; a same-name swap
+    to a *different* old regular file inside the approved directory reads as unchanged, and is
+    reachable only once the concurrency contract above is already broken. A deletion the platform refuses (Windows holds
     a file someone has open) is likewise a per-entry error and the sweep finishes; a failed
     entry is loud precisely because it usually means the concurrency contract is being tested.
 

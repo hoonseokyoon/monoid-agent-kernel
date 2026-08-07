@@ -433,11 +433,16 @@ writers in other processes — and `monoid gc RUN_DIR --apply` deletes it, exiti
 refusals and failed deletions and zero for garbage merely found. Never run it beside a live
 writer of the same run directory: the writer takes no cross-process lock and nothing on disk can
 prove a writer dead, so liveness is the operator's knowledge, exactly as it is for
-`monoid validate`. Two belts bound the damage of a broken contract without licensing one: entries
-younger than `--min-age-s` (default one day) are never touched, and the write-once store
-refreshes a chunk's timestamps when a resumed run re-derives one it already holds, so recent use
-looks recent — an incremental archiver may answer that refreshed timestamp with one redundant
-re-copy, a copy and not a correctness cost. A corpus that is absent or unreadable beside stored
+`monoid validate`. Two belts bound the damage of a broken contract without licensing one: an
+entry whose age has not reached `--min-age-s` (default one day) is never touched, and the
+write-once store refreshes a chunk's timestamps whenever a writer accepts one that already exists
+— a resumed run re-deriving what it already holds is the common case — so recent use looks
+recent. Neither belt is a guarantee: the refresh is best-effort (a touch the platform refuses is
+swallowed, since the chunk is stored either way), and a writer that stalls past the gate between
+storing a chunk and appending the line referencing it outlives both. An incremental archiver may
+answer the refreshed timestamp with one redundant re-copy, a copy and not a correctness cost. The
+gate itself must be a finite, non-negative number of seconds; anything else is refused before the
+directory is read, because each unusable value breaks the belt a different way. A corpus that is absent or unreadable beside stored
 chunks leaves them `unjudged` and untouched (a mutilated directory and a first-call crash whose
 very first chunk was directory-sized leave the same state); damaged corpus *lines* are the
 opposite case — no reader parses them, so what only they referenced is collected, and the report

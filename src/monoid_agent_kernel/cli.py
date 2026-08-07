@@ -756,8 +756,8 @@ def gc_command(
 
     Report-only by default; --apply deletes. Never run this against a run whose writer may
     still be alive -- liveness is the operator's knowledge, exactly as it is for validate.
-    Referenced chunks are protected by membership, not age; --min-age-s additionally protects
-    every recently written or recently adopted entry, whatever it is.
+    Referenced chunks are protected by membership, not age; --min-age-s additionally spares
+    every entry whose recorded age has not reached it, whatever that entry is.
     """
     run_dir = _resolve_run_dir(run_dir_or_id, run_root)
     if not run_dir.is_dir():
@@ -771,9 +771,10 @@ def gc_command(
         # bad flag from sweeping first and only then failing to report what it swept.
         raise click.BadParameter(str(exc), param_hint="--min-age-s") from exc
     # A refusal or a failed deletion exits non-zero so scripted sweeps notice -- via ctx.exit
-    # after the payload, never ClickException, whose Error line would land in the same stream
-    # and corrupt --json output (the builder validate precedent). Garbage merely *found* is
-    # exit 0: finding it is the verb working.
+    # after the payload, never ClickException, whose Error line joins the payload wherever the
+    # two streams merge (a `2>&1` pipeline, or the CliRunner harness that pins this) and leaves
+    # --json unparseable; the builder validate precedent. Garbage merely *found* is exit 0:
+    # finding it is the verb working.
     failed = (
         report.chunk_dir_state == "unsafe"
         or any(entry.classification == "unjudged" for entry in report.entries)
