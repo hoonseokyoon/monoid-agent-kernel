@@ -1120,20 +1120,21 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
             ]
 
     provider = ApprovalProvider()
+    first_adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            # The approval starts as an async task and the model is consulted again with that
+            # observation, so the first activation makes TWO recorded calls before the session
+            # parks -- ledger indexes [0, 1].
+            ModelTurn(final_text="park"),
+        ]
+    )
     backend1 = RunnerBackend(
         run_root=run_root,
         token_manager=token_manager,
         allowed_workspace_roots=(workspace,),
         llm_gateway_url="http://llm-gateway.internal/v1/turns",
-        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
-            turns=[
-                ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
-                # The approval starts as an async task and the model is consulted again with
-                # that observation, so the first activation makes TWO recorded calls before
-                # the session parks -- ledger indexes [0, 1].
-                ModelTurn(final_text="park"),
-            ]
-        ),
+        model_adapter_factory=lambda _spec, _token: first_adapter,
         tool_providers=(provider,),
         model_calls_file=True,
         model_payload_file=True,
@@ -1168,9 +1169,14 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
     assert eventually(lambda: bool(pending_approval_tasks(backend1)))
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
     # Hand over only after the first activation has finished writing, so the recorded index
-    # sequence is deterministic rather than racing the takeover.
+    # sequence is deterministic rather than racing the takeover. The barrier is the adapter's
+    # exhaustion, not a line count: `>= 2` would also be satisfied by an activation that went on
+    # to make a third call, releasing the gate mid-write and racing the assertion below against
+    # a line that had not landed. `FakeModelAdapter` answers past its script rather than raising,
+    # so counting scripted turns is the only statement of "this activation is done asking".
     ledger_path = submission.run_dir / "model_calls.jsonl"
-    assert eventually(lambda: len(_jsonl_lines(ledger_path)) >= 2)
+    assert eventually(lambda: len(first_adapter.requests) == 2)
+    assert eventually(lambda: len(_jsonl_lines(ledger_path)) == 2)
 
     backend2 = RunnerBackend(
         run_root=run_root,
@@ -1205,3 +1211,10 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
     assert {record["request_digest"] for record in request_records} == {
         line["request_digest"] for line in ledger_lines
     }, "every activation's ledger line joins a recorded preimage"
+
+    # Both backends are constructed directly, so the autouse factory that drains and shuts down
+    # managed ones never sees them. Left running, backend1 keeps a loop thread, a parked session
+    # and an open append handle on the very ledger backend2 appended to -- which on Windows is
+    # what stops pytest from removing this test's tmp_path.
+    backend1.shutdown(drain=False)
+    backend2.shutdown(drain=False)
