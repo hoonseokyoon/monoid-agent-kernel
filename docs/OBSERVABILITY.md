@@ -450,21 +450,36 @@ opposite case — no reader parses them, so what only they referenced is collect
 names the line numbers (a count, plus the first hundred). Deletion never outruns the validator:
 `monoid validate` reports the same issues after a sweep as before it.
 
-The report's `chunk_dir_state` separates two refusals an operator must not confuse. `unsafe` means
-something is wearing the directory's name that is not a directory this run owns — a symlink, a
-Windows junction (which needs no privilege to create and `lstat`s as an ordinary directory, so
-only its reparse tag tells it apart), or a plain file. `unreadable` means the platform declined to
-answer, which on Windows is the everyday shape of an antivirus pass, the search indexer, or a sync
-engine holding the directory for a moment. Nothing is enumerated in either case. The same
-distinction governs the corpus: `absent`, `unreadable`, `ok`. A deletion is also withheld, per
-entry, on a volume that supplies no stable file ids (`st_ino` zero — FAT, some network
-redirectors), because there the collector cannot re-prove which directory it is standing in; the
-cost is uncollected garbage, reported and exit-1 visible. `candidate_bytes` and `reclaimed_bytes`
-are sizes, and only the second one is a claim about the volume: it counts a file only when the
-sweep removed the inode's last name, so an orphan inside a hardlink-deduplicated archive is
-reported deleted and reclaims nothing. Run one sweep at a time — two overlapping collectors leave
-the loser reporting a failure per entry although the directory reached the state it asked for. The
-verb writes nothing to the run's `events.jsonl`; its record is the report it prints.
+`chunk_dir_state` names what the collector found where the chunk directory should be, and the
+values call for different responses: `ok`; `absent` (a run that never offloaded); `unsafe`
+(something is wearing the name that is not this run's directory — a symlink, a plain file, or a
+Windows junction, which needs no privilege to create and `lstat`s as an ordinary directory, so
+only its reparse tag tells it apart); `unreadable` (the platform declined, which on Windows is the
+everyday shape of an antivirus pass, the search indexer, or a sync engine); `unprovable` (the
+volume supplies no stable file ids — `st_ino` zero, as on FAT and some network redirectors — so
+no deletion here could be re-proved and none is attempted, in either mode); and `swapped` (the
+directory the gate approved was replaced before the pass finished, so every entry below it
+describes whatever was standing there at the time). `corpus_state` is `ok`, `absent`, or
+`unreadable`. Each entry carries a `classification`: `kept` (the keep-set names it), `orphan`
+(chunk-shaped and unresolvable), `temp` (a write-once temporary over a chunk-name stem), `foreign`
+(anything the writer demonstrably did not mint — never touched), or `unjudged` (chunk-shaped, but
+the corpus needed to judge it was absent or unreadable — never touched).
+
+`candidate_bytes` and `reclaimed_bytes` are both sizes, and only the second is a claim about the
+volume: it counts a file only when the sweep removed the inode's last name, so an orphan inside a
+hardlink-deduplicated archive reports `deleted` and reclaims nothing. Per entry, `reclaimed` says
+which one that was, so the two totals can always be reconciled. `swept_at` is the instant every
+`age_s` is measured against; the verb writes nothing to the run's `events.jsonl`, so the report it
+prints is the only record it leaves.
+
+Run one sweep at a time — two overlapping collectors leave the loser reporting a failure per entry
+although the directory reached the state it asked for. Point the verb at a *run* directory, not at
+a run root: a root is not a run, so it reports `absent` and exits 0, and a fleet sweep is a loop
+over its children. Subagents keep their own run directories as siblings of their parent's, named
+`<parent>.sub.<task>`, so a delegating run needs one sweep per member of the family. Note also
+that `_resolve_run_dir` prefers a path that exists in the working directory over `--run-root`, as
+it does for `validate` and `status`; the report echoes the absolute directory it swept, which is
+the one to check when a bare run id is passed.
 
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains

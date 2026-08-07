@@ -24,7 +24,6 @@ from monoid_agent_kernel import cli as cli_module
 from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core import schemas
 from monoid_agent_kernel.core import _verified_file
-from monoid_agent_kernel.core import payload_gc
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._verified_file import write_once_temp_stem
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
@@ -833,7 +832,12 @@ def test_a_chunk_directory_swapped_mid_pass_stops_the_deletions(
 
     withheld = _entry(report, "b" * 64)
     assert withheld.deleted is False
-    assert withheld.error == "chunk directory changed since the scan; left in place"
+    assert withheld.error == "the chunk directory changed since the scan; left in place"
+    # And the top of the report says so. ``chunk_dir_state`` described the gate -- true when it
+    # ran, stale by the time it printed -- so a consumer reading states alone saw a healthy sweep
+    # of a directory that had been replaced under it, and the only carrier was a per-entry string
+    # one of whose siblings is a substring of it.
+    assert report.chunk_dir_state == "swapped"
     assert (chunk_dir / ("b" * 64)).read_bytes() == b"someone else's referenced chunk"
 
 
@@ -948,36 +952,152 @@ def test_a_swapped_directory_is_named_as_such_even_when_the_decoy_lacks_the_name
 
     withheld = _entry(report, "b" * 64)
     assert withheld.deleted is False
-    assert withheld.error == "chunk directory changed since the scan; left in place"
+    assert withheld.error == "the chunk directory changed since the scan; left in place"
+    assert report.chunk_dir_state == "swapped"
 
 
-def test_an_unprovable_directory_identity_withholds_every_deletion(
+def test_an_unprovable_directory_identity_stops_the_pass_in_both_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An inode number is evidence only where the platform supplies one -- Python documents
     `st_ino` as identifying a file "if non-zero", CPython's Windows lstat zeroes it when it falls
-    back to directory attributes, and network volumes may have no stable index at all. Two zeroed
-    identities compare equal, so the guard would pass always: a check that silently becomes a
-    no-op while the docs still advertise it. A deleter answers "cannot prove" with "then not
-    now"."""
+    back to directory attributes, and network volumes may have no stable index. Two zeroed
+    identities compare equal, so the guard would pass always. Decided once, at the gate, so the
+    two modes cannot disagree: report-only used to promise bytes `--apply` could not remove, and
+    `--apply` answered with one sentence repeated per entry and nothing at the report level.
+
+    The zeroing is done to `lstat`, not to `file_identity`: stubbing the function under test
+    pins the guard against its own stub, and would stay green for a mutant that made
+    `file_identity` invent an id."""
     run_dir, sha = _recorded_run(tmp_path)
-    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    orphan = chunk_dir / ("f" * 64)
     orphan.write_bytes(b"j" * 64)
     _backdate(orphan)
     before = _issues(run_dir)
-    monkeypatch.setattr(
-        payload_gc, "file_identity", lambda metadata: _verified_file.VerifiedFileIdentity(0, 0)
-    )
+
+    class NoFileIds:
+        def __init__(self, real: os.stat_result) -> None:
+            self.st_mode = real.st_mode
+            self.st_size = real.st_size
+            self.st_mtime = real.st_mtime
+            self.st_nlink = real.st_nlink
+            self.st_dev = real.st_dev
+            self.st_ino = 0  # what FAT and some redirectors report for everything
+
+    real_lstat = Path.lstat
+
+    def volume_without_file_ids(self: Path, *args: object, **kwargs: object):
+        metadata = real_lstat(self, *args, **kwargs)
+        return NoFileIds(metadata) if self == chunk_dir else metadata
+
+    monkeypatch.setattr(Path, "lstat", volume_without_file_ids)
+
+    reported = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=False)
+    applied = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    for report in (reported, applied):
+        assert report.chunk_dir_state == "unprovable"
+        # Nothing is a candidate, so the estimate does not promise what no pass could deliver...
+        assert report.candidate_bytes == 0 and report.reclaimed_bytes == 0
+        # ...and the operator is not handed N copies of one sentence to read.
+        assert all(entry.error == "" for entry in report.entries)
+        assert _entry(report, "f" * 64).classification == "orphan"
+    assert orphan.exists()
+    assert (chunk_dir / sha).exists()
+    assert _issues(run_dir) == before
+
+
+def test_a_chunk_directory_the_platform_refuses_reports_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal is not an accusation. On Windows this is the everyday shape of an antivirus
+    pass, the search indexer or a sync engine, and `unsafe` -- "something is wearing the
+    directory's name" -- sends the operator the wrong way."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    real_lstat = Path.lstat
+
+    def denied(self: Path, *args: object, **kwargs: object):
+        if self == chunk_dir:
+            raise PermissionError(13, "held by another process")
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", denied)
 
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
-    entry = _entry(report, "f" * 64)
-    assert entry.classification == "orphan" and entry.deleted is False
-    assert "not provable" in entry.error
-    assert orphan.exists()
-    assert (run_dir / MODEL_PAYLOADS_DIRNAME / sha).exists()
-    assert report.reclaimed_bytes == 0
-    assert _issues(run_dir) == before
+    assert report.chunk_dir_state == "unreadable"
+    assert report.entries == ()
+
+
+def test_the_safety_gate_judges_the_stat_it_already_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate used to ask the *path* a second time, through a predicate that answers one
+    boolean for "planted" and "refused" alike -- which is why a platform refusal came back as an
+    accusation, and why a swap landing between the two calls could decide the gate. It now judges
+    the metadata it already read. Pinned by making any second look disagree with the first: the
+    verdict must come from the first."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    orphan = chunk_dir / ("f" * 64)
+    orphan.write_bytes(b"j" * 64)
+    _backdate(orphan)
+    real_lstat = Path.lstat
+    looks: list[int] = []
+
+    class WearingAJunctionsShape:
+        def __init__(self, real: os.stat_result) -> None:
+            self.st_mode = real.st_mode
+            self.st_size = real.st_size
+            self.st_mtime = real.st_mtime
+            self.st_nlink = real.st_nlink
+            self.st_dev = real.st_dev
+            self.st_ino = real.st_ino
+            self.st_reparse_tag = 0xA0000003
+
+    def a_different_answer_every_time(self: Path, *args: object, **kwargs: object):
+        metadata = real_lstat(self, *args, **kwargs)
+        if self != chunk_dir:
+            return metadata
+        looks.append(1)
+        return metadata if len(looks) == 1 else WearingAJunctionsShape(metadata)
+
+    monkeypatch.setattr(Path, "lstat", a_different_answer_every_time)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=False)
+
+    assert report.chunk_dir_state == "ok"
+    assert _entry(report, "f" * 64).classification == "orphan"
+
+def test_reclaimed_bytes_are_attributable_to_the_entry_that_freed_them(tmp_path: Path) -> None:
+    """A script summing per-entry sizes over `deleted` entries got a different number from the
+    report's own total, and nothing in the report could name the entry responsible. Three link
+    counts, not two: a rule read off {1, 2} alone cannot tell `nlink <= 1` from `nlink != 2`."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    solo = chunk_dir / ("a" * 64)
+    solo.write_bytes(b"x" * 100)
+    twice = chunk_dir / ("b" * 64)
+    twice.write_bytes(b"x" * 200)
+    os.link(twice, tmp_path / "archive-1.bin")
+    thrice = chunk_dir / ("c" * 64)
+    thrice.write_bytes(b"x" * 400)
+    os.link(thrice, tmp_path / "archive-2.bin")
+    os.link(thrice, tmp_path / "archive-3.bin")
+    for target in (solo, twice, thrice):
+        _backdate(target)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    assert [
+        (_entry(report, name * 64).deleted, _entry(report, name * 64).reclaimed)
+        for name in ("a", "b", "c")
+    ] == [(True, 100), (True, 0), (True, 0)]
+    assert report.reclaimed_bytes == 100
+    assert sum(entry.reclaimed for entry in report.entries) == report.reclaimed_bytes
+    assert report.candidate_bytes == 700
 
 
 def test_deleting_one_name_of_a_shared_inode_reclaims_nothing(tmp_path: Path) -> None:
@@ -1042,6 +1162,38 @@ def test_a_corpus_of_damaged_lines_does_not_produce_an_unbounded_report(tmp_path
     assert report.damaged_line_count == damaged
     assert len(report.damaged_lines) == MAX_REPORTED_DAMAGED_LINES
     assert report.damaged_lines[0] == 1
+
+
+def test_a_directory_that_vanishes_mid_pass_is_named_as_the_directory_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sibling half of the swap: nothing is planted, the directory is simply gone, so the
+    check's own ``lstat`` raises. Letting that fall through to the caller's per-entry handler
+    named the failure after the *entry* -- the misattribution the ordering fix removed, surviving
+    one function over, and the decoy-planting fixture could never reach it because a decoy makes
+    the directory's ``lstat`` succeed."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    for name in ("a" * 64, "b" * 64):
+        target = chunk_dir / name
+        target.write_bytes(b"x" * 16)
+        _backdate(target)
+    real_unlink = os.unlink
+
+    def take_the_directory_away(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if chunk_dir.exists():
+            chunk_dir.rename(run_dir / "moved-away")
+        return result
+
+    monkeypatch.setattr(os, "unlink", take_the_directory_away)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    withheld = _entry(report, "b" * 64)
+    assert withheld.deleted is False
+    assert withheld.error == "the chunk directory changed since the scan; left in place"
+    assert report.chunk_dir_state == "swapped"
 
 
 # --- The CLI verb ---------------------------------------------------------------------------------
@@ -1157,6 +1309,7 @@ def test_the_json_report_survives_a_name_it_cannot_encode(
     hostile = "chunk-\udce9-name"
     report = PayloadGcReport(
         run_dir=str(tmp_path),
+        swept_at="2026-08-07T00:00:00Z",
         chunk_dir_state="ok",
         corpus_state="ok",
         applied=False,
@@ -1168,6 +1321,7 @@ def test_the_json_report_survives_a_name_it_cannot_encode(
                 size=1,
                 age_s=1.0,
                 deleted=False,
+                reclaimed=0,
                 error="",
             ),
         ),
@@ -1259,3 +1413,132 @@ def test_gc_exit_is_nonzero_when_the_corpus_could_not_be_judged(tmp_path: Path) 
     payload = json.loads(result.output)
     assert payload["corpus_state"] == "unreadable"
     assert not temp.exists()  # the litter half still ran; only the verdict changed
+
+    # And the cell that mattered: a run that never offloaded has no chunk directory at all, which
+    # is the common shape (offload needs a size threshold). Scoping the refusal to a directory
+    # that exists put this case back on exit 0 -- the very hole the clause was added to close.
+    bare = tmp_path / "never-offloaded"
+    bare.mkdir()
+    (bare / MODEL_PAYLOADS_FILENAME).mkdir()
+
+    result = CliRunner().invoke(main, ["gc", str(bare), "--apply", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["corpus_state"] == "unreadable" and payload["chunk_dir_state"] == "absent"
+
+    # ...while an *absent* corpus beside no chunk directory is the ordinary state of a run that
+    # never enabled the artifact, and must not alarm.
+    quiet = tmp_path / "never-enabled"
+    quiet.mkdir()
+
+    result = CliRunner().invoke(main, ["gc", str(quiet), "--apply", "--json"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_the_text_report_survives_a_run_directory_name_it_cannot_encode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule was written for entry names and stated as if it covered the mode. It did not
+    reach the `run_dir` echo -- and that line runs *after* the sweep, so a run directory whose
+    name carries an unpaired surrogate killed the whole text report and took the record of what
+    had just been deleted with it. The JSON twin was fixed a round earlier; this is the half that
+    fix's own comment claimed to cover."""
+    hostile = str(tmp_path / ("run-" + chr(0xDCE9) + "-1"))
+    report = PayloadGcReport(
+        run_dir=hostile,
+        swept_at="2026-08-07T00:00:00Z",
+        chunk_dir_state="ok",
+        corpus_state="ok",
+        applied=True,
+        min_age_s=_DAY_S,
+        entries=(),
+        damaged_lines=(),
+        damaged_line_count=0,
+        candidate_bytes=0,
+        reclaimed_bytes=0,
+    )
+    monkeypatch.setattr(cli_module, "collect_payload_garbage", lambda *a, **k: report)
+    (tmp_path / MODEL_PAYLOADS_FILENAME).write_text("", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["gc", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    result.output.encode("utf-8")  # a strict stream is the default for a redirected report
+
+
+def test_the_text_report_says_why_an_entry_is_or_is_not_a_candidate(tmp_path: Path) -> None:
+    """Two orphans, one a month old and one seconds old, rendered identically in the default
+    mode: the gate is the only thing standing between them and the report could not say which
+    side of it each was on. The freed-bytes attribution and the damaged-line summary are
+    exercised here too -- the whole text branch had one test, and it touched none of this."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    old_orphan = chunk_dir / ("a" * 64)
+    old_orphan.write_bytes(b"x" * 1000)
+    _backdate(old_orphan)
+    young_orphan = chunk_dir / ("b" * 64)
+    young_orphan.write_bytes(b"x" * 4096)
+    corpus = run_dir / MODEL_PAYLOADS_FILENAME
+    corpus.write_text(corpus.read_text(encoding="utf-8") + "torn\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir), "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert "swept_at:" in result.output
+    rendered = {}
+    for line in result.output.splitlines():
+        for name in ("a" * 64, "b" * 64):
+            if name in line:
+                rendered[name] = line
+    assert "deleted (freed 1000)" in rendered["a" * 64]
+    assert "deleted" not in rendered["b" * 64]
+
+    def rendered_age(line: str) -> float:
+        seconds = [
+            float(token[:-1])
+            for token in line.split()
+            if token.endswith("s") and token[:-1].replace(".", "", 1).replace("-", "", 1).isdigit()
+        ]
+        assert len(seconds) == 1, line
+        return seconds[0]
+
+    # The two orphans differ by age alone, and the report has to say so in the numbers -- not
+    # merely differ in some column, which is true of their names too.
+    assert rendered_age(rendered["a" * 64]) > _DAY_S > rendered_age(rendered["b" * 64])
+    assert "damaged_lines (1): " in result.output
+
+
+def test_gc_refuses_an_empty_run_id_instead_of_sweeping_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Path("")` is `Path(".")`, which exists and is a directory, so the not-found guard passed
+    and the verb swept the working directory -- the unset-shell-variable shape, in exactly the
+    scripted nightly sweep this verb is built for."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 64)
+    _backdate(orphan)
+    monkeypatch.chdir(run_dir)
+
+    result = CliRunner().invoke(main, ["gc", "", "--apply", "--min-age-s", "0"])
+
+    assert result.exit_code == 1
+    assert orphan.exists()
+
+
+def test_gc_reports_the_directory_it_actually_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare run id resolves against the working directory before `--run-root`, which the
+    read-only sibling verbs can afford and a deleter cannot. The precedence is not changed here
+    -- the helper is shared -- but the report names the absolute directory that lost files
+    instead of echoing back the ambiguous argument."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    monkeypatch.chdir(run_dir.parent)
+
+    result = CliRunner().invoke(main, ["gc", run_dir.name, "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run_dir"] == str(run_dir.resolve())

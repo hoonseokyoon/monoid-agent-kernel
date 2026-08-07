@@ -82,6 +82,23 @@ def verified_file_is_safe(
     return metadata.st_nlink == 1 or not require_single_link
 
 
+def directory_metadata_is_safe(metadata: os.stat_result) -> bool:
+    """Whether an ``lstat`` result describes a real directory rather than a redirection wearing
+    one's shape.
+
+    Split out from :func:`verified_directory_is_safe` so a caller that already holds the stat can
+    ask the question without a second ``lstat`` -- and, more importantly, without folding its own
+    ``OSError`` into the same ``False``. A boolean cannot tell "somebody planted this" apart from
+    "the platform declined to answer", and a caller that reports those differently (the collector
+    does; they call for opposite responses) has to keep the two questions separate. One authoring
+    site for the rule either way: the path-taking form below is this one plus a lookup.
+    """
+
+    if getattr(metadata, "st_reparse_tag", 0):
+        return False  # a junction lstats as a directory; only the tag distinguishes it
+    return stat.S_ISDIR(metadata.st_mode)
+
+
 def verified_directory_is_safe(path: Path) -> bool:
     """Whether ``path`` is absent or a real directory, not a redirection wearing one's shape.
 
@@ -90,6 +107,9 @@ def verified_directory_is_safe(path: Path) -> bool:
     symlink -- or a Windows junction, which needs no privilege to create -- planted at
     ``model_payloads/`` accepted every chunk write and sent it out of the run directory, with the
     writer told it had succeeded.
+
+    Fails closed on an unreadable path, which is right for a *writer* -- it declines to write --
+    and is why a reporting caller wants :func:`directory_metadata_is_safe` instead.
     """
 
     try:
@@ -98,9 +118,7 @@ def verified_directory_is_safe(path: Path) -> bool:
         return True
     except OSError:
         return False
-    if getattr(metadata, "st_reparse_tag", 0):
-        return False  # a junction lstats as a directory; only the tag distinguishes it
-    return stat.S_ISDIR(metadata.st_mode)
+    return directory_metadata_is_safe(metadata)
 
 
 def open_verified_regular_fd(

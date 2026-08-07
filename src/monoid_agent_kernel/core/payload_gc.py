@@ -42,15 +42,16 @@ import math
 import os
 import stat
 import time
+from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core._verified_file import (
     VerifiedFileIdentity,
+    directory_metadata_is_safe,
     file_identity,
     open_verified_regular_fd,
-    verified_directory_is_safe,
     write_once_temp_stem,
 )
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
@@ -67,6 +68,17 @@ from monoid_agent_kernel.core.model_payloads import (
 # put a million integers on one terminal line and into the JSON. The count is what an operator
 # acts on -- "this corpus is torn" -- and the list is a sample to start reading from.
 MAX_REPORTED_DAMAGED_LINES = 100
+
+
+def utc_timestamp_of(moment: float) -> str:
+    """``moment`` -- the epoch reading every ``age_s`` in a report is relative to -- as ISO-8601.
+
+    Derived from the pass's own clock reading rather than taken freshly, so the stamp and the ages
+    describe one instant. Spelled the way ``core._util.utc_timestamp`` spells now, which is what
+    every other artifact in a run directory carries.
+    """
+
+    return datetime.fromtimestamp(moment, UTC).isoformat().replace("+00:00", "Z")
 
 
 class UnusableAgeGate(ValueError):
@@ -90,7 +102,10 @@ class PayloadGcEntry:
     write-once temporary shape over a sha stem), ``foreign`` (anything else -- never touched), or
     ``unjudged`` (chunk-shaped, but the corpus needed to judge it was absent or unreadable --
     never touched). ``age_s`` is against the single clock reading the whole pass used, and it is
-    the quantity the ``min_age_s`` gate consumed. ``error`` names whatever stopped this entry
+    the quantity the ``min_age_s`` gate consumed. ``reclaimed`` is the bytes this entry returned
+    to the volume -- ``size`` when the sweep removed the inode's last name, ``0`` otherwise, so a
+    consumer summing it gets the report's own total and can name the entry a hardlink accounted
+    for rather than only observe the aggregate gap. ``error`` names whatever stopped this entry
     from being handled as classified: a deletion that failed or was withheld, or -- in either
     mode -- a scan whose ``stat`` raised.
     """
@@ -100,6 +115,7 @@ class PayloadGcEntry:
     size: int
     age_s: float
     deleted: bool
+    reclaimed: int
     error: str
 
 
@@ -107,24 +123,34 @@ class PayloadGcEntry:
 class PayloadGcReport:
     """What one pass saw, and what it did.
 
-    ``chunk_dir_state``: ``absent``, ``unsafe`` (a redirection or a non-directory wearing the
-    name -- somebody put it there), ``unreadable`` (the platform refused the listing, which on
-    Windows is the shape of an antivirus pass, the indexer or a sync engine), or ``ok``. The two
-    refusals are separated because they call for opposite responses, and the corpus half already
-    made that distinction.
+    ``chunk_dir_state``: ``absent``; ``unsafe`` (a redirection or a non-directory wearing the
+    name -- somebody put it there); ``unreadable`` (the platform refused, which on Windows is the
+    shape of an antivirus pass, the indexer or a sync engine); ``unprovable`` (a volume that
+    supplies no stable file ids, so no deletion here could be re-proved and none is attempted);
+    ``swapped`` (the gate approved a directory and something else was standing in its place
+    before the pass finished -- every entry below it describes whatever was there at the time);
+    or ``ok``. The refusals are separated because they call for opposite responses, and the
+    corpus half already made that distinction.
 
     ``candidate_bytes`` is the size of what ``--apply`` would remove (orphans and temps past the
     age gate), counted identically in both modes. It is an **upper bound** on bytes returned to
     the volume, not a promise of them: a name whose inode has other links frees nothing, and a
     scan cannot see a link count on every platform (Windows serves ``scandir`` stats from the
     directory listing, with ``st_nlink`` zero). ``reclaimed_bytes`` counts only files whose last
-    name this pass removed, which is knowable, because the pre-unlink ``lstat`` is a real one.
+    name this pass removed -- knowable because the pre-unlink ``lstat`` is a real one, except
+    where that ``lstat`` itself reports no link count (the same Windows attribute fallback), which
+    counts as one name and is the one way this number can over-report.
 
     ``damaged_line_count`` is how many corpus lines no reader parses; ``damaged_lines`` names the
     first :data:`MAX_REPORTED_DAMAGED_LINES` of them.
+
+    ``swept_at`` is when the pass read its clock. Every ``age_s`` is relative to that instant, so
+    without it a saved report cannot be placed in time -- and this report is the only record the
+    verb leaves, since it writes nothing to the run's event log.
     """
 
     run_dir: str
+    swept_at: str
     chunk_dir_state: str
     corpus_state: str
     applied: bool
@@ -194,15 +220,14 @@ def _corpus_records(path: Path) -> tuple[str, list[dict[str, Any]], list[int]]:
 def _directory_still_approved(chunk_dir: Path, approved: VerifiedFileIdentity) -> str:
     """``""`` when ``chunk_dir`` is still the directory the gate approved, else why not.
 
-    Identity is ``(st_dev, st_ino)``, and an inode number is only evidence *if the platform
-    supplies one*: Python's own documentation says ``st_ino`` "if non-zero, uniquely identifies
-    the file", CPython's Windows ``lstat`` leaves it zero when it falls back to directory
-    attributes (an access-denied or sharing-violation open), and SMB/FAT volumes may have no
-    stable file index at all. Comparing two zeroed identities is a check that passes always --
-    a guard that silently becomes a no-op while the documentation still advertises it, which is
-    worse than an absent one. A deleter cannot spend that: an unprovable identity withholds the
-    deletion and says so. The cost is uncollected garbage on such a volume, reported per entry
-    and exit-1 visible; the alternative cost is deleting in a directory nobody vouched for.
+    Only reached when the gate proved an identity worth comparing: identity is ``(st_dev,
+    st_ino)``, and an inode number is evidence only *if the platform supplies one*. Python's own
+    documentation says ``st_ino`` "if non-zero, uniquely identifies the file", CPython's Windows
+    ``lstat`` leaves it zero when it falls back to directory attributes, and SMB/FAT volumes may
+    have no stable file index at all -- where two zeroed identities compare equal and this check
+    would pass always, a guard silently becoming a no-op while the documentation advertises it.
+    That question is settled once, at the gate, so both modes give the same answer; here the
+    comparison can be taken at face value.
 
     Deliberately narrower than :func:`~monoid_agent_kernel.core._verified_file.file_identity`
     itself, whose other consumers compare an identity they captured from a descriptor they hold
@@ -210,11 +235,15 @@ def _directory_still_approved(chunk_dir: Path, approved: VerifiedFileIdentity) -
     volumes rather than merely decline to delete.
     """
 
-    if not approved.inode:
-        return "chunk directory identity is not provable on this filesystem; left in place"
-    current = file_identity(chunk_dir.lstat())
-    if not current.inode or current != approved:
-        return "chunk directory changed since the scan; left in place"
+    try:
+        current = file_identity(chunk_dir.lstat())
+    except OSError:
+        # The directory being gone or unreadable *is* the answer, and it must not fall through to
+        # the caller's per-entry ``except OSError``, which would name the failure after the entry
+        # -- the same misattribution the ordering fix removed, surviving on its sibling half.
+        return "the chunk directory changed since the scan; left in place"
+    if current != approved:
+        return "the chunk directory changed since the scan; left in place"
     return ""
 
 
@@ -270,6 +299,7 @@ def collect_payload_garbage(
     if not math.isfinite(min_age_s) or min_age_s < 0:
         raise UnusableAgeGate("must be a finite, non-negative number of seconds")
     moment = time.time() if now is None else now
+    swept_at = utc_timestamp_of(moment)
     corpus_state, records, damaged = _corpus_records(run_dir / MODEL_PAYLOADS_FILENAME)
 
     def report(
@@ -280,6 +310,7 @@ def collect_payload_garbage(
     ) -> PayloadGcReport:
         return PayloadGcReport(
             run_dir=str(run_dir),
+            swept_at=swept_at,
             chunk_dir_state=chunk_dir_state,
             corpus_state=corpus_state,
             applied=apply,
@@ -302,10 +333,13 @@ def collect_payload_garbage(
         # sync engine holding the directory for a moment, and telling an operator they were
         # attacked when they were merely unlucky sends them the wrong way.
         return report("unreadable")
-    if not verified_directory_is_safe(chunk_dir):
+    if not directory_metadata_is_safe(approved):
         # The gate the writer's own sweep runs behind, for the same reason: enumeration and
         # deletion through a redirection are operations in a directory of somebody else's
-        # choosing. Nothing is listed, nothing is touched.
+        # choosing. Nothing is listed, nothing is touched. Asked of the stat already in hand,
+        # never of the path: the path-taking form answers ``False`` for an unreadable directory
+        # too, which would put the platform declining back under "somebody planted this" -- the
+        # third of the three refusal sites, and the one a boolean hid.
         return report("unsafe")
     # Which directory the gate approved, so every unlink can re-prove it is standing in that one.
     # A gate that runs once governs a pathname, and each deletion re-resolves that pathname: a
@@ -313,6 +347,12 @@ def collect_payload_garbage(
     # a name that is garbage here can be a referenced chunk (tool-definition chunks are
     # byte-identical across runs, so one run's orphan sha is another run's live one).
     approved_directory = file_identity(approved)
+    # Decided once, here, rather than per candidate, so both modes answer the same. An inode
+    # number is evidence only where the platform supplies one, and without it no deletion in this
+    # directory can ever be re-proved -- so nothing is a candidate, ``--apply`` has nothing to do,
+    # and a report-only pass says so instead of promising bytes it could not have removed. Per
+    # candidate it produced N copies of one sentence in one mode and silence in the other.
+    provable = bool(approved_directory.inode)
 
     snapshot: list[tuple[str, os.stat_result | None]] = []
     try:
@@ -326,6 +366,8 @@ def collect_payload_garbage(
                     snapshot.append((entry.name, entry.stat(follow_symlinks=False)))
                 except OSError:
                     snapshot.append((entry.name, None))
+    except FileNotFoundError:
+        return report("absent")
     except OSError:
         return report("unreadable")
     snapshot.sort(key=lambda pair: pair[0])
@@ -338,6 +380,7 @@ def collect_payload_garbage(
     entries: list[PayloadGcEntry] = []
     candidate_bytes = 0
     reclaimed_bytes = 0
+    swapped = False
     for name, metadata in snapshot:
         classification = _classification(
             name, metadata, keep=keep, corpus_ok=corpus_state == "ok"
@@ -345,8 +388,9 @@ def collect_payload_garbage(
         size = int(metadata.st_size) if metadata is not None else 0
         age_s = (moment - metadata.st_mtime) if metadata is not None else 0.0
         deleted = False
+        reclaimed = 0
         error = "" if metadata is not None else "could not stat"
-        if classification in ("orphan", "temp") and age_s >= min_age_s:
+        if provable and classification in ("orphan", "temp") and age_s >= min_age_s:
             candidate_bytes += size
             if apply:
                 target = chunk_dir / name
@@ -358,12 +402,14 @@ def collect_payload_garbage(
                     # operator "a file vanished, probably a writer" when the truth is "every
                     # remaining line of this report describes somebody else's directory".
                     error = _directory_still_approved(chunk_dir, approved_directory)
-                    if not error:
+                    if error:
+                        swapped = True
+                    else:
                         current = target.lstat()
                         if not stat.S_ISREG(current.st_mode) or (
                             moment - current.st_mtime
                         ) < min_age_s:
-                            error = "changed since the scan; left in place"
+                            error = "this entry changed since the scan; left in place"
                         else:
                             # Counted only when this name was the inode's last one. A
                             # hardlink-deduplicated archive of a run directory is a supported
@@ -372,12 +418,18 @@ def collect_payload_garbage(
                             # archive's name goes on holding the bytes. A count of zero is the
                             # honest answer for a capacity script; the file is still gone, and
                             # ``deleted`` says so. ``st_nlink == 0`` means the platform did not
-                            # answer, which is treated as one name -- the pre-change behavior.
+                            # answer, which is treated as one name -- the pre-change behavior,
+                            # and the one place this number can over-report.
                             last_name = current.st_nlink <= 1
                             os.unlink(target)
                             deleted = True
                             if last_name:
-                                reclaimed_bytes += size
+                                # The fresh size, not the scan's: the two are the same file only
+                                # if nothing rewrote it, which is what the mtime test above
+                                # establishes -- so take the measurement from the stat that made
+                                # the decision.
+                                reclaimed = int(current.st_size)
+                                reclaimed_bytes += reclaimed
                 except OSError as exc:
                     error = f"{type(exc).__name__}: {exc}"
         entries.append(
@@ -387,11 +439,16 @@ def collect_payload_garbage(
                 size=size,
                 age_s=age_s,
                 deleted=deleted,
+                reclaimed=reclaimed,
                 error=error,
             )
         )
+    # A swap discovered mid-pass has to reach the top of the report. ``chunk_dir_state`` said
+    # "ok" -- true of the gate, and stale by the time it was printed -- so a consumer reading
+    # states alone saw a healthy sweep, and the only carrier was a per-entry string one of whose
+    # siblings is a substring of it.
     return report(
-        "ok",
+        "unprovable" if not provable else "swapped" if swapped else "ok",
         entries=tuple(entries),
         candidate_bytes=candidate_bytes,
         reclaimed_bytes=reclaimed_bytes,

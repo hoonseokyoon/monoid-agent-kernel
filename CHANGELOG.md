@@ -27,8 +27,12 @@ out in commit messages and here.
   number in the report, and what only they referenced is collected: those references are
   invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
   failed deletions, zero for garbage merely found, and 2 — no report, nothing swept — for an
-  unusable `--min-age-s`. A refusal includes a corpus the collector could not read, whether or
-  not any chunk-shaped file was there to carry it. `reclaimed_bytes` counts a file only when the
+  unusable `--min-age-s` or a missing run directory. A refusal includes a corpus the collector
+  could not read, whether or not any chunk-shaped file was there to carry it. `chunk_dir_state`
+  distinguishes `unsafe` (something is wearing the directory's name) from `unreadable` (the
+  platform declined), `unprovable` (a volume with no stable file ids, where no deletion could be
+  re-proved, so none is attempted in either mode) and `swapped` (the approved directory was
+  replaced mid-pass). `reclaimed_bytes` counts a file only when the
   sweep removed its inode's last name, so an orphan inside a hardlink-deduplicated archive
   reports as deleted and reclaims nothing; `candidate_bytes` is an upper bound, because a scan
   cannot see a link count on every platform. `chunk_dir_state` separates `unsafe` (something is
