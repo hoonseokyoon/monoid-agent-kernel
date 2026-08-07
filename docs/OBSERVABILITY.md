@@ -407,7 +407,10 @@ shielded four ways — the ledger opens only if its own path is a single-link re
 symlink or hard link planted where a reopened run expects its artifact, an unencodable record costs
 its own line, a write error disables the handle so a torn line cannot consume the next record, and
 nothing raises into the call. The switch is independent of `stream_model_calls` and
-`model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say.
+`model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say. From the
+shipped shapes it is `monoid run --model-calls-file` or `RunnerBackend(model_calls_file=True)` —
+the backend carries the boolean into the submitted run and into every activation recovery
+rebuilds.
 
 One operational note for all three verified-append sidecars — `model-content.jsonl`,
 `model_calls.jsonl` and `model_payloads.jsonl`, named individually because a rule stated over "the
@@ -425,7 +428,9 @@ the ledger's per-call lock and index, so a response record and its ledger line n
 by construction, and the two arms fail independently — a disk error in one file disables that
 file only. Chunk files are created write-once through the same verified-file primitives as the
 JSONL handles. The corpus, unlike the ledger, is content-classified; enable it with the same care
-as `model_content_file`.
+as `model_content_file`. From the shipped shapes it is `monoid run --model-payload-file` or
+`RunnerBackend(model_payload_file=True)`, opt-in in both, and a subagent inherits whichever
+switches its parent ran under.
 
 Chunk-directory hygiene is a separate verb. `monoid gc RUN_DIR` reports what no record in the
 corpus resolves — orphaned chunks from an interrupted write, dead `*.tmp` litter left by crashed

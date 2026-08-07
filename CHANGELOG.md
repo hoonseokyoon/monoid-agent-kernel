@@ -7,6 +7,20 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the recording switches are reachable from the shipped shapes
+
+- **`monoid run --model-calls-file` / `--model-payload-file`, and the matching keyword-only
+  `RunnerBackend(model_calls_file=..., model_payload_file=...)` fields.** The per-call ledger
+  and the private replay corpus existed only as `AgentLoop` keyword arguments — an embedder
+  could record, no shipped shape could — while the same CLI already shipped `monoid gc` and
+  `monoid validate`, consumer verbs for artifacts nothing it ran could produce. The backend
+  carries the booleans exactly as it carries `model_content_file`: into the submitted run and
+  into every activation recovery rebuilds, pinned by the ledger's own activation-restart
+  signature (`call_index` back at zero, both zeros recorded). Both flags stay opt-in — the
+  corpus is content-classified — and the omission half is pinned too: a run without the flags
+  writes neither file. The backend fields are keyword-only because the positional argument
+  lists of `RunnerBackend` and `BackendLoopFactoryContext` are pinned compatibility surfaces.
+
 ### Added — the chunk directory's crash litter now has a collector
 
 - **`monoid gc RUN_DIR` reports what no record in a run's replay corpus resolves — orphaned

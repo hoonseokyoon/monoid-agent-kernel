@@ -797,8 +797,11 @@ The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
 and inherited by in-process descendants, producing one passive root-multiplexed presentation
 channel. This observer does not write durable events and holds no run control handle. The separate
-`RunnerBackend.stream_model_calls` and `model_content_file` switches let a host independently select
-provider streaming, private retention, and live delivery.
+`RunnerBackend.stream_model_calls`, `model_content_file`, `model_calls_file` and
+`model_payload_file` switches let a host independently select provider streaming, private
+retention, the per-call ledger, the replay corpus, and live delivery; each boolean is carried into
+the submitted run and into every activation recovery rebuilds. The CLI's `monoid run` exposes the
+two recording switches as `--model-calls-file` and `--model-payload-file`.
 
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
