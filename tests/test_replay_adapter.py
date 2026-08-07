@@ -680,3 +680,47 @@ def test_a_recorded_count_the_loop_would_refuse_is_refused_here(tmp_path: Path, 
 
     assert caught.value.provider_error_code == MISS_NOT_RECORDED
     assert "input_tokens is not a non-negative integer" in str(caught.value)
+
+
+def test_a_failed_live_serve_does_not_move_the_sequence(tmp_path: Path) -> None:
+    """Falling through spends the refused slot because the call was answered -- so the spend
+    has to wait until it was. A live adapter that raises recoverably (a 429 is enough) parks
+    the turn for an idempotent re-attempt, and a slot spent on the attempt would answer that
+    re-attempt with the next call's recording: the same silent substitution the two-phase
+    consume exists to prevent, reached through the other exit.
+    """
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    _prepend_refused_answer(tmp_path, digest)
+
+    class _FailsOnce:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError(
+                    "upstream is busy", error_code="rate_limited", config_recoverable=True
+                )
+            return ModelTurn(final_text="live answer")
+
+    inner = _FailsOnce()
+    adapter = _replay(tmp_path, inner=inner)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _call(adapter, _request())
+    assert caught.value.error_code == "rate_limited"
+
+    served = _call(adapter, _request())
+
+    assert served.final_text == "live answer", (
+        "the re-attempt was answered from the corpus, so the failed attempt spent a slot"
+    )
+    assert inner.calls == 2
+    assert _call(adapter, _request()).final_text == "recovered"

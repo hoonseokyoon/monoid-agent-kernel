@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -117,6 +117,10 @@ class ReplayMissReason:
 
     reason: str
     detail: str
+    slot: int | None = None
+    """The position this refusal is standing on, when a record earned it -- the coordinate
+    :meth:`ReplayCorpus.spend_refused` needs to move past exactly that one and no other. An
+    integer position discloses nothing; it is the same kind of fact as ``call_index``."""
 
 
 @dataclass(frozen=True)
@@ -160,6 +164,7 @@ class ReplayCorpus:
         self._run_ids: list[str] = []
         self._damaged = 0
         self._rejected = 0
+        self._unjoinable = 0
         self._repeated_sources = 0
         self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
         self._profiles: tuple[dict[str, Any], ...] | None = None
@@ -216,12 +221,22 @@ class ReplayCorpus:
         Unnameable means "index it": the reader already accepted these bytes, and refusing to
         index a readable source because its metadata is unavailable would lose answers rather
         than duplicate them.
+
+        A zero inode is unnameable. ``payload_gc`` states the rule for this repo and enforces
+        it (``provable = bool(approved_directory.inode)``): an inode number is evidence only
+        where the platform supplies one, and SMB shares, FAT/exFAT volumes and CPython's
+        Windows directory-attribute fallback all report ``0``. Without this gate two *distinct*
+        corpora that both report ``(0, 0)`` compare equal, so every source after the first is
+        discarded as a repeat -- and on the family union, which ``docs/CLI.md`` documents as
+        the required shape for a spawning run, that silently drops the child's answers and
+        tells the operator they made a spelling mistake they did not make.
         """
 
         try:
-            return file_identity(path.lstat())
+            identity = file_identity(path.lstat())
         except OSError:
             return None
+        return identity if identity.inode else None
 
     def _index(self, record: Mapping[str, Any]) -> None:
         if record.get("schema_version") != MODEL_PAYLOADS_SCHEMA_VERSION:
@@ -277,9 +292,13 @@ class ReplayCorpus:
         elif kind == MODEL_RESPONSE_KIND:
             digest = record.get("request_digest")
             if not is_chunk_sha256(digest):
-                # An empty digest is legal in the file (it joins the ledger's refusal line)
-                # but it can never be *asked for* by digest, so it has no queue to join.
-                self._rejected += 1
+                # An empty digest is legal and deliberate -- a keyless call still records its
+                # answer -- but it can never be *asked for* by digest, so it has no queue to
+                # join. That is the reader declining to index a healthy record, not damage:
+                # counting it as damage made every corpus holding one `too_large` call (an
+                # operational condition, not a defect) announce itself as broken to an
+                # operator whose `monoid validate` says it is clean.
+                self._unjoinable += 1
                 return
             call_index = record.get("call_index")
             if isinstance(call_index, bool) or not isinstance(call_index, int):
@@ -328,7 +347,9 @@ class ReplayCorpus:
             entry = queue[cursor]
             body = self._entry_body(entry)
             if isinstance(body, ReplayMissReason):
-                return body
+                # Name the position the refusal stands on, so a caller that later moves past
+                # it moves past *this* one -- see spend_refused.
+                return replace(body, slot=cursor)
             self._cursors[digest] = cursor + 1
         return ReplayedResponse(
             body=body,
@@ -338,23 +359,27 @@ class ReplayCorpus:
             slot=cursor,
         )
 
-    def spend_refused(self, digest: str) -> None:
-        """Advance past a slot this corpus could not give back, once the caller has served
-        that call another way.
+    def spend_refused(self, digest: str, slot: int) -> None:
+        """Advance past the slot ``slot``, once the caller has served that call another way.
 
         The only honest reason to spend a refused slot: the conversation really has moved past
         the call it belongs to, so the original run's next call and this run's next call are
         at the same position again. Serving the miss live (``--replay-fallthrough``) is that
         reason; parking on it is not.
+
+        It names the slot for the reason :meth:`release` does. ``consume`` deliberately does
+        not advance on a refusal, so every concurrent caller meets the *same* refused entry --
+        and a blind increment would then spend one slot per caller, skipping recorded answers
+        no caller ever sees. Naming it makes duplicate refusals idempotent, which is what they
+        are: one slot, refused once, however many callers heard about it.
         """
 
         with self._lock:
             queue = self._responses.get(digest)
             if not queue:
                 return
-            cursor = self._cursors.get(digest, 0)
-            if cursor < len(queue):
-                self._cursors[digest] = cursor + 1
+            if self._cursors.get(digest, 0) == slot < len(queue):
+                self._cursors[digest] = slot + 1
 
     def release(self, digest: str, slot: int) -> None:
         """Give back an answer :meth:`consume` handed out that the caller could not use.
@@ -662,6 +687,14 @@ class ReplayCorpus:
     @property
     def rejected_records(self) -> int:
         return self._rejected
+
+    @property
+    def unjoinable_records(self) -> int:
+        """Healthy records the reader cannot index by key -- today, the deliberate answer of a
+        keyless call. Separate from :attr:`rejected_records` because one is the corpus being
+        well-formed about a call that had no key, and the other is the corpus being wrong."""
+
+        return self._unjoinable
 
     @property
     def repeated_sources(self) -> int:

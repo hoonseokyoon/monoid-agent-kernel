@@ -372,11 +372,18 @@ class ReplayModelAdapter:
         """
 
         if self._inner is not None:
-            if digest is not None and held is None and miss.reason == MISS_NOT_RECORDED:
-                # The refusal came from the record itself, so a slot is still standing where
-                # this call was; serving live is what spends it.
-                self._corpus.spend_refused(digest)
-            return self._inner.next_turn(request)
+            turn = self._inner.next_turn(request)
+            # Only now. Spending before the call would claim the conversation moved past this
+            # slot on the strength of an attempt: a live adapter that raises recoverably (a
+            # 429 is enough) parks the turn for an idempotent re-attempt, and the re-attempt
+            # would be answered with the next call's recording -- the same silent substitution
+            # the two-phase consume exists to prevent, reached through the other exit.
+            # A `held` slot needs nothing: ``consume`` handed that record over and already
+            # advanced past it, so the sequence is aligned. Only a refusal that left the
+            # cursor standing has a slot to spend.
+            if digest is not None and held is None and miss.slot is not None:
+                self._corpus.spend_refused(digest, miss.slot)
+            return turn
         if digest is not None and held is not None:
             self._corpus.release(digest, held)
         raise ReplayMiss(

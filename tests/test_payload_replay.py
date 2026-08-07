@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from monoid_agent_kernel.core import model_payloads, payload_gc
+from monoid_agent_kernel.core import model_payloads, payload_gc, payload_replay
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
@@ -280,8 +281,9 @@ def test_a_refused_answer_keeps_its_slot_until_the_caller_moves_past_it(tmp_path
     assert "unencodable" in first.detail
     assert isinstance(again, ReplayMissReason)
     assert (again.reason, again.detail) == (first.reason, first.detail)
+    assert first.slot == again.slot == 0, "a refusal names the position it stands on"
 
-    corpus.spend_refused(digest)
+    corpus.spend_refused(digest, first.slot)
     after = corpus.consume(digest, generation=_GEN)
 
     assert isinstance(after, ReplayedResponse)
@@ -732,3 +734,122 @@ def test_a_retired_generation_is_nameable_before_the_run_starts(tmp_path: Path) 
     assert "monoid.model-request-digest.v0" in divergence
     assert _GEN in divergence
     assert corpus.generation_divergence("monoid.model-request-digest.v0") is None
+
+
+def test_concurrent_refusals_of_one_slot_spend_it_once(tmp_path: Path) -> None:
+    """``consume`` deliberately does not advance on a refusal, so every concurrent caller
+    meets the SAME refused entry. A blind increment would then spend one slot per caller and
+    skip recorded answers no caller ever sees -- which is worse than the ordering
+    nondeterminism the module docstring does disclaim, because those answers are simply lost.
+
+    Naming the slot makes duplicate refusals idempotent, which is what they are: one slot,
+    refused once, however many callers heard about it.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    answered = path.read_text(encoding="utf-8").splitlines()
+    refused = json.dumps(
+        model_response_record(
+            None,
+            call_index=0,
+            request_digest=digest,
+            unrecorded_reason="too_large",
+            **_envelope(),
+        ),
+        sort_keys=True,
+    )
+    path.write_text("\n".join([answered[0], refused, answered[1]]) + "\n", encoding="utf-8")
+    corpus = ReplayCorpus.load([run_dir])
+
+    barrier = threading.Barrier(4)
+    misses: list[Any] = []
+
+    def refuse() -> None:
+        barrier.wait()
+        misses.append(corpus.consume(digest, generation=_GEN))
+
+    threads = [threading.Thread(target=refuse) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(isinstance(miss, ReplayMissReason) for miss in misses)
+    assert {miss.slot for miss in misses} == {0}
+    for miss in misses:
+        corpus.spend_refused(digest, miss.slot)
+
+    served = corpus.consume(digest, generation=_GEN)
+    assert isinstance(served, ReplayedResponse), "four refusals of one slot spent four slots"
+    assert served.body["final_text"] == "hand answer"
+
+
+def test_a_keyless_answer_is_unjoinable_not_damage(tmp_path: Path) -> None:
+    """A `model_response` with an empty `request_digest` is deliberate and legal -- a keyless
+    call still records its answer. The reader cannot index it (nothing can ask for it by key),
+    but declining to index a healthy record is not damage, and calling it damage told the
+    operator their corpus was broken when `monoid validate` says it is clean.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    with (run_dir / MODEL_PAYLOADS_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                model_response_record(
+                    {
+                        "response_id": "r-keyless",
+                        "final_text": "answered without a key",
+                        "tool_calls": [],
+                        "reasoning": [],
+                        "usage": {},
+                        "stop_reason": "stop",
+                        "provider_retried": False,
+                    },
+                    call_index=1,
+                    request_digest="",
+                    unrecorded_reason="",
+                    **_envelope(),
+                ),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    corpus = ReplayCorpus.load([run_dir])
+
+    assert corpus.unjoinable_records == 1
+    assert corpus.rejected_records == 0, "a legal record the reader cannot key is not damage"
+    assert corpus.damaged_lines == 0
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+
+
+def test_a_volume_without_inodes_does_not_collapse_the_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`payload_gc` states this repo's rule -- an inode number is evidence only where the
+    platform supplies one -- and enforces it. The dedupe is the second consumer of
+    `file_identity`, and without the same gate two DISTINCT corpora that both report `(0, 0)`
+    compare equal, so every source after the first is discarded as a repeat. On the family
+    union, which `docs/CLI.md` documents as the required shape for a spawning run, that drops
+    the child's answers and blames the operator for a spelling mistake they did not make.
+    """
+
+    first = tmp_path / "runs" / "run-1"
+    second = tmp_path / "runs" / "run-2"
+    digest = _recorded_pair(first)
+    assert _recorded_pair(second) == digest
+    monkeypatch.setattr(
+        payload_replay,
+        "file_identity",
+        lambda metadata: payload_replay.VerifiedFileIdentity(device=0, inode=0),
+    )
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.repeated_sources == 0
+    assert corpus.response_count() == 2, "an unnameable source is indexed, not discarded"
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
