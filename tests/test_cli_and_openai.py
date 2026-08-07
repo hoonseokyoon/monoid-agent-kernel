@@ -1931,6 +1931,21 @@ def test_cli_run_recording_flags_produce_the_sidecars(
     assert quiet.exit_code == 0, quiet.output
     assert not (run_root / "cli-quiet" / "model_calls.jsonl").exists()
     assert not (run_root / "cli-quiet" / "model_payloads.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model-content.jsonl").exists()
+
+    # The third sidecar, whose flag landed with these two so that `monoid validate`'s
+    # model-content arm stops being a consumer with no producer.
+    content = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-content", "--model-content-file",
+        ],
+    )
+
+    assert content.exit_code == 0, content.output
+    assert (run_root / "cli-content" / "model-content.jsonl").exists()
 
 
 @pytest.mark.parametrize("requested", [True, False], ids=["asked", "omitted"])
@@ -1964,17 +1979,64 @@ def test_backend_serve_carries_the_recording_flags_to_the_backend(
         "--ephemeral-token-secret",
     ]
     if requested:
-        argv += ["--model-calls-file", "--model-payload-file"]
+        argv += ["--model-calls-file", "--model-payload-file", "--model-content-file"]
 
     result = CliRunner().invoke(main, argv)
 
     assert built, result.output
     backend = built[0]
     try:
+        # All three private sidecars, because a deployment reachable for two of them is the
+        # asymmetry this branch exists to close, and `monoid validate` re-checks all three.
         assert backend.model_calls_file is requested
         assert backend.model_payload_file is requested
+        assert backend.model_content_file is requested
     finally:
         backend.shutdown()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["backend", "serve"], ["llm-gateway", "serve"], ["web-gateway", "serve"]],
+    ids=["backend", "llm-gateway", "web-gateway"],
+)
+def test_every_serve_command_reports_a_bind_failure_as_a_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
+) -> None:
+    """Three commands, one rule. The first version of this fix was bound on `backend serve` alone
+    while its two siblings, eighty and two hundred lines below in the same file, kept the bare
+    traceback the commit message said had been removed -- and that message's own words were "the
+    CLI error *every other* startup failure gets".
+
+    Port 99999 rather than a genuinely bound socket, because that is the shape that escaped:
+    `click`'s `int` accepts it and the socket layer answers with `OverflowError`, not `OSError`,
+    so an `except OSError` catches nothing at all here.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in (
+        "MONOID_BACKEND_ADMIN_TOKEN",
+        "MONOID_LLM_GATEWAY_ADMIN_TOKEN",
+        "MONOID_WEB_GATEWAY_ADMIN_TOKEN",
+    ):
+        monkeypatch.setenv(name, "admin-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    argv = [*command, "--port", "99999", "--ephemeral-token-secret"]
+    if command[0] == "backend":
+        argv += [
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        ]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, (OSError, OverflowError)), (
+        f"the bind failure escaped as a traceback: {result.exception!r}"
+    )
+    assert "could not listen on" in result.output, result.output
 
 
 def test_backend_serve_releases_the_backend_when_the_socket_cannot_be_taken(

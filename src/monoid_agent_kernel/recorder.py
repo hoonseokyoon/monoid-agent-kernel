@@ -784,7 +784,7 @@ class AgentRecorder:
             # A chunk lands before the record that references it, so this is the one disable that
             # can leave the corpus file never created at all -- nothing on disk to notice, which is
             # why it needs the loudest of them, not the quietest.
-            self._lose_model_payloads("a chunk could not be stored")
+            self._lose_model_payloads_locked("a chunk could not be stored")
             return False
         line = self._encoded_payload_line(chunk_record(chunk, **envelope))
         if line is None:
@@ -816,19 +816,26 @@ class AgentRecorder:
             extra={"monoid_run_id": self.run_id, "monoid_artifact": artifact},
         )
 
-    def _lose_model_calls(self, reason: str) -> None:
+    def _lose_model_calls_locked(self, reason: str) -> None:
+        """Caller holds ``_model_calls_lock``."""
+
         if self._model_calls_failed:
             return
         self._model_calls_failed = True
         self._lose_artifact(MODEL_CALLS_FILENAME, reason)
 
-    def _lose_model_payloads(self, reason: str) -> None:
+    def _lose_model_payloads_locked(self, reason: str) -> None:
+        """Caller holds ``_model_calls_lock`` -- both sidecar arms share it."""
+
         if self._model_payloads_failed:
             return
         self._model_payloads_failed = True
         self._lose_artifact(MODEL_PAYLOADS_FILENAME, reason)
 
-    def _lose_model_content(self, reason: str) -> None:
+    def _lose_model_content_locked(self, reason: str) -> None:
+        """Caller holds ``_model_content_store_lock`` -- a DIFFERENT lock from the two above, which
+        is why each door names its own rather than inheriting a file-wide convention."""
+
         if self._model_content_store_failed:
             return
         self._model_content_store_failed = True
@@ -844,7 +851,12 @@ class AgentRecorder:
             handle.write(line + "\n")
             handle.flush()
         except (OSError, UnicodeError):
-            self._lose_model_calls("an append failed and may have torn its line")
+            # The traceback stays, at ``debug``, beside the announcement: the door says *that* the
+            # ledger stopped, and only errno says whether this was a full disk, a dead handle or a
+            # network mount going away. Dropping it here while the constructor site kept its own
+            # was the level promotion eating the detail it was not about.
+            _LOGGER.debug("model call ledger append failed", exc_info=True)
+            self._lose_model_calls_locked("an append failed and may have torn its line")
             return False
         return True
 
@@ -858,7 +870,8 @@ class AgentRecorder:
             handle.write(line + "\n")
             handle.flush()
         except (OSError, UnicodeError):
-            self._lose_model_payloads("an append failed and may have torn its line")
+            _LOGGER.debug("model payload append failed", exc_info=True)
+            self._lose_model_payloads_locked("an append failed and may have torn its line")
             return False
         return True
 
@@ -887,7 +900,7 @@ class AgentRecorder:
             return self._model_payloads_handle
         handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
         if handle is None:
-            self._lose_model_payloads("it could not be safely opened")
+            self._lose_model_payloads_locked("it could not be safely opened")
             return None
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
@@ -937,7 +950,7 @@ class AgentRecorder:
             return self._model_calls_handle
         handle = open_verified_append_text(self.run_dir / MODEL_CALLS_FILENAME)
         if handle is None:
-            self._lose_model_calls("it could not be safely opened")
+            self._lose_model_calls_locked("it could not be safely opened")
             return None
         self._model_calls_handle = handle
         return handle
@@ -971,7 +984,7 @@ class AgentRecorder:
                 # whatever the deployment's parents are called -- on the stderr of every embedder,
                 # which is the thing the sibling site twelve lines up refuses to do by name.
                 _LOGGER.debug("model content store initialization failed", exc_info=True)
-                self._lose_model_content("it could not be opened")
+                self._lose_model_content_locked("it could not be opened")
                 return None
         return self._model_content_store
 

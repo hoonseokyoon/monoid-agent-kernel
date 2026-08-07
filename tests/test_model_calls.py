@@ -656,26 +656,61 @@ def test_the_door_is_what_makes_the_announcement_once_per_activation(
     """
     from monoid_agent_kernel.recorder import AgentRecorder
 
+    from monoid_agent_kernel.core.model_content import ModelContentStore
+
     recorder = AgentRecorder(tmp_path / "runs", "run-1", status_file=False)
+    # The store's door is in this tuple because it is the one that is *re-entered*: once the
+    # store is disabled, `active_state()` calls it again on every call, and Studio's hydration
+    # calls that repeatedly. Its guard is therefore the load-bearing one, and it was the door
+    # this test originally left out -- the same twin-miss the repair it belongs to is named for.
+    store = ModelContentStore(tmp_path / "runs" / "run-1" / MODEL_CONTENT_FILENAME, run_id="run-1")
     doors = (
-        (recorder._lose_model_calls, MODEL_CALLS_FILENAME, "_model_calls_failed"),
-        (recorder._lose_model_payloads, MODEL_PAYLOADS_FILENAME, "_model_payloads_failed"),
-        (recorder._lose_model_content, MODEL_CONTENT_FILENAME, "_model_content_store_failed"),
+        (recorder._lose_model_calls_locked, MODEL_CALLS_FILENAME, recorder, "_model_calls_failed"),
+        (
+            recorder._lose_model_payloads_locked,
+            MODEL_PAYLOADS_FILENAME,
+            recorder,
+            "_model_payloads_failed",
+        ),
+        (
+            recorder._lose_model_content_locked,
+            MODEL_CONTENT_FILENAME,
+            recorder,
+            "_model_content_store_failed",
+        ),
+        (store._disable_locked, MODEL_CONTENT_FILENAME, store, "_disabled"),
     )
     with caplog.at_level(logging.WARNING):
-        for door, _artifact, _flag in doors:
+        for door, _artifact, _owner, _flag in doors[:3]:
             for _ in range(3):
                 door("a reason")
     recorder.close()
 
-    for _door, artifact, flag in doors:
+    for _door, artifact, owner, flag in doors[:3]:
         named = [
             record
             for record in caplog.records
             if record.levelno >= logging.WARNING and artifact in record.getMessage()
         ]
         assert len(named) == 1, [record.getMessage() for record in caplog.records]
-        assert getattr(recorder, flag) is True
+        assert getattr(owner, flag) is True
+
+    # The store's door, on its own record set: it shares an artifact name with the recorder's
+    # third door, so it cannot be counted in the same pass.
+    caplog.clear()
+    store_door, store_artifact, store_owner, store_flag = doors[3]
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            store_door("a reason")
+    store.close()
+
+    named = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and store_artifact in record.getMessage()
+    ]
+    assert len(named) == 1, [record.getMessage() for record in caplog.records]
+    assert getattr(store_owner, store_flag) is True
 
 
 def test_the_announcement_carries_no_traceback_and_no_identifier(
@@ -727,43 +762,109 @@ def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other
     """
     import ast
 
-    from monoid_agent_kernel.core import model_content as content_module
     from monoid_agent_kernel import recorder as recorder_module
+    from monoid_agent_kernel.core import model_content as content_module
 
-    for module, attributes, doors in (
+    def door_ranges(tree: ast.AST, doors: tuple[str, ...]) -> list[tuple[int, int]]:
+        # A list of ranges, not a name->node dict: two functions can share a name, and collapsing
+        # them silently moves the accepted range onto whichever came last.
+        found = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in doors
+        ]
+        missing = set(doors) - {node.name for node in found}
+        assert not missing, f"missing announcing door(s): {sorted(missing)}"
+        return [(node.lineno, node.end_lineno or node.lineno) for node in found]
+
+    def flags_the_gates_read(tree: ast.AST, artifacts: tuple[str, ...]) -> set[str]:
+        """Every ``self._x`` a gate consults to decide whether the artifact still records.
+
+        Derived, not hand-listed. The first version of this census enumerated the three
+        ``_failed`` names and missed the ``_closed`` ones sitting in the same boolean expression
+        -- a one-line, permanent, silent kill switch the census would have waved through, which is
+        exactly the defect it exists to refuse.
+        """
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.BoolOp):
+                continue
+            attrs = {
+                sub.attr
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name)
+            }
+            if attrs & set(artifacts):
+                names |= {attr for attr in attrs if attr.startswith("_")}
+        return names - set(artifacts)
+
+    for module, artifacts, doors, extra_flags in (
         (
             recorder_module,
-            ("_model_calls_failed", "_model_payloads_failed", "_model_content_store_failed"),
-            ("_lose_model_calls", "_lose_model_payloads", "_lose_model_content"),
+            ("model_calls_file", "model_payload_file"),
+            (
+                "_lose_model_calls_locked",
+                "_lose_model_payloads_locked",
+                "_lose_model_content_locked",
+            ),
+            ("_model_content_store_failed",),
         ),
-        (content_module, ("_disabled",), ("_disable_locked",)),
+        (content_module, (), ("_disable_locked",), ("_disabled",)),
     ):
-        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
-        functions = {
-            node.name: node
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        ranges = door_ranges(tree, doors)
+        flags = flags_the_gates_read(tree, artifacts) | set(extra_flags)
+        assert flags, f"{module.__name__}: derived no gate flags, so this census proves nothing"
+
+        # Two function bodies join the doors, each for a stated reason rather than by being
+        # overlooked: `__init__` establishes the flags rather than transitioning into the state,
+        # and `close` is normal termination -- the artifact stops because the run ended, which is
+        # the one transition an operator must NOT be warned about. Everything else, including a
+        # `_closed = True` written from an append handler, is a silent kill switch and fails here.
+        allowed = ranges + [
+            (node.lineno, node.end_lineno or node.lineno)
             for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        }
-        for door in doors:
-            assert door in functions, f"{module.__name__} must funnel its disable through {door}"
-        outside = [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            for target in node.targets
-            if isinstance(target, ast.Attribute)
-            and target.attr in attributes
-            and isinstance(node.value, ast.Constant)
-            and node.value.value is True
-            and not any(
-                door_node.lineno <= node.lineno <= (door_node.end_lineno or node.lineno)
-                for name, door_node in functions.items()
-                if name in doors
-            )
+            if isinstance(node, ast.FunctionDef) and node.name in {"__init__", "close"}
         ]
-        assert not outside, (
-            f"{module.__name__} sets a terminal-disable flag outside its announcing door at "
-            f"lines {outside}; that is the silent-artifact defect this census exists to refuse"
+        writes: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                for element in ast.walk(target):
+                    if (
+                        isinstance(element, ast.Attribute)
+                        and element.attr in flags
+                        and not any(lo <= node.lineno <= hi for lo, hi in allowed)
+                    ):
+                        writes.append((node.lineno, element.attr))
+        # `setattr` and `__dict__` reach the same state without an `Assign` node at all.
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"setattr", "object"}
+                and any(
+                    isinstance(arg, ast.Constant) and arg.value in flags for arg in node.args
+                )
+            ):
+                writes.append((node.lineno, "setattr"))
+        assert "__dict__[" not in source, (
+            f"{module.__name__} reaches an attribute through __dict__; the census cannot see that"
+        )
+        assert not writes, (
+            f"{module.__name__} writes a terminal-state flag outside its announcing door at "
+            f"{writes}; every transition into that state must go through the door that speaks. "
+            f"Gate flags derived: {sorted(flags)}"
+        )
+        # Non-vacuity: the doors must actually be called, or the rule above is satisfied by a
+        # module that never disables anything.
+        assert sum(source.count(f"{door}(") for door in doors) > len(doors), (
+            f"{module.__name__}: the doors exist but nothing calls them"
         )
 
 

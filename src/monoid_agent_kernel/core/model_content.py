@@ -431,19 +431,20 @@ class ModelContentStore:
         a reader cannot tell a truncated sidecar from a complete one, so silence there is worse
         than at the door that was already loud.
 
-        The message names the artifact, never ``self.path`` -- the constructor stores the caller's
-        path verbatim and this class is public Helper Kit surface, so a caller who hands it a run
-        directory would otherwise put a run id on every embedder's stderr.
+        The message names ``self.path.name`` and never the path: a basename cannot carry the run
+        directory, and hardcoding the default filename instead would name a file that does not
+        exist for a caller who chose another one.
         """
 
         if self._disabled:
             return
         self._disabled = True
+        artifact = self.path.name
         _LOGGER.warning(
             "%s: %s; this activation records no more of it",
-            MODEL_CONTENT_FILENAME,
+            artifact,
             reason,
-            extra={"monoid_run_id": self.run_id, "monoid_artifact": MODEL_CONTENT_FILENAME},
+            extra={"monoid_run_id": self.run_id, "monoid_artifact": artifact},
         )
 
 

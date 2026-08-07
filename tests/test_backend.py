@@ -1177,10 +1177,11 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
     ledger_path = submission.run_dir / "model_calls.jsonl"
     assert eventually(lambda: len(first_adapter.requests) == 2)
     assert eventually(lambda: len(_jsonl_lines(ledger_path)) == 2)
-    # Structural, not hopeful: the first activation is stopped before the second exists, so the
-    # `[0, 1, 0]` sequence cannot be disturbed by it, and its append handle on the shared ledger
-    # is released before the takeover appends to the same file. `FakeModelAdapter` answers past
-    # its script instead of raising, so waiting on counts alone could never rule out a third call.
+    # `shutdown(drain=False)` on a backend with no broker and no watchdog is close to inert -- it
+    # does not end the parked session or close the recorder's handle, and nothing in the backend
+    # does. What makes `[0, 1, 0]` safe is the barrier above: the adapter's script is exhausted,
+    # so the first activation has no fourth turn to take. This call is teardown hygiene, placed
+    # before the takeover so the two backends' lifetimes do not overlap for the rest of the test.
     backend1.shutdown(drain=False)
 
     backend2 = RunnerBackend(

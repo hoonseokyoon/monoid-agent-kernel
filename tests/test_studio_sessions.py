@@ -515,6 +515,11 @@ def test_studio_streams_content_without_mirroring_tokens_into_durable_events(
         assert server._backend.stream_model_calls is True
         assert server._backend.model_content_file is True
         assert server._backend.model_stream_broker is not None
+        # Egress on grants live delivery and the content sidecar; it grants neither recording
+        # switch. Asserted here too, because a rule stated in one of three enumerations is a rule
+        # that reaches whichever one the next editor happens to open.
+        assert server._backend.model_calls_file is False
+        assert server._backend.model_payload_file is False
 
         subscription = server.model_stream_subscription(run_id)
         frames = subscription.poll()
