@@ -365,31 +365,47 @@ class ReplayModelAdapter:
     ) -> ModelTurn:
         """Fall through to the inner adapter, or refuse -- and settle the refused slot.
 
-        The two exits disagree about what happened to the call, so they must disagree about
-        the sequence. Serving it live moves the conversation past it, so the slot is spent and
-        the next call meets the next recording. Raising parks the turn for an idempotent
-        re-attempt, so the slot goes back: the re-attempt must earn the same refusal, not the
-        answer that belonged to the call after it.
+        Not two exits but three, and only one of them is a call that happened. Serving it live
+        moves the conversation past this slot, so the slot is spent and the next call meets the
+        next recording. Raising -- because there is no inner, or because the inner raised --
+        parks the turn for an idempotent re-attempt, so the slot goes back: the re-attempt must
+        earn the same refusal, not the answer that belonged to the call after it.
+
+        The two unserved exits settle through one function rather than two hand-kept sites,
+        because that is the seam this repair was needed at twice: the rule was written for the
+        refusal that leaves the cursor standing and never bound on the record ``consume``
+        handed over and reconstruction then rejected.
         """
 
         if self._inner is not None:
-            turn = self._inner.next_turn(request)
+            try:
+                turn = self._inner.next_turn(request)
+            except BaseException:
+                self._settle_unserved(digest, held)
+                raise
             # Only now. Spending before the call would claim the conversation moved past this
             # slot on the strength of an attempt: a live adapter that raises recoverably (a
             # 429 is enough) parks the turn for an idempotent re-attempt, and the re-attempt
             # would be answered with the next call's recording -- the same silent substitution
             # the two-phase consume exists to prevent, reached through the other exit.
-            # A `held` slot needs nothing: ``consume`` handed that record over and already
-            # advanced past it, so the sequence is aligned. Only a refusal that left the
-            # cursor standing has a slot to spend.
             if digest is not None and held is None and miss.slot is not None:
                 self._corpus.spend_refused(digest, miss.slot)
             return turn
-        if digest is not None and held is not None:
-            self._corpus.release(digest, held)
+        self._settle_unserved(digest, held)
         raise ReplayMiss(
             f"replay miss ({miss.reason}): {miss.detail}", provider_error_code=miss.reason
         )
+
+    def _settle_unserved(self, digest: str | None, held: int | None) -> None:
+        """Give back a slot ``consume`` handed over for a call that then did not happen.
+
+        A refusal that left the cursor standing holds nothing and needs nothing; only a record
+        reconstruction rejected has already moved the cursor, and only that one has to be put
+        back before the turn parks.
+        """
+
+        if digest is not None and held is not None:
+            self._corpus.release(digest, held)
 
     # --- lifecycle ----------------------------------------------------------------------------
 

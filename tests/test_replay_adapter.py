@@ -730,6 +730,73 @@ def test_a_failed_live_serve_does_not_move_the_sequence(tmp_path: Path) -> None:
     assert _call(adapter, _request()).final_text == "recovered"
 
 
+def test_a_failed_live_serve_gives_back_a_held_slot_too(tmp_path: Path) -> None:
+    """The same rule on the other kind of unusable slot, which is where it was missing.
+
+    Falling through has two shapes of refusal behind it. A ``unrecorded_reason`` is refused
+    before the cursor moves, so a failed live serve simply must not *spend* it. A body only
+    reconstruction rejects was already handed over -- the cursor is past it -- so a failed live
+    serve must *give it back*. Same failure either way: the call did not happen, the
+    conversation did not move, and a re-attempt answered from the corpus is the next call's
+    recording arriving as this call's answer.
+    """
+
+    digest, repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-2", final_text="answer for call two"),
+                ModelTurn(response_id="r-3", final_text="answer for call three"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    assert digest == repeat, "two identical calls are one key with two recorded answers"
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": None,
+            "tool_calls": [{"id": "c1", "name": "fs_list"}],  # no arguments: not a triple
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": None,
+            "provider_retried": False,
+        },
+    )
+
+    class _FailsOnce:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError(
+                    "upstream is busy", error_code="rate_limited", config_recoverable=True
+                )
+            return ModelTurn(final_text="live answer")
+
+    inner = _FailsOnce()
+    adapter = _replay(tmp_path, inner=inner)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _call(adapter, _request())
+    assert caught.value.error_code == "rate_limited"
+
+    served = _call(adapter, _request())
+
+    assert served.final_text == "live answer", (
+        "the re-attempt was answered from the corpus, so the failed attempt kept a slot it "
+        "never served"
+    )
+    assert inner.calls == 2
+    assert _call(adapter, _request()).final_text == "answer for call two"
+
+
 def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
     """The release coordinate, driven where it can be wrong.
 
