@@ -1164,8 +1164,13 @@ def _bind_or_report(
         return build()
     except (OSError, OverflowError) as exc:
         if release is not None:
-            with contextlib.suppress(Exception):
+            try:
                 release()
+            except Exception as teardown:  # noqa: BLE001 - never replace the bind failure
+                # Demoted to a warning beside the real error, the way `_adapter_teardown` handles
+                # the same problem in this file. Fully silent, a failed release leaves a watchdog
+                # thread and whatever it holds with nothing to say so.
+                click.echo(f"warning: releasing the server failed: {teardown}", err=True)
         raise click.ClickException(f"could not listen on {host}:{port}: {exc}") from exc
 
 
@@ -1221,7 +1226,9 @@ def _bind_or_report(
     is_flag=True,
     help=(
         "Record the private model-content sidecar (model-content.jsonl) in every run this "
-        "backend serves. Content, and deployment-wide like the two above."
+        "backend serves. Content, and deployment-wide like the two above. Unlike them it also "
+        "selects provider streaming, so every tenant's model call moves to the streaming "
+        "dispatch."
     ),
 )
 @click.option(

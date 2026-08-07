@@ -429,8 +429,8 @@ refused open, a refused chunk, an append that may have torn its line, and, for
 `monoid_agent_kernel.recorder` (all three artifacts, when the recorder is the one that gives up)
 and `monoid_agent_kernel.core.model_content` (when the content store is); the record carries
 `monoid_run_id` and `monoid_artifact` as fields, so an aggregator can key on the run without every
-default stderr rendering carrying identifiers, and the message text names the artifact and nothing
-else. `WARNING` because it means a run lost an artifact it was configured to produce, and because
+default stderr rendering carrying identifiers, and the message text names the artifact's filename
+and nothing else — a basename, never the directory holding it. `WARNING` because it means a run lost an artifact it was configured to produce, and because
 Python's last-resort handler delivers exactly that level to stderr for an operator who configured
 no logging. Once per writer per activation, and not necessarily on the run's own thread — the
 content store's batch flush runs on a timer.

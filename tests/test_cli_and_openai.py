@@ -33,7 +33,11 @@ from monoid_agent_kernel.providers._common import (
     prune_dead_reasoning,
     reasoning_replay_window_start,
 )
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
 from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
@@ -1934,7 +1938,17 @@ def test_cli_run_recording_flags_produce_the_sidecars(
     assert not (run_root / "cli-quiet" / "model-content.jsonl").exists()
 
     # The third sidecar, whose flag landed with these two so that `monoid validate`'s
-    # model-content arm stops being a consumer with no producer.
+    # model-content arm stops being a consumer with no producer. Driven by a *streaming* adapter,
+    # because this flag is the one with a side effect: it selects the streaming dispatch, and the
+    # non-streaming fake above produces a file with `stream_opened`/`stream_closed` and not one
+    # `stream_segment` -- so an existence check on that adapter pins the wiring and none of the
+    # behaviour the flag's own help advertises.
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeStreamingModelAdapter(
+            chunk_turns=[[TextDelta("streamed "), TextDelta("answer"), TurnComplete()]]
+        ),
+    )
     content = CliRunner().invoke(
         main,
         [
@@ -1945,7 +1959,14 @@ def test_cli_run_recording_flags_produce_the_sidecars(
     )
 
     assert content.exit_code == 0, content.output
-    assert (run_root / "cli-content" / "model-content.jsonl").exists()
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (run_root / "cli-content" / "model-content.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert "stream_segment" in kinds, kinds
 
 
 @pytest.mark.parametrize("requested", [True, False], ids=["asked", "omitted"])

@@ -431,9 +431,13 @@ class ModelContentStore:
         refuses, noticed one moment later, and a reader cannot tell a truncated sidecar from a
         complete one, so silence there is worse than at the door that was already loud.
 
-        The message names ``self.path.name`` and never the path: a basename cannot carry the run
-        directory, and hardcoding the default filename instead would name a file that does not
-        exist for a caller who chose another one.
+        The message names ``self.path.name`` -- the basename of the file this store was pointed
+        at, never the directory holding it. Hardcoding ``MODEL_CONTENT_FILENAME`` instead would
+        name a file that does not exist for a caller who chose another one. The guarantee is
+        exactly "a basename, not a path": for every shipped configuration that basename is the
+        sidecar filename, and a caller who points this class at a *directory* gets that
+        directory's name -- which is also a caller whose open is about to fail, since the
+        constructor stores the path verbatim while the registry key normalizes it.
         """
 
         if self._disabled:

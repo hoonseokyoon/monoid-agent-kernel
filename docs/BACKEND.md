@@ -59,8 +59,10 @@ whenever this process builds an activation (a submitted run, and the one recover
 it applies to every tenant's runs with no per-run override, and a subagent inherits it into its
 own run directory. Two of the three are content — `model_payloads.jsonl` carries the request and
 response bodies in full, and `model-content.jsonl` the streamed text; only the ledger is
-metadata-only. Nothing in the kernel deletes them: `monoid gc` collects orphaned chunks, never a
-healthy corpus. Decide retention before enabling. In-process embedders set the same three with
+metadata-only. `--model-content-file` additionally **selects provider streaming**, so on a
+deployment it moves every tenant's model call to the streaming dispatch; the other two leave the
+dispatch shape alone. Nothing in the kernel deletes any of them: `monoid gc` collects orphaned
+chunks, never a healthy corpus. Decide retention before enabling. In-process embedders set the same three with
 the matching `RunnerBackend(model_calls_file=..., model_payload_file=..., model_content_file=...)`
 fields; see [OBSERVABILITY.md](OBSERVABILITY.md) for what each artifact records.
 
