@@ -861,6 +861,55 @@ def test_a_keyless_answer_is_unjoinable_not_damage(tmp_path: Path) -> None:
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
 
 
+@pytest.mark.parametrize(
+    "request_digest",
+    ["deadbeef", "0" * 63, "A" * 64, 12345, None],
+    ids=["short-hex", "truncated", "uppercase", "integer", "missing"],
+)
+def test_an_answer_keyed_by_something_that_is_not_a_key_is_damage(
+    tmp_path: Path, request_digest: Any
+) -> None:
+    """The other side of the line the test above draws, and the side it opened.
+
+    `schemas.py` allows a `request_digest` of exactly `^(|[0-9a-f]{64})$` and the writer emits
+    only those two shapes, so a *non-empty* value that is not a name is corruption by
+    construction -- `monoid validate` says so. Counting it healthy alongside the legal keyless
+    answer makes the preflight silent about a damaged corpus, and the miss it causes is then
+    diagnosed `absent`: "the original call failed, or its activation ended before answering",
+    which is the exact misdirection the damage warning exists to prevent.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    record = model_response_record(
+        {
+            "response_id": "r-damaged",
+            "final_text": "answered under a key that is not one",
+            "tool_calls": [],
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": "stop",
+            "provider_retried": False,
+        },
+        call_index=1,
+        request_digest="",
+        unrecorded_reason="",
+        **_envelope(),
+    )
+    if request_digest is None:
+        record.pop("request_digest")
+    else:
+        record["request_digest"] = request_digest
+    with (run_dir / MODEL_PAYLOADS_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    corpus = ReplayCorpus.load([run_dir])
+
+    assert corpus.rejected_records == 1, "a digest that is neither empty nor a name is damage"
+    assert corpus.unjoinable_records == 0
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+
+
 def test_a_volume_without_inodes_does_not_collapse_the_union(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

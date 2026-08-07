@@ -304,13 +304,23 @@ class ReplayCorpus:
         elif kind == MODEL_RESPONSE_KIND:
             digest = record.get("request_digest")
             if not is_chunk_sha256(digest):
-                # An empty digest is legal and deliberate -- a keyless call still records its
-                # answer -- but it can never be *asked for* by digest, so it has no queue to
-                # join. That is the reader declining to index a healthy record, not damage:
-                # counting it as damage made every corpus holding one `too_large` call (an
-                # operational condition, not a defect) announce itself as broken to an
+                # The empty digest, and only it. It is legal and deliberate -- a keyless call
+                # still records its answer -- but it can never be *asked for* by digest, so it
+                # has no queue to join. That is the reader declining to index a healthy record,
+                # not damage: counting it as damage made every corpus holding one `too_large`
+                # call (an operational condition, not a defect) announce itself as broken to an
                 # operator whose `monoid validate` says it is clean.
-                self._unjoinable += 1
+                #
+                # Anything else here is damage by construction. `schemas.py` allows exactly
+                # `^(|[0-9a-f]{64})$` and the writer emits only those two shapes, so a
+                # non-empty value that is not a name is a record `monoid validate` calls
+                # corrupt -- and calling it healthy is the same silence, mirrored: the
+                # preflight says nothing, and the miss it causes is diagnosed `absent`, which
+                # blames the original call for a failure that is the corpus's.
+                if digest == "":
+                    self._unjoinable += 1
+                else:
+                    self._rejected += 1
                 return
             call_index = record.get("call_index")
             if isinstance(call_index, bool) or not isinstance(call_index, int):
