@@ -33,10 +33,18 @@ and the preflight refuses a config and a corpus that are both correct.
 answers; a family that mixed providers cannot exist under the kernel (children share the
 parent's adapter instance), so arriving here it is an assembly mistake, said early.
 
-``astream_turn`` is deliberately absent: the runner's structural fallback serves streamed
-runs one-shot, which is the documented support shape. ``resolve_destination`` is deliberately
-absent too (D-f): ``not_declared`` is the honest answer, and the ledger delta it causes
-against an original whose destination resolved is documented rather than imitated.
+``astream_turn`` is deliberately absent: the runner's structural fallback serves streamed runs
+one-shot, and ``docs/CLI.md`` names that degradation under the v1 limits rather than leaving
+it to be discovered. ``resolve_destination`` is deliberately absent too (D-f):
+``not_declared`` is the honest answer, and the ledger delta it causes against an original
+whose destination resolved is documented rather than imitated.
+
+**Under fallthrough the wrapper still speaks for the call.** The receipt is built by probing
+this adapter, so a live answer the inner produced is stamped with the corpus-derived provider
+and ``not_declared`` -- the inner's own declaration and destination do not reach it, and its
+``supports_multimodal``/``astream_turn`` do not either. That is forced rather than chosen: the
+declaration is what makes recorded keys reachable, so it cannot also report who served a miss.
+``docs/CONTRACTS.md`` carries it as the third ledger delta, the one only fallthrough produces.
 """
 
 from __future__ import annotations

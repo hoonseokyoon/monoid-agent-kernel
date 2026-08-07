@@ -297,13 +297,29 @@ the first answer, then the second, then an `exhausted` miss. A miss without fall
 the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
 `provider_error_code` (`no_key`, `absent`, `not_recorded`, `identity_mismatch`, `exhausted`,
 `generation_mismatch`), checkpoints kept. Under a session driver the same miss parks the run
-(`config_recoverable: true`): fix the config or the sources and resend.
+(`config_recoverable: true`), and the same call asks again on the re-attempt — it earns the
+same refusal rather than the next call's recording. Note what that remedy can and cannot buy:
+a session cannot be given new sources while it is running, and the failed turn stays in the
+history, so "resend" recovers a run whose *config* was wrong far more often than one whose
+corpus was.
+
+**Two shapes replay does not reproduce.** A run whose calls were concurrent — background
+subagents draining together — issues the same key from more than one caller, and which caller
+receives which recording is the scheduler's answer both times; the recording never fixed that
+order, so the replay cannot either. And the consumption cursor lives in the process: a replay
+that crashes and durably resumes starts its counting again, so a key with more than one
+recorded answer is re-served from the first.
 
 **A run that spawned subagents is a family.** Children record into their own run directories,
 so name them too — `--replay-from` is repeatable — or the child's first call is the miss. With
 the union the child's calls replay; the parent's first *post-spawn* turn is a documented v1
 limit either way, because the spawn observation the model saw embeds per-run identifiers
 (`child_run_id`, `task_id`, `traceparent`) that a replay honestly cannot reproduce.
+
+**Replay does not stream.** The adapter serves whole turns, so a replay run combined with a
+streaming-selecting flag (`--model-content-file`) degrades to one-shot: the answer arrives
+complete, and no token deltas are produced or written. The run is correct; only its liveness
+is not reproduced.
 
 **Provenance and privacy.** Every ledger line of a replay run carries
 `attributes.replay_from` (the source run ids, comma-joined), inherited by children. The corpus

@@ -832,10 +832,21 @@ refuses everything it cannot prove. The contract:
   parent's first post-spawn turn is a documented v1 limit — the spawn observation embeds
   per-run identifiers a replay honestly cannot reproduce, and fabricating them would be exactly
   the invented identity the key doctrine forbids.
-- **Ledger deltas, two, both here on purpose:** the adapter declares no `resolve_destination`,
+- **Ledger deltas, three, all here on purpose:** the adapter declares no `resolve_destination`,
   so a replay run's `destination_status` reads `not_declared` even when the original resolved;
-  and when the no-reasoning rule declares a provider an undeclared original did not, the replay
-  ledger's `provider_name` is non-empty where the original's was `""`.
+  when the no-reasoning rule declares a provider an undeclared original did not, the replay
+  ledger's `provider_name` is non-empty where the original's was `""`; and under
+  `--replay-fallthrough` a call the *inner* adapter served is still stamped with the wrapper's
+  provider and `not_declared`, because the declaration is what makes recorded keys reachable
+  and cannot simultaneously report who answered a miss. A corpus recorded through fallthrough
+  therefore keys its live calls under the wrapper's provider term, which is the term a later
+  correctly-configured live run will not compute.
+- **A miss message names run ids as well as terms.** The content-free rule bounds *values*, not
+  identifiers: a diagnosis names the diverging term, a 12-hex digest prefix on each side, and
+  the run id (and `call_index`) of the record it compared against — including on the public
+  `turn.failed` payload, in `failure.json`, and on CLI stderr. Run ids are minted hex, but they
+  are foreign run ids when the corpus is foreign, so an event stream relayed to end users
+  carries them.
 - **Sources are read, never written**, and they are content: replaying a foreign run directory
   means reading that run's conversation bytes, so the corpus's privacy classification travels
   with the replay. A replay run's own recording switches write into its own directory only.

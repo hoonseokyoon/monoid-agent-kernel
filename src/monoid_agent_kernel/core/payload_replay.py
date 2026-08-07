@@ -32,10 +32,15 @@ named by term name and digest prefix only: a diverging ``observations`` is the n
 tool shape and the operator needs its *name*, not its bytes, which land on public event
 surfaces downstream.
 
-Not thread-safe per instance beyond its own consumption lock: ``consume`` holds a lock so two
-concurrent calls cannot double-spend one slot, but interleaving order across threads is the
-caller's business. The kernel drives one call at a time; a batch embedder replaying in parallel
-should give each run its own corpus instance.
+**Concurrent callers get each-once, not an order.** ``consume`` holds a lock across the whole
+take, so two callers can never be handed one slot and none is lost. Which of them gets which
+recording is the scheduler's answer, not this class's -- and the kernel does drive calls
+concurrently: a child loop is constructed with the parent's adapter instance, and background
+subagents drain the reentry queue together. Two identical background children therefore issue
+the *same* key (nothing run-scoped is in it) and divide that key's recordings between them in
+whatever order they arrive. Replay is deterministic for a run whose calls are ordered; a run
+whose concurrency the recording did not fix is replayed as faithfully as it was run, which is
+to say not deterministically. Same family as the spawn-observation limit in ``docs/CLI.md``.
 """
 
 from __future__ import annotations
@@ -167,8 +172,13 @@ class ReplayCorpus:
         """Index ``run_dirs`` in argument order; file order within each is preserved.
 
         Refuses at construction -- not on the tenth turn -- when a named directory has no
-        readable corpus: a replay source that recorded nothing is an operator mistake, and
+        corpus *file* to read: a replay source that never recorded is an operator mistake, and
         every later miss it would cause misdirects toward the request rather than the source.
+
+        A file that exists and holds nothing usable is not refused here, because "empty" and
+        "damaged" are answers about content rather than about the source, and the reader
+        reports them (``damaged_lines``, ``rejected_records``) for the preflight to act on. A
+        library embedder that skips the preflight gets the misses, not the construction error.
         """
 
         corpus = cls()
@@ -413,7 +423,12 @@ class ReplayCorpus:
         )
 
     def response_bodies_view(self) -> tuple[Mapping[str, Any], ...]:
-        """Every materializable answer body, in file order, cursors untouched.
+        """Every materializable answer body, grouped by key then in file order, cursors
+        untouched.
+
+        Not file order across the whole corpus: answers are indexed per key, so two keys whose
+        records interleave in the file come back one key at a time. The only caller asks
+        whether *any* body carries reasoning, which no ordering changes.
 
         Unrecorded and unresolvable entries are simply absent from the view: an evidence
         scan asks what the corpus can say, and a record that cannot testify says nothing.

@@ -22,9 +22,17 @@ out in commit messages and here.
   match anything recorded, naming expected and actual. Provider impersonation is derived from
   corpus evidence (declared originals re-inject reasoning into the record; undeclared ones do
   not), heterogeneous-provider unions are rejected at construction, tools re-execute for real,
-  and every ledger line of a replay run carries `attributes.replay_from`. Known v1 limit,
+  and every ledger line of a replay run carries `attributes.replay_from`. A refused record
+  keeps its slot until the caller moves past it, so a parked turn's re-attempt earns the same
+  refusal rather than the next call's answer; a source named twice is one source; and a body
+  that is not a recorded turn — wrong fields, or a count the loop would refuse — is a typed
+  miss rather than a model error blamed on a model that was never called. Known v1 limits,
   documented: a spawning run's post-spawn parent turn cannot replay (the spawn observation
-  embeds per-run identifiers), though the children themselves replay from the family union.
+  embeds per-run identifiers), though the children themselves replay from the family union;
+  concurrent callers of one key divide its recordings in scheduler order, because the
+  recording never fixed that order either; the consumption cursor is per-process, so a durably
+  resumed replay counts from the start again; and replay serves whole turns, so a streaming
+  run degrades to one-shot.
 - **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
   shares the exact functions the runner stamps receipts with; `model_call` re-imports every
   name, so embedder imports and behavior are unchanged, and the identity pins moved with the
