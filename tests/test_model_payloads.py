@@ -600,6 +600,58 @@ def test_a_hardlink_deduplicated_chunk_survives_being_restored_and_resumed(
     )
 
 
+def test_adopting_an_already_stored_chunk_refreshes_its_age(tmp_path: Path) -> None:
+    """Adoption must leave a timestamp, because it is the one event age-based collection cannot
+    otherwise see. The write-once short-circuit stores nothing and used to touch nothing, so a
+    chunk orphaned by one activation and re-derived by the next -- referenced *now*, mtime from
+    days ago -- looked exactly like the garbage `monoid gc --min-age-s` exists to remove. Bumping
+    times on the accepted name turns the age gate from a heuristic about fresh writes into a
+    protocol about recent use. Bytes are still never rewritten; only the times move."""
+    preimage, digest, _sha = _offloadable_call()
+    first = _standalone_recorder(tmp_path)
+    _record_offloadable(first, preimage, digest)
+    stored = next(iter((first.run_dir / MODEL_PAYLOADS_DIRNAME).iterdir()))
+    ancient_ns = 1_000_000_000_000_000_000  # 2001-09-09, any long-past instant works
+    os.utime(stored, ns=(ancient_ns, ancient_ns))
+    backdated = stored.lstat().st_mtime_ns
+
+    resumed = AgentRecorder(
+        tmp_path / "runs",
+        "run-1",
+        status_file=False,
+        model_calls_file=True,
+        model_payload_file=True,
+        reopen=True,
+    )
+    _record_offloadable(resumed, preimage, digest)
+
+    assert stored.lstat().st_mtime_ns > backdated
+
+
+def test_a_refused_existing_name_is_not_touched_even_in_metadata(tmp_path: Path) -> None:
+    """The bump belongs to the accepted arm only. A planted name is refused before it, so a
+    refusal must not freshen somebody else's file -- freshening is exactly what would shield a
+    plant from the age-gated collector its owner eventually runs."""
+    preimage, digest, sha = _offloadable_call()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "someone-elses.bin"
+    target.write_bytes(b"theirs")
+    run_dir = tmp_path / "runs" / "run-1"
+    (run_dir / MODEL_PAYLOADS_DIRNAME).mkdir(parents=True)
+    planted = run_dir / MODEL_PAYLOADS_DIRNAME / sha
+    os.link(target, planted)
+    ancient_ns = 1_000_000_000_000_000_000
+    os.utime(planted, ns=(ancient_ns, ancient_ns))
+    before = planted.lstat().st_mtime_ns
+    recorder = _standalone_recorder(tmp_path)
+
+    _record_offloadable(recorder, preimage, digest)
+
+    assert recorder._model_payloads_failed is True
+    assert planted.lstat().st_mtime_ns == before
+
+
 def test_an_indirection_planted_at_the_chunk_directory_is_refused(tmp_path: Path) -> None:
     """The final path component was the only one the file primitives checked, and the corpus added
     a subdirectory. `mkdir(exist_ok=True)` asks `is_dir()`, which follows -- so a link planted at

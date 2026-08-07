@@ -23,9 +23,9 @@ deployment's boundary to defend, not this module's.
 
 ``st_nlink == 1`` is part of that rule only for the artifacts these functions *append to*: a hard
 link is a second name for an inode a writer is about to mutate. It is deliberately not required of
-a content-addressed chunk, which nothing mutates and whose bytes the reader authenticates by
-hashing them -- requiring it there would fail every hardlink-deduplicated archive of a run
-directory.
+a content-addressed chunk, whose bytes nothing rewrites (adoption refreshes only its times; see
+:func:`write_verified_bytes_once`) and which the reader authenticates by re-hashing -- requiring
+it there would fail every hardlink-deduplicated archive of a run directory.
 
 These primitives were written for ``model-content.jsonl`` and live here because they were never
 about that artifact. ``model_calls.jsonl`` is the second append-only sidecar in the same directory
@@ -237,7 +237,8 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
     """Create one write-once content-addressed file, or report that it could not be done.
 
     The write-once half: if ``path`` already holds a regular file **of exactly this length**,
-    nothing is written and the answer is ``True`` -- content addressing means a file of the right
+    no bytes are written, the accepted name's times are refreshed (adoption; the comment in the
+    body says why), and the answer is ``True`` -- content addressing means a file of the right
     name and the right size is almost certainly this content, and :func:`read_verified_bytes`
     re-hashes what it reads, so the remaining lie is caught at resolution. Anything else under that
     name is refused, and a refusal here is terminal for the caller's artifact: "already written",
@@ -283,7 +284,32 @@ def write_verified_bytes_once(path: Path, data: bytes) -> bool:
             # than deferring it to whoever next runs a validator, and costs the archive case
             # nothing. Equal size is not proof -- the reader still hashes -- but it is the only
             # cheap evidence available before the bytes are read.
-            return stat.S_ISREG(existing.st_mode) and existing.st_size == len(data)
+            if not (stat.S_ISREG(existing.st_mode) and existing.st_size == len(data)):
+                return False
+            # Adoption leaves a timestamp. Accepting an existing name is the one write-path event
+            # age-based collection cannot otherwise see: a chunk orphaned by a crashed activation
+            # and re-derived by a resumed one is referenced from *now* with an mtime from days
+            # ago, indistinguishable from the garbage ``monoid gc --min-age-s`` deletes.
+            # Refreshing the times (never the bytes) on the accepted name is what makes that age
+            # gate a protocol about recent use rather than a guess about fresh writes.
+            # Deliberately unlike the conformance runner's ``_publish_content_addressed``, whose
+            # exists-hit reuse is pinned mtime-stable (``tests/conformance/
+            # test_runner_publication.py``): no collector sweeps the evidence directory, so
+            # stability is the useful property there. On a multiply-linked chunk the shared
+            # inode's times move too, which an incremental archiver may answer with one redundant
+            # re-copy -- that costs a copy, not correctness. By name, not by
+            # ``follow_symlinks=False`` or a descriptor: Windows CPython supports neither for
+            # ``utime`` (measured -- ``os.utime`` is in neither ``os.supports_follow_symlinks``
+            # nor ``os.supports_fd`` on 3.11), and the ``lstat`` above already proved the name a
+            # regular file. What remains is a same-instant swap redirecting a *time* touch -- no
+            # bytes move -- a strictly weaker residual than the unlink-after-glob the recorder's
+            # own temp sweep documents and accepts. Best-effort, because the chunk IS stored and
+            # ``True`` is the honest answer whether or not the touch landed.
+            try:
+                os.utime(path)
+            except OSError:
+                pass
+            return True
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
         flags = (
