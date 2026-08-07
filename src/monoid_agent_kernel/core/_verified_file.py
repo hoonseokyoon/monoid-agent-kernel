@@ -237,7 +237,11 @@ def read_verified_bytes(path: Path, *, max_bytes: int) -> bytes | None:
 # The temporary-name shape ``write_verified_bytes_once`` mints, matched where it is minted. The
 # pid segment is matched, never trusted: pids are reused, so it identifies a writer's *naming*
 # and nothing about its liveness -- freshness is the caller's own filter.
-_WRITE_ONCE_TEMP_NAME = re.compile(r"(.+)\.\d+\.[0-9a-f]{12}\.tmp")
+#
+# ``[0-9]`` rather than ``\d``, which in a Python regex accepts every Unicode decimal digit: an
+# Arabic-Indic pid matched a shape ``os.getpid()`` cannot produce, and matching here is a licence
+# to delete.
+_WRITE_ONCE_TEMP_NAME = re.compile(r"(.+)\.[0-9]+\.[0-9a-f]{12}\.tmp")
 
 
 def write_once_temp_stem(name: str) -> str | None:

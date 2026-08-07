@@ -12,13 +12,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+from monoid_agent_kernel import cli as cli_module
 from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core import schemas
+from monoid_agent_kernel.core import _verified_file
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._verified_file import write_once_temp_stem
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
@@ -152,11 +155,45 @@ def test_the_temp_name_predicate_matches_exactly_what_the_writer_creates() -> No
         f"{sha}.{os.getpid()}.{'A' * 12}.tmp",
         f"{sha}..{'a' * 12}.tmp",
         f"{sha}.pid.{'a' * 12}.tmp",
+        # A pid the writer cannot mint: ``\d`` in a Python regex accepts every Unicode decimal
+        # digit, so Arabic-Indic digits matched a shape no writer produces -- and a match here is
+        # a licence to delete.
+        f"{sha}.١٢٣.{'a' * 12}.tmp",
         f"{'a' * 12}.tmp",
         sha,
         "",
     ):
         assert write_once_temp_stem(near_miss) is None, near_miss
+
+
+def test_the_predicate_recognizes_a_temporary_the_writer_actually_minted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The predicate and the f-string that mints the shape are two sites, and every other test
+    hand-builds the name -- so a drift in the mint would leave both sweepers collecting nothing,
+    silently and forever, with the suite green. This one watches a real store hand its temporary
+    to ``os.replace`` and asks the predicate about *that* name."""
+    minted: list[str] = []
+    real_replace = os.replace
+
+    def watching(src, dst, *args, **kwargs):
+        minted.append(os.path.basename(os.fspath(src)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    preimage, digest, sha = _offloadable()
+    recorder = _recorder(tmp_path)
+    monkeypatch.setattr(_verified_file.os, "replace", watching)
+    recorder.record_settled_call(
+        SettledModelCall(
+            receipt=ModelCallReceipt(request_digest=digest, digest_generation=_GENERATION),
+            request_preimage=preimage,
+            turn=ModelTurn(response_id="r", final_text="answer"),
+        )
+    )
+    recorder.close()
+
+    assert minted, "no chunk was stored; this bind would be vacuous"
+    assert [write_once_temp_stem(name) for name in minted] == [sha]
 
 
 # --- Binding the keep-set to the validator's resolution -------------------------------------------
@@ -413,6 +450,9 @@ def test_foreign_entries_are_never_touched(tmp_path: Path) -> None:
         entry = _entry(report, name)
         assert entry.classification == "foreign" and entry.deleted is False, name
         (chunk_dir / name).lstat()  # still present, whatever it is
+    # And they are not counted as reclaimable either: the counter answers "what would --apply
+    # remove", so anything it names must be something --apply is allowed to remove.
+    assert report.candidate_bytes == 0
 
 
 def test_chunks_referenced_only_by_damaged_lines_are_collectable_and_the_lines_are_named(
@@ -696,6 +736,153 @@ def test_a_redirected_chunk_directory_is_refused_untouched(tmp_path: Path) -> No
     assert (outside / ("2" * 64)).read_bytes() == b"theirs"
 
 
+def test_a_reparse_point_wearing_the_chunk_directorys_name_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A junction needs no privilege to create and `lstat`s as an ordinary directory -- only the
+    reparse tag tells it apart. That distinction is the whole gate now that a *deleter* stands
+    behind it, and a symlink cannot pin it (a symlink fails the directory test anyway, and this
+    platform will not create one without privilege), so the tag is faked here the way
+    `test_model_content.py` fakes one."""
+    run_dir, sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    orphan = chunk_dir / ("1" * 64)
+    orphan.write_bytes(b"x" * 32)
+    _backdate(orphan)
+
+    class DirectoryReparseMetadata:
+        st_mode = stat.S_IFDIR
+        st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+        st_size = 0
+        st_mtime = 0.0
+
+    real_lstat = Path.lstat
+
+    def lying_about_the_chunk_dir(self: Path, *args: object, **kwargs: object):
+        if self == chunk_dir:
+            return DirectoryReparseMetadata()
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lying_about_the_chunk_dir)
+
+    report = collect_payload_garbage(run_dir, min_age_s=0.0, apply=True)
+
+    assert report.chunk_dir_state == "unsafe"
+    assert report.entries == ()
+    assert orphan.exists()
+    assert (chunk_dir / sha).exists()
+
+
+def test_a_chunk_directory_swapped_mid_pass_stops_the_deletions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety gate runs once, and every deletion afterwards re-resolves the directory by
+    *pathname* -- so a redirection planted after the scan would aim the rest of the pass at a
+    directory of the planter's choosing, and a name that is garbage here is a referenced chunk
+    over there (tool-definition chunks are byte-identical across runs). Each deletion therefore
+    re-proves it is standing in the same directory the gate approved."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    for name in ("a" * 64, "b" * 64):
+        target = chunk_dir / name
+        target.write_bytes(b"x" * 16)
+        _backdate(target)
+    decoy_home = tmp_path / "decoy"
+    decoy_home.mkdir()
+    decoy = decoy_home / ("b" * 64)
+    decoy.write_bytes(b"someone else's referenced chunk")
+    _backdate(decoy)
+    real_unlink = os.unlink
+
+    def swap_after_the_first(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if chunk_dir.exists():
+            chunk_dir.rename(run_dir / "moved-away")
+            decoy_home.rename(chunk_dir)
+        return result
+
+    monkeypatch.setattr(os, "unlink", swap_after_the_first)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    withheld = _entry(report, "b" * 64)
+    assert withheld.deleted is False and withheld.error != ""
+    assert (chunk_dir / ("b" * 64)).read_bytes() == b"someone else's referenced chunk"
+
+
+def test_a_candidate_refreshed_between_the_scan_and_the_unlink_is_withheld(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting on the strength of a stat taken minutes ago is deleting on stale evidence: the
+    scan's age is what nominates a candidate, and between then and the unlink a writer may have
+    adopted the very file (adoption refreshes times). The re-check is what turns the age gate
+    from a claim about the past into one about the instant of deletion."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    fresh_orphan = chunk_dir / ("a" * 64)
+    fresh_orphan.write_bytes(b"x" * 16)  # genuinely young: never backdated
+
+    class StaleMetadata:
+        def __init__(self, real: os.stat_result) -> None:
+            self.st_mode = real.st_mode
+            self.st_size = real.st_size
+            self.st_mtime = 0.0  # the scan claims 1970; the file on disk is seconds old
+
+    class StaleEntry:
+        def __init__(self, entry: os.DirEntry) -> None:
+            self.name = entry.name
+            self._metadata = StaleMetadata(entry.stat(follow_symlinks=False))
+
+        def stat(self, *, follow_symlinks: bool = True) -> object:
+            return self._metadata
+
+    class StaleListing:
+        def __init__(self, entries: list[StaleEntry]) -> None:
+            self._entries = entries
+
+        def __enter__(self):
+            return iter(self._entries)
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    real_scandir = os.scandir
+
+    def stale_scandir(path):
+        with real_scandir(path) as listing:
+            return StaleListing([StaleEntry(entry) for entry in listing])
+
+    monkeypatch.setattr(os, "scandir", stale_scandir)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    entry = _entry(report, "a" * 64)
+    assert entry.classification == "orphan"
+    assert entry.deleted is False and entry.error != ""
+    assert fresh_orphan.exists()
+    assert report.reclaimed_bytes == 0
+
+
+def test_an_unusable_age_gate_is_refused_before_the_directory_is_read(tmp_path: Path) -> None:
+    """The gate is the collector's only safety belt, so a value that cannot act as one is refused
+    rather than interpreted. Infinity spares everything and then breaks the JSON report it is
+    stamped into; not-a-number makes every comparison false, so `--apply` becomes a silent no-op;
+    a negative gate deletes entries the collector's own docstring promises are protected --
+    future-dated files, and a candidate freshened between the scan and the unlink. Refusal comes
+    first, so nothing is read and nothing is swept."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 64)
+    _backdate(orphan)
+
+    for unusable in (float("inf"), float("-inf"), float("nan"), -1.0):
+        with pytest.raises(ValueError):
+            collect_payload_garbage(run_dir, min_age_s=unusable, apply=True)
+        assert orphan.exists()
+
+    assert collect_payload_garbage(run_dir, min_age_s=0.0, apply=False).chunk_dir_state == "ok"
+
+
 # --- The CLI verb ---------------------------------------------------------------------------------
 
 
@@ -776,3 +963,117 @@ def test_gc_on_a_missing_run_dir_is_a_click_error(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "Error" in result.output
+
+
+def test_gc_refuses_an_unusable_age_gate_without_sweeping_or_crashing(tmp_path: Path) -> None:
+    """The option layer is where an unusable gate has to stop. Reaching the collector with one
+    would sweep first and only then destroy its own report -- `json.dumps` refuses a non-finite
+    number, so `--apply --json --min-age-s -inf` deleted everything of every age and then printed
+    a traceback instead of the record of what it deleted."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 64)
+    _backdate(orphan)
+
+    for unusable in ("inf", "-inf", "nan", "-1"):
+        result = CliRunner().invoke(
+            main, ["gc", str(run_dir), "--apply", "--json", "--min-age-s", unusable]
+        )
+        assert result.exit_code == 2, (unusable, result.output)
+        assert "Traceback" not in result.output
+        assert orphan.exists(), unusable
+
+
+def test_the_json_report_survives_a_name_it_cannot_encode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Foreign names are whoever-wrote-them's strings, and a filesystem can hand back one no
+    UTF-8 stream will accept -- a lone surrogate, which `os.scandir` produces for undecodable
+    bytes on POSIX and which NTFS permits outright. The text mode was built for exactly this
+    (`!r`); its machine-readable twin was not, and emitted a document that either failed to
+    write or silently renamed the file it was reporting. Under `--apply` the deletions have
+    already happened by then, so the record of them is what is lost."""
+    hostile = "chunk-\udce9-name"
+    report = PayloadGcReport(
+        run_dir=str(tmp_path),
+        chunk_dir_state="ok",
+        corpus_state="ok",
+        applied=False,
+        min_age_s=_DAY_S,
+        entries=(
+            PayloadGcEntry(
+                name=hostile,
+                classification="foreign",
+                size=1,
+                age_s=1.0,
+                deleted=False,
+                error="",
+            ),
+        ),
+        damaged_lines=(),
+        candidate_bytes=0,
+        reclaimed_bytes=0,
+    )
+    monkeypatch.setattr(cli_module, "collect_payload_garbage", lambda *a, **k: report)
+    (tmp_path / MODEL_PAYLOADS_FILENAME).write_text("", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["gc", str(tmp_path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    result.output.encode("utf-8")  # a strict stream is the default for a piped report
+    assert json.loads(result.output)["entries"][0]["name"] == hostile
+
+
+def test_gc_exit_is_nonzero_when_the_chunk_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One disjunct of the failure predicate per test: a refused directory reports no entries at
+    all, so no other disjunct can carry it."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+
+    class DirectoryReparseMetadata:
+        st_mode = stat.S_IFDIR
+        st_reparse_tag = 0xA0000003
+        st_size = 0
+        st_mtime = 0.0
+
+    real_lstat = Path.lstat
+
+    def lying_about_the_chunk_dir(self: Path, *args: object, **kwargs: object):
+        if self == chunk_dir:
+            return DirectoryReparseMetadata()
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lying_about_the_chunk_dir)
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir), "--apply", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.output)["chunk_dir_state"] == "unsafe"
+
+
+def test_gc_exit_is_nonzero_when_a_deletion_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other disjunct: the sweep finished, but something it was asked to remove is still
+    there, and a scripted sweep that read exit 0 would never come back for it."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    stuck = run_dir / MODEL_PAYLOADS_DIRNAME / ("5" * 64)
+    stuck.write_bytes(b"x" * 32)
+    _backdate(stuck)
+    real_unlink = os.unlink
+
+    def refusing(path, *args, **kwargs):
+        if os.path.basename(os.fspath(path)) == "5" * 64:
+            raise PermissionError(13, "held open elsewhere")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refusing)
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir), "--apply", "--json"])
+
+    assert result.exit_code == 1, result.output
+    entries = {entry["name"]: entry for entry in json.loads(result.output)["entries"]}
+    assert entries["5" * 64]["deleted"] is False and entries["5" * 64]["error"]
+    assert stuck.exists()

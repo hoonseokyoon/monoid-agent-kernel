@@ -763,7 +763,13 @@ def gc_command(
     if not run_dir.is_dir():
         # A typo'd run id must fail loudly, not come back as a clean empty report.
         raise click.ClickException(f"run directory not found: {run_dir}")
-    report = collect_payload_garbage(run_dir, min_age_s=min_age_s, apply=apply_deletes)
+    try:
+        report = collect_payload_garbage(run_dir, min_age_s=min_age_s, apply=apply_deletes)
+    except ValueError as exc:
+        # Click's FLOAT accepts "inf" and "nan", and a negative gate parses fine, so the option
+        # layer cannot refuse these on type alone. Refusing here -- before any output -- keeps a
+        # bad flag from sweeping first and only then failing to report what it swept.
+        raise click.BadParameter(str(exc), param_hint="--min-age-s") from exc
     # A refusal or a failed deletion exits non-zero so scripted sweeps notice -- via ctx.exit
     # after the payload, never ClickException, whose Error line would land in the same stream
     # and corrupt --json output (the builder validate precedent). Garbage merely *found* is
@@ -774,9 +780,16 @@ def gc_command(
         or any(entry.error for entry in report.entries)
     )
     if json_output:
+        # ``ensure_ascii=True`` here, unlike every other payload this module prints: those carry
+        # values the kernel produced, this one carries directory entry names, which a filesystem
+        # may hand back with unpaired surrogates (POSIX surrogateescape for undecodable bytes,
+        # NTFS by permission). Emitted verbatim, such a name either fails to write to a strict
+        # UTF-8 stream -- the default for the piped consumer this mode exists for -- or gets
+        # substituted, silently renaming the file being reported. The text mode's ``!r`` is the
+        # same rule; this is its twin.
         click.echo(
             json.dumps(
-                dataclasses.asdict(report), ensure_ascii=False, sort_keys=True, allow_nan=False
+                dataclasses.asdict(report), ensure_ascii=True, sort_keys=True, allow_nan=False
             )
         )
     else:

@@ -35,6 +35,7 @@ names come from ``os.scandir``, and the keep-set is only ever tested for members
 
 from __future__ import annotations
 
+import math
 import os
 import stat
 import time
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core._verified_file import (
+    file_identity,
     open_verified_regular_fd,
     verified_directory_is_safe,
     write_once_temp_stem,
@@ -180,9 +182,19 @@ def collect_payload_garbage(
     entry is loud precisely because it usually means the concurrency contract is being tested.
 
     ``now`` is injectable so tests own the clock. Ages are ``now - st_mtime``; a file dated in
-    the future is younger than any gate, which is the protective direction.
+    the future is younger than any non-negative gate, which is the protective direction.
+
+    ``min_age_s`` must be finite and non-negative, and a value that is not is refused here --
+    before anything is read, so a refusal can never follow a sweep. The gate is the only safety
+    belt this function has, and each unusable value breaks it a different way: infinity spares
+    everything and then cannot be reported (``json.dumps`` refuses non-finite numbers), a NaN
+    makes every comparison false so an applied pass becomes a silent no-op, and a negative gate
+    deletes exactly what the belt exists to protect -- future-dated entries, and a candidate
+    freshened between the scan and the unlink.
     """
 
+    if not math.isfinite(min_age_s) or min_age_s < 0:
+        raise ValueError("min_age_s must be a finite, non-negative number of seconds")
     moment = time.time() if now is None else now
     corpus_state, records, damaged = _corpus_records(run_dir / MODEL_PAYLOADS_FILENAME)
 
@@ -206,7 +218,7 @@ def collect_payload_garbage(
 
     chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
     try:
-        chunk_dir.lstat()
+        approved = chunk_dir.lstat()
     except FileNotFoundError:
         return report("absent")
     except OSError:
@@ -216,6 +228,12 @@ def collect_payload_garbage(
         # deletion through a redirection are operations in a directory of somebody else's
         # choosing. Nothing is listed, nothing is touched.
         return report("unsafe")
+    # Which directory the gate approved, so every unlink can re-prove it is standing in that one.
+    # A gate that runs once governs a pathname, and each deletion re-resolves that pathname: a
+    # redirection planted after the scan would aim the rest of the pass elsewhere, and elsewhere
+    # a name that is garbage here can be a referenced chunk (tool-definition chunks are
+    # byte-identical across runs, so one run's orphan sha is another run's live one).
+    approved_directory = file_identity(approved)
 
     snapshot: list[tuple[str, os.stat_result | None]] = []
     try:
@@ -247,7 +265,9 @@ def collect_payload_garbage(
                 target = chunk_dir / name
                 try:
                     current = target.lstat()
-                    if not stat.S_ISREG(current.st_mode) or (
+                    if file_identity(chunk_dir.lstat()) != approved_directory:
+                        error = "chunk directory changed since the scan; left in place"
+                    elif not stat.S_ISREG(current.st_mode) or (
                         moment - current.st_mtime
                     ) < min_age_s:
                         error = "changed since the scan; left in place"
