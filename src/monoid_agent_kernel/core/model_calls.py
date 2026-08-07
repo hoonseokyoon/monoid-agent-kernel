@@ -23,7 +23,7 @@ it entirely: a per-process HMAC written to a file that survives a restart splits
 naming one destination with two digests and reading as a deployment change that never happened.
 ``destination_status`` carries the diagnosis, which is the part an auditor actually asks for.
 
-Deliberately **not** shared with ``model_call._model_identity``. Both are hand-listed projections
+Deliberately **not** shared with ``providers._request_identity._model_identity``. Both are hand-listed projections
 of ``ModelConfig`` and they answer different questions -- that one says what the provider was
 asked for, this one says what the call was. Sharing the function would mean that adding a field
 for the ledger's sake rekeys every recorded replay key, which is the exact defect W6-0 closed.

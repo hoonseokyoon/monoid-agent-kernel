@@ -248,11 +248,14 @@ def test_a_recorded_request_never_carries_the_endpoint_it_is_keyed_beside() -> N
 
 def test_the_digest_encoder_and_the_chunk_encoder_are_the_same_object() -> None:
     """Two instances with equal settings are a resemblance, not a binding; the corpus's
-    self-verification rests on the chunk bytes being what the digest hashed."""
-    from monoid_agent_kernel import model_call
-    from monoid_agent_kernel.core import _util, model_payloads
+    self-verification rests on the chunk bytes being what the digest hashed.
 
-    assert model_call.CANONICAL_JSON_ENCODER is _util.CANONICAL_JSON_ENCODER
+    The digest side is ``providers/_request_identity`` since W6-4b moved the key derivation
+    there (the pin moved with it -- same claim, digest's current home)."""
+    from monoid_agent_kernel.core import _util, model_payloads
+    from monoid_agent_kernel.providers import _request_identity
+
+    assert _request_identity.CANONICAL_JSON_ENCODER is _util.CANONICAL_JSON_ENCODER
     assert model_payloads.CANONICAL_JSON_ENCODER is _util.CANONICAL_JSON_ENCODER
 
 

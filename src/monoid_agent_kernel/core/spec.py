@@ -202,7 +202,7 @@ class GenerationConfig:
         ``generation`` key — changing the runtime-config semantic hash that durable recovery
         compares across restarts, and the gateway wire, while changing nothing either of them is
         about. Two gates read this property now: ``ModelConfig.to_json`` above, and the replay
-        key's own projection (``model_call._model_identity``), which restates the omission rather
+        key's own projection (``providers._request_identity._model_identity``), which restates the omission rather
         than inheriting it.
         """
 
@@ -378,7 +378,7 @@ class ModelConfig:
         # runtime-config semantic hash (durable recovery compares it across versions), so a
         # never-configured block must serialize byte-identically to a config that predates the
         # field. The replay key holds the same rule for the same reason but no longer through
-        # here -- W6-0 gave it a hand-listed projection (`model_call._model_identity`), so this
+        # here -- W6-0 gave it a hand-listed projection (`providers._request_identity._model_identity`), so this
         # serializer stopped being a co-author of every recorded key.
         if not self.generation.is_default:
             payload["generation"] = self.generation.to_json()
