@@ -255,6 +255,23 @@ class ReplayCorpus:
                 )
             self._cursors[digest] = cursor + 1
             entry = queue[cursor]
+        body = self._entry_body(entry)
+        if isinstance(body, ReplayMissReason):
+            return body
+        return ReplayedResponse(
+            body=body,
+            call_index=entry.call_index,
+            recorded_at=entry.recorded_at,
+            run_id=entry.run_id,
+        )
+
+    def _entry_body(self, entry: _ResponseEntry) -> dict[str, Any] | ReplayMissReason:
+        """One entry's answer body, materialized and verified -- or the refusal it earns.
+
+        Shared by :meth:`consume` and the cursor-free evidence view, so "what does this
+        record actually say" has one answer however it is asked.
+        """
+
         if entry.unrecorded_reason:
             return ReplayMissReason(
                 MISS_NOT_RECORDED,
@@ -287,12 +304,36 @@ class ReplayCorpus:
                 f"the recorded answer is not an object; run {entry.run_id} "
                 f"call_index {entry.call_index}",
             )
-        return ReplayedResponse(
-            body=body,
-            call_index=entry.call_index,
-            recorded_at=entry.recorded_at,
-            run_id=entry.run_id,
+        return body
+
+    # --- cursor-free evidence views ----------------------------------------------------------
+
+    def request_terms_view(self) -> tuple[Mapping[str, Any], ...]:
+        """The reassembled terms of every readable request record, in index order.
+
+        For derivation-time evidence scans (the replay adapter's impersonation rules read
+        recorded messages, not record lines -- any term at marker size is a chunk, P4).
+        Reads nothing consumable: cursors are untouched.
+        """
+
+        return tuple(
+            terms for digest in self._requests if (terms := self._request_terms(digest)) is not None
         )
+
+    def response_bodies_view(self) -> tuple[Mapping[str, Any], ...]:
+        """Every materializable answer body, in file order, cursors untouched.
+
+        Unrecorded and unresolvable entries are simply absent from the view: an evidence
+        scan asks what the corpus can say, and a record that cannot testify says nothing.
+        """
+
+        bodies: list[Mapping[str, Any]] = []
+        for queue in self._responses.values():
+            for entry in queue:
+                body = self._entry_body(entry)
+                if not isinstance(body, ReplayMissReason):
+                    bodies.append(body)
+        return tuple(bodies)
 
     def _absent_locked(self, digest: str, generation: str) -> ReplayMissReason:
         if digest in self._requests:
@@ -401,17 +442,28 @@ class ReplayCorpus:
         suffix = f" ({len(profiles)} recorded identities)" if len(profiles) > 1 else ""
         return "; ".join(clauses) + suffix
 
-    def diagnose(self, payload: Mapping[str, Any], *, generation: str) -> ReplayMissReason:
-        """Refine an ``absent`` miss: generation first, identity second, then term-by-term.
+    def diagnose(
+        self, payload: Mapping[str, Any], *, generation: str, digest: str | None = None
+    ) -> ReplayMissReason:
+        """Refine an ``absent`` miss: the failed-call shape first, then generation, identity,
+        and term-by-term.
 
         ``payload`` is the live, generation-wrapped identity payload the lookup hashed --
         handed in rather than rebuilt so the diagnosis and the key derive from one
-        composition. The order is the frequency order the design predicts: a wholesale
-        generation change misses everything, a config divergence (the runtime config authors
-        the key's model identity) misses everything under one name, and only then is it worth
-        naming individual prompt terms.
+        composition. ``digest`` (when the caller has one) lets the request-known-answer-absent
+        shape (P6) keep its own sentence: comparing that request against itself would
+        otherwise "diagnose" zero diverging terms and say nothing useful. The rest is the
+        frequency order the design predicts: a wholesale generation change misses everything,
+        a config divergence (the runtime config authors the key's model identity) misses
+        everything under one name, and only then is it worth naming individual prompt terms.
         """
 
+        if digest is not None and digest in self._requests and not self._responses.get(digest):
+            return ReplayMissReason(
+                MISS_ABSENT,
+                "a request record exists under this key but no answer was recorded "
+                "(the original call failed, or its activation ended before answering)",
+            )
         mismatch = self._generation_mismatch(generation)
         if mismatch is not None:
             return mismatch
