@@ -42,6 +42,7 @@ from monoid_agent_kernel.core.spec import (
     ReasoningConfig,
 )
 from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.providers import _request_identity
 from monoid_agent_kernel.providers._request_identity import (
     _PROMPT_DIGEST_GENERATION,
     _REQUEST_DIGEST_GENERATION,
@@ -145,7 +146,9 @@ def test_the_projection_carries_no_transport_terms() -> None:
     (
         pytest.param(ModelConfig(model="gpt-5.5-mini"), id="model"),
         pytest.param(ModelConfig(reasoning=ReasoningConfig(effort="high")), id="reasoning.effort"),
-        pytest.param(ModelConfig(reasoning=ReasoningConfig(summary="auto")), id="reasoning.summary"),
+        pytest.param(
+            ModelConfig(reasoning=ReasoningConfig(summary="auto")), id="reasoning.summary"
+        ),
         pytest.param(
             ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit")),
             id="reasoning.on_unsupported",
@@ -399,9 +402,7 @@ def test_replay_lookup_reproduces_the_runner_stamp(
     normalization, a second declaration read, a re-derived projection -- lands here first.
     """
 
-    request = ModelRequest(
-        instruction="hi", system_prompt="sys", tools=(), model=request_model
-    )
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=request_model)
     _turn, receipt = asyncio.run(ModelCallRunner(adapter=adapter).acall(request))
     assert receipt.digest_status == "ok"
 
@@ -433,9 +434,7 @@ def test_the_lookup_reads_the_declaration_once() -> None:
             return "openai"
 
     adapter = _OneAnswer()
-    lookup = replay_lookup(
-        ModelRequest(instruction="hi", system_prompt="sys", tools=()), adapter
-    )
+    lookup = replay_lookup(ModelRequest(instruction="hi", system_prompt="sys", tools=()), adapter)
 
     assert adapter.reads == 1
     assert lookup.result.status == "ok"
@@ -443,12 +442,27 @@ def test_the_lookup_reads_the_declaration_once() -> None:
 
 
 def test_model_call_reexports_the_same_objects() -> None:
-    """`model_call` re-imports these names; identity is what rules out a quiet mirror."""
+    """`model_call` re-imports these names; identity is what rules out a quiet mirror.
 
-    assert model_call._request_payload is _request_payload
-    assert model_call._digest is _digest
-    assert model_call._prompt_payload is _prompt_payload
-    assert model_call._REQUEST_DIGEST_GENERATION is _REQUEST_DIGEST_GENERATION
+    The list is *derived* from the import statement, not written out here. A hand-listed
+    census covers the names its author was thinking about, which is how the shape this test
+    exists to catch survives inside the test itself: the first version named four of the nine
+    and left `_model_identity` -- which two other suites still reach through the old home --
+    free to regrow as a copy that every one of those suites would then be testing instead.
+    """
+
+    tree = ast.parse(inspect.getsource(model_call))
+    reexported = sorted(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "monoid_agent_kernel.providers._request_identity"
+        for alias in node.names
+    )
+
+    assert reexported, "the re-export block moved; this census now covers nothing"
+    for name in reexported:
+        assert getattr(model_call, name) is getattr(_request_identity, name), name
 
 
 def test_the_runner_delegates_effective_model_resolution() -> None:
