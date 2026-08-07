@@ -46,6 +46,7 @@ to say not deterministically. Same family as the spawn-observation limit in ``do
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -187,7 +188,7 @@ class ReplayCorpus:
         """
 
         corpus = cls()
-        indexed: set[VerifiedFileIdentity] = set()
+        indexed: set[VerifiedFileIdentity | str] = set()
         for run_dir in run_dirs:
             run_dir = Path(run_dir)
             path = run_dir / MODEL_PAYLOADS_FILENAME
@@ -199,7 +200,7 @@ class ReplayCorpus:
             # own offloaded bytes. Only the *records* are at risk of being counted twice.
             corpus._chunk_dirs.append(run_dir / MODEL_PAYLOADS_DIRNAME)
             identity = corpus._corpus_identity(path)
-            if identity is not None and identity in indexed:
+            if identity in indexed:
                 # One directory named twice -- as an id and as a path, through a link, or
                 # simply repeated -- is one source. Indexing it again would append every
                 # answer to its queue a second time, and "each answer once" would quietly
@@ -207,36 +208,47 @@ class ReplayCorpus:
                 # ``exhausted`` gets a stale recorded body instead.
                 corpus._repeated_sources += 1
                 continue
-            if identity is not None:
-                indexed.add(identity)
+            indexed.add(identity)
             corpus._damaged += len(damaged)
             for record in records:
                 corpus._index(record)
         return corpus
 
     @staticmethod
-    def _corpus_identity(path: Path) -> VerifiedFileIdentity | None:
-        """The device/inode pair naming this corpus file, or ``None`` when it cannot be named.
+    def _corpus_identity(path: Path) -> VerifiedFileIdentity | str:
+        """A hashable name for this corpus file: its device/inode pair where the platform
+        proves one, its resolved path where the platform does not.
 
-        Unnameable means "index it": the reader already accepted these bytes, and refusing to
-        index a readable source because its metadata is unavailable would lose answers rather
-        than duplicate them.
-
-        A zero inode is unnameable. ``payload_gc`` states the rule for this repo and enforces
+        A zero inode is not evidence. ``payload_gc`` states the rule for this repo and enforces
         it (``provable = bool(approved_directory.inode)``): an inode number is evidence only
         where the platform supplies one, and SMB shares, FAT/exFAT volumes and CPython's
-        Windows directory-attribute fallback all report ``0``. Without this gate two *distinct*
-        corpora that both report ``(0, 0)`` compare equal, so every source after the first is
+        Windows directory-attribute fallback all report ``0``. Two *distinct* corpora that both
+        report ``(0, 0)`` compare equal, so without a gate every source after the first is
         discarded as a repeat -- and on the family union, which ``docs/CLI.md`` documents as
         the required shape for a spawning run, that silently drops the child's answers and
         tells the operator they made a spelling mistake they did not make.
+
+        But falling back to *no* identity only closes that half. The other half is one
+        directory named twice on such a volume, which ``load`` calls routine, and there an
+        absent identity re-opens the duplicate-indexing defect: every answer joins its queue
+        once per spelling, ``repeated_sources`` reads zero so the preflight stays quiet, and
+        the call that should have earned ``exhausted`` is handed a stale recording as a real
+        turn. A loud loss is a bad trade for a silent wrong answer.
+
+        The resolved, case-folded path is the identity that answers both: it distinguishes two
+        corpora and it collapses the spellings ``load`` enumerates -- an id, a path, a symlink,
+        a repeat. It does not collapse two hardlinks to one file, which the inode pair does;
+        that is the residue, and it costs an over-indexed source on exactly the volumes where
+        the loud failure is the one we are trading away from.
         """
 
         try:
             identity = file_identity(path.lstat())
         except OSError:
-            return None
-        return identity if identity.inode else None
+            identity = None
+        if identity is not None and identity.inode:
+            return identity
+        return os.path.normcase(os.path.realpath(path))
 
     def _index(self, record: Mapping[str, Any]) -> None:
         if record.get("schema_version") != MODEL_PAYLOADS_SCHEMA_VERSION:

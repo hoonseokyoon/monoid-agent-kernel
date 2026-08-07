@@ -888,3 +888,36 @@ def test_a_volume_without_inodes_does_not_collapse_the_union(
     assert corpus.response_count() == 2, "an unnameable source is indexed, not discarded"
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+
+
+def test_a_volume_without_inodes_still_knows_one_directory_named_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The twin of the test above, and the direction where being unable to name a file is
+    dangerous rather than merely unhelpful.
+
+    Refusing to *distinguish* two corpora loses answers loudly -- misses, a park, a warning.
+    Refusing to *recognise* one corpus named twice serves a stale recording as a real turn,
+    silently, and `repeated_sources` reads zero so the preflight says nothing either. Where the
+    platform proves no inode the identity has to fall back to something, and falling back to
+    nothing only closes the loud half.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    monkeypatch.setattr(
+        payload_replay,
+        "file_identity",
+        lambda metadata: payload_replay.VerifiedFileIdentity(device=0, inode=0),
+    )
+
+    corpus = ReplayCorpus.load([run_dir, run_dir.parent / "run-1"])
+
+    assert corpus.repeated_sources == 1, "one directory named twice is one source"
+    assert corpus.response_count() == 1
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    exhausted = corpus.consume(digest, generation=_GEN)
+    assert isinstance(exhausted, ReplayMissReason)
+    assert exhausted.reason == MISS_EXHAUSTED, (
+        "the second call was answered from the corpus, so the one recording was indexed twice"
+    )
