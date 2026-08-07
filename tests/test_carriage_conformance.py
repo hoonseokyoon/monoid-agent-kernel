@@ -6589,6 +6589,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "loop_phases.py",
             "providers/gateway.py",
             "providers/openai.py",
+            # Joined in W6-4b: a replay miss is the client-side park shape by construction --
+            # ReplayMiss pins config_recoverable=True so a session survives a miss and only a
+            # closing one-shot facade promotes it, the same classification a provider 4xx gets.
+            "providers/replay.py",
             # Joined in the carriage sweep: status.json (the live sink) carries the same set
             # its offline twin projects.
             "recorder.py",
@@ -6638,6 +6642,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "providers/gateway.py",
             # Joined in the burn-down: the classifier reports the retries its own SDK made.
             "providers/openai.py",
+            # Joined in W6-4b: the replay adapter reconstructs the flag the corpus recorded
+            # (see core/model_payloads.py above) back onto the replayed ModelTurn -- dropping
+            # it here would replay a retried call as a clean one, the exact lie W6-2 recorded
+            # the field to prevent.
+            "providers/replay.py",
             "recorder.py",
             # Joined in the carriage sweep: the backend record carries all five park facts
             # (type, protocol, event capture, the driver's promotion, and the projections
