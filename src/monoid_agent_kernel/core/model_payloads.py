@@ -482,69 +482,79 @@ def _no_resolution(sha256: str) -> bytes:
     raise LookupError(f"a refs=False payload resolves no chunks (asked for {sha256})")
 
 
-RECORDED_TURN_FIELDS = (
-    "response_id",
-    "final_text",
-    "tool_calls",
-    "reasoning",
-    "usage",
-    "stop_reason",
-    "provider_retried",
-)
-"""Every field a recorded answer carries, declared once beside the writer that emits them.
+class _Unencodable(Exception):
+    """A field the writer refuses to record; see :func:`response_record_body`."""
 
-The reader needs the same list to tell a recorded turn from any other object that happens to
-be a JSON dict: without it, a corrupt or foreign body reconstructs into an *empty* turn, which
-the loop then rejects as a model error and blames on a model it never called.
-``response_record_body`` asserts it builds exactly these, so the two stay one list.
+
+def _recorded_tool_calls(turn: Any) -> list[dict[str, Any]]:
+    """The settled tool calls, or the refusal the whole body earns.
+
+    A call that does not carry the ``id``/``name``/``arguments`` triple -- the legacy
+    preserved-beside-a-settled-answer shape -- makes the response ``unencodable`` rather than a
+    bounded repr: the capture surface may describe such an entry, but a replay corpus that
+    recorded a description would replay a fabricated call.
+    """
+
+    calls = []
+    for call in getattr(turn, "tool_calls", ()) or ():
+        call_id = getattr(call, "id", None)
+        name = getattr(call, "name", None)
+        arguments = getattr(call, "arguments", None)
+        if (
+            not isinstance(call_id, str)
+            or not isinstance(name, str)
+            or not isinstance(arguments, dict)
+        ):
+            raise _Unencodable(name if isinstance(name, str) else "tool_calls")
+        calls.append({"id": call_id, "name": name, "arguments": arguments})
+    return calls
+
+
+_RECORDED_TURN_PROJECTIONS: tuple[tuple[str, Any], ...] = (
+    ("response_id", lambda turn: getattr(turn, "response_id", None)),
+    ("final_text", lambda turn: getattr(turn, "final_text", None)),
+    ("tool_calls", _recorded_tool_calls),
+    ("reasoning", lambda turn: list(getattr(turn, "reasoning", ()) or ())),
+    ("usage", lambda turn: dict(getattr(turn, "usage", {}) or {})),
+    ("stop_reason", lambda turn: getattr(turn, "stop_reason", None)),
+    ("provider_retried", lambda turn: bool(getattr(turn, "provider_retried", False))),
+)
+"""Every field a recorded answer carries, paired with how the writer projects it.
+
+The body and the field list are one declaration because two of them drift, and drift here has
+no loud failure available to it. A guard that raises is swallowed by the recorder's own
+``except Exception`` -- ``one unrecordable call must not cost the others`` -- at DEBUG, and the
+call then records a request with no answer at all: a corpus `monoid validate` calls clean,
+whose replay says ``absent``, "the original call failed", about a call that succeeded. A guard
+that asserts is erased by ``python -O`` and, inside the encoder's ``try``, reclassifies every
+answer as ``unencodable``. None of those exist if there is nothing to keep in step.
+"""
+
+RECORDED_TURN_FIELDS = tuple(name for name, _ in _RECORDED_TURN_PROJECTIONS)
+"""The field names alone, for the reader.
+
+The reader needs the same list to tell a recorded turn from any other object that happens to be
+a JSON dict: without it, a corrupt or foreign body reconstructs into an *empty* turn, which the
+loop then rejects as a model error and blames on a model it never called.
 """
 
 
 def response_record_body(turn: Any) -> RecordedResponse:
     """One settled turn as a record body, or the typed reason there is none.
 
-    The field list is declared here, once, and ``raw`` is not on it (module docstring). A tool
-    call that does not carry the ``id``/``name``/``arguments`` triple -- the legacy
-    preserved-beside-a-settled-answer shape -- makes the whole response ``unencodable`` rather
-    than a bounded repr: the capture surface may describe such an entry, but a replay corpus
-    that recorded a description would replay a fabricated call.
+    The body is built from ``_RECORDED_TURN_PROJECTIONS``, the same declaration
+    ``RECORDED_TURN_FIELDS`` is derived from, so the writer and the reader's field list cannot
+    disagree -- there is no second list to keep in step, and so no drift for the recorder's
+    ``except Exception`` to swallow. ``raw`` is not on it (module docstring).
     """
 
     try:
-        calls = []
-        for call in getattr(turn, "tool_calls", ()) or ():
-            call_id = getattr(call, "id", None)
-            name = getattr(call, "name", None)
-            arguments = getattr(call, "arguments", None)
-            if (
-                not isinstance(call_id, str)
-                or not isinstance(name, str)
-                or not isinstance(arguments, dict)
-            ):
-                return RecordedResponse(unrecorded_reason="unencodable")
-            calls.append({"id": call_id, "name": name, "arguments": arguments})
         value: dict[str, Any] = {
-            "response_id": getattr(turn, "response_id", None),
-            "final_text": getattr(turn, "final_text", None),
-            "tool_calls": calls,
-            "reasoning": list(getattr(turn, "reasoning", ()) or ()),
-            "usage": dict(getattr(turn, "usage", {}) or {}),
-            "stop_reason": getattr(turn, "stop_reason", None),
-            "provider_retried": bool(getattr(turn, "provider_retried", False)),
+            name: project(turn) for name, project in _RECORDED_TURN_PROJECTIONS
         }
         encoded = _encoded(value)
     except Exception:
         return RecordedResponse(unrecorded_reason="unencodable")
-    if set(value) != set(RECORDED_TURN_FIELDS):
-        # Outside the try, and a raise rather than an assert. Inside, an AssertionError is an
-        # Exception like any other and drift would silently reclassify every recorded answer
-        # as ``unencodable`` -- a corpus that records nothing, surfacing much later as a replay
-        # miss blaming the corpus. And `python -O` erases an assert, so the rule the reader
-        # depends on would simply not exist in an optimized deployment.
-        raise RuntimeError(
-            "the recorded-turn field list and the body this function builds have drifted: "
-            f"{sorted(set(value) ^ set(RECORDED_TURN_FIELDS))}"
-        )
     if len(encoded) > MAX_MODEL_PAYLOAD_BYTES:
         return RecordedResponse(unrecorded_reason="too_large")
     return RecordedResponse(value=value, encoded=encoded)

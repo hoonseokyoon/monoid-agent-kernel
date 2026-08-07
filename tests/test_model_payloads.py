@@ -13,7 +13,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import ANY
+from unittest.mock import ANY, patch
 
 import pytest
 from support.runtime import runtime_config, runtime_provider
@@ -983,14 +983,45 @@ def test_the_corpus_never_writes_a_line_its_own_schema_rejects(
 
 def test_the_recorded_turn_field_list_is_the_writer_s_own_key_set() -> None:
     """The reader tells a recorded turn from any other JSON object by this list, and the
-    writer builds its body from the same one. Two lists that agree today is exactly what the
-    constant exists to prevent -- and the writer's own check cannot be the only binding,
-    because a check that lives inside `except Exception` turns drift into a silent
-    `unencodable` and `python -O` erases an assert outright.
+    writer builds its body from the same one.
+
+    Not two lists checked against each other -- one declaration both are derived from. A guard
+    could not have held this: raised, the recorder's own `except Exception` swallows it at
+    DEBUG and the call records a request with no answer, which `monoid validate` calls clean
+    and replay diagnoses as `absent`, "the original call failed", about a call that succeeded.
+    Asserted, `python -O` erases it and the encoder's `try` turns drift into a silent
+    `unencodable`. So the binding is that there is nothing to keep in step: the field names and
+    the body's keys come from one tuple, in one order.
     """
 
     recorded = model_payloads.response_record_body(ModelTurn(final_text="x"))
 
     assert recorded.unrecorded_reason == ""
     assert recorded.value is not None
-    assert tuple(sorted(recorded.value)) == tuple(sorted(model_payloads.RECORDED_TURN_FIELDS))
+    assert tuple(recorded.value) == tuple(model_payloads.RECORDED_TURN_FIELDS)
+    assert tuple(model_payloads.RECORDED_TURN_FIELDS) == tuple(
+        name for name, _ in model_payloads._RECORDED_TURN_PROJECTIONS
+    ), "the reader's field list is derived from the writer's projections, not restated"
+    assert len(set(model_payloads.RECORDED_TURN_FIELDS)) == len(
+        model_payloads.RECORDED_TURN_FIELDS
+    ), "a repeated name would let one projection silently overwrite another"
+
+
+def test_drift_between_the_field_list_and_the_body_cannot_be_written() -> None:
+    """The structural claim, driven: adding a projection moves both sides at once.
+
+    The previous mechanism was a check, and every placement available to it lost. This asserts
+    the property the check was trying to buy -- that a new field reaches the reader's list and
+    the written body together -- so a future edit that re-splits them fails here rather than
+    silently recording nothing.
+    """
+
+    extended = model_payloads._RECORDED_TURN_PROJECTIONS + (("late_addition", lambda turn: 7),)
+    with patch.object(model_payloads, "_RECORDED_TURN_PROJECTIONS", extended):
+        recorded = model_payloads.response_record_body(ModelTurn(final_text="x"))
+        fields = tuple(name for name, _ in model_payloads._RECORDED_TURN_PROJECTIONS)
+
+    assert recorded.unrecorded_reason == "", "an added field must not make the answer unrecordable"
+    assert recorded.value is not None
+    assert recorded.value["late_addition"] == 7
+    assert tuple(recorded.value) == fields
