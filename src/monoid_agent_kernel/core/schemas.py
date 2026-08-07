@@ -25,10 +25,12 @@ from monoid_agent_kernel.core.model_payloads import (
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
-    PAYLOAD_CHUNK_REF_KEY,
+    RESPONSE_MALFORMED,
+    RESPONSE_REFERENCE,
     UNRECORDED_REASONS,
     is_chunk_sha256,
     reassemble_request_preimage,
+    response_reference,
 )
 from monoid_agent_kernel.core._verified_file import read_verified_bytes
 from monoid_agent_kernel.core.model_io import (
@@ -1821,14 +1823,22 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                     )
                 )
         elif kind == MODEL_RESPONSE_KIND:
-            response = payload.get("response")
-            if (
-                isinstance(response, dict)
-                and set(response.keys()) == {PAYLOAD_CHUNK_REF_KEY}
-                and isinstance(response.get(PAYLOAD_CHUNK_REF_KEY), str)
-            ):
+            # Through the shared trichotomy, not an inline shape test: the replay reader
+            # refuses through the same function, so the two consumers cannot disagree about
+            # which objects are references. The ``malformed`` arm is new strictness this
+            # gained from the share -- a single-key marker object carrying a non-sha value
+            # used to be skipped as data here while being unmistakably writer-shaped.
+            shape, sha = response_reference(payload.get("response"))
+            if shape == RESPONSE_MALFORMED:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        "response reference is not a content-addressed name",
+                    )
+                )
+            elif shape == RESPONSE_REFERENCE:
                 try:
-                    resolve(response[PAYLOAD_CHUNK_REF_KEY])
+                    resolve(sha)
                 except Exception:
                     issues.append(
                         ValidationIssue(

@@ -10,8 +10,14 @@ and no content" and the two files have different keys: the ledger is a sequence 
 call, ``call_index``), this corpus is mostly a set (one request record per digest, however many
 calls shared it).
 
-This module is pure. It splits, reassembles, and shapes records; the recorder owns every byte
-that reaches disk, so a run whose disk is full loses a record rather than an answer.
+This module is pure, with one deliberate exception. It splits, reassembles, and shapes records;
+the recorder owns every byte that reaches disk, so a run whose disk is full loses a record
+rather than an answer. The exception is :func:`read_corpus_records` -- the lenient,
+verified-descriptor line reader every corpus consumer whose conclusions carry authority shares
+(the collector deletes on its say-so, the replay reader substitutes it for paid calls). It lives
+here because a reader per consumer is the twin-drift shape this repo keeps paying for; the
+validator's loop stays its own on purpose, interleaved as it is with per-line schema reporting
+and pinned by the collector's spy test.
 
 **A request record is a recipe, not a copy, and the recipe is verified.** The bytes that matter
 are the exact bytes the replay key was hashed over. A record stores them as a payload tree whose
@@ -48,10 +54,14 @@ whole, never invent a partial identity.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
+from monoid_agent_kernel.core._verified_file import open_verified_regular_fd
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -145,6 +155,37 @@ def _is_marker(value: Any) -> bool:
     )
 
 
+RESPONSE_INLINE = "inline"
+RESPONSE_REFERENCE = "reference"
+RESPONSE_MALFORMED = "malformed"
+
+
+def response_reference(value: Any) -> tuple[str, str | None]:
+    """What a ``model_response``'s ``response`` field is: inline data, a reference, or a lie.
+
+    The trichotomy exists because its two consumers used to disagree at the third arm. A
+    single-key ``{PAYLOAD_CHUNK_REF_KEY: ...}`` object is unmistakably writer-shaped -- the
+    writer produces it in exactly one place and only with a ``sha256_bytes`` name -- so one
+    carrying anything else is corruption, not data. The validator's inline check called it a
+    reference whenever the value was a string (so ``"../../etc"`` was reported but ``123`` was
+    silently data), while :func:`_is_marker` called it data whenever the sha was malformed (so
+    reassembly would have embedded it verbatim). One function, one answer, both consumers: the
+    replay reader refuses to resolve a ``malformed`` reference (it never becomes a filename),
+    and the validator reports it as an integrity issue.
+
+    ``inline`` covers everything else, including ``None`` (an unrecorded body) and dicts that
+    merely contain the key among siblings -- those are ordinary payload data by the same
+    single-key rule :func:`_is_marker` applies inside request recipes.
+    """
+
+    if isinstance(value, dict) and len(value) == 1 and PAYLOAD_CHUNK_REF_KEY in value:
+        sha = value[PAYLOAD_CHUNK_REF_KEY]
+        if is_chunk_sha256(sha):
+            return RESPONSE_REFERENCE, sha
+        return RESPONSE_MALFORMED, None
+    return RESPONSE_INLINE, None
+
+
 def iter_chunk_references(value: Any) -> Iterator[str]:
     """Every chunk sha ``value`` could let a reader resolve, by the writer's own predicate.
 
@@ -191,6 +232,68 @@ def corpus_keep_set(records: Iterable[dict[str, Any]]) -> set[str]:
             if is_chunk_sha256(sha):
                 keep.add(sha)
     return keep
+
+
+def read_corpus_records(path: Path) -> tuple[str, list[dict[str, Any]], list[int]]:
+    """(state, parseable records, damaged line numbers) -- THE lenient corpus line reader.
+
+    Shared by every consumer whose conclusions carry authority: the collector deletes on what
+    this returns (it was ``payload_gc._corpus_records``, moved here whole), and the replay
+    reader substitutes recorded answers for paid provider calls on it. One function because a
+    reader per consumer is a twin that drifts; the validator's loop is the deliberate
+    exception (see the module docstring).
+
+    The read goes through the verified opener because of that authority: a corpus reached
+    through a planted link is not this run's corpus, and judging from it would turn the swap
+    into a purge -- or into somebody else's answers replayed as this run's. A hard link is
+    accepted (``require_single_link=False``) for the reason the chunk reader accepts one -- a
+    hardlink-deduplicated archive is still these bytes. The line loop mirrors
+    ``_validate_model_payload_digests`` exactly: blank lines skip silently, a line that fails
+    ingress parsing or is not an object is damaged, the rest count.
+    """
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return "absent", [], []
+    except OSError:
+        return "unreadable", [], []
+    descriptor = open_verified_regular_fd(path, os.O_RDONLY, require_single_link=False)
+    if descriptor is None:
+        return "unreadable", [], []
+    handle = None
+    try:
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None  # owned by ``handle`` from here
+        data = handle.read()
+    except (OSError, ValueError):
+        return "unreadable", [], []
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        elif descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    records: list[dict[str, Any]] = []
+    damaged: list[int] = []
+    for index, raw_line in enumerate(data.split(b"\n"), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            payload = loads_json_ingress(raw_line.decode("utf-8"))
+        except Exception:  # noqa: BLE001 - unparseable is a classification here, not a failure
+            damaged.append(index)
+            continue
+        if not isinstance(payload, dict):
+            damaged.append(index)
+            continue
+        records.append(payload)
+    return "ok", records, damaged
 
 
 def _encoded(value: Any) -> bytes:
