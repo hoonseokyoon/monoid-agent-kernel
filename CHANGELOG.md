@@ -26,7 +26,8 @@ out in commit messages and here.
   file lands before the corpus file's lazy create. Corpus lines no reader parses are named by
   number in the report, and what only they referenced is collected: those references are
   invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
-  failed deletions, zero for garbage merely found. Never run it beside a live writer of the same
+  failed deletions, zero for garbage merely found, and 2 — no report, nothing swept — for an
+  unusable `--min-age-s`. Never run it beside a live writer of the same
   run directory; liveness is the operator's knowledge, as with `monoid validate`.
 - **Adoption now leaves a timestamp.** A writer accepting a chunk file that already exists — a
   resumed run re-deriving what it already holds is the common case — takes the stored file

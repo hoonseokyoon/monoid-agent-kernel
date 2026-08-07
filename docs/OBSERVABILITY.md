@@ -430,7 +430,8 @@ as `model_content_file`.
 Chunk-directory hygiene is a separate verb. `monoid gc RUN_DIR` reports what no record in the
 corpus resolves — orphaned chunks from an interrupted write, dead `*.tmp` litter left by crashed
 writers in other processes — and `monoid gc RUN_DIR --apply` deletes it, exiting non-zero for
-refusals and failed deletions and zero for garbage merely found. Never run it beside a live
+refusals and failed deletions, zero for garbage merely found, and 2 with no report at all and
+nothing swept when `--min-age-s` is unusable. Never run it beside a live
 writer of the same run directory: the writer takes no cross-process lock and nothing on disk can
 prove a writer dead, so liveness is the operator's knowledge, exactly as it is for
 `monoid validate`. Two belts bound the damage of a broken contract without licensing one: an

@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core._verified_file import (
+    VerifiedFileIdentity,
     file_identity,
     open_verified_regular_fd,
     verified_directory_is_safe,
@@ -59,6 +60,17 @@ from monoid_agent_kernel.core.model_payloads import (
     corpus_keep_set,
     is_chunk_sha256,
 )
+
+
+class UnusableAgeGate(ValueError):
+    """The age gate cannot act as one, so no pass is attempted.
+
+    Its own type, rather than a bare ``ValueError``, because the caller that renders it has to
+    know it came from the *argument* and not from the sweep. This neighbourhood signals with
+    ``ValueError`` in several places (the reassembly budget, chunk resolution), and a sweep that
+    raised one mid-pass would otherwise be reported as a bad flag -- after deletions had already
+    happened, which is the failure the check exists to prevent.
+    """
 
 
 @dataclass(frozen=True)
@@ -159,6 +171,33 @@ def _corpus_records(path: Path) -> tuple[str, list[dict[str, Any]], list[int]]:
     return "ok", records, damaged
 
 
+def _directory_still_approved(chunk_dir: Path, approved: VerifiedFileIdentity) -> str:
+    """``""`` when ``chunk_dir`` is still the directory the gate approved, else why not.
+
+    Identity is ``(st_dev, st_ino)``, and an inode number is only evidence *if the platform
+    supplies one*: Python's own documentation says ``st_ino`` "if non-zero, uniquely identifies
+    the file", CPython's Windows ``lstat`` leaves it zero when it falls back to directory
+    attributes (an access-denied or sharing-violation open), and SMB/FAT volumes may have no
+    stable file index at all. Comparing two zeroed identities is a check that passes always --
+    a guard that silently becomes a no-op while the documentation still advertises it, which is
+    worse than an absent one. A deleter cannot spend that: an unprovable identity withholds the
+    deletion and says so. The cost is uncollected garbage on such a volume, reported per entry
+    and exit-1 visible; the alternative cost is deleting in a directory nobody vouched for.
+
+    Deliberately narrower than :func:`~monoid_agent_kernel.core._verified_file.file_identity`
+    itself, whose other consumers compare an identity they captured from a descriptor they hold
+    open -- and where failing closed on a zeroed inode would refuse ordinary writes on those same
+    volumes rather than merely decline to delete.
+    """
+
+    if not approved.inode:
+        return "chunk directory identity is not provable on this filesystem; left in place"
+    current = file_identity(chunk_dir.lstat())
+    if not current.inode or current != approved:
+        return "chunk directory changed since the scan; left in place"
+    return ""
+
+
 def _classification(
     name: str, metadata: os.stat_result | None, *, keep: set[str], corpus_ok: bool
 ) -> str:
@@ -186,9 +225,10 @@ def collect_payload_garbage(
     meeting those three tests since the scan is withheld with a per-entry error rather than
     deleted on stale evidence. Those are the three things the re-check can see; a same-name swap
     to a *different* old regular file inside the approved directory reads as unchanged, and is
-    reachable only once the concurrency contract above is already broken. A deletion the platform refuses (Windows holds
-    a file someone has open) is likewise a per-entry error and the sweep finishes; a failed
-    entry is loud precisely because it usually means the concurrency contract is being tested.
+    reachable only once the concurrency contract above is already broken. A deletion the platform
+    refuses (Windows holds a file someone has open) is likewise a per-entry error and the sweep
+    finishes; a failed entry is loud precisely because it usually means the contract is
+    being tested.
 
     ``now`` is injectable so tests own the clock. Ages are ``now - st_mtime``; a file dated in
     the future is younger than any non-negative gate, which is the protective direction.
@@ -203,7 +243,7 @@ def collect_payload_garbage(
     """
 
     if not math.isfinite(min_age_s) or min_age_s < 0:
-        raise ValueError("min_age_s must be a finite, non-negative number of seconds")
+        raise UnusableAgeGate("must be a finite, non-negative number of seconds")
     moment = time.time() if now is None else now
     corpus_state, records, damaged = _corpus_records(run_dir / MODEL_PAYLOADS_FILENAME)
 
@@ -273,17 +313,23 @@ def collect_payload_garbage(
             if apply:
                 target = chunk_dir / name
                 try:
-                    current = target.lstat()
-                    if file_identity(chunk_dir.lstat()) != approved_directory:
-                        error = "chunk directory changed since the scan; left in place"
-                    elif not stat.S_ISREG(current.st_mode) or (
-                        moment - current.st_mtime
-                    ) < min_age_s:
-                        error = "changed since the scan; left in place"
-                    else:
-                        os.unlink(target)
-                        deleted = True
-                        reclaimed_bytes += size
+                    # The directory first, and by itself: every fact gathered after this one is
+                    # read through the pathname it governs. Asking about the *entry* first put the
+                    # likelier half of a swap -- a planted directory that does not happen to
+                    # mirror this sha -- on the ``FileNotFoundError`` arm, which tells the
+                    # operator "a file vanished, probably a writer" when the truth is "every
+                    # remaining line of this report describes somebody else's directory".
+                    error = _directory_still_approved(chunk_dir, approved_directory)
+                    if not error:
+                        current = target.lstat()
+                        if not stat.S_ISREG(current.st_mode) or (
+                            moment - current.st_mtime
+                        ) < min_age_s:
+                            error = "changed since the scan; left in place"
+                        else:
+                            os.unlink(target)
+                            deleted = True
+                            reclaimed_bytes += size
                 except OSError as exc:
                     error = f"{type(exc).__name__}: {exc}"
         entries.append(

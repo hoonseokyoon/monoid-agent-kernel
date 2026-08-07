@@ -24,6 +24,7 @@ from monoid_agent_kernel import cli as cli_module
 from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core import schemas
 from monoid_agent_kernel.core import _verified_file
+from monoid_agent_kernel.core import payload_gc
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._verified_file import write_once_temp_stem
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
@@ -40,7 +41,12 @@ from monoid_agent_kernel.core.model_payloads import (
     model_response_record,
     split_request_payload,
 )
-from monoid_agent_kernel.core.payload_gc import PayloadGcEntry, PayloadGcReport, collect_payload_garbage
+from monoid_agent_kernel.core.payload_gc import (
+    PayloadGcEntry,
+    PayloadGcReport,
+    UnusableAgeGate,
+    collect_payload_garbage,
+)
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.model_call import SettledModelCall
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -312,6 +318,11 @@ def _recorded_run(base: Path) -> tuple[Path, str]:
         )
     )
     recorder.close()
+    # Backdated on purpose: every fixture built here uses the validate-verdict oracle,
+    # and an oracle only bites if the referenced chunk is protected by *membership
+    # alone*. Left fresh, the age gate shielded it too, and a collector that had
+    # forgotten the keep-set entirely would still have passed six of seven fixtures.
+    _backdate(recorder.run_dir / MODEL_PAYLOADS_DIRNAME / sha)
     return recorder.run_dir, sha
 
 
@@ -820,7 +831,8 @@ def test_a_chunk_directory_swapped_mid_pass_stops_the_deletions(
     report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
 
     withheld = _entry(report, "b" * 64)
-    assert withheld.deleted is False and withheld.error != ""
+    assert withheld.deleted is False
+    assert withheld.error == "chunk directory changed since the scan; left in place"
     assert (chunk_dir / ("b" * 64)).read_bytes() == b"someone else's referenced chunk"
 
 
@@ -877,7 +889,9 @@ def test_a_candidate_refreshed_between_the_scan_and_the_unlink_is_withheld(
     assert report.reclaimed_bytes == 0
 
 
-def test_an_unusable_age_gate_is_refused_before_the_directory_is_read(tmp_path: Path) -> None:
+def test_an_unusable_age_gate_is_refused_before_the_directory_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The gate is the collector's only safety belt, so a value that cannot act as one is refused
     rather than interpreted. Infinity spares everything and then breaks the JSON report it is
     stamped into; not-a-number makes every comparison false, so `--apply` becomes a silent no-op;
@@ -889,12 +903,80 @@ def test_an_unusable_age_gate_is_refused_before_the_directory_is_read(tmp_path: 
     orphan.write_bytes(b"j" * 64)
     _backdate(orphan)
 
+    def refuse_to_be_read(path):
+        raise AssertionError(f"the directory was read despite an unusable gate: {path}")
+
     for unusable in (float("inf"), float("-inf"), float("nan"), -1.0):
-        with pytest.raises(ValueError):
-            collect_payload_garbage(run_dir, min_age_s=unusable, apply=True)
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "scandir", refuse_to_be_read)
+            with pytest.raises(UnusableAgeGate):
+                collect_payload_garbage(run_dir, min_age_s=unusable, apply=True)
         assert orphan.exists()
 
     assert collect_payload_garbage(run_dir, min_age_s=0.0, apply=False).chunk_dir_state == "ok"
+
+
+def test_a_swapped_directory_is_named_as_such_even_when_the_decoy_lacks_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planted directory will not usually mirror the sha names of the one it replaced, and that
+    is the half where the diagnosis matters most. Asking about the entry first answered
+    "FileNotFoundError" -- which an operator reads as a file vanishing under a concurrent writer
+    -- when the truth is that every remaining line of the report describes somebody else's
+    directory."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    for name in ("a" * 64, "b" * 64):
+        target = chunk_dir / name
+        target.write_bytes(b"x" * 16)
+        _backdate(target)
+    empty_decoy = tmp_path / "decoy"
+    empty_decoy.mkdir()
+    real_unlink = os.unlink
+
+    def swap_after_the_first(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if chunk_dir.exists():
+            chunk_dir.rename(run_dir / "moved-away")
+            empty_decoy.rename(chunk_dir)
+        return result
+
+    monkeypatch.setattr(os, "unlink", swap_after_the_first)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    withheld = _entry(report, "b" * 64)
+    assert withheld.deleted is False
+    assert withheld.error == "chunk directory changed since the scan; left in place"
+
+
+def test_an_unprovable_directory_identity_withholds_every_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inode number is evidence only where the platform supplies one -- Python documents
+    `st_ino` as identifying a file "if non-zero", CPython's Windows lstat zeroes it when it falls
+    back to directory attributes, and network volumes may have no stable index at all. Two zeroed
+    identities compare equal, so the guard would pass always: a check that silently becomes a
+    no-op while the docs still advertise it. A deleter answers "cannot prove" with "then not
+    now"."""
+    run_dir, sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 64)
+    _backdate(orphan)
+    before = _issues(run_dir)
+    monkeypatch.setattr(
+        payload_gc, "file_identity", lambda metadata: _verified_file.VerifiedFileIdentity(0, 0)
+    )
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    entry = _entry(report, "f" * 64)
+    assert entry.classification == "orphan" and entry.deleted is False
+    assert "not provable" in entry.error
+    assert orphan.exists()
+    assert (run_dir / MODEL_PAYLOADS_DIRNAME / sha).exists()
+    assert report.reclaimed_bytes == 0
+    assert _issues(run_dir) == before
 
 
 # --- The CLI verb ---------------------------------------------------------------------------------
@@ -993,7 +1075,8 @@ def test_gc_refuses_an_unusable_age_gate_without_sweeping_or_crashing(tmp_path: 
             main, ["gc", str(run_dir), "--apply", "--json", "--min-age-s", unusable]
         )
         assert result.exit_code == 2, (unusable, result.output)
-        assert "Traceback" not in result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "--min-age-s" in result.output and "finite, non-negative" in result.output
         assert orphan.exists(), unusable
 
 

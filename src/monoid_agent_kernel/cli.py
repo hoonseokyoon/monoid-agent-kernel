@@ -33,7 +33,7 @@ from monoid_agent_kernel.core.spec import (
     ModelConfig,
     RunLimits,
 )
-from monoid_agent_kernel.core.payload_gc import collect_payload_garbage
+from monoid_agent_kernel.core.payload_gc import UnusableAgeGate, collect_payload_garbage
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.packages import (
     apply_package,
@@ -765,10 +765,13 @@ def gc_command(
         raise click.ClickException(f"run directory not found: {run_dir}")
     try:
         report = collect_payload_garbage(run_dir, min_age_s=min_age_s, apply=apply_deletes)
-    except ValueError as exc:
+    except UnusableAgeGate as exc:
         # Click's FLOAT accepts "inf" and "nan", and a negative gate parses fine, so the option
         # layer cannot refuse these on type alone. Refusing here -- before any output -- keeps a
-        # bad flag from sweeping first and only then failing to report what it swept.
+        # bad flag from sweeping first and only then failing to report what it swept. Caught by
+        # its own type, never by ``ValueError``: this neighbourhood raises those as control flow,
+        # and rendering a mid-sweep one as "bad --min-age-s" would blame the flag for deletions
+        # that had already happened.
         raise click.BadParameter(str(exc), param_hint="--min-age-s") from exc
     # A refusal or a failed deletion exits non-zero so scripted sweeps notice -- via ctx.exit
     # after the payload, never ClickException, whose Error line joins the payload wherever the

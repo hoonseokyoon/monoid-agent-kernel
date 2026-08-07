@@ -154,9 +154,9 @@ def iter_chunk_references(value: Any) -> Iterator[str]:
     (bounded waste), while missing one a reader resolves deletes a referenced chunk, the one
     corruption ``validate_run_dir`` refuses. So this deliberately names more than any resolver
     walks -- a marker inside a verbatim payload is data to every reader and is still counted.
-    Markers are recognized by the same predicate reassembly resolves through (:func:`_filled`),
-    never re-derived, so a marker-shaped object carrying a malformed sha yields nothing -- and it also names nothing a
-    content-addressed directory could hold. Strings are never parsed. Depth needs no budget of
+    Markers are recognized by :func:`_is_marker`, the predicate reassembly resolves through, never
+    re-derived -- so a marker-shaped object carrying a malformed sha yields nothing, and it also
+    names nothing a content-addressed directory could hold. Strings are never parsed. Depth needs no budget of
     its own: a record deeper than the ingress limit was refused by the writer and is unparseable
     to every reader that could hand a record to this walker.
     """
