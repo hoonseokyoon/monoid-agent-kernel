@@ -1722,6 +1722,18 @@ def _replay_preflight(
             "given; each was counted once",
             err=True,
         )
+    if corpus.crossed_keys:
+        # The one property of a union the operator cannot read off their own command line:
+        # "each answer once, in file order" is a rule about one corpus, and across sources the
+        # file order is the flag order. Reversing two --replay-from arguments then replays a
+        # different conversation, and where one source recorded a refusal at that position it
+        # turns a union that holds the answer into a miss.
+        click.echo(
+            f"warning: {corpus.crossed_keys} recorded call(s) can be answered by more than "
+            "one --replay-from source; the order the sources were named in decides which "
+            "answer each call gets",
+            err=True,
+        )
     generation = corpus.generation_divergence(_REQUEST_DIGEST_GENERATION)
     if generation is not None:
         message = f"replay preflight: {generation}"

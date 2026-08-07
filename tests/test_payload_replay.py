@@ -985,6 +985,47 @@ def test_a_slot_below_zero_is_not_a_slot(tmp_path: Path) -> None:
     assert served.body["final_text"] == "first"
 
 
+def test_a_key_two_sources_can_answer_is_reported(tmp_path: Path) -> None:
+    """ "File order, each answer once" is a rule about one corpus. Across a union it silently
+    becomes "the order of the --replay-from flags", and nothing tells the operator.
+
+    Two recordings of one conversation is not an exotic shape: it is the same prompt run twice,
+    and it is the crash-and-rerun union `docs/CONTRACTS.md` itself calls "the ordinary durable-
+    resume shape". Reversing the two flags then serves a different conversation -- or, where
+    one source recorded a refusal at that position and the other the answer, turns a union that
+    demonstrably holds the answer into a miss. The reader is the only place that can see it
+    happening, so it counts it and the preflight says it out loud.
+    """
+
+    first = tmp_path / "runs" / "run-1"
+    second = tmp_path / "runs" / "run-2"
+    digest = _recorded_pair(first, answers=["from the first recording"])
+    assert _recorded_pair(second, answers=["from the second recording"]) == digest
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 1, "one key, two sources, and the flag order picks the answer"
+    assert corpus.repeated_sources == 0, "two distinct corpora are not a repeat"
+    served = corpus.consume(digest, generation=_GEN)
+    assert isinstance(served, ReplayedResponse)
+    assert served.body["final_text"] == "from the first recording"
+
+
+def test_disjoint_sources_are_not_a_crossed_key(tmp_path: Path) -> None:
+    """The family union -- a parent and its children -- is the documented shape, and every key
+    in it is answered by exactly one source. It must not draw the warning."""
+
+    first = tmp_path / "runs" / "run-1"
+    second = tmp_path / "runs" / "run-2"
+    _recorded_pair(first, generation=_GEN)
+    _recorded_pair(second, generation="monoid.model-request-digest.v0")
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 0
+    assert corpus.response_count() == 2
+
+
 def test_a_volume_without_inodes_does_not_collapse_the_union(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -171,6 +171,8 @@ class ReplayCorpus:
         self._rejected = 0
         self._unjoinable = 0
         self._repeated_sources = 0
+        self._response_source: dict[str, int] = {}
+        self._crossed: set[str] = set()
         self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
         self._profiles: tuple[dict[str, Any], ...] | None = None
         self._lock = threading.Lock()
@@ -215,7 +217,7 @@ class ReplayCorpus:
             indexed.add(identity)
             corpus._damaged += len(damaged)
             for record in records:
-                corpus._index(record)
+                corpus._index(record, source=len(indexed))
         return corpus
 
     @staticmethod
@@ -254,7 +256,7 @@ class ReplayCorpus:
             return identity
         return os.path.normcase(os.path.realpath(path))
 
-    def _index(self, record: Mapping[str, Any]) -> None:
+    def _index(self, record: Mapping[str, Any], *, source: int = 0) -> None:
         if record.get("schema_version") != MODEL_PAYLOADS_SCHEMA_VERSION:
             # The validator enforces this on the same bytes, and a reader that skipped it
             # would serve a corpus the kernel's own `monoid validate` calls corrupt -- or,
@@ -331,6 +333,17 @@ class ReplayCorpus:
                 self._rejected += 1
                 return
             reason = record.get("unrecorded_reason")
+            # "File order, each answer once" is a rule about one corpus. Across a union it
+            # quietly becomes "the order the sources were named in", and the operator is told
+            # nothing: two recordings of the same conversation -- the same prompt run twice, or
+            # the crash-and-rerun union `docs/CONTRACTS.md` calls the ordinary durable-resume
+            # shape -- interleave their answers by flag order. Reversing two flags then replays
+            # a different conversation, or, where one source recorded a refusal at that
+            # position and the other the answer, turns a union that demonstrably holds the
+            # answer into a miss. This is the only place that can see it happen.
+            if self._response_source.setdefault(digest, source) != source:
+                if digest not in self._crossed:
+                    self._crossed.add(digest)
             self._responses.setdefault(digest, []).append(
                 _ResponseEntry(
                     response=record.get("response"),
@@ -759,6 +772,17 @@ class ReplayCorpus:
         """How many named directories resolved to a corpus this union had already indexed."""
 
         return self._repeated_sources
+
+    @property
+    def crossed_keys(self) -> int:
+        """How many keys more than one source recorded an answer for.
+
+        Zero for the family union, which is the documented multi-source shape: a parent and its
+        children record disjoint conversations. Non-zero means the answer a call gets depends
+        on the order the sources were named in, which no rule this reader states makes visible.
+        """
+
+        return len(self._crossed)
 
     def request_count(self) -> int:
         return len(self._requests)

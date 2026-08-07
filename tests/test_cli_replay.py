@@ -107,6 +107,50 @@ def test_cli_replays_a_recorded_run_with_no_live_configuration(
     assert "recorded answer" in result.output
 
 
+def test_cli_warns_when_two_sources_can_answer_the_same_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The one property of a union an operator cannot read off their own command line.
+
+    Two recordings of one conversation is the same prompt run twice, or the crash-and-rerun
+    union `docs/CONTRACTS.md` calls the ordinary durable-resume shape. Across sources, "file
+    order" is the order of the `--replay-from` flags, so reversing two arguments replays a
+    different conversation. Both orders complete, both say `status: completed`, and nothing in
+    the run afterwards records which source answered -- `attributes.replay_from` is the joined
+    list and is identical either way.
+    """
+
+    _record_run(tmp_path, monkeypatch, run_id="first")
+    _record_run(tmp_path, monkeypatch, run_id="second")
+
+    result = CliRunner().invoke(
+        main, _replay_args(tmp_path, "first", "second") + ["--run-id", "replayed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "1 recorded call(s) can be answered by more than one --replay-from source" in (
+        result.output
+    )
+    assert "the order the sources were named in decides" in result.output
+
+
+def test_cli_says_nothing_about_a_disjoint_union(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The family union is the documented multi-source shape and every key in it belongs to one
+    source; a warning there would train the operator to ignore the one above."""
+
+    _record_run(tmp_path, monkeypatch, run_id="first")
+    _record_run(tmp_path, monkeypatch, run_id="second", instruction=f"Something else. {_MARKER}")
+
+    result = CliRunner().invoke(
+        main, _replay_args(tmp_path, "first", "second") + ["--run-id", "replayed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "more than one --replay-from source" not in result.output
+
+
 def test_cli_pure_replay_skips_the_direct_provider_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
