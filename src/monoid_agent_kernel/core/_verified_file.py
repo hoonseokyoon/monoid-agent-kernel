@@ -249,7 +249,15 @@ def write_once_temp_stem(name: str) -> str | None:
     ``None`` when ``name`` was never one of its temporaries. One authoring site: this predicate
     sits beside the f-string that mints the shape (``{name}.{pid}.{12 hex}.tmp``), so a collector
     matching crash litter and the writer creating it cannot drift apart. What the stem *means* is
-    the caller's question -- this module does not know it stores content-addressed names."""
+    the caller's question -- this module does not know it stores content-addressed names.
+
+    Case-sensitive, deliberately, and therefore narrower than the recorder's own pid-scoped
+    ``Path.glob`` sweep, which folds case on Windows. A temporary whose name reached the directory
+    with any letter re-cased -- a restore through a case-mangling path -- is classified foreign
+    and never collected. That is the safe end of the asymmetry: the wider matcher is the one with
+    no age gate and no directory re-check behind it, and widening a *delete* predicate to accept
+    spellings the writer cannot mint is the wrong direction.
+    """
 
     match = _WRITE_ONCE_TEMP_NAME.fullmatch(name)
     return match.group(1) if match is not None else None

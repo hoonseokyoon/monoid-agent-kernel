@@ -779,7 +779,13 @@ def gc_command(
     # --json unparseable; the builder validate precedent. Garbage merely *found* is exit 0:
     # finding it is the verb working.
     failed = (
-        report.chunk_dir_state == "unsafe"
+        report.chunk_dir_state not in ("absent", "ok")
+        # A corpus the collector refused to read is a refusal in its own right. It reached the
+        # exit code only through ``unjudged`` entries before, so a chunk directory holding
+        # nothing chunk-shaped left it with no carrier -- and a nightly sweep got a green light
+        # on a run whose corpus is mutilated, in a pass that had just deleted its temporaries.
+        # Scoped to a directory that exists: a run that never offloaded anything is not a fault.
+        or (report.corpus_state != "ok" and report.chunk_dir_state == "ok")
         or any(entry.classification == "unjudged" for entry in report.entries)
         or any(entry.error for entry in report.entries)
     )
@@ -816,8 +822,13 @@ def gc_command(
             if entry.error:
                 line += f"  [{entry.error}]"
             click.echo(line)
-        if report.damaged_lines:
-            click.echo(f"damaged_lines: {', '.join(map(str, report.damaged_lines))}")
+        if report.damaged_line_count:
+            shown = ", ".join(map(str, report.damaged_lines))
+            more = report.damaged_line_count - len(report.damaged_lines)
+            click.echo(
+                f"damaged_lines ({report.damaged_line_count}): {shown}"
+                + (f", and {more} more" if more else "")
+            )
         click.echo(f"candidate_bytes: {report.candidate_bytes}")
         click.echo(f"reclaimed_bytes: {report.reclaimed_bytes}")
     if failed:

@@ -42,6 +42,7 @@ from monoid_agent_kernel.core.model_payloads import (
     split_request_payload,
 )
 from monoid_agent_kernel.core.payload_gc import (
+    MAX_REPORTED_DAMAGED_LINES,
     PayloadGcEntry,
     PayloadGcReport,
     UnusableAgeGate,
@@ -979,6 +980,70 @@ def test_an_unprovable_directory_identity_withholds_every_deletion(
     assert _issues(run_dir) == before
 
 
+def test_deleting_one_name_of_a_shared_inode_reclaims_nothing(tmp_path: Path) -> None:
+    """`docs/OBSERVABILITY.md` blesses hardlink-deduplicated archives of a run directory two
+    paragraphs above the collector's own, so the shape is supported, not hostile -- and there
+    unlinking an orphan frees no bytes at all, because the archive's name still holds the inode.
+    Reporting the file's length as reclaimed told a capacity script the opposite of the truth."""
+    run_dir, _sha = _recorded_run(tmp_path)
+    orphan = run_dir / MODEL_PAYLOADS_DIRNAME / ("f" * 64)
+    orphan.write_bytes(b"j" * 4096)
+    archive = tmp_path / "archive.bin"
+    os.link(orphan, archive)
+    _backdate(orphan)
+    solo = run_dir / MODEL_PAYLOADS_DIRNAME / ("e" * 64)
+    solo.write_bytes(b"j" * 512)
+    _backdate(solo)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    assert _entry(report, "f" * 64).deleted is True
+    assert _entry(report, "e" * 64).deleted is True
+    assert not orphan.exists() and not solo.exists()
+    assert archive.read_bytes() == b"j" * 4096
+    # Only the file whose last name went away returned bytes to the volume.
+    assert report.reclaimed_bytes == 512
+    # The scan cannot know a link count on every platform (Windows serves `scandir` stats from
+    # the listing with `st_nlink == 0`), so the estimate stays an upper bound and says so.
+    assert report.candidate_bytes == 4608
+
+
+def test_a_chunk_directory_that_cannot_be_read_is_told_apart_from_one_that_was_redirected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows an antivirus pass, the search indexer or a sync engine can deny a directory for
+    a moment. Reporting that as `unsafe` -- the same word a planted junction gets -- tells the
+    operator they were attacked when they were merely unlucky, and the two call for opposite
+    responses. The corpus half already made this distinction; the directory half did not."""
+    run_dir, _sha = _recorded_run(tmp_path)
+
+    def denied(path):
+        raise PermissionError(13, "held by another process")
+
+    monkeypatch.setattr(os, "scandir", denied)
+
+    report = collect_payload_garbage(run_dir, min_age_s=_DAY_S, apply=True)
+
+    assert report.chunk_dir_state == "unreadable"
+    assert report.entries == ()
+
+
+def test_a_corpus_of_damaged_lines_does_not_produce_an_unbounded_report(tmp_path: Path) -> None:
+    """Every other quantity in the report is bounded by the files on disk; this one tracked corpus
+    content one-to-one, so a million-line corpus put a million integers on one terminal line and
+    into the JSON. The count is what an operator acts on; the list is a sample."""
+    damaged = 250
+    (tmp_path / MODEL_PAYLOADS_FILENAME).write_text(
+        "".join(f"not json {index}\n" for index in range(damaged)), encoding="utf-8"
+    )
+
+    report = collect_payload_garbage(tmp_path, min_age_s=_DAY_S, apply=False)
+
+    assert report.damaged_line_count == damaged
+    assert len(report.damaged_lines) == MAX_REPORTED_DAMAGED_LINES
+    assert report.damaged_lines[0] == 1
+
+
 # --- The CLI verb ---------------------------------------------------------------------------------
 
 
@@ -1107,6 +1172,7 @@ def test_the_json_report_survives_a_name_it_cannot_encode(
             ),
         ),
         damaged_lines=(),
+        damaged_line_count=0,
         candidate_bytes=0,
         reclaimed_bytes=0,
     )
@@ -1173,3 +1239,23 @@ def test_gc_exit_is_nonzero_when_a_deletion_fails(
     entries = {entry["name"]: entry for entry in json.loads(result.output)["entries"]}
     assert entries["5" * 64]["deleted"] is False and entries["5" * 64]["error"]
     assert stuck.exists()
+
+
+def test_gc_exit_is_nonzero_when_the_corpus_could_not_be_judged(tmp_path: Path) -> None:
+    """The report carries two refusal-bearing states and only one reached the exit code. With no
+    chunk-shaped file to turn `unjudged`, a mutilated corpus had no carrier -- so a nightly
+    `monoid gc RUN --apply || alert` got a green light on a run whose corpus it could not read,
+    in a pass that had just modified the directory."""
+    (tmp_path / MODEL_PAYLOADS_FILENAME).mkdir()
+    chunk_dir = tmp_path / MODEL_PAYLOADS_DIRNAME
+    chunk_dir.mkdir()
+    temp = chunk_dir / f"{'a' * 64}.{os.getpid() + 1}.{'0' * 12}.tmp"
+    temp.write_bytes(b"partial")
+    _backdate(temp)
+
+    result = CliRunner().invoke(main, ["gc", str(tmp_path), "--apply", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["corpus_state"] == "unreadable"
+    assert not temp.exists()  # the litter half still ran; only the verdict changed

@@ -447,8 +447,24 @@ directory is read, because each unusable value breaks the belt a different way. 
 chunks leaves them `unjudged` and untouched (a mutilated directory and a first-call crash whose
 very first chunk was directory-sized leave the same state); damaged corpus *lines* are the
 opposite case — no reader parses them, so what only they referenced is collected, and the report
-names the line numbers. Deletion never outruns the validator: `monoid validate` reports the same
-issues after a sweep as before it.
+names the line numbers (a count, plus the first hundred). Deletion never outruns the validator:
+`monoid validate` reports the same issues after a sweep as before it.
+
+The report's `chunk_dir_state` separates two refusals an operator must not confuse. `unsafe` means
+something is wearing the directory's name that is not a directory this run owns — a symlink, a
+Windows junction (which needs no privilege to create and `lstat`s as an ordinary directory, so
+only its reparse tag tells it apart), or a plain file. `unreadable` means the platform declined to
+answer, which on Windows is the everyday shape of an antivirus pass, the search indexer, or a sync
+engine holding the directory for a moment. Nothing is enumerated in either case. The same
+distinction governs the corpus: `absent`, `unreadable`, `ok`. A deletion is also withheld, per
+entry, on a volume that supplies no stable file ids (`st_ino` zero — FAT, some network
+redirectors), because there the collector cannot re-prove which directory it is standing in; the
+cost is uncollected garbage, reported and exit-1 visible. `candidate_bytes` and `reclaimed_bytes`
+are sizes, and only the second one is a claim about the volume: it counts a file only when the
+sweep removed the inode's last name, so an orphan inside a hardlink-deduplicated archive is
+reported deleted and reclaims nothing. Run one sweep at a time — two overlapping collectors leave
+the loser reporting a failure per entry although the directory reached the state it asked for. The
+verb writes nothing to the run's `events.jsonl`; its record is the report it prints.
 
 Gateway token streaming uses Server-Sent Events and needs the `[http-async]` extra. A presentation
 layer can connect its chat UI to the live observer channel while `events.jsonl` retains

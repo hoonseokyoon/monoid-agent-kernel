@@ -27,7 +27,13 @@ out in commit messages and here.
   number in the report, and what only they referenced is collected: those references are
   invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
   failed deletions, zero for garbage merely found, and 2 — no report, nothing swept — for an
-  unusable `--min-age-s`. Never run it beside a live writer of the same
+  unusable `--min-age-s`. A refusal includes a corpus the collector could not read, whether or
+  not any chunk-shaped file was there to carry it. `reclaimed_bytes` counts a file only when the
+  sweep removed its inode's last name, so an orphan inside a hardlink-deduplicated archive
+  reports as deleted and reclaims nothing; `candidate_bytes` is an upper bound, because a scan
+  cannot see a link count on every platform. `chunk_dir_state` separates `unsafe` (something is
+  wearing the directory's name) from `unreadable` (the platform declined), which call for
+  opposite responses. Never run it beside a live writer of the same
   run directory; liveness is the operator's knowledge, as with `monoid validate`.
 - **Adoption now leaves a timestamp.** A writer accepting a chunk file that already exists — a
   resumed run re-deriving what it already holds is the common case — takes the stored file

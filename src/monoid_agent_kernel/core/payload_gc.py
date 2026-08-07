@@ -62,6 +62,13 @@ from monoid_agent_kernel.core.model_payloads import (
 )
 
 
+# How many damaged corpus line numbers one report will name. Every other quantity in a report is
+# bounded by files on disk; this one tracked corpus content one-to-one, so a million-line corpus
+# put a million integers on one terminal line and into the JSON. The count is what an operator
+# acts on -- "this corpus is torn" -- and the list is a sample to start reading from.
+MAX_REPORTED_DAMAGED_LINES = 100
+
+
 class UnusableAgeGate(ValueError):
     """The age gate cannot act as one, so no pass is attempted.
 
@@ -100,9 +107,21 @@ class PayloadGcEntry:
 class PayloadGcReport:
     """What one pass saw, and what it did.
 
-    ``candidate_bytes`` is what ``--apply`` would reclaim (orphans and temps past the age gate),
-    counted identically in both modes; ``reclaimed_bytes`` is what an applied pass actually
-    deleted. ``damaged_lines`` are the 1-based corpus line numbers no reader parses.
+    ``chunk_dir_state``: ``absent``, ``unsafe`` (a redirection or a non-directory wearing the
+    name -- somebody put it there), ``unreadable`` (the platform refused the listing, which on
+    Windows is the shape of an antivirus pass, the indexer or a sync engine), or ``ok``. The two
+    refusals are separated because they call for opposite responses, and the corpus half already
+    made that distinction.
+
+    ``candidate_bytes`` is the size of what ``--apply`` would remove (orphans and temps past the
+    age gate), counted identically in both modes. It is an **upper bound** on bytes returned to
+    the volume, not a promise of them: a name whose inode has other links frees nothing, and a
+    scan cannot see a link count on every platform (Windows serves ``scandir`` stats from the
+    directory listing, with ``st_nlink`` zero). ``reclaimed_bytes`` counts only files whose last
+    name this pass removed, which is knowable, because the pre-unlink ``lstat`` is a real one.
+
+    ``damaged_line_count`` is how many corpus lines no reader parses; ``damaged_lines`` names the
+    first :data:`MAX_REPORTED_DAMAGED_LINES` of them.
     """
 
     run_dir: str
@@ -112,6 +131,7 @@ class PayloadGcReport:
     min_age_s: float
     entries: tuple[PayloadGcEntry, ...]
     damaged_lines: tuple[int, ...]
+    damaged_line_count: int
     candidate_bytes: int
     reclaimed_bytes: int
 
@@ -226,9 +246,14 @@ def collect_payload_garbage(
     deleted on stale evidence. Those are the three things the re-check can see; a same-name swap
     to a *different* old regular file inside the approved directory reads as unchanged, and is
     reachable only once the concurrency contract above is already broken. A deletion the platform
-    refuses (Windows holds a file someone has open) is likewise a per-entry error and the sweep
-    finishes; a failed entry is loud precisely because it usually means the contract is
-    being tested.
+    refuses is likewise a per-entry error and the sweep finishes; a failed entry is loud precisely
+    because it usually means the contract is being tested. That refusal is a Windows property: it
+    holds an open file against unlink, so a writer racing this pass costs a loud error there and
+    nothing at all on POSIX, where the unlink succeeds and the writer keeps filling an inode with
+    no name. Two collectors overlapping is the same shape -- the loser reports one
+    ``FileNotFoundError`` per entry and exits non-zero although the directory reached the state
+    it asked for. The contract that forbids the first case forbids this one too: one sweep at a
+    time, and none beside a writer.
 
     ``now`` is injectable so tests own the clock. Ages are ``now - st_mtime``; a file dated in
     the future is younger than any non-negative gate, which is the protective direction.
@@ -260,7 +285,8 @@ def collect_payload_garbage(
             applied=apply,
             min_age_s=min_age_s,
             entries=entries,
-            damaged_lines=tuple(damaged),
+            damaged_lines=tuple(damaged[:MAX_REPORTED_DAMAGED_LINES]),
+            damaged_line_count=len(damaged),
             candidate_bytes=candidate_bytes,
             reclaimed_bytes=reclaimed_bytes,
         )
@@ -271,7 +297,11 @@ def collect_payload_garbage(
     except FileNotFoundError:
         return report("absent")
     except OSError:
-        return report("unsafe")
+        # Not ``unsafe``: the platform declining to answer is not somebody having planted
+        # something. On Windows this is the shape of an antivirus pass, the search indexer or a
+        # sync engine holding the directory for a moment, and telling an operator they were
+        # attacked when they were merely unlucky sends them the wrong way.
+        return report("unreadable")
     if not verified_directory_is_safe(chunk_dir):
         # The gate the writer's own sweep runs behind, for the same reason: enumeration and
         # deletion through a redirection are operations in a directory of somebody else's
@@ -289,14 +319,22 @@ def collect_payload_garbage(
         with os.scandir(chunk_dir) as listing:
             for entry in listing:
                 try:
+                    # Mode, size and mtime only. Windows serves these from the directory listing,
+                    # where ``st_dev``/``st_ino``/``st_nlink`` come back zero for every ordinary
+                    # file -- so nothing here may be handed to ``file_identity`` or read as a
+                    # link count. Both of those questions get a real ``lstat`` below.
                     snapshot.append((entry.name, entry.stat(follow_symlinks=False)))
                 except OSError:
                     snapshot.append((entry.name, None))
     except OSError:
-        return report("unsafe")
+        return report("unreadable")
     snapshot.sort(key=lambda pair: pair[0])
 
     keep = corpus_keep_set(records) if corpus_state == "ok" else set()
+    # The corpus was the largest thing this pass allocated and its records are spent: the keep-set
+    # is all the directory pass consults. Releasing them here keeps a big corpus from being
+    # resident for the whole sweep.
+    records = []
     entries: list[PayloadGcEntry] = []
     candidate_bytes = 0
     reclaimed_bytes = 0
@@ -327,9 +365,19 @@ def collect_payload_garbage(
                         ) < min_age_s:
                             error = "changed since the scan; left in place"
                         else:
+                            # Counted only when this name was the inode's last one. A
+                            # hardlink-deduplicated archive of a run directory is a supported
+                            # shape (``docs/OBSERVABILITY.md`` blesses ``cp -al`` for these very
+                            # files), and there an unlink returns nothing to the volume while the
+                            # archive's name goes on holding the bytes. A count of zero is the
+                            # honest answer for a capacity script; the file is still gone, and
+                            # ``deleted`` says so. ``st_nlink == 0`` means the platform did not
+                            # answer, which is treated as one name -- the pre-change behavior.
+                            last_name = current.st_nlink <= 1
                             os.unlink(target)
                             deleted = True
-                            reclaimed_bytes += size
+                            if last_name:
+                                reclaimed_bytes += size
                 except OSError as exc:
                     error = f"{type(exc).__name__}: {exc}"
         entries.append(
