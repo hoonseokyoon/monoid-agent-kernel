@@ -40,9 +40,10 @@ it to be discovered. ``resolve_destination`` is deliberately absent too (D-f):
 whose destination resolved is documented rather than imitated.
 
 **Under fallthrough the wrapper still speaks for the call.** The receipt is built by probing
-this adapter, so a live answer the inner produced is stamped with the corpus-derived provider
-and ``not_declared`` -- the inner's own declaration and destination do not reach it, and its
-``supports_multimodal``/``astream_turn`` do not either. That is forced rather than chosen: the
+this adapter, so a live answer the inner produced is stamped with whatever *this* adapter
+declares -- the corpus-derived provider, or nothing at all where the derivation declined, which
+the receipt records as ``""`` -- and with ``not_declared``. The inner's own declaration and
+destination do not reach it, and its ``supports_multimodal``/``astream_turn`` do not either. That is forced rather than chosen: the
 declaration is what makes recorded keys reachable, so it cannot also report who served a miss.
 ``docs/CONTRACTS.md`` carries it as the third ledger delta, the one only fallthrough produces.
 """

@@ -289,8 +289,11 @@ by this run's runtime config — not by the corpus — so the config must match 
 A config that cannot match anything recorded is refused before the run starts (the preflight
 names expected and actual, e.g. the model names); `--replay-fallthrough` softens that to a
 warning and serves misses from the live adapter this command would have built anyway
-(recording flags compose, so `--replay-from ... --model-payload-file` re-records what actually
-happened — the new-episodes shape).
+(recording flags compose, so `--replay-from ... --model-payload-file` records the run as it
+went — the new-episodes shape). One caveat on that second corpus: a call the *inner* adapter
+served is keyed under the wrapper's provider term rather than the inner's, so it replays
+faithfully but is not interchangeable with a recording made live. `docs/CONTRACTS.md` carries
+the detail as the third ledger delta.
 
 **Answers replay in recorded order, each once.** A request the original run made twice gets
 the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
