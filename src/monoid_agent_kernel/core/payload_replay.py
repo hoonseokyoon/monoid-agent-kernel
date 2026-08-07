@@ -408,10 +408,19 @@ class ReplayCorpus:
 
         Only that exact slot, and only while nothing else has moved: under concurrent callers
         another turn may already hold the next one, and rewinding then would hand it out twice.
+
+        Bounded like :meth:`spend_refused`, because `cursor == slot + 1` alone is satisfied by
+        ``slot = -1`` against a fresh cursor -- and a negative cursor makes ``consume`` read
+        ``queue[-1]``, handing the last recording back as the first call's answer and again at
+        the end. Nothing shipped can ask for a negative slot; the public constructor takes a
+        corpus by value, so an embedder can.
         """
 
         with self._lock:
-            if self._cursors.get(digest, 0) == slot + 1:
+            queue = self._responses.get(digest)
+            if not queue:
+                return
+            if 0 <= slot < len(queue) and self._cursors.get(digest, 0) == slot + 1:
                 self._cursors[digest] = slot
 
     def _entry_body(self, entry: _ResponseEntry) -> dict[str, Any] | ReplayMissReason:

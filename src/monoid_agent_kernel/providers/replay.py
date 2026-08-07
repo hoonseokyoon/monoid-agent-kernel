@@ -62,6 +62,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayMissReason,
     ReplayedResponse,
 )
+from monoid_agent_kernel.core._sync_bridge import is_async_callable
 from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -169,9 +170,14 @@ class ReplayModelAdapter:
         self._inner_closer = None
         if inner is not None:
             next_turn = getattr(inner, "next_turn", None)
-            if not callable(next_turn):
+            if not callable(next_turn) or is_async_callable(next_turn):
+                # `callable` is true for an `async def`, and `ModelCallRunner` documents a
+                # coroutine `next_turn` as one of its four dispatch shapes -- so without the
+                # second half this wrapper accepts an inner it cannot drive, hands `_adrive` a
+                # coroutine that has done no provider work, and spends the refused slot on it
+                # before the awaited call has a chance to fail.
                 raise ValueError(
-                    "the fallthrough inner adapter exposes no callable next_turn; this "
+                    "the fallthrough inner adapter exposes no synchronous next_turn; this "
                     "wrapper is synchronous and cannot drive an anext_turn-only adapter"
                 )
             # Both halves resolved before either is ever called -- the CLI's own lifecycle

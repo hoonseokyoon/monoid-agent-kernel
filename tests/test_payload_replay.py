@@ -910,6 +910,30 @@ def test_an_answer_keyed_by_something_that_is_not_a_key_is_damage(
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
 
 
+def test_a_slot_below_zero_is_not_a_slot(tmp_path: Path) -> None:
+    """`release`'s guard is `cursor == slot + 1`, which `slot = -1` satisfies against a fresh
+    cursor of zero -- and the cursor then goes negative.
+
+    `consume` reads `queue[cursor]` after checking only the upper bound, so a negative cursor
+    hands back the *last* recording as the first call's answer and then hands it out again at
+    the end of the queue. Nothing shipped can reach it (`ReplayedResponse.slot` is never
+    negative and the adapter is the only caller), but `ReplayModelAdapter` takes a corpus by
+    value on a public signature, so the method is an embedder's to call. `spend_refused`
+    already carries the bounds this one was missing.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir, answers=["first", "second"])
+    corpus = ReplayCorpus.load([run_dir])
+
+    corpus.release(digest, -1)
+
+    served = corpus.consume(digest, generation=_GEN)
+    assert isinstance(served, ReplayedResponse)
+    assert served.slot == 0, "a slot below zero rewound the cursor past the start of the queue"
+    assert served.body["final_text"] == "first"
+
+
 def test_a_volume_without_inodes_does_not_collapse_the_union(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

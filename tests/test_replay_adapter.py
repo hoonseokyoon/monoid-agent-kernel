@@ -797,6 +797,36 @@ def test_a_failed_live_serve_gives_back_a_held_slot_too(tmp_path: Path) -> None:
     assert _call(adapter, _request()).final_text == "answer for call two"
 
 
+def test_an_inner_whose_next_turn_is_a_coroutine_function_is_refused(tmp_path: Path) -> None:
+    """The constructor's synchronous-inner check asks `callable(next_turn)`, which is true for
+    an `async def`.
+
+    `ModelCallRunner` documents a coroutine `next_turn` as one of its four dispatch shapes, and
+    `_adrive` awaits whatever this wrapper hands back -- *after* `_serve_miss` has already
+    spent the refused slot on a coroutine object that has done no provider work. The awaited
+    call then raises, the turn parks, and the re-attempt meets the next recording. No shipped
+    inner has this shape (the CLI builds only gateway and OpenAI adapters, both blocking), so
+    the door is a library embedder's; the check the constructor already wanted to make is the
+    one that closes it.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-1", final_text="recorded")]),
+        [_request()],
+    )
+
+    class _AsyncInner:
+        async def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live")
+
+    with pytest.raises(ValueError) as caught:
+        _replay(tmp_path, inner=_AsyncInner())
+
+    assert "anext_turn-only" in str(caught.value) or "coroutine" in str(caught.value)
+
+
 def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
     """The release coordinate, driven where it can be wrong.
 
