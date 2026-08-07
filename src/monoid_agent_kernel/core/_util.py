@@ -30,6 +30,21 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# THE canonical-JSON encoder -- one instance, not a settings convention. Every digest in the tree
+# (`canonical_sha256`, the keyed variant, the model-call replay key) and every byte a payload
+# record stores for reassembly encode through this object. Two instances with equal settings are
+# a resemblance: nothing stops one growing an option the other lacks, and the first divergence
+# silently unkeys a corpus whose records no longer re-encode to the bytes their digests were
+# taken over. `tests/test_model_payloads_schema.py` pins the sharing by identity (`is`).
+CANONICAL_JSON_ENCODER = json.JSONEncoder(
+    ensure_ascii=False,
+    allow_nan=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    check_circular=True,
+)
+
+
 def _canonical_bytes(payload: dict[str, Any], drop: tuple[str, ...]) -> bytes:
     """``payload`` as canonical JSON bytes, minus the ``drop`` keys.
 
@@ -39,13 +54,7 @@ def _canonical_bytes(payload: dict[str, Any], drop: tuple[str, ...]) -> bytes:
     canonical = dict(payload)
     for key in drop:
         canonical.pop(key, None)
-    return json.dumps(
-        canonical,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return CANONICAL_JSON_ENCODER.encode(canonical).encode("utf-8")
 
 
 def canonical_sha256(payload: dict[str, Any], *, drop: tuple[str, ...] = ()) -> str:

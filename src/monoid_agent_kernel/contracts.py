@@ -137,7 +137,7 @@ from monoid_agent_kernel.core.model_stream import (
 
 # Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
 # it names the provider vocabulary it drives; see the module docstring.
-from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_call import ModelCallRunner, SettledModelCall
 
 # One validated model call: dispatch + validate + bounded explicit repair, outside any loop.
 from monoid_agent_kernel.validated_call import (
@@ -382,6 +382,7 @@ __all__ = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    "SettledModelCall",
     "ValidatedCallRunner",
     "ValidatedCallResult",
     "AttemptDeltaConsumer",

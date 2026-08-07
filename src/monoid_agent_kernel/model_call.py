@@ -26,7 +26,6 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
-import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +33,7 @@ from copy import copy
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
+from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     abandon_unwaited_call,
@@ -46,6 +46,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.model_io import (
+    MAX_MODEL_PAYLOAD_BYTES,
     ModelCallReceipt,
     ModelIOSubscription,
     destination_digest,
@@ -110,8 +111,9 @@ for the same reason. Two jobs, one tag:
   retire a corpus that a change has invalidated.
 
 Not inside :func:`_digest`: that function's contract is "the canonical-JSON digest of `payload`",
-its tests are about the encoder, and a prefix fed to the hasher would bypass `_CANONICAL_ENCODER`
-and break the twin invariant the comment beside it guards.
+its tests are about the encoder, and a prefix fed to the hasher would bypass
+`CANONICAL_JSON_ENCODER` and break the shared-instance invariant its comment in `core/_util.py`
+guards.
 """
 
 
@@ -153,25 +155,25 @@ def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
     return {_PROMPT_DIGEST_GENERATION: _prompt_terms(request)}
 
 
-# Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
-# request (base64 image parts ride in ``messages``) and far below the point where a deliberately
-# shared payload could expand without end.
-_MAX_DIGEST_BYTES = 4 * 1024 * 1024
-
-# The settings ``core._util.canonical_sha256`` serializes with, and the same object does the
-# encoding and the hashing here. A guard that checks one encoding while another does the hashing
-# is exactly how a payload once passed validation and then raised mid-hash.
-_CANONICAL_ENCODER = json.JSONEncoder(
-    ensure_ascii=False,
-    allow_nan=False,
-    sort_keys=True,
-    separators=(",", ":"),
-    check_circular=True,
-)
 
 
-def _digest(payload: dict[str, Any]) -> str:
-    """The canonical-JSON digest of `payload`, or `""` when canonical JSON cannot carry it.
+@dataclass(frozen=True)
+class _DigestResult:
+    """What the encoder said about one payload: a key, or a named refusal.
+
+    ``status`` is the value ``ModelCallReceipt.digest_status`` records for the request key, minus
+    the two members only other actors can produce (``withheld`` is a capture policy's, and
+    ``not_reached`` is the boundary check's). The pair travels together so the two fields that
+    describe one decision cannot be computed twice and disagree.
+    """
+
+    digest: str = ""
+    status: str = "absent"
+    preimage: bytes | None = None
+
+
+def _encoded_digest(payload: dict[str, Any], *, want_preimage: bool = False) -> _DigestResult:
+    """The canonical-JSON digest of `payload`, or a named refusal when no key can be issued.
 
     Streamed through the standard encoder rather than normalized first. Four rounds of review went
     into a hand-written normalizer that reshaped anything into something hashable -- stringified
@@ -197,21 +199,73 @@ def _digest(payload: dict[str, Any]) -> str:
     statement about the payload.
 
     Output is capped so a payload built from shared references cannot expand without bound; passing
-    the cap also means no key, since a prefix would stand for the whole.
+    the cap also means no key, since a prefix would stand for the whole. The cap is
+    :data:`~monoid_agent_kernel.core.model_io.MAX_MODEL_PAYLOAD_BYTES`, set to the same number as
+    the default message-log bound so the band between a smaller digest cap and that bound -- which
+    once shipped calls that transmitted successfully and silently had no replay key -- cannot
+    reopen by drift. It is not the *wire's* bound: it covers the whole identity payload, so a
+    request can clear every run limit and still exceed it. Exceeding it is a *named* refusal
+    (``too_large``), distinct from ``absent``: one says the payload is too big to key, the other
+    says it is malformed, and a status that conflated them said neither. A refusal reports the first reason the
+    encoder hit; a payload both hostile and oversized is not diagnosed twice.
     """
 
     hasher = hashlib.sha256()
     encoded = 0
+    parts: list[bytes] = []
     try:
-        for chunk in _CANONICAL_ENCODER.iterencode(payload):
+        for chunk in CANONICAL_JSON_ENCODER.iterencode(payload):
             raw = chunk.encode("utf-8")
             encoded += len(raw)
-            if encoded > _MAX_DIGEST_BYTES:
-                return ""
+            if encoded > MAX_MODEL_PAYLOAD_BYTES:
+                return _DigestResult(status="too_large")
             hasher.update(raw)
+            if want_preimage:
+                parts.append(raw)
     except Exception:
-        return ""
-    return hasher.hexdigest()
+        return _DigestResult(status="absent")
+    return _DigestResult(
+        digest=hasher.hexdigest(),
+        status="ok",
+        # The exact bytes the hasher consumed -- not a re-encoding of `payload`, which a caller
+        # could have mutated by the time anyone looked. A refusal never carries bytes: a preimage
+        # for a key that was not issued would be an identity for a call that does not exist.
+        preimage=b"".join(parts) if want_preimage else None,
+    )
+
+
+def _digest(payload: dict[str, Any]) -> str:
+    """The canonical-JSON digest of `payload`, or `""` when no key was issued.
+
+    The refusal-collapsing view of :func:`_encoded_digest`, for the callers that only file or
+    compare keys -- the prompt digest has no status field to feed, and the tests that pin encoder
+    behavior pin it through here. The request-key path calls `_encoded_digest` directly, because
+    it must record *why* a key is missing, not just that it is.
+    """
+
+    return _encoded_digest(payload).digest
+
+
+@dataclass(frozen=True)
+class SettledModelCall:
+    """One settled call, as `ModelCallRunner.settled_sink` receives it.
+
+    ``receipt`` is always present -- success or failure, this is the audit fact. ``turn`` is the
+    normalized provider turn on success and ``None`` on failure, because a failed call has no
+    answer to record. ``request_preimage`` is the exact byte sequence ``request_digest`` was
+    hashed over, present only when the runner was asked to capture it
+    (`capture_request_preimage`) *and* a key was issued -- a refusal has no preimage because a
+    preimage for an unissued key would be an identity for a call that does not exist.
+
+    The preimage travels as the bytes the hasher consumed, never re-derived at the sink: the
+    key's ``provider`` term comes from a resolution the runner performed against the adapter at
+    call time, and re-resolving at the sink is the double-read that once let a receipt say
+    ``openai`` while its key was taken under ``gateway``.
+    """
+
+    receipt: ModelCallReceipt
+    request_preimage: bytes | None = None
+    turn: Any | None = None
 
 
 def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
@@ -525,12 +579,12 @@ class ModelCallRunner:
     Identifying the call is not: `prompt_digest` and `request_digest` are computed on every call,
     before anything looks at this field, because they describe the call whether or not anyone is
     watching. That costs two canonical-JSON encodes and two SHA-256 passes over the serialized
-    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. An `AgentLoop` with no model-I/O
+    prompt per call, which is why `MAX_MODEL_PAYLOAD_BYTES` bounds it. An `AgentLoop` with no model-I/O
     subscriptions still pays that; anyone trimming the cost should start there and not expect this
     field to gate it."""
 
-    receipt_sink: Callable[[ModelCallReceipt], None] | None = None
-    """Where a settled receipt is recorded, as opposed to *delivered*.
+    settled_sink: Callable[[SettledModelCall], None] | None = None
+    """Where a settled call is recorded, as opposed to *delivered*.
 
     Separate from `subscriptions` rather than a subscription of its own, for three reasons. A
     subscription is governed by a `CapturePolicy`, and the narrowing a `none`-mode policy applies
@@ -544,8 +598,24 @@ class ModelCallRunner:
     for successful calls only. A ledger built on it would record everything except the failures --
     which are exactly what an audit trail is for.
 
+    ONE sink receiving the whole settled call -- receipt, optional preimage, optional turn --
+    rather than a receipt sink beside a payload sink. Two sinks would put the receipt ledger and
+    the payload corpus for one call in two deliveries, and the recorder behind them could only
+    keep their line indices agreeing by cooperation across two lock acquisitions -- the exact
+    index race W6-1 fixed *inside* the recorder, reopened one seam higher. A superset delivery
+    makes the agreement structural: one call, one delivery, one reservation. (This superseded the
+    unreleased `receipt_sink`, whose guarantees the tests re-prove on this seam.)
+
     Read once per call, like `subscriptions`, and expected not to raise; one that does is contained
     the same way an observer is."""
+
+    capture_request_preimage: bool = False
+    """Whether the sink's `SettledModelCall.request_preimage` is populated.
+
+    Off by default because the preimage is the encoded request -- up to `MAX_MODEL_PAYLOAD_BYTES`
+    held in memory per in-flight call -- and a sink that only files receipts (the ledger without
+    the payload corpus) should not pay for bytes it never reads. The wiring that enables the
+    payload recorder sets this; the digests themselves are computed either way."""
 
     def _effective_model(
         self,
@@ -701,6 +771,9 @@ class ModelCallRunner:
             model=provisional_model,
             provider_name=provider,
         )
+        # Assigned once the request key is taken; a failure before that point hands the sink
+        # `None`, which is truthful -- there is no preimage for a call that never got a key.
+        request_preimage: bytes | None = None
         with collect_retry_reports() as progress:
             # Whether the kernel got as far as reaching into the adapter, which is what `attempts`
             # counts. A run already cancelled or past its deadline is refused below without the
@@ -731,8 +804,8 @@ class ModelCallRunner:
                     request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
                 where, destination_status = self._resolved_destination(model, adapter)
-                request_digest = _digest(
-                    _request_payload(
+                digest_result = _encoded_digest(
+                    payload=_request_payload(
                         request,
                         model,
                         # The RESOLVED provider, not the raw declaration `provider_name` records
@@ -751,18 +824,21 @@ class ModelCallRunner:
                         # A key whose preimage the record contradicts is the exact defect that took
                         # the destination out of this payload.
                         provider=resolved_provider_name(adapter, model, declared=provider) or "",
-                    )
+                    ),
+                    want_preimage=self.capture_request_preimage,
                 )
+                request_preimage = digest_result.preimage
                 receipt = replace(
                     receipt,
                     context=normalized_context,
                     model=model,
                     prompt_digest=_digest(_prompt_payload(request)),
-                    request_digest=request_digest,
+                    request_digest=digest_result.digest,
                     digest_generation=_REQUEST_DIGEST_GENERATION,
-                    # Read off the key rather than recomputed: the two cannot disagree about
-                    # whether one was issued if only one of them decides.
-                    digest_status="ok" if request_digest else "absent",
+                    # Key and status arrive as one result object: the two fields describing one
+                    # encoder decision cannot be computed twice and disagree, and the encoder is
+                    # the only party that can tell `absent` from `too_large`.
+                    digest_status=digest_result.status,
                     destination_status=destination_status,
                     destination_digest=destination_digest(where),
                 )
@@ -786,7 +862,13 @@ class ModelCallRunner:
                 if not reached_adapter:
                     failed = replace(failed, attempts=0)
                 with contextlib.suppress(Exception):
-                    self._publish(request, None, failed, elapsed_ms=self._ms_since(started))
+                    self._publish(
+                        request,
+                        None,
+                        failed,
+                        elapsed_ms=self._ms_since(started),
+                        request_preimage=request_preimage,
+                    )
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
@@ -797,6 +879,7 @@ class ModelCallRunner:
                 turn,
                 self._completed(receipt, turn, retried=progress.retried),
                 elapsed_ms=self._ms_since(started),
+                request_preimage=request_preimage,
             )
         return turn, settled
 
@@ -849,6 +932,7 @@ class ModelCallRunner:
         receipt: ModelCallReceipt,
         *,
         elapsed_ms: int,
+        request_preimage: bytes | None = None,
     ) -> ModelCallReceipt:
         """Deliver the settled receipt to observers, then record it, on every exit.
 
@@ -875,26 +959,35 @@ class ModelCallRunner:
                     subscriptions=self.subscriptions,
                 )
         finally:
-            self._record(settled)
+            self._record(settled, request_preimage, turn)
         return settled
 
-    def _record(self, receipt: ModelCallReceipt) -> None:
-        """Hand the receipt to `receipt_sink`, absorbing whatever it does.
+    def _record(
+        self, receipt: ModelCallReceipt, request_preimage: bytes | None, turn: Any | None
+    ) -> None:
+        """Hand the settled call to `settled_sink`, absorbing whatever it does.
 
         The same containment `dispatch_model_call` gives an observer, and for a sharper version of
         the same reason: a sink is typically a durable writer, so "the disk is full" must not
         become "the answer is discarded" -- nor "this provider failure is now a RuntimeError",
         which is what an unguarded call on the failure path would do to the taxonomy an escaping
         `ModelAdapterError` carries.
+
+        The `SettledModelCall` is assembled inside the containment: its constructor is trivial
+        today, and the guard is what keeps that an implementation detail rather than a promise.
         """
 
-        sink = self.receipt_sink
+        sink = self.settled_sink
         if sink is None:
             return
         try:
-            sink(receipt)
+            sink(
+                SettledModelCall(
+                    receipt=receipt, request_preimage=request_preimage, turn=turn
+                )
+            )
         except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
-            _LOGGER.debug("model call receipt sink failed", exc_info=True)
+            _LOGGER.debug("model call settled sink failed", exc_info=True)
 
     async def _adrive(
         self,

@@ -18,7 +18,6 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
-    ModelCallReceipt,
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -30,9 +29,12 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
+    SettledModelCall,
     _digest,
+    _encoded_digest,
     _prompt_payload,
     _request_payload,
 )
@@ -2046,14 +2048,16 @@ def test_a_truncated_payload_gets_no_replay_key_rather_than_a_misleading_one() -
     call. Refusing to issue a key is the safe half: the call still happens, it is just not
     replayable.
     """
+    # Sized past MAX_MODEL_PAYLOAD_BYTES -- the cap is the wire's since W6-2, so the old
+    # million-int payload (~6.9 MB) is now legitimately keyable and no longer exercises this.
     huge = ModelRequest(
-        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_000_100))},)
+        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_300_000))},)
     )
     huge_but_different = ModelRequest(
         instruction="hi",
         system_prompt="s",
         tools=(),
-        messages=({"v": list(range(1_000_099)) + [-999]},),
+        messages=({"v": list(range(1_299_999)) + [-999]},),
     )
 
     assert _digest(_prompt_payload(huge)) == ""
@@ -3254,7 +3258,7 @@ class _RaisingAdapter:
         )
 
 
-def test_a_failed_call_reaches_the_receipt_sink_the_caller_never_receives_one_from() -> None:
+def test_a_failed_call_reaches_the_settled_sink_the_caller_never_receives_one_from() -> None:
     """The sink exists because `acall`'s return value is not a delivery channel for a failure.
 
     A failed call publishes its receipt and then re-raises (see `acall`), and it does not stamp the
@@ -3263,23 +3267,25 @@ def test_a_failed_call_reaches_the_receipt_sink_the_caller_never_receives_one_fr
     only the calls that succeeded, which is the opposite of what an audit trail is for.
 
     Both halves are asserted from one runner: the success arm proves the sink is not a
-    failure-only hook, and the failure arm proves the receipt carries the classification the
-    exception did.
+    failure-only hook (and hands over the turn), and the failure arm proves the receipt carries
+    the classification the exception did -- and no turn, because there is none.
     """
-    recorded: list[ModelCallReceipt] = []
-    runner = ModelCallRunner(adapter=SyncAdapter(), receipt_sink=recorded.append)
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(adapter=SyncAdapter(), settled_sink=recorded.append)
     turn, returned = asyncio.run(runner.acall(REQUEST))
 
     assert turn.final_text == "answer"
-    assert [receipt.request_digest for receipt in recorded] == [returned.request_digest]
-    assert recorded[0].error_code == ""
+    assert [call.receipt.request_digest for call in recorded] == [returned.request_digest]
+    assert recorded[0].receipt.error_code == ""
+    assert recorded[0].turn is turn
 
-    failing = ModelCallRunner(adapter=_RaisingAdapter(), receipt_sink=recorded.append)
+    failing = ModelCallRunner(adapter=_RaisingAdapter(), settled_sink=recorded.append)
     with pytest.raises(ModelAdapterError):
         asyncio.run(failing.acall(REQUEST))
 
     assert len(recorded) == 2
-    failed = recorded[1]
+    failed = recorded[1].receipt
+    assert recorded[1].turn is None
     assert failed.error_code != ""
     assert failed.provider_error_code == "rate_limit"
     assert failed.http_status == 429
@@ -3298,7 +3304,7 @@ def test_the_sink_is_handed_the_settled_receipt_and_not_the_one_before_dispatch(
     that says a consumer was denied the content it asked for -- an audit record that always reads
     "nothing was withheld" is worse than one that omits the question.
     """
-    recorded: list[ModelCallReceipt] = []
+    recorded: list[SettledModelCall] = []
     observer = RecordingObserver()
     runner = ModelCallRunner(
         adapter=SyncAdapter(),
@@ -3310,15 +3316,15 @@ def test_the_sink_is_handed_the_settled_receipt_and_not_the_one_before_dispatch(
                 policy=CapturePolicy(mode="redacted", restored_without_redactor=True),
             ),
         ),
-        receipt_sink=recorded.append,
+        settled_sink=recorded.append,
     )
     _turn, returned = asyncio.run(runner.acall(REQUEST))
 
     assert observer.captures[0].was_downgraded is True
     assert returned.capture_downgrades == 1
     assert len(recorded) == 1
-    assert recorded[0].capture_downgrades == 1
-    assert recorded[0].latency_ms == returned.latency_ms
+    assert recorded[0].receipt.capture_downgrades == 1
+    assert recorded[0].receipt.latency_ms == returned.latency_ms
 
 
 def test_a_raising_sink_does_not_fail_a_call_the_provider_was_paid_for() -> None:
@@ -3330,18 +3336,20 @@ def test_a_raising_sink_does_not_fail_a_call_the_provider_was_paid_for() -> None
     threw. That second half is the one a bare try/except around the call would not catch.
     """
 
-    def explode(receipt: ModelCallReceipt) -> None:
-        del receipt
+    def explode(call: SettledModelCall) -> None:
+        del call
         raise RuntimeError("ledger is on fire")
 
     turn, receipt = asyncio.run(
-        ModelCallRunner(adapter=SyncAdapter(), receipt_sink=explode).acall(REQUEST)
+        ModelCallRunner(adapter=SyncAdapter(), settled_sink=explode).acall(REQUEST)
     )
     assert turn.final_text == "answer"
     assert receipt.error_code == ""
 
     with pytest.raises(ModelAdapterError) as failure:
-        asyncio.run(ModelCallRunner(adapter=_RaisingAdapter(), receipt_sink=explode).acall(REQUEST))
+        asyncio.run(
+            ModelCallRunner(adapter=_RaisingAdapter(), settled_sink=explode).acall(REQUEST)
+        )
     assert failure.value.provider_error_code == "rate_limit"
     assert failure.value.http_status == 429
     assert failure.value.retryable is True
@@ -3366,14 +3374,14 @@ def test_a_dispatch_that_raises_still_records_the_call_it_could_not_deliver(
         raise RuntimeError("dispatch is broken")
 
     monkeypatch.setattr(model_call_module, "dispatch_model_call", explode)
-    recorded: list[ModelCallReceipt] = []
+    recorded: list[SettledModelCall] = []
     observer = RecordingObserver()
     runner = ModelCallRunner(
         adapter=SyncAdapter(),
         subscriptions=(
             ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
         ),
-        receipt_sink=recorded.append,
+        settled_sink=recorded.append,
     )
 
     with pytest.raises(RuntimeError, match="dispatch is broken"):
@@ -3382,7 +3390,121 @@ def test_a_dispatch_that_raises_still_records_the_call_it_could_not_deliver(
     # Delivery never happened, and the record still names the call.
     assert observer.captures == []
     assert len(recorded) == 1
-    assert recorded[0].request_digest
+    assert recorded[0].receipt.request_digest
     # The receipt a broken dispatch leaves behind is the pre-delivery one, so the count it could
     # not resolve stays at its floor rather than being invented.
-    assert recorded[0].capture_downgrades == 0
+    assert recorded[0].receipt.capture_downgrades == 0
+
+
+# --- One size gate, three named refusals (W6-2) ---------------------------------------------------
+
+
+def test_a_payload_between_the_old_digest_cap_and_the_wire_cap_gets_a_key() -> None:
+    """4 MiB was the digest cap while 8,000,000 bytes was the message-log cap, so the band between
+    them shipped calls that transmitted successfully and silently had no replay key. One constant
+    now gates both: what can be sent can be keyed."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * (5 * 1024 * 1024), tools=())
+        )
+    )
+    assert receipt.request_digest != ""
+    assert receipt.digest_status == "ok"
+
+
+def test_a_payload_over_the_ceiling_is_a_named_condition_not_a_missing_key() -> None:
+    """`absent` used to cover both "cannot be encoded" (a defect in the payload) and "over the cap"
+    (an operational condition, answered by raising the cap or offloading). A consumer holding a
+    keyless record could not tell which one it was looking at."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * 8_000_001, tools=())
+        )
+    )
+    assert receipt.request_digest == ""
+    assert receipt.digest_status == "too_large"
+
+
+def test_an_unencodable_payload_is_still_absent_so_the_distinction_is_real() -> None:
+    """The split would be cosmetic if every refusal drifted to the new value."""
+    hostile = _encoded_digest({"v": 10**5000})
+    assert (hostile.digest, hostile.status) == ("", "absent")
+
+    oversized = _encoded_digest({"v": "x" * 8_000_001})
+    assert (oversized.digest, oversized.status) == ("", "too_large")
+
+
+def test_a_payload_under_the_old_cap_keeps_the_digest_it_always_had() -> None:
+    """Witness, not red: the cap moved up, which only turns refusals into keys. A payload that had
+    a digest under the old cap must keep it byte-for-byte, or the raise would rekey every recorded
+    corpus. Recomputed through `canonical_sha256` rather than compared to a golden constant, so the
+    thing pinned is the encoding itself."""
+    payload = _request_payload(REQUEST, ModelConfig(), provider="fake")
+
+    assert _digest(payload) == canonical_sha256(payload)
+
+
+# --- The preimage the sink receives (W6-2) --------------------------------------------------------
+
+
+def test_the_preimage_the_sink_receives_is_the_bytes_the_key_was_hashed_over() -> None:
+    """D-a's whole content: the sink is handed the encoder's own output, not a re-derivation it
+    would have to reconstruct from the receipt -- which it cannot, because the key's provider term
+    came from an adapter resolution only the call itself performed."""
+    import hashlib
+
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    _turn, receipt = asyncio.run(runner.acall(REQUEST))
+
+    call = recorded[0]
+    assert call.request_preimage is not None
+    assert hashlib.sha256(call.request_preimage).hexdigest() == receipt.request_digest
+    assert receipt.digest_status == "ok"
+
+
+def test_a_failed_call_still_hands_the_sink_its_preimage() -> None:
+    """The corpus wants "what was asked" for failures too; the request side of a failed call is
+    exactly as recordable as a successful one's, because the key is taken before dispatch."""
+    import hashlib
+
+    recorded: list[SettledModelCall] = []
+    failing = ModelCallRunner(
+        adapter=_RaisingAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(failing.acall(REQUEST))
+
+    call = recorded[0]
+    assert call.turn is None
+    assert call.request_preimage is not None
+    assert hashlib.sha256(call.request_preimage).hexdigest() == call.receipt.request_digest
+
+
+def test_a_call_refused_before_its_key_hands_the_sink_no_preimage() -> None:
+    """A boundary crossed before the digest means no key and therefore no preimage -- `None` here
+    is truthful, not a capture failure."""
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    with pytest.raises(RunTimeout):
+        asyncio.run(runner.acall(REQUEST, deadline=time.monotonic() - 1.0))
+
+    assert len(recorded) == 1
+    assert recorded[0].request_preimage is None
+    assert recorded[0].receipt.digest_status == "not_reached"
+
+
+def test_the_preimage_is_not_captured_unless_asked_for() -> None:
+    """The knob exists so a ledger-only run does not hold up to 8 MB per in-flight call for bytes
+    its sink never reads. The digests themselves are computed either way."""
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(adapter=SyncAdapter(), settled_sink=recorded.append)
+    _turn, receipt = asyncio.run(runner.acall(REQUEST))
+
+    assert recorded[0].request_preimage is None
+    assert receipt.request_digest != ""
+    assert receipt.digest_status == "ok"

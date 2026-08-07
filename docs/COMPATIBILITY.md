@@ -57,6 +57,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
 | `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
+| `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
@@ -204,6 +205,15 @@ the two shapes are deliberately not interchangeable — a recorded line does not
 `ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.
 Adding a field to `ModelCallReceipt` therefore does not change this artifact; adding one *here*
 is a schema change like any other, because `additionalProperties` is false.
+
+`model_payloads.jsonl` follows the same two rules (optional; single-namespace, literal enum) and
+adds a third that is this artifact's whole contract: every `model_request` record must reassemble
+to the exact preimage of its `request_digest`, and `monoid validate` recomputes that per record —
+resolving chunk references from inline records and the `model_payloads/` directory, re-encoding,
+and comparing hashes. Unreferenced files in the chunk directory are not integrity issues (a
+crashed write may orphan one; garbage collection is a separate concern), but a referenced chunk
+that fails its hash, or a request record that does not reassemble, is. The record kinds share one
+`oneOf` schema the way `model-content.v1`'s four kinds do.
 
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,

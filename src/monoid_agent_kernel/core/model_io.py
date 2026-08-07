@@ -399,13 +399,28 @@ def redacted_or_none(
         return None
 
 
-DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld")
+# The one ceiling the digest gate and the payload-recording gate share: whatever gets a key gets
+# recorded, and what exceeds it is refused whole -- never truncated. Decimal, agreeing with
+# ``AgentRunSpec.max_message_log_bytes`` so the two numbers cannot drift, but that knob is a
+# different owner's and measures a different thing: it sums a run's ``messages``, while this
+# bounds one call's whole identity payload -- system prompt, tool definitions, instruction and
+# observations included. So a request can still pass every run limit and exceed this; what the
+# shared number buys is that such a call is now a NAMED condition (``too_large``) rather than an
+# unexplained ``absent``, not that the case is gone. Raising this only turns refusals into keys;
+# lowering it orphans every corpus recorded above the new value, so it moves up or not at all.
+MAX_MODEL_PAYLOAD_BYTES = 8_000_000
+
+DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld", "too_large")
 """Why ``ModelCallReceipt.request_digest`` holds what it holds.
 
-``absent`` means no key was issued -- the payload could not be canonically encoded, or it exceeded
-the size cap. ``withheld`` means one was issued and a ``none``-mode policy removed it. ``not_reached``
-means the call was refused before a key was computed at all. Those were one value before, and a
-consumer holding a keyless record could not tell a defect from a policy from a boundary.
+``absent`` means no key was issued because canonical JSON could not carry the payload -- a defect
+in the payload. ``too_large`` means no key was issued because the payload exceeded
+:data:`MAX_MODEL_PAYLOAD_BYTES` -- an operational condition rather than a defect, though not one an
+operator can configure their way out of: that constant is a build-time value, and it bounds the
+whole identity payload rather than the message log the run limits bound, so a request can pass
+every limit and still be refused a key. The two were one value, and a consumer holding a keyless
+record could not tell a payload to file a bug about from one to make smaller. ``withheld`` means a key was issued and a ``none``-mode policy
+removed it. ``not_reached`` means the call was refused before a key was computed at all.
 """
 
 DESTINATION_STATUSES = (

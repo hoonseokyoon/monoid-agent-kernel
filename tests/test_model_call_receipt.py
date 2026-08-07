@@ -207,6 +207,19 @@ def test_with_error_preserves_everything_else() -> None:
 # --- serialization --------------------------------------------------------------------------
 
 
+def test_a_too_large_receipt_survives_the_round_trip() -> None:
+    """Self-evidencing red for the fifth digest status. The vocabulary pins beside this file are
+    construction-enumerated -- they iterate the tuples -- so a member added to `DIGEST_STATUSES`
+    passes them without any writer ever producing it. This is the write that proves the value is
+    accepted on both sides of the wire."""
+    receipt = ModelCallReceipt(digest_status="too_large")
+
+    restored = ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json())))
+
+    assert restored.digest_status == "too_large"
+    assert restored.request_digest == ""
+
+
 def test_json_round_trip_preserves_every_field() -> None:
     """Every field, enumerated by construction -- so a new one that is not added here leaves the
     test green while its name becomes a lie. The guard below turns that failure mode into a

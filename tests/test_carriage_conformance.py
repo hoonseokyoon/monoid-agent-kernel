@@ -6619,6 +6619,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # retries as one clean call.
             "core/model_calls.py",
             "core/model_io.py",
+            # Joined in W6-2: the replay corpus's response body carries the flag because a
+            # replayed turn must answer with what the original turn declared -- a corpus that
+            # dropped it would replay a retried call as a clean one.
+            "core/model_payloads.py",
             # Joined in the carriage sweep, with core/projections.py and recorder.py: the two
             # status readers carry the parked fact and drop it at terminal, like the event.
             "core/projections.py",
@@ -6830,6 +6834,11 @@ EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
         # already. The anchor is the clause naming the hazard, absent at 41c8550 and present
         # exactly once now.
         "never the preimage of a digest it also records",
+        # W6-2: the corpus's reassembly contract. Not "model_payloads.jsonl" (stays green after
+        # the paragraph stating the byte-identity rule is deleted) and not "reassemble" alone
+        # (this suite and the validator prose would satisfy it). The anchor is the clause that
+        # states the contract, absent at 5ceaa93 and present exactly once now.
+        "reassembles to the exact bytes the key was taken over",
     ),
     "docs/OBSERVABILITY.md": (
         "metrics.updated",

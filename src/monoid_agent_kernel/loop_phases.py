@@ -114,6 +114,7 @@ class LoopBootstrapper:
             status_file=loop.status_file,
             model_content_file=loop.model_content_file,
             model_calls_file=loop.model_calls_file,
+            model_payload_file=loop.model_payload_file,
             # Resolved once here rather than per record: the recorder owns the whole ledger
             # envelope, and this is the same proven-lineage root the model-stream context uses.
             root_run_id=loop._validated_root_run_id(),
@@ -181,7 +182,14 @@ class LoopBootstrapper:
             # A bound method, not a closure: the recorder already owns the run id, the root, the
             # switch and the counter, so there is nothing for a closure to capture. Gated on both
             # sides -- here and in the method -- the same way ``recorder.open_model_stream`` is.
-            receipt_sink=recorder.record_model_call if loop.model_calls_file else None,
+            settled_sink=(
+                recorder.record_settled_call
+                if (loop.model_calls_file or loop.model_payload_file)
+                else None
+            ),
+            # The corpus needs the exact bytes the key was hashed over; the ledger alone does
+            # not, and must not pay the per-call buffering for them.
+            capture_request_preimage=loop.model_payload_file,
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.

@@ -568,9 +568,17 @@ and is the exact replay key. Both are computed on the **raw** request, before an
 capture policy, so consumers on different policies agree on the identity of what the provider
 was sent. An empty digest means *no key was issued* (the payload could not be canonically
 encoded, or exceeded the size cap) and must never be read as a key. `digest_status` says which
-of four things happened, because the empty string used to be the answer to all of them:
-`absent` (no key could be issued), `withheld` (one was, and a `none`-mode capture policy removed
-it), `not_reached` (the call was refused before a key was computed), and `ok`.
+of five things happened, because the empty string used to be the answer to all of them:
+`absent` (canonical JSON could not carry the payload — a defect in the payload), `too_large`
+(the payload exceeded `MAX_MODEL_PAYLOAD_BYTES`). The cap is set to the same number as the
+default `max_message_log_bytes`, but it bounds one call's whole identity payload — system prompt,
+tool definitions, instruction and observations included — while the run limit sums only the
+message log and the resolved-wire guard runs only for a multimodal adapter, so a request can pass
+every run limit and still be refused a key. What the shared number buys is that such a call is
+*named* rather than reported as `absent`, not that the case is gone; the cap is a build-time
+constant, and a `too_large` call contributes no request record to the corpus at all), `withheld`
+(a key was issued and a `none`-mode capture policy removed it), `not_reached` (the call was
+refused before a key was computed), and `ok`.
 `digest_generation` records the domain the key was taken in, so a consumer holding a key can tell
 which rules produced it.
 
@@ -715,6 +723,75 @@ derived:
 `call_index` counts within one activation and restarts at zero when a durable run reopens its
 directory and appends to the ledger it already has. It is a gap detector, not a join key: a
 restart is self-evident because the index drops while `recorded_at` advances.
+
+`AgentLoop.model_payload_file=True` writes the optional private replay corpus:
+`model_payloads.jsonl` (`monoid.model-payloads.v1`; kinds `chunk`, `model_request`,
+`model_response`) plus a `model_payloads/` directory of content-addressed files for values past
+256 KiB. It is independent of every other switch — in particular it does not join the streaming
+selection, so a corpus-only run keeps non-streamed cancellation granularity — and a subagent
+inherits it, recording into its own run directory with `root_run_id` as the join. Unlike the
+ledger beside it, this artifact is **content**: request records carry the conversation and the
+tool definitions, response records carry model output and provider reasoning artifacts, and the
+whole file inherits the run directory's private access boundary.
+
+A `model_request` record is a **recipe, not a copy**: every value at least as large as the
+reference that would replace it is lifted out as a content-addressed chunk -- per tool definition,
+per message and per observation. Tools and history are resent unchanged turn after turn, so those
+two carry the deduplication; observations are a per-turn delta, elementwise for the within-turn
+half of the argument, so one oversized tool result does not drag its siblings onto the line with
+it. The record verifiably
+reassembles to the exact bytes the key was taken over — substitute each chunk's decoded value,
+re-encode through the canonical encoder, and the SHA-256 equals `request_digest`. The writer
+performs that reassembly *before* writing and falls back to a verbatim payload (`refs: false`,
+never walked) when anything disagrees; `monoid validate` re-verifies every request record against
+its own digest. Caller data shaped like a chunk reference does not reach that arm: a reference is
+a fixed size, so anything that could be one is large enough to be lifted into a chunk, and a
+resolved value is never re-walked. Records are set-keyed by digest — a run that issues the same request twice writes
+one request record, and both ledger lines join to it — while `model_response` records are
+sequence-keyed by `call_index`, because models are not functions: every answer is recorded, and
+choosing which one a replay returns is the replay adapter's policy, not the corpus's. Both keys
+are **per activation**, like the ledger's: a durable reopen starts a fresh recorder, so a
+re-issued in-flight request appends a second request record and `call_index` restarts at zero. The
+two records share a digest and a payload, not a line — every record carries its own `recorded_at`
+— so a consumer collapsing duplicates keys on `request_digest` (and on `sha256` for chunks), never
+on the line. What joins a response record to its ledger line across that boundary is the
+pair — the two arms record one call under one lock and read the clock once, so `call_index` *and*
+`recorded_at` agree by construction. A failed
+call records its request — when a key was issued for it — and no response; the ledger line carries
+its taxonomy. A call refused a key records no *request* either: the preimage it would stand for
+has no key to be filed under. Whether its **answer** is recorded depends on whether there was one,
+and the three keyless statuses differ:
+
+- `absent` and `too_large` are refusals of the *key*, not of the call — the request is sent, the
+  model answers, and that answer lands as a response record with an empty `request_digest`. So a
+  keyless call is not a call whose content stays off disk, and this artifact's retention
+  classification does not change with `digest_status`.
+- `not_reached` means the call was refused before a key was computed, so it never settles a turn
+  and contributes nothing to the corpus at all; the ledger line is its only trace.
+(`withheld` never appears on either sidecar: the capture narrowing that produces it builds a
+per-subscription copy, exactly as it does for `redaction_digest` above, and the recording seam sees
+the un-narrowed receipt.) A response the canonical encoder cannot carry, one past
+`MAX_MODEL_PAYLOAD_BYTES`, or one whose assembled record line nests deeper than this artifact's own
+reader parses, costs its own record a typed `unrecorded_reason` — never a truncation, and never a
+dropped line.
+
+Whether media is *present* depends on the adapter, and an operator sizing or classifying this
+artifact should read that first. When the adapter declares `supports_multimodal` the loop resolves
+by-reference attachments into inline bytes **before** it builds the request, so the preimage — and
+therefore the request record — carries the image itself, base64 and all: the largest thing this
+artifact can hold, and one more reason it is content-classified. A text-only adapter never reaches
+that resolution, so its corpus carries references and no image bytes. The `observations` term is
+by-reference either way, because it is hashed as the tool returned it; a `workspace:` reference is
+not content-addressed, so re-reading one later can yield different bytes under a digest that has
+not changed.
+
+Two deliberate absences. `ModelTurn.raw` is not recorded: it has no shape contract and no
+consumer outside the provider layer, so a replayed turn answers `raw={}` — an honest statement
+that this is a replay, not a gap. And the configured endpoint is absent here for the same
+structural reason as in the ledger: the preimage is built from the replay key's own projection,
+which excludes `gateway_url` by construction. `reasoning` *is* recorded, encrypted entries
+included, because the loop re-injects it into the next by-value turn — a corpus without it would
+derail one turn after every replayed answer.
 
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
