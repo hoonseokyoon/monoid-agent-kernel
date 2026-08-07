@@ -416,6 +416,13 @@ class RunnerBackend:
     # (`model_calls.jsonl`) and the private replay corpus (`model_payloads.jsonl` plus its
     # chunk directory). Keyword-only because the positional argument list that predates them
     # is a pinned public surface, like ``llm_gateway_provider`` above.
+    #
+    # The embedding application decides the entitlement here too, with one difference worth
+    # stating: the corpus is content-classified like ``model_content_file``, but unlike it has no
+    # shipped reader -- no projection, no hydration, no HTTP route serves it -- so filesystem
+    # access to the run directory is the only control over it, and there is no retention verb.
+    # These are also deployment-wide: a multi-tenant backend records every tenant's runs or none,
+    # since ``BackendRunRequest`` carries no per-run override.
     model_calls_file: bool = field(default=False, kw_only=True)
     model_payload_file: bool = field(default=False, kw_only=True)
     # Process-local, root-multiplexed presentation channel. Its observer receives parent and child

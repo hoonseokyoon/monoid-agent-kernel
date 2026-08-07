@@ -108,7 +108,7 @@ main.add_command(builder_group)
         "Load run-specific values from a JSON file (AgentRunSpec.to_json shape). "
         "When set, individual spec flags are ignored; runtime flags "
         "(runtime config, gateway URLs/tokens, --event-sink-module, --stream-json, "
-        "--no-status-file, --tool-module) still apply."
+        "--no-status-file, --tool-module, --model-calls-file, --model-payload-file) still apply."
     ),
 )
 @click.option("--agent-definition-file", type=click.Path(path_type=Path), default=None)
@@ -226,8 +226,9 @@ main.add_command(builder_group)
     is_flag=True,
     help=(
         "Record the private replay corpus (model_payloads.jsonl plus its chunk directory). "
-        "Carries request and response content; inspect with `monoid validate`, collect with "
-        "`monoid gc`."
+        "Carries request and response content in full, including what --redact-path masks from "
+        "events, and grows with the conversation with no retention verb. Verify with "
+        "`monoid validate`; sweep its crash litter with `monoid gc --apply`."
     ),
 )
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")

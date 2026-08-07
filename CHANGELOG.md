@@ -9,17 +9,42 @@ out in commit messages and here.
 
 ### Added — the recording switches are reachable from the shipped shapes
 
-- **`monoid run --model-calls-file` / `--model-payload-file`, and the matching keyword-only
-  `RunnerBackend(model_calls_file=..., model_payload_file=...)` fields.** The per-call ledger
-  and the private replay corpus existed only as `AgentLoop` keyword arguments — an embedder
-  could record, no shipped shape could — while the same CLI already shipped `monoid gc` and
-  `monoid validate`, consumer verbs for artifacts nothing it ran could produce. The backend
-  carries the booleans exactly as it carries `model_content_file`: into the submitted run and
-  into every activation recovery rebuilds, pinned by the ledger's own activation-restart
-  signature (`call_index` back at zero, both zeros recorded). Both flags stay opt-in — the
-  corpus is content-classified — and the omission half is pinned too: a run without the flags
-  writes neither file. The backend fields are keyword-only because the positional argument
-  lists of `RunnerBackend` and `BackendLoopFactoryContext` are pinned compatibility surfaces.
+- **`--model-calls-file` / `--model-payload-file` on both `monoid run` and `monoid backend
+  serve`, and the matching keyword-only `RunnerBackend(model_calls_file=...,
+  model_payload_file=...)` fields.** The per-call ledger and the private replay corpus existed
+  only as `AgentLoop` keyword arguments — an embedder could record, no shipped shape could —
+  while the same CLI already shipped `monoid gc`, a consumer verb for an artifact nothing it ran
+  could produce, and `monoid validate`'s corpus arm beside it. All three surfaces land together,
+  as `--llm-gateway-provider` did, because a switch reachable from two of three leaves the
+  served deployment with the consumer verbs and no producer. The backend carries the booleans
+  exactly as it carries `model_content_file`: into the submitted run and into the activation
+  recovery rebuilds, pinned by the ledger's own activation-restart signature (`call_index` back
+  at zero, both zeros recorded). Each boolean is read when a host builds an activation, so it
+  describes the host, not the run — a run reclaimed by a node configured differently records
+  differently from there on. Both flags stay opt-in — the corpus is content-classified — and the
+  omission half is pinned too: a run without the flags writes neither file. Studio is
+  deliberately not wired; its egress toggle grants live delivery and the content sidecar, never
+  the corpus, and the Studio census test now enumerates both recording switches so that stays
+  true. The backend fields are keyword-only because the positional argument lists of
+  `RunnerBackend` and `BackendLoopFactoryContext` are pinned compatibility surfaces; note that
+  `BackendLoopFactoryContext`'s two new providers are *required* keyword arguments, following
+  `llm_gateway_provider_provider` — an embedder assembling that context directly (it is not part
+  of the supported public surface) must supply them.
+
+### Fixed — a sidecar somebody asked for and did not get says so
+
+- **All three verified-append sidecars now log one `WARNING` naming the artifact they will not
+  write, instead of a `debug` line nobody sees.** Each fails closed when its path is not a file
+  this process may append to — a planted link, or the second name a hardlink-deduplicating
+  backup leaves behind — which is right, and was silent: the run exited zero, reported
+  `completed`, and `monoid validate` called the directory clean, because each artifact is
+  optional. Worse, the refused file keeps whatever was there, so a reader could find another
+  run's records under this run's name. `WARNING` because these writers are opt-in — reaching
+  that line means somebody asked — and because Python's last-resort handler delivers exactly
+  that level to stderr for an operator who configured no logging, which is the shape `monoid
+  run` runs in. Once per activation, since the refusal was already terminal. The rule is bound
+  at every verified-open refusal rather than at the recorder's log sites, because
+  `model-content.jsonl` owns its own open in `core/model_content.py`.
 
 ### Added — the chunk directory's crash litter now has a collector
 
