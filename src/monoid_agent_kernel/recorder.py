@@ -795,7 +795,9 @@ class AgentRecorder:
         """Say, once, that an artifact this run was configured to produce stops here.
 
         Every writer below keeps a flag meaning "this artifact records nothing for the rest of the
-        activation", reachable through a refused open, a refused chunk, and a torn append. Setting
+        activation". The two sidecar arms reach it through a refused open, a refused chunk and a
+        torn append; the content flag has one door, a store that would not construct, and the
+        store's own further transitions live on its ``_disabled`` and its own logger. Setting
         one *is* the event an operator needs told -- the run still exits zero, and `monoid
         validate` still calls the directory clean, because each artifact is optional -- so the
         assignment and the announcement are one call, and the three doors below are the only places
@@ -982,7 +984,7 @@ class AgentRecorder:
                 # The detail stays at ``debug``. Promoting the level carried this ``exc_info`` up
                 # with it, and a rendered traceback names the absolute run directory -- run id and
                 # whatever the deployment's parents are called -- on the stderr of every embedder,
-                # which is the thing the sibling site twelve lines up refuses to do by name.
+                # which is exactly what ``_lose_artifact`` refuses to put in its message.
                 _LOGGER.debug("model content store initialization failed", exc_info=True)
                 self._lose_model_content_locked("it could not be opened")
                 return None

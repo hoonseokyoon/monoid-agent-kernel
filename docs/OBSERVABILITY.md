@@ -408,9 +408,9 @@ symlink or hard link planted where a reopened run expects its artifact, an unenc
 its own line, a write error disables the handle so a torn line cannot consume the next record, and
 nothing raises into the call. The switch is independent of `stream_model_calls` and
 `model_content_file`; see `docs/CONTRACTS.md` for what a record deliberately cannot say. From the
-shipped shapes it is `monoid run --model-calls-file` or `RunnerBackend(model_calls_file=True)` —
-the backend carries the boolean into the submitted run and into every activation recovery
-rebuilds.
+shipped shapes it is `monoid run --model-calls-file`, `monoid backend serve --model-calls-file`,
+or `RunnerBackend(model_calls_file=True)` — the backend carries the boolean into the submitted run
+and into the activation recovery rebuilds.
 
 One operational note for all three verified-append sidecars — `model-content.jsonl`,
 `model_calls.jsonl` and `model_payloads.jsonl`, named individually because a rule stated over "the
@@ -422,17 +422,23 @@ unaffected — it completes and exits zero — and in that scenario `monoid vali
 directory clean, because the linked file is a valid earlier copy and each artifact is optional.
 (An arbitrary planted file is a different matter: validate then reports it as unparseable.)
 
-So the refusal is announced. Every transition into an artifact's terminal state — a refused open,
-a refused chunk, an append that may have torn its line, and, for `model-content.jsonl`, a
-descriptor that no longer matches its path — logs one `WARNING` naming the artifact, once per
-activation, on `monoid_agent_kernel.recorder` (all three artifacts, when the recorder is the one
-that gives up) and `monoid_agent_kernel.core.model_content` (when the content store is). A
-failure that costs a single record stays at `debug`; only the terminal transition is loud.
-`WARNING` because it means a run lost an artifact it was configured to produce, and because
+So the refusal is announced. Each of these three writers logs one `WARNING` naming the artifact
+whenever it enters the state where it records nothing more for the rest of the activation — a
+refused open, a refused chunk, an append that may have torn its line, and, for
+`model-content.jsonl`, a descriptor that no longer matches its path. The loggers are
+`monoid_agent_kernel.recorder` (all three artifacts, when the recorder is the one that gives up)
+and `monoid_agent_kernel.core.model_content` (when the content store is); the record carries
+`monoid_run_id` and `monoid_artifact` as fields, so an aggregator can key on the run without every
+default stderr rendering carrying identifiers, and the message text names the artifact and nothing
+else. `WARNING` because it means a run lost an artifact it was configured to produce, and because
 Python's last-resort handler delivers exactly that level to stderr for an operator who configured
-no logging. The message names the artifact and nothing else — the run id travels as the
-`monoid_run_id` field on the record, so an aggregator can key on it without every default stderr
-rendering carrying identifiers.
+no logging. Once per writer per activation, and not necessarily on the run's own thread — the
+content store's batch flush runs on a timer.
+
+Two boundaries. A failure that costs a single record — an unencodable value, one line that would
+not serialize — is not this, and stays quiet. And a third-party model-stream observer that
+*raises* is a different contract: those failures are isolated from the run and logged at `debug`
+by design, because one broken exporter must not produce a line per provider token.
 
 A stale artifact is the reason it matters: the refused file is left as it was, so what a reader
 finds there afterwards is whatever the link pointed at, not this run's record.
@@ -445,9 +451,10 @@ the ledger's per-call lock and index, so a response record and its ledger line n
 by construction, and the two arms fail independently — a disk error in one file disables that
 file only. Chunk files are created write-once through the same verified-file primitives as the
 JSONL handles. The corpus, unlike the ledger, is content-classified; enable it with the same care
-as `model_content_file`. From the shipped shapes it is `monoid run --model-payload-file` or
-`RunnerBackend(model_payload_file=True)`, opt-in in both, and a subagent inherits whichever
-switches its parent ran under.
+as `model_content_file`. From the shipped shapes it is `monoid run --model-payload-file`,
+`monoid backend serve --model-payload-file`, or `RunnerBackend(model_payload_file=True)`, opt-in
+in all three, and a subagent inherits whichever switches its parent ran under.
+(`model_content_file` has the same three: `--model-content-file` on both commands and the field.)
 
 Chunk-directory hygiene is a separate verb. `monoid gc RUN_DIR` reports what no record in the
 corpus resolves — orphaned chunks from an interrupted write, dead `*.tmp` litter left by crashed

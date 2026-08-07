@@ -9,27 +9,32 @@ out in commit messages and here.
 
 ### Added — the recording switches are reachable from the shipped shapes
 
-- **`--model-calls-file` / `--model-payload-file` on both `monoid run` and `monoid backend
-  serve`, and the matching keyword-only `RunnerBackend(model_calls_file=...,
+- **`--model-calls-file`, `--model-payload-file` and `--model-content-file` on both `monoid run`
+  and `monoid backend serve`, and the matching keyword-only `RunnerBackend(model_calls_file=...,
   model_payload_file=...)` fields.** The per-call ledger and the private replay corpus existed
   only as `AgentLoop` keyword arguments — an embedder could record, no shipped shape could —
   while the same CLI already shipped `monoid gc`, a consumer verb for an artifact nothing it ran
-  could produce, and `monoid validate`'s corpus arm beside it. All three surfaces land together,
-  as `--llm-gateway-provider` did, because a switch reachable from two of three leaves the
-  served deployment with the consumer verbs and no producer. The backend carries the booleans
-  exactly as it carries `model_content_file`: into the submitted run and into the activation
-  recovery rebuilds, pinned by the ledger's own activation-restart signature (`call_index` back
-  at zero, both zeros recorded). Each boolean is read when a host builds an activation, so it
-  describes the host, not the run — a run reclaimed by a node configured differently records
-  differently from there on. Both flags stay opt-in — the corpus is content-classified — and the
-  omission half is pinned too: a run without the flags writes neither file. Studio is
-  deliberately not wired; its egress toggle grants live delivery and the content sidecar, never
-  the corpus, and the Studio census test now enumerates both recording switches so that stays
-  true. The backend fields are keyword-only because the positional argument lists of
-  `RunnerBackend` and `BackendLoopFactoryContext` are pinned compatibility surfaces; note that
-  `BackendLoopFactoryContext`'s two new providers are *required* keyword arguments, following
-  `llm_gateway_provider_provider` — an embedder assembling that context directly (it is not part
-  of the supported public surface) must supply them.
+  could produce, and `monoid validate`'s corpus arm beside it. Every surface lands together, as
+  `--llm-gateway-provider` did, because a switch reachable from two of three leaves the served
+  deployment with the consumer verbs and no producer — and `model-content.jsonl` is in the set
+  for that same reason, since `monoid validate` re-checks it too. The backend carries the
+  booleans exactly as it carries `model_content_file`: into the submitted run and into the
+  activation recovery rebuilds, pinned by the ledger's own activation-restart signature
+  (`call_index` back at zero, both zeros recorded). Each boolean is read when a host builds an
+  activation, so it describes the host, not the run — a run reclaimed by a node configured
+  differently records differently from there on. All three stay opt-in — two of them are
+  content-classified — and the omission half is pinned too: a run without the flags writes none
+  of them. Studio is deliberately not wired for the two recording switches; its egress toggle
+  grants live delivery and the content sidecar, never the corpus, and all three Studio censuses
+  now enumerate them so that stays true.
+- **Breaking, for direct constructors of an unsupported surface:**
+  `BackendLoopFactoryContext` gains two *required* keyword arguments,
+  `model_calls_file_provider` and `model_payload_file_provider`, following
+  `llm_gateway_provider_provider`. `reference.backend` declares itself outside the supported
+  public surface, and only `RunnerBackend` constructs this class in-tree, so nothing in a
+  supported configuration breaks; an embedder that assembles the context itself must add the two.
+  The `RunnerBackend` fields are keyword-only for the ordinary reason: its positional argument
+  list is pinned by `tests/test_public_surface.py`.
 
 ### Fixed — a sidecar somebody asked for and did not get says so
 
@@ -45,14 +50,21 @@ out in commit messages and here.
   indistinguishable from never asking for it. `WARNING` because it means a run lost an artifact
   it was configured to produce, and because Python's last-resort handler delivers exactly that
   level to stderr for an operator who configured no logging, which is the shape `monoid run` runs
-  in. Once per activation: the flag and the announcement are one call, and every one of the
-  thirteen assignments goes through it, pinned by an AST census — a failure that costs a single
-  record stays at `debug`. The message names the artifact only; the run id travels as a
-  `monoid_run_id` field on the record.
-- **`monoid backend serve` releases its backend when the socket cannot be taken.** The release
-  was keyed to `serve_forever`, so a bound port — the everyday failure of this command, and one
-  that happens after the backend is constructed — returned a built backend to nobody and reported
-  itself as a bare `OSError` traceback instead of the CLI error every other startup failure gets.
+  in. Once per writer per activation: in each writer the flag and the announcement are one call,
+  the raw assignment appears only inside it, and an AST census derives the flag set from the gates
+  that read it and fails the file if any other site writes one. A failure that costs a single
+  record stays at `debug`, and a third-party stream observer that raises stays `debug` too — that
+  isolation is a different contract. The loggers are `monoid_agent_kernel.recorder` and
+  `monoid_agent_kernel.core.model_content` (renamed from `monoid_agent_kernel.model_content` so
+  that quieting `monoid_agent_kernel.core` reaches it); the message names the artifact only, with
+  `monoid_run_id` and `monoid_artifact` carried as record fields.
+  **For embedders: this is new output.** These lines did not exist below `debug` before, and
+  Python's last-resort handler puts `WARNING` on stderr when no logging is configured.
+- **Every `serve` command reports a bind failure as a CLI error.** `backend serve`,
+  `llm-gateway serve` and `web-gateway serve` all bind after constructing what they serve, so a
+  bound port ended in a bare traceback; `backend serve` additionally left the constructed backend
+  unreleased. `--port 99999` is part of this: click accepts it and the socket layer answers with
+  `OverflowError`, which an `OSError` handler does not catch.
 
 ### Added — the chunk directory's crash litter now has a collector
 

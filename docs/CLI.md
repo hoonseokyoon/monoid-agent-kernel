@@ -212,7 +212,7 @@ for the design of these surfaces.
 
 ## Recording model calls
 
-Two opt-in artifacts, off unless their flag is set, on both `monoid run` and
+Three opt-in artifacts, off unless their flag is set, on both `monoid run` and
 `monoid backend serve`:
 
 - `--model-calls-file` — `model_calls.jsonl`, one metadata record per settled model call,
@@ -221,6 +221,8 @@ Two opt-in artifacts, off unless their flag is set, on both `monoid run` and
 - `--model-payload-file` — `model_payloads.jsonl` plus a `model_payloads/` directory of
   content-addressed chunks: the exact request bytes each replay key was hashed over, and the
   settled response bodies with provider reasoning included.
+- `--model-content-file` — `model-content.jsonl`, the streamed output and reasoning text of each
+  call. Content, like the corpus. It also selects provider streaming, which the other two do not.
 
 ```bash
 monoid run \
@@ -258,7 +260,9 @@ content. **Sweep crash litter with `monoid gc RUN_DIR --apply`**, never beside a
 the same directory. Both verbs are covered in
 [OBSERVABILITY.md](OBSERVABILITY.md), which also documents the hardlink hazard: a backup that
 deduplicates a run directory disables these writers on the next activation, and each says so with
-one `WARNING` naming the artifact it will not write.
+one `WARNING` naming the artifact it will not write. If you configured no logging, that line
+reaches stderr; if you configured some, the loggers are `monoid_agent_kernel.recorder` and
+`monoid_agent_kernel.core.model_content`.
 
 ## Streaming JSON
 

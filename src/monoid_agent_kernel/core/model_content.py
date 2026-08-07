@@ -425,11 +425,11 @@ class ModelContentStore:
 
         This is the oldest of the three sidecar writers and the one that owns its own open, so a
         rule bound where the *recorder* logs leaves it silent -- which is how it was written first.
-        Its terminal state has seven doors, not one: a refused open, a torn append, and five
-        detections that the file under the descriptor is no longer the file at the path. The last
-        five are the same substitution the open-time check refuses, noticed one moment later, and
-        a reader cannot tell a truncated sidecar from a complete one, so silence there is worse
-        than at the door that was already loud.
+        Its terminal state has several doors, not one: a refused open, a torn append, three
+        detections that the file under the descriptor is no longer the file at the path, and two
+        that the descriptor itself is gone. The substitution ones are what the open-time check
+        refuses, noticed one moment later, and a reader cannot tell a truncated sidecar from a
+        complete one, so silence there is worse than at the door that was already loud.
 
         The message names ``self.path.name`` and never the path: a basename cannot carry the run
         directory, and hardcoding the default filename instead would name a file that does not

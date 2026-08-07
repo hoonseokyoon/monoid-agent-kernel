@@ -1306,9 +1306,12 @@ def backend_serve(
         click.echo("Monoid backend stopped")
     finally:
         server.server_close()
-        # Releases the run loop and any leases this backend holds. It does not stop a watchdog:
-        # `start_watchdog` is opt-in and this command never starts one, which is what the old
-        # comment here claimed the opposite of.
+        # Stops this backend's watchdog and closes its live-stream broker, if it has either --
+        # this command starts no watchdog and sets no broker, so today it is close to a no-op,
+        # kept because both are backend-owned and a future flag could turn one on. What it
+        # deliberately does NOT do: the run loop is process-shared and survives (stopping it here
+        # would break other backends in the process), and `drain=False` leaves parked sessions on
+        # it. Two earlier versions of this comment claimed otherwise in opposite directions.
         runner_backend.shutdown()
 
 
