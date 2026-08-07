@@ -43,7 +43,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
-from monoid_agent_kernel.core._verified_file import read_verified_bytes
+from monoid_agent_kernel.core._verified_file import (
+    VerifiedFileIdentity,
+    file_identity,
+    read_verified_bytes,
+)
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
@@ -143,6 +147,7 @@ class ReplayCorpus:
         self._run_ids: list[str] = []
         self._damaged = 0
         self._rejected = 0
+        self._repeated_sources = 0
         self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
         self._profiles: tuple[dict[str, Any], ...] | None = None
         self._lock = threading.Lock()
@@ -159,16 +164,46 @@ class ReplayCorpus:
         """
 
         corpus = cls()
+        indexed: set[VerifiedFileIdentity] = set()
         for run_dir in run_dirs:
             run_dir = Path(run_dir)
-            state, records, damaged = cls._read(run_dir / MODEL_PAYLOADS_FILENAME)
+            path = run_dir / MODEL_PAYLOADS_FILENAME
+            state, records, damaged = cls._read(path)
             if state != "ok":
                 raise ValueError(f"replay source has no readable corpus ({state}): {run_dir}")
-            corpus._damaged += len(damaged)
+            # The chunk directory joins the union even for a repeat: a corpus reached twice
+            # is the same references, and a hardlinked copy in another directory keeps its
+            # own offloaded bytes. Only the *records* are at risk of being counted twice.
             corpus._chunk_dirs.append(run_dir / MODEL_PAYLOADS_DIRNAME)
+            identity = corpus._corpus_identity(path)
+            if identity is not None and identity in indexed:
+                # One directory named twice -- as an id and as a path, through a link, or
+                # simply repeated -- is one source. Indexing it again would append every
+                # answer to its queue a second time, and "each answer once" would quietly
+                # become "each answer once per spelling": the call that should have earned
+                # ``exhausted`` gets a stale recorded body instead.
+                corpus._repeated_sources += 1
+                continue
+            if identity is not None:
+                indexed.add(identity)
+            corpus._damaged += len(damaged)
             for record in records:
                 corpus._index(record)
         return corpus
+
+    @staticmethod
+    def _corpus_identity(path: Path) -> VerifiedFileIdentity | None:
+        """The device/inode pair naming this corpus file, or ``None`` when it cannot be named.
+
+        Unnameable means "index it": the reader already accepted these bytes, and refusing to
+        index a readable source because its metadata is unavailable would lose answers rather
+        than duplicate them.
+        """
+
+        try:
+            return file_identity(path.lstat())
+        except OSError:
+            return None
 
     def _index(self, record: Mapping[str, Any]) -> None:
         kind = record.get("kind")
@@ -544,6 +579,12 @@ class ReplayCorpus:
     @property
     def rejected_records(self) -> int:
         return self._rejected
+
+    @property
+    def repeated_sources(self) -> int:
+        """How many named directories resolved to a corpus this union had already indexed."""
+
+        return self._repeated_sources
 
     def request_count(self) -> int:
         return len(self._requests)

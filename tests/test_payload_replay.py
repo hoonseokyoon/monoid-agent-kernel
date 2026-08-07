@@ -600,3 +600,48 @@ def test_a_union_replays_across_run_directories_in_argument_order(tmp_path: Path
     assert isinstance(second, ReplayedResponse)
     assert (second.body["final_text"], second.run_id) == ("child", "run-2")
     assert set(corpus.run_ids()) == {"run-1", "run-2"}
+
+
+@pytest.mark.parametrize("spelling", ["identical", "dot-suffixed", "absolute"])
+def test_one_directory_named_twice_is_one_source(tmp_path: Path, spelling: str) -> None:
+    """Each answer once is a property of the *corpus*, not of the argument list.
+
+    A directory reaches the union by more than one name routinely -- as a run id and as a
+    path, through a relative and an absolute spelling, through a link. Indexing it twice
+    would append every answer to its queue again, so the call that has earned ``exhausted``
+    receives a stale recorded body instead, and nothing anywhere says the source was doubled.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    again = {
+        "identical": run_dir,
+        "dot-suffixed": run_dir / ".",
+        "absolute": run_dir.resolve(),
+    }[spelling]
+
+    corpus = ReplayCorpus.load([run_dir, again])
+
+    assert corpus.response_count() == 1
+    assert corpus.repeated_sources == 1
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    exhausted = corpus.consume(digest, generation=_GEN)
+    assert isinstance(exhausted, ReplayMissReason)
+    assert exhausted.reason == MISS_EXHAUSTED
+
+
+def test_two_directories_holding_the_same_bytes_are_two_sources(tmp_path: Path) -> None:
+    """The rule is file identity, not file content: two runs that happen to record the same
+    answer are two answers, and a union of them must serve both."""
+
+    first = tmp_path / "runs" / "run-1"
+    second = tmp_path / "runs" / "run-2"
+    digest = _recorded_pair(first)
+    assert _recorded_pair(second) == digest
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.response_count() == 2
+    assert corpus.repeated_sources == 0
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
