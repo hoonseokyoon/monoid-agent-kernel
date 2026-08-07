@@ -797,6 +797,169 @@ def test_a_failed_live_serve_gives_back_a_held_slot_too(tmp_path: Path) -> None:
     assert _call(adapter, _request()).final_text == "answer for call two"
 
 
+def test_a_message_that_is_not_an_assistant_reply_is_not_a_turn_behind_it(tmp_path: Path) -> None:
+    """The D-h witness, in the direction that costs a whole run.
+
+    "A request that already had a turn behind it" is what makes the corpus able to testify
+    about impersonation at all. Widening it from `role == "assistant"` to `role != "user"`
+    catches the `role: "tool"` messages the loop writes after every tool call -- and then a
+    corpus of first turns whose answers carry reasoning is read as evidence that the original
+    declined to declare. The adapter declines too, its key term stops being the relayed
+    provider, and every lookup in the run misses: the 100%-miss shape.
+    """
+
+    messages = [{"role": "tool", "tool_call_id": "c1", "content": "output"}]
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(
+                    response_id="r1",
+                    final_text="answered",
+                    reasoning=({"type": "reasoning", "encrypted_content": "OPAQUE"},),
+                )
+            ],
+            provider_name="openai",
+        ),
+        [_request(_MARKER, messages=messages)],
+    )
+
+    adapter = _replay(tmp_path)
+
+    assert adapter.provider_name == "openai", (
+        "no request carried an assistant reply, so the corpus is silent on impersonation -- "
+        "and silence is not evidence for the negative"
+    )
+    assert _call(adapter, _request(_MARKER, messages=messages)).final_text == "answered"
+
+
+def test_a_partial_reasoning_block_is_not_an_injected_one(tmp_path: Path) -> None:
+    """The other witness, in its own negative direction.
+
+    `_is_injected_reasoning` describes the block "as the assistant-message append writes it" --
+    both keys. Accepting either one alone makes any foreign or third-party corpus with a
+    `reasoning` key look like a re-injected trace, and the adapter then declares where the
+    evidence says the original did not: the loop injects blocks the recorded preimages never
+    had, and every key moves.
+    """
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "a reply", "reasoning": {"provider": "openai"}},
+    ]
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(
+                    response_id="r1",
+                    final_text="answered",
+                    reasoning=({"type": "reasoning", "encrypted_content": "OPAQUE"},),
+                )
+            ],
+            provider_name="openai",
+        ),
+        [_request(_MARKER, messages=messages)],
+    )
+
+    adapter = _replay(tmp_path)
+
+    assert not hasattr(adapter, "provider_name"), (
+        "a block missing `items` is not the block the append writes, so the corpus shows an "
+        "assistant reply that carried no injected trace -- the original did not declare"
+    )
+
+
+def test_a_media_source_that_is_not_base64_is_not_media(tmp_path: Path) -> None:
+    """`supports_multimodal` moves the preimage, so deriving it loosely moves every key.
+
+    The neutral resolved block is `source.type == "base64"`. Counting any mapping named
+    `source` as media flips the flag on a text-only corpus whose messages happen to carry a
+    by-reference part, and the recorded keys stop matching the ones this run computes.
+    """
+
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "url", "url": "http://x/y.png"}}],
+        }
+    ]
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r1", final_text="answered")]),
+        [_request(_MARKER, messages=messages)],
+    )
+
+    adapter = _replay(tmp_path)
+
+    assert adapter.supports_multimodal is False
+
+
+def test_a_retried_call_replays_as_a_retried_call(tmp_path: Path) -> None:
+    """`provider_retried` is registered in the carriage conformance census as a field this
+    adapter carries, with the note that dropping it "would replay a retried call as a clean
+    one, the exact lie W6-2 recorded the field to prevent".
+
+    That registration is a file-level census: it reads which modules mention the name, not what
+    any of them does with the value. Hard-coding `provider_retried=False` in the reconstruction
+    passes it, and passes every replay suite.
+    """
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-1", final_text="answered after a retry")]),
+        [_request()],
+    )
+    path = tmp_path / "runs" / "run-1" / MODEL_PAYLOADS_FILENAME
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("kind") == "model_response":
+            record["response"]["provider_retried"] = True
+        out.append(json.dumps(record, sort_keys=True))
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    del digest
+
+    turn = _call(_replay(tmp_path), _request())
+
+    assert turn.final_text == "answered after a retry"
+    assert turn.provider_retried is True, "the replay reported a retried call as a clean one"
+
+
+def test_a_refusal_after_the_first_spends_its_own_slot(tmp_path: Path) -> None:
+    """The spend coordinate, driven where it can be wrong.
+
+    Every refusal any fixture builds stands at slot 0, and there `spend_refused(digest, slot)`
+    and `spend_refused(digest, 0)` agree -- so a `slot` that is simply the constant zero passes
+    the whole suite. At any later slot the guard `cursor == slot` is then false, the spend does
+    nothing, and the sequence never realigns: every remaining turn of the run is paid for live
+    while its recording sits unread one position back.
+    """
+
+    digest, repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="recorded first"),
+                ModelTurn(response_id="r-3", final_text="recorded third"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    assert digest == repeat, "two identical calls are one key with two recorded answers"
+    _prepend_refused_answer(tmp_path, digest, after=1)
+
+    inner = _CountingInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    served = [_call(adapter, _request()).final_text for _ in range(3)]
+
+    assert served == ["recorded first", "live answer", "recorded third"], (
+        "the refused slot was not spent, so the corpus never realigned"
+    )
+    assert inner.calls == 1
+
+
 def test_an_inner_whose_next_turn_is_a_coroutine_function_is_refused(tmp_path: Path) -> None:
     """The constructor's synchronous-inner check asks `callable(next_turn)`, which is true for
     an `async def`.

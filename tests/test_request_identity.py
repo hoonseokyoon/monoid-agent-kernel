@@ -445,22 +445,36 @@ def test_the_lookup_reads_the_declaration_once() -> None:
 def test_model_call_reexports_the_same_objects() -> None:
     """`model_call` re-imports these names; identity is what rules out a quiet mirror.
 
-    The list is derived from the **consumers**, not from `model_call`'s own import statement.
-    Two wrong versions preceded this one, and they failed in opposite directions. The first
-    hand-listed four of the nine names, leaving the rest free to regrow. The second derived
-    the list from the import block -- which is the artifact the mutation edits, so dropping a
-    name from it merely shrank the census and the mutant went green.
+    The census is the two modules' **attributes**, intersected. Three wrong versions preceded
+    it, each defeated by a different artifact.
 
-    Deriving from what the tree actually reaches through `model_call` cannot be defeated that
-    way: four suites import digest functions through the old home
-    (`test_model_calls_schema`, `test_model_payloads_schema`, `test_generation_config`,
-    `test_tool_schema_delivery`), so a locally regrown copy still has to answer for the name
-    they use -- and if it did not, they would be testing the copy while production keys come
-    from `providers/_request_identity`.
+    Hand-listing named four names and left the rest free to regrow. Deriving from
+    `model_call`'s import block used the artifact the mutation edits, so dropping a name from
+    the block merely shrank the census. Deriving from the *consumers* -- what the tree reaches
+    through `model_call` -- looked immune and was not: it covers only the names something
+    happens to import today, which measured seven against the block's eleven, and the four it
+    lost included `effective_model_for`, the projection whose single implementation is the
+    reason for the move. A locally regrown copy of it passed.
+
+    An attribute intersection is not an artifact either module's author edits when they add a
+    mirror: regrowing a function *creates* the attribute the census then compares, so the only
+    way to leave the census is to stop re-exporting the name, which is the change this test
+    exists to notice.
     """
 
+    census = sorted(
+        name
+        for name in vars(_request_identity)
+        if not name.startswith("__") and hasattr(model_call, name)
+    )
+
+    assert len(census) >= 11, f"the census shrank to {len(census)}: {census}"
+    for name in census:
+        assert getattr(model_call, name) is getattr(_request_identity, name), name
+    # The consumer view is now a subset check rather than the census itself: anything the tree
+    # imports through the old home must be in it, or the two disagree about what moved.
     root = Path(model_call.__file__).parent.parent.parent
-    wanted: set[str] = set()
+    reached: set[str] = set()
     for path in (*root.joinpath("src").rglob("*.py"), *root.joinpath("tests").rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -468,13 +482,10 @@ def test_model_call_reexports_the_same_objects() -> None:
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "monoid_agent_kernel.model_call":
-                wanted |= {
+                reached |= {
                     alias.name for alias in node.names if hasattr(_request_identity, alias.name)
                 }
-
-    assert wanted, "nothing reaches the projection through model_call; this census is empty"
-    for name in sorted(wanted):
-        assert getattr(model_call, name) is getattr(_request_identity, name), name
+    assert reached <= set(census), sorted(reached - set(census))
 
 
 def test_the_runner_delegates_effective_model_resolution() -> None:
