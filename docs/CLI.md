@@ -291,27 +291,41 @@ names expected and actual, e.g. the model names); `--replay-fallthrough` softens
 warning and serves misses from the live adapter this command would have built anyway
 (recording flags compose, so `--replay-from ... --model-payload-file` records the run as it
 went — the new-episodes shape). One caveat on that second corpus: a call the *inner* adapter
-served is keyed under the wrapper's provider term rather than the inner's, so it replays
-faithfully but is not interchangeable with a recording made live. `docs/CONTRACTS.md` carries
-the detail as the third ledger delta.
+served is keyed under the wrapper's provider term. Where the wrapper's derivation declared —
+the shipped gateway default, and every corpus that cannot testify — that term *is* the
+original's resolved provider and the keys agree; where it declined, the recording is faithful
+but not interchangeable with one made live. `docs/CONTRACTS.md` carries the detail as the
+third ledger delta.
 
 **Answers replay in recorded order, each once.** A request the original run made twice gets
 the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
 the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
-`provider_error_code` (`no_key`, `absent`, `not_recorded`, `identity_mismatch`, `exhausted`,
-`generation_mismatch`), checkpoints kept. Under a session driver the same miss parks the run
-(`config_recoverable: true`), and the same call asks again on the re-attempt — it earns the
-same refusal rather than the next call's recording. Note what that remedy can and cannot buy:
-a session cannot be given new sources while it is running, and the failed turn stays in the
-history, so "resend" recovers a run whose *config* was wrong far more often than one whose
-corpus was.
+`provider_error_code`, checkpoints kept. Four of the six sub-reasons reach `failure.json`:
+`no_key`, `absent`, `not_recorded`, `exhausted`. The other two — `identity_mismatch` and
+`generation_mismatch` — are what the preflight refuses *before* a run directory exists, so
+without `--replay-fallthrough` they arrive as an exit-1 message on stderr and never as a
+`provider_error_code`; with it they are warnings and the calls are served live.
 
-**Two shapes replay does not reproduce.** A run whose calls were concurrent — background
+**Naming more than one source is an ordered union.** `--replay-from` is repeatable, and
+"file order, each answer once" spans the sources in the order the flags were given. For the
+family union (a parent and its children, below) that is invisible, because every key belongs
+to exactly one source. For two recordings of the *same* conversation — the same prompt run
+twice, or a crashed run beside its rerun — it decides which answer each call gets, and where
+one source recorded a refusal at that position it decides whether the call is answered at all.
+The preflight counts such keys and warns; nothing in the finished run records which source
+answered, since `attributes.replay_from` is the whole list.
+
+**Three shapes replay does not reproduce.** A run whose calls were concurrent — background
 subagents draining together — issues the same key from more than one caller, and which caller
 receives which recording is the scheduler's answer both times; the recording never fixed that
-order, so the replay cannot either. And the consumption cursor lives in the process: a replay
-that crashes and durably resumes starts its counting again, so a key with more than one
-recorded answer is re-served from the first.
+order, so the replay cannot either. The consumption cursor lives in the process: a replay that
+crashes and durably resumes starts its counting again, so a key with more than one recorded
+answer is re-served from the first. And a turn that failed recoverably *while recording* is not
+replayable at that position: the retry recomputes its key without the `instruction` term the
+first attempt carried, so the answer is recorded under a key the replay's first attempt does
+not compute, and that attempt earns `absent` — a request record with no answer — while the
+answer sits one record below. Record the corpus you intend to replay from a run that did not
+retry, or replay with `--replay-fallthrough`.
 
 **A run that spawned subagents is a family.** Children record into their own run directories,
 so name them too — `--replay-from` is repeatable — or the child's first call is the miss. With
@@ -321,14 +335,20 @@ limit either way, because the spawn observation the model saw embeds per-run ide
 
 **Replay does not stream.** The adapter serves whole turns, so a replay run combined with a
 streaming-selecting flag (`--model-content-file`) degrades to one-shot: the answer arrives
-complete, and no token deltas are produced or written. The run is correct; only its liveness
-is not reproduced.
+complete, and no token deltas are produced. `model-content.jsonl` is still written — the
+one-shot answer lands in it as a single record, alongside a `stream_opened` entry naming the
+configured provider, which is the provider this run did not call.
 
 **Provenance and privacy.** Every ledger line of a replay run carries
-`attributes.replay_from` (the source run ids, comma-joined), inherited by children. The corpus
-you replay from is content-classified — replaying somebody else's run directory means reading
-their conversation bytes — and the source is never written to: a replay run records into its
-own directory only.
+`attributes.replay_from` (the source run ids, comma-joined), inherited by children. Two limits
+on that. The ledger is opt-in: without `--model-calls-file` a replay run is indistinguishable
+from a live one to anyone auditing the run directory — `manifest.json`, `status.json`,
+`metrics.json` and `events.jsonl` say nothing about replay, and `model_provider` names the
+configured provider. And the attribute is stamped by this command, not by the adapter: a run
+driven programmatically through `ReplayModelAdapter` carries no `replay_from` at all. The
+corpus you replay from is content-classified — replaying somebody else's run directory means
+reading their conversation bytes — and the source is never written to: a replay run records
+into its own directory only.
 
 ## Streaming JSON
 

@@ -22,11 +22,16 @@ out in commit messages and here.
   match anything recorded, naming expected and actual. Provider impersonation is derived from
   corpus evidence (declared originals re-inject reasoning into the record; undeclared ones do
   not), heterogeneous-provider unions are rejected at construction, tools re-execute for real,
-  and every ledger line of a replay run carries `attributes.replay_from`. A refused record
+  and every ledger line of a `monoid run --replay-from` run carries `attributes.replay_from`
+  (a stamp of that command, not of the adapter). A refused record
   keeps its slot until the caller moves past it, so a parked turn's re-attempt earns the same
-  refusal rather than the next call's answer; a source named twice is one source; and a body
-  that is not a recorded turn — wrong fields, or a count the loop would refuse — is a typed
-  miss rather than a model error blamed on a model that was never called. Known v1 limits,
+  refusal rather than the next call's answer, whether the corpus refused it or reconstruction
+  did; a source named twice is one source, on volumes that report an inode and on those that do
+  not; a key more than one named source can answer is counted and warned about, because across
+  a union "file order" is the order of the flags; a miss whose diverging term is the model
+  identity says `identity_mismatch` and names both sides in plaintext rather than blaming the
+  conversation; and a body that is not a recorded turn — wrong fields, or a count the loop would
+  refuse — is a typed miss rather than a model error blamed on a model that was never called. Known v1 limits,
   documented: a spawning run's post-spawn parent turn cannot replay (the spawn observation
   embeds per-run identifiers), though the children themselves replay from the family union;
   concurrent callers of one key divide its recordings in scheduler order, because the

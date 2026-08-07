@@ -23,9 +23,10 @@ The run-directory artifact set is:
 - `model_payloads.jsonl` + `model_payloads/`: optional private replay corpus — request preimages
   as verified reassembly recipes whose chunks deduplicate per tool definition, per message and per
   observation, and settled response bodies including provider reasoning
-  (`monoid.model-payloads.v1`). `monoid run --replay-from RUN_DIR` reads it back as the model
-  ([CLI.md](CLI.md)); a replay run's ledger lines carry `attributes.replay_from` naming the
-  source run ids
+  (`monoid.model-payloads.v1`). `monoid run --replay-from RUN_DIR_OR_ID` reads it back as the model
+  ([CLI.md](CLI.md)); a `monoid run --replay-from` run's ledger lines carry
+  `attributes.replay_from` naming the source run ids — the ledger is opt-in, and a run driven
+  programmatically through `ReplayModelAdapter` carries no such stamp
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
   non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
   from the `session.state.changed` event). While a run is parked on a recoverable turn failure

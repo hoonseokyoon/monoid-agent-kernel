@@ -36,11 +36,18 @@ surfaces downstream.
 take, so two callers can never be handed one slot and none is lost. Which of them gets which
 recording is the scheduler's answer, not this class's -- and the kernel does drive calls
 concurrently: a child loop is constructed with the parent's adapter instance, and background
-subagents drain the reentry queue together. Two identical background children therefore issue
-the *same* key (nothing run-scoped is in it) and divide that key's recordings between them in
-whatever order they arrive. Replay is deterministic for a run whose calls are ordered; a run
-whose concurrency the recording did not fix is replayed as faithfully as it was run, which is
-to say not deterministically. Same family as the spawn-observation limit in ``docs/CLI.md``.
+children publish into a reentry queue the parent drains. Two identical background children
+therefore issue the *same* key (nothing run-scoped is in it) and divide that key's recordings
+between them in whatever order they arrive. Replay is deterministic for a run whose calls are
+ordered; a run whose concurrency the recording did not fix is replayed as faithfully as it was
+run, which is to say not deterministically. Same family as the spawn-observation limit in
+``docs/CLI.md``.
+
+**A union is ordered, and that is not visible from the command line.** "File order" spans the
+named sources in the order they were given, which is invisible for the family union (disjoint
+conversations) and decisive for two recordings of one conversation. This reader is the only
+place that can see a key drawing answers from more than one source, so it counts them
+(``crossed_keys``) for the preflight to say out loud.
 """
 
 from __future__ import annotations
@@ -89,9 +96,11 @@ REPLAY_MISS_REASONS = (
     MISS_EXHAUSTED,
     MISS_GENERATION_MISMATCH,
 )
-"""The approved vocabulary (D-i), in one place. ``no_key`` belongs to the adapter's own
-encoder refusal and ``identity_mismatch`` to :meth:`ReplayCorpus.diagnose`; ``consume``
-produces the other four. A reason outside this tuple is a contract change, not a detail."""
+"""The approved vocabulary (D-i), in one place. Not a partition by producer: ``no_key`` is the
+adapter's alone, ``consume`` produces ``absent``, ``not_recorded``, ``exhausted`` and
+``generation_mismatch``, and :meth:`ReplayCorpus.diagnose` refines an ``absent`` into any of
+``absent``, ``identity_mismatch`` or ``generation_mismatch``. A reason outside this tuple is a
+contract change, not a detail."""
 
 # How many diverging prompt terms one diagnosis will name, and how much of each digest.
 # Bounds the message, not the comparison -- and a digest prefix is still content-free.
@@ -183,14 +192,16 @@ class ReplayCorpus:
     def load(cls, run_dirs: Sequence[Path]) -> "ReplayCorpus":
         """Index ``run_dirs`` in argument order; file order within each is preserved.
 
-        Refuses at construction -- not on the tenth turn -- when a named directory has no
-        corpus *file* to read: a replay source that never recorded is an operator mistake, and
-        every later miss it would cause misdirects toward the request rather than the source.
+        Refuses at construction -- not on the tenth turn -- when a named directory yields no
+        readable corpus at all: not only a missing file, but any state the reader cannot open
+        or verify. A replay source that never recorded is an operator mistake, and every later
+        miss it would cause misdirects toward the request rather than the source.
 
-        A file that exists and holds nothing usable is not refused here, because "empty" and
+        A file that opens and holds nothing usable is not refused here, because "empty" and
         "damaged" are answers about content rather than about the source, and the reader
-        reports them (``damaged_lines``, ``rejected_records``) for the preflight to act on. A
-        library embedder that skips the preflight gets the misses, not the construction error.
+        reports them (``damaged_lines``, ``rejected_records``, ``crossed_keys``). The preflight
+        warns on those; it does not refuse. A library embedder that skips the preflight gets
+        the misses rather than the construction error, and hears nothing at all.
         """
 
         corpus = cls()
@@ -200,7 +211,13 @@ class ReplayCorpus:
             path = run_dir / MODEL_PAYLOADS_FILENAME
             state, records, damaged = cls._read(path)
             if state != "ok":
-                raise ValueError(f"replay source has no readable corpus ({state}): {run_dir}")
+                hint = ""
+                if Path(run_dir).name == MODEL_PAYLOADS_FILENAME:
+                    # The one wrong path an operator reaches by knowing more, not less: they
+                    # found the corpus file and named it. Saying `absent` about the file they
+                    # are looking at reads as a claim about its contents.
+                    hint = f"; name the run directory instead, e.g. {Path(run_dir).parent}"
+                raise ValueError(f"replay source has no readable corpus ({state}): {run_dir}{hint}")
             # The chunk directory joins the union even for a repeat: a corpus reached twice
             # is the same references, and a hardlinked copy in another directory keeps its
             # own offloaded bytes. Only the *records* are at risk of being counted twice.

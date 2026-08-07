@@ -240,9 +240,7 @@ def generation_support(
     return _declared_support(adapter, "generation_support", config)
 
 
-def reasoning_support(
-    adapter: Any, config: ModelConfig | None = None
-) -> Literal["native", "none"]:
+def reasoning_support(adapter: Any, config: ModelConfig | None = None) -> Literal["native", "none"]:
     """Whether ``adapter`` applies :attr:`ModelConfig.reasoning` to the provider request.
 
     The third member of the capability family above, same fail-closed rule, one difference
@@ -1131,10 +1129,19 @@ class ModelStreamIngressNormalizer:
 def portable_usage_value(value: Any) -> bool:
     """Whether one usage count is a portable non-negative integer.
 
-    The rule the loop enforces when it sums a turn's usage, named here so the replay adapter
-    can enforce the *same* one on a recorded turn before it becomes a turn at all. Two copies
-    would disagree the day the rule changes, and the disagreement would surface as a corpus
-    that replays into a model error blamed on a model that was never called.
+    The rule the *loop's summation* applies, named here so the replay adapter can apply the
+    same one to a recorded turn before it becomes a turn at all. Two copies of a rule disagree
+    the day it changes, and here the disagreement would surface as a corpus that replays into a
+    model error blamed on a model that was never called.
+
+    Scope, because the name is broader than the fact. This is not a package-wide predicate:
+    ``provider_usage_of``, ``usage_reported_by``, ``_usage_count`` and ``_recordable_usage``
+    each still spell it inline, and they agree today by measurement rather than by
+    construction. Nor is it the rule the *live* ingress applies -- ``normalize_usage`` runs
+    first there and keeps a fixed key list, so a live provider returning ``{"weird": -5}`` is
+    accepted with ``weird`` dropped while the replay precheck refuses that body. The precheck
+    is deliberately the stricter of the two: a corpus is untrusted input and a refusal costs a
+    rerun, where a fabricated turn costs a wrong answer.
 
     ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` and a boolean
     token count is a provider bug, not a count of one.
@@ -1233,11 +1240,7 @@ def provider_usage_of(error: BaseException) -> dict[str, int]:
         return {}
     if not isinstance(usage, Mapping):
         return {}
-    return {
-        str(key): value
-        for key, value in usage.items()
-        if type(value) is int and value >= 0
-    }
+    return {str(key): value for key, value in usage.items() if type(value) is int and value >= 0}
 
 
 @dataclass

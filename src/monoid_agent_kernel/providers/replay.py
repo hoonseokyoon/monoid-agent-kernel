@@ -259,7 +259,11 @@ class ReplayModelAdapter:
                 ReplayMissReason(
                     MISS_NO_KEY,
                     "no replay key could be issued for this request "
-                    f"({lookup.result.status}); an unkeyable call was never recorded either",
+                    # Labelled, because the statuses overlap the miss vocabulary by name:
+                    # an unlabelled `(absent)` two words after `(no_key)` reads as a second,
+                    # contradicting reason rather than as the key derivation's own verdict.
+                    f"(key status: {lookup.result.status}); an unkeyable call was never "
+                    "recorded either",
                 ),
                 digest=None,
                 held=None,

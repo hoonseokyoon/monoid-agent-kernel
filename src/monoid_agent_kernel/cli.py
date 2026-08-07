@@ -256,11 +256,13 @@ main.add_command(builder_group)
     "replay_from",
     multiple=True,
     type=str,
+    metavar="RUN_DIR_OR_ID",
     help=(
-        "Serve model calls from a recorded run's replay corpus (RUN_DIR_OR_ID under "
-        "--run-root) instead of a live provider. Repeatable: a run that spawned subagents "
-        "records each child in its own run directory, so name the children too. Tools "
-        "re-execute for real; only the model answers are replayed."
+        "Serve model calls from a recorded run's replay corpus (a run directory, or a run id "
+        "under --run-root) instead of a live provider. Repeatable: a run that spawned "
+        "subagents records each child in its own run directory, so name the children too, and "
+        "the sources form an ordered union. Tools re-execute for real; only the model answers "
+        "are replayed."
     ),
 )
 @click.option(
