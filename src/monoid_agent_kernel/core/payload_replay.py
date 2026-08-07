@@ -56,6 +56,7 @@ from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
+    MODEL_PAYLOADS_SCHEMA_VERSION,
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
@@ -213,6 +214,13 @@ class ReplayCorpus:
             return None
 
     def _index(self, record: Mapping[str, Any]) -> None:
+        if record.get("schema_version") != MODEL_PAYLOADS_SCHEMA_VERSION:
+            # The validator enforces this on the same bytes, and a reader that skipped it
+            # would serve a corpus the kernel's own `monoid validate` calls corrupt -- or,
+            # after a version bump, serve v2 answers as though the v1 field semantics still
+            # held. A version is a promise about what the other fields mean.
+            self._rejected += 1
+            return
         kind = record.get("kind")
         run_id = record.get("run_id")
         if isinstance(run_id, str) and run_id and run_id not in self._run_ids:
@@ -430,6 +438,17 @@ class ReplayCorpus:
         if mismatch is not None:
             return mismatch
         return ReplayMissReason(MISS_ABSENT, "no record carries this key")
+
+    def generation_divergence(self, generation: str) -> str | None:
+        """The sentence naming a wholesale generation retirement, or ``None``.
+
+        One function for the preflight and for the miss diagnosis, the same way
+        :meth:`identity_divergence` serves both -- a corpus retired by a generation bump can
+        match nothing, and "before the run starts" is where the CHANGELOG promises to say so.
+        """
+
+        mismatch = self._generation_mismatch(generation)
+        return None if mismatch is None else mismatch.detail
 
     def _generation_mismatch(self, generation: str) -> ReplayMissReason | None:
         if self._generations and generation not in self._generations:

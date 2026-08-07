@@ -682,3 +682,53 @@ def test_two_directories_holding_the_same_bytes_are_two_sources(tmp_path: Path) 
     assert corpus.repeated_sources == 0
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+
+
+# --- what the reader refuses to read at all ---------------------------------------------------
+
+
+def test_a_record_from_another_schema_version_is_not_served(tmp_path: Path) -> None:
+    """The validator enforces the version on these bytes; a reader that did not would serve a
+    corpus the kernel's own `monoid validate` calls corrupt -- and, after a bump, serve v2
+    answers under v1 field semantics. A version is a promise about what the other fields mean.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("kind") == "model_response":
+            record["schema_version"] = "monoid.model-payloads.v2"
+        lines.append(json.dumps(record, sort_keys=True))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    corpus = ReplayCorpus.load([run_dir])
+
+    assert corpus.rejected_records == 1
+    assert corpus.response_count() == 0
+    miss = corpus.consume(digest, generation=_GEN)
+    assert isinstance(miss, ReplayMissReason)
+    assert miss.reason == MISS_ABSENT
+
+
+def test_a_retired_generation_is_nameable_before_the_run_starts(tmp_path: Path) -> None:
+    """The same sentence the miss diagnosis gives, available to the preflight.
+
+    A corpus retired by a generation bump can match nothing at all, so "before the run starts"
+    is where an operator should hear it -- not at turn one, after a run directory and a
+    checkpoint already exist, and not at all under `--replay-fallthrough`, where the whole run
+    would otherwise go live and billed in silence.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    _recorded_pair(run_dir, generation="monoid.model-request-digest.v0")
+    corpus = ReplayCorpus.load([run_dir])
+
+    divergence = corpus.generation_divergence(_GEN)
+
+    assert divergence is not None
+    assert "monoid.model-request-digest.v0" in divergence
+    assert _GEN in divergence
+    assert corpus.generation_divergence("monoid.model-request-digest.v0") is None

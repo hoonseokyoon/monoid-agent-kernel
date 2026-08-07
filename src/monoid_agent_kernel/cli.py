@@ -62,7 +62,10 @@ from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.payload_replay import ReplayCorpus
-from monoid_agent_kernel.providers._request_identity import _model_identity
+from monoid_agent_kernel.providers._request_identity import (
+    _REQUEST_DIGEST_GENERATION,
+    _model_identity,
+)
 from monoid_agent_kernel.providers.base import (
     ModelAdapter,
     normalize_model_config,
@@ -505,9 +508,7 @@ def run(
             # verbatim on every ledger line and inherited by children. Never in the
             # replay run's own corpus envelope; provenance is the ledger's business.
             invocation_context=(
-                InvocationContext(
-                    attributes={"replay_from": ",".join(replay_corpus.run_ids())}
-                )
+                InvocationContext(attributes={"replay_from": ",".join(replay_corpus.run_ids())})
                 if replay_corpus is not None
                 else None
             ),
@@ -934,8 +935,7 @@ def gc_command(
         click.echo(f"swept_at: {report.swept_at}")
         click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {report.corpus_state}")
         click.echo(
-            f"mode: {'apply' if report.applied else 'report-only'}"
-            f"  min_age_s: {report.min_age_s!r}"
+            f"mode: {'apply' if report.applied else 'report-only'}  min_age_s: {report.min_age_s!r}"
         )
         kept = sum(1 for entry in report.entries if entry.classification == "kept")
         click.echo(f"kept: {kept}")
@@ -949,8 +949,7 @@ def gc_command(
             # or is not a candidate: a month-old orphan and one written a second ago rendered
             # identically, and the gate is the only thing standing between them.
             line = (
-                f"{entry.classification:>8} {entry.size:>10} {entry.age_s:>12.1f}s "
-                f"{entry.name!r}"
+                f"{entry.classification:>8} {entry.size:>10} {entry.age_s:>12.1f}s {entry.name!r}"
             )
             if entry.deleted:
                 line += f"  deleted (freed {entry.reclaimed})"
@@ -1705,6 +1704,33 @@ def _replay_preflight(
     miss and the operator should hear it here rather than at turn N.
     """
 
+    if corpus.damaged_lines or corpus.rejected_records:
+        # The reader knows; without this the operator never hears it, and the miss it causes
+        # is diagnosed as `absent` -- "the original call failed, or its activation ended
+        # before answering" -- which sends them to read the recorded run instead of the file
+        # that is actually broken.
+        click.echo(
+            "warning: replay source is damaged: "
+            f"{corpus.damaged_lines} unparseable line(s), "
+            f"{corpus.rejected_records} record(s) the reader could not accept; "
+            "answers recorded on them are unavailable and will miss",
+            err=True,
+        )
+    if corpus.repeated_sources:
+        click.echo(
+            f"warning: {corpus.repeated_sources} replay source(s) named a corpus already "
+            "given; each was counted once",
+            err=True,
+        )
+    generation = corpus.generation_divergence(_REQUEST_DIGEST_GENERATION)
+    if generation is not None:
+        message = f"replay preflight: {generation}"
+        if fallthrough:
+            click.echo(f"warning: {message}", err=True)
+            return
+        raise click.ClickException(
+            f"{message}. Replay a corpus recorded under this generation, or rerun live."
+        )
     model = normalize_model_config(config) or ModelConfig()
     provider = resolved_provider_name(adapter, model) or ""
     divergence = corpus.identity_divergence(model=_model_identity(model), provider=provider)
@@ -1718,8 +1744,7 @@ def _replay_preflight(
             )
         return
     message = (
-        "replay preflight: no recorded request matches this run's model identity -- "
-        f"{divergence}"
+        f"replay preflight: no recorded request matches this run's model identity -- {divergence}"
     )
     if fallthrough:
         click.echo(f"warning: {message}", err=True)
