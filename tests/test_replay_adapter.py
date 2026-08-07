@@ -109,6 +109,46 @@ def _call(adapter: Any, request: ModelRequest) -> ModelTurn:
     return turn
 
 
+def _prepend_refused_answer(
+    base: Path,
+    digest: str,
+    *,
+    run_id: str = "run-1",
+    body: Any = None,
+    unrecorded_reason: str = "too_large",
+) -> None:
+    """Put an unusable record in front of the recorded answer, so slot 0 cannot be given back
+    and slot 1 can.
+
+    The two ways a slot goes unusable reach the corpus differently and must both be driven:
+    ``unrecorded_reason`` is refused before the cursor moves, while a body that only
+    *reconstruction* rejects is handed over first and has to be given back.
+    """
+
+    path = base / "runs" / run_id / MODEL_PAYLOADS_FILENAME
+    refused = json.dumps(
+        model_response_record(
+            body,
+            call_index=0,
+            request_digest=digest,
+            unrecorded_reason=unrecorded_reason,
+            run_id=run_id,
+            root_run_id=run_id,
+            recorded_at="2026-08-08T00:00:00Z",
+        ),
+        sort_keys=True,
+    )
+    out: list[str] = []
+    inserted = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not inserted and json.loads(line).get("kind") == "model_response":
+            out.append(refused)
+            inserted = True
+        out.append(line)
+    assert inserted
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 # --- hits are verbatim ---------------------------------------------------------------------
 
 
@@ -223,10 +263,11 @@ def test_a_corrupt_recorded_body_is_a_miss_not_a_crash(tmp_path: Path) -> None:
     corpus = ReplayCorpus.load([run_dir])
     adapter = ReplayModelAdapter(corpus, provider_name=None)
 
-    outcome = adapter._replayed_turn_or_miss(digest)
+    outcome, held = adapter._replayed_turn_or_miss(digest)
 
     assert not isinstance(outcome, ModelTurn)
     assert outcome.reason == MISS_NOT_RECORDED
+    assert held == 0, "reconstruction rejected a record the corpus had handed over"
 
 
 def test_the_vocabulary_is_a_door_not_a_convention() -> None:
@@ -428,3 +469,95 @@ def test_replay_lookup_agrees_with_the_recorded_corpus_key(tmp_path: Path) -> No
     lookup = replay_lookup(_request(), adapter)
 
     assert lookup.result.digest == recorded_digest
+
+
+# --- a refused slot belongs to the call that earned it ---------------------------------------
+
+
+def test_a_re_attempt_earns_the_same_refusal_not_the_next_call_s_answer(tmp_path: Path) -> None:
+    """A replay miss parks the turn, and the loop re-attempts a ``config_recoverable`` failure
+    idempotently. So asking twice must refuse twice: a refusal that advanced the sequence
+    would hand the re-attempt of call N the answer recorded for call N+1 -- a different call's
+    words, arriving as a valid turn, with nothing anywhere saying so.
+    """
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    _prepend_refused_answer(tmp_path, digest)
+    adapter = _replay(tmp_path)
+
+    details = []
+    for _ in range(3):
+        with pytest.raises(ReplayMiss) as caught:
+            _call(adapter, _request())
+        assert caught.value.provider_error_code == MISS_NOT_RECORDED
+        details.append(str(caught.value))
+
+    assert details[0] == details[1] == details[2]
+    assert "too_large" in details[0]
+    assert "recovered" not in details[0]
+
+
+def test_a_record_reconstruction_rejects_is_given_back_for_the_re_attempt(tmp_path: Path) -> None:
+    """The other route to an unusable slot, and the one that has to be *given back*.
+
+    An ``unrecorded_reason`` is refused before the cursor moves; a body that only
+    reconstruction rejects has already been handed over, so the adapter must release it before
+    it parks. Otherwise the re-attempt of this call is answered with the next call's recording
+    -- the same silent substitution, reached by the other door.
+    """
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": None,
+            "tool_calls": [{"id": "c1", "name": "fs_list"}],  # no arguments: not a triple
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": None,
+            "provider_retried": False,
+        },
+    )
+    adapter = _replay(tmp_path)
+
+    details = []
+    for _ in range(2):
+        with pytest.raises(ReplayMiss) as caught:
+            _call(adapter, _request())
+        assert caught.value.provider_error_code == MISS_NOT_RECORDED
+        details.append(str(caught.value))
+
+    assert details[0] == details[1]
+    assert "recovered" not in details[0]
+
+
+def test_serving_a_refused_call_live_moves_the_sequence_past_it(tmp_path: Path) -> None:
+    """The other exit from the same refusal. Falling through means this call really was
+    answered, so the slot is spent and the next call meets the next recording -- which is the
+    alignment ``unrecorded_reason`` records exist to preserve."""
+
+    [digest] = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-good", final_text="recovered")]),
+        [_request()],
+    )
+    _prepend_refused_answer(tmp_path, digest)
+    inner = _CountingInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    first = _call(adapter, _request())
+    second = _call(adapter, _request())
+
+    assert (first.final_text, inner.calls) == ("live answer", 1)
+    assert (second.final_text, inner.calls) == ("recovered", 1)

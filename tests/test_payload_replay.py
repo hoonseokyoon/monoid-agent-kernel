@@ -239,9 +239,17 @@ def test_answers_replay_in_file_order_each_once(tmp_path: Path) -> None:
     assert "2" in third.detail
 
 
-def test_an_unrecorded_answer_occupies_its_slot(tmp_path: Path) -> None:
-    """[P3] A record whose body was refused still spends its turn in the order; skipping it
-    would hand answer N+1 to call N and lie about what happened when."""
+def test_a_refused_answer_keeps_its_slot_until_the_caller_moves_past_it(tmp_path: Path) -> None:
+    """[P3, refined in round-1 review] A record whose body was refused still owns its turn in
+    the order -- but the corpus does not spend it on the refusal itself.
+
+    Both halves are the same rule seen from the two exits a miss has. Asking again without
+    having served the call must earn the *same* refusal: a replay miss parks the turn, and
+    the loop's contract for a ``config_recoverable`` failure is an idempotent re-attempt, so
+    an advancing refusal would answer the re-attempt with the next call's recording. Once the
+    caller says the conversation has moved past this call -- ``spend_refused``, which is what
+    serving it live means -- answer N+1 belongs to call N+1 again.
+    """
 
     recorder = _recorder(tmp_path)
     digest = sha256_bytes(b"slot")
@@ -265,13 +273,42 @@ def test_an_unrecorded_answer_occupies_its_slot(tmp_path: Path) -> None:
 
     corpus = _load(tmp_path)
     first = corpus.consume(digest, generation=_GEN)
-    second = corpus.consume(digest, generation=_GEN)
+    again = corpus.consume(digest, generation=_GEN)
 
     assert isinstance(first, ReplayMissReason)
     assert first.reason == MISS_NOT_RECORDED
     assert "unencodable" in first.detail
-    assert isinstance(second, ReplayedResponse)
-    assert second.body["final_text"] == "recovered"
+    assert isinstance(again, ReplayMissReason)
+    assert (again.reason, again.detail) == (first.reason, first.detail)
+
+    corpus.spend_refused(digest)
+    after = corpus.consume(digest, generation=_GEN)
+
+    assert isinstance(after, ReplayedResponse)
+    assert after.body["final_text"] == "recovered"
+    assert after.slot == 1
+
+
+def test_a_released_answer_is_handed_out_again_and_only_that_one(tmp_path: Path) -> None:
+    """``release`` is the other half of the same accounting: a slot handed over and then found
+    unusable goes back, so the re-attempt meets it -- but only while nothing else has moved,
+    because rewinding past a concurrent taker would hand one answer to two calls."""
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    corpus = ReplayCorpus.load([run_dir])
+
+    taken = corpus.consume(digest, generation=_GEN)
+    assert isinstance(taken, ReplayedResponse)
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayMissReason)
+
+    corpus.release(digest, taken.slot)
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+
+    stale = corpus.consume(digest, generation=_GEN)
+    corpus.release(digest, taken.slot - 1)  # a slot nobody is holding: refused
+    assert isinstance(stale, ReplayMissReason)
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayMissReason)
 
 
 def test_a_failed_call_leaves_a_request_with_no_answer(tmp_path: Path) -> None:

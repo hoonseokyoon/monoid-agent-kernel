@@ -207,23 +207,37 @@ class ReplayModelAdapter:
                     "no replay key could be issued for this request "
                     f"({lookup.result.status}); an unkeyable call was never recorded either",
                 ),
+                digest=None,
+                held=None,
             )
-        outcome = self._replayed_turn_or_miss(lookup.result.digest)
+        digest = lookup.result.digest
+        outcome, held = self._replayed_turn_or_miss(digest)
         if isinstance(outcome, ReplayMissReason):
             if outcome.reason == MISS_ABSENT:
                 outcome = self._corpus.diagnose(
                     lookup.payload,
                     generation=_REQUEST_DIGEST_GENERATION,
-                    digest=lookup.result.digest,
+                    digest=digest,
                 )
-            return self._serve_miss(request, outcome)
+            return self._serve_miss(request, outcome, digest=digest, held=held)
         return outcome
 
-    def _replayed_turn_or_miss(self, digest: str) -> ModelTurn | ReplayMissReason:
+    def _replayed_turn_or_miss(
+        self, digest: str
+    ) -> tuple[ModelTurn | ReplayMissReason, int | None]:
+        """The turn, or the refusal -- and the slot the corpus is holding open for us, if any.
+
+        ``consume`` no longer advances on a refusal, so a miss it returns holds nothing; a
+        record it *did* hand over and reconstruction then rejected holds exactly one slot,
+        which the caller must either spend (it served the call live) or release (the turn
+        parks and will be re-attempted).
+        """
+
         outcome = self._corpus.consume(digest, generation=_REQUEST_DIGEST_GENERATION)
         if isinstance(outcome, ReplayMissReason):
-            return outcome
-        return self._reconstruct(outcome)
+            return outcome, None
+        turn = self._reconstruct(outcome)
+        return turn, (outcome.slot if isinstance(turn, ReplayMissReason) else None)
 
     def _reconstruct(self, hit: ReplayedResponse) -> ModelTurn | ReplayMissReason:
         """The recorded body as a real ``ModelTurn``, or the refusal it earns.
@@ -277,9 +291,31 @@ class ReplayModelAdapter:
                 f"run {hit.run_id} call_index {hit.call_index}",
             )
 
-    def _serve_miss(self, request: ModelRequest, miss: ReplayMissReason) -> ModelTurn:
+    def _serve_miss(
+        self,
+        request: ModelRequest,
+        miss: ReplayMissReason,
+        *,
+        digest: str | None,
+        held: int | None,
+    ) -> ModelTurn:
+        """Fall through to the inner adapter, or refuse -- and settle the refused slot.
+
+        The two exits disagree about what happened to the call, so they must disagree about
+        the sequence. Serving it live moves the conversation past it, so the slot is spent and
+        the next call meets the next recording. Raising parks the turn for an idempotent
+        re-attempt, so the slot goes back: the re-attempt must earn the same refusal, not the
+        answer that belonged to the call after it.
+        """
+
         if self._inner is not None:
+            if digest is not None and held is None and miss.reason == MISS_NOT_RECORDED:
+                # The refusal came from the record itself, so a slot is still standing where
+                # this call was; serving live is what spends it.
+                self._corpus.spend_refused(digest)
             return self._inner.next_turn(request)
+        if digest is not None and held is not None:
+            self._corpus.release(digest, held)
         raise ReplayMiss(
             f"replay miss ({miss.reason}): {miss.detail}", provider_error_code=miss.reason
         )

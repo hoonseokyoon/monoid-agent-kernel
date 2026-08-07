@@ -13,9 +13,13 @@ directory.
 honest option is to hand those answers back in the order they were produced. That rule is also
 what makes a durable-resumed run's corpus readable: ``call_index`` restarts per activation and
 the request seen-set is activation-local, so duplicates and second zeros are the *ordinary*
-shape, resolved by file position rather than by any per-record field. A record whose body was
-refused (``unrecorded_reason``) still spends its slot; skipping it would hand answer N+1 to call
-N and lie about what happened when.
+shape, resolved by file position rather than by any per-record field. A record whose body cannot
+be given back (``unrecorded_reason``, an unresolvable reference, a body that is not a recorded
+turn) spends its slot **only when the caller moves the conversation past it** by serving that
+call live: then the original's next call and this run's next call are at the same position
+again. Parking on the refusal does not spend it, because the loop's contract for a
+``config_recoverable`` failure is an idempotent re-attempt of the *same* call, and a refusal
+that advanced would answer that re-attempt with the next call's recording.
 
 **The miss vocabulary is exactly six** (D-i): ``no_key`` (the adapter's own refusal to key a
 request -- named here so the vocabulary has one home, produced by no method of this class),
@@ -96,6 +100,9 @@ class ReplayedResponse:
     call_index: int
     recorded_at: str
     run_id: str
+    slot: int
+    """Position in this key's recorded sequence -- the coordinate :meth:`ReplayCorpus.release`
+    needs to give the answer back if the caller turns out not to be able to use it."""
 
 
 @dataclass(frozen=True)
@@ -275,8 +282,20 @@ class ReplayCorpus:
 
     def consume(self, digest: str, *, generation: str) -> ReplayedResponse | ReplayMissReason:
         """The next unconsumed answer recorded under ``digest``, or the typed reason there is
-        none. Advances the cursor on every record it touches -- including one whose body it
-        must refuse -- because position in the sequence is part of what the record says."""
+        none. **Advances the cursor only when it hands an answer back.**
+
+        Refusing and consuming are separate acts (D-c, refined in round-1 review). A refused
+        body leaves the cursor where it was, because a refusal parks the turn and the loop's
+        contract for a ``config_recoverable`` failure is an *idempotent re-attempt of the same
+        call*: an advancing refusal would serve that re-attempt the next call's recorded
+        answer, silently, as a valid turn. A caller that instead moves the conversation past
+        the refused call -- by serving it live -- says so with :meth:`spend_refused`, and the
+        sequence realigns.
+
+        Materialization happens under the lock so that two concurrent callers cannot both be
+        handed the slot one of them is about to take; the cost is that a chunk read serializes
+        them, which is the right trade for a rule about not answering twice.
+        """
 
         with self._lock:
             queue = self._responses.get(digest)
@@ -288,17 +307,47 @@ class ReplayCorpus:
                     MISS_EXHAUSTED,
                     f"all {len(queue)} recorded answer(s) under this key were already consumed",
                 )
-            self._cursors[digest] = cursor + 1
             entry = queue[cursor]
-        body = self._entry_body(entry)
-        if isinstance(body, ReplayMissReason):
-            return body
+            body = self._entry_body(entry)
+            if isinstance(body, ReplayMissReason):
+                return body
+            self._cursors[digest] = cursor + 1
         return ReplayedResponse(
             body=body,
             call_index=entry.call_index,
             recorded_at=entry.recorded_at,
             run_id=entry.run_id,
+            slot=cursor,
         )
+
+    def spend_refused(self, digest: str) -> None:
+        """Advance past a slot this corpus could not give back, once the caller has served
+        that call another way.
+
+        The only honest reason to spend a refused slot: the conversation really has moved past
+        the call it belongs to, so the original run's next call and this run's next call are
+        at the same position again. Serving the miss live (``--replay-fallthrough``) is that
+        reason; parking on it is not.
+        """
+
+        with self._lock:
+            queue = self._responses.get(digest)
+            if not queue:
+                return
+            cursor = self._cursors.get(digest, 0)
+            if cursor < len(queue):
+                self._cursors[digest] = cursor + 1
+
+    def release(self, digest: str, slot: int) -> None:
+        """Give back an answer :meth:`consume` handed out that the caller could not use.
+
+        Only that exact slot, and only while nothing else has moved: under concurrent callers
+        another turn may already hold the next one, and rewinding then would hand it out twice.
+        """
+
+        with self._lock:
+            if self._cursors.get(digest, 0) == slot + 1:
+                self._cursors[digest] = slot
 
     def _entry_body(self, entry: _ResponseEntry) -> dict[str, Any] | ReplayMissReason:
         """One entry's answer body, materialized and verified -- or the refusal it earns.
