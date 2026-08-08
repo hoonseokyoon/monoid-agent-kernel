@@ -919,7 +919,16 @@ inside `async_model_cancel_grace_s` settles normally and is not abandoned, so th
 reported once the worker has stopped rather than while it races run finalization. Only a call still
 running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
 worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
-the grace is not an extension of the deadline. Sync adapters should still enforce their own provider
+the grace is not an extension of the deadline.
+
+"Discarded" is about the *result*, not about everything the worker touches, and an adapter
+holding shared state has to close that gap itself. `ReplayModelAdapter` is the shipped case:
+an abandoned worker still reached the corpus cursor, so a discarded call permanently consumed
+a recorded answer and every later consumer of that corpus object was shifted by one — reachable
+wherever the adapter outlives the call, which a subagent family already does. It now exposes
+`anext_turn`, so a pure-replay call runs on the loop thread and either completes or has not
+begun; abandonment cannot land between the two. A **fallthrough** call still reaches a live
+provider on a worker and still settles late, because a blocking inner cannot be cancelled. Sync adapters should still enforce their own provider
 I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
 
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can

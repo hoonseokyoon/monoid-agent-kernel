@@ -300,12 +300,14 @@ third ledger delta.
 **Answers replay in recorded order, each once.** A request the original run made twice gets
 the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
 the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
-`provider_error_code`, checkpoints kept. Five of the six sub-reasons reach `failure.json`:
-`no_key`, `absent`, `not_recorded`, `exhausted` and `identity_mismatch`. Only
-`generation_mismatch` is preflight-exclusive. `identity_mismatch` reaches a run because the
-preflight refuses only a config that can match *nothing* recorded: a corpus holding more than
-one model identity — the ordinary shape as soon as a subagent declares its own `model:` —
-passes the preflight with a warning, and then a call recorded under the other identity misses.
+`provider_error_code`, checkpoints kept. **All six sub-reasons reach `failure.json`**; none is
+preflight-exclusive. The count has been wrong twice here in the other direction (four, then
+five), and for the same reason each time: the preflight refuses only a corpus that can match
+*nothing*, so every "mismatch" reason survives a corpus that is merely *mixed*. A corpus
+holding more than one digest generation passes with a warning, and a call keyed under the
+other one raises `generation_mismatch`. `identity_mismatch` arrives the same way: a corpus holding
+more than one model identity — the ordinary shape as soon as a subagent declares its own
+`model:` — passes with a warning, and then a call recorded under the other identity misses.
 What the preflight refuses *before* a run directory exists arrives as an exit-1 message on
 stderr; `--replay-fallthrough` softens those refusals to warnings and serves the calls live.
 

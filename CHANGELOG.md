@@ -9,6 +9,39 @@ out in commit messages and here.
 
 ### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
 
+- **A replay corpus can be narrowed rather than silent, and the two are no longer confused.**
+  A request record that reassembles and hashes correctly can still be past the reader's JSON
+  nesting bound, and it was then simply absent from `request_terms_view()`. The impersonation
+  derivation reads those terms, so a corpus missing exactly the records that argue against
+  declaring looked identical to one that never had them — and took the opposite horn, declaring
+  a provider and making the loop inject reasoning blocks the recorded preimages never had.
+  `ReplayCorpus.unreadable_requests()` counts them, the derivation declines while it is
+  non-zero, `monoid validate` reports each such record instead of certifying the corpus clean,
+  and the preflight says so even when enough records remain to derive an identity. The records
+  are still *written*: a deep tool result stays in the by-value message log, so refusing them
+  would cost the run its request provenance from that call onward.
+- **The replay preflight no longer blames the runtime config for the corpus's silence.** With no
+  readable request record there is nothing for a config to match or to diverge from, so "fix the
+  runtime config" named the one cause that was ruled out. It now points at `monoid validate`.
+- **An abandoned pure-replay call no longer moves the cursor.** Without an async entry point the
+  adapter took `_adrive`'s last dispatch shape — a blocking call on an abandonable daemon thread
+  — so a run that gave up left a worker that still spent a recorded answer, shifting every later
+  consumer of that corpus object by one. `ReplayModelAdapter.anext_turn` keeps a pure-replay call
+  on the loop thread, where it either completes or has not begun. A fallthrough call still
+  reaches a live provider on a worker; `docs/CONTRACTS.md` states that residue.
+- **A settle that raises no longer becomes the verdict.** A corpus whose `release` raised inside
+  `ReplayTake.__exit__` replaced the typed `ReplayMiss` with a bare `RuntimeError`, turning a
+  `config_recoverable` park into an unclassified kill; through `served()` it discarded a live
+  answer already paid for. Both call sites now contain it and log, the way disposal already did.
+- **`monoid validate` no longer retains every chunk it reads.** Memoizing resolved bytes beside
+  the inline chunks made its footprint O(total offloaded corpus) with an 8 MB per-chunk ceiling
+  and no bound on the count. A chunk whose verdict is already known is no longer resolved at all,
+  so read-once now holds however the records are ordered, and the bytes stay transient.
+- **Three diagnosis sentences were still unbounded**, and the census meant to prevent that could
+  not see them: it matched attribute names, and all three interpolate plain locals. The census is
+  now an allow-list — every interpolation must be bounded or reviewed by name.
+
+
 - **`ReplayModelAdapter` and `ReplayMiss` (`monoid_agent_kernel.providers`), the corpus reader
   behind them (`core/payload_replay.py`), and `monoid run --replay-from RUN_DIR_OR_ID`
   (repeatable) with `--replay-fallthrough`.** A recorded run replays through the engine to the
