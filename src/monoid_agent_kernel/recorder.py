@@ -72,6 +72,39 @@ if TYPE_CHECKING:
     from monoid_agent_kernel.core.workspace import ChangedEntry, Workspace
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.recorder")
+
+
+@dataclass(frozen=True)
+class _EncodedResponseBody:
+    """``response_record_body`` plus the reader's nesting verdict on an offloaded body.
+
+    Both halves are functions of the turn alone, which is why they belong together and why
+    they belong outside ``_model_calls_lock``. ``readable`` is False only for a body that
+    would be offloaded AND that the replay reader's lexical bound refuses.
+    """
+
+    value: Any
+    encoded: bytes | None
+    unrecorded_reason: str
+    readable: bool
+
+
+def encoded_response_body(turn: Any) -> _EncodedResponseBody:
+    """The response record's body and whether the reader could parse it back. Pure."""
+
+    recorded = response_record_body(turn)
+    readable = True
+    if (
+        recorded.value is not None
+        and recorded.encoded is not None
+        and len(recorded.encoded) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES
+    ):
+        readable = json_nesting_within_limit(recorded.encoded.decode("utf-8"))
+    return _EncodedResponseBody(
+        recorded.value, recorded.encoded, recorded.unrecorded_reason, readable
+    )
+
+
 _PROPOSAL_LOCKS_GUARD = threading.Lock()
 _PROPOSAL_LOCKS: dict[str, threading.RLock] = {}
 
@@ -554,6 +587,19 @@ class AgentRecorder:
             except Exception:  # noqa: BLE001 - one unrecordable corpus entry costs only the corpus
                 _LOGGER.debug("model payload split failed", exc_info=True)
                 split = None
+            # The response body joins the split out here for the same reason, and it was not
+            # always so: the offloaded-depth gate arrived inside the lock, where its per-character
+            # scan measured 382.9 ms on a 7.9 MB body against 4.0 ms of sha256 -- a 12x critical
+            # section, all of it pure work the paragraph above already ruled out holding. Both the
+            # encode and the verdict are functions of the turn alone, so a concurrent recorder now
+            # waits on the write, not on the scan.
+            body = None
+            if payloads_wanted and call.turn is not None:
+                try:
+                    body = encoded_response_body(call.turn)
+                except Exception:  # noqa: BLE001 - as above: the corpus entry, never the ledger
+                    _LOGGER.debug("model payload response encode failed", exc_info=True)
+                    body = None
             with self._model_calls_lock:
                 index = self._model_calls_index
                 # One clock read for however many files record this call. ``call_index`` restarts
@@ -575,7 +621,8 @@ class AgentRecorder:
                     and not self._model_payloads_closed
                 ):
                     advanced = (
-                        self._record_payloads_locked(call, index, recorded_at, split) or advanced
+                        self._record_payloads_locked(call, index, recorded_at, split, body)
+                        or advanced
                     )
                 # One counter for however many files recorded this call, advanced when any of
                 # them did: the index identifies the CALL, so per-file write failures surface as
@@ -619,6 +666,7 @@ class AgentRecorder:
         index: int,
         recorded_at: str,
         split: SplitRequestPayload | None,
+        body: _EncodedResponseBody | None,
     ) -> bool:
         """Record one call's corpus entries. Caller holds ``_model_calls_lock``.
 
@@ -686,12 +734,14 @@ class AgentRecorder:
             # a response record written now would carry a ``request_digest`` naming a request
             # record that can never exist, and would append to a handle the opener just refused.
             if call.turn is not None and not self._model_payloads_failed:
-                recorded = response_record_body(call.turn)
+                # Recomputed only if the hoist did not manage it, so a raise still lands exactly
+                # where it used to -- after the ledger arm, not instead of it.
+                recorded = body if body is not None else encoded_response_body(call.turn)
                 reason = recorded.unrecorded_reason
                 response: dict | None
                 if recorded.value is not None and recorded.encoded is not None:
                     if len(recorded.encoded) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
-                        if not json_nesting_within_limit(recorded.encoded.decode("utf-8")):
+                        if not recorded.readable:
                             # Asked here because the line gate cannot ask it: an offloaded body
                             # is never in the line, so its brackets sit in a chunk file and the
                             # encoder below sees a shallow reference. Storing it anyway wrote a
