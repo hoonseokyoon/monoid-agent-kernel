@@ -161,6 +161,85 @@ def _term_digest(value: Any) -> str:
         return "unencodable"
 
 
+class ReplayTake:
+    """One take on one key: what the corpus offered, and the settlement it is owed.
+
+    The cursor is the only thing linking a call to its answer, and the two ways a take can go
+    unusable settle in **opposite directions**: a refusal standing on a record is spent
+    *forward* once the caller served that call another way, while a record handed over and then
+    rejected is given *back*. Which of the two you are holding is not visible from the call
+    site -- and every one of the routes into the substitution failure was a wrong answer to
+    that question, not to "did you remember to settle at all".
+
+    So the choice lives here, in the object that owns the cursor, and the caller declares only
+    the fact it actually knows: did the call happen?
+
+        with corpus.take(digest, generation=...) as take:
+            ...
+            take.served()
+
+    Leaving the block by any other route -- a raise, a return, a rejection -- settles unserved.
+    Leaving it having declared *nothing* is a programming error and raises, deliberately: a
+    silent default would convert "forgot to declare" into "the same answer served twice",
+    which is another silent substitution, and a loud crash in development beats a wrong answer
+    at exit 0.
+    """
+
+    __slots__ = ("_corpus", "_digest", "hit", "miss", "_declared")
+
+    def __init__(
+        self,
+        corpus: ReplayCorpus,
+        digest: str,
+        outcome: ReplayedResponse | ReplayMissReason,
+    ) -> None:
+        self._corpus = corpus
+        self._digest = digest
+        self.hit = outcome if isinstance(outcome, ReplayedResponse) else None
+        self.miss = outcome if isinstance(outcome, ReplayMissReason) else None
+        self._declared: bool | None = None
+
+    def served(self) -> None:
+        """The call happened -- by this answer, or live. The conversation moved past this slot."""
+
+        self._declare(True)
+
+    def unserved(self) -> None:
+        """The call did not happen, so the next attempt must meet the same position again."""
+
+        self._declare(False)
+
+    def _declare(self, served: bool) -> None:
+        if self._declared is not None:
+            raise RuntimeError("this take has already been settled")
+        self._declared = served
+        self._settle(served)
+
+    def _settle(self, served: bool) -> None:
+        if served:
+            # A hit already advanced the cursor when it was handed over; only a refusal that
+            # left the cursor standing has to be stepped past now.
+            if self.hit is None and self.miss is not None and self.miss.slot is not None:
+                self._corpus.spend_refused(self._digest, self.miss.slot)
+        elif self.hit is not None:
+            self._corpus.release(self._digest, self.hit.slot)
+
+    def __enter__(self) -> ReplayTake:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self._declared is not None:
+            return False
+        self._settle(False)
+        self._declared = False
+        if exc_type is None:
+            raise RuntimeError(
+                "a replay take left its block without saying whether the call happened; "
+                "declare served() or unserved() -- the slot has been given back"
+            )
+        return False
+
+
 class ReplayCorpus:
     """Every record the named run directories hold, indexed for consumption and diagnosis."""
 
@@ -456,6 +535,21 @@ class ReplayCorpus:
                 return
             if 0 <= slot < len(queue) and self._cursors.get(digest, 0) == slot + 1:
                 self._cursors[digest] = slot
+
+    def take(self, digest: str, *, generation: str) -> ReplayTake:
+        """A take on the next unconsumed answer, settled by the block that receives it.
+
+        The safe way to reach :meth:`consume`: the settlement becomes a property of leaving the
+        block rather than a rule a new call path has to re-attach by hand. Every route into the
+        substitution failure so far has been a missed or mistimed settle at a call site, so the
+        rule moves to where the cursor lives.
+
+        Holds **no lock across the block**. All the locked work -- including the chunk file I/O
+        in :meth:`_entry_body` -- happens inside ``consume`` before this returns, exactly as it
+        does for a bare ``consume`` caller, so the block is free to make a provider call.
+        """
+
+        return ReplayTake(self, digest, self.consume(digest, generation=generation))
 
     def _entry_body(self, entry: _ResponseEntry) -> dict[str, Any] | ReplayMissReason:
         """One entry's answer body, materialized and verified -- or the refusal it earns.

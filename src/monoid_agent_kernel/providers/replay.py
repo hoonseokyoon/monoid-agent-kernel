@@ -61,6 +61,7 @@ from monoid_agent_kernel.core.payload_replay import (
     REPLAY_MISS_REASONS,
     ReplayCorpus,
     ReplayMissReason,
+    ReplayTake,
     ReplayedResponse,
 )
 from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
@@ -283,37 +284,32 @@ class ReplayModelAdapter:
                     f"(key status: {lookup.result.status}); an unkeyable call was never "
                     "recorded either",
                 ),
-                digest=None,
-                held=None,
+                take=None,
             )
         digest = lookup.result.digest
-        outcome, held = self._replayed_turn_or_miss(digest)
-        if isinstance(outcome, ReplayMissReason):
-            if outcome.reason == MISS_ABSENT:
-                outcome = self._corpus.diagnose(
-                    lookup.payload,
-                    generation=_REQUEST_DIGEST_GENERATION,
-                    digest=digest,
-                )
-            return self._serve_miss(request, outcome, digest=digest, held=held)
-        return outcome
-
-    def _replayed_turn_or_miss(
-        self, digest: str
-    ) -> tuple[ModelTurn | ReplayMissReason, int | None]:
-        """The turn, or the refusal -- and the slot the corpus is holding open for us, if any.
-
-        ``consume`` no longer advances on a refusal, so a miss it returns holds nothing; a
-        record it *did* hand over and reconstruction then rejected holds exactly one slot,
-        which the caller must either spend (it served the call live) or release (the turn
-        parks and will be re-attempted).
-        """
-
-        outcome = self._corpus.consume(digest, generation=_REQUEST_DIGEST_GENERATION)
-        if isinstance(outcome, ReplayMissReason):
-            return outcome, None
-        turn = self._reconstruct(outcome)
-        return turn, (outcome.slot if isinstance(turn, ReplayMissReason) else None)
+        # Everything from here settles by leaving the block. The two ways a take goes unusable
+        # settle in opposite directions -- a standing refusal is spent forward, a rejected
+        # record is given back -- and choosing between them at the call site is what every
+        # route into the substitution failure got wrong. The take owns that choice now; this
+        # function only ever says whether the call happened.
+        with self._corpus.take(digest, generation=_REQUEST_DIGEST_GENERATION) as take:
+            if take.hit is not None:
+                outcome = self._reconstruct(take.hit)
+                if isinstance(outcome, ModelTurn):
+                    take.served()
+                    return outcome
+                miss = outcome
+            else:
+                miss = take.miss
+                if miss.reason == MISS_ABSENT:
+                    # Re-authored for the operator, not re-settled: the take still remembers
+                    # the slot the original refusal stood on, so a diagnosis cannot drop it.
+                    miss = self._corpus.diagnose(
+                        lookup.payload,
+                        generation=_REQUEST_DIGEST_GENERATION,
+                        digest=digest,
+                    )
+            return self._serve_miss(request, miss, take=take)
 
     def _reconstruct(self, hit: ReplayedResponse) -> ModelTurn | ReplayMissReason:
         """The recorded body as a real ``ModelTurn``, or the refusal it earns.
@@ -388,79 +384,48 @@ class ReplayModelAdapter:
         request: ModelRequest,
         miss: ReplayMissReason,
         *,
-        digest: str | None,
-        held: int | None,
+        take: ReplayTake | None,
     ) -> ModelTurn:
-        """Fall through to the inner adapter, or refuse -- and settle the refused slot.
+        """Fall through to the inner adapter, or refuse.
 
-        Not two exits but three, and only one of them is a call that happened. Serving it live
-        moves the conversation past this slot, so the slot is spent and the next call meets the
-        next recording. Raising -- because there is no inner, or because the inner raised --
-        parks the turn for an idempotent re-attempt, so the slot goes back: the re-attempt must
-        earn the same refusal, not the answer that belonged to the call after it.
+        Three exits, and only one of them is a call that happened. Serving it live moves the
+        conversation past this slot, so the take is told the call happened and the next call
+        meets the next recording. Raising -- because there is no inner, or because the inner
+        raised, or because what it handed back was not a turn -- parks the turn for an
+        idempotent re-attempt, and leaving the block without the declaration is what gives the
+        slot back. There is nothing to remember here and nothing to choose between: this
+        function knows only whether the call happened, which is the only thing it can know.
 
-        The two unserved exits settle through one function rather than two hand-kept sites,
-        because that is the seam this repair was needed at twice: the rule was written for the
-        refusal that leaves the cursor standing and never bound on the record ``consume``
-        handed over and reconstruction then rejected.
-
-        And the settlement is a fact about the call's *result*, not about how the call
-        returned. An ``except`` clause -- however wide -- only ever sees the inner shapes that
-        raise; the one that returns an awaitable returns cleanly, having done no provider work,
-        and defeated both halves at once.
+        ``take`` is None for the one call that took nothing: an unkeyable request never
+        reached the corpus, so no slot is owed either way.
         """
 
         if self._inner is not None:
-            served = False
-            try:
-                turn = self._inner.next_turn(request)
-                if inspect.isawaitable(turn):
-                    # `_adrive` awaits whatever a synchronous adapter hands back, so this
-                    # return means the provider has not been called yet -- the awaited call
-                    # still has every chance to fail, and settling on it would pay for a call
-                    # that has not happened. No declaration-side gate can see this shape:
-                    # `iscoroutinefunction` is False for a plain `def` that returns a
-                    # coroutine, so the result is the only place left to ask.
-                    dispose_unawaited(turn)
-                    raise ModelAdapterError(
-                        "the fallthrough inner adapter returned an awaitable from a "
-                        "synchronous next_turn; this wrapper cannot drive it",
-                        retryable=False,
-                        # The remedy is operator-shaped -- build the wrapper around an inner
-                        # it can drive -- so the session survives to be resumed against a
-                        # fixed configuration, rather than dying as an unclassified kill that
-                        # takes the checkpoints with it.
-                        config_recoverable=True,
-                    )
-                served = True
-                return turn
-            finally:
-                # Exactly one settlement on every exit, chosen by whether the call happened
-                # rather than by which exit was taken. Spending before the call would claim
-                # the conversation moved past this slot on the strength of an attempt: a live
-                # adapter that raises recoverably (a 429 is enough) parks the turn for an
-                # idempotent re-attempt, and the re-attempt would be answered with the next
-                # call's recording -- the same silent substitution the two-phase consume
-                # exists to prevent, reached through the other exit.
-                if not served:
-                    self._settle_unserved(digest, held)
-                elif digest is not None and held is None and miss.slot is not None:
-                    self._corpus.spend_refused(digest, miss.slot)
-        self._settle_unserved(digest, held)
+            turn = self._inner.next_turn(request)
+            if inspect.isawaitable(turn):
+                # `_adrive` awaits whatever a synchronous adapter hands back, so this return
+                # means the provider has not been called yet -- the awaited call still has
+                # every chance to fail, and declaring it served would pay for a call that has
+                # not happened. No declaration-side gate can see this shape:
+                # `iscoroutinefunction` is False for a plain `def` that returns a coroutine,
+                # so the result is the only place left to ask.
+                dispose_unawaited(turn)
+                raise ModelAdapterError(
+                    "the fallthrough inner adapter returned an awaitable from a "
+                    "synchronous next_turn; this wrapper cannot drive it",
+                    retryable=False,
+                    # The remedy is operator-shaped -- build the wrapper around an inner it
+                    # can drive -- so the session survives to be resumed against a fixed
+                    # configuration, rather than dying as an unclassified kill that takes the
+                    # checkpoints with it.
+                    config_recoverable=True,
+                )
+            if take is not None:
+                take.served()
+            return turn
         raise ReplayMiss(
             f"replay miss ({miss.reason}): {miss.detail}", provider_error_code=miss.reason
         )
-
-    def _settle_unserved(self, digest: str | None, held: int | None) -> None:
-        """Give back a slot ``consume`` handed over for a call that then did not happen.
-
-        A refusal that left the cursor standing holds nothing and needs nothing; only a record
-        reconstruction rejected has already moved the cursor, and only that one has to be put
-        back before the turn parks.
-        """
-
-        if digest is not None and held is not None:
-            self._corpus.release(digest, held)
 
     # --- lifecycle ----------------------------------------------------------------------------
 

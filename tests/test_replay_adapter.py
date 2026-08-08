@@ -8,6 +8,7 @@ forwarding that keeps the CLI's open/close probe honest about what the wrapper w
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import json
@@ -30,8 +31,12 @@ from monoid_agent_kernel.core.payload_replay import (
 )
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.model_call import ModelCallRunner, SettledModelCall
-from monoid_agent_kernel.providers._request_identity import replay_lookup
+from monoid_agent_kernel.providers._request_identity import (
+    _REQUEST_DIGEST_GENERATION as _GENERATION,
+    replay_lookup,
+)
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
+from monoid_agent_kernel.providers import replay as replay_module
 from monoid_agent_kernel.providers.replay import ReplayMiss, ReplayModelAdapter
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -268,11 +273,14 @@ def test_a_corrupt_recorded_body_is_a_miss_not_a_crash(tmp_path: Path) -> None:
     corpus = ReplayCorpus.load([run_dir])
     adapter = ReplayModelAdapter(corpus, provider_name=None)
 
-    outcome, held = adapter._replayed_turn_or_miss(digest)
+    with corpus.take(digest, generation=_GENERATION) as take:
+        assert take.hit is not None, "the corpus handed the record over"
+        outcome = adapter._reconstruct(take.hit)
+        take.unserved()
 
     assert not isinstance(outcome, ModelTurn)
     assert outcome.reason == MISS_NOT_RECORDED
-    assert held == 0, "reconstruction rejected a record the corpus had handed over"
+    assert take.hit.slot == 0, "reconstruction rejected a record the corpus had handed over"
 
 
 def test_the_vocabulary_is_a_door_not_a_convention() -> None:
@@ -1261,12 +1269,17 @@ def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
             "provider_retried": False,
         },
     )
-    # A separate instance for the coordinate, because reaching past `_serve_miss` takes the
-    # slot without settling it and would move the sequence this test is about.
+    # A separate instance for the coordinate. The probe declares `unserved()` rather than
+    # walking off the end of the block, so it gives the slot back instead of moving the
+    # sequence this test is about.
     probe = _replay(tmp_path)
     assert _call(probe, _request()).final_text == "first"
-    _outcome, held = probe._replayed_turn_or_miss(digest)
-    assert held == 1, "the slot the corpus is holding is the one it handed over, not zero"
+    with probe._corpus.take(digest, generation=_GENERATION) as take:
+        assert take.hit is not None
+        assert take.hit.slot == 1, (
+            "the slot the corpus is holding is the one it handed over, not zero"
+        )
+        take.unserved()
 
     adapter = _replay(tmp_path)
     assert _call(adapter, _request()).final_text == "first"
@@ -1275,3 +1288,28 @@ def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
             _call(adapter, _request())
         assert caught.value.provider_error_code == MISS_NOT_RECORDED
         assert "third" not in str(caught.value)
+
+
+def test_the_adapter_reaches_the_cursor_only_through_a_take() -> None:
+    """The wrapped primitives stay reachable, so this census is what keeps them unreached.
+
+    ``take`` wraps ``consume``/``spend_refused``/``release`` rather than replacing them,
+    because replacing would move the embedder-facing bounds guards -- ``0 <= slot < len(queue)``
+    and ``cursor == slot + 1`` -- behind an API that never hands a caller a slot integer, and
+    the negative tests that gate them would have to be deleted. Each of those guards was added
+    by a review round that found it missing, so deleting them is the wrong trade.
+
+    The cost of wrapping is that a future call site in this adapter could re-attach the settle
+    rule by hand, which is precisely how three of the six routes were introduced. This fails
+    the day it happens, which is the only reason wrapping is safe.
+    """
+
+    tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
+    named = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    reached = sorted({"consume", "spend_refused", "release"} & named)
+
+    assert not reached, (
+        f"the adapter names the cursor primitive(s) {', '.join(reached)} directly; settle "
+        "through `corpus.take(...)` so leaving the block is what settles"
+    )

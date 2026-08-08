@@ -1356,3 +1356,93 @@ def test_a_volume_without_inodes_still_knows_one_directory_named_twice(
     assert exhausted.reason == MISS_EXHAUSTED, (
         "the second call was answered from the corpus, so the one recording was indexed twice"
     )
+
+
+# --- the take: settlement as a property of leaving the block ------------------------------------
+
+
+def test_a_take_that_declares_nothing_is_a_failure(tmp_path: Path) -> None:
+    """Leaving the block silently must crash, not default.
+
+    A silent default release would turn "forgot to declare" into "the same answer served
+    twice" -- another wrong answer at exit 0, which is the whole class being left. The slot is
+    still given back, because the crash must not also lose a recording.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir, answers=["first", "second"])
+    corpus = ReplayCorpus.load([run_dir])
+
+    with pytest.raises(RuntimeError) as caught:
+        with corpus.take(digest, generation=_GEN) as take:
+            assert take.hit is not None
+            assert take.hit.body["final_text"] == "first"
+
+    assert "served() or unserved()" in str(caught.value)
+    again = corpus.take(digest, generation=_GEN)
+    assert again.hit is not None
+    assert again.hit.body["final_text"] == "first", "the undeclared take gave its slot back"
+    again.unserved()
+
+
+def test_a_take_declared_twice_is_a_failure(tmp_path: Path) -> None:
+    """One take, one settlement. A second declaration is a caller bug, not a second act."""
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    corpus = ReplayCorpus.load([run_dir])
+
+    take = corpus.take(digest, generation=_GEN)
+    take.served()
+    with pytest.raises(RuntimeError):
+        take.served()
+    with pytest.raises(RuntimeError):
+        take.unserved()
+
+
+def test_a_take_on_a_refusal_that_holds_no_slot_settles_nothing(tmp_path: Path) -> None:
+    """The third row of the settlement table, where both declarations are no-ops.
+
+    An `absent` or `exhausted` refusal stands on no record, so there is nothing to spend and
+    nothing to give back -- and a settle that reached for `slot` anyway would move a cursor
+    that belongs to some other call.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    _recorded_pair(run_dir)
+    corpus = ReplayCorpus.load([run_dir])
+
+    with corpus.take("f" * 64, generation=_GEN) as take:
+        assert take.hit is None
+        assert take.miss is not None and take.miss.slot is None
+        take.served()
+
+    with corpus.take("f" * 64, generation=_GEN) as take:
+        assert take.miss is not None and take.miss.reason == MISS_ABSENT
+        take.unserved()
+
+
+def test_a_take_holds_no_lock_across_its_block(tmp_path: Path) -> None:
+    """The block contains a provider call, so it must not contain the corpus lock.
+
+    All the locked work -- including the chunk file I/O -- happens inside ``consume`` before
+    the take is returned. Driven rather than read: a second thread must complete a take on
+    another key while the first block is still open.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir, answers=["first", "second"])
+    corpus = ReplayCorpus.load([run_dir])
+    finished = threading.Event()
+
+    def other() -> None:
+        with corpus.take(digest, generation=_GEN) as inner:
+            inner.unserved()
+        finished.set()
+
+    with corpus.take(digest, generation=_GEN) as take:
+        worker = threading.Thread(target=other)
+        worker.start()
+        assert finished.wait(timeout=5), "the take held the lock across its block"
+        take.unserved()
+    worker.join(timeout=5)
