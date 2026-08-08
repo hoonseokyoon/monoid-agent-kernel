@@ -28,6 +28,15 @@ out in commit messages and here.
   rather than above it, since `ReplayTake`'s own reconstruction-failure release is a second caller
   and a rule living in the adapter released straight past it. Compaction walks *consecutive* slots
   only, so a slot whose successor was delivered and kept is still not given back.
+- **A payload record whose envelope is corrupt is damage, not something to coerce.** The reader
+  type-checked the fields it *keys* on and substituted the ones it *reports* with: a missing or
+  wrongly typed `run_id`, `root_run_id` or `recorded_at` became `""` or `str(...)` and the record
+  was indexed anyway. `schemas.py` requires all three, so those are records `monoid validate` calls
+  corrupt while `rejected_records` stayed zero — the preflight then told the operator a damaged
+  corpus was sound, and the adapter served the record as a successful turn with its provenance lost
+  or invented. The check sits above the kind dispatch, so chunks, requests and answers all get it.
+  The coercion had also stopped being merely advisory: `run_id` correlates the impersonation
+  evidence now, so two damaged records in two unrelated runs both collapsed to `""` and intersected.
 - **A discarded outcome is handed back on every path that drops one, not just the first.** A run
   boundary can throw away a real result in four places: the boundary check finding the call already
   done, the awaiter's own cleanup finding it done a moment later, an async callee settling after

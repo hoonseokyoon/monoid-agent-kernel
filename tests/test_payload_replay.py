@@ -1295,6 +1295,80 @@ def test_an_answer_keyed_by_something_that_is_not_a_key_is_damage(
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
 
 
+@pytest.mark.parametrize(
+    "field, planted",
+    [
+        ("run_id", None),
+        ("run_id", ""),
+        ("run_id", 12345),
+        ("root_run_id", None),
+        ("root_run_id", ""),
+        ("root_run_id", True),
+        ("recorded_at", None),
+        ("recorded_at", 0),
+        ("recorded_at", "2026-08-08T00:00:00"),
+    ],
+    ids=lambda value: repr(value),
+)
+def test_an_answer_whose_envelope_is_corrupt_is_damage(
+    tmp_path: Path, field: str, planted: Any
+) -> None:
+    """The reader validated the two fields it keys on and coerced the three it reports with.
+
+    `request_digest` and `call_index` earn a rejection from the wrong shape. The envelope --
+    `run_id`, `root_run_id`, `recorded_at` -- was substituted instead: a missing or wrongly typed
+    value became `""` or `str(...)` and the body was queued anyway. `schemas.py` requires all
+    three (`minLength: 1` on the run ids, a `Z$` timestamp), so those are records `monoid validate`
+    calls corrupt while `rejected_records` stayed zero, the preflight reported no damage, and the
+    adapter served the record as a successful turn with its provenance lost or invented.
+
+    The coercion also became load-bearing in a way it never used to be. `run_id` now correlates
+    the impersonation evidence, so two damaged records in two unrelated runs both collapse to `""`
+    and *intersect* -- reintroducing exactly the cross-run contamination that correlation was
+    added to stop, through the back door of a corpus nobody validated.
+
+    Checked once for every kind rather than per arm: the envelope is common to chunks, requests
+    and answers, and validating it in the response arm alone would leave the same coercion in the
+    request arm one branch up -- the twin this reader has now been bitten by four times.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    record = model_response_record(
+        {
+            "response_id": "r-envelope",
+            "final_text": "answered from a record validate calls corrupt",
+            "tool_calls": [],
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": "stop",
+            "provider_retried": False,
+        },
+        call_index=1,
+        request_digest=digest,
+        unrecorded_reason="",
+        **_envelope(),
+    )
+    if planted is None:
+        record.pop(field)
+    else:
+        record[field] = planted
+    with (run_dir / MODEL_PAYLOADS_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    corpus = ReplayCorpus.load([run_dir])
+
+    assert corpus.rejected_records == 1, (
+        f"a {field} of {planted!r} is a record `monoid validate` calls corrupt, and the reader "
+        "coerced it into a healthy one"
+    )
+    first = corpus.consume(digest, generation=_GEN)
+    assert isinstance(first, ReplayedResponse)
+    assert corpus.consume(digest, generation=_GEN).reason == MISS_EXHAUSTED, (
+        "the corrupt record was queued behind the healthy one and would be served as a turn"
+    )
+
+
 def test_a_slot_below_zero_is_not_a_slot(tmp_path: Path) -> None:
     """`release`'s guard is `cursor == slot + 1`, which `slot = -1` satisfies against a fresh
     cursor of zero -- and the cursor then goes negative.
@@ -2100,14 +2174,20 @@ def test_a_run_named_beside_a_copy_of_itself_is_not_a_family(tmp_path: Path) -> 
 
 
 def test_a_root_run_id_that_is_not_a_string_invents_no_family(tmp_path: Path) -> None:
-    """The one indexed field that was stringified instead of type-checked.
+    """The one indexed field that was stringified instead of type-checked -- now refused outright.
 
     ``_index`` type-checks ``text``, ``sha256``, ``request_digest``, ``refs``,
-    ``digest_generation``, ``call_index`` and ``unrecorded_reason``; this one went through
+    ``digest_generation``, ``call_index`` and ``unrecorded_reason``; the envelope went through
     ``str(... or "")``. The schema requires a non-empty string, so anything else is planted --
     and planted, ``123`` or ``True`` or ``["P"]`` stringifies to the same text in two unrelated
-    corpora, making them compare equal and fire the fan-out remedy. Advisory harm only: the
-    crossed-key warning above it stays correct either way.
+    corpora, making them compare equal and fire the fan-out remedy.
+
+    The guarantee has strengthened rather than moved. It used to be "the coercion happens and the
+    family is not invented anyway"; it is now "the record never joins at all", because a corpus
+    ``monoid validate`` calls corrupt must not read as healthy here -- and the harm stopped being
+    advisory once ``run_id`` became the unit the impersonation evidence correlates on. The family
+    assertion is kept exactly as it was: it is the property, and it must hold under the new
+    handling for the same reason it held under the old.
     """
 
     first = tmp_path / "runs" / "a"
@@ -2118,9 +2198,18 @@ def test_a_root_run_id_that_is_not_a_string_invents_no_family(tmp_path: Path) ->
 
     corpus = ReplayCorpus.load([first, second])
 
-    assert corpus.crossed_keys == 1
+    assert corpus.rejected_records == 4, (
+        "a root_run_id the schema forbids is damage, and reading it as healthy is what let the "
+        "preflight call a corrupt corpus sound. Four and not two because each corpus carries the "
+        "planted envelope on its request record as well as its answer, and the check sits above "
+        "the kind dispatch -- the request arm held the identical coercion, so covering only the "
+        "arm the review named would have left half of this fixture indexed"
+    )
     assert corpus.crossed_within_one_run == 0, (
         "two unrelated runs were made a family by a value the schema forbids"
+    )
+    assert corpus.crossed_keys == 0, (
+        "neither answer joined a queue, so nothing crossed -- the count reports what was indexed"
     )
 
 

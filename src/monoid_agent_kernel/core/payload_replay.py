@@ -143,6 +143,31 @@ class ReplayMissReason:
     integer position discloses nothing; it is the same kind of fact as ``call_index``."""
 
 
+def _has_sound_envelope(record: Mapping[str, Any]) -> bool:
+    """Whether a payload record carries the envelope every kind of it must carry.
+
+    The same three terms ``schemas.py`` requires of all three kinds -- non-empty ``run_id`` and
+    ``root_run_id``, a ``Z``-suffixed ``recorded_at`` -- checked here so the reader and
+    ``monoid validate`` cannot disagree about whether a corpus is damaged. They disagreed: the
+    reader validated the two fields it *keys* on and substituted the three it *reports* with, so a
+    record the validator calls corrupt was queued, served as a successful turn, and left
+    ``rejected_records`` at zero, which is what the preflight reads before telling an operator the
+    corpus is sound.
+
+    ``run_id`` in particular stopped being merely descriptive when it became the unit the
+    impersonation evidence correlates on: two damaged records in two unrelated runs both coerced
+    to ``""``, so they *intersected*, reintroducing the cross-run contamination that correlation
+    exists to prevent.
+    """
+
+    for name in ("run_id", "root_run_id"):
+        value = record.get(name)
+        if not isinstance(value, str) or not value:
+            return False
+    recorded_at = record.get("recorded_at")
+    return isinstance(recorded_at, str) and recorded_at.endswith("Z")
+
+
 @dataclass(frozen=True)
 class _ResponseEntry:
     response: Any
@@ -438,6 +463,13 @@ class ReplayCorpus:
             # would serve a corpus the kernel's own `monoid validate` calls corrupt -- or,
             # after a version bump, serve v2 answers as though the v1 field semantics still
             # held. A version is a promise about what the other fields mean.
+            self._rejected += 1
+            return
+        if not _has_sound_envelope(record):
+            # Before the kind dispatch, because the envelope is common to all three kinds and
+            # the coercions it replaces were spread across two of them. Validating it in the
+            # answer arm alone would leave the identical `str(... or "")` standing one branch up
+            # in the request arm -- the half-bound rule this reader keeps paying for.
             self._rejected += 1
             return
         kind = record.get("kind")
