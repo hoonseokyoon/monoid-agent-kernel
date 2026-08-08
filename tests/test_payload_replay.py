@@ -1874,9 +1874,42 @@ def test_no_message_interpolates_a_corpus_string_unbounded() -> None:
     """
 
     bounded = {"_short", "_named", "_where", "_term_digest"}
-    corpus_supplied = {"run_id", "root_run_id", "unrecorded_reason", "generation", "recorded_at"}
+    # Every other interpolation in the module, reviewed once and keyed by its source text --
+    # an allow-list, deliberately, because the deny-list this replaced could only see misses
+    # someone had already thought of. It named five corpus-supplied ATTRIBUTES, so it was blind
+    # to all three of the sites that survived the round that wrote it: they interpolate plain
+    # locals. An expression that is neither bounded nor listed here fails, so the next message
+    # cannot quietly become the next unbounded channel. Keyed by text, not line, so the pin
+    # survives edits above it.
+    reviewed = {
+        # Integers. Cannot carry corpus bytes at any length.
+        "len(text)": "int",
+        "entry.call_index": "int",
+        "len(profiles)": "int",
+        "len(conversation) - len(named)": "int",
+        "len(differing) - _DIAGNOSED_TERMS": "int",
+        "len(queue)": "int",
+        "self._damaged": "int",
+        "self._rejected": "int",
+        # Sliced at the interpolation itself; the slice IS the bound.
+        "text[:_NAMED_VALUE_CHARS]": "_short's own slice",
+        "live_digests.get(name, 'missing')[:_DIGEST_PREFIX]": "digest prefix",
+        "recorded.get(name, 'missing')[:_DIGEST_PREFIX]": "digest prefix",
+        # Shape-validated before it reaches a message: 64 hex characters or nothing.
+        "sha": "is_chunk_sha256 at the trichotomy and again in the resolver",
+        # Bound where it is built, one statement above its message.
+        "recorded": "assigned _short(', '.join(sorted(self._generations)))",
+        # Kernel vocabulary, not corpus content: the caller's generation constant.
+        "generation": "the generation the kernel asked for, not one the corpus supplied",
+        # Operator-supplied paths from the command line, not corpus bytes.
+        "Path(run_dir).parent": "operator-supplied path",
+        "state": "operator-supplied path",
+        "run_dir": "operator-supplied path",
+        "hint": "operator-supplied path",
+    }
 
-    tree = ast.parse(Path(payload_replay.__file__).read_text(encoding="utf-8"))
+    source = Path(payload_replay.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.JoinedStr):
@@ -1884,17 +1917,23 @@ def test_no_message_interpolates_a_corpus_string_unbounded() -> None:
         for piece in node.values:
             if not isinstance(piece, ast.FormattedValue):
                 continue
-            call = piece.value
-            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                if call.func.id in bounded:
-                    continue
-            for inner in ast.walk(piece.value):
-                if isinstance(inner, ast.Attribute) and inner.attr in corpus_supplied:
-                    offenders.append(f"line {piece.lineno}: {inner.attr}")
+            value = piece.value
+            if isinstance(value, ast.Constant):
+                continue
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in bounded
+            ):
+                continue
+            text = ast.get_source_segment(source, value) or ""
+            if text not in reviewed:
+                offenders.append(f"line {piece.lineno}: {text}")
 
     assert not offenders, (
-        "a message interpolates a corpus-supplied string without a bound; the corpus is "
-        f"untrusted by this module's own threat model: {offenders}"
+        "a message interpolates an expression that is neither bounded nor reviewed; the corpus "
+        "is untrusted by this module's own threat model, so a new interpolation must either "
+        f"pass through a bounding call or be added above with a reason: {offenders}"
     )
 
 

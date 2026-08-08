@@ -930,8 +930,13 @@ class ReplayCorpus:
         # can have both.
         conversation = [name for name in diverging if name not in _IDENTITY_TERMS]
         named = conversation[:_DIAGNOSED_TERMS]
+        # The term NAME is corpus-supplied and needs the same bound the identity half below
+        # already applies. It was left raw when that half was fixed -- one of two sibling
+        # clause builders in one function -- and a hostile corpus reached 800,239 characters
+        # through it, into failure.json, status.json and stderr. The digests either side are
+        # bounded by their slices.
         clauses = [
-            f"{name} live={live_digests.get(name, 'missing')[:_DIGEST_PREFIX]} "
+            f"{_short(str(name))} live={live_digests.get(name, 'missing')[:_DIGEST_PREFIX]} "
             f"recorded={recorded.get(name, 'missing')[:_DIGEST_PREFIX]}"
             for name in named
         ]
@@ -953,7 +958,7 @@ class ReplayCorpus:
             ]
             detail = (
                 "this run's config reaches an identity the corpus recorded, but not the one "
-                f"the closest recorded request (run {run_id}) was recorded under: "
+                f"the closest recorded request (run {_short(str(run_id))}) was recorded under: "
                 + "; ".join(identity_clauses)
             )
             if clauses:
@@ -966,7 +971,7 @@ class ReplayCorpus:
         return ReplayMissReason(
             MISS_ABSENT,
             "identity matches; diverging terms vs the closest recorded request "
-            f"(run {run_id}): " + "; ".join(clauses) + more,
+            f"(run {_short(str(run_id))}): " + "; ".join(clauses) + more,
         )
 
     def _request_terms(self, digest: str) -> Mapping[str, Any] | None:
