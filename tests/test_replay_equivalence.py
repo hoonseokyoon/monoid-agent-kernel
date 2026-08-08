@@ -386,12 +386,25 @@ def test_one_directory_named_twice_supplies_its_answers_once(
     # Textually DIFFERENT spellings of one directory, because a fixture whose "two names" are
     # the same string only drives the repeat any fallback collapses -- the fixture defect the
     # mutation axis found in this repair's first pin.
+    #
+    # All three are ``..`` round trips, which every filesystem resolves. A case-flipped spelling
+    # is added only where it actually names the directory: unprobed, it made this test pass here
+    # and error on every Linux CI job, because `ReplayCorpus.load` refuses an absent source at
+    # construction and `platform-smoke` -- the Windows/macOS job -- runs a fixed file list that
+    # excludes this suite. A fixture that only holds on the author's filesystem is the same
+    # defect as a rule that only holds on one of two branches.
+    parent, grandparent = source.parent, source.parent.parent
     spellings = [
         source,
-        source.parent / ".." / source.parent.name / source.name,
-        Path(str(source).replace(source.name, source.name.upper())),
+        parent / ".." / parent.name / source.name,
+        parent / ".." / ".." / grandparent.name / parent.name / source.name,
     ]
-    assert len({str(path) for path in spellings}) == 3, "the spellings must differ as text"
+    flipped = parent / source.name.upper()
+    if flipped != source and flipped.exists():
+        spellings.append(flipped)
+    assert len({str(path) for path in spellings}) == len(spellings) >= 3, (
+        "the spellings must differ as text"
+    )
     corpus = ReplayCorpus.load(spellings)
 
     assert_supply_conserved(spellings, corpus)

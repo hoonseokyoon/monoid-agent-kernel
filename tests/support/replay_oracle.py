@@ -278,8 +278,15 @@ def _distinct_sources(sources: Sequence[Path]) -> dict[str, Path]:
         corpus = path if path.name == MODEL_PAYLOADS_FILENAME else path / MODEL_PAYLOADS_FILENAME
         try:
             data = corpus.read_bytes()
-        except OSError:
-            continue
+        except OSError as error:
+            # Never quieter than the code under test: ``ReplayCorpus.load`` refuses an unreadable
+            # source at construction, so an oracle that skipped one would compute ``expected``
+            # from fewer sources than were named and pass by counting less. That is how a
+            # fixture naming a path that exists only on the author's filesystem stayed green.
+            raise AssertionError(
+                f"the oracle cannot read a named source, so it cannot count its supply: "
+                f"{corpus} ({error})"
+            ) from error
         key = f"{os.path.realpath(corpus).casefold()}|{hashlib.sha256(data).hexdigest()}"
         distinct.setdefault(key, path)
     return distinct
