@@ -34,6 +34,7 @@ from support.replay_oracle import (
     assert_no_substitution,
     assert_pure_replay_equivalent,
     assert_supply_conserved,
+    masked_field_relations,
     read_corpus,
     structural_diff,
 )
@@ -563,6 +564,72 @@ def test_the_oracle_reports_a_shifted_answer(tmp_path: Path) -> None:
     )
     with pytest.raises(AssertionError):
         assert_no_substitution(source, shifted)
+
+
+def test_each_comparator_claim_has_its_own_negative(tmp_path: Path) -> None:
+    """One pin over five simultaneous differences proves nothing about any one of them.
+
+    The existing negative compares two *unrelated conversations*, whose records differ in
+    ``payload``, ``response``, ``sha256``, ``text`` and ``request_digest`` at once. Masking any
+    one of those still leaves four problems, so it stayed green while the comparator was
+    weakened -- including the sharp case where ``_mask`` also drops ``response`` and the
+    comparator stops looking at recorded answers entirely.
+
+    Each claim gets a corpus doctored in exactly one way instead.
+    """
+
+    source, _ = _two_answers(Path("original"), tmp_path)
+    lines = (source / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8").splitlines()
+
+    def doctored(name: str, edit: Any) -> Path:
+        out = tmp_path / name
+        out.mkdir()
+        body = "\n".join(edit(list(lines))) + "\n"
+        (out / MODEL_PAYLOADS_FILENAME).write_text(body, encoding="utf-8")
+        return out
+
+    def retext(edited: list[str]) -> list[str]:
+        for index, line in enumerate(edited):
+            record = json.loads(line)
+            if record.get("kind") == "model_response":
+                record["response"]["final_text"] = "TAMPERED"
+                edited[index] = json.dumps(record, sort_keys=True)
+                break
+        return edited
+
+    def rerun(edited: list[str]) -> list[str]:
+        out = []
+        for line in edited:
+            record = json.loads(line)
+            record["run_id"] = "run-2"
+            out.append(json.dumps(record, sort_keys=True))
+        return out
+
+    view = read_corpus(source)
+
+    body = structural_diff(view, read_corpus(doctored("body", retext)))
+    assert any("differs" in problem for problem in body), (
+        f"one answer's text was changed and the comparator did not notice: {body}"
+    )
+
+    extra = structural_diff(view, read_corpus(doctored("extra", lambda ls: ls + [ls[-1]])))
+    assert any("record count" in problem for problem in extra), (
+        f"a record was appended and the comparator did not notice: {extra}"
+    )
+
+    torn = structural_diff(view, read_corpus(doctored("torn", lambda ls: ls + ["{not json"])))
+    assert any("damaged" in problem for problem in torn), (
+        f"a corrupt line was added and the comparator did not notice: {torn}"
+    )
+
+    # The masked fields hold a relation: a replay is a DIFFERENT run, on both identifiers.
+    same = masked_field_relations(view, view)
+    assert any("reused the source's run_id" in problem for problem in same), same
+
+    kept_root = masked_field_relations(view, read_corpus(doctored("rerun", rerun)))
+    assert any("reused the source's root_run_id" in problem for problem in kept_root), (
+        f"the replay kept the source's root_run_id and only run_id was related: {kept_root}"
+    )
 
 
 def test_the_mask_is_exactly_the_three_fields_a_replay_may_differ_in() -> None:

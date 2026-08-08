@@ -39,12 +39,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
     RESPONSE_REFERENCE,
+    is_chunk_sha256,
     read_corpus_records,
     response_reference,
 )
@@ -104,19 +106,25 @@ def _chunk_map(run_dir: Path, records: Iterable[dict[str, Any]]) -> dict[str, by
     """Every chunk this corpus can resolve, inline records first, then directory files."""
 
     chunks: dict[str, bytes] = {}
+    # Inline first and first-wins, because that is what ``ReplayCorpus._chunks.setdefault`` does.
+    # The oracle read last-wins, so a corpus with two records under one name resolved to a
+    # different body here than the code under test resolves -- an oracle disagreeing with the
+    # reader about what a chunk IS cannot testify about what the reader served.
+    for record in records:
+        if record.get("kind") != PAYLOAD_CHUNK_KIND:
+            continue
+        sha, text = record.get("sha256"), record.get("text")
+        if not (isinstance(sha, str) and isinstance(text, str) and is_chunk_sha256(sha)):
+            continue
+        data = text.encode("utf-8")
+        if sha256_bytes(data) != sha:
+            continue  # the reader re-hashes before believing a name; so does this
+        chunks.setdefault(sha, data)
     directory = run_dir / MODEL_PAYLOADS_DIRNAME
     if directory.is_dir():
         for entry in sorted(directory.iterdir()):
             if entry.is_file():
-                chunks[entry.name] = entry.read_bytes()
-    for record in records:
-        if record.get("kind") == PAYLOAD_CHUNK_KIND:
-            sha = record.get("sha256")
-            text = record.get("text")
-            if isinstance(sha, str) and isinstance(text, str):
-                # Inline wins, the way resolution does: the writer cannot produce both under one
-                # name, so a same-named file would be an unreachable shadow.
-                chunks[sha] = text.encode("utf-8")
+                chunks.setdefault(entry.name, entry.read_bytes())
     return chunks
 
 
@@ -139,8 +147,8 @@ def read_corpus(run_dir: Path) -> CorpusView:
         if record.get("kind") != MODEL_RESPONSE_KIND:
             continue
         digest = record.get("request_digest")
-        if not isinstance(digest, str) or not digest:
-            continue  # keyless: the reader cannot join it either
+        if not isinstance(digest, str) or not is_chunk_sha256(digest):
+            continue  # unkeyable: the reader refuses it as a rejected record, not as an answer
         placement, sha = response_reference(record.get("response"))
         body: Any = record.get("response")
         if placement == RESPONSE_REFERENCE and sha is not None:
@@ -219,18 +227,25 @@ def structural_diff(a: CorpusView, b: CorpusView) -> list[str]:
 def masked_field_relations(a: CorpusView, b: CorpusView) -> list[str]:
     """The masked fields still have to hold a relation; masking is not licence.
 
-    A replay run is a *different* run, so its ids must differ from the source's rather than
-    merely being ignored, and its clock must still be read once per call -- the rule at
-    ``recorder.py:561-566`` that nothing else asserts end to end.
+    A replay run is a *different* run, so both its ids must differ from the source's rather than
+    merely being ignored, and its clock must be non-decreasing in file order.
+
+    What this deliberately does **not** claim: the recorder's one-clock-read-per-call rule. That
+    rule is that ``model_calls.jsonl`` and ``model_payloads.jsonl`` share a single reading for
+    one call, and this module never opens the ledger, so it cannot see the pair. An earlier
+    docstring cited it anyway. Non-decreasing stamps are also satisfied by a recorder that read
+    the clock once for the whole run, so the check is weaker than the sentence was.
     """
 
     problems: list[str] = []
-    source_ids = {r.get("run_id") for r in a.records if "run_id" in r}
-    replay_ids = {r.get("run_id") for r in b.records if "run_id" in r}
-    if len(replay_ids) > 1:
-        problems.append(f"replay corpus carries more than one run_id: {sorted(replay_ids)}")
-    if source_ids & replay_ids:
-        problems.append(f"replay reused the source's run_id: {sorted(source_ids & replay_ids)}")
+    for field in ("run_id", "root_run_id"):
+        source_ids = {r.get(field) for r in a.records if field in r}
+        replay_ids = {r.get(field) for r in b.records if field in r}
+        if len(replay_ids) > 1:
+            problems.append(f"replay corpus carries more than one {field}: {sorted(replay_ids)}")
+        shared = source_ids & replay_ids
+        if shared:
+            problems.append(f"replay reused the source's {field}: {sorted(shared)}")
     for label, view in (("source", a), ("replay", b)):
         stamps = [r["recorded_at"] for r in view.records if isinstance(r.get("recorded_at"), str)]
         if stamps != sorted(stamps):
@@ -352,9 +367,15 @@ def assert_supply_conserved(sources: Sequence[Path], corpus: Any) -> None:
     for path in _distinct_sources(sources).values():
         view = read_corpus(path)
         expected += sum(len(queue) for queue in view.answers.values())
+    assert expected, (
+        "the named sources supply no answers at all, so conservation is vacuously true; "
+        "the fixture is not testing what it claims to test"
+    )
     actual = corpus.response_count()
+    diagnosis = (
+        "a source was indexed more than once" if actual > expected else "a source is missing"
+    )
     assert actual == expected, (
         f"the corpus holds {actual} joinable answer(s) but its "
-        f"{len(_distinct_sources(sources))} distinct source(s) supply {expected}: "
-        "a source was indexed more than once"
+        f"{len(_distinct_sources(sources))} distinct source(s) supply {expected}: {diagnosis}"
     )
