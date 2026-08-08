@@ -19,7 +19,9 @@ import ast
 import asyncio
 import json
 import threading
+import tempfile
 import tracemalloc
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +29,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core import model_payloads, payload_gc, payload_replay, schemas
+from monoid_agent_kernel.providers import replay as providers_replay
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
@@ -1790,76 +1793,204 @@ def test_a_hostile_corpus_cannot_write_a_megabyte_of_diagnosis(tmp_path: Path) -
     assert stale and len(stale) < ceiling, f"generation tags unbounded: {len(stale or '')} chars"
 
 
-def test_no_message_interpolates_a_corpus_string_unbounded() -> None:
-    """The rule, bound by machine at every site instead of at the sites someone listed.
+_BOUNDING_CALLS = {"_short", "_named", "_where", "_term_digest"}
 
-    Bounding one site at a time is how three of this PR's six routes were made. This walks every
-    f-string in the reader and refuses a corpus-supplied string field interpolated into one
-    unless it passes through a bounding call. Scope is honest: attribute reads of the known
-    corpus-supplied fields, which is what carries a hostile corpus's bytes into a message.
+# Every interpolation in the message-building modules, reviewed once and keyed by
+# (enclosing function, source text). Keyed by FUNCTION as well as text because the earlier
+# version keyed on text alone, which exempted a name like `sha` or `run_dir` ANYWHERE in the
+# file -- the same name-matching blindness as the `ast.Attribute` deny-list that version had
+# itself replaced, just mirrored onto locals. A mutant reusing an exempt name survived it.
+_REVIEWED_INTERPOLATIONS = {
+    "monoid_agent_kernel.core.payload_replay": {
+        # Integers: cannot carry corpus bytes at any length.
+        ("_short", "len(text)"),
+        ("_where", "entry.call_index"),
+        ("consume", "len(queue)"),
+        ("identity_divergence", "len(profiles)"),
+        ("identity_divergence", "len(differing) - _DIAGNOSED_TERMS"),
+        ("_closest_divergence", "len(conversation) - len(named)"),
+        ("_no_answer_reason", "self._damaged"),
+        ("_no_answer_reason", "self._rejected"),
+        # Sliced at the interpolation itself; the slice IS the bound.
+        ("_short", "text[:_NAMED_VALUE_CHARS]"),
+        ("_closest_divergence", "live_digests.get(name, 'missing')[:_DIGEST_PREFIX]"),
+        ("_closest_divergence", "recorded.get(name, 'missing')[:_DIGEST_PREFIX]"),
+        # Lists of already-bounded clauses, capped in length by _DIAGNOSED_TERMS.
+        ("identity_divergence", "clauses"),
+        ("_closest_divergence", "clauses"),
+        ("_closest_divergence", "identity_clauses"),
+        ("_closest_divergence", '"; ".join(clauses)'),
+        ("_closest_divergence", '"; ".join(identity_clauses)'),
+        # Built bounded one statement above their message.
+        ("_generation_mismatch", "recorded"),
+        ("_no_answer_reason", "detail"),
+        # Shape-validated before it reaches a message: 64 hex characters or nothing.
+        ("_resolve_chunk", "sha"),
+        # Kernel vocabulary, not corpus content.
+        ("_generation_mismatch", "generation"),
+        # Operator-supplied paths from the command line.
+        ("load", "Path(run_dir).parent"),
+        ("load", "state"),
+        ("load", "run_dir"),
+        ("load", "hint"),
+    },
+    "monoid_agent_kernel.providers.replay": {
+        # Fixed vocabularies and module constants.
+        ("__init__", "', '.join(REPLAY_MISS_REASONS)"),
+        ("__init__", "REPLAY_MISS_REASONS"),
+        ("__init__", "provider_error_code"),
+        ("_reconstruct", "', '.join(missing)"),
+        ("_reconstruct", "missing"),
+        ("_reconstruct", "name"),
+        ("_forward_lifecycle", "name"),
+        ("_forward_lifecycle", "'opened' if name == 'open' else 'closed'"),
+        ("next_turn", "lookup.result.status"),
+        ("_serve_miss", "miss.reason"),
+        # Attribute names off the operator's own inner adapter, and its class name.
+        ("__init__", "', '.join(asynchronous)"),
+        ("__init__", "asynchronous"),
+        ("__init__", "'is' if len(asynchronous) == 1 else 'are'"),
+        ("__init__", "type(inner).__name__"),
+        # Bounded by every producer: each ReplayMissReason detail is built through _short/_where.
+        ("_serve_miss", "miss.detail"),
+    },
+}
+
+
+def _message_interpolations(module: Any) -> set[tuple[str, str]]:
+    """Every expression whose value reaches a message string, with its enclosing function.
+
+    Sees three shapes, not one. The earlier version walked ``ast.JoinedStr`` only, so ``+``
+    concatenation and ``"".join(...)`` were invisible to it -- a measured fail-open: a mutant
+    leaking the same corpus string by concatenation passed it.
     """
 
-    bounded = {"_short", "_named", "_where", "_term_digest"}
-    # Every other interpolation in the module, reviewed once and keyed by its source text --
-    # an allow-list, deliberately, because the deny-list this replaced could only see misses
-    # someone had already thought of. It named five corpus-supplied ATTRIBUTES, so it was blind
-    # to all three of the sites that survived the round that wrote it: they interpolate plain
-    # locals. An expression that is neither bounded nor listed here fails, so the next message
-    # cannot quietly become the next unbounded channel. Keyed by text, not line, so the pin
-    # survives edits above it.
-    reviewed = {
-        # Integers. Cannot carry corpus bytes at any length.
-        "len(text)": "int",
-        "entry.call_index": "int",
-        "len(profiles)": "int",
-        "len(conversation) - len(named)": "int",
-        "len(differing) - _DIAGNOSED_TERMS": "int",
-        "len(queue)": "int",
-        "self._damaged": "int",
-        "self._rejected": "int",
-        # Sliced at the interpolation itself; the slice IS the bound.
-        "text[:_NAMED_VALUE_CHARS]": "_short's own slice",
-        "live_digests.get(name, 'missing')[:_DIGEST_PREFIX]": "digest prefix",
-        "recorded.get(name, 'missing')[:_DIGEST_PREFIX]": "digest prefix",
-        # Shape-validated before it reaches a message: 64 hex characters or nothing.
-        "sha": "is_chunk_sha256 at the trichotomy and again in the resolver",
-        # Bound where it is built, one statement above its message.
-        "recorded": "assigned _short(', '.join(sorted(self._generations)))",
-        # Kernel vocabulary, not corpus content: the caller's generation constant.
-        "generation": "the generation the kernel asked for, not one the corpus supplied",
-        # Operator-supplied paths from the command line, not corpus bytes.
-        "Path(run_dir).parent": "operator-supplied path",
-        "state": "operator-supplied path",
-        "run_dir": "operator-supplied path",
-        "hint": "operator-supplied path",
-    }
-
-    source = Path(payload_replay.__file__).read_text(encoding="utf-8")
+    source = Path(module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    offenders: list[str] = []
+    scope: dict[int, str] = {}
+    covered: set[int] = set()
+
+    def walk(node: Any, name: str, inside_bound: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_name = (
+                child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else name
+            )
+            scope[id(child)] = child_name
+            if inside_bound:
+                covered.add(id(child))
+            bound = inside_bound or (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in _BOUNDING_CALLS
+            )
+            walk(child, child_name, bound)
+
+    walk(tree, "<module>", False)
+
+    def is_literal(node: Any) -> bool:
+        return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+    found: set[tuple[str, str]] = set()
+
+    def record(expr: Any, enclosing: str) -> None:
+        if id(expr) in covered or isinstance(expr, ast.Constant):
+            return
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id in _BOUNDING_CALLS
+        ):
+            return
+        found.add((enclosing, ast.get_source_segment(source, expr) or ""))
+
     for node in ast.walk(tree):
-        if not isinstance(node, ast.JoinedStr):
+        if id(node) in covered:
             continue
-        for piece in node.values:
-            if not isinstance(piece, ast.FormattedValue):
-                continue
-            value = piece.value
-            if isinstance(value, ast.Constant):
-                continue
-            if (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Name)
-                and value.func.id in bounded
-            ):
-                continue
-            text = ast.get_source_segment(source, value) or ""
-            if text not in reviewed:
-                offenders.append(f"line {piece.lineno}: {text}")
+        enclosing = scope.get(id(node), "<module>")
+        if isinstance(node, ast.JoinedStr):
+            for piece in node.values:
+                if isinstance(piece, ast.FormattedValue):
+                    record(piece.value, enclosing)
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            sides = [node.left, node.right]
+            if any(is_literal(side) or isinstance(side, ast.JoinedStr) for side in sides):
+                for side in sides:
+                    if not (is_literal(side) or isinstance(side, ast.JoinedStr)):
+                        record(side, enclosing)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"join", "format"}
+            and is_literal(node.func.value)
+        ):
+            for argument in node.args:
+                record(argument, enclosing)
+    return found
+
+
+def test_no_message_interpolates_a_corpus_string_unbounded() -> None:
+    """The rule, bound by machine across every module that builds these messages.
+
+    Bounding one site at a time is how three of this PR's routes were made, and this census has
+    now failed twice in the same way. First it matched corpus-supplied ATTRIBUTE names, so it was
+    blind to three sites interpolating plain locals. Then, fixed, it walked ONE module -- while
+    the adapter one import away had three raw sites of its own, one of them a hand-written copy
+    of the very sentence `_where` exists to bound ("One function, so the four sites cannot drift
+    apart"; the fifth site was in the other module and drifted). Measured: 800,000 characters
+    into failure.json, status.json, events.jsonl and stderr.
+
+    So the scope is derived from a module list, and an expression must either pass through a
+    bounding call or be reviewed by (function, text) below.
+    """
+
+    offenders: dict[str, list[tuple[str, str]]] = {}
+    for module in (payload_replay, providers_replay):
+        reviewed = _REVIEWED_INTERPOLATIONS[module.__name__]
+        unreviewed = sorted(_message_interpolations(module) - reviewed)
+        if unreviewed:
+            offenders[module.__name__] = unreviewed
 
     assert not offenders, (
         "a message interpolates an expression that is neither bounded nor reviewed; the corpus "
-        "is untrusted by this module's own threat model, so a new interpolation must either "
+        "is untrusted by these modules' own threat model, so a new interpolation must either "
         f"pass through a bounding call or be added above with a reason: {offenders}"
+    )
+
+
+def test_the_interpolation_census_sees_the_shapes_it_claims_to() -> None:
+    """The census's own negative, on a synthetic module rather than the real one.
+
+    An allow-list census fails open by construction: every shape it cannot see reads as a pass.
+    Both holes measured in review are pinned here -- a name reused in a DIFFERENT function from
+    the one it was exempted in, and a leak by concatenation rather than by f-string.
+    """
+
+    planted = (
+        "def elsewhere(entry):\n"
+        "    sha = str(entry.run_id)\n"
+        '    return f"borrowed an exempt name {sha}"\n'
+        "\n"
+        "def concatenated(self, detail):\n"
+        '    return detail + " and " + " ".join(self._run_ids)\n'
+    )
+    module = types.ModuleType("planted")
+    path = Path(tempfile.mkdtemp()) / "planted.py"
+    path.write_text(planted, encoding="utf-8")
+    module.__file__ = str(path)
+
+    seen = _message_interpolations(module)
+
+    assert ("elsewhere", "sha") in seen, (
+        "an exempt name reused in another function was invisible; the census is keyed by text "
+        f"alone again: {sorted(seen)}"
+    )
+    assert ("concatenated", "detail") in seen, (
+        f"a leak by concatenation was invisible; the census walks f-strings only: {sorted(seen)}"
+    )
+    # The ARGUMENT, not the join expression: the census names the term that carries the
+    # bytes, which is the thing a fix has to wrap.
+    assert ("concatenated", "self._run_ids") in seen, (
+        f"a leak through str.join was invisible: {sorted(seen)}"
     )
 
 
