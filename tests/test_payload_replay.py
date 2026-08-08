@@ -29,6 +29,7 @@ from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
+    MODEL_RESPONSE_KIND,
     MODEL_PAYLOADS_FILENAME,
     MODEL_REQUEST_KIND,
     PAYLOAD_CHUNK_REF_KEY,
@@ -1446,3 +1447,73 @@ def test_a_take_holds_no_lock_across_its_block(tmp_path: Path) -> None:
         assert finished.wait(timeout=5), "the take held the lock across its block"
         take.unserved()
     worker.join(timeout=5)
+
+
+def test_an_offloaded_body_is_held_to_the_same_ingress_rules_as_an_inline_one(
+    tmp_path: Path,
+) -> None:
+    """One response body, two parsers -- and the offloaded half was held to neither rule.
+
+    This module's contract is that it re-establishes on arrival every rule the writer holds by
+    construction. Inline bodies arrive through ``read_corpus_records`` and therefore through
+    the hardened ingress parser: bounded nesting, unique keys after normalization, bounded
+    ints, no non-finite floats. An offloaded body got plain ``json.loads``.
+
+    The sharpest consequence is not a parse difference. ``docs/CLI.md`` promises tools
+    re-execute for real on replay, and ``_reconstruct`` checks that ``arguments`` is a dict
+    without walking its values -- so a ``NaN`` in recorded tool arguments becomes a LIVE tool
+    invocation carrying an argument value that exists in no recording. The chunk is planted
+    under its own true name, so the re-hash cannot object; that is the actor
+    ``core/_verified_file.py`` exists for.
+    """
+
+    big = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096)
+    recorder = _recorder(tmp_path)
+    [digest] = _drive(
+        recorder, _ScriptedAdapter([ModelTurn(response_id="r", final_text=big)]), [_request()]
+    )
+    recorder.close()
+
+    planted = json.dumps(
+        {
+            "response_id": "r",
+            "final_text": None,
+            "tool_calls": [{"id": "c1", "name": "shell", "arguments": {"timeout": float("nan")}}],
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": "stop",
+            "provider_retried": False,
+        }
+    ).encode("utf-8")
+    assert b"NaN" in planted, "the fixture must actually carry a non-finite literal"
+
+    run_dir = tmp_path / "runs" / "run-1"
+    directory = run_dir / MODEL_PAYLOADS_DIRNAME
+    for stale in directory.iterdir():
+        stale.unlink()
+    name = sha256_bytes(planted)
+    (directory / name).write_bytes(planted)
+
+    corpus_path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = []
+    for line in corpus_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("kind") == MODEL_RESPONSE_KIND:
+            record["response"] = {PAYLOAD_CHUNK_REF_KEY: name}
+        lines.append(json.dumps(record, sort_keys=True))
+    corpus_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    outcome = _load(tmp_path).consume(digest, generation=_GEN)
+
+    assert isinstance(outcome, ReplayMissReason), (
+        "a body the inline half would have refused was served from the offloaded half"
+    )
+    assert outcome.reason == MISS_NOT_RECORDED
+
+    # And the validator has to agree. It re-hashes the resolved chunk without ever parsing it,
+    # so it certified this corpus clean -- tightening the reader alone would only have added a
+    # fourth verdict to a corpus that already gets different answers from validate, gc and run.
+    issues = validate_run_dir(run_dir)
+    assert any("response" in issue.path or "response" in issue.message for issue in issues), (
+        f"monoid validate certified a corpus the reader refuses: {issues}"
+    )

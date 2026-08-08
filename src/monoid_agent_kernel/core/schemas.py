@@ -1086,6 +1086,7 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
 def _payloads_envelope(kind: str) -> dict[str, Any]:
     return {
         "schema_version": {"enum": [MODEL_PAYLOADS_SCHEMA_VERSION]},
@@ -1167,7 +1168,6 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
 }
 
 PROPOSAL_SCHEMA: dict[str, Any] = {
-
     "type": "object",
     "required": [
         "schema_version",
@@ -1713,7 +1713,9 @@ def _validate_object(
         location = detail.json_path
         where = "" if location in ("$", "") else f" at {location}"
         issues.append(
-            ValidationIssue(issue_path, f"does not satisfy the {detail.validator} constraint{where}")
+            ValidationIssue(
+                issue_path, f"does not satisfy the {detail.validator} constraint{where}"
+            )
         )
 
 
@@ -1774,9 +1776,7 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             data = text.encode("utf-8")
             if sha256_bytes(data) != sha:
                 issues.append(
-                    ValidationIssue(
-                        f"{path.name}:{index}", "chunk text does not match its sha256"
-                    )
+                    ValidationIssue(f"{path.name}:{index}", "chunk text does not match its sha256")
                 )
                 continue
             chunks[sha] = data
@@ -1805,14 +1805,10 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             if not isinstance(digest, str) or not isinstance(refs, bool):
                 continue  # shape issues are the schema pass's report
             try:
-                rebuilt = reassemble_request_preimage(
-                    payload.get("payload"), resolve, refs=refs
-                )
+                rebuilt = reassemble_request_preimage(payload.get("payload"), resolve, refs=refs)
             except Exception:
                 issues.append(
-                    ValidationIssue(
-                        f"{path.name}:{index}", "request payload cannot be reassembled"
-                    )
+                    ValidationIssue(f"{path.name}:{index}", "request payload cannot be reassembled")
                 )
                 continue
             if sha256_bytes(rebuilt) != digest:
@@ -1838,12 +1834,29 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                 )
             elif shape == RESPONSE_REFERENCE:
                 try:
-                    resolve(sha)
+                    resolved = resolve(sha)
                 except Exception:
                     issues.append(
                         ValidationIssue(
                             f"{path.name}:{index}",
                             "response reference does not resolve to a recorded chunk",
+                        )
+                    )
+                    continue
+                try:
+                    # Resolving is not believing. Re-hashing proves the bytes are the ones the
+                    # writer named, not that they are a body any reader will accept: the sha
+                    # names whatever was planted, so an offloaded body could carry JSON the
+                    # ingress rules forbid and still pass every check here. The replay reader
+                    # refuses such a body; without this arm ``monoid validate`` would certify
+                    # the corpus clean and the operator would meet the refusal at run time
+                    # with a green integrity report in hand.
+                    loads_json_ingress(resolved.decode("utf-8"))
+                except Exception:
+                    issues.append(
+                        ValidationIssue(
+                            f"{path.name}:{index}",
+                            "response body is not JSON this kernel's readers accept",
                         )
                     )
 

@@ -52,7 +52,6 @@ place that can see a key drawing answers from more than one source, so it counts
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -65,6 +64,7 @@ from monoid_agent_kernel.core._verified_file import (
     file_identity,
     read_verified_bytes,
 )
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
@@ -575,7 +575,13 @@ class ReplayCorpus:
             assert sha is not None
             try:
                 body_bytes = self._resolve_chunk(sha)
-                body = json.loads(body_bytes.decode("utf-8"))
+                # The same parser the inline half gets through ``read_corpus_records``. One
+                # body, two parsers was the gap: an offloaded answer bypassed bounded nesting,
+                # unique-keys-after-normalization, bounded ints and the non-finite refusal, and
+                # `_reconstruct` checks that ``arguments`` is a dict without walking its
+                # values -- so a NaN in recorded tool arguments became a live tool invocation
+                # carrying a value that exists in no recording.
+                body = loads_json_ingress(body_bytes.decode("utf-8"))
             except Exception as error:  # noqa: BLE001 - every failure is one refusal
                 return ReplayMissReason(
                     MISS_NOT_RECORDED,
@@ -848,7 +854,11 @@ class ReplayCorpus:
                 entry.payload, self._resolve_chunk, refs=entry.refs
             )
             if sha256_bytes(preimage) == digest:
-                value = json.loads(preimage.decode("utf-8"))
+                # The reassembled preimage is corpus bytes too, and this projection feeds the
+                # impersonation derivation and the CLI preflight -- the twin of the body site
+                # above, and the one a census of "where does a corpus become objects" finds
+                # while reading the response path alone does not.
+                value = loads_json_ingress(preimage.decode("utf-8"))
                 inner = value.get(entry.generation) if isinstance(value, dict) else None
                 if isinstance(inner, Mapping):
                     terms = inner
