@@ -37,6 +37,9 @@ out in commit messages and here.
   or invented. The check sits above the kind dispatch, so chunks, requests and answers all get it.
   The coercion had also stopped being merely advisory: `run_id` correlates the impersonation
   evidence now, so two damaged records in two unrelated runs both collapsed to `""` and intersected.
+  `unrecorded_reason` is checked the same way, by membership in the schema's own enum: coerced, a
+  missing marker or a `false` became `""` — the value meaning "recorded normally" — so a damaged
+  record with a well-formed body beside it replayed as a successful turn.
 - **A discarded outcome is handed back on every path that drops one, not just the first.** A run
   boundary can throw away a real result in four places: the boundary check finding the call already
   done, the awaiter's own cleanup finding it done a moment later, an async callee settling after

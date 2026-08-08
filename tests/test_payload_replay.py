@@ -1369,6 +1369,66 @@ def test_an_answer_whose_envelope_is_corrupt_is_damage(
     )
 
 
+@pytest.mark.parametrize(
+    "planted",
+    [None, False, 0, "not_a_declared_reason", "TOO_LARGE"],
+    ids=lambda value: repr(value),
+)
+def test_an_answer_whose_unrecorded_reason_is_not_a_declared_one_is_damage(
+    tmp_path: Path, planted: Any
+) -> None:
+    """The coercion three lines from the envelope check, left standing by the envelope fix.
+
+    ``schemas.py`` declares this field as an enum of exactly ``UNRECORDED_REASONS`` and requires
+    it. The reader wrote ``reason if isinstance(reason, str) else ""`` -- so a missing marker, or
+    ``false``, became the empty string, which is the value meaning *"this answer was recorded
+    normally"*. With a well-formed body beside it the record then replays as a successful turn,
+    and ``rejected_records`` stays zero, so the preflight reports a damaged corpus as sound. A
+    string outside the enum is the same defect wearing the right type.
+
+    The previous round fixed ``run_id``, ``root_run_id`` and ``recorded_at`` and left this one,
+    and the docstring written with that fix listed ``unrecorded_reason`` among the *type-checked*
+    fields -- it was never checked, only coerced. Enumerating "every field of this kind" by
+    reading the code rather than by trusting a sentence is the difference, and the sentence was
+    mine.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    record = model_response_record(
+        {
+            "response_id": "r-reason",
+            "final_text": "a body good enough to replay under a marker that is not one",
+            "tool_calls": [],
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": "stop",
+            "provider_retried": False,
+        },
+        call_index=1,
+        request_digest=digest,
+        unrecorded_reason="",
+        **_envelope(),
+    )
+    if planted is None:
+        record.pop("unrecorded_reason")
+    else:
+        record["unrecorded_reason"] = planted
+    with (run_dir / MODEL_PAYLOADS_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    corpus = ReplayCorpus.load([run_dir])
+
+    assert corpus.rejected_records == 1, (
+        f"an unrecorded_reason of {planted!r} is outside the schema's enum, and the reader "
+        "coerced it into the value that means the answer was recorded normally"
+    )
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse)
+    assert corpus.consume(digest, generation=_GEN).reason == MISS_EXHAUSTED, (
+        "the corrupt record was queued behind the healthy one and would be served as a turn"
+    )
+
+
 def test_a_slot_below_zero_is_not_a_slot(tmp_path: Path) -> None:
     """`release`'s guard is `cursor == slot + 1`, which `slot = -1` satisfies against a fresh
     cursor of zero -- and the cursor then goes negative.
@@ -2177,8 +2237,11 @@ def test_a_root_run_id_that_is_not_a_string_invents_no_family(tmp_path: Path) ->
     """The one indexed field that was stringified instead of type-checked -- now refused outright.
 
     ``_index`` type-checks ``text``, ``sha256``, ``request_digest``, ``refs``,
-    ``digest_generation``, ``call_index`` and ``unrecorded_reason``; the envelope went through
-    ``str(... or "")``. The schema requires a non-empty string, so anything else is planted --
+    ``digest_generation`` and ``call_index``; the envelope went through ``str(... or "")``. (This
+    sentence listed ``unrecorded_reason`` among the checked fields when it was written, and that
+    was wrong -- it was coerced too, and the review round after this one found it. A census read
+    off a sentence is not a census.) The schema requires a non-empty string, so anything else is
+    planted --
     and planted, ``123`` or ``True`` or ``["P"]`` stringifies to the same text in two unrelated
     corpora, making them compare equal and fire the fan-out remedy.
 

@@ -71,6 +71,7 @@ from monoid_agent_kernel.core._verified_file import (
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.core.model_payloads import (
+    UNRECORDED_REASONS,
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     MODEL_PAYLOADS_SCHEMA_VERSION,
@@ -506,7 +507,7 @@ class ReplayCorpus:
             # First-wins across duplicates: a durable resume re-records the same digest with
             # an empty seen-set, and the earliest record is the one whose activation the
             # file-order answers below it belong to.
-            record_run = str(record.get("run_id") or "")
+            record_run = record["run_id"]
             self._requests.setdefault(
                 digest,
                 _RequestEntry(
@@ -553,6 +554,16 @@ class ReplayCorpus:
                 self._rejected += 1
                 return
             reason = record.get("unrecorded_reason")
+            if reason not in UNRECORDED_REASONS:
+                # Declared as an enum by `schemas.py` and required, so anything else is a record
+                # `monoid validate` calls corrupt. Coerced, a missing marker or a `false` became
+                # `""` -- the value that means "recorded normally" -- so a damaged record with a
+                # well-formed body replayed as a successful turn while `rejected_records` stayed
+                # zero. Checked by membership rather than by type: `isinstance(reason, str)` is
+                # what was here, and a string outside the enum is the same defect wearing the
+                # right type. `True` cannot slip through either -- `True in ("", ...)` is False.
+                self._rejected += 1
+                return
             # "File order, each answer once" is a rule about one corpus. Across a union it
             # quietly becomes "the order the sources were named in", and the operator is told
             # nothing: two recordings of the same conversation -- the same prompt run twice, or
@@ -561,15 +572,15 @@ class ReplayCorpus:
             # a different conversation, or, where one source recorded a refusal at that
             # position and the other the answer, turns a union that demonstrably holds the
             # answer into a miss. This is the only place that can see it happen.
-            # Type-checked like every other indexed field. Stringified, a planted 123 or
-            # True or ["P"] compares equal across two unrelated sources and fires the
-            # family warning, telling the operator to name children "in spawn order" for a
-            # parent that never spawned anything -- the misdirection this warning was
-            # written to remove.
-            raw_root = record.get("root_run_id")
-            root = raw_root if isinstance(raw_root, str) else ""
-            raw_run = record.get("run_id")
-            run = raw_run if isinstance(raw_run, str) else ""
+            # Read directly: `_has_sound_envelope` proved these are non-empty strings before
+            # the kind dispatch. They used to be stringified here, and planted, a 123 or True or
+            # ["P"] compared equal across two unrelated sources and fired the family warning --
+            # telling the operator to name children "in spawn order" for a parent that never
+            # spawned anything. Leaving the coercion behind the check would keep that reasoning
+            # attached to code that can no longer run, which is how the field beside it
+            # (`unrecorded_reason`) got read as "already validated" for a whole review round.
+            root = record["root_run_id"]
+            run = record["run_id"]
             if self._response_source.setdefault(digest, source) != source:
                 self._crossed.add(digest)
                 # Which remedy is actionable depends on what crossed. Two recordings of one
@@ -591,10 +602,10 @@ class ReplayCorpus:
             self._responses.setdefault(digest, []).append(
                 _ResponseEntry(
                     response=record.get("response"),
-                    unrecorded_reason=reason if isinstance(reason, str) else "",
+                    unrecorded_reason=reason,
                     call_index=call_index,
-                    recorded_at=str(record.get("recorded_at") or ""),
-                    run_id=str(record.get("run_id") or ""),
+                    recorded_at=record["recorded_at"],
+                    run_id=record["run_id"],
                 )
             )
 
