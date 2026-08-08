@@ -1731,9 +1731,20 @@ def _replay_preflight(
         # different conversation, and where one source recorded a refusal at that position it
         # turns a union that holds the answer into a miss.
         click.echo(
-            f"warning: {corpus.crossed_keys} recorded call(s) can be answered by more than "
-            "one --replay-from source; the order the sources were named in decides which "
-            "answer each call gets",
+            f"warning: {corpus.crossed_keys} recorded call key(s) can be answered by more "
+            "than one --replay-from source; the order the sources were named in decides "
+            "which answer each call gets",
+            err=True,
+        )
+    if corpus.crossed_within_one_run:
+        # "Reverse the flags" is not actionable for a family: the children are one run's
+        # fan-out, their ids are minted hex in no meaningful order, and glob order sorts by
+        # that hex. Say which order is the right one instead.
+        click.echo(
+            f"warning: {corpus.crossed_within_one_run} of those key(s) were recorded by "
+            "children of one run -- identical subagents record the same key, because nothing "
+            "run-scoped is in it; name the child run directories in the order the parent "
+            "spawned them",
             err=True,
         )
     generation = corpus.generation_divergence(_REQUEST_DIGEST_GENERATION)

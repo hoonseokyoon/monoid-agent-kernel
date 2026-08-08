@@ -800,13 +800,27 @@ CLI face, [CLI.md](CLI.md)) serves `next_turn` from one or more recorded run dir
 refuses everything it cannot prove. The contract:
 
 - **Selection is file order, each answer once.** The corpus records what happened; the adapter
-  hands answers back in that order. A record whose body was refused (`unrecorded_reason`) still
-  spends its slot — skipping it would hand answer N+1 to call N — and consuming it is a
-  `not_recorded` miss. Duplicate request records and a restarting `call_index` are the ordinary
-  durable-resume shape and collapse by digest, exactly as the previous section specifies.
-  Across a union, "file order" spans the sources in the order they were named: disjoint for the
-  family union, decisive for two recordings of one conversation. The reader counts the keys more
-  than one source can answer and the CLI preflight warns; it is not otherwise visible.
+  hands answers back in that order. Consuming a record whose body cannot be given back
+  (`unrecorded_reason`, an unresolvable reference, a body that is not a recorded turn) is a
+  `not_recorded` miss that **leaves the cursor standing**. The loop's contract for a
+  `config_recoverable` failure is an idempotent re-attempt of the *same* call, so a refusal that
+  advanced would answer that re-attempt with the recording belonging to the call after it —
+  silently, as a structurally valid turn. A slot is spent only when the caller moves the
+  conversation past it by serving that call another way (`--replay-fallthrough`); a record the
+  reader handed over that reconstruction then rejected is given back.
+  Both settlements are properties of *leaving a take*, not calls a caller remembers to make:
+  `ReplayCorpus.take(digest, generation=...)` is a context manager whose block declares
+  `served()` when the call happened and settles unserved by every other exit. The two
+  directions are opposite — a standing refusal is spent forward, a rejected record is given
+  back — and choosing between them at the call site is what repeatedly went wrong.
+  Duplicate request records and a restarting `call_index` are the ordinary durable-resume shape
+  and collapse by digest, exactly as the previous section specifies.
+  Across a union, "file order" spans the sources in the order they were named, and it is
+  decisive wherever two sources can answer one key. That includes families: keys are disjoint
+  across a family only when no two children share a definition and a prompt, because nothing
+  run-scoped is in the key, so an ordinary fan-out of two identical children records one key in
+  two run directories. The reader counts the keys more than one source can answer
+  (`crossed_keys`) and the CLI preflight warns; it is not otherwise visible.
 - **Misses are typed and content-free.** Six reasons, fixed: `no_key` (the live request could
   not be keyed), `absent` (nothing recorded under the key — including the failed-original-call
   shape, whose request record has no answer beside it), `not_recorded` (an answer slot exists

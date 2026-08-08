@@ -44,10 +44,13 @@ run, which is to say not deterministically. Same family as the spawn-observation
 ``docs/CLI.md``.
 
 **A union is ordered, and that is not visible from the command line.** "File order" spans the
-named sources in the order they were given, which is invisible for the family union (disjoint
-conversations) and decisive for two recordings of one conversation. This reader is the only
-place that can see a key drawing answers from more than one source, so it counts them
-(``crossed_keys``) for the preflight to say out loud.
+named sources in the order they were given, and it is decisive wherever two sources can answer
+one key -- two recordings of one conversation, and equally a fan-out of two children with the
+same definition and the same prompt, which record one key in two run directories for the same
+reason the concurrency paragraph above gives: nothing run-scoped is in the key. Disjointness is
+a property of the prompts, not of the family shape. This reader is the only place that can see
+a key drawing answers from more than one source, so it counts them (``crossed_keys``) for the
+preflight to say out loud.
 """
 
 from __future__ import annotations
@@ -152,6 +155,27 @@ class _RequestEntry:
     refs: bool
     payload: Any
     run_id: str
+
+
+_NAMED_VALUE_CHARS = 120
+"""How much of one identity value a diagnosis will quote.
+
+Identity terms are config vocabulary the ledger beside the corpus already records in plaintext,
+so naming them discloses nothing new -- but the corpus is untrusted by this module's own threat
+model, and ``repr`` of a recorded value has neither a length bound nor a key-count bound. A
+recorded ``model.model`` of 200,000 characters produced a 200,043-character miss message, and
+that message lands on ``turn.failed``, in ``failure.json``, in ``status.json`` and on stderr,
+where nothing downstream truncates. The digest branch twelve lines below has been bounded since
+it was written; this is its twin, and it was the unbounded one."""
+
+
+def _named(value: Any) -> str:
+    """One identity value, in plaintext, bounded. Keep the vocabulary, bound the size."""
+
+    text = repr(value)
+    if len(text) <= _NAMED_VALUE_CHARS:
+        return text
+    return f"{text[:_NAMED_VALUE_CHARS]}... ({len(text)} chars)"
 
 
 def _term_digest(value: Any) -> str:
@@ -260,7 +284,9 @@ class ReplayCorpus:
         self._unjoinable = 0
         self._repeated_sources = 0
         self._response_source: dict[str, int] = {}
+        self._response_root: dict[str, str] = {}
         self._crossed: set[str] = set()
+        self._crossed_within_one_run: set[str] = set()
         self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
         self._profiles: tuple[dict[str, Any], ...] | None = None
         self._lock = threading.Lock()
@@ -437,9 +463,17 @@ class ReplayCorpus:
             # a different conversation, or, where one source recorded a refusal at that
             # position and the other the answer, turns a union that demonstrably holds the
             # answer into a miss. This is the only place that can see it happen.
+            root = str(record.get("root_run_id") or "")
             if self._response_source.setdefault(digest, source) != source:
-                if digest not in self._crossed:
-                    self._crossed.add(digest)
+                self._crossed.add(digest)
+                # Which remedy is actionable depends on what crossed. Two recordings of one
+                # conversation are two runs, and the operator reorders the flags. Two children
+                # of ONE run are a fan-out -- nothing run-scoped is in the key, so identical
+                # children issue the same key -- and "reverse the flags" tells them nothing:
+                # they have to name the children in the order the parent spawned them.
+                if root and self._response_root.get(digest) == root:
+                    self._crossed_within_one_run.add(digest)
+            self._response_root.setdefault(digest, root)
             self._responses.setdefault(digest, []).append(
                 _ResponseEntry(
                     response=record.get("response"),
@@ -736,14 +770,16 @@ class ReplayCorpus:
         expected = profiles[0]
         clauses: list[str] = []
         if expected["provider"] != provider:
-            clauses.append(f"provider recorded {expected['provider']!r}, computing {provider!r}")
+            clauses.append(
+                f"provider recorded {_named(expected['provider'])}, computing {_named(provider)}"
+            )
         recorded_model = expected["model"] if isinstance(expected["model"], dict) else {}
         live_model = model if isinstance(model, dict) else {}
         for name in sorted(set(recorded_model) | set(live_model)):
             if recorded_model.get(name) != live_model.get(name):
                 clauses.append(
-                    f"model.{name} recorded {recorded_model.get(name)!r}, "
-                    f"computing {live_model.get(name)!r}"
+                    f"model.{name} recorded {_named(recorded_model.get(name))}, "
+                    f"computing {_named(live_model.get(name))}"
                 )
         if not clauses:
             clauses.append("the identity block differs in shape")
@@ -795,7 +831,17 @@ class ReplayCorpus:
             if terms is None:
                 continue
             recorded = {name: _term_digest(value) for name, value in terms.items()}
-            matches = sum(1 for name in live_digests if recorded.get(name) == live_digests[name])
+            # Closeness is scored over the CONVERSATION only. Scoring identity terms too let a
+            # same-identity record tie with the identity-diverging one the call would actually
+            # have used, and a strict `>` then hands the tie to whichever came first in file
+            # order -- so the diagnosis reported `absent` with "identity matches" about a call
+            # recorded under a different model, which is verbatim the failure the identity
+            # branch below exists to remove. A file position is not a semantic tie-break.
+            matches = sum(
+                1
+                for name in live_digests
+                if name not in _IDENTITY_TERMS and recorded.get(name) == live_digests[name]
+            )
             if best is None or matches > best[0]:
                 best = (matches, self._requests[digest].run_id, recorded, terms)
         if best is None:
@@ -810,6 +856,19 @@ class ReplayCorpus:
             if live_digests.get(name) != recorded.get(name)
         )
         identity_terms = [name for name in _IDENTITY_TERMS if name in diverging]
+        # The conversation half is built once and used by both exits: an identity divergence
+        # and a diverged conversation are independent facts about one comparison, and a call
+        # can have both.
+        conversation = [name for name in diverging if name not in _IDENTITY_TERMS]
+        named = conversation[:_DIAGNOSED_TERMS]
+        clauses = [
+            f"{name} live={live_digests.get(name, 'missing')[:_DIGEST_PREFIX]} "
+            f"recorded={recorded.get(name, 'missing')[:_DIGEST_PREFIX]}"
+            for name in named
+        ]
+        more = (
+            f" and {len(conversation) - len(named)} more" if len(conversation) > len(named) else ""
+        )
         if identity_terms:
             # `identity_divergence` answered "some recorded identity matches this run", which
             # is a different question from "the record this call would have used was recorded
@@ -818,23 +877,23 @@ class ReplayCorpus:
             # reason that says so, and names the identity in the plaintext the preflight uses.
             # (Identity terms are config vocabulary the ledger already records in the clear;
             # everything below this branch stays digests.)
-            clauses = [
-                f"{name} recorded {recorded_terms.get(name)!r}, computing {live_terms.get(name)!r}"
+            identity_clauses = [
+                f"{name} recorded {_named(recorded_terms.get(name))}, "
+                f"computing {_named(live_terms.get(name))}"
                 for name in identity_terms
             ]
-            return ReplayMissReason(
-                MISS_IDENTITY_MISMATCH,
+            detail = (
                 "this run's config reaches an identity the corpus recorded, but not the one "
                 f"the closest recorded request (run {run_id}) was recorded under: "
-                + "; ".join(clauses),
+                + "; ".join(identity_clauses)
             )
-        named = diverging[:_DIAGNOSED_TERMS]
-        clauses = [
-            f"{name} live={live_digests.get(name, 'missing')[:_DIGEST_PREFIX]} "
-            f"recorded={recorded.get(name, 'missing')[:_DIGEST_PREFIX]}"
-            for name in named
-        ]
-        more = f" and {len(diverging) - len(named)} more" if len(diverging) > len(named) else ""
+            if clauses:
+                # Appended rather than swallowed by an early return. Reporting only the
+                # identity sends the operator to fix the model, re-run, and earn `absent` for
+                # a conversation term they were never told about -- two round trips for one
+                # diagnosis the corpus could give at once.
+                detail += "; the conversation diverges too: " + "; ".join(clauses) + more
+            return ReplayMissReason(MISS_IDENTITY_MISMATCH, detail)
         return ReplayMissReason(
             MISS_ABSENT,
             "identity matches; diverging terms vs the closest recorded request "
@@ -898,12 +957,30 @@ class ReplayCorpus:
     def crossed_keys(self) -> int:
         """How many keys more than one source recorded an answer for.
 
-        Zero for the family union, which is the documented multi-source shape: a parent and its
-        children record disjoint conversations. Non-zero means the answer a call gets depends
-        on the order the sources were named in, which no rule this reader states makes visible.
+        Non-zero means the answer a call gets depends on the order the sources were named in,
+        which no rule this reader states makes visible.
+
+        A family union is **not** exempt, though it is the documented multi-source shape.
+        Nothing run-scoped is in the key -- the same fact the concurrency paragraph above rests
+        on -- so two children with the same definition and the same prompt record one key in
+        two run directories, and the order the flags were given decides which child gets which
+        answer. A family whose children are distinguishable by prompt reads zero here; an
+        ordinary fan-out of identical children does not.
         """
 
         return len(self._crossed)
+
+    @property
+    def crossed_within_one_run(self) -> int:
+        """How many of those crossed keys were recorded by children of the *same* run.
+
+        The distinction is about which remedy is actionable, not about severity. Two recordings
+        of one conversation are two runs and the operator reorders the flags; two children of
+        one run are a fan-out, and the flags have to be given in the order the parent spawned
+        them -- an order that is not recoverable from the run ids, which are minted hex.
+        """
+
+        return len(self._crossed_within_one_run)
 
     def request_count(self) -> int:
         return len(self._requests)

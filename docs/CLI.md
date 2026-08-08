@@ -300,20 +300,30 @@ third ledger delta.
 **Answers replay in recorded order, each once.** A request the original run made twice gets
 the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
 the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
-`provider_error_code`, checkpoints kept. Four of the six sub-reasons reach `failure.json`:
-`no_key`, `absent`, `not_recorded`, `exhausted`. The other two — `identity_mismatch` and
-`generation_mismatch` — are what the preflight refuses *before* a run directory exists, so
-without `--replay-fallthrough` they arrive as an exit-1 message on stderr and never as a
-`provider_error_code`; with it they are warnings and the calls are served live.
+`provider_error_code`, checkpoints kept. Five of the six sub-reasons reach `failure.json`:
+`no_key`, `absent`, `not_recorded`, `exhausted` and `identity_mismatch`. Only
+`generation_mismatch` is preflight-exclusive. `identity_mismatch` reaches a run because the
+preflight refuses only a config that can match *nothing* recorded: a corpus holding more than
+one model identity — the ordinary shape as soon as a subagent declares its own `model:` —
+passes the preflight with a warning, and then a call recorded under the other identity misses.
+What the preflight refuses *before* a run directory exists arrives as an exit-1 message on
+stderr; `--replay-fallthrough` softens those refusals to warnings and serves the calls live.
 
 **Naming more than one source is an ordered union.** `--replay-from` is repeatable, and
-"file order, each answer once" spans the sources in the order the flags were given. For the
-family union (a parent and its children, below) that is invisible, because every key belongs
-to exactly one source. For two recordings of the *same* conversation — the same prompt run
-twice, or a crashed run beside its rerun — it decides which answer each call gets, and where
-one source recorded a refusal at that position it decides whether the call is answered at all.
-The preflight counts such keys and warns; nothing in the finished run records which source
-answered, since `attributes.replay_from` is the whole list.
+"file order, each answer once" spans the sources in the order the flags were given. Wherever
+two sources can answer one key, that order decides which answer each call gets — and where one
+source recorded a refusal at that position, it decides whether the call is answered at all.
+Two recordings of the *same* conversation are the obvious case: the same prompt run twice, or
+a crashed run beside its rerun.
+
+A family is not exempt. Nothing run-scoped is in the key, so two children with the same
+definition and the same prompt — an ordinary fan-out — record **the same key in two different
+run directories**, and naming them in the other order swaps their answers. The run still exits
+0 and reports `completed`; the only signal is the preflight's crossed-key warning, which for a
+family names the children and asks you to give them in spawn order. Take it seriously: a
+family union whose children are distinguishable by prompt has no crossed keys and will not
+warn. Nothing in the finished run records which source answered, since
+`attributes.replay_from` is the whole list.
 
 **Three shapes replay does not reproduce.** A run whose calls were concurrent — background
 subagents draining together — issues the same key from more than one caller, and which caller

@@ -20,6 +20,7 @@ import pytest
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_FILENAME,
+    RECORDED_TURN_FIELDS,
     model_response_record,
 )
 from monoid_agent_kernel.core.payload_replay import (
@@ -1313,3 +1314,52 @@ def test_the_adapter_reaches_the_cursor_only_through_a_take() -> None:
         f"the adapter names the cursor primitive(s) {', '.join(reached)} directly; settle "
         "through `corpus.take(...)` so leaving the block is what settles"
     )
+
+
+@pytest.mark.parametrize("missing", RECORDED_TURN_FIELDS)
+def test_a_body_missing_any_one_recorded_field_is_refused(tmp_path: Path, missing: str) -> None:
+    """The derived declaration binds the writer to the field list; this binds the list to the
+    reader.
+
+    `RECORDED_TURN_FIELDS` is derived from the projections tuple, and mutating it AT THE
+    DECLARATION reddens. Mutating the reader's USE of it did not: only the field a given test
+    happens to care about was ever driven, so `RECORDED_TURN_FIELDS[:-1]` passed the suite while
+    a body omitting `provider_retried` reconstructed as False -- a retried call replayed as a
+    clean one, the exact lie the field was recorded to prevent.
+
+    Parametrized over the declaration rather than over a hand-written list, so a field added to
+    the projections earns this coverage without anyone remembering to add it.
+    """
+
+    full = {
+        "response_id": "r-1",
+        "final_text": "recorded",
+        "tool_calls": [],
+        "reasoning": [],
+        "usage": {},
+        "stop_reason": "stop",
+        "provider_retried": True,
+    }
+    assert set(full) == set(RECORDED_TURN_FIELDS), (
+        "this fixture must carry exactly the declared fields, or it is testing a stale shape"
+    )
+    body = {name: value for name, value in full.items() if name != missing}
+
+    digest, _repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="first"),
+                ModelTurn(response_id="r-2", final_text="second"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    _prepend_refused_answer(tmp_path, digest, unrecorded_reason="", body=body)
+
+    adapter = _replay(tmp_path)
+    with pytest.raises(ReplayMiss) as caught:
+        _call(adapter, _request())
+
+    assert caught.value.provider_error_code == MISS_NOT_RECORDED
+    assert missing in str(caught.value), "the refusal names the field that was missing"

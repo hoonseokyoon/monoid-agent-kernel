@@ -124,8 +124,12 @@ def _write_corpus(run_dir: Path, records: list[dict[str, Any]]) -> None:
     (run_dir / MODEL_PAYLOADS_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _envelope(run_id: str = "run-1") -> dict[str, str]:
-    return {"run_id": run_id, "root_run_id": run_id, "recorded_at": "2026-08-08T00:00:00Z"}
+def _envelope(run_id: str = "run-1", root_run_id: str | None = None) -> dict[str, str]:
+    return {
+        "run_id": run_id,
+        "root_run_id": root_run_id or run_id,
+        "recorded_at": "2026-08-08T00:00:00Z",
+    }
 
 
 def _recorded_pair(
@@ -134,6 +138,9 @@ def _recorded_pair(
     generation: str = _GEN,
     body: dict[str, Any] | None = None,
     answers: list[str] | None = None,
+    run_id: str = "run-1",
+    root_run_id: str | None = None,
+    terms: dict[str, Any] | None = None,
 ) -> str:
     """A hand-built, self-consistent request + N answers; returns the request digest.
 
@@ -141,7 +148,11 @@ def _recorded_pair(
     -- the only shape in which a slot coordinate is distinguishable from the constant zero.
     """
 
-    preimage_value = {generation: {"instruction": "hand-built", "provider": "gateway"}}
+    preimage_value = {
+        generation: terms
+        if terms is not None
+        else {"instruction": "hand-built", "provider": "gateway"}
+    }
     preimage = model_payloads._encoded(preimage_value)
     digest = sha256_bytes(preimage)
 
@@ -170,7 +181,7 @@ def _recorded_pair(
                 refs=False,
                 request_digest=digest,
                 digest_generation=generation,
-                **_envelope(),
+                **_envelope(run_id, root_run_id),
             ),
             *(
                 model_response_record(
@@ -178,7 +189,7 @@ def _recorded_pair(
                     call_index=index,
                     request_digest=digest,
                     unrecorded_reason="",
-                    **_envelope(),
+                    **_envelope(run_id, root_run_id),
                 )
                 for index, response in enumerate(bodies)
             ),
@@ -1517,3 +1528,217 @@ def test_an_offloaded_body_is_held_to_the_same_ingress_rules_as_an_inline_one(
     assert any("response" in issue.path or "response" in issue.message for issue in issues), (
         f"monoid validate certified a corpus the reader refuses: {issues}"
     )
+
+
+def test_two_identical_children_of_one_run_cross_a_key(tmp_path: Path) -> None:
+    """The family union is not key-disjoint, and three documents used to say it was.
+
+    Nothing run-scoped is in the key -- the same fact the module's concurrency paragraph rests
+    on -- so an ordinary fan-out of two children with the same definition and the same prompt
+    records ONE key in TWO run directories. Naming them in the other order swaps their answers,
+    and the run still exits 0 reporting `completed`.
+
+    The family case is called out separately because the remedies differ: two recordings of one
+    conversation are two runs and the operator reorders the flags, while a fan-out has to be
+    named in spawn order -- an order the minted-hex child ids do not carry.
+    """
+
+    first = tmp_path / "runs" / "child-a"
+    second = tmp_path / "runs" / "child-b"
+    digest = _recorded_pair(first, run_id="child-a", root_run_id="parent", answers=["child one"])
+    repeat = _recorded_pair(second, run_id="child-b", root_run_id="parent", answers=["child two"])
+    assert digest == repeat, "identical children record the same key -- that is the premise"
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 1
+    assert corpus.crossed_within_one_run == 1, "both sources are children of one run"
+
+    reversed_corpus = ReplayCorpus.load([second, first])
+    served = corpus.consume(digest, generation=_GEN)
+    served_reversed = reversed_corpus.consume(digest, generation=_GEN)
+    assert isinstance(served, ReplayedResponse) and isinstance(served_reversed, ReplayedResponse)
+    assert served.body["final_text"] == "child one"
+    assert served_reversed.body["final_text"] == "child two", (
+        "the flag order decided which child's answer the call got"
+    )
+
+
+def test_two_recordings_of_one_conversation_cross_without_being_a_family(tmp_path: Path) -> None:
+    """The other half of the same counter: crossing is not by itself a family collision.
+
+    A crash-and-rerun union crosses keys and is remedied by reordering the flags. Counting it as
+    a family would send the operator after a spawn order that does not exist.
+    """
+
+    first = tmp_path / "runs" / "run-a"
+    second = tmp_path / "runs" / "run-b"
+    _recorded_pair(first, run_id="run-a", answers=["first attempt"])
+    _recorded_pair(second, run_id="run-b", answers=["second attempt"])
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 1
+    assert corpus.crossed_within_one_run == 0, "two independent runs are not one run's fan-out"
+
+
+def _diagnose(corpus: ReplayCorpus, terms: dict[str, Any]) -> ReplayMissReason:
+    return corpus.diagnose({_GEN: terms}, generation=_GEN)
+
+
+def test_the_identity_clause_says_which_side_is_which(tmp_path: Path) -> None:
+    """Orientation, not membership.
+
+    The clause tells the operator which value to change. Asserting only that both values appear
+    passes whichever way round they are printed -- and a swapped clause sends them to change the
+    side that is already right, which is the failure the sibling clause in
+    `identity_divergence` was repaired for. The twin created alongside it inherited the weak
+    pin and never got a strong one.
+    """
+
+    here = tmp_path / "runs" / "run-1"
+    elsewhere = tmp_path / "runs" / "run-2"
+    live = {"instruction": "the live call", "system_prompt": "sys", "model": "m-here"}
+    _recorded_pair(
+        here,
+        run_id="run-1",
+        terms={"instruction": "something else", "system_prompt": "sys", "model": "m-here"},
+    )
+    _recorded_pair(
+        elsewhere,
+        run_id="run-2",
+        terms={"instruction": "the live call", "system_prompt": "sys", "model": "m-elsewhere"},
+    )
+    corpus = ReplayCorpus.load([here, elsewhere])
+
+    outcome = _diagnose(corpus, live)
+
+    assert outcome.reason == MISS_IDENTITY_MISMATCH
+    assert "recorded 'm-elsewhere', computing 'm-here'" in outcome.detail, (
+        f"the clause is oriented recorded-then-live; got: {outcome.detail}"
+    )
+
+
+def test_an_identity_value_is_bounded_before_it_reaches_a_public_surface(
+    tmp_path: Path,
+) -> None:
+    """Keep the config vocabulary, bound the size.
+
+    Identity terms are named in plaintext because the ledger beside the corpus already records
+    them that way. But the corpus is untrusted here, and `repr` has no length bound: a recorded
+    model of 200,000 characters produced a 200,043-character miss message on `turn.failed`, in
+    failure.json, in status.json and on stderr, where nothing downstream truncates. The digest
+    branch has been bounded since it was written; this is its twin.
+    """
+
+    here = tmp_path / "runs" / "run-1"
+    elsewhere = tmp_path / "runs" / "run-2"
+    live = {"instruction": "the live call", "system_prompt": "sys", "model": "m-here"}
+    _recorded_pair(
+        here,
+        run_id="run-1",
+        terms={"instruction": "something else", "system_prompt": "sys", "model": "m-here"},
+    )
+    _recorded_pair(
+        elsewhere,
+        run_id="run-2",
+        terms={
+            "instruction": "the live call",
+            "system_prompt": "sys",
+            "model": "M" * 200_000,
+        },
+    )
+    corpus = ReplayCorpus.load([here, elsewhere])
+
+    outcome = _diagnose(corpus, live)
+
+    assert outcome.reason == MISS_IDENTITY_MISMATCH
+    assert len(outcome.detail) < 1_000, f"unbounded diagnosis: {len(outcome.detail)} chars"
+    assert "200002 chars" in outcome.detail, "the operator is told what was elided"
+
+
+def test_the_closest_record_is_chosen_by_conversation_not_by_file_order(
+    tmp_path: Path,
+) -> None:
+    """A tie must not be broken by file position.
+
+    Scoring identity terms alongside conversation terms let a same-identity record tie with the
+    identity-diverging one the call would actually have used, and `matches > best[0]` hands a
+    tie to whichever came first in the file. The diagnosis then said `absent` with "identity
+    matches" about a call recorded under a different model -- verbatim the failure the identity
+    branch exists to remove. The earlier fixture for that branch had to be hand-tuned with an
+    extra shared term to make it win, and that tuning was the smell.
+    """
+
+    decoy = tmp_path / "runs" / "run-decoy"
+    real = tmp_path / "runs" / "run-real"
+    live = {"instruction": "the live call", "model": "m-live"}
+    # The decoy shares the identity and nothing else; the real record shares the conversation
+    # and diverges in the identity. Under the old scoring these tie at one match each.
+    _recorded_pair(decoy, run_id="run-decoy", terms={"instruction": "unrelated", "model": "m-live"})
+    _recorded_pair(
+        real, run_id="run-real", terms={"instruction": "the live call", "model": "m-old"}
+    )
+    corpus = ReplayCorpus.load([decoy, real])
+
+    outcome = _diagnose(corpus, live)
+
+    assert outcome.reason == MISS_IDENTITY_MISMATCH, (
+        f"file order decided a semantic classification; got {outcome.reason}: {outcome.detail}"
+    )
+    assert "run-real" in outcome.detail
+
+
+def test_a_diverging_identity_does_not_swallow_the_diverging_conversation(
+    tmp_path: Path,
+) -> None:
+    """Both facts, one diagnosis.
+
+    Returning early on the identity sends the operator to fix the model, re-run, and earn
+    `absent` for a conversation term they were never told about -- two round trips for one
+    comparison the corpus can report at once.
+    """
+
+    here = tmp_path / "runs" / "run-1"
+    elsewhere = tmp_path / "runs" / "run-2"
+    _recorded_pair(
+        here,
+        run_id="run-1",
+        terms={"instruction": "unrelated", "system_prompt": "other", "model": "m-here"},
+    )
+    _recorded_pair(
+        elsewhere,
+        run_id="run-2",
+        terms={"instruction": "shared", "system_prompt": "recorded", "model": "m-elsewhere"},
+    )
+    corpus = ReplayCorpus.load([here, elsewhere])
+
+    outcome = _diagnose(
+        corpus, {"instruction": "shared", "system_prompt": "live", "model": "m-here"}
+    )
+
+    assert outcome.reason == MISS_IDENTITY_MISMATCH
+    assert "system_prompt" in outcome.detail, (
+        f"the conversation divergence was swallowed: {outcome.detail}"
+    )
+
+
+def test_the_diagnosis_names_exactly_four_diverging_terms(tmp_path: Path) -> None:
+    """The cap, pinned at the use site and to the literal.
+
+    `_DIAGNOSED_TERMS == 4` and `len(named) <= 4` both pass when the slice is `[:2]`, and an
+    "and N more" assertion computed from the observed length re-derives whatever the code did.
+    The bound is a contract about the message, so it is pinned to the number the contract
+    states on a fixture that has strictly more terms than that.
+    """
+
+    recorded = {f"term_{index}": f"recorded-{index}" for index in range(9)}
+    run_dir = tmp_path / "runs" / "run-1"
+    _recorded_pair(run_dir, terms=recorded)
+    corpus = ReplayCorpus.load([run_dir])
+
+    outcome = _diagnose(corpus, {f"term_{index}": f"live-{index}" for index in range(9)})
+
+    assert outcome.reason == MISS_ABSENT
+    assert outcome.detail.count(" live=") == 4, f"expected four named terms: {outcome.detail}"
+    assert " and 5 more" in outcome.detail

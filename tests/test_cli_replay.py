@@ -128,17 +128,28 @@ def test_cli_warns_when_two_sources_can_answer_the_same_call(
     )
 
     assert result.exit_code == 0, result.output
-    assert "1 recorded call(s) can be answered by more than one --replay-from source" in (
+    # "key(s)", not "call(s)": the counter is over keys, and a key with five recordings is one.
+    assert "1 recorded call key(s) can be answered by more than one --replay-from source" in (
         result.output
     )
     assert "the order the sources were named in decides" in result.output
+    assert "children of one run" not in result.output, (
+        "two independent runs are not one run's fan-out, and the spawn-order advice would "
+        "send the operator after an order that does not exist"
+    )
 
 
 def test_cli_says_nothing_about_a_disjoint_union(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The family union is the documented multi-source shape and every key in it belongs to one
-    source; a warning there would train the operator to ignore the one above."""
+    """Sources whose conversations differ share no key, so there is nothing to warn about --
+    and warning anyway would train the operator to ignore the one above.
+
+    Note what this does *not* say. Disjointness is a property of the prompts, not of the family
+    shape: two children with the same definition and the same prompt record one key in two run
+    directories, and that union does warn. See
+    ``test_two_identical_children_of_one_run_cross_a_key``.
+    """
 
     _record_run(tmp_path, monkeypatch, run_id="first")
     _record_run(tmp_path, monkeypatch, run_id="second", instruction=f"Something else. {_MARKER}")
