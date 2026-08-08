@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core._util import sha256_bytes
+from monoid_agent_kernel.core.media import WIRE_MEDIA_CARRIERS
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_FILENAME,
     RECORDED_TURN_FIELDS,
@@ -575,6 +576,90 @@ def test_multimodal_declaration_follows_the_recorded_messages(tmp_path: Path) ->
 
     assert _replay(tmp_path, "run-1").supports_multimodal is True
     assert _replay(tmp_path, "run-2").supports_multimodal is False
+
+
+def test_multimodal_declaration_sees_tool_returned_media(tmp_path: Path) -> None:
+    """Two carriers reach the wire, and the derivation used to read one of them.
+
+    ``core/media.py`` resolves a user turn's parts from ``content`` and a tool message's returned
+    media from a top-level ``media`` list -- its own comment says so. Reading only ``content``
+    derives ``supports_multimodal=False`` for a corpus whose images came back from a tool, and the
+    flag is a *preimage term*: replay then leaves the re-executed tool media by reference while
+    the recorded digest covers its resolved base64 form, so every lookup after that turn misses.
+    It fails closed, but it fails the whole corpus, and the corpus is entirely valid.
+
+    ``test_the_multimodal_scan_reads_every_carrier_the_wire_resolves`` binds the pair so the twin
+    cannot drift again; this one is the behaviour that binding exists for.
+    """
+
+    media_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="seen")]),
+        [
+            _request(
+                messages=[
+                    {
+                        "role": "tool",
+                        "tool_call_id": "c1",
+                        "content": "screenshot attached",
+                        "media": [media_block],
+                    }
+                ]
+            )
+        ],
+    )
+
+    assert _replay(tmp_path).supports_multimodal is True, (
+        "media returned by a tool rides a top-level `media` list, not `content`, so the "
+        "derivation called a multimodal corpus text-only and every later lookup misses"
+    )
+
+
+def test_the_multimodal_scan_reads_every_carrier_the_wire_resolves() -> None:
+    """Neither reader may spell a carrier key by hand; both iterate the one list.
+
+    A census rather than a second list: pinning "the derivation reads content and media" would
+    itself be a third copy to maintain, and the review round that produced this test is the one
+    where a hand-maintained second copy was found already drifted. The property that matters is
+    that no reader names a carrier itself, so adding one to ``WIRE_MEDIA_CARRIERS`` reaches every
+    reader by construction.
+
+    Scoped to the two functions that consume the constant. Keys that are not carriers -- a part's
+    ``type``, ``source``, ``source_ref`` -- are untouched by this, and so is any other module.
+    """
+
+    import monoid_agent_kernel.core.media as media_module
+
+    readers = {
+        (media_module, "resolve_wire_messages"),
+        (replay_module, "__init__"),
+    }
+    hand_spelled: list[str] = []
+    for module, function in sorted(readers, key=lambda pair: (pair[0].__name__, pair[1])):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != function:
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                if call.func.attr not in {"get", "pop"} or not call.args:
+                    continue
+                key = call.args[0]
+                if isinstance(key, ast.Constant) and key.value in WIRE_MEDIA_CARRIERS:
+                    hand_spelled.append(f"{module.__name__}.{function} names {key.value!r}")
+
+    assert not hand_spelled, (
+        "a media carrier is spelled by hand instead of read from WIRE_MEDIA_CARRIERS: "
+        + ", ".join(hand_spelled)
+        + " -- iterate the constant, so a carrier added there reaches this reader too"
+    )
 
 
 # --- the lookup the adapter serves is the runner's ---------------------------------------------
@@ -1560,4 +1645,83 @@ def test_a_discarded_call_does_not_consume_its_recorded_answer(tmp_path: Path) -
     assert served.final_text == "ANSWER-1", (
         "the discarded call kept the recording it never delivered, so the next call was served an "
         f"answer belonging to a different call: {served.final_text!r}"
+    )
+
+
+def test_discarding_a_live_answer_does_not_rewind_a_delivered_recording(tmp_path: Path) -> None:
+    """The hook must take back the answer it served, not the last one it happens to remember.
+
+    ``_served_slots`` is written on every hit and cleared by nothing, so an entry outlives the
+    call that made it. Once the key is exhausted, a later call for the SAME key falls through to
+    a live provider -- and if that one is discarded, keying the release by digest alone reaches
+    the surviving entry from the earlier call. ``release`` does not catch it: the exhausted call
+    never moved the cursor, so ``cursor == slot + 1`` still holds for the slot the FIRST call was
+    served, and the rewind succeeds.
+
+    The result is this PR's whole failure class arriving through its own repair -- a recording
+    already delivered once, handed out a second time, at exit 0 with a clean ``monoid validate``.
+    The docstring on ``discard_turn`` already claimed a live fallthrough answer is not taken back;
+    the code ignored its ``turn`` argument entirely, so the claim lived in prose only.
+
+    Identity, not a flag: the dict holds the turn, so the entry keeps the object alive and an
+    ``id()`` cannot be recycled underneath it while it is reachable.
+    """
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="RECORDED")]), [_request()])
+    inner = _CountingInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    delivered = _call(adapter, _request())
+    live = _call(adapter, _request())
+    adapter.discard_turn(_request(), live)
+
+    after = _call(adapter, _request())
+
+    assert (delivered.final_text, live.final_text) == ("RECORDED", "live answer")
+    assert after.final_text == "live answer", (
+        "discarding a live fallthrough answer rewound the cursor onto a recording that had "
+        f"already been delivered, so it was served twice: {after.final_text!r}"
+    )
+
+
+def test_a_non_boolean_provider_retried_is_refused_rather_than_coerced(tmp_path: Path) -> None:
+    """Every neighbouring field earns a refusal from the wrong type; this one used to be coerced.
+
+    Response bodies are deliberately open-shaped in the payload schema, so a damaged or
+    hand-edited corpus can carry ``provider_retried`` as a string or a number. ``bool()`` accepts
+    all of them, and the JSON string ``"false"`` is the case that shows what that costs: it is
+    truthy, so the corpus's own recorded "this answer was not retried" replays as *retried*. The
+    adapter would be inventing an audit value rather than refusing to speak, which is exactly the
+    line ``_reconstruct`` holds for ``response_id``, ``final_text``, ``stop_reason``, ``usage``,
+    ``reasoning`` and the tool-call triple.
+    """
+
+    digest, _repeat = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="first"), ModelTurn(final_text="second")]),
+        [_request(), _request()],
+    )
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": "coerced",
+            "tool_calls": [],
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": None,
+            "provider_retried": "false",
+        },
+    )
+
+    adapter = _replay(tmp_path)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _call(adapter, _request())
+
+    assert MISS_NOT_RECORDED in str(caught.value), (
+        "a non-boolean provider_retried was coerced into an invented audit value instead of "
+        f"earning the refusal every other malformed recorded field earns: {caught.value}"
     )

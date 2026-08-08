@@ -67,6 +67,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayedResponse,
 )
 from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
+from monoid_agent_kernel.core.media import WIRE_MEDIA_CARRIERS
 from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -228,9 +229,10 @@ class ReplayModelAdapter:
                     injected_reasoning = True
                 if _is_assistant_message(message):
                     assistant_history = True
-                content = message.get("content") if isinstance(message, Mapping) else None
-                if isinstance(content, list) and any(_is_media_block(part) for part in content):
-                    media_seen = True
+                for carrier in WIRE_MEDIA_CARRIERS:
+                    parts = message.get(carrier) if isinstance(message, Mapping) else None
+                    if isinstance(parts, list) and any(_is_media_block(p) for p in parts):
+                        media_seen = True
         if len(providers) > 1:
             raise ValueError(
                 "replay sources recorded more than one provider "
@@ -275,7 +277,7 @@ class ReplayModelAdapter:
         self.supports_multimodal = (
             media_seen if supports_multimodal is _AUTO else bool(supports_multimodal)
         )
-        self._served_slots: dict[str, int] = {}
+        self._served_slots: dict[str, tuple[int, ModelTurn]] = {}
         self.wire_image_encoding = wire_image_encoding
         if config is not None:
             # Inert under the loop (it always authors request.model); a standalone
@@ -312,9 +314,13 @@ class ReplayModelAdapter:
                 if isinstance(outcome, ModelTurn):
                     take.served()
                     # Only the most recent slot per key is releasable -- ``release`` guards on
-                    # ``cursor == slot + 1`` -- so one int per key is both sufficient and all the
-                    # memory this bookkeeping can ever cost.
-                    self._served_slots[digest] = take.hit.slot
+                    # ``cursor == slot + 1`` -- so one entry per key is both sufficient and all
+                    # the memory this bookkeeping can ever cost. The turn travels WITH the slot
+                    # because the entry outlives the call that made it: nothing clears it on
+                    # success, so a later call on an exhausted key that falls through live and is
+                    # then discarded would otherwise reach this slot and rewind onto a recording
+                    # already delivered. ``discard_turn`` compares identity against this object.
+                    self._served_slots[digest] = (take.hit.slot, outcome)
                     return outcome
                 miss = outcome
             else:
@@ -382,6 +388,13 @@ class ReplayModelAdapter:
             for name in ("response_id", "final_text", "stop_reason"):
                 if body.get(name) is not None and not isinstance(body.get(name), str):
                     raise ValueError(f"the recorded {name} is neither null nor a string")
+            retried = body.get("provider_retried", False)
+            if not isinstance(retried, bool):
+                # ``bool()`` accepts every JSON scalar, and the string "false" is truthy: coercing
+                # replays a recorded "not retried" as RETRIED. Bodies are deliberately open-shaped
+                # in the payload schema, so a damaged corpus reaches here, and inventing an audit
+                # value from one is the single thing every neighbour above refuses to do.
+                raise ValueError("the recorded provider_retried is not a boolean")
             return ModelTurn(
                 response_id=body.get("response_id"),
                 final_text=body.get("final_text"),
@@ -390,7 +403,7 @@ class ReplayModelAdapter:
                 raw={},
                 reasoning=tuple(reasoning),
                 stop_reason=body.get("stop_reason"),
-                provider_retried=bool(body.get("provider_retried", False)),
+                provider_retried=retried,
             )
         except Exception as error:  # noqa: BLE001 - one unreplayable record, one refusal
             return ReplayMissReason(
@@ -409,22 +422,33 @@ class ReplayModelAdapter:
         exit 0, ledger success, ``monoid validate`` clean. That is the whole failure class.
 
         Keyed by recomputing the request's own digest rather than by object identity, so a
-        recycled ``id()`` can never release a slot belonging to a different key. Popping the last
-        served slot for that key is exactly right rather than merely convenient: ``release``
-        refuses any slot the cursor has moved past, so the most recent is the only releasable one.
+        recycled ``id()`` can never release a slot belonging to a different key. The digest alone
+        is not enough, though, and the first version of this shipped believing it was: the entry
+        is cleared by nothing on success, so it outlives its call, and a LATER call on the same
+        key -- exhausted by then, so served live through the fallthrough -- would pop the earlier
+        call's slot when discarded. ``release`` cannot catch that, because an exhausted call never
+        moved the cursor, so ``cursor == slot + 1`` still holds for the delivered slot and the
+        rewind succeeds. A recording already handed to one call gets handed to another: this
+        module's whole failure class, arriving through the repair meant to close it.
 
-        A live fallthrough answer is deliberately NOT taken back: that call reached a provider and
-        was paid for, and the corpus has no unspend primitive for a refusal spent forward. See
+        So the served turn travels with the slot and is compared by identity here. The dict holds
+        the object, which is what makes identity sound -- an ``id()`` cannot be recycled while the
+        entry that would match it is still reachable.
+
+        A live fallthrough answer is deliberately NOT taken back -- that call reached a provider
+        and was paid for, and the corpus has no unspend primitive for a refusal spent forward --
+        and the identity check is now what enforces that, rather than the docstring. See
         ``docs/CONTRACTS.md``.
         """
 
         lookup = replay_lookup(request, self)
         if lookup.result.status != "ok":
             return
-        slot = self._served_slots.pop(lookup.result.digest, None)
-        if slot is None:
+        served = self._served_slots.get(lookup.result.digest)
+        if served is None or served[1] is not turn:
             return
-        self._corpus.release(lookup.result.digest, slot)
+        del self._served_slots[lookup.result.digest]
+        self._corpus.release(lookup.result.digest, served[0])
 
     def _serve_miss(
         self,
