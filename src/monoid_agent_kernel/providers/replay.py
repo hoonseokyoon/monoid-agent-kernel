@@ -50,6 +50,7 @@ declaration is what makes recorded keys reachable, so it cannot also report who 
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -280,6 +281,30 @@ class ReplayModelAdapter:
             self.config = config
 
     # --- the call ----------------------------------------------------------------------------
+
+    async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+        """The same call, on the loop thread when nothing here blocks.
+
+        Not a second implementation -- deliberately, because a rule proven on one of two
+        parallel halves and missed on the twin is how three of this PR's routes were made. It
+        delegates, and the only thing it decides is *where* :meth:`next_turn` runs.
+
+        Why it exists: without it, ``_adrive`` reaches its last dispatch shape and puts every
+        call on an abandonable daemon thread. A run that gives up stops waiting, but the worker
+        finishes, reaches ``take.served()`` and moves the cursor for an answer nobody received;
+        the next consumer of the corpus object is then shifted by one, silently and as a
+        structurally valid turn. A pure-replay call does no I/O, so run here it either completes
+        or has not begun, and abandonment cannot land between the two.
+
+        A fallthrough call reaches a live provider, so it keeps the worker: blocking the loop
+        for a provider call would stall every sibling, and a blocking inner cannot be cancelled,
+        so no arrangement of this function makes that arm atomic. That residue is stated in
+        ``docs/CLI.md`` rather than papered over.
+        """
+
+        if self._inner is None:
+            return self.next_turn(request)
+        return await asyncio.to_thread(self.next_turn, request)
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         lookup = replay_lookup(request, self)

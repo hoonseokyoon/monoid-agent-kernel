@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
+import threading
 import gc
 import json
 from pathlib import Path
@@ -1478,4 +1480,46 @@ def test_a_request_the_reader_cannot_parse_is_not_evidence_of_absence(tmp_path: 
     assert getattr(adapter, "provider_name", None) is None, (
         "the adapter declared a provider from the requests it could read, while a request it "
         "could not read is what carried the evidence against declaring"
+    )
+
+
+def test_a_pure_replay_call_is_not_run_on_an_abandonable_worker(tmp_path: Path) -> None:
+    """The cursor must not be moved by a call whose answer the run never received.
+
+    `_adrive` has no async entry point to prefer here, so every call took its last dispatch
+    shape: a blocking `next_turn` on an abandonable daemon thread. When a run gives up, that
+    worker finishes anyway -- its context copy is deliberately not a fence -- and reaches
+    `take.served()`. The answer is discarded and the cursor stays moved, so the next consumer of
+    that corpus object is shifted by one. Driven in review with two ModelCallRunners sharing one
+    adapter, which is the shape a subagent family already has: run 1 timed out, and run 2's
+    FIRST call was served run 1's SECOND answer -- exactly the substitution this PR exists to
+    close, arriving by a route none of the seven covered.
+
+    Pinned as the mechanism rather than as a race: a pure-replay call does no I/O, so served on
+    the loop thread it either completes or has not started, and abandonment cannot land between
+    the two. A fallthrough call still reaches a live provider and still runs on a worker; that
+    residue is documented in docs/CLI.md rather than pretended away, because a blocking inner
+    cannot be cancelled.
+    """
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="x")]), [_request()])
+    adapter = _replay(tmp_path)
+    assert inspect.iscoroutinefunction(getattr(adapter, "anext_turn", None)), (
+        "without an async entry point _adrive dispatches this adapter onto an abandonable "
+        "daemon thread, where the take outlives the run that owns it"
+    )
+
+    seen: list[Any] = []
+    original = adapter._reconstruct
+
+    def spy(entry: Any) -> Any:
+        seen.append(threading.current_thread())
+        return original(entry)
+
+    adapter._reconstruct = spy  # type: ignore[method-assign]
+    _call(adapter, _request())
+
+    assert seen == [threading.main_thread()], (
+        "the take was materialised on a worker the run can abandon; a settle from there moves "
+        f"the cursor for an answer nobody received: {seen}"
     )
