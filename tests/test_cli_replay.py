@@ -372,3 +372,37 @@ def test_the_damage_warning_does_not_promise_a_miss_that_need_not_happen(
     assert "status: completed" in result.output, (
         "the run completed, so a categorical promise of a miss would have been false"
     )
+
+
+def test_a_corpus_that_cannot_say_what_it_recorded_is_not_a_config_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The preflight sent the operator to the one place the fault was not.
+
+    Reaching this branch means no request record was readable -- since the writer now refuses
+    a preimage the reader would refuse, and unreadable records already on disk project nothing.
+    The corpus cannot say what identity it was recorded against, so there is nothing for the
+    runtime config to match or to diverge from. Wrapping that in "no recorded request matches
+    this run's model identity" and prescribing "fix the runtime config" names a cause that is
+    not merely unproven but ruled out, and hides the one command that would show the truth.
+    """
+
+    _record_run(tmp_path, monkeypatch, run_id="first")
+    corpus = tmp_path / "runs" / "first" / MODEL_PAYLOADS_FILENAME
+    kept = [
+        line
+        for line in corpus.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") != "model_request"
+    ]
+    corpus.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, _replay_args(tmp_path, "first") + ["--run-id", "replayed"])
+
+    assert result.exit_code != 0, result.output
+    assert "no readable request identities" in result.output, result.output
+    assert "Fix the runtime config" not in result.output, (
+        f"the corpus, not the config, is why there is nothing to compare against: {result.output}"
+    )
+    assert "monoid validate" in result.output, (
+        f"the operator was not pointed at the command that names the bad records: {result.output}"
+    )

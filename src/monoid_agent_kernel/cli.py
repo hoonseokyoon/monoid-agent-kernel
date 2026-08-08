@@ -1767,6 +1767,23 @@ def _replay_preflight(
         )
     model = normalize_model_config(config) or ModelConfig()
     provider = resolved_provider_name(adapter, model) or ""
+    if not corpus.identity_profiles():
+        # Not a config mismatch, and saying so sends the operator to the one place the fault
+        # is ruled out. No readable request record means the corpus cannot state what it was
+        # recorded against, so there is nothing for this run's config to match OR diverge
+        # from. The remedy is the command that names the unreadable records, not the config.
+        message = (
+            "replay preflight: the corpus holds no readable request identities -- it cannot "
+            "say what model identity it was recorded against"
+        )
+        if fallthrough:
+            click.echo(f"warning: {message}", err=True)
+            return
+        raise click.ClickException(
+            f"{message}. Run 'monoid validate' on the recorded run directory to see which "
+            "request records are unreadable, or pass --replay-fallthrough to serve the "
+            "misses live."
+        )
     divergence = corpus.identity_divergence(model=_model_identity(model), provider=provider)
     if divergence is None:
         if len(corpus.identity_profiles()) > 1:
