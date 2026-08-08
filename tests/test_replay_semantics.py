@@ -238,7 +238,11 @@ def test_a_missed_call_lands_on_the_replay_runs_ledger_with_its_taxonomy(tmp_pat
 
     [line] = _ledger(replay_result.run_dir)
     assert line["error_code"] == "replay_miss"
-    assert line["provider_error_code"] in {"absent", "identity_mismatch"}
+    # One value, not a set. This fixture records and replays under one identity, so `absent` is
+    # the only correct classification -- and the set spelling sat precisely on the distinction
+    # the identity branch and its tie-break are about, passing whichever way that classification
+    # went. A pin that accepts both answers to the question under test is not a pin.
+    assert line["provider_error_code"] == "absent"
     assert line["config_recoverable"] is True
     assert line["retryable"] is False
 

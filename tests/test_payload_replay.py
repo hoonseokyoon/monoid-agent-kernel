@@ -52,6 +52,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayedResponse,
 )
 from monoid_agent_kernel.core.schemas import validate_run_dir
+from monoid_agent_kernel.providers.replay import ReplayModelAdapter
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.model_call import ModelCallRunner, SettledModelCall
@@ -1742,3 +1743,75 @@ def test_the_diagnosis_names_exactly_four_diverging_terms(tmp_path: Path) -> Non
     assert outcome.reason == MISS_ABSENT
     assert outcome.detail.count(" live=") == 4, f"expected four named terms: {outcome.detail}"
     assert " and 5 more" in outcome.detail
+
+
+def test_a_damaged_corpus_does_not_blame_the_original_call(tmp_path: Path) -> None:
+    """The sentence the caller sees, and the widening it earns.
+
+    `caf0f6a` set out to fix two symptoms -- a silent preflight and a miss that blames the
+    original call for the corpus's failure -- and bought only the first. The sentence lived in
+    two hand-written copies and the pinned one was `_absent_locked`'s, while the copy that
+    reaches `turn.failed`, `failure.json` and stderr is `diagnose`'s: the adapter always refines
+    a MISS_ABSENT through `diagnose`.
+
+    Now one function answers both, and it widens when the corpus is damaged -- because "the
+    original call failed" is a claim about the recorded run, and here the answer may well have
+    been recorded and simply be unreadable.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") != MODEL_RESPONSE_KIND
+    ]
+    lines.append("{ this line is not json")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    corpus = ReplayCorpus.load([run_dir])
+    assert corpus.damaged_lines == 1
+
+    consumed = corpus.consume(digest, generation=_GEN)
+    diagnosed = corpus.diagnose(
+        {_GEN: {"instruction": "hand-built", "provider": "gateway"}},
+        generation=_GEN,
+        digest=digest,
+    )
+
+    for outcome in (consumed, diagnosed):
+        assert isinstance(outcome, ReplayMissReason)
+        assert outcome.reason == MISS_ABSENT
+        assert "corpus is damaged" in outcome.detail, (
+            f"the corpus's own failure was blamed on the recorded run: {outcome.detail}"
+        )
+    assert consumed.detail == diagnosed.detail, "one sentence, however it is asked for"
+
+
+def test_a_non_string_provider_term_does_not_crash_the_provider_census(tmp_path: Path) -> None:
+    """The adapter's provider census reads reassembled corpus terms, so its type guard is the
+    only thing between a planted value and a `', '.join(sorted(...))`.
+
+    Without it, a non-string `provider` beside a string one makes the heterogeneity refusal
+    raise **TypeError** -- an unclassified crash where the constructor documents a ValueError --
+    and a corpus of only non-strings leaves the declaration unset, so the key's provider term
+    falls back to the run config's and every lookup in the run misses with nothing said.
+
+    Note the term has to be planted in the PREIMAGE, not on the record envelope: the census
+    reads `request_terms_view()`, and a fixture that plants the envelope field drives nothing.
+    """
+
+    good = tmp_path / "runs" / "run-1"
+    planted = tmp_path / "runs" / "run-2"
+    _recorded_pair(good, run_id="run-1", terms={"instruction": "a", "provider": "gateway"})
+    _recorded_pair(
+        planted, run_id="run-2", terms={"instruction": "b", "provider": {"not": "a string"}}
+    )
+    corpus = ReplayCorpus.load([good, planted])
+
+    adapter = ReplayModelAdapter(corpus)  # must not raise TypeError
+
+    assert adapter.provider_name == "gateway", (
+        "the only string provider recorded is the one that can be declared"
+    )

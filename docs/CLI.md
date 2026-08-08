@@ -335,7 +335,15 @@ replayable at that position: the retry recomputes its key without the `instructi
 first attempt carried, so the answer is recorded under a key the replay's first attempt does
 not compute, and that attempt earns `absent` — a request record with no answer — while the
 answer sits one record below. Record the corpus you intend to replay from a run that did not
-retry, or replay with `--replay-fallthrough`.
+retry.
+
+`--replay-fallthrough` will get such a run to finish, but it is not a way to replay it. Once
+one call falls through, the live answer enters `messages`, so every later key diverges and
+every later call falls through too — a run that reports `completed` at exit 0 having contacted
+(and billed) a live provider for every one of its calls, with the recorded answer one record
+below never recovered. Nothing in the finished run says so: with `--model-calls-file` every
+line is still stamped `replay_from`, and without it the run directory says nothing about replay
+at all.
 
 **A run that spawned subagents is a family.** Children record into their own run directories,
 so name them too — `--replay-from` is repeatable — or the child's first call is the miss. With
@@ -350,8 +358,9 @@ one-shot answer lands in it as a single record, alongside a `stream_opened` entr
 configured provider, which is the provider this run did not call.
 
 **Provenance and privacy.** Every ledger line of a replay run carries
-`attributes.replay_from` (the source run ids, comma-joined), inherited by children. Two limits
-on that. The ledger is opt-in: without `--model-calls-file` a replay run is indistinguishable
+`attributes.replay_from` (the source run ids, comma-joined), inherited by children. Three limits
+on that. `--run-id` is not validated, so a run id containing a comma produces a
+`replay_from` an auditor cannot split back into the sources it names. The ledger is opt-in: without `--model-calls-file` a replay run is indistinguishable
 from a live one to anyone auditing the run directory — `manifest.json`, `status.json`,
 `metrics.json` and `events.jsonl` say nothing about replay, and `model_provider` names the
 configured provider. And the attribute is stamped by this command, not by the adapter: a run

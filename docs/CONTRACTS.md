@@ -864,10 +864,13 @@ refuses everything it cannot prove. The contract:
   resolved provider and the keys agree; where it declined, the live calls are keyed under a
   term a correctly-configured live run will not compute.
 - **A miss message names run ids as well as terms.** The content-free rule bounds *values*, not
-  identifiers. Two disjoint message families carry those identifiers. A term-by-term diagnosis
+  identifiers. Three message families carry those identifiers. A term-by-term diagnosis
   names up to four diverging terms with a 12-hex digest prefix on each side and the run id of
   the record it compared against; a `not_recorded` refusal names the run id and `call_index` of
-  the record it refused. Both reach the public
+  the record it refused; and an `identity_mismatch` diagnosis names the run id of the closest
+  recorded request together with the identity values on each side — in plaintext, because they
+  are config vocabulary the ledger already records in the clear, and bounded to 120 characters
+  per value because the corpus is not trusted to keep them short. All three reach the public
   `turn.failed` payload, in `failure.json`, and on CLI stderr. Run ids are minted hex, but they
   are foreign run ids when the corpus is foreign, so an event stream relayed to end users
   carries them.

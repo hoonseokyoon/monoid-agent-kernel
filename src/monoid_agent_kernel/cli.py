@@ -935,7 +935,12 @@ def gc_command(
         # under ``OSError.__str__``; the states and the numbers are ours.
         click.echo(f"run_dir: {report.run_dir!r}")
         click.echo(f"swept_at: {report.swept_at}")
-        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {report.corpus_state}")
+        # `corpus_state` means READABLE, not valid -- but "ok" printed next to a damaged-line
+        # count that proves it is not reads as a verdict, and the same corpus already gets
+        # three different answers from `validate`, `gc` and `run`. Say which question was
+        # answered.
+        corpus_state = "readable" if report.corpus_state == "ok" else report.corpus_state
+        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {corpus_state}")
         click.echo(
             f"mode: {'apply' if report.applied else 'report-only'}  min_age_s: {report.min_age_s!r}"
         )
@@ -1715,7 +1720,11 @@ def _replay_preflight(
             "warning: replay source is damaged: "
             f"{corpus.damaged_lines} unparseable line(s), "
             f"{corpus.rejected_records} record(s) the reader could not accept; "
-            "answers recorded on them are unavailable and will miss",
+            # Conditional, because a corpus damaged only where this run asks nothing completes
+            # with no miss at all -- and a categorical "will miss" beside a clean exit 0 is how
+            # an operator learns to ignore the warning. The reader cannot know the key of a
+            # record whose key is what got damaged, so the conditional is the only honest form.
+            "any call that needed one of them will miss",
             err=True,
         )
     if corpus.repeated_sources:

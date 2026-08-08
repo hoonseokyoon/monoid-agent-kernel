@@ -666,13 +666,38 @@ class ReplayCorpus:
                     bodies.append(body)
         return tuple(bodies)
 
-    def _absent_locked(self, digest: str, generation: str) -> ReplayMissReason:
-        if digest in self._requests:
+    def _no_answer_reason(self) -> ReplayMissReason:
+        """Why a key has a request record and no answer -- one sentence, both askers.
+
+        It was hand-written twice, and only the copy in ``_absent_locked`` was pinned while the
+        copy callers actually see is ``diagnose``'s: the adapter always refines a ``MISS_ABSENT``
+        through ``diagnose``, so that is the string reaching ``turn.failed``, ``failure.json``
+        and stderr. Softening one and leaving the other is how a repair buys half of what it
+        promises.
+
+        And the parenthetical widens when it must. Blaming the original call is right only when
+        the answer was never written; where the reader *rejected* records or the file has
+        damaged lines, the answer may well have been recorded and this corpus simply cannot
+        present it -- a distinction the operator acts on differently, and which otherwise
+        appears nowhere but a stderr warning that no run directory retains.
+        """
+
+        detail = "a request record exists under this key but no answer was recorded "
+        if self._rejected or self._damaged:
             return ReplayMissReason(
                 MISS_ABSENT,
-                "a request record exists under this key but no answer was recorded "
-                "(the original call failed, or its activation ended before answering)",
+                detail + "and this corpus is damaged "
+                f"({self._damaged} unparseable line(s), {self._rejected} rejected record(s)), "
+                "so an answer that was recorded may be among what could not be read",
             )
+        return ReplayMissReason(
+            MISS_ABSENT,
+            detail + "(the original call failed, or its activation ended before answering)",
+        )
+
+    def _absent_locked(self, digest: str, generation: str) -> ReplayMissReason:
+        if digest in self._requests:
+            return self._no_answer_reason()
         mismatch = self._generation_mismatch(generation)
         if mismatch is not None:
             return mismatch
@@ -803,11 +828,7 @@ class ReplayCorpus:
         """
 
         if digest is not None and digest in self._requests and not self._responses.get(digest):
-            return ReplayMissReason(
-                MISS_ABSENT,
-                "a request record exists under this key but no answer was recorded "
-                "(the original call failed, or its activation ended before answering)",
-            )
+            return self._no_answer_reason()
         mismatch = self._generation_mismatch(generation)
         if mismatch is not None:
             return mismatch
@@ -986,4 +1007,13 @@ class ReplayCorpus:
         return len(self._requests)
 
     def response_count(self) -> int:
+        """Joinable answer *records*, refused ones included.
+
+        Deliberately not the same number as ``len(response_bodies_view())``, which resolves
+        bodies and therefore skips every record whose body cannot be given back. A corpus with
+        one refused record reads 2 here and 1 there, and an embedder comparing them without
+        this sentence concludes the corpus lost records. This one counts supply -- what a cursor
+        can be asked for; that one counts evidence -- what can be read.
+        """
+
         return sum(len(queue) for queue in self._responses.values())

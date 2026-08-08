@@ -21,6 +21,7 @@ from click.testing import CliRunner
 
 from monoid_agent_kernel.cli import main
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_FILENAME
+from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_FILENAME
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter
@@ -346,3 +347,28 @@ def test_cli_pure_replay_never_touches_the_live_adapter_branch(
     result = CliRunner().invoke(main, _replay_args(tmp_path) + ["--run-id", "guarded"])
 
     assert result.exit_code == 0, result.output
+
+
+def test_the_damage_warning_does_not_promise_a_miss_that_need_not_happen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A corpus damaged only where this run asks nothing completes with no miss at all.
+
+    The categorical "will miss" beside a clean exit 0 is how an operator learns to ignore the
+    warning. The reader cannot know the key of a record whose key is what got damaged, so the
+    conditional is the only honest form -- and the sentence had no pin, which is how the
+    previous round's operator-facing wording regressed silently.
+    """
+
+    _record_run(tmp_path, monkeypatch, run_id="first")
+    corpus = tmp_path / "runs" / "first" / MODEL_PAYLOADS_FILENAME
+    corpus.write_text(corpus.read_text(encoding="utf-8") + "{ not json at all\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, _replay_args(tmp_path, "first") + ["--run-id", "replayed"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 unparseable line(s)" in result.output
+    assert "any call that needed one of them will miss" in result.output
+    assert "status: completed" in result.output, (
+        "the run completed, so a categorical promise of a miss would have been false"
+    )
