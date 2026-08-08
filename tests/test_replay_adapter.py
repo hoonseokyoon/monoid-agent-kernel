@@ -244,6 +244,30 @@ def test_an_unkeyable_request_is_no_key(tmp_path: Path) -> None:
     assert caught.value.provider_error_code == MISS_NO_KEY
 
 
+def test_an_unkeyable_request_falls_through_with_no_take_to_settle(tmp_path: Path) -> None:
+    """A keyless call reaches the fallthrough holding no take, and must not try to settle one.
+
+    Every other path into ``_serve_miss`` carries a take, so the guard before ``served()`` stood
+    unexercised -- removing it altogether left the entire adapter suite green. There is nothing
+    to settle here: the corpus was never asked, because there was no key to ask it with. Calling
+    ``served()`` on the absent take would kill the run with an ``AttributeError`` on a call the
+    inner had already answered for real, turning a handled miss into an unclassified crash.
+    """
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="recorded")]), [_request()])
+    adapter = _replay(tmp_path, inner=_OriginalAdapter([ModelTurn(final_text="live")]))
+    hostile = _request(messages=[{"role": "user", "content": {1, 2}}])  # a set never encodes
+
+    turn = _call(adapter, hostile)
+
+    assert turn.final_text == "live", (
+        "the inner must serve a call the corpus cannot even be asked about"
+    )
+    assert _call(adapter, _request()).final_text == "recorded", (
+        "the keyless call must not have moved a cursor it never consulted"
+    )
+
+
 def test_a_corrupt_recorded_body_is_a_miss_not_a_crash(tmp_path: Path) -> None:
     """A tool call without its triple cannot become a real ToolCall; replaying a fabrication
     is the one thing the adapter must never do, so the record reads as unrecoverable."""

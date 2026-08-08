@@ -254,8 +254,13 @@ class ReplayTake:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if self._declared is not None:
             return False
-        self._settle(False)
+        # Marked before settling, the way ``_declare`` does it. Settling first left ``_declared``
+        # None if the settle raised, so the take could be settled a second time and in the
+        # opposite direction -- a released slot then re-served. The shipped corpus cannot raise
+        # here, but this class takes its corpus from a public constructor and its whole premise
+        # is that a take is declared exactly once.
         self._declared = False
+        self._settle(False)
         if exc_type is None:
             raise RuntimeError(
                 "a replay take left its block without saying whether the call happened; "

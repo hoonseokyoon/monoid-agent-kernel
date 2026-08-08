@@ -75,14 +75,20 @@ class Answer:
 class Slip:
     """A served answer that did not come from the source slot standing at its position.
 
-    ``source_slot is None`` means the answer is in no source slot at all -- a live fallthrough
-    answer, which is not a substitution. ``source_slot != served_position`` is the failure this
-    module exists to name.
+    ``source_slot != served_position`` is the failure this module exists to name.
+
+    ``source_slot is None`` is ambiguous on its own, and reading it as "live" was a hole: it
+    covers both an answer in no source slot at all (a fallthrough served it live, which is not
+    a substitution) *and* a recorded answer served more often than it was recorded, whose slots
+    are simply used up. The second is a substitution -- one recorded answer handed to two
+    different calls is exactly "an answer belonging to a different call is served" -- so
+    ``oversupplied`` separates them rather than leaving the two under one ``None``.
     """
 
     digest: str
     served_position: int
     source_slot: int | None
+    oversupplied: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,15 +178,32 @@ def structural_diff(a: CorpusView, b: CorpusView) -> list[str]:
 
     Equality after masking rather than a field-by-field comparison, so it subsumes the whole
     "must be identical" list in one statement -- schema version, kind, digest generation, refs,
-    recipe shape, chunk sha and text, **inline-vs-offloaded placement** (both predicates are
-    pure functions of canonical encoded length, so the same logical body cannot land inline in
-    one run and offloaded in another), every recorded turn field, ``unrecorded_reason``, and
+    recipe shape, inline chunk sha and text, **inline-vs-offloaded placement** (both predicates
+    are pure functions of canonical encoded length, so the same logical body cannot land inline
+    in one run and offloaded in another), every recorded turn field, ``unrecorded_reason``, and
     record order -- and stays true when a record grows a field.
+
+    Record equality is not enough on its own, and claiming "chunk sha and text" for the
+    offloaded case was wrong: an offloaded body is not in any record, only its reference is.
+    Comparing records alone, a replay could write a *completely different answer* under the same
+    chunk name, or write no chunk file at all, and still compare equal -- which left the strict
+    half weaker than the tolerant one, since ``alignment_report`` resolves through ``chunks``
+    and would have caught it. So the bytes are compared too.
     """
 
     problems: list[str] = []
     if len(a.records) != len(b.records):
         problems.append(f"record count: source {len(a.records)}, replay {len(b.records)}")
+    missing = sorted(set(a.chunks) - set(b.chunks))
+    extra = sorted(set(b.chunks) - set(a.chunks))
+    altered = sorted(sha for sha in set(a.chunks) & set(b.chunks) if a.chunks[sha] != b.chunks[sha])
+    if missing or extra or altered:
+        problems.append(
+            "chunk bytes differ: "
+            f"missing from replay {[sha[:12] for sha in missing]}, "
+            f"only in replay {[sha[:12] for sha in extra]}, "
+            f"contents differ {[sha[:12] for sha in altered]}"
+        )
     for index, (left, right) in enumerate(zip(a.records, b.records)):
         masked_left, masked_right = _mask(left), _mask(right)
         if masked_left != masked_right:
@@ -228,12 +251,30 @@ def alignment_report(a: CorpusView, b: CorpusView) -> list[Slip]:
         remaining: dict[str, list[int]] = {}
         for answer in a.answers.get(digest, ()):
             remaining.setdefault(_canonical(answer.body), []).append(answer.slot)
+        for key, slots in remaining.items():
+            if len(slots) > 1:
+                raise AssertionError(
+                    f"key {digest[:12]} records the same answer in slots {slots}, so no "
+                    "alignment can be derived: build fixtures with distinguishable answers. "
+                    f"({key[:80]})"
+                )
+        supplied = set(remaining)
         for position, answer in enumerate(served):
             key = _canonical(answer.body)
             slots = remaining.get(key)
             slot = slots.pop(0) if slots else None
-            if slot != position:
-                slips.append(Slip(digest=digest, served_position=position, source_slot=slot))
+            # A body that matches a source body whose slots are exhausted was served more often
+            # than it was recorded. That is oversupply, not a live answer.
+            oversupplied = slot is None and key in supplied
+            if slot != position or oversupplied:
+                slips.append(
+                    Slip(
+                        digest=digest,
+                        served_position=position,
+                        source_slot=slot,
+                        oversupplied=oversupplied,
+                    )
+                )
     return slips
 
 
@@ -254,12 +295,19 @@ def assert_no_substitution(source: Path, replay: Path) -> None:
     """
 
     a, b = read_corpus(source), read_corpus(replay)
-    substitutions = [s for s in alignment_report(a, b) if s.source_slot is not None]
+    substitutions = [
+        slip for slip in alignment_report(a, b) if slip.source_slot is not None or slip.oversupplied
+    ]
     assert not substitutions, (
         "a recorded answer was served for a call it does not belong to: "
         + ", ".join(
-            f"key {s.digest[:12]} position {s.served_position} was served slot {s.source_slot}"
-            for s in substitutions
+            f"key {slip.digest[:12]} position {slip.served_position} was served "
+            + (
+                "an answer already used up -- one recording served twice"
+                if slip.oversupplied
+                else f"slot {slip.source_slot}"
+            )
+            for slip in substitutions
         )
     )
 

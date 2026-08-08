@@ -40,6 +40,7 @@ from support.replay_oracle import (
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.model_payloads import (
+    MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     model_response_record,
@@ -215,6 +216,106 @@ def test_an_offloaded_answer_lands_offloaded_on_replay_too(tmp_path: Path) -> No
         "the fixture is degenerate: nothing was offloaded, so placement is not under test"
     )
     assert_pure_replay_equivalent(source.run_dir, replayed.run_dir)
+
+
+def _two_answers(base: Path, tmp_path: Path) -> tuple[Path, list[str]]:
+    """One key carrying two distinguishable answers -- the shape that makes a cursor observable."""
+
+    return _record_calls(
+        tmp_path / base,
+        _Scripted(
+            [
+                ModelTurn(response_id="r-1", final_text="A-one"),
+                ModelTurn(response_id="r-2", final_text="A-two"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+
+
+def test_two_calls_on_one_key_are_answered_in_order(tmp_path: Path) -> None:
+    """The cursor has to *advance*, and nothing else in this file makes it.
+
+    The other Tier A fixtures are multi-turn conversations, where turn 2's preimage carries the
+    tool result and is therefore a different key: one answer per key, so a reader whose cursor
+    never moves still serves each call the only answer it has. The Tier B fixtures put a refusal
+    at slot 0, so every call misses and the replay records no answers at all -- ``b.answers`` is
+    empty and the substitution check is satisfied by having nothing to check.
+
+    Two identical calls really are one key with two answers, which is the smallest shape that
+    tells "advanced" apart from "stood still". Without it, a reader that never advances its
+    cursor and a reader that hands the same recording to both calls each pass this whole suite.
+    """
+
+    source, digests = _two_answers(Path("original"), tmp_path)
+    assert digests[0] == digests[1], "two identical calls must be one key with two answers"
+
+    replay_dir, _ = _record_calls(
+        tmp_path / "replay",
+        ReplayModelAdapter([source]),
+        [_request(), _request()],
+        run_id="run-2",
+    )
+
+    assert_pure_replay_equivalent(source, replay_dir)
+    assert_no_substitution(source, replay_dir)
+
+
+def test_the_oracle_reports_one_recorded_answer_served_to_two_calls(tmp_path: Path) -> None:
+    """Oversupply is a substitution; reading it as a live fallthrough was a hole in the oracle.
+
+    When a key's source slots are used up, the matcher has no slot to return. Treating that
+    ``None`` as "this answer came from a live inner" is right for a fallthrough and wrong for a
+    recording served twice -- and the second is precisely "an answer belonging to a different
+    call is served", the failure this module exists to name.
+    """
+
+    source, _ = _two_answers(Path("original"), tmp_path)
+
+    doctored = tmp_path / "doctored"
+    doctored.mkdir()
+    lines = (source / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8").splitlines()
+    answers = [
+        i for i, line in enumerate(lines) if json.loads(line).get("kind") == "model_response"
+    ]
+    assert len(answers) == 2
+    first, second = answers
+    lines[second] = lines[first]  # slot 0's answer handed to the second call as well
+    (doctored / MODEL_PAYLOADS_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    slips = alignment_report(read_corpus(source), read_corpus(doctored))
+    assert [(slip.served_position, slip.oversupplied) for slip in slips] == [(1, True)], (
+        f"serving one recording twice must be reported as oversupply, got {slips}"
+    )
+    with pytest.raises(AssertionError, match="already used up"):
+        assert_no_substitution(source, doctored)
+
+
+def test_the_oracle_reports_a_replay_whose_offloaded_bytes_changed(tmp_path: Path) -> None:
+    """An offloaded answer lives in a file, not in a record, so record equality cannot see it.
+
+    Comparing records alone, a replay could write a completely different answer under the same
+    chunk name -- the name is the only thing the record carries -- or write no chunk at all, and
+    still compare equal. That left the strict half weaker than the tolerant one.
+    """
+
+    big = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 1024)
+    original = _loop(
+        tmp_path / "original",
+        FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text=big, stop_reason="stop")]),
+        record=True,
+    )
+    source = original.run_once("say the long thing")
+    replay = _loop(tmp_path / "replay", ReplayModelAdapter([source.run_dir]), record=True)
+    replayed = replay.run_once("say the long thing")
+    assert_pure_replay_equivalent(source.run_dir, replayed.run_dir)
+
+    chunks = sorted((replayed.run_dir / MODEL_PAYLOADS_DIRNAME).iterdir())
+    assert chunks, "the fixture is degenerate: nothing was offloaded"
+    chunks[0].write_text(json.dumps({"final_text": "A COMPLETELY DIFFERENT ANSWER"}), "utf-8")
+
+    with pytest.raises(AssertionError, match="chunk bytes differ"):
+        assert_pure_replay_equivalent(source.run_dir, replayed.run_dir)
 
 
 # --- Tier B: no answer is served for a call it does not belong to -------------------------------
