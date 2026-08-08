@@ -1823,14 +1823,29 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                         "request payload does not reassemble to its request_digest",
                     )
                 )
-            # No ingress arm here, deliberately, and the asymmetry with the response half below
-            # is the conclusion rather than an oversight. Reassembly *is* a canonical encode, so
-            # a preimage whose digest checks out is canonical JSON by construction: the encoder
-            # has already refused non-finite values and over-long ints, and surrogates cannot
-            # survive UTF-8 encoding at all. Parsing it could only fail on a rule no corpus can
-            # reach -- an unreachable branch, paid for on every request record of every
-            # ``monoid validate``, on a command whose per-record parse is already its cost.
-            # The response half is different: its bytes are whatever the chunk file holds.
+                continue
+            # Resolving is not believing -- on this half too. What stood here instead was a
+            # comment declining this arm, on the reasoning that reassembly is a canonical
+            # encode and a digest-valid preimage is therefore canonical JSON by construction.
+            # That enumerated three of the encoder's refusals (non-finite values, over-long
+            # ints, surrogates) and omitted nesting, which the encoder does not bound and the
+            # reader does. The writer now refuses such a preimage, but corpora written before
+            # that gate still hold these records, and this is the command an operator runs on a
+            # run directory that arrived from somewhere else. A record that reassembles and
+            # hashes correctly and *still* cannot be read testifies to nothing, and saying so
+            # here is the difference between an unreadable corpus and a silent one.
+            try:
+                loads_json_ingress(rebuilt.decode("utf-8"))
+            except Exception as error:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        # Bounded: these messages come from the parser's own fixed vocabulary
+                        # and carry positions rather than content, but the corpus is untrusted
+                        # input and a validator report is not the place to find that out.
+                        f"request payload is not readable by the replay reader: {str(error)[:200]}",
+                    )
+                )
         elif kind == MODEL_RESPONSE_KIND:
             # Through the shared trichotomy, not an inline shape test: the replay reader
             # refuses through the same function, so the two consumers cannot disagree about

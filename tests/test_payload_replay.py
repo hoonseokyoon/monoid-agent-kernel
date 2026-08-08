@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -1638,6 +1639,128 @@ def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -
     directory = tmp_path / "runs" / "run-1" / MODEL_PAYLOADS_DIRNAME
     assert not (directory.exists() and any(directory.iterdir())), (
         "the refused body was stored anyway, as an orphan chunk no record names"
+    )
+
+
+def test_a_request_too_deep_to_read_is_never_recorded(tmp_path: Path) -> None:
+    """The response half's rule, on the carrier the response half's fix did not reach.
+
+    A request term is lifted into a chunk once its canonical encoding reaches
+    ``MARKER_ENCODED_BYTES`` (94), and a chunk's brackets sit inside the record line's JSON
+    *string*, which the line gate does not count. Any value deep enough to matter is also long
+    enough to be lifted, so the depth rule was enforced for no reachable request at all: the
+    writer recorded a preimage ``loads_json_ingress`` then refused, ``monoid validate`` called
+    the corpus clean, and ``request_terms_view()`` came back empty with the record on disk.
+
+    The cost of that silence is not the lost record -- it is that the D-h impersonation
+    derivation reads these terms, so losing the *disagreeing* request manufactures unanimity,
+    and the preflight tells the operator to fix a model config that was never wrong.
+
+    Refusing here is the ``split_request_payload`` doctrine already stated one paragraph above
+    the fix: a corpus entry that fails its own join is worse than an absent one. It costs the
+    request record and not the answer, which this test pins by serving it.
+    """
+
+    recorder = _recorder(tmp_path)
+    [digest] = _drive(
+        recorder,
+        _ScriptedAdapter([ModelTurn(response_id="r", final_text="answered")]),
+        [_request(output_schema=_nested(552))],
+    )
+    recorder.close()
+    run_dir = tmp_path / "runs" / "run-1"
+
+    assert not _corpus_records(run_dir, MODEL_REQUEST_KIND), (
+        "the writer recorded a request preimage the replay reader refuses to parse"
+    )
+    assert not [issue for issue in validate_run_dir(run_dir) if "model_payloads" in issue.path], (
+        f"validate condemned a corpus the writer refused cleanly: {validate_run_dir(run_dir)}"
+    )
+
+    corpus = _load(tmp_path)
+    assert corpus.request_terms_view() == (), "an absent request must not project terms"
+    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse), (
+        "refusing the request record must not cost the recorded answer"
+    )
+
+
+def test_the_writer_asks_the_readers_own_question_not_a_list_of_rules(tmp_path: Path) -> None:
+    """The gate is the reader's parser, so it cannot be wrong about which rules exist.
+
+    Two rules where the writer and the reader disagree, found one round apart. Depth: the
+    canonical encoder bounds non-finite values, circular references and surrogates, and does
+    **not** bound nesting -- the one rule the round that found it was about. Integers:
+    ``json_ingress`` hard-codes 4300 digits on purpose ("a deterministic, cross-interpreter
+    digit limit") while the encoder's ``str(int)`` tracks whatever the host set, so a process
+    that raised the interpreter's limit opens the disagreement again.
+
+    A depth check would pass the second case, which is why this pins the *ingress parse*: an
+    enumerated gate has to be right about the list, and the list is exactly what was wrong
+    twice. Asserting both arms in one test is deliberate -- either one alone is satisfied by a
+    gate that re-earns the defect.
+    """
+
+    deep = model_payloads._encoded({_GEN: {"instruction": "x", "deep": _nested(552)}})
+    assert model_payloads.split_request_payload(deep, sha256_bytes(deep)) is None, (
+        "a preimage nested past the reader's bound was accepted for recording"
+    )
+
+    restore = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)
+    try:
+        huge = model_payloads._encoded({_GEN: {"instruction": "x", "n": int("9" * 5000)}})
+        assert model_payloads.split_request_payload(huge, sha256_bytes(huge)) is None, (
+            "an integer past the reader's fixed digit bound was accepted for recording; a "
+            "depth-only gate passes this case, so the gate is still a list of rules"
+        )
+    finally:
+        sys.set_int_max_str_digits(restore)
+
+
+def test_validate_refuses_a_request_record_the_reader_cannot_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corpora already on disk were written before the gate, so validate has to say so.
+
+    The request arm re-hashed the reassembled preimage without ever parsing it, on the
+    reasoning that reassembly is a canonical encode and a digest-valid preimage is therefore
+    canonical JSON by construction. That enumerated three of the encoder's refusals and omitted
+    depth. Resolving is not believing: the arm has to ask the reader's question, exactly as the
+    response arm below it does.
+
+    The fixture is the pre-gate writer itself, not a hand-built record, and that is load-bearing
+    twice. A hand-built preimage goes into the record line verbatim, where the *line* reader
+    already refuses it -- the arm that always worked -- so such a fixture pins nothing about
+    this one. And the shape that reaches disk is the offloaded one: the deep term is lifted into
+    a chunk and the line the validator reads is shallow.
+    """
+
+    monkeypatch.setattr(model_payloads, "loads_json_ingress", json.loads)
+    recorder = _recorder(tmp_path)
+    [digest] = _drive(
+        recorder,
+        _ScriptedAdapter([ModelTurn(response_id="r", final_text="answered")]),
+        [_request(output_schema=_nested(552))],
+    )
+    recorder.close()
+    monkeypatch.undo()
+    run_dir = tmp_path / "runs" / "run-1"
+
+    [record] = _corpus_records(run_dir, MODEL_REQUEST_KIND)
+    assert record["refs"] is True, (
+        "the fixture must be the offloaded shape -- a verbatim payload is caught by the line "
+        "reader, which is the arm that never had this defect"
+    )
+    assert _load(tmp_path).request_terms_view() == (), (
+        "the fixture must be one the reader actually refuses, or it pins nothing"
+    )
+
+    issues = validate_run_dir(run_dir)
+    assert any("request" in issue.message for issue in issues), (
+        f"monoid validate certified a request record the reader refuses: {issues}"
+    )
+    assert isinstance(_load(tmp_path).consume(digest, generation=_GEN), ReplayedResponse), (
+        "the unreadable request must not cost the answer recorded beside it"
     )
 
 
