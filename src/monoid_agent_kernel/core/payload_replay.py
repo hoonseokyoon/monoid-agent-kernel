@@ -324,6 +324,7 @@ class ReplayCorpus:
 
     def __init__(self) -> None:
         self._requests: dict[str, _RequestEntry] = {}
+        self._request_runs: dict[str, list[str]] = {}
         self._responses: dict[str, list[_ResponseEntry]] = {}
         self._cursors: dict[str, int] = {}
         self._chunks: dict[str, bytes] = {}
@@ -472,15 +473,27 @@ class ReplayCorpus:
             # First-wins across duplicates: a durable resume re-records the same digest with
             # an empty seen-set, and the earliest record is the one whose activation the
             # file-order answers below it belong to.
+            record_run = str(record.get("run_id") or "")
             self._requests.setdefault(
                 digest,
                 _RequestEntry(
                     generation=generation,
                     refs=refs,
                     payload=record.get("payload"),
-                    run_id=str(record.get("run_id") or ""),
+                    run_id=record_run,
                 ),
             )
+            # The runs, however, accumulate. First-wins is right for the PAYLOAD and wrong for
+            # provenance: a request recorded by two runs was recorded by both of them, and the
+            # evidence correlation downstream asks which runs hold a given continuation. Keeping
+            # only the first made a run that recorded both a continuation and a reasoning-bearing
+            # answer fail to intersect itself, so the derivation declared where that run alone
+            # proves it must not -- and a wrong declaration injects blocks the recorded preimages
+            # never had. Duplicate digests across a resume or a union are supported, not exotic:
+            # `crossed_keys` exists to count them.
+            runs = self._request_runs.setdefault(digest, [])
+            if record_run not in runs:
+                runs.append(record_run)
         elif kind == MODEL_RESPONSE_KIND:
             digest = record.get("request_digest")
             if not is_chunk_sha256(digest):
@@ -713,12 +726,18 @@ class ReplayCorpus:
         continuation", which is only true of a continuation in the same conversation. Dropping
         the run here is what let a union of two sources -- neither of them evidence alone -- reach
         a conclusion neither supports.
+
+        One pair per *contributing run*, not per digest: a request two runs recorded belongs to
+        both, and reporting it under the first alone stopped a run that holds both halves from
+        intersecting itself. The terms are the first-wins payload either way -- duplicates share
+        a digest, so they share their terms; only the provenance differs.
         """
 
         return tuple(
-            (entry.run_id, terms)
-            for digest, entry in self._requests.items()
+            (run_id, terms)
+            for digest in self._requests
             if (terms := self._request_terms(digest)) is not None
+            for run_id in self._request_runs.get(digest, ())
         )
 
     def unreadable_requests(self) -> int:

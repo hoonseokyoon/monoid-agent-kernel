@@ -1842,6 +1842,8 @@ _REVIEWED_INTERPOLATIONS = {
         ("_reconstruct", "', '.join(missing)"),
         ("_reconstruct", "missing"),
         ("_reconstruct", "name"),
+        # The expected-type nouns, spelled in the guard table beside them ("a list"/"an object").
+        ("_reconstruct", "noun"),
         ("_forward_lifecycle", "name"),
         ("_forward_lifecycle", "'opened' if name == 'open' else 'closed'"),
         ("next_turn", "lookup.result.status"),

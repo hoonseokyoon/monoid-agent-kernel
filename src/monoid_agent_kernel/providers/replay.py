@@ -51,6 +51,8 @@ declaration is what makes recorded keys reachable, so it cannot also report who 
 from __future__ import annotations
 
 import inspect
+import threading
+import weakref
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -294,7 +296,8 @@ class ReplayModelAdapter:
         self.supports_multimodal = (
             media_seen if supports_multimodal is _AUTO else bool(supports_multimodal)
         )
-        self._served_slots: dict[str, tuple[int, ModelTurn]] = {}
+        self._served_slots: dict[str, list[tuple[int, weakref.ref[ModelTurn]]]] = {}
+        self._served_lock = threading.Lock()
         self.wire_image_encoding = wire_image_encoding
         if config is not None:
             # Inert under the loop (it always authors request.model); a standalone
@@ -330,14 +333,7 @@ class ReplayModelAdapter:
                 outcome = self._reconstruct(take.hit)
                 if isinstance(outcome, ModelTurn):
                     take.served()
-                    # Only the most recent slot per key is releasable -- ``release`` guards on
-                    # ``cursor == slot + 1`` -- so one entry per key is both sufficient and all
-                    # the memory this bookkeeping can ever cost. The turn travels WITH the slot
-                    # because the entry outlives the call that made it: nothing clears it on
-                    # success, so a later call on an exhausted key that falls through live and is
-                    # then discarded would otherwise reach this slot and rewind onto a recording
-                    # already delivered. ``discard_turn`` compares identity against this object.
-                    self._served_slots[digest] = (take.hit.slot, outcome)
+                    self._note_served(digest, take.hit.slot, outcome)
                     return outcome
                 miss = outcome
             else:
@@ -374,8 +370,21 @@ class ReplayModelAdapter:
                     "the recorded answer is missing the fields a recorded turn carries "
                     f"({', '.join(missing)})"
                 )
+            # One table rather than three hand-written guards, because the first repair here
+            # bounded `provider_retried` alone and left `or ()` / `or {}` standing three lines
+            # up: a damaged `false`, `0` or `""` became an empty container, and for `tool_calls`
+            # that reconstructs into a perfectly successful final-text turn -- the corpus's
+            # damage answered rather than refused. The writer projects these through `list(...)`
+            # and `dict(...)`, so no recorded body legitimately carries anything else.
+            for name, kind, noun in (
+                ("tool_calls", list, "a list"),
+                ("reasoning", list, "a list"),
+                ("usage", Mapping, "an object"),
+            ):
+                if not isinstance(body.get(name), kind):
+                    raise ValueError(f"the recorded {name} is not {noun}")
             calls: list[ToolCall] = []
-            for call in body.get("tool_calls") or ():
+            for call in body["tool_calls"]:
                 if (
                     not isinstance(call, Mapping)
                     or not isinstance(call.get("id"), str)
@@ -387,13 +396,11 @@ class ReplayModelAdapter:
                     ToolCall(id=call["id"], name=call["name"], arguments=dict(call["arguments"]))
                 )
             reasoning: list[dict[str, Any]] = []
-            for item in body.get("reasoning") or ():
+            for item in body["reasoning"]:
                 if not isinstance(item, Mapping):
                     raise ValueError("a recorded reasoning item is not an object")
                 reasoning.append(dict(item))
-            usage = body.get("usage") or {}
-            if not isinstance(usage, Mapping):
-                raise ValueError("the recorded usage is not an object")
+            usage = body["usage"]
             unportable = unportable_usage_key(usage)
             if unportable is not None:
                 # The loop refuses these too, three layers down, as `model_bad_response` --
@@ -429,6 +436,31 @@ class ReplayModelAdapter:
                 + _where(hit),
             )
 
+    def _note_served(self, digest: str, slot: int, turn: ModelTurn) -> None:
+        """Remember which slot produced ``turn``, weakly and per in-flight call.
+
+        Per call, not per key: nothing serialises ``next_turn`` against a shared adapter, and a
+        family of sibling subagents shares one. A single note per key let whichever of two
+        concurrent calls served last overwrite the other's turn-to-slot association, so discarding
+        both gave back at most one slot and the lost one stayed consumed but undelivered -- the
+        next caller then received the answer recorded for a different call.
+
+        Weakly, because the note must not be the reason a recorded body stays in memory. Holding
+        the turn made every accepted hit a permanent retention: one ``ModelTurn`` per key, with its
+        copied tool-call/reasoning/usage containers, for the adapter's whole life, and recorded
+        bodies reach the 8 MB payload ceiling. The turn is alive at the only moment this is read --
+        the runner holds it across the boundary check that discards it -- so a weak reference does
+        the job and stops doing it afterwards, with no accept-side hook to invent.
+
+        Dead references are pruned here rather than on a timer: the next call on a key is the only
+        moment that key's list can grow, so it is the moment to shrink it.
+        """
+
+        with self._served_lock:
+            held = [pair for pair in self._served_slots.get(digest, ()) if pair[1]() is not None]
+            held.append((slot, weakref.ref(turn)))
+            self._served_slots[digest] = held
+
     def discard_turn(self, request: ModelRequest, turn: ModelTurn) -> None:
         """Take back an answer the run threw away without ever seeing it.
 
@@ -461,11 +493,27 @@ class ReplayModelAdapter:
         lookup = replay_lookup(request, self)
         if lookup.result.status != "ok":
             return
-        served = self._served_slots.get(lookup.result.digest)
-        if served is None or served[1] is not turn:
+        digest = lookup.result.digest
+        slot: int | None = None
+        with self._served_lock:
+            remaining: list[tuple[int, weakref.ref[ModelTurn]]] = []
+            for pair in self._served_slots.get(digest, ()):
+                alive = pair[1]()
+                if alive is None:
+                    continue
+                if slot is None and alive is turn:
+                    slot = pair[0]
+                    continue
+                remaining.append(pair)
+            if remaining:
+                self._served_slots[digest] = remaining
+            else:
+                self._served_slots.pop(digest, None)
+        if slot is None:
             return
-        del self._served_slots[lookup.result.digest]
-        self._corpus.release(lookup.result.digest, served[0])
+        # Outside the lock: the corpus takes its own, and holding both in one order here while
+        # ``take`` holds them in the other is the shape a deadlock needs.
+        self._corpus.release(digest, slot)
 
     def _serve_miss(
         self,

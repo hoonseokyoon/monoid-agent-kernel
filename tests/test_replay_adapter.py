@@ -12,6 +12,7 @@ import ast
 import asyncio
 import gc
 import json
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -545,6 +546,53 @@ def test_reasoning_evidence_does_not_cross_recorded_runs(tmp_path: Path) -> None
     assert getattr(_replay(tmp_path, "run-1", "run-2"), "provider_name", None) == "openai", (
         "reasoning recorded in one run was read as evidence about a continuation in another, so "
         "the union declined a declaration both of its sources declare on their own"
+    )
+
+
+def test_a_continuation_recorded_in_two_runs_keeps_both_runs_as_evidence(tmp_path: Path) -> None:
+    """The run-correlation fix's own hole: a digest belongs to every run that recorded it.
+
+    `_requests` is first-wins per digest -- deliberately, since a durable resume re-records the
+    same key and the earliest entry is the one the file-order answers belong to. That is right for
+    the *payload* and wrong for the *run*, and correlating on the run made the difference matter:
+    a continuation recorded by both runs reports its history under the first alone, so a run that
+    recorded both the continuation AND a reasoning-bearing answer no longer intersects itself.
+
+    The intersection then comes back empty and the adapter declares, which is the direction the
+    original global scan could not get wrong. Duplicate digests across a resume or a union are
+    explicitly supported (`crossed_keys` counts them), so narrowing to one run per digest traded
+    a false refusal for a false declaration -- and a false declaration makes the loop inject
+    reasoning blocks the recorded preimages never had, missing every lookup from turn two.
+    """
+
+    continuation = _request(
+        "continued",
+        model=ModelConfig(provider="gateway"),
+        messages=[{"role": "assistant", "content": "prior turn"}],
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="plain")], provider_name="openai"),
+        [continuation],
+        run_id="run-1",
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="thought", reasoning=({"type": "reasoning", "id": "o"},))],
+            provider_name="openai",
+        ),
+        [continuation],
+        run_id="run-2",
+    )
+
+    assert getattr(_replay(tmp_path, "run-2"), "provider_name", None) is None, (
+        "run-2 alone holds both halves -- a continuation and a reasoning-bearing answer -- so it "
+        "is exactly the evidence the rule is about"
+    )
+    assert getattr(_replay(tmp_path, "run-1", "run-2"), "provider_name", None) is None, (
+        "the shared digest kept only the first run's id, so the run that proves the original did "
+        "not declare could not intersect itself and the union declared anyway"
     )
 
 
@@ -1721,16 +1769,98 @@ def test_discarding_a_live_answer_does_not_rewind_a_delivered_recording(tmp_path
     inner = _CountingInner()
     adapter = _replay(tmp_path, inner=inner)
 
-    delivered = _call(adapter, _request())
-    live = _call(adapter, _request())
+    # Through the adapter, not through the runner: `ModelCallRunner.acall` does not hand back the
+    # object the adapter produced, so a test that discarded ITS turn would never match on identity
+    # and would pass no matter what this guard does. The real hook passes the adapter's own object
+    # -- `on_discarded` receives `task.result()`, before any runner post-processing -- so this is
+    # the object under test.
+    delivered = adapter.next_turn(_request())
+    live = adapter.next_turn(_request())
     adapter.discard_turn(_request(), live)
 
-    after = _call(adapter, _request())
+    after = adapter.next_turn(_request())
 
     assert (delivered.final_text, live.final_text) == ("RECORDED", "live answer")
     assert after.final_text == "live answer", (
         "discarding a live fallthrough answer rewound the cursor onto a recording that had "
         f"already been delivered, so it was served twice: {after.final_text!r}"
+    )
+
+
+def test_two_in_flight_answers_for_one_key_are_tracked_separately(tmp_path: Path) -> None:
+    """One note per key loses the earlier call the moment a second is in flight.
+
+    Nothing serialises `next_turn` against a shared adapter, and a family of sibling subagents
+    shares one -- the case `discard_turn`'s own docstring names. Two calls on the same key take
+    slots 0 and 1, and a single per-key note means whichever serves last overwrites the other's
+    turn-to-slot association. Both then being discarded gives back at most one slot: the lost one
+    stays consumed and undelivered, so the next caller is served the answer recorded for a
+    different call -- the substitution this module exists to prevent, reached by way of its own
+    bookkeeping rather than by a corpus or a race in the corpus.
+
+    Driven in reverse-serve order, which is the order the cursor guard can actually recover:
+    `release` takes only the slot the cursor stands one past. That is the arm where the repair is
+    observable, and on the parent even it fails, because the earlier turn is not remembered at all.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="ANSWER-1"), ModelTurn(final_text="ANSWER-2")]),
+        [_request(), _request()],
+    )
+    adapter = _replay(tmp_path)
+
+    # The adapter's own objects: the runner hands back a different turn, so a test that discarded
+    # ITS result would never match on identity and would prove nothing either way.
+    first = adapter.next_turn(_request())
+    second = adapter.next_turn(_request())
+    assert (first.final_text, second.final_text) == ("ANSWER-1", "ANSWER-2")
+
+    adapter.discard_turn(_request(), second)
+    adapter.discard_turn(_request(), first)
+
+    served = adapter.next_turn(_request())
+
+    assert served.final_text == "ANSWER-1", (
+        "the first in-flight answer was forgotten when the second was served, so discarding it "
+        f"gave nothing back and the next call was served a different call's answer: "
+        f"{served.final_text!r}"
+    )
+
+
+def test_served_answers_are_not_retained_for_the_adapter_lifetime(tmp_path: Path) -> None:
+    """The bookkeeping must not be why a recorded answer stays in memory.
+
+    Keying a slot to its turn is what makes `discard_turn` safe, but holding the turn to do it
+    turns every accepted hit into a permanent retention: one `ModelTurn` per key, with its copied
+    tool-call, reasoning and usage containers, for as long as the adapter lives. Recorded bodies
+    reach the 8 MB payload ceiling, and a long replay has a distinct key per turn, so the note
+    outgrows what it is noting.
+
+    The turn is alive at the only moment the note is read -- the runner holds it across the
+    boundary check that discards it -- so a weak reference is enough to do the job and enough to
+    stop doing it afterwards. No accept-side hook is needed, which matters: there is no such hook,
+    and inventing one would put a second lifecycle rule on every adapter.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="x" * 4096) for _ in range(4)]),
+        [_request(f"call {n}") for n in range(4)],
+    )
+    adapter = _replay(tmp_path)
+
+    # The adapter's own turns, for the third time in this file and for the third reason: the
+    # bookkeeping stores what `next_turn` produced, and the runner hands back something else.
+    # Weak-referencing the runner's turn measures the runner's retention, not this one's -- it
+    # collects no matter what `_note_served` holds, which a mutation check caught after the
+    # assertion had already been written and believed.
+    alive = [weakref.ref(adapter.next_turn(_request(f"call {n}"))) for n in range(4)]
+    gc.collect()
+
+    assert [ref() for ref in alive] == [None] * 4, (
+        "a served answer outlived every caller's reference to it, so the slot bookkeeping is "
+        "retaining recorded bodies for the adapter's whole lifetime"
     )
 
 
@@ -1774,4 +1904,58 @@ def test_a_non_boolean_provider_retried_is_refused_rather_than_coerced(tmp_path:
     assert MISS_NOT_RECORDED in str(caught.value), (
         "a non-boolean provider_retried was coerced into an invented audit value instead of "
         f"earning the refusal every other malformed recorded field earns: {caught.value}"
+    )
+
+
+@pytest.mark.parametrize(
+    "field, planted",
+    [
+        ("tool_calls", False),
+        ("tool_calls", 0),
+        ("tool_calls", ""),
+        ("reasoning", False),
+        ("reasoning", 0),
+        ("usage", False),
+        ("usage", ""),
+    ],
+)
+def test_a_falsy_recorded_container_is_refused_rather_than_defaulted(
+    tmp_path: Path, field: str, planted: Any
+) -> None:
+    """The twins of the `provider_retried` coercion, and the reason that fix was not enough.
+
+    `provider_retried` was repaired by itself, and `or ()` / `or {}` three lines above went on
+    turning a damaged `false`, `0` or `""` into an empty container. `tool_calls` is the one that
+    costs: a body claiming no tool calls reconstructs into a perfectly successful final-text turn,
+    so the corpus's damage is not refused, it is *answered*.
+
+    Bounding one field of a set and leaving its siblings is this repository's standing defect
+    shape, and it was re-earned here inside the commit that fixed the first instance. The writer
+    projects `tool_calls` and `reasoning` through `list(...)` and `usage` through `dict(...)`, so
+    no recorded body legitimately carries anything else and the reader can demand the exact type.
+    """
+
+    digest, _repeat = _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="first"), ModelTurn(final_text="second")]),
+        [_request(), _request()],
+    )
+    body = {
+        "response_id": "r-bad",
+        "final_text": "answered a damaged body",
+        "tool_calls": [],
+        "reasoning": [],
+        "usage": {},
+        "stop_reason": None,
+        "provider_retried": False,
+    }
+    body[field] = planted
+    _prepend_refused_answer(tmp_path, digest, unrecorded_reason="", body=body)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _call(_replay(tmp_path), _request())
+
+    assert MISS_NOT_RECORDED in str(caught.value), (
+        f"a recorded {field} of {planted!r} was defaulted to an empty container instead of "
+        f"earning a refusal, so a damaged corpus was answered: {caught.value}"
     )

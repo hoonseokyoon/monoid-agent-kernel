@@ -15,8 +15,12 @@ out in commit messages and here.
   released the *earlier* call's slot when discarded. Nothing caught it, because an exhausted call
   never moves the cursor, so the `cursor == slot + 1` guard still held for the delivered slot. A
   recording already handed to one call was handed to another, at exit 0 with a clean
-  `monoid validate`. The served turn now travels with the slot and is matched by identity, which
-  is what makes the documented "a live fallthrough answer is not taken back" true in code.
+  `monoid validate`. Each in-flight answer is now noted separately and matched by identity, which
+  is what makes the documented "a live fallthrough answer is not taken back" true in code. The note
+  is per call rather than per key — nothing serialises `next_turn` against the adapter a sibling
+  family shares, and one note per key let whichever of two concurrent calls served last overwrite
+  the other's turn-to-slot association — and it holds the turn weakly, so the bookkeeping is never
+  why a recorded body (up to the 8 MB payload ceiling) stays in memory.
 - **The multimodal derivation reads both media carriers.** A user turn carries parts in `content`;
   a tool message carries returned media in a top-level `media` list. Only the first was scanned, so
   a corpus whose images came back from a tool derived text-only — and since the flag is a preimage
@@ -31,13 +35,18 @@ out in commit messages and here.
   alone declares. Under the shipped gateway default that drops the declaration and makes every
   recomputed key name the transport instead of the relayed provider, so the preflight refused a
   corpus and a config that were both correct. `request_terms_view()` and `response_bodies_view()`
-  now carry each item's `run_id` and the derivation intersects them. This narrows the inference
-  rather than proving it: correlating a continuation with the answer it continues from needs
-  message-prefix matching the corpus does not model. Both error directions fail closed.
-- **A non-boolean `provider_retried` in a recorded body is refused rather than coerced.** Bodies are
-  deliberately open-shaped, so a damaged corpus can carry a string there — and `bool("false")` is
-  `True`, so a recorded "not retried" replayed as retried. It now earns the `not_recorded` refusal
-  every neighbouring malformed field earns, instead of inventing an audit value.
+  now carry each item's `run_id` and the derivation intersects them, and a request recorded by two
+  runs reports under *both* — first-wins is right for the payload and wrong for provenance, and
+  keeping only the first stopped a run holding both halves from intersecting itself. This narrows
+  the inference rather than proving it: correlating a continuation with the answer it continues
+  from needs message-prefix matching the corpus does not model. Both error directions fail closed.
+- **A malformed recorded scalar or container is refused rather than defaulted.** Bodies are
+  deliberately open-shaped, so a damaged corpus can carry a string where a bool belongs, or `false`
+  where a list does. `bool("false")` is `True`, so a recorded "not retried" replayed as retried; and
+  `or ()` turned a damaged `tool_calls` into an empty one, reconstructing a perfectly successful
+  final-text turn — the corpus's damage answered rather than refused. `provider_retried`,
+  `tool_calls`, `reasoning` and `usage` now all earn the `not_recorded` refusal, checked from one
+  declared table rather than four hand-written guards.
 - **A replay corpus can be narrowed rather than silent, and the two are no longer confused.**
   A request record that reassembles and hashes correctly can still be past the reader's JSON
   nesting bound, and it was then simply absent from `request_terms_view()`. The impersonation
