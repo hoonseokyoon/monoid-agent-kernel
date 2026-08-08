@@ -61,7 +61,12 @@ from monoid_agent_kernel.providers._request_identity import (
     _request_payload,
     replay_lookup,
 )
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, normalize_model_request
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    ToolCall,
+    normalize_model_request,
+)
 from monoid_agent_kernel.recorder import AgentRecorder
 
 _GEN = _REQUEST_DIGEST_GENERATION
@@ -1528,6 +1533,106 @@ def test_an_offloaded_body_is_held_to_the_same_ingress_rules_as_an_inline_one(
     issues = validate_run_dir(run_dir)
     assert any("response" in issue.path or "response" in issue.message for issue in issues), (
         f"monoid validate certified a corpus the reader refuses: {issues}"
+    )
+
+
+def _nested(depth: int) -> Any:
+    """A value ``depth`` containers deep. The documented line bound is 512."""
+
+    node: Any = {"leaf": 1}
+    for _ in range(depth):
+        node = {"k": node}
+    return node
+
+
+def _corpus_records(run_dir: Path, kind: str) -> list[dict[str, Any]]:
+    lines = (run_dir / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8").splitlines()
+    return [record for record in map(json.loads, lines) if record.get("kind") == kind]
+
+
+@pytest.mark.parametrize("placement", ["inline", "offloaded"])
+def test_a_body_too_deep_to_read_is_refused_the_same_way_either_placement(
+    tmp_path: Path, placement: str
+) -> None:
+    """The kernel must not record a body it then refuses to read -- on both placements.
+
+    The line encoder asks ``json_nesting_within_limit`` before writing a record, so an INLINE
+    body deeper than the reader parses is refused at write time and the record carries
+    ``unrecorded_reason: "unencodable"``. An OFFLOADED body is never in the line: its brackets
+    go to a chunk file and the encoder sees a shallow reference. So the same body was written
+    with ``unrecorded_reason: ""`` -- the writer stating it recorded this answer -- and then
+    refused by the reader as ``not_recorded``. ``recorder.py`` already called that "an asymmetry
+    with no reason"; its typed-absence fallback was written for it and could not reach it.
+
+    Moving the bound to the reader instead does not work, and that is why this is fixed at the
+    writer: without the lexical scan the decoder's own stack limit decides, so the identical
+    corpus replays or does not depending on how deep the call stack already is. Measured -- the
+    same 520-deep body parses at module level and raises under pytest.
+    """
+
+    pad = "x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096) if placement == "offloaded" else "short"
+    recorder = _recorder(tmp_path)
+    [digest] = _drive(
+        recorder,
+        _ScriptedAdapter(
+            [
+                ModelTurn(
+                    response_id="r",
+                    final_text=pad,
+                    tool_calls=[ToolCall(id="c1", name="t", arguments={"deep": _nested(520)})],
+                )
+            ]
+        ),
+        [_request()],
+    )
+    recorder.close()
+    run_dir = tmp_path / "runs" / "run-1"
+
+    [answer] = _corpus_records(run_dir, MODEL_RESPONSE_KIND)
+    assert answer["unrecorded_reason"] == "unencodable", (
+        f"a {placement} body the reader cannot parse was recorded as though it could be served"
+    )
+    assert answer["response"] is None, "a refused body must not also be stored"
+
+    outcome = _load(tmp_path).consume(digest, generation=_GEN)
+
+    assert isinstance(outcome, ReplayMissReason) and outcome.reason == MISS_NOT_RECORDED
+    assert "unencodable" in outcome.detail, (
+        "the miss must repeat the writer's own reason, not invent a parser complaint about a "
+        f"body the writer never stored: {outcome.detail}"
+    )
+    assert not [issue for issue in validate_run_dir(run_dir) if "model_payloads" in issue.path], (
+        f"validate condemned a corpus the writer refused cleanly: {validate_run_dir(run_dir)}"
+    )
+
+
+def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -> None:
+    """The refusal happens before the chunk is stored, not after.
+
+    A body refused for depth must not leave its bytes in ``model_payloads/`` under a name no
+    record references: ``monoid gc`` would carry it forever as an orphan, and the bytes are the
+    conversation content the corpus is otherwise careful never to keep unreferenced.
+    """
+
+    recorder = _recorder(tmp_path)
+    _drive(
+        recorder,
+        _ScriptedAdapter(
+            [
+                ModelTurn(
+                    response_id="r",
+                    final_text="x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096),
+                    tool_calls=[ToolCall(id="c1", name="t", arguments={"deep": _nested(520)})],
+                )
+            ]
+        ),
+        [_request()],
+    )
+    recorder.close()
+
+    directory = tmp_path / "runs" / "run-1" / MODEL_PAYLOADS_DIRNAME
+    assert not (directory.exists() and any(directory.iterdir())), (
+        "the refused body was stored anyway, as an orphan chunk no record names"
     )
 
 

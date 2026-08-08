@@ -1818,6 +1818,14 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                         "request payload does not reassemble to its request_digest",
                     )
                 )
+            # No ingress arm here, deliberately, and the asymmetry with the response half below
+            # is the conclusion rather than an oversight. Reassembly *is* a canonical encode, so
+            # a preimage whose digest checks out is canonical JSON by construction: the encoder
+            # has already refused non-finite values and over-long ints, and surrogates cannot
+            # survive UTF-8 encoding at all. Parsing it could only fail on a rule no corpus can
+            # reach -- an unreachable branch, paid for on every request record of every
+            # ``monoid validate``, on a command whose per-record parse is already its cost.
+            # The response half is different: its bytes are whatever the chunk file holds.
         elif kind == MODEL_RESPONSE_KIND:
             # Through the shared trichotomy, not an inline shape test: the replay reader
             # refuses through the same function, so the two consumers cannot disagree about
