@@ -344,6 +344,26 @@ not compute, and that attempt earns `absent` — a request record with no answer
 answer sits one record below. Record the corpus you intend to replay from a run that did not
 retry.
 
+**Concurrency and `--replay-fallthrough` together lose a position, not just an order.** The
+paragraph above is about *which* caller gets which recording. This is a stronger shape, and it is
+measurable rather than theoretical. A refused record does not advance the cursor when it is read —
+deliberately, because a parked turn's re-attempt has to earn the same refusal rather than the next
+call's answer — so two concurrent callers on one key both stand on it. If both then fall through
+and are answered live, both report that the conversation moved past that call, and the cursor
+advances **once**: one slot, refused once, however many callers heard about it.
+
+Measured on a key recorded as `[refused, A, B]`: two concurrent fallthroughs, then a third call,
+and the third call is served `A` — the answer the second call would have been given had it not gone
+live. Every later call on that key is shifted by one for the rest of the run.
+
+Neither obvious remedy is available inside the current contract. Advancing once per *served* caller
+re-breaks the guarantee that a spend arriving after the conversation has moved on cannot disturb it
+(a rule an earlier review round added, and one this suite pins). Handing the second concurrent
+caller the *next* entry instead would give the faithful mapping, but it requires the corpus to tell
+a concurrent sibling from a park re-attempt — a reservation model, and a change to what a take is.
+Recorded here as a limit rather than closed: replay a run whose concurrency the recording fixed, or
+do not combine background fan-out with `--replay-fallthrough` on a shared key.
+
 `--replay-fallthrough` will get such a run to finish, but it is not a way to replay it. Once
 one call falls through, the live answer enters `messages`, so every later key diverges and
 every later call falls through too — a run that reports `completed` at exit 0 having contacted

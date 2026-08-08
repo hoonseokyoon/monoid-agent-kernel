@@ -43,6 +43,20 @@ ordered; a run whose concurrency the recording did not fix is replayed as faithf
 run, which is to say not deterministically. Same family as the spawn-observation limit in
 ``docs/CLI.md``.
 
+That is about *order*. A **refusal** loses a position outright, which is stronger and worth
+stating separately. ``consume`` does not advance on a refusal -- a parked turn's re-attempt has to
+earn the same one -- so concurrent callers all stand on the same refused slot, and
+``spend_refused`` is idempotent per slot. Two callers who both fall through and are both answered
+live therefore move the cursor once between them. Measured on ``[refused, A, B]``: two concurrent
+fallthroughs, then a third call, and the third call is served ``A``.
+
+Neither remedy fits the current contract. Advancing once per served caller re-breaks
+``test_a_spend_the_cursor_has_already_passed_does_not_rewind`` -- a rule an earlier review round
+added, pinning that a spend arriving after the conversation moved on cannot disturb it. Handing
+the second concurrent caller the next entry gives the faithful mapping but needs the corpus to
+tell a concurrent sibling from a park re-attempt, which is a reservation model and a change to
+what a take is. Recorded in ``docs/CLI.md`` as a limit rather than closed.
+
 **A union is ordered, and that is not visible from the command line.** "File order" spans the
 named sources in the order they were given, and it is decisive wherever two sources can answer
 one key -- two recordings of one conversation, and equally a fan-out of two children with the

@@ -842,6 +842,64 @@ def test_a_spend_the_cursor_has_already_passed_does_not_rewind(tmp_path: Path) -
     )
 
 
+def test_two_concurrent_fallthroughs_on_one_refusal_advance_the_cursor_once(
+    tmp_path: Path,
+) -> None:
+    """A **limit**, pinned so it cannot be lost or misdescribed. Not a property worth having.
+
+    `consume` does not advance on a refusal -- a parked turn's re-attempt has to earn the same one
+    -- so concurrent callers all stand on the same refused slot, and `spend_refused` is idempotent
+    per slot. Two callers who both fall through and are both answered live therefore move the
+    cursor once between them, and the answer recorded for the second call goes to the third.
+
+    Recorded as a limit rather than closed because neither remedy fits the current contract.
+    Advancing once per served caller re-breaks
+    `test_a_spend_the_cursor_has_already_passed_does_not_rewind`, which an earlier review round
+    added; handing the second concurrent caller the next entry gives the faithful mapping but
+    needs the corpus to tell a concurrent sibling from a park re-attempt, which is a reservation
+    model and a change to what a take is.
+
+    This test exists because the alternative was a sentence. `docs/CLI.md` states the shape and
+    quotes this measurement, and a limit stated only in prose is one nobody re-checks -- the
+    review round before this one produced exactly that mistake. Implementing the reservation model
+    must redden this test, which is the point: it forces the documentation to move with the code.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir, answers=["A", "B"])
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = path.read_text(encoding="utf-8").splitlines()
+    refused = json.dumps(
+        model_response_record(
+            None,
+            call_index=0,
+            request_digest=digest,
+            unrecorded_reason="too_large",
+            **_envelope(),
+        ),
+        sort_keys=True,
+    )
+    path.write_text("\n".join([lines[0], refused, *lines[1:]]) + "\n", encoding="utf-8")
+    corpus = ReplayCorpus.load([run_dir])
+
+    # Both takes open before either settles: that is what makes them concurrent callers rather
+    # than one caller parking and re-attempting, and the corpus cannot tell the two apart.
+    with corpus.take(digest, generation=_GEN) as first:
+        with corpus.take(digest, generation=_GEN) as second:
+            assert first.miss is not None and second.miss is not None
+            assert first.miss.slot == 0 and second.miss.slot == 0
+            first.served()
+            second.served()
+
+    third = corpus.consume(digest, generation=_GEN)
+
+    assert isinstance(third, ReplayedResponse)
+    assert third.body["final_text"] == "A", (
+        "the documented limit has changed: two live fallthroughs now advance the cursor twice, "
+        "so update `docs/CLI.md` and the module docstring, which both quote this measurement"
+    )
+
+
 def test_a_request_that_does_not_hash_to_its_own_key_testifies_about_nothing(
     tmp_path: Path,
 ) -> None:
