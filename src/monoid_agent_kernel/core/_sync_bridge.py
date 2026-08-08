@@ -67,6 +67,34 @@ def consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
+def dispose_unawaited(payload: Any, *, on_live_loop: bool = True) -> None:
+    """Dispose an awaitable nobody will await.
+
+    A coroutine is closed so its cleanup runs and it cannot surface as an unawaited-coroutine
+    warning; a future or task is cancelled and consumed so it stops running and cannot surface as
+    a never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
+
+    ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there is
+    unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no longer
+    run, so there is nothing to stop and no outcome to read. An *already settled* one is different:
+    reading its outcome touches no loop, and an unretrieved exception is exactly what warns at
+    collection, so that case is consumed rather than skipped.
+
+    One rule with two callers: the abandonment path below, and a synchronous wrapper that refuses
+    an awaitable its inner handed back. Both are disposing something for the same reason, and the
+    second was written because the first was a closure nobody outside this module could reach.
+    """
+
+    if inspect.iscoroutine(payload):
+        payload.close()
+    elif isinstance(payload, asyncio.Future):
+        if on_live_loop:
+            payload.cancel()
+            payload.add_done_callback(consume_task_outcome)
+        elif payload.done():
+            consume_task_outcome(payload)
+
+
 @dataclass(frozen=True)
 class AbandonableSyncCall(Generic[_T]):
     """A blocking call in flight on a daemon thread, as the two handles an awaiter needs.
@@ -141,29 +169,15 @@ def start_abandonable_sync_call(
         """Dispose an awaitable that arrived after the run gave up on the call.
 
         A sync tool handler may return one, and the normal path accepts any awaitable, so the late
-        path has to handle the same shapes. Nothing downstream will await this one: a coroutine is
-        closed so its cleanup runs and it cannot surface as an unawaited-coroutine warning, and a
-        future or task is cancelled and consumed so it stops running and cannot surface as a
-        never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
-
-        ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there
-        is unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no
-        longer run, so there is nothing to stop and no outcome to read. An *already settled* one is
-        different: reading its outcome touches no loop, and an unretrieved exception is exactly what
-        warns at collection, so that case is consumed rather than skipped.
+        path has to handle the same shapes. ``dispose_unawaited`` above carries the disposal rule
+        and the reasoning about ``on_live_loop``; what belongs here is only that a call which
+        *failed* left no awaitable to dispose of.
         """
 
         succeeded, payload = outcome[0]
         if not succeeded:
             return
-        if inspect.iscoroutine(payload):
-            payload.close()
-        elif isinstance(payload, asyncio.Future):
-            if on_live_loop:
-                payload.cancel()
-                payload.add_done_callback(consume_task_outcome)
-            elif payload.done():
-                consume_task_outcome(payload)
+        dispose_unawaited(payload, on_live_loop=on_live_loop)
 
     def deliver() -> None:
         if not settled.done():

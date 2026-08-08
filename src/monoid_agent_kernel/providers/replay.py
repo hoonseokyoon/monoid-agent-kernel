@@ -50,6 +50,7 @@ declaration is what makes recorded keys reachable, so it cannot also report who 
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -62,7 +63,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayMissReason,
     ReplayedResponse,
 )
-from monoid_agent_kernel.core._sync_bridge import is_async_callable
+from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
 from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -170,12 +171,7 @@ class ReplayModelAdapter:
         self._inner_closer = None
         if inner is not None:
             next_turn = getattr(inner, "next_turn", None)
-            if not callable(next_turn) or is_async_callable(next_turn):
-                # `callable` is true for an `async def`, and `ModelCallRunner` documents a
-                # coroutine `next_turn` as one of its four dispatch shapes -- so without the
-                # second half this wrapper accepts an inner it cannot drive, hands `_adrive` a
-                # coroutine that has done no provider work, and spends the refused slot on it
-                # before the awaited call has a chance to fail.
+            if not callable(next_turn):
                 raise ValueError(
                     "the fallthrough inner adapter exposes no synchronous next_turn; this "
                     "wrapper is synchronous and cannot drive an anext_turn-only adapter"
@@ -188,6 +184,28 @@ class ReplayModelAdapter:
                 raise ValueError(
                     f"inner adapter {type(inner).__name__} exposes open() or close() "
                     "without its pair; nothing would release what open() allocates"
+                )
+            # Every callable this wrapper forwards, gated by one predicate over the census
+            # rather than by a hand-picked member. `next_turn` earned this check and `open`/
+            # `close` inherited nothing from it, so an `async def` lifecycle pair passed the
+            # pairing test above and then neither half ran: `open()` called the coroutine
+            # function, discarded the coroutine, and reported success to a CLI probe that has
+            # only this wrapper to ask -- the exact outcome the pairing check exists to
+            # prevent. Three hand-written checks can be half-applied; a census cannot.
+            asynchronous = [
+                name
+                for name, member in (
+                    ("next_turn", next_turn),
+                    ("open", opener),
+                    ("close", closer),
+                )
+                if callable(member) and is_async_callable(member)
+            ]
+            if asynchronous:
+                raise ValueError(
+                    f"the fallthrough inner adapter's {', '.join(asynchronous)} "
+                    f"{'is' if len(asynchronous) == 1 else 'are'} asynchronous; this wrapper "
+                    "is synchronous and would hand back a coroutine nothing awaits"
                 )
             if callable(opener):
                 self._inner_opener = opener
@@ -385,22 +403,49 @@ class ReplayModelAdapter:
         because that is the seam this repair was needed at twice: the rule was written for the
         refusal that leaves the cursor standing and never bound on the record ``consume``
         handed over and reconstruction then rejected.
+
+        And the settlement is a fact about the call's *result*, not about how the call
+        returned. An ``except`` clause -- however wide -- only ever sees the inner shapes that
+        raise; the one that returns an awaitable returns cleanly, having done no provider work,
+        and defeated both halves at once.
         """
 
         if self._inner is not None:
+            served = False
             try:
                 turn = self._inner.next_turn(request)
-            except BaseException:
-                self._settle_unserved(digest, held)
-                raise
-            # Only now. Spending before the call would claim the conversation moved past this
-            # slot on the strength of an attempt: a live adapter that raises recoverably (a
-            # 429 is enough) parks the turn for an idempotent re-attempt, and the re-attempt
-            # would be answered with the next call's recording -- the same silent substitution
-            # the two-phase consume exists to prevent, reached through the other exit.
-            if digest is not None and held is None and miss.slot is not None:
-                self._corpus.spend_refused(digest, miss.slot)
-            return turn
+                if inspect.isawaitable(turn):
+                    # `_adrive` awaits whatever a synchronous adapter hands back, so this
+                    # return means the provider has not been called yet -- the awaited call
+                    # still has every chance to fail, and settling on it would pay for a call
+                    # that has not happened. No declaration-side gate can see this shape:
+                    # `iscoroutinefunction` is False for a plain `def` that returns a
+                    # coroutine, so the result is the only place left to ask.
+                    dispose_unawaited(turn)
+                    raise ModelAdapterError(
+                        "the fallthrough inner adapter returned an awaitable from a "
+                        "synchronous next_turn; this wrapper cannot drive it",
+                        retryable=False,
+                        # The remedy is operator-shaped -- build the wrapper around an inner
+                        # it can drive -- so the session survives to be resumed against a
+                        # fixed configuration, rather than dying as an unclassified kill that
+                        # takes the checkpoints with it.
+                        config_recoverable=True,
+                    )
+                served = True
+                return turn
+            finally:
+                # Exactly one settlement on every exit, chosen by whether the call happened
+                # rather than by which exit was taken. Spending before the call would claim
+                # the conversation moved past this slot on the strength of an attempt: a live
+                # adapter that raises recoverably (a 429 is enough) parks the turn for an
+                # idempotent re-attempt, and the re-attempt would be answered with the next
+                # call's recording -- the same silent substitution the two-phase consume
+                # exists to prevent, reached through the other exit.
+                if not served:
+                    self._settle_unserved(digest, held)
+                elif digest is not None and held is None and miss.slot is not None:
+                    self._corpus.spend_refused(digest, miss.slot)
         self._settle_unserved(digest, held)
         raise ReplayMiss(
             f"replay miss ({miss.reason}): {miss.detail}", provider_error_code=miss.reason
@@ -419,13 +464,33 @@ class ReplayModelAdapter:
 
     # --- lifecycle ----------------------------------------------------------------------------
 
+    def _forward_lifecycle(self, name: str, member: Any) -> None:
+        """Drive one forwarded lifecycle half, refusing a result nothing will await.
+
+        The constructor's census already rejects an async pair, so this is the second binding
+        of one rule rather than its only one: an inner that resolves ``open`` to a coroutine
+        function at call time -- a ``__getattr__``, a hot-swapped attribute -- is invisible to
+        a check that ran at construction, and it fails the same way. The coroutine is
+        discarded, the inner is never entered, and the CLI's synchronous probe has only this
+        wrapper to ask, so it reports success on a lifecycle that did not happen.
+        """
+
+        result = member()
+        if inspect.isawaitable(result):
+            dispose_unawaited(result)
+            raise ValueError(
+                f"the fallthrough inner adapter's {name}() returned an awaitable; this "
+                "wrapper is synchronous and nothing would await it, so the inner would never "
+                f"be {'opened' if name == 'open' else 'closed'}"
+            )
+
     def open(self) -> None:
         """Forwarded when the inner has a lifecycle; a no-op otherwise, so the CLI's
         open/close probe drives the wrapper it sees and reaches what that wrapper wraps."""
 
         if self._inner_opener is not None:
-            self._inner_opener()
+            self._forward_lifecycle("open", self._inner_opener)
 
     def close(self) -> None:
         if self._inner_closer is not None:
-            self._inner_closer()
+            self._forward_lifecycle("close", self._inner_closer)

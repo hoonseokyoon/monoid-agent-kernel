@@ -9,6 +9,7 @@ forwarding that keeps the CLI's open/close probe honest about what the wrapper w
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from pathlib import Path
 from typing import Any
@@ -988,6 +989,195 @@ def test_an_inner_whose_next_turn_is_a_coroutine_function_is_refused(tmp_path: P
         _replay(tmp_path, inner=_AsyncInner())
 
     assert "anext_turn-only" in str(caught.value) or "coroutine" in str(caught.value)
+
+
+class _AwaitableInner:
+    """A *synchronous* ``next_turn`` that hands back an awaitable.
+
+    `_adrive`'s fourth documented shape: "an adapter can be synchronous and still hand back
+    something awaitable -- it delegates to an async client". `inspect.iscoroutinefunction` is
+    False for a plain `def`, so no declaration-side gate can see this one; only the result can.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def next_turn(self, request: ModelRequest) -> Any:
+        del request
+        self.calls += 1
+
+        async def _later() -> ModelTurn:
+            raise RuntimeError("the live call failed after the wrapper had already returned")
+
+        return _later()
+
+
+def _serve_or_error(adapter: Any, request: ModelRequest) -> str:
+    """The answer, or a stand-in naming the failure -- so a sequence can be asserted whole."""
+
+    try:
+        text = _call(adapter, request).final_text
+    except BaseException as error:  # noqa: BLE001 - the failure is the observation
+        return f"<{type(error).__name__}>"
+    return text if text is not None else "<no text>"
+
+
+def test_an_awaitable_from_a_sync_inner_does_not_spend_the_refused_slot(tmp_path: Path) -> None:
+    """The spend guard is bound on the blocking inner only, and one inner shape defeats it.
+
+    `_serve_miss` spends the refused slot the moment `next_turn` *returns*. An inner that
+    returns an awaitable returns immediately, having done no provider work: the slot is paid
+    for, then `_adrive` awaits the call and the call fails. The turn parks for an idempotent
+    re-attempt -- and the re-attempt meets the recording that belongs to the call after it,
+    exit 0, a valid turn, no surface reporting the substitution.
+
+    `except BaseException` cannot help here: nothing raises inside the try. The settlement has
+    to be a fact about the *result*, not about how the call returned.
+    """
+
+    digest, repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="recorded first"),
+                ModelTurn(response_id="r-3", final_text="recorded third"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    assert digest == repeat, "two identical calls are one key with two recorded answers"
+    _prepend_refused_answer(tmp_path, digest, after=1)
+
+    inner = _AwaitableInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    served = [_serve_or_error(adapter, _request()) for _ in range(3)]
+
+    assert served[0] == "recorded first"
+    assert served[2] != "recorded third", (
+        "the refused slot was spent on a call that never happened, so the parked turn's "
+        "re-attempt was answered with the next call's recording"
+    )
+
+
+def test_an_awaitable_from_a_sync_inner_gives_back_the_held_slot(tmp_path: Path) -> None:
+    """The release half of the same shape, defeated the same way.
+
+    A record `consume` handed over and reconstruction rejected is held, and `_settle_unserved`
+    puts it back when the inner raises. An inner that hands back an awaitable never raises
+    inside the try, so the held slot is never given back: the cursor stands one past the
+    refusal and the re-attempt is served the *following* recording instead of earning the same
+    `not_recorded` refusal it must earn every time.
+    """
+
+    digest, repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="first"),
+                ModelTurn(response_id="r-3", final_text="third"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    assert digest == repeat
+    _prepend_refused_answer(
+        tmp_path,
+        digest,
+        after=1,
+        unrecorded_reason="",
+        body={
+            "response_id": "r-bad",
+            "final_text": None,
+            "tool_calls": [{"id": "c1", "name": "fs_list"}],  # no arguments: not a triple
+            "reasoning": [],
+            "usage": {},
+            "stop_reason": None,
+            "provider_retried": False,
+        },
+    )
+
+    inner = _AwaitableInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    served = [_serve_or_error(adapter, _request()) for _ in range(3)]
+
+    assert served[0] == "first"
+    assert served[2] != "third", (
+        "the held slot was never given back, so the re-attempt was handed the recording "
+        "belonging to the call after the one it asked about"
+    )
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_the_refused_awaitable_is_disposed_rather_than_left_to_warn(tmp_path: Path) -> None:
+    """Refusing an awaitable is not enough; something has to close it.
+
+    A coroutine that is never awaited surfaces at collection as a RuntimeWarning attributed to
+    whatever line happened to trigger the collection -- noise pointing at innocent code, on a
+    path the operator reaches by misconfiguration rather than by fault. The wrapper made the
+    thing and refused it, so the wrapper disposes of it.
+    """
+
+    digest, _repeat = _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(response_id="r-1", final_text="recorded"),
+                ModelTurn(response_id="r-2", final_text="recorded again"),
+            ]
+        ),
+        [_request(), _request()],
+    )
+    _prepend_refused_answer(tmp_path, digest, after=1)
+
+    adapter = _replay(tmp_path, inner=_AwaitableInner())
+    assert _call(adapter, _request()).final_text == "recorded"
+    with pytest.raises(ModelAdapterError) as caught:
+        _call(adapter, _request())
+
+    assert "awaitable" in str(caught.value)
+    assert caught.value.config_recoverable, (
+        "the remedy is to build the wrapper around an inner it can drive, so the session "
+        "survives to be resumed rather than dying as an unclassified kill"
+    )
+    gc.collect()
+
+
+def test_an_inner_whose_lifecycle_is_async_is_refused(tmp_path: Path) -> None:
+    """The pairing check is one of three probed callables, and only one of them is gated.
+
+    `open`/`close` are checked for *pairing* and not for async-ness, so an `async def` pair
+    passes: `open()` calls the coroutine function and discards the coroutine, the inner is
+    never opened, `close()` releases nothing, and the CLI's synchronous probe reports success --
+    the exact outcome the pairing check exists to prevent. One predicate over the census of
+    probed callables, rather than one hand-picked member.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-1", final_text="recorded")]),
+        [_request()],
+    )
+
+    class _AsyncLifecycleInner:
+        def __init__(self) -> None:
+            self.entered = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live")
+
+        async def open(self) -> None:
+            self.entered += 1
+
+        async def close(self) -> None:
+            self.entered -= 1
+
+    with pytest.raises(ValueError) as caught:
+        _replay(tmp_path, inner=_AsyncLifecycleInner())
+
+    assert "open" in str(caught.value) or "close" in str(caught.value)
 
 
 def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
