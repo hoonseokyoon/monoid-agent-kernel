@@ -40,6 +40,17 @@ out in commit messages and here.
   `unrecorded_reason` is checked the same way, by membership in the schema's own enum: coerced, a
   missing marker or a `false` became `""` — the value meaning "recorded normally" — so a damaged
   record with a well-formed body beside it replayed as a successful turn.
+- **The reader and `monoid validate` now agree on what a damaged payload record is.** Three
+  successive review rounds found the same shape — the reader validating what it *keys* on and
+  indexing what the schema calls corrupt, so `rejected_records` stayed zero and the replay preflight
+  reported a damaged corpus as sound. Rather than add the reported field a fourth time, the
+  comparison is now made by machine over every field of every record kind, and it found five groups
+  where reading had found two: an unknown or missing `kind` (silently ignored, *after* its run id
+  had been taken for `attributes.replay_from`), a request with no `payload`, a negative
+  `call_index`, and a `response` that is neither an object nor null. Full schema validation in the
+  reader was measured and rejected: `is_valid` costs ~650µs per record against this schema — 41× a
+  `json.loads` — which is 6.5 seconds of startup for a 10,000-record corpus, so the exhaustive
+  comparison runs in the suite and the reader keeps cheap hand-written guards that it pins.
 - **A discarded outcome is handed back on every path that drops one, not just the first.** A run
   boundary can throw away a real result in four places: the boundary check finding the call already
   done, the awaiter's own cleanup finding it done a moment later, an async callee settling after

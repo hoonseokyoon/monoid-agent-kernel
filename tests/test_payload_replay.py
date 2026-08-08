@@ -41,9 +41,14 @@ from monoid_agent_kernel.core.model_payloads import (
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     chunk_record,
     model_request_record,
+    chunk_record,
+    model_request_record,
     model_response_record,
     read_corpus_records,
 )
+from jsonschema import Draft202012Validator
+
+from monoid_agent_kernel.core.schemas import MODEL_PAYLOADS_RECORD_SCHEMA
 from monoid_agent_kernel.core.payload_replay import (
     MISS_ABSENT,
     MISS_EXHAUSTED,
@@ -897,6 +902,101 @@ def test_two_concurrent_fallthroughs_on_one_refusal_advance_the_cursor_once(
     assert third.body["final_text"] == "A", (
         "the documented limit has changed: two live fallthroughs now advance the cursor twice, "
         "so update `docs/CLI.md` and the module docstring, which both quote this measurement"
+    )
+
+
+_READER_STRICTER_THAN_SCHEMA = {
+    ("chunk", "text"),
+}
+"""Where the reader refuses a record ``MODEL_PAYLOADS_RECORD_SCHEMA`` accepts, on purpose.
+
+A chunk's ``text`` is only "a string" to the schema, which cannot hash it. The reader re-hashes
+before it believes the name, so a chunk lying about its content is refused here and nowhere else.
+Being stricter is never the failure this census is looking for; being *looser* is.
+"""
+
+
+def test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is(tmp_path: Path) -> None:
+    """The divergence class, closed by machine instead of one field per review round.
+
+    Three consecutive rounds found the same shape -- the reader validating what it *keys* on and
+    accepting what ``monoid validate`` calls corrupt -- and each was repaired by adding the field
+    that had been reported. This asks the question the way it should have been asked from the
+    start: for every field of every record kind, does the reader count as damage exactly what the
+    schema rejects? It found five groups where three rounds of reading had found two.
+
+    The check lives here rather than in ``_index`` because it cannot afford to live there.
+    Measured: ``Draft202012Validator.is_valid`` costs ~650us per record against this schema --
+    41x a ``json.loads`` of the same line, and a top-level ``oneOf`` over three branches with
+    ``additionalProperties: False`` is inherently that. A 10,000-record corpus would pay 6.5
+    seconds on every replay run, at adapter construction, before a single call is served. So the
+    exhaustive comparison runs where it is free and the reader keeps its hand-written guards --
+    with this test as the thing that stops them drifting apart again.
+
+    Reader-stricter is fine and enumerated; reader-looser is the defect.
+    """
+
+    validator = Draft202012Validator(MODEL_PAYLOADS_RECORD_SCHEMA)
+    envelope = {"run_id": "run-1", "root_run_id": "run-1", "recorded_at": "2026-08-08T00:00:00Z"}
+    digest = "a" * 64
+    bases = {
+        "chunk": chunk_record(b"chunk-bytes", **envelope),
+        "request": model_request_record(
+            {"g": {"instruction": "hi"}},
+            request_digest=digest,
+            digest_generation="g",
+            refs=False,
+            **envelope,
+        ),
+        "response": model_response_record(
+            {
+                "response_id": "r",
+                "final_text": "ok",
+                "tool_calls": [],
+                "reasoning": [],
+                "usage": {},
+                "stop_reason": "stop",
+                "provider_retried": False,
+            },
+            call_index=0,
+            request_digest=digest,
+            unrecorded_reason="",
+            **envelope,
+        ),
+    }
+    drop = object()
+    planted = [None, "", 0, -1, True, [], {}, "unexpected", drop]
+
+    def reader_calls_it_damage(record: dict[str, Any], index: int) -> bool:
+        run_dir = tmp_path / f"case-{index}" / "runs" / "run-1"
+        run_dir.mkdir(parents=True)
+        (run_dir / MODEL_PAYLOADS_FILENAME).write_text(
+            json.dumps(record) + "\n", encoding="utf-8"
+        )
+        return ReplayCorpus.load([run_dir]).rejected_records > 0
+
+    looser: list[str] = []
+    case = 0
+    for kind, base in bases.items():
+        assert validator.is_valid(base), f"the {kind} fixture must be a record the schema accepts"
+        for field in base:
+            for value in planted:
+                case += 1
+                record = (
+                    {name: held for name, held in base.items() if name != field}
+                    if value is drop
+                    else {**base, field: value}
+                )
+                if validator.is_valid(record) or (kind, field) in _READER_STRICTER_THAN_SCHEMA:
+                    continue
+                if not reader_calls_it_damage(record, case):
+                    shown = "absent" if value is drop else repr(value)
+                    looser.append(f"{kind}.{field}={shown}")
+
+    assert not looser, (
+        "the reader indexed records `monoid validate` calls corrupt, so `rejected_records` stays "
+        "zero and the replay preflight reports a damaged corpus as sound: "
+        + ", ".join(looser)
     )
 
 

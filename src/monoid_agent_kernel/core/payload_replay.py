@@ -102,6 +102,13 @@ from monoid_agent_kernel.core.model_payloads import (
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.core.payload_replay")
 
+_MISSING: Any = object()
+"""Absent, told apart from a recorded ``null`` -- which is legal and means the body is elsewhere."""
+
+_PAYLOAD_RECORD_KINDS = (PAYLOAD_CHUNK_KIND, MODEL_REQUEST_KIND, MODEL_RESPONSE_KIND)
+"""The three kinds ``MODEL_PAYLOADS_RECORD_SCHEMA`` discriminates on. A record outside them is
+one the schema refuses, so the reader refuses it too rather than ignoring it."""
+
 MISS_NO_KEY = "no_key"
 MISS_ABSENT = "absent"
 MISS_NOT_RECORDED = "not_recorded"
@@ -488,8 +495,16 @@ class ReplayCorpus:
             self._rejected += 1
             return
         kind = record.get("kind")
-        run_id = record.get("run_id")
-        if isinstance(run_id, str) and run_id and run_id not in self._run_ids:
+        if kind not in _PAYLOAD_RECORD_KINDS:
+            # Before the run id is collected, not after. The dispatch below had no rejection arm,
+            # so a record with a valid version and envelope and an unknown `kind` was counted
+            # nowhere and dropped silently -- while its run id had already been taken, which is
+            # what `attributes.replay_from` stamps. A corpus could therefore contribute
+            # provenance from a line the schema's top-level `oneOf` refuses outright.
+            self._rejected += 1
+            return
+        run_id = record["run_id"]
+        if run_id not in self._run_ids:
             self._run_ids.append(run_id)
         if kind == PAYLOAD_CHUNK_KIND:
             text = record.get("text")
@@ -522,6 +537,13 @@ class ReplayCorpus:
             # an empty seen-set, and the earliest record is the one whose activation the
             # file-order answers below it belong to.
             record_run = record["run_id"]
+            if "payload" not in record:
+                # Required by the schema, and its absence is not the same as a payload that is
+                # merely unreadable: a record with no preimage at all cannot be re-hashed against
+                # its own key, so treating it as a narrowed-but-honest corpus would let a forged
+                # key testify.
+                self._rejected += 1
+                return
             self._requests.setdefault(
                 digest,
                 _RequestEntry(
@@ -564,7 +586,17 @@ class ReplayCorpus:
                     self._rejected += 1
                 return
             call_index = record.get("call_index")
-            if isinstance(call_index, bool) or not isinstance(call_index, int):
+            if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 0:
+                # The schema's minimum is zero, and it is the position of a call: negative is not
+                # a weaker version of a position, it is not one.
+                self._rejected += 1
+                return
+            body = record.get("response", _MISSING)
+            if not (body is None or isinstance(body, dict)):
+                # `object | null` per the schema. Anything else reaches `response_reference` as a
+                # malformed shape, which refuses the call at serve time -- but by then the record
+                # has been counted healthy, so the preflight already told the operator the corpus
+                # was sound. Damage is a property of the corpus, not of when it is noticed.
                 self._rejected += 1
                 return
             reason = record.get("unrecorded_reason")
@@ -615,7 +647,7 @@ class ReplayCorpus:
             self._response_run.setdefault(digest, run)
             self._responses.setdefault(digest, []).append(
                 _ResponseEntry(
-                    response=record.get("response"),
+                    response=body,
                     unrecorded_reason=reason,
                     call_index=call_index,
                     recorded_at=record["recorded_at"],
