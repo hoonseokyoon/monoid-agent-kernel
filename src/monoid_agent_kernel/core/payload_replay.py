@@ -60,7 +60,7 @@ import os
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
 from monoid_agent_kernel.core._verified_file import (
@@ -631,8 +631,13 @@ class ReplayCorpus:
             if self._cursors.get(digest, 0) == slot < len(queue):
                 self._cursors[digest] = slot + 1
 
-    def release(self, digest: str, slot: int) -> None:
+    def release(self, digest: str, slot: int) -> bool:
         """Give back an answer :meth:`consume` handed out that the caller could not use.
+
+        Answers whether the cursor moved, because "not now" and "not ever" are different and only
+        the caller can tell them apart: a slot the cursor has run past is releasable again once
+        the slots above it come back, and a caller that dropped the refusal on the first failure
+        lost an answer permanently. The adapter retries its pending set on every later release.
 
         Only that exact slot, and only while nothing else has moved: under concurrent callers
         another turn may already hold the next one, and rewinding then would hand it out twice.
@@ -647,9 +652,11 @@ class ReplayCorpus:
         with self._lock:
             queue = self._responses.get(digest)
             if not queue:
-                return
+                return False
             if 0 <= slot < len(queue) and self._cursors.get(digest, 0) == slot + 1:
                 self._cursors[digest] = slot
+                return True
+            return False
 
     def take(self, digest: str, *, generation: str) -> ReplayTake:
         """A take on the next unconsumed answer, settled by the block that receives it.
@@ -754,9 +761,16 @@ class ReplayCorpus:
 
         return sum(1 for digest in self._requests if self._request_terms(digest) is None)
 
-    def response_bodies_view(self) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    def response_bodies_view(self) -> Iterator[tuple[str, Mapping[str, Any]]]:
         """Every materializable answer body with its run, grouped by key then in file order,
         cursors untouched.
+
+        A generator, and that is the memory bound rather than a style: the only caller asks one
+        boolean per body and drops it, while a tuple resolved every offloaded answer into memory
+        first. A body may be ``MAX_MODEL_PAYLOAD_BYTES`` (8 MB) and nothing bounds how many there
+        are, so constructing an adapter over a run directory that arrived from somewhere else cost
+        the whole response corpus at once -- during the derivation, before a single answer is
+        served. Yielding keeps one body alive at a time.
 
         Not file order across the whole corpus: answers are indexed per key, so two keys whose
         records interleave in the file come back one key at a time. The only caller asks which
@@ -770,13 +784,11 @@ class ReplayCorpus:
         scan asks what the corpus can say, and a record that cannot testify says nothing.
         """
 
-        bodies: list[tuple[str, Mapping[str, Any]]] = []
         for queue in self._responses.values():
             for entry in queue:
                 body = self._entry_body(entry)
                 if not isinstance(body, ReplayMissReason):
-                    bodies.append((entry.run_id, body))
-        return tuple(bodies)
+                    yield entry.run_id, body
 
     def _no_answer_reason(self) -> ReplayMissReason:
         """Why a key has a request record and no answer -- one sentence, both askers.
@@ -1135,7 +1147,7 @@ class ReplayCorpus:
     def response_count(self) -> int:
         """Joinable answer *records*, refused ones included.
 
-        Deliberately not the same number as ``len(response_bodies_view())``, which resolves
+        Deliberately not the same number as the evidence view yields, which resolves
         bodies and therefore skips every record whose body cannot be given back. A corpus with
         one refused record reads 2 here and 1 there, and an embedder comparing them without
         this sentence concludes the corpus lost records. This one counts supply -- what a cursor

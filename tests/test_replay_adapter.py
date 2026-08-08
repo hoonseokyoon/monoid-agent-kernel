@@ -1551,16 +1551,20 @@ def test_the_adapter_reaches_the_cursor_only_through_a_take() -> None:
     by hand, which is precisely how three of the six routes were introduced. This fails the day it
     happens, which is the only reason wrapping is safe.
 
-    ``discard_turn`` is the one reviewed exception, and it is scoped to that function rather than
-    waived for the file. It runs when the take is already closed and the run has thrown the answer
-    away, so there is no block left to leave and ``release`` is the only primitive that can give
-    the slot back. Widening the exemption to the whole module would re-earn exactly the defect the
-    census exists to catch -- the interpolation census next door failed that way twice.
+    ``_compact_releases`` is the one reviewed exception, and it is scoped to that function rather
+    than waived for the file. It runs when the take is already closed and the run has thrown the
+    answer away, so there is no block left to leave and ``release`` is the only primitive that can
+    give the slot back. Widening the exemption to the whole module would re-earn exactly the defect
+    the census exists to catch -- the interpolation census next door failed that way twice.
+
+    The exemption moved once already, from ``discard_turn``, when the retry loop was split out.
+    That it had to be moved rather than silently kept working is the point: a function-scoped
+    exemption follows the code it justifies instead of quietly covering whatever grows into it.
     """
 
     tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
     guarded = {"consume", "spend_refused", "release"}
-    exempt = {("discard_turn", "release")}
+    exempt = {("_compact_releases", "release")}
 
     scope: dict[int, str] = {}
 
@@ -1824,6 +1828,44 @@ def test_two_in_flight_answers_for_one_key_are_tracked_separately(tmp_path: Path
     assert served.final_text == "ANSWER-1", (
         "the first in-flight answer was forgotten when the second was served, so discarding it "
         f"gave nothing back and the next call was served a different call's answer: "
+        f"{served.final_text!r}"
+    )
+
+
+def test_discards_arriving_in_serve_order_still_give_every_slot_back(tmp_path: Path) -> None:
+    """The order the previous test chose to avoid, which is why it had to be written.
+
+    `release` takes only the slot the cursor stands one past, so a slot-0 discard arriving while
+    the cursor is at 2 does nothing, and the slot-1 discard behind it rewinds to 1 -- leaving slot
+    0 consumed and undelivered, and the next caller served `ANSWER-2`. The per-call bookkeeping
+    fix remembered both turns and still could not give both back, and the regression test written
+    with it drove the reverse order, so it passed over the top of this.
+
+    A discard that cannot be honoured now stays pending instead of being dropped, and every
+    release retries the highest pending slot, so a later discard compacts the cursor back across
+    the whole consecutive run. Concurrent identical calls arrive in no particular order; a repair
+    that only works in one of them is half a repair.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="ANSWER-1"), ModelTurn(final_text="ANSWER-2")]),
+        [_request(), _request()],
+    )
+    adapter = _replay(tmp_path)
+
+    first = adapter.next_turn(_request())
+    second = adapter.next_turn(_request())
+    assert (first.final_text, second.final_text) == ("ANSWER-1", "ANSWER-2")
+
+    adapter.discard_turn(_request(), first)
+    adapter.discard_turn(_request(), second)
+
+    served = adapter.next_turn(_request())
+
+    assert served.final_text == "ANSWER-1", (
+        "the slot-0 discard arrived while the cursor was past it and was dropped, so the answer "
+        f"it gave back was never recoverable and the next call took a later one: "
         f"{served.final_text!r}"
     )
 

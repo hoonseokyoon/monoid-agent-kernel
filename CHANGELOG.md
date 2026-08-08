@@ -20,7 +20,16 @@ out in commit messages and here.
   is per call rather than per key — nothing serialises `next_turn` against the adapter a sibling
   family shares, and one note per key let whichever of two concurrent calls served last overwrite
   the other's turn-to-slot association — and it holds the turn weakly, so the bookkeeping is never
-  why a recorded body (up to the 8 MB payload ceiling) stays in memory.
+  why a recorded body (up to the 8 MB payload ceiling) stays in memory. A discard the cursor
+  cannot honour yet stays pending rather than being dropped, and every release retries the highest
+  pending slot, so two concurrent calls give both slots back whichever order their discards
+  arrive in; `ReplayCorpus.release` now reports whether it rewound, because "not now" and "not
+  ever" are different and only the caller can tell them apart.
+- **Deriving the adapter no longer materializes the response corpus.** `response_bodies_view()`
+  built a tuple of every answer body so the impersonation derivation could ask one boolean per
+  body. Bodies reach the 8 MB payload ceiling and nothing bounds how many there are, so
+  constructing a `ReplayModelAdapter` over a large run directory resolved the whole corpus into
+  memory before serving a single call. It yields now, keeping one body alive at a time.
 - **The multimodal derivation reads both media carriers.** A user turn carries parts in `content`;
   a tool message carries returned media in a top-level `media` list. Only the first was scanned, so
   a corpus whose images came back from a tool derived text-only — and since the flag is a preimage

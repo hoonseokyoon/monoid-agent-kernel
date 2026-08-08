@@ -2390,6 +2390,59 @@ def test_validate_does_not_retain_every_chunk_it_reads(tmp_path: Path) -> None:
     )
 
 
+def test_the_reasoning_evidence_scan_does_not_hold_the_whole_response_corpus(
+    tmp_path: Path,
+) -> None:
+    """Building the adapter must not cost the corpus, and the evidence view is what decides.
+
+    The only caller of ``response_bodies_view`` asks which runs recorded reasoning -- one boolean
+    per body, discarded immediately. Returning a tuple materialized every body first, so a corpus
+    of offloaded answers was resolved into memory all at once before the adapter served a single
+    call. A body may be MAX_MODEL_PAYLOAD_BYTES (8 MB) and nothing bounds how many there are, so
+    a run directory that arrived from somewhere else could exhaust memory during construction --
+    on the derivation, before any answer is read.
+
+    Same slope shape as the validate retention test above, and for the same reason: one body's
+    transient is several times its own size, so an absolute bound would measure that rather than
+    the accumulation. What must not happen is the peak tracking the corpus.
+    """
+
+    size = PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096
+
+    def peak_for(count: int, run_id: str) -> int:
+        recorder = _recorder(tmp_path, run_id=run_id)
+        _drive(
+            recorder,
+            _ScriptedAdapter(
+                [
+                    ModelTurn(response_id=f"r{n}", final_text=chr(ord("a") + n) * size)
+                    for n in range(count)
+                ]
+            ),
+            [_request(f"call {n}") for n in range(count)],
+        )
+        recorder.close()
+        corpus = ReplayCorpus.load([tmp_path / "runs" / run_id])
+        tracemalloc.reset_peak()
+        seen = {run for run, body in corpus.response_bodies_view() if body.get("reasoning")}
+        peak = tracemalloc.get_traced_memory()[1]
+        assert seen == set(), "the fixture records no reasoning; the scan must find none"
+        return peak
+
+    tracemalloc.start()
+    try:
+        small = peak_for(4, "bodies-small")
+        large = peak_for(16, "bodies-large")
+    finally:
+        tracemalloc.stop()
+
+    added = 12 * size
+    assert large - small < added / 4, (
+        f"twelve more offloaded answers ({added:,} bytes) raised the evidence scan's peak by "
+        f"{large - small:,}; it is materializing the corpus to ask one question per body"
+    )
+
+
 def test_validate_reads_each_chunk_once_even_when_the_records_interleave(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
