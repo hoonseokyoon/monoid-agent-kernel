@@ -498,6 +498,56 @@ def test_a_corpus_of_first_turns_cannot_testify_and_so_it_declares(tmp_path: Pat
     assert _call(adapter, _request(model=ModelConfig(provider="gateway"))).final_text == "x"
 
 
+def test_reasoning_evidence_does_not_cross_recorded_runs(tmp_path: Path) -> None:
+    """Both halves of the negative inference must come from one run, or it proves nothing.
+
+    The rule reads: answers carried reasoning, and a request had a turn behind it in which the
+    block *would have appeared*, and none did -- so the original did not declare. The "would have
+    appeared" step needs the continuation to be the same conversation the reasoning-bearing answer
+    came from. Across runs it is simply false: nothing would have appeared in an unrelated one.
+
+    Both scans were global `any` over the whole union, so the halves could arrive from different
+    sources. Here neither source is evidence on its own -- run-1 is a single turn, so no block
+    could exist either way; run-2 has a continuation but no reasoning to inject -- and each alone
+    declares. Only their union used to decline, and that decline costs the corpus everything: with
+    no declaration the resolved provider becomes the config's transport (`gateway`) rather than
+    the recorded relayed provider (`openai`), so every recomputed key misses and the preflight
+    refuses a corpus and a config that are both correct.
+
+    The split is the family union -- a parent run and a subagent run, which `docs/CONTRACTS.md`
+    calls the documented multi-source shape -- so this is the ordinary case, not an exotic one.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="x", reasoning=({"type": "reasoning", "id": "opaque"},))],
+            provider_name="openai",
+        ),
+        [_request(model=ModelConfig(provider="gateway"))],
+        run_id="run-1",
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="y")], provider_name="openai"),
+        [
+            _request(
+                "continued",
+                model=ModelConfig(provider="gateway"),
+                messages=[{"role": "assistant", "content": "prior turn"}],
+            )
+        ],
+        run_id="run-2",
+    )
+
+    assert getattr(_replay(tmp_path, "run-1"), "provider_name", None) == "openai"
+    assert getattr(_replay(tmp_path, "run-2"), "provider_name", None) == "openai"
+    assert getattr(_replay(tmp_path, "run-1", "run-2"), "provider_name", None) == "openai", (
+        "reasoning recorded in one run was read as evidence about a continuation in another, so "
+        "the union declined a declaration both of its sources declare on their own"
+    )
+
+
 def test_history_without_a_reply_still_cannot_testify(tmp_path: Path) -> None:
     """The witness is an assistant *reply*, not the presence of a message list.
 

@@ -700,16 +700,25 @@ class ReplayCorpus:
 
     # --- cursor-free evidence views ----------------------------------------------------------
 
-    def request_terms_view(self) -> tuple[Mapping[str, Any], ...]:
-        """The reassembled terms of every readable request record, in index order.
+    def request_terms_view(self) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """The reassembled terms of every readable request record, in index order, with its run.
 
         For derivation-time evidence scans (the replay adapter's impersonation rules read
         recorded messages, not record lines -- any term at marker size is a chunk, P4).
         Reads nothing consumable: cursors are untouched.
+
+        The ``run_id`` rides along because the one derivation over this view combines it with
+        evidence from :meth:`response_bodies_view`, and combining the two halves across different
+        runs is unsound: its inference is "the reasoning block WOULD HAVE APPEARED in this
+        continuation", which is only true of a continuation in the same conversation. Dropping
+        the run here is what let a union of two sources -- neither of them evidence alone -- reach
+        a conclusion neither supports.
         """
 
         return tuple(
-            terms for digest in self._requests if (terms := self._request_terms(digest)) is not None
+            (entry.run_id, terms)
+            for digest, entry in self._requests.items()
+            if (terms := self._request_terms(digest)) is not None
         )
 
     def unreadable_requests(self) -> int:
@@ -726,24 +735,28 @@ class ReplayCorpus:
 
         return sum(1 for digest in self._requests if self._request_terms(digest) is None)
 
-    def response_bodies_view(self) -> tuple[Mapping[str, Any], ...]:
-        """Every materializable answer body, grouped by key then in file order, cursors
-        untouched.
+    def response_bodies_view(self) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """Every materializable answer body with its run, grouped by key then in file order,
+        cursors untouched.
 
         Not file order across the whole corpus: answers are indexed per key, so two keys whose
-        records interleave in the file come back one key at a time. The only caller asks
-        whether *any* body carries reasoning, which no ordering changes.
+        records interleave in the file come back one key at a time. The only caller asks which
+        *runs* carry reasoning, which no ordering changes.
+
+        The ``run_id`` rides along for the reason :meth:`request_terms_view` gives: the caller
+        intersects the two views, and an intersection over a corpus that forgot which run each
+        half came from is not an intersection at all.
 
         Unrecorded and unresolvable entries are simply absent from the view: an evidence
         scan asks what the corpus can say, and a record that cannot testify says nothing.
         """
 
-        bodies: list[Mapping[str, Any]] = []
+        bodies: list[tuple[str, Mapping[str, Any]]] = []
         for queue in self._responses.values():
             for entry in queue:
                 body = self._entry_body(entry)
                 if not isinstance(body, ReplayMissReason):
-                    bodies.append(body)
+                    bodies.append((entry.run_id, body))
         return tuple(bodies)
 
     def _no_answer_reason(self) -> ReplayMissReason:

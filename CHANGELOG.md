@@ -9,6 +9,35 @@ out in commit messages and here.
 
 ### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
 
+- **`discard_turn` now takes back the answer it served, not the last one it remembers.** The
+  per-key served-slot note was written on every hit and cleared by nothing, so it outlived its
+  call: a later call on the same key — exhausted by then, so served live through the fallthrough —
+  released the *earlier* call's slot when discarded. Nothing caught it, because an exhausted call
+  never moves the cursor, so the `cursor == slot + 1` guard still held for the delivered slot. A
+  recording already handed to one call was handed to another, at exit 0 with a clean
+  `monoid validate`. The served turn now travels with the slot and is matched by identity, which
+  is what makes the documented "a live fallthrough answer is not taken back" true in code.
+- **The multimodal derivation reads both media carriers.** A user turn carries parts in `content`;
+  a tool message carries returned media in a top-level `media` list. Only the first was scanned, so
+  a corpus whose images came back from a tool derived text-only — and since the flag is a preimage
+  term, replay then left the re-executed media by reference while the recorded digest covered its
+  resolved base64 form, missing every lookup after that turn. `core.media.WIRE_MEDIA_CARRIERS` is
+  now one list with two readers rather than two hand-maintained copies.
+- **Reasoning evidence no longer crosses recorded runs.** The rule that declines to declare reads
+  "answers carried reasoning, and a request had a turn behind it in which the block would have
+  appeared" — a claim about a continuation of the conversation the reasoning came from. Both halves
+  were global scans over the whole union, so a family union could combine a single-turn source that
+  recorded reasoning with a multi-turn source that recorded none, and decline where each source
+  alone declares. Under the shipped gateway default that drops the declaration and makes every
+  recomputed key name the transport instead of the relayed provider, so the preflight refused a
+  corpus and a config that were both correct. `request_terms_view()` and `response_bodies_view()`
+  now carry each item's `run_id` and the derivation intersects them. This narrows the inference
+  rather than proving it: correlating a continuation with the answer it continues from needs
+  message-prefix matching the corpus does not model. Both error directions fail closed.
+- **A non-boolean `provider_retried` in a recorded body is refused rather than coerced.** Bodies are
+  deliberately open-shaped, so a damaged corpus can carry a string there — and `bool("false")` is
+  `True`, so a recorded "not retried" replayed as retried. It now earns the `not_recorded` refusal
+  every neighbouring malformed field earns, instead of inventing an audit value.
 - **A replay corpus can be narrowed rather than silent, and the two are no longer confused.**
   A request record that reassembles and hashes correctly can still be past the reader's JSON
   nesting bound, and it was then simply absent from `request_terms_view()`. The impersonation

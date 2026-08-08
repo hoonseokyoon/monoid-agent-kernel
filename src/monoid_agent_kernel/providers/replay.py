@@ -217,9 +217,9 @@ class ReplayModelAdapter:
 
         providers: list[str] = []
         injected_reasoning = False
-        assistant_history = False
         media_seen = False
-        for terms in corpus.request_terms_view():
+        runs_with_history: set[str] = set()
+        for run_id, terms in corpus.request_terms_view():
             provider = terms.get("provider")
             if isinstance(provider, str) and provider not in providers:
                 providers.append(provider)
@@ -228,7 +228,7 @@ class ReplayModelAdapter:
                 if _is_injected_reasoning(message):
                     injected_reasoning = True
                 if _is_assistant_message(message):
-                    assistant_history = True
+                    runs_with_history.add(run_id)
                 for carrier in WIRE_MEDIA_CARRIERS:
                     parts = message.get(carrier) if isinstance(message, Mapping) else None
                     if isinstance(parts, list) and any(_is_media_block(p) for p in parts):
@@ -243,13 +243,30 @@ class ReplayModelAdapter:
             recorded = providers[0] if providers else None
             if injected_reasoning:
                 declared = recorded
-            elif assistant_history and any(
-                body.get("reasoning") for body in corpus.response_bodies_view()
-            ):
+            elif runs_with_history & {
+                run_id for run_id, body in corpus.response_bodies_view() if body.get("reasoning")
+            }:
                 # Answers carried reasoning, and a recorded request had a turn behind it in
                 # which the block would have appeared: the original did not declare, so
                 # neither may this adapter -- declaring would make the loop inject blocks the
                 # recorded preimages never had.
+                #
+                # Both halves must come from ONE run. "The block would have appeared" is a claim
+                # about a continuation of the conversation the reasoning came from; of a
+                # continuation in some other run it is simply false. Two global `any`s let a
+                # union combine a single-turn source that recorded reasoning with a multi-turn
+                # source that recorded none -- neither evidence alone, both declaring alone --
+                # and decline, which drops the declaration and, under the shipped gateway
+                # default, makes every recomputed key name the transport instead of the relayed
+                # provider: the preflight then refuses a corpus and a config that are both right.
+                #
+                # The run is a NARROWING, not a proof. One run can still hold a single-turn call
+                # that recorded reasoning alongside a continuation of a different conversation
+                # whose own upstream answer carried none. Proving it needs the continuation
+                # matched to the answer it continues from -- message-prefix against the recorded
+                # requests -- which the corpus does not model today. Both error directions fail
+                # closed (a wrong decline refuses at preflight; a wrong declaration injects
+                # blocks the preimages never had and misses), so this buys the reachable half.
                 declared = None
             elif corpus.unreadable_requests():
                 # A request record the reader could not parse is present, hashes correctly, and
