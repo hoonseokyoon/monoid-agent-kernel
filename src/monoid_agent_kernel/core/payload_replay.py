@@ -309,6 +309,7 @@ class ReplayCorpus:
         self._repeated_sources = 0
         self._response_source: dict[str, int] = {}
         self._response_root: dict[str, str] = {}
+        self._response_run: dict[str, str] = {}
         self._crossed: set[str] = set()
         self._crossed_within_one_run: set[str] = set()
         self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
@@ -487,7 +488,15 @@ class ReplayCorpus:
             # a different conversation, or, where one source recorded a refusal at that
             # position and the other the answer, turns a union that demonstrably holds the
             # answer into a miss. This is the only place that can see it happen.
-            root = str(record.get("root_run_id") or "")
+            # Type-checked like every other indexed field. Stringified, a planted 123 or
+            # True or ["P"] compares equal across two unrelated sources and fires the
+            # family warning, telling the operator to name children "in spawn order" for a
+            # parent that never spawned anything -- the misdirection this warning was
+            # written to remove.
+            raw_root = record.get("root_run_id")
+            root = raw_root if isinstance(raw_root, str) else ""
+            raw_run = record.get("run_id")
+            run = raw_run if isinstance(raw_run, str) else ""
             if self._response_source.setdefault(digest, source) != source:
                 self._crossed.add(digest)
                 # Which remedy is actionable depends on what crossed. Two recordings of one
@@ -495,9 +504,17 @@ class ReplayCorpus:
                 # of ONE run are a fan-out -- nothing run-scoped is in the key, so identical
                 # children issue the same key -- and "reverse the flags" tells them nothing:
                 # they have to name the children in the order the parent spawned them.
-                if root and self._response_root.get(digest) == root:
+                # Distinct run ids are part of the test, not a detail: a shared root_run_id is
+                # also what a run and an archived COPY of itself have, and `--replay-from` takes
+                # a directory or an id, so naming both is an ordinary slip. Two real children
+                # always differ in run_id, so nothing true is lost -- but without this a two-turn
+                # run with no subagent anywhere in it was told its keys "were recorded by
+                # children of one run" and handed a spawn order that does not exist.
+                same_run = self._response_run.get(digest) == run
+                if root and self._response_root.get(digest) == root and not same_run:
                     self._crossed_within_one_run.add(digest)
             self._response_root.setdefault(digest, root)
+            self._response_run.setdefault(digest, run)
             self._responses.setdefault(digest, []).append(
                 _ResponseEntry(
                     response=record.get("response"),

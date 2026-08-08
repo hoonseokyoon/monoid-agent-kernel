@@ -391,9 +391,12 @@ class ReplayModelAdapter:
         Three exits, and only one of them is a call that happened. Serving it live moves the
         conversation past this slot, so the take is told the call happened and the next call
         meets the next recording. Raising -- because there is no inner, or because the inner
-        raised, or because what it handed back was not a turn -- parks the turn for an
-        idempotent re-attempt, and leaving the block without the declaration is what gives the
-        slot back. There is nothing to remember here and nothing to choose between: this
+        raised, or because it handed back an awaitable this wrapper cannot drive -- parks
+        the turn for an idempotent re-attempt, and leaving the block without the declaration is
+        what gives the slot back. An inner returning some *other* non-turn is not refused here:
+        it goes to the runner, which classifies it terminally, and the slot is spent because the
+        call did happen. Two review axes read the earlier wording as a promise to check the
+        shape. There is nothing to remember here and nothing to choose between: this
         function knows only whether the call happened, which is the only thing it can know.
 
         ``take`` is None for the one call that took nothing: an unkeyable request never
@@ -409,7 +412,12 @@ class ReplayModelAdapter:
                 # not happened. No declaration-side gate can see this shape:
                 # `iscoroutinefunction` is False for a plain `def` that returns a coroutine,
                 # so the result is the only place left to ask.
-                dispose_unawaited(turn)
+                # Not on a loop thread: this is the abandonable daemon worker. On the live-
+                # loop default the disposal itself raises under asyncio debug mode and
+                # REPLACES the typed error below, losing the config_recoverable
+                # classification the guard exists to carry. Disposal is hygiene; it must
+                # never become the verdict.
+                dispose_unawaited(turn, on_live_loop=False)
                 raise ModelAdapterError(
                     "the fallthrough inner adapter returned an awaitable from a "
                     "synchronous next_turn; this wrapper cannot drive it",
@@ -442,7 +450,8 @@ class ReplayModelAdapter:
 
         result = member()
         if inspect.isawaitable(result):
-            dispose_unawaited(result)
+            # The CLI thread, not a loop thread -- same reason as the call site above.
+            dispose_unawaited(result, on_live_loop=False)
             raise ValueError(
                 f"the fallthrough inner adapter's {name}() returned an awaitable; this "
                 "wrapper is synchronous and nothing would await it, so the inner would never "

@@ -146,7 +146,7 @@ def _recorded_pair(
     body: dict[str, Any] | None = None,
     answers: list[str] | None = None,
     run_id: str = "run-1",
-    root_run_id: str | None = None,
+    root_run_id: Any = None,
     terms: dict[str, Any] | None = None,
 ) -> str:
     """A hand-built, self-consistent request + N answers; returns the request digest.
@@ -1738,6 +1738,59 @@ def test_two_identical_children_of_one_run_cross_a_key(tmp_path: Path) -> None:
     assert served.body["final_text"] == "child one"
     assert served_reversed.body["final_text"] == "child two", (
         "the flag order decided which child's answer the call got"
+    )
+
+
+def test_a_run_named_beside_a_copy_of_itself_is_not_a_family(tmp_path: Path) -> None:
+    """A shared ``root_run_id`` is also what a run and an archived copy of itself have.
+
+    ``--replay-from`` takes a directory *or* an id under a run root, so naming a run and its
+    backup is an ordinary slip -- and the copy has a different inode, so source dedupe does not
+    collapse it either. Gated on the root alone, a two-turn run with no subagent anywhere in it
+    was told its keys "were recorded by children of one run" and handed a remedy -- name them in
+    spawn order -- for an order that does not exist.
+
+    The distinguishing fact was already in the records: two real children always carry distinct
+    ``run_id``s, and a run beside its own copy carries one twice. The generic crossed-key
+    warning still fires, because source order really does decide which copy answers.
+    """
+
+    first = tmp_path / "runs" / "rec0001"
+    second = tmp_path / "runs" / "rec0001-archived"
+    digest = _recorded_pair(first, run_id="rec0001", root_run_id="rec0001", answers=["only"])
+    repeat = _recorded_pair(second, run_id="rec0001", root_run_id="rec0001", answers=["only"])
+    assert digest == repeat, "a copy records the same key -- that is the premise"
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 1, "source order still decides which copy answers"
+    assert corpus.crossed_within_one_run == 0, (
+        "one run reached by two paths is not a fan-out, and has no spawn order to be named in"
+    )
+
+
+def test_a_root_run_id_that_is_not_a_string_invents_no_family(tmp_path: Path) -> None:
+    """The one indexed field that was stringified instead of type-checked.
+
+    ``_index`` type-checks ``text``, ``sha256``, ``request_digest``, ``refs``,
+    ``digest_generation``, ``call_index`` and ``unrecorded_reason``; this one went through
+    ``str(... or "")``. The schema requires a non-empty string, so anything else is planted --
+    and planted, ``123`` or ``True`` or ``["P"]`` stringifies to the same text in two unrelated
+    corpora, making them compare equal and fire the fan-out remedy. Advisory harm only: the
+    crossed-key warning above it stays correct either way.
+    """
+
+    first = tmp_path / "runs" / "a"
+    second = tmp_path / "runs" / "b"
+    digest = _recorded_pair(first, run_id="run-a", root_run_id=123, answers=["one"])
+    repeat = _recorded_pair(second, run_id="run-b", root_run_id=123, answers=["two"])
+    assert digest == repeat, "the two corpora must share a key for anything to cross"
+
+    corpus = ReplayCorpus.load([first, second])
+
+    assert corpus.crossed_keys == 1
+    assert corpus.crossed_within_one_run == 0, (
+        "two unrelated runs were made a family by a value the schema forbids"
     )
 
 

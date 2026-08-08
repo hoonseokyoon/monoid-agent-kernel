@@ -268,6 +268,41 @@ def test_an_unkeyable_request_falls_through_with_no_take_to_settle(tmp_path: Pat
     )
 
 
+def test_disposal_never_becomes_the_verdict() -> None:
+    """Neither disposal site runs on a loop thread, and the default assumes one.
+
+    ``next_turn`` runs on the abandonable daemon worker; ``open``/``close`` run on the CLI
+    thread. On the live-loop default the disposal calls ``cancel()`` and
+    ``add_done_callback()`` on a foreign or already-closed loop, which raises -- and that
+    exception REPLACES the typed ``ModelAdapterError`` the guard was raising, losing the
+    ``config_recoverable`` classification that lets the run park and be resumed. Disposal is
+    hygiene; it must never decide what the caller is told.
+
+    Pinned as a census because the failure needs asyncio debug mode or a closed loop to
+    reproduce, and neither is a state this suite should be entering to prove two keyword
+    arguments.
+    """
+
+    tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dispose_unawaited"
+    ]
+
+    assert len(calls) == 2, f"a new disposal site appeared: {len(calls)}, expected 2"
+    for call in calls:
+        assert [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "on_live_loop"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is False
+        ], f"the disposal at line {call.lineno} assumes a live loop it is not running on"
+
+
 def test_a_corrupt_recorded_body_is_a_miss_not_a_crash(tmp_path: Path) -> None:
     """A tool call without its triple cannot become a real ToolCall; replaying a fabrication
     is the one thing the adapter must never do, so the record reads as unrecoverable."""
@@ -1096,7 +1131,7 @@ def test_an_awaitable_from_a_sync_inner_does_not_spend_the_refused_slot(tmp_path
 def test_an_awaitable_from_a_sync_inner_gives_back_the_held_slot(tmp_path: Path) -> None:
     """The release half of the same shape, defeated the same way.
 
-    A record `consume` handed over and reconstruction rejected is held, and `_settle_unserved`
+    A record `consume` handed over and reconstruction rejected is held, and leaving the take
     puts it back when the inner raises. An inner that hands back an awaitable never raises
     inside the try, so the held slot is never given back: the cursor stands one past the
     refusal and the re-attempt is served the *following* recording instead of earning the same
