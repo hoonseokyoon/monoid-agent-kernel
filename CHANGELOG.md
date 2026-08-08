@@ -23,12 +23,14 @@ out in commit messages and here.
 - **The replay preflight no longer blames the runtime config for the corpus's silence.** With no
   readable request record there is nothing for a config to match or to diverge from, so "fix the
   runtime config" named the one cause that was ruled out. It now points at `monoid validate`.
-- **An abandoned pure-replay call no longer moves the cursor.** Without an async entry point the
-  adapter took `_adrive`'s last dispatch shape — a blocking call on an abandonable daemon thread
-  — so a run that gave up left a worker that still spent a recorded answer, shifting every later
-  consumer of that corpus object by one. `ReplayModelAdapter.anext_turn` keeps a pure-replay call
-  on the loop thread, where it either completes or has not begun. A fallthrough call still
-  reaches a live provider on a worker; `docs/CONTRACTS.md` states that residue.
+- **A discarded model call can now be taken back: `ModelCallRunner` offers adapters an optional
+  `discard_turn(request, turn)`.** A run boundary is checked before a completed call's result is
+  read, so a call can finish and still have its answer thrown away — on every dispatch shape, not
+  just the abandonable-worker one. For `ReplayModelAdapter` that meant a discarded call
+  permanently consumed a recorded answer, and the next consumer of that corpus was served the
+  following one: a structurally valid turn belonging to a different call, at exit 0 with a clean
+  `monoid validate`. The hook releases the slot, keyed by recomputing the request's digest. A
+  fallthrough answer served live is deliberately not taken back; `docs/CONTRACTS.md` states it.
 - **A settle that raises no longer becomes the verdict.** A corpus whose `release` raised inside
   `ReplayTake.__exit__` replaced the typed `ReplayMiss` with a bare `RuntimeError`, turning a
   `config_recoverable` park into an unclassified kill; through `served()` it discarded a live

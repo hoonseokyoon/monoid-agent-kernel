@@ -921,14 +921,25 @@ running when the grace expires is abandoned: the run reports `cancelled` or `run
 worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
 the grace is not an extension of the deadline.
 
-"Discarded" is about the *result*, not about everything the worker touches, and an adapter
-holding shared state has to close that gap itself. `ReplayModelAdapter` is the shipped case:
-an abandoned worker still reached the corpus cursor, so a discarded call permanently consumed
-a recorded answer and every later consumer of that corpus object was shifted by one — reachable
-wherever the adapter outlives the call, which a subagent family already does. It now exposes
-`anext_turn`, so a pure-replay call runs on the loop thread and either completes or has not
-begun; abandonment cannot land between the two. A **fallthrough** call still reaches a live
-provider on a worker and still settles late, because a blocking inner cannot be cancelled. Sync adapters should still enforce their own provider
+"Discarded" is about the *result*, not about everything the call touched on its way there, and
+an adapter holding shared state needs a way to hear about it. Two routes reach a discarded
+outcome, and neither is the worker: a boundary is checked **before** the completed task's result
+is read — deliberately, so a boundary landing in the same tick still wins — so even a call that
+finished can have its answer thrown away.
+
+`ModelCallRunner` therefore offers adapters an optional `discard_turn(request, turn)`, invoked at
+exactly that point, because it is the only place that knows both that a result exists and that
+nobody will see it. Absent, behaviour is unchanged. `ReplayModelAdapter` is the shipped
+implementer: `consume` advances its per-key cursor when the answer is handed over, so without the
+hook a discarded call permanently consumed a recorded answer and every later consumer of that
+corpus was served the following one — a structurally valid turn belonging to a different call,
+reachable wherever the adapter outlives the call, which a subagent family already does. The hook
+releases the slot, keyed by recomputing the request's own digest so a recycled object identity
+cannot release a slot belonging to another key.
+
+One residue, stated rather than closed: a **fallthrough** answer served live is not taken back.
+That call reached a provider and was paid for, and the corpus has no unspend primitive for a
+refusal spent forward. Sync adapters should still enforce their own provider
 I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
 
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can

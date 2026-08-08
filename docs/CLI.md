@@ -300,14 +300,19 @@ third ledger delta.
 **Answers replay in recorded order, each once.** A request the original run made twice gets
 the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
 the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
-`provider_error_code`, checkpoints kept. **All six sub-reasons reach `failure.json`**; none is
-preflight-exclusive. The count has been wrong twice here in the other direction (four, then
-five), and for the same reason each time: the preflight refuses only a corpus that can match
-*nothing*, so every "mismatch" reason survives a corpus that is merely *mixed*. A corpus
-holding more than one digest generation passes with a warning, and a call keyed under the
-other one raises `generation_mismatch`. `identity_mismatch` arrives the same way: a corpus holding
-more than one model identity — the ordinary shape as soon as a subagent declares its own
-`model:` — passes with a warning, and then a call recorded under the other identity misses.
+`provider_error_code`, checkpoints kept. Five of the six sub-reasons reach `failure.json`:
+`no_key`, `absent`, `not_recorded`, `exhausted` and `identity_mismatch`. `generation_mismatch` is
+preflight-exclusive, and structurally so rather than by accident: the miss fires iff
+`self._generations and generation not in self._generations`, which is the *same predicate*, from
+the same function with the same argument, that `generation_divergence` hands the preflight — and
+the preflight always runs. No corpus can pass one and fail the other. A union that *mixes* a
+current source with a retired one satisfies neither, so its calls come back `absent`, which
+`docs/CONTRACTS.md` states as a limit of the union.
+
+`identity_mismatch` is different, and the contrast is the point: the preflight refuses only a
+config that can match *nothing* recorded, so a corpus holding more than one model identity — the
+ordinary shape as soon as a subagent declares its own `model:` — passes with a warning, and then
+a call recorded under the other identity misses at run time.
 What the preflight refuses *before* a run directory exists arrives as an exit-1 message on
 stderr; `--replay-fallthrough` softens those refusals to warnings and serves the calls live.
 
