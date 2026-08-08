@@ -169,13 +169,32 @@ where nothing downstream truncates. The digest branch twelve lines below has bee
 it was written; this is its twin, and it was the unbounded one."""
 
 
-def _named(value: Any) -> str:
-    """One identity value, in plaintext, bounded. Keep the vocabulary, bound the size."""
+def _short(text: str) -> str:
+    """One corpus-supplied string, bounded. Every string in a message comes from the corpus.
 
-    text = repr(value)
+    The bound below covered a *value* and left three other channels in the same sentences
+    uncovered: the number of clauses, the term *names* interpolated into them, and the
+    identifiers (``run_id``, ``unrecorded_reason``, the generation tags) that carry no value at
+    all. Measured: 100,000 model keys produced a 4,477,883-character miss detail, and four long
+    term names produced an 800 KB ``status.json`` beside an 800 KB ``failure.json`` and 2.4 MB
+    of events. Bounding one of four channels is not bounding the message.
+    """
+
     if len(text) <= _NAMED_VALUE_CHARS:
         return text
     return f"{text[:_NAMED_VALUE_CHARS]}... ({len(text)} chars)"
+
+
+def _named(value: Any) -> str:
+    """One identity value, in plaintext, bounded. Keep the vocabulary, bound the size."""
+
+    return _short(repr(value))
+
+
+def _where(entry: Any) -> str:
+    """The coordinates a miss names. One function, so the four sites cannot drift apart."""
+
+    return f"run {_short(str(entry.run_id))} call_index {entry.call_index}"
 
 
 def _term_digest(value: Any) -> str:
@@ -600,15 +619,14 @@ class ReplayCorpus:
         if entry.unrecorded_reason:
             return ReplayMissReason(
                 MISS_NOT_RECORDED,
-                f"the answer was not recorded ({entry.unrecorded_reason}); "
-                f"run {entry.run_id} call_index {entry.call_index}",
+                f"the answer was not recorded ({_short(str(entry.unrecorded_reason))}); "
+                f"{_where(entry)}",
             )
         shape, sha = response_reference(entry.response)
         if shape == RESPONSE_MALFORMED:
             return ReplayMissReason(
                 MISS_NOT_RECORDED,
-                "a response reference is not a content-addressed name "
-                f"(run {entry.run_id} call_index {entry.call_index})",
+                f"a response reference is not a content-addressed name ({_where(entry)})",
             )
         if shape == RESPONSE_REFERENCE:
             assert sha is not None
@@ -624,16 +642,15 @@ class ReplayCorpus:
             except Exception as error:  # noqa: BLE001 - every failure is one refusal
                 return ReplayMissReason(
                     MISS_NOT_RECORDED,
-                    f"the recorded answer could not be resolved ({error}); "
-                    f"run {entry.run_id} call_index {entry.call_index}",
+                    f"the recorded answer could not be resolved ({_short(str(error))}); "
+                    f"{_where(entry)}",
                 )
         else:
             body = entry.response
         if not isinstance(body, dict):
             return ReplayMissReason(
                 MISS_NOT_RECORDED,
-                f"the recorded answer is not an object; run {entry.run_id} "
-                f"call_index {entry.call_index}",
+                f"the recorded answer is not an object; {_where(entry)}",
             )
         return body
 
@@ -721,7 +738,7 @@ class ReplayCorpus:
 
     def _generation_mismatch(self, generation: str) -> ReplayMissReason | None:
         if self._generations and generation not in self._generations:
-            recorded = ", ".join(self._generations)
+            recorded = _short(", ".join(sorted(self._generations)))
             return ReplayMissReason(
                 MISS_GENERATION_MISMATCH,
                 f"the corpus was recorded under {recorded}; this run computes keys "
@@ -805,12 +822,21 @@ class ReplayCorpus:
             )
         recorded_model = expected["model"] if isinstance(expected["model"], dict) else {}
         live_model = model if isinstance(model, dict) else {}
-        for name in sorted(set(recorded_model) | set(live_model)):
-            if recorded_model.get(name) != live_model.get(name):
-                clauses.append(
-                    f"model.{name} recorded {_named(recorded_model.get(name))}, "
-                    f"computing {_named(live_model.get(name))}"
-                )
+        differing = [
+            name
+            for name in sorted(set(recorded_model) | set(live_model))
+            if recorded_model.get(name) != live_model.get(name)
+        ]
+        # Capped like the term-by-term branch below, which has been capped since it was written.
+        # This one iterated the union of two corpus-supplied key sets, so the clause COUNT was
+        # the unbounded channel even once each value was bounded -- and the key names went in raw.
+        for name in differing[:_DIAGNOSED_TERMS]:
+            clauses.append(
+                f"model.{_short(str(name))} recorded {_named(recorded_model.get(name))}, "
+                f"computing {_named(live_model.get(name))}"
+            )
+        if len(differing) > _DIAGNOSED_TERMS:
+            clauses.append(f"and {len(differing) - _DIAGNOSED_TERMS} more model term(s)")
         if not clauses:
             clauses.append("the identity block differs in shape")
         suffix = f" ({len(profiles)} recorded identities)" if len(profiles) > 1 else ""
@@ -904,7 +930,7 @@ class ReplayCorpus:
             # (Identity terms are config vocabulary the ledger already records in the clear;
             # everything below this branch stays digests.)
             identity_clauses = [
-                f"{name} recorded {_named(recorded_terms.get(name))}, "
+                f"{_short(str(name))} recorded {_named(recorded_terms.get(name))}, "
                 f"computing {_named(live_terms.get(name))}"
                 for name in identity_terms
             ]

@@ -15,6 +15,7 @@ digest, never by content.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import threading
@@ -1633,6 +1634,76 @@ def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -
     directory = tmp_path / "runs" / "run-1" / MODEL_PAYLOADS_DIRNAME
     assert not (directory.exists() and any(directory.iterdir())), (
         "the refused body was stored anyway, as an orphan chunk no record names"
+    )
+
+
+def test_a_hostile_corpus_cannot_write_a_megabyte_of_diagnosis(tmp_path: Path) -> None:
+    """Every string in a miss message comes from the corpus, and the corpus is untrusted.
+
+    ``_NAMED_VALUE_CHARS`` bounded one identity *value* -- and its own docstring named the
+    key-count bound it did not implement. Three other channels in the same sentences stayed
+    unbounded: how many clauses there are, the term *names* interpolated into them, and the
+    identifiers that carry no value at all.
+
+    Measured before this: 100,000 model keys produced 4,477,883 characters of miss detail, and
+    four long term names produced ``status.json`` 801,638 B beside ``failure.json`` 800,657 B
+    and 2,406,011 B of events. All of it lands on ``turn.failed``, in ``failure.json``, in
+    ``status.json`` and on stderr, where nothing downstream truncates.
+    """
+
+    huge = "Z" * 200_000
+    ceiling = 4_000
+
+    # The clause COUNT, iterated over a key set the corpus supplies.
+    many = tmp_path / "runs" / "many"
+    _recorded_pair(many, terms={"provider": "openai", "model": {f"k{n}": n for n in range(50_000)}})
+    counted = ReplayCorpus.load([many]).identity_divergence(model={}, provider="gateway")
+    assert counted and len(counted) < ceiling, f"clause count unbounded: {len(counted or '')} chars"
+
+    # The term NAME, which no value bound ever covered.
+    named = tmp_path / "runs" / "named"
+    _recorded_pair(named, terms={"provider": "openai", "model": {huge: 1}})
+    quoted = ReplayCorpus.load([named]).identity_divergence(model={}, provider="gateway")
+    assert quoted and len(quoted) < ceiling, f"term name unbounded: {len(quoted or '')} chars"
+
+    # The generation tags, joined without a bound on either count or members.
+    retired = tmp_path / "runs" / "retired"
+    _recorded_pair(retired, generation=huge)
+    stale = ReplayCorpus.load([retired]).generation_divergence(_GEN)
+    assert stale and len(stale) < ceiling, f"generation tags unbounded: {len(stale or '')} chars"
+
+
+def test_no_message_interpolates_a_corpus_string_unbounded() -> None:
+    """The rule, bound by machine at every site instead of at the sites someone listed.
+
+    Bounding one site at a time is how three of this PR's six routes were made. This walks every
+    f-string in the reader and refuses a corpus-supplied string field interpolated into one
+    unless it passes through a bounding call. Scope is honest: attribute reads of the known
+    corpus-supplied fields, which is what carries a hostile corpus's bytes into a message.
+    """
+
+    bounded = {"_short", "_named", "_where", "_term_digest"}
+    corpus_supplied = {"run_id", "root_run_id", "unrecorded_reason", "generation", "recorded_at"}
+
+    tree = ast.parse(Path(payload_replay.__file__).read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        for piece in node.values:
+            if not isinstance(piece, ast.FormattedValue):
+                continue
+            call = piece.value
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                if call.func.id in bounded:
+                    continue
+            for inner in ast.walk(piece.value):
+                if isinstance(inner, ast.Attribute) and inner.attr in corpus_supplied:
+                    offenders.append(f"line {piece.lineno}: {inner.attr}")
+
+    assert not offenders, (
+        "a message interpolates a corpus-supplied string without a bound; the corpus is "
+        f"untrusted by this module's own threat model: {offenders}"
     )
 
 
