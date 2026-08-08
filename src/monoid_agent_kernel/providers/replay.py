@@ -50,12 +50,13 @@ declaration is what makes recorded keys reachable, so it cannot also report who 
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from monoid_agent_kernel.core.payload_replay import (
+    _short,
+    _where,
     MISS_ABSENT,
     MISS_NO_KEY,
     MISS_NOT_RECORDED,
@@ -233,7 +234,7 @@ class ReplayModelAdapter:
         if len(providers) > 1:
             raise ValueError(
                 "replay sources recorded more than one provider "
-                f"({', '.join(sorted(providers))}); replay one provider per adapter"
+                f"({_short(', '.join(sorted(providers)))}); replay one provider per adapter"
             )
 
         if provider_name is _AUTO:
@@ -274,6 +275,7 @@ class ReplayModelAdapter:
         self.supports_multimodal = (
             media_seen if supports_multimodal is _AUTO else bool(supports_multimodal)
         )
+        self._served_slots: dict[str, int] = {}
         self.wire_image_encoding = wire_image_encoding
         if config is not None:
             # Inert under the loop (it always authors request.model); a standalone
@@ -281,30 +283,6 @@ class ReplayModelAdapter:
             self.config = config
 
     # --- the call ----------------------------------------------------------------------------
-
-    async def anext_turn(self, request: ModelRequest) -> ModelTurn:
-        """The same call, on the loop thread when nothing here blocks.
-
-        Not a second implementation -- deliberately, because a rule proven on one of two
-        parallel halves and missed on the twin is how three of this PR's routes were made. It
-        delegates, and the only thing it decides is *where* :meth:`next_turn` runs.
-
-        Why it exists: without it, ``_adrive`` reaches its last dispatch shape and puts every
-        call on an abandonable daemon thread. A run that gives up stops waiting, but the worker
-        finishes, reaches ``take.served()`` and moves the cursor for an answer nobody received;
-        the next consumer of the corpus object is then shifted by one, silently and as a
-        structurally valid turn. A pure-replay call does no I/O, so run here it either completes
-        or has not begun, and abandonment cannot land between the two.
-
-        A fallthrough call reaches a live provider, so it keeps the worker: blocking the loop
-        for a provider call would stall every sibling, and a blocking inner cannot be cancelled,
-        so no arrangement of this function makes that arm atomic. That residue is stated in
-        ``docs/CLI.md`` rather than papered over.
-        """
-
-        if self._inner is None:
-            return self.next_turn(request)
-        return await asyncio.to_thread(self.next_turn, request)
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         lookup = replay_lookup(request, self)
@@ -333,6 +311,10 @@ class ReplayModelAdapter:
                 outcome = self._reconstruct(take.hit)
                 if isinstance(outcome, ModelTurn):
                     take.served()
+                    # Only the most recent slot per key is releasable -- ``release`` guards on
+                    # ``cursor == slot + 1`` -- so one int per key is both sufficient and all the
+                    # memory this bookkeeping can ever cost.
+                    self._served_slots[digest] = take.hit.slot
                     return outcome
                 miss = outcome
             else:
@@ -394,7 +376,9 @@ class ReplayModelAdapter:
                 # The loop refuses these too, three layers down, as `model_bad_response` --
                 # a kill, reported against the adapter. Refusing here keeps a corrupt corpus
                 # inside the miss vocabulary, where the operator can act on it.
-                raise ValueError(f"the recorded usage {unportable} is not a non-negative integer")
+                raise ValueError(
+                    f"the recorded usage {_short(str(unportable))} is not a non-negative integer"
+                )
             for name in ("response_id", "final_text", "stop_reason"):
                 if body.get(name) is not None and not isinstance(body.get(name), str):
                     raise ValueError(f"the recorded {name} is neither null nor a string")
@@ -411,9 +395,36 @@ class ReplayModelAdapter:
         except Exception as error:  # noqa: BLE001 - one unreplayable record, one refusal
             return ReplayMissReason(
                 MISS_NOT_RECORDED,
-                f"the recorded answer could not be reconstructed ({error}); "
-                f"run {hit.run_id} call_index {hit.call_index}",
+                f"the recorded answer could not be reconstructed ({_short(str(error))}); "
+                + _where(hit),
             )
+
+    def discard_turn(self, request: ModelRequest, turn: ModelTurn) -> None:
+        """Take back an answer the run threw away without ever seeing it.
+
+        ``consume`` advances the cursor when the answer is handed over, so by the time a run
+        boundary wins the race the recording is already spent. Without this the next call on this
+        corpus -- a sibling subagent, or a later call in a run that reused the adapter -- is
+        served the FOLLOWING recording: a structurally valid turn belonging to a different call,
+        exit 0, ledger success, ``monoid validate`` clean. That is the whole failure class.
+
+        Keyed by recomputing the request's own digest rather than by object identity, so a
+        recycled ``id()`` can never release a slot belonging to a different key. Popping the last
+        served slot for that key is exactly right rather than merely convenient: ``release``
+        refuses any slot the cursor has moved past, so the most recent is the only releasable one.
+
+        A live fallthrough answer is deliberately NOT taken back: that call reached a provider and
+        was paid for, and the corpus has no unspend primitive for a refusal spent forward. See
+        ``docs/CONTRACTS.md``.
+        """
+
+        lookup = replay_lookup(request, self)
+        if lookup.result.status != "ok":
+            return
+        slot = self._served_slots.pop(lookup.result.digest, None)
+        if slot is None:
+            return
+        self._corpus.release(lookup.result.digest, slot)
 
     def _serve_miss(
         self,

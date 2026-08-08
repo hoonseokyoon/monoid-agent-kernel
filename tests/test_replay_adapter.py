@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import inspect
-import threading
 import gc
 import json
 from pathlib import Path
@@ -33,6 +31,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayCorpus,
 )
 from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.model_call import ModelCallRunner, SettledModelCall
 from monoid_agent_kernel.providers._request_identity import (
     _REQUEST_DIGEST_GENERATION as _GENERATION,
@@ -1359,25 +1358,56 @@ def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
 def test_the_adapter_reaches_the_cursor_only_through_a_take() -> None:
     """The wrapped primitives stay reachable, so this census is what keeps them unreached.
 
-    ``take`` wraps ``consume``/``spend_refused``/``release`` rather than replacing them,
-    because replacing would move the embedder-facing bounds guards -- ``0 <= slot < len(queue)``
-    and ``cursor == slot + 1`` -- behind an API that never hands a caller a slot integer, and
-    the negative tests that gate them would have to be deleted. Each of those guards was added
-    by a review round that found it missing, so deleting them is the wrong trade.
+    ``take`` wraps ``consume``/``spend_refused``/``release`` rather than replacing them, because
+    replacing would move the embedder-facing bounds guards -- ``0 <= slot < len(queue)`` and
+    ``cursor == slot + 1`` -- behind an API that never hands a caller a slot integer, and the
+    negative tests that gate them would have to be deleted. Each of those guards was added by a
+    review round that found it missing, so deleting them is the wrong trade.
 
-    The cost of wrapping is that a future call site in this adapter could re-attach the settle
-    rule by hand, which is precisely how three of the six routes were introduced. This fails
-    the day it happens, which is the only reason wrapping is safe.
+    The cost of wrapping is that a future call site in this adapter could re-attach the settle rule
+    by hand, which is precisely how three of the six routes were introduced. This fails the day it
+    happens, which is the only reason wrapping is safe.
+
+    ``discard_turn`` is the one reviewed exception, and it is scoped to that function rather than
+    waived for the file. It runs when the take is already closed and the run has thrown the answer
+    away, so there is no block left to leave and ``release`` is the only primitive that can give
+    the slot back. Widening the exemption to the whole module would re-earn exactly the defect the
+    census exists to catch -- the interpolation census next door failed that way twice.
     """
 
     tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
-    named = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    reached = sorted({"consume", "spend_refused", "release"} & named)
+    guarded = {"consume", "spend_refused", "release"}
+    exempt = {("discard_turn", "release")}
+
+    scope: dict[int, str] = {}
+
+    def walk(node: Any, name: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_name = (
+                child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else name
+            )
+            scope[id(child)] = child_name
+            walk(child, child_name)
+
+    walk(tree, "<module>")
+
+    reached = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            named = node.attr
+        elif isinstance(node, ast.Name):
+            named = node.id
+        else:
+            continue
+        if named in guarded:
+            site = (scope.get(id(node), "<module>"), named)
+            if site not in exempt:
+                reached.add(site)
 
     assert not reached, (
-        f"the adapter names the cursor primitive(s) {', '.join(reached)} directly; settle "
-        "through `corpus.take(...)` so leaving the block is what settles"
+        "the adapter names a cursor primitive outside a take: "
+        + ", ".join(f"{named} in {func}()" for func, named in sorted(reached))
+        + " -- settle through `corpus.take(...)` so leaving the block is what settles"
     )
 
 
@@ -1483,43 +1513,51 @@ def test_a_request_the_reader_cannot_parse_is_not_evidence_of_absence(tmp_path: 
     )
 
 
-def test_a_pure_replay_call_is_not_run_on_an_abandonable_worker(tmp_path: Path) -> None:
-    """The cursor must not be moved by a call whose answer the run never received.
+def test_a_discarded_call_does_not_consume_its_recorded_answer(tmp_path: Path) -> None:
+    """The property, not the mechanism -- and the previous version of this test is the lesson.
 
-    `_adrive` has no async entry point to prefer here, so every call took its last dispatch
-    shape: a blocking `next_turn` on an abandonable daemon thread. When a run gives up, that
-    worker finishes anyway -- its context copy is deliberately not a fence -- and reaches
-    `take.served()`. The answer is discarded and the cursor stays moved, so the next consumer of
-    that corpus object is shifted by one. Driven in review with two ModelCallRunners sharing one
-    adapter, which is the shape a subagent family already has: run 1 timed out, and run 2's
-    FIRST call was served run 1's SECOND answer -- exactly the substitution this PR exists to
-    close, arriving by a route none of the seven covered.
+    It asserted the take was materialised on the loop thread. True, and worth nothing: the
+    boundary check in ``await_abandonable_call`` deliberately runs BEFORE the result is read ("a
+    boundary that lands in the same tick as a completed call still wins"), so a call can complete,
+    advance the cursor, and still have its answer thrown away. That route exists on every dispatch
+    shape, so the commit that "closed" it by moving the call to the loop thread changed nothing
+    measurable while three documents said the class was shut.
 
-    Pinned as the mechanism rather than as a race: a pure-replay call does no I/O, so served on
-    the loop thread it either completes or has not started, and abandonment cannot land between
-    the two. A fallthrough call still reaches a live provider and still runs on a worker; that
-    residue is documented in docs/CLI.md rather than pretended away, because a blocking inner
-    cannot be cancelled.
+    What closes it is giving the answer back. ``ModelCallRunner`` is the only place that knows both
+    that a result exists and that it is being discarded, so it offers the adapter a ``discard_turn``
+    hook there and the adapter releases the slot.
+
+    The cancellation is raised from INSIDE the call, which is load-bearing. Cancelling beforehand
+    is refused by the pre-dispatch check, the adapter is never entered, and no answer is consumed --
+    a test written that way passes with the fix reverted three different ways. Measured: all three
+    mutants GREEN. Here the call runs to completion and the boundary wins over a done task.
     """
 
-    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="x")]), [_request()])
-    adapter = _replay(tmp_path)
-    assert inspect.iscoroutinefunction(getattr(adapter, "anext_turn", None)), (
-        "without an async entry point _adrive dispatches this adapter onto an abandonable "
-        "daemon thread, where the take outlives the run that owns it"
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="ANSWER-1"), ModelTurn(final_text="ANSWER-2")]),
+        [_request(), _request()],
     )
+    token = CancellationToken()
 
-    seen: list[Any] = []
-    original = adapter._reconstruct
+    class _CancelsItself(ReplayModelAdapter):
+        armed = True
 
-    def spy(entry: Any) -> Any:
-        seen.append(threading.current_thread())
-        return original(entry)
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            if self.armed:
+                self.armed = False
+                token.cancel()
+            return super().next_turn(request)
 
-    adapter._reconstruct = spy  # type: ignore[method-assign]
-    _call(adapter, _request())
+    adapter = _CancelsItself([tmp_path / "runs" / "run-1"])
+    runner = ModelCallRunner(adapter=adapter, current_cancellation_token=lambda: token)
 
-    assert seen == [threading.main_thread()], (
-        "the take was materialised on a worker the run can abandon; a settle from there moves "
-        f"the cursor for an answer nobody received: {seen}"
+    with pytest.raises(BaseException):
+        asyncio.run(runner.acall(_request()))
+
+    served = _call(adapter, _request())
+
+    assert served.final_text == "ANSWER-1", (
+        "the discarded call kept the recording it never delivered, so the next call was served an "
+        f"answer belonging to a different call: {served.final_text!r}"
     )

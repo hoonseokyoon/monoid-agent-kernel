@@ -268,6 +268,30 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
         return {}
 
 
+def _discard_hook(adapter: Any, request: Any) -> Any:
+    """The adapter's chance to take back an answer the run threw away, or None.
+
+    A run boundary that wins over a COMPLETED call discards a real result. For a
+    stateless adapter that is nothing; for one holding shared state it is a silent
+    corruption. The replay adapter advances a per-key cursor when it hands an answer
+    over, so a discarded call permanently consumes a recorded answer and every later
+    consumer of that corpus is shifted by one -- a structurally valid turn belonging to
+    a different call, which is the substitution the replay work exists to prevent.
+
+    Optional and duck-typed, so no adapter is obliged to care: absent means the old
+    behaviour exactly.
+    """
+
+    hook = getattr(adapter, "discard_turn", None)
+    if not callable(hook) or request is None:
+        return None
+
+    def discarded(turn: Any) -> None:
+        hook(request, turn)
+
+    return discarded
+
+
 @dataclass
 class ModelCallRunner:
     """Runs one model call against an adapter, whatever shape that adapter is.
@@ -737,13 +761,19 @@ class ModelCallRunner:
             )
         anext_turn = getattr(adapter, "anext_turn", None)
         if anext_turn is not None:
-            return await self._aawait(anext_turn(request), deadline)
+            return await self._aawait(
+                anext_turn(request), deadline, adapter=adapter, request=request
+            )
         next_turn = adapter.next_turn
         if is_async_callable(next_turn):
-            return await self._aawait(next_turn(request), deadline)
+            return await self._aawait(
+                next_turn(request), deadline, adapter=adapter, request=request
+            )
         turn = await self._aawait(
             start_abandonable_sync_call(lambda: next_turn(request), thread_name=self.thread_name),
             deadline,
+            adapter=adapter,
+            request=request,
         )
         # Second line of defence, the same one the tool half keeps: an adapter can be synchronous
         # and still hand back something awaitable -- it delegates to an async client, or its
@@ -752,7 +782,7 @@ class ModelCallRunner:
         # reads are all defensive, so it recorded a *successful* call for a provider that was never
         # invoked, and the caller got an object whose every turn field was missing.
         if inspect.isawaitable(turn):
-            return await self._aawait(turn, deadline)
+            return await self._aawait(turn, deadline, adapter=adapter, request=request)
         return turn
 
     async def _astream(
@@ -926,7 +956,14 @@ class ModelCallRunner:
             else:
                 closing.add_done_callback(consume_task_outcome)
 
-    async def _aawait(self, pending: Any, deadline: float | None) -> ModelTurn:
+    async def _aawait(
+        self,
+        pending: Any,
+        deadline: float | None,
+        *,
+        adapter: Any = None,
+        request: ModelRequest | None = None,
+    ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
 
         Only terminal run boundaries apply while a model call is in flight. Interrupt and pause are
@@ -965,6 +1002,7 @@ class ModelCallRunner:
                 token=token,
                 grace_s=grace_s,
                 check_boundary=self._check_cancel_or_deadline,
+                on_discarded=_discard_hook(adapter, request),
             )
         except CalleeCancelled as exc:
             raise ModelAdapterError(

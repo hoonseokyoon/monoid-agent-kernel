@@ -238,6 +238,7 @@ async def await_abandonable_call(
     token: CancellationToken | None,
     grace_s: float,
     check_boundary: Callable[[float | None], None],
+    on_discarded: Callable[[Any], None] | None = None,
 ) -> Any:
     """Await a call while propagating run cancellation and the run deadline.
 
@@ -293,7 +294,29 @@ async def await_abandonable_call(
         await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         # Checked before the result is read, so a boundary that lands in the same tick as a
         # completed call still wins. A run told to stop must not report work it decided not to do.
-        check_boundary(deadline)
+        # A boundary that wins over a COMPLETED call leaves a result nobody will ever see, and
+        # for a caller holding shared state that is not the same as the call never happening: the
+        # replay adapter has already advanced its cursor by the time this raises, so the discarded
+        # answer stays consumed and every later consumer is shifted by one. ``on_discarded`` is the
+        # only place that can tell them apart, because it is the only place that knows both that a
+        # result exists and that it is being thrown away.
+        try:
+            check_boundary(deadline)
+        except BaseException:
+            if task.done() and on_discarded is not None:
+                outcome_consumed = True
+                try:
+                    produced = task.result()
+                except BaseException:
+                    produced = None
+                if produced is not None:
+                    # Contained, the way disposal already is: giving a result back is hygiene, and
+                    # hygiene must never replace the boundary that is the caller's real answer.
+                    try:
+                        on_discarded(produced)
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception("discarded-outcome hook failed")
+            raise
         if task.done():
             outcome_consumed = True
             try:
