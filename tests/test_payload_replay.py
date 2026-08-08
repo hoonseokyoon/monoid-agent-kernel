@@ -2307,3 +2307,55 @@ def test_validate_reads_each_chunk_once_even_when_the_records_interleave(
         f"eight records alternating between two chunks read them {len(body_reads)} times; a "
         "one-entry cache thrashes on this order, so read-once has to come from the memo"
     )
+
+
+class _RaisingSettleCorpus(ReplayCorpus):
+    """A corpus whose settle blows up. Reachable: ``ReplayModelAdapter`` takes one publicly."""
+
+    def release(self, digest: str, slot: int) -> None:
+        raise RuntimeError("release blew up")
+
+    def spend_refused(self, digest: str, slot: int) -> None:
+        raise RuntimeError("spend blew up")
+
+
+def test_a_settle_that_raises_does_not_become_the_verdict(tmp_path: Path) -> None:
+    """Disposal is hygiene, and so is settlement -- the same rule, on the site that missed it.
+
+    The commit that established "disposal must never become the verdict" bound it at the
+    disposal site and added, in the same PR, two settle calls that can do exactly what it
+    forbade. A corpus whose release raises inside ``__exit__`` replaces the typed ReplayMiss
+    travelling out of the block with a bare RuntimeError: the loop then sees an unclassified
+    kill instead of a config_recoverable park, and takes the checkpoints with it.
+
+    Containing it is not hiding a bug. Raising does not repair the cursor either -- it only
+    adds the loss of the caller's verdict to the loss of the settle.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    corpus = _RaisingSettleCorpus.load([run_dir])
+
+    with pytest.raises(ValueError, match="the caller's own error"):
+        with corpus.take(digest, generation=_GEN):
+            raise ValueError("the caller's own error")
+
+
+def test_a_settle_that_raises_does_not_discard_a_paid_answer(tmp_path: Path) -> None:
+    """The other half of the same rule: ``_declare`` is a call site too.
+
+    ``served()`` is reached after a live fallthrough call has already been made and paid for.
+    A settle that raises there throws that answer away and reports the corpus's internal
+    failure in its place -- the same substitution, arriving through the twin site.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir)
+    corpus = _RaisingSettleCorpus.load([run_dir])
+    # A standing refusal, which is the shape served() actually settles: a hit advanced the
+    # cursor when it was handed over, so only a refusal spent forward reaches spend_refused.
+    take = payload_replay.ReplayTake(
+        corpus, digest, ReplayMissReason(MISS_NOT_RECORDED, "planted", slot=0)
+    )
+
+    take.served()

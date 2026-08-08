@@ -55,6 +55,7 @@ preflight to say out loud.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from dataclasses import dataclass, replace
@@ -83,6 +84,8 @@ from monoid_agent_kernel.core.model_payloads import (
     reassemble_request_preimage,
     response_reference,
 )
+
+_LOGGER = logging.getLogger("monoid_agent_kernel.core.payload_replay")
 
 MISS_NO_KEY = "no_key"
 MISS_ABSENT = "absent"
@@ -256,7 +259,31 @@ class ReplayTake:
         if self._declared is not None:
             raise RuntimeError("this take has already been settled")
         self._declared = served
-        self._settle(served)
+        self._settle_contained(served)
+
+    def _settle_contained(self, served: bool) -> None:
+        """Settle, and never let the settle become the caller's answer.
+
+        The same rule ``dispose_unawaited`` carries one module over, on the site that missed
+        it: settlement is bookkeeping about a call, not the verdict on it. This class takes its
+        corpus from a public constructor, so a settle *can* raise -- and both call sites turn
+        that into a substitution. Out of ``__exit__`` it replaces the typed ReplayMiss with a
+        bare RuntimeError, so the loop meets an unclassified kill instead of a
+        config_recoverable park and the checkpoints go with it. Out of ``served()`` it discards
+        a live fallthrough answer that has already been paid for.
+
+        Swallowing is the lesser loss and not a cover-up: the cursor is equally wrong whether
+        this raises or not, and raising only adds the caller's verdict to what was lost. Logged
+        at exception level so the corpus bug is not silent, and ``_declared`` is already set, so
+        a contained failure cannot be re-settled in the opposite direction.
+        """
+
+        try:
+            self._settle(served)
+        except Exception:  # noqa: BLE001 - see the docstring: bookkeeping never becomes a verdict
+            _LOGGER.exception(
+                "replay take could not settle (served=%s); the cursor may be out of step", served
+            )
 
     def _settle(self, served: bool) -> None:
         if served:
@@ -279,7 +306,7 @@ class ReplayTake:
         # here, but this class takes its corpus from a public constructor and its whole premise
         # is that a take is declared exactly once.
         self._declared = False
-        self._settle(False)
+        self._settle_contained(False)
         if exc_type is None:
             raise RuntimeError(
                 "a replay take left its block without saying whether the call happened; "
