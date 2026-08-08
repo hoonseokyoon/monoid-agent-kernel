@@ -38,6 +38,31 @@ out in commit messages and here.
   recording never fixed that order either; the consumption cursor is per-process, so a durably
   resumed replay counts from the start again; and replay serves whole turns, so a streaming
   run degrades to one-shot.
+- **Settlement is a property of leaving a take, not a rule each call site re-attaches.**
+  `ReplayCorpus.take(digest, generation=...)` is a context manager: its block declares
+  `served()` when the call happened, and every other exit — a raise, a rejected reconstruction,
+  a refusal with no fallthrough — settles unserved. The two directions are opposite (a standing
+  refusal is spent forward, a record handed over and rejected is given back) and which one is
+  held is not visible from the call site, so the choice moved into the object that owns the
+  cursor. Leaving the block having declared nothing raises rather than defaulting, because a
+  silent default is another way to serve one answer twice. A synchronous wrapper now also
+  refuses an inner that hands back an *awaitable*: such a call returns having done no provider
+  work, so nothing may be settled on its behalf, and no declaration-side check can see the shape
+  (`iscoroutinefunction` is false for a plain `def` returning a coroutine). The same rule is
+  bound over `next_turn`, `open` and `close` as one census rather than three hand-written
+  checks.
+- **An offloaded response body is held to the same ingress rules as an inline one**, and
+  `monoid validate` now parses a resolved chunk rather than only re-hashing it. Re-hashing
+  proves the bytes are the ones the writer named, not that they are a body any reader will
+  accept — so a planted chunk could carry JSON the ingress rules forbid, and, since tools
+  re-execute for real, a non-finite number in recorded tool arguments could reach a live tool
+  invocation as a value that exists in no recording.
+- **The family union is not key-disjoint, and the warning says which remedy applies.** Nothing
+  run-scoped is in a replay key, so two subagents with the same definition and the same prompt
+  record one key in two run directories and the `--replay-from` order decides which child gets
+  which answer. Disjointness is a property of the prompts, not of the family shape. Where the
+  crossing sources are children of one run the preflight asks for them in spawn order, because
+  reversing the flags is not an actionable instruction for a fan-out.
 - **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
   shares the exact functions the runner stamps receipts with; `model_call` re-imports every
   name, so embedder imports and behavior are unchanged, and the identity pins moved with the
