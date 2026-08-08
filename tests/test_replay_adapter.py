@@ -1180,6 +1180,52 @@ def test_an_inner_whose_lifecycle_is_async_is_refused(tmp_path: Path) -> None:
     assert "open" in str(caught.value) or "close" in str(caught.value)
 
 
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_an_inner_whose_open_returns_an_awaitable_is_refused(tmp_path: Path) -> None:
+    """The lifecycle's twin of the `next_turn` shape, and the constructor cannot see it either.
+
+    `is_async_callable` is False for a plain `def` that returns a coroutine -- an inner
+    delegating its lifecycle to an async client -- so the census accepts this one at
+    construction. Then `open()` calls it, discards the coroutine, and returns None: the inner
+    is never entered and the CLI's probe, which has only this wrapper to ask, reports success
+    on a lifecycle that did not happen. The result is the only place left to ask, in both
+    halves, which is why the rule is bound twice rather than once at the gate.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(response_id="r-1", final_text="recorded")]),
+        [_request()],
+    )
+
+    class _AwaitableLifecycleInner:
+        def __init__(self) -> None:
+            self.entered = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live")
+
+        def open(self) -> Any:
+            async def _later() -> None:  # pragma: no cover - closed before it runs
+                self.entered += 1
+
+            return _later()
+
+        def close(self) -> None:
+            self.entered -= 1
+
+    inner = _AwaitableLifecycleInner()
+    adapter = _replay(tmp_path, inner=inner)  # the census cannot see this shape
+
+    with pytest.raises(ValueError) as caught:
+        adapter.open()
+
+    assert "open()" in str(caught.value)
+    assert inner.entered == 0, "the coroutine was discarded, so the inner was never entered"
+    gc.collect()
+
+
 def test_a_slot_after_the_first_is_given_back_too(tmp_path: Path) -> None:
     """The release coordinate, driven where it can be wrong.
 
