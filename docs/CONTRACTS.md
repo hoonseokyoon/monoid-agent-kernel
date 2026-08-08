@@ -879,8 +879,19 @@ refuses everything it cannot prove. The contract:
   with the replay. A replay run's own recording switches write into its own directory only.
 
 The generation rule above is what retires a corpus: a composition change bumps
-`monoid.model-request-digest.v1`, and every replay against the old recording answers
-`generation_mismatch` naming both tags instead of silently missing.
+`monoid.model-request-digest.v1`, and a replay whose sources carry **only** the retired tag
+answers `generation_mismatch` naming both tags, at the CLI preflight and again from the miss
+diagnosis, instead of silently missing.
+
+Two limits on that sentence, because it used to be written without them. The comparison is
+whether this run's tag appears **anywhere in the union**, so a union mixing a current source
+with a retired one does not report `generation_mismatch` at all: the current tag is present, the
+retired source's keys were composed differently and therefore match nothing, and its calls come
+back `absent` with a term-by-term diagnosis that names conversation terms rather than the
+generation. And the tag is consulted when a key is *looked up*, not when an answer is handed
+back — a record whose own `digest_generation` differs is not re-checked at the moment it is
+served, because after a real bump its digest cannot match the key being asked for in the first
+place. Both are visible only on a corpus whose tags were edited without recomposing its keys.
 
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run

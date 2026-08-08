@@ -45,7 +45,10 @@ out in commit messages and here.
   refusal is spent forward, a record handed over and rejected is given back) and which one is
   held is not visible from the call site, so the choice moved into the object that owns the
   cursor. Leaving the block having declared nothing raises rather than defaulting, because a
-  silent default is another way to serve one answer twice. A synchronous wrapper now also
+  silent default is another way to serve one answer twice. It also closes a route nobody had
+  named: any exception escaping between the take and the settle now gives the slot back, where
+  before it was lost, so a Ctrl-C landing inside reconstruction no longer costs the re-attempt
+  its position. A synchronous wrapper now also
   refuses an inner that hands back an *awaitable*: such a call returns having done no provider
   work, so nothing may be settled on its behalf, and no declaration-side check can see the shape
   (`iscoroutinefunction` is false for a plain `def` returning a coroutine). The same rule is
@@ -57,12 +60,30 @@ out in commit messages and here.
   accept — so a planted chunk could carry JSON the ingress rules forbid, and, since tools
   re-execute for real, a non-finite number in recorded tool arguments could reach a live tool
   invocation as a value that exists in no recording.
+- **The recorder no longer writes an answer the reader will refuse to read.** The record line's
+  depth gate cannot see an offloaded body, whose brackets live in a chunk file rather than in
+  the line, so a body deeper than the reader parses was stored with `unrecorded_reason: ""` —
+  the writer stating it recorded the answer — and then refused at replay as `not_recorded`. It
+  is refused at write time now, as `unencodable`, which is exactly what the inline half has
+  always done with the same body. The bound stays on the writer rather than moving off the
+  reader because without the lexical scan the decoder's own stack limit decides instead, and
+  the same corpus would replay or not depending on how deep the call stack already is.
+- **A miss message is bounded in every channel, not only in its values.** The identity bound
+  covered one quoted value and left the clause *count*, the term *names*, and the identifiers
+  (`run_id`, `unrecorded_reason`, the generation tags, a resolver's error text) unbounded — all
+  of them corpus-supplied, on a corpus this reader's own threat model does not trust, and all
+  landing on `turn.failed`, in `failure.json`, in `status.json` and on stderr where nothing
+  downstream truncates.
 - **The family union is not key-disjoint, and the warning says which remedy applies.** Nothing
   run-scoped is in a replay key, so two subagents with the same definition and the same prompt
   record one key in two run directories and the `--replay-from` order decides which child gets
   which answer. Disjointness is a property of the prompts, not of the family shape. Where the
-  crossing sources are children of one run the preflight asks for them in spawn order, because
-  reversing the flags is not an actionable instruction for a fan-out.
+  crossing sources are children of one run — sharing a `root_run_id` *and* differing in
+  `run_id` — the preflight asks for them in spawn order, because reversing the flags is not an
+  actionable instruction for a fan-out. The run-id test is what keeps that sentence true: a run
+  named beside an archived copy of itself shares a root as well, and `--replay-from` takes a
+  directory or an id, so naming both is an ordinary slip that would otherwise be reported as a
+  fan-out with a spawn order that does not exist.
 - **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
   shares the exact functions the runner stamps receipts with; `model_call` re-imports every
   name, so embedder imports and behavior are unchanged, and the identity pins moved with the
@@ -71,6 +92,12 @@ out in commit messages and here.
 
 ### Changed
 
+- **`monoid validate` answers per chunk what it used to answer per record.** An offloaded body
+  is content-addressed, so whether it reads back is a property of the bytes, and the bytes
+  cannot change between two reads of one run directory — but N response records may name one
+  chunk, and each re-read and re-parsed it. Measured at eight records over one 8 MB chunk, the
+  command took 7.4 s; the read and the parse verdict are now memoized by sha, so the cost tracks
+  a corpus's distinct chunk bytes rather than its record count.
 - **`monoid validate` now reports a malformed response reference as its own integrity issue**
   ("response reference is not a content-addressed name"). A single-key chunk-marker object
   carrying a non-sha value is unmistakably writer-shaped corruption; it used to be skipped as
