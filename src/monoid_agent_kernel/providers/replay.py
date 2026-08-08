@@ -247,12 +247,23 @@ class ReplayModelAdapter:
                 # neither may this adapter -- declaring would make the loop inject blocks the
                 # recorded preimages never had.
                 declared = None
+            elif corpus.unreadable_requests():
+                # A request record the reader could not parse is present, hashes correctly, and
+                # says nothing -- so this corpus is not silent, it is NARROWED, and the two must
+                # not take the same horn. The evidence for not declaring lives in the requests,
+                # so the ones that went missing are exactly the ones that could have carried it:
+                # taking the "cannot testify" horn here concludes more confidently from strictly
+                # less. Measured -- with both requests readable the derivation declines; with the
+                # one carrying assistant history unreadable it declared, and the loop would
+                # inject blocks the recorded preimages never had.
+                declared = None
             else:
                 # Including the corpus that cannot testify: every recorded request is a first
                 # turn, so no injected block could exist either way. Silence is not evidence
                 # for the negative, and reading it as one breaks the shipped gateway default,
                 # whose key term is the RELAYED provider ("openai") while the config names the
                 # transport ("gateway") -- declining there misses every lookup in the run.
+                # Reachable only when every request record was readable; see the branch above.
                 declared = recorded
         else:
             declared = provider_name

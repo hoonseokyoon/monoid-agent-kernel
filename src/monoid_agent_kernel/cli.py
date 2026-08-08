@@ -1767,6 +1767,17 @@ def _replay_preflight(
         )
     model = normalize_model_config(config) or ModelConfig()
     provider = resolved_provider_name(adapter, model) or ""
+    if corpus.unreadable_requests():
+        # Said even when enough records remain to derive an identity, because that is the case
+        # where nothing else would say it: the derivation quietly narrows to the readable ones
+        # and reaches a confident answer from an incomplete corpus.
+        click.echo(
+            f"warning: replay preflight: {corpus.unreadable_requests()} request record(s) are "
+            "present but unreadable, so anything derived from recorded requests is derived from "
+            "an incomplete corpus; run 'monoid validate' on the recorded run directory to see "
+            "which",
+            err=True,
+        )
     if not corpus.identity_profiles():
         # Not a config mismatch, and saying so sends the operator to the one place the fault
         # is ruled out. No readable request record means the corpus cannot state what it was

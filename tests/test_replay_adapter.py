@@ -111,6 +111,10 @@ def _replay(base: Path, *run_ids: str, **kwargs: Any) -> ReplayModelAdapter:
     return ReplayModelAdapter(sources, **kwargs)
 
 
+def _corpus(base: Path, *run_ids: str) -> ReplayCorpus:
+    return ReplayCorpus.load([base / "runs" / run_id for run_id in (run_ids or ("run-1",))])
+
+
 def _call(adapter: Any, request: ModelRequest) -> ModelTurn:
     turn, _receipt = asyncio.run(ModelCallRunner(adapter=adapter).acall(request))
     return turn
@@ -1422,3 +1426,56 @@ def test_a_body_missing_any_one_recorded_field_is_refused(tmp_path: Path, missin
 
     assert caught.value.provider_error_code == MISS_NOT_RECORDED
     assert missing in str(caught.value), "the refusal names the field that was missing"
+
+
+def test_a_request_the_reader_cannot_parse_is_not_evidence_of_absence(tmp_path: Path) -> None:
+    """A narrowed view is not a silent one, and the derivation used to read it as one.
+
+    Shape (b) again -- answers carry reasoning and a recorded request had a turn behind it, so
+    the original did not declare -- except that the request carrying that evidence is one the
+    reader's nesting bound refuses. It is written on purpose (refusing it would cost the run
+    its request provenance from that call onward), so it exists, hashes correctly, and says
+    nothing. Dropping it silently left a corpus that looks like first turns only, and the
+    derivation took the "cannot testify" horn and DECLARED -- concluding more confidently from
+    strictly less evidence, and making the loop inject blocks the preimages never had.
+
+    Measured the same way in review: at tool-result depth 400 the adapter declares nothing with
+    two readable requests; at 600 it declares `openai` with one. The evidence that would have
+    stopped it is exactly what went missing.
+    """
+
+    deep: Any = "leaf"
+    for _ in range(552):
+        deep = [deep]
+    reasoning = ({"type": "reasoning", "id": "opaque"},)
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [
+                ModelTurn(final_text="x", reasoning=reasoning),
+                ModelTurn(final_text="y", reasoning=reasoning),
+            ],
+            provider_name="openai",
+        ),
+        [
+            _request(),
+            _request(
+                messages=[
+                    {"role": "assistant", "content": "prior turn"},
+                    {"role": "user", "content": deep},
+                ]
+            ),
+        ],
+    )
+    corpus = _corpus(tmp_path)
+    assert corpus.unreadable_requests() == 1, (
+        "the fixture must leave exactly one request record present and unreadable, or it pins "
+        f"nothing: view={len(corpus.request_terms_view())} unreadable={corpus.unreadable_requests()}"
+    )
+
+    adapter = _replay(tmp_path)
+
+    assert getattr(adapter, "provider_name", None) is None, (
+        "the adapter declared a provider from the requests it could read, while a request it "
+        "could not read is what carried the evidence against declaring"
+    )

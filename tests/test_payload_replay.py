@@ -18,8 +18,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import sys
 import threading
+import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1642,23 +1642,25 @@ def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -
     )
 
 
-def test_a_request_too_deep_to_read_is_never_recorded(tmp_path: Path) -> None:
-    """The response half's rule, on the carrier the response half's fix did not reach.
+def test_validate_refuses_a_request_record_the_reader_cannot_parse(tmp_path: Path) -> None:
+    """The record is written on purpose, so the report is the only thing that can say so.
 
-    A request term is lifted into a chunk once its canonical encoding reaches
-    ``MARKER_ENCODED_BYTES`` (94), and a chunk's brackets sit inside the record line's JSON
-    *string*, which the line gate does not count. Any value deep enough to matter is also long
-    enough to be lifted, so the depth rule was enforced for no reachable request at all: the
-    writer recorded a preimage ``loads_json_ingress`` then refused, ``monoid validate`` called
-    the corpus clean, and ``request_terms_view()`` came back empty with the record on disk.
+    The request arm re-hashed the reassembled preimage without ever parsing it, on the reasoning
+    that reassembly is a canonical encode and a digest-valid preimage is therefore canonical
+    JSON by construction. That enumerated three of the encoder's refusals -- non-finite values,
+    over-long ints, surrogates -- and omitted nesting, which the encoder does not bound and the
+    reader does. Resolving is not believing: the arm has to ask the reader's question, exactly
+    as the response arm below it does.
 
-    The cost of that silence is not the lost record -- it is that the D-h impersonation
-    derivation reads these terms, so losing the *disagreeing* request manufactures unanimity,
-    and the preflight tells the operator to fix a model config that was never wrong.
+    Refusing to *write* such a record is the wrong repair and is deliberately not made here: a
+    deep tool result stays in the by-value message log, so it would cost every later call in the
+    run its request record, trading the only copy of what was sent for one the replay reader
+    happens not to want. See test_a_deep_tool_result_still_gets_its_request_record.
 
-    Refusing here is the ``split_request_payload`` doctrine already stated one paragraph above
-    the fix: a corpus entry that fails its own join is worse than an absent one. It costs the
-    request record and not the answer, which this test pins by serving it.
+    The fixture is the real writer, and the shape that reaches disk is the offloaded one: the
+    deep term is lifted into a chunk and the line the validator reads is shallow. A hand-built
+    preimage goes into the record line verbatim, where the *line* reader already refuses it --
+    the arm that never had this defect -- so that fixture would pin nothing about this one.
     """
 
     recorder = _recorder(tmp_path)
@@ -1668,82 +1670,6 @@ def test_a_request_too_deep_to_read_is_never_recorded(tmp_path: Path) -> None:
         [_request(output_schema=_nested(552))],
     )
     recorder.close()
-    run_dir = tmp_path / "runs" / "run-1"
-
-    assert not _corpus_records(run_dir, MODEL_REQUEST_KIND), (
-        "the writer recorded a request preimage the replay reader refuses to parse"
-    )
-    assert not [issue for issue in validate_run_dir(run_dir) if "model_payloads" in issue.path], (
-        f"validate condemned a corpus the writer refused cleanly: {validate_run_dir(run_dir)}"
-    )
-
-    corpus = _load(tmp_path)
-    assert corpus.request_terms_view() == (), "an absent request must not project terms"
-    assert isinstance(corpus.consume(digest, generation=_GEN), ReplayedResponse), (
-        "refusing the request record must not cost the recorded answer"
-    )
-
-
-def test_the_writer_asks_the_readers_own_question_not_a_list_of_rules(tmp_path: Path) -> None:
-    """The gate is the reader's parser, so it cannot be wrong about which rules exist.
-
-    Two rules where the writer and the reader disagree, found one round apart. Depth: the
-    canonical encoder bounds non-finite values, circular references and surrogates, and does
-    **not** bound nesting -- the one rule the round that found it was about. Integers:
-    ``json_ingress`` hard-codes 4300 digits on purpose ("a deterministic, cross-interpreter
-    digit limit") while the encoder's ``str(int)`` tracks whatever the host set, so a process
-    that raised the interpreter's limit opens the disagreement again.
-
-    A depth check would pass the second case, which is why this pins the *ingress parse*: an
-    enumerated gate has to be right about the list, and the list is exactly what was wrong
-    twice. Asserting both arms in one test is deliberate -- either one alone is satisfied by a
-    gate that re-earns the defect.
-    """
-
-    deep = model_payloads._encoded({_GEN: {"instruction": "x", "deep": _nested(552)}})
-    assert model_payloads.split_request_payload(deep, sha256_bytes(deep)) is None, (
-        "a preimage nested past the reader's bound was accepted for recording"
-    )
-
-    restore = sys.get_int_max_str_digits()
-    sys.set_int_max_str_digits(0)
-    try:
-        huge = model_payloads._encoded({_GEN: {"instruction": "x", "n": int("9" * 5000)}})
-        assert model_payloads.split_request_payload(huge, sha256_bytes(huge)) is None, (
-            "an integer past the reader's fixed digit bound was accepted for recording; a "
-            "depth-only gate passes this case, so the gate is still a list of rules"
-        )
-    finally:
-        sys.set_int_max_str_digits(restore)
-
-
-def test_validate_refuses_a_request_record_the_reader_cannot_parse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Corpora already on disk were written before the gate, so validate has to say so.
-
-    The request arm re-hashed the reassembled preimage without ever parsing it, on the
-    reasoning that reassembly is a canonical encode and a digest-valid preimage is therefore
-    canonical JSON by construction. That enumerated three of the encoder's refusals and omitted
-    depth. Resolving is not believing: the arm has to ask the reader's question, exactly as the
-    response arm below it does.
-
-    The fixture is the pre-gate writer itself, not a hand-built record, and that is load-bearing
-    twice. A hand-built preimage goes into the record line verbatim, where the *line* reader
-    already refuses it -- the arm that always worked -- so such a fixture pins nothing about
-    this one. And the shape that reaches disk is the offloaded one: the deep term is lifted into
-    a chunk and the line the validator reads is shallow.
-    """
-
-    monkeypatch.setattr(model_payloads, "loads_json_ingress", json.loads)
-    recorder = _recorder(tmp_path)
-    [digest] = _drive(
-        recorder,
-        _ScriptedAdapter([ModelTurn(response_id="r", final_text="answered")]),
-        [_request(output_schema=_nested(552))],
-    )
-    recorder.close()
-    monkeypatch.undo()
     run_dir = tmp_path / "runs" / "run-1"
 
     [record] = _corpus_records(run_dir, MODEL_REQUEST_KIND)
@@ -2273,4 +2199,111 @@ def test_a_non_string_provider_term_does_not_crash_the_provider_census(tmp_path:
 
     assert adapter.provider_name == "gateway", (
         "the only string provider recorded is the one that can be declared"
+    )
+
+
+def test_validate_does_not_retain_every_chunk_it_reads(tmp_path: Path) -> None:
+    """Reading a chunk once is the win; keeping it afterwards is not part of it.
+
+    The memo that stopped N records re-reading ONE chunk cached the bytes beside the inline
+    chunks, which turned this command's footprint from O(largest chunk) into O(total offloaded
+    corpus). A chunk may be MAX_MODEL_PAYLOAD_BYTES (8 MB) and nothing bounds how many there
+    are, so a large run directory that arrived from somewhere else costs gigabytes on the one
+    command an operator runs to inspect it before trusting it.
+
+    Measured against total corpus size rather than an absolute number, because that is the
+    shape of the defect: the bound must not move when the corpus grows.
+    """
+
+    size = PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096
+
+    def peak_for(count: int, run_id: str) -> int:
+        recorder = _recorder(tmp_path, run_id=run_id)
+        _drive(
+            recorder,
+            _ScriptedAdapter(
+                [
+                    ModelTurn(response_id=f"r{n}", final_text=chr(ord("a") + n) * size)
+                    for n in range(count)
+                ]
+            ),
+            [_request(f"call {n}") for n in range(count)],
+        )
+        recorder.close()
+        run_dir = tmp_path / "runs" / run_id
+        answers = _corpus_records(run_dir, MODEL_RESPONSE_KIND)
+        distinct = {json.dumps(answer["response"], sort_keys=True) for answer in answers}
+        assert len(distinct) == count, (
+            f"the fixture must offload {count} DISTINCT chunks, got {len(distinct)}"
+        )
+        tracemalloc.reset_peak()
+        validate_run_dir(run_dir)
+        return tracemalloc.get_traced_memory()[1]
+
+    # A slope, not a level: one chunk's transient is several times its own size (read, decode,
+    # parse, and the ingress normalizer's copy), so an absolute bound would be measuring that
+    # rather than the retention. What must not happen is the peak tracking the corpus.
+    tracemalloc.start()
+    try:
+        small = peak_for(4, "small")
+        large = peak_for(16, "large")
+    finally:
+        tracemalloc.stop()
+
+    added = 12 * size
+    assert large - small < added / 4, (
+        f"twelve more chunks ({added:,} bytes) raised validate's peak by {large - small:,}; it "
+        "is retaining what it reads, so the cost grows with the run directory"
+    )
+
+
+def test_validate_reads_each_chunk_once_even_when_the_records_interleave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read-once is a property of the chunk, not of the records happening to be adjacent.
+
+    The bounded byte cache holds one entry, so records that alternate between two chunks defeat
+    it completely: every record re-reads. What makes read-once hold regardless of order is that
+    a chunk whose verdict is already memoized is never resolved at all -- the sha names the
+    bytes, so a second record needs neither the read nor the re-hash that produced the verdict.
+
+    The sibling test's fixture repeats ONE chunk, where the single slot is enough and this rule
+    is invisible; a mutant that removes it stays green there. Interleaving is the arm where the
+    mechanism differs.
+    """
+
+    recorder = _recorder(tmp_path)
+    size = PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096
+    _drive(
+        recorder,
+        _ScriptedAdapter(
+            [ModelTurn(response_id=f"r{n}", final_text=chr(ord("a") + n) * size) for n in range(2)]
+        ),
+        [_request(f"call {n}") for n in range(2)],
+    )
+    recorder.close()
+
+    run_dir = tmp_path / "runs" / "run-1"
+    corpus_path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = corpus_path.read_text(encoding="utf-8").splitlines()
+    answers = [line for line in lines if json.loads(line).get("kind") == MODEL_RESPONSE_KIND]
+    assert len(answers) == 2, "the fixture must offload exactly two answers"
+    others = [line for line in lines if json.loads(line).get("kind") != MODEL_RESPONSE_KIND]
+    _write_lines(corpus_path, others + [answers[n % 2] for n in range(8)])
+
+    reads: list[int] = []
+    real_read = schemas.read_verified_bytes
+
+    def counting_read(*args: Any, **kwargs: Any) -> Any:
+        data = real_read(*args, **kwargs)
+        reads.append(len(data or b""))
+        return data
+
+    monkeypatch.setattr(schemas, "read_verified_bytes", counting_read)
+    validate_run_dir(run_dir)
+
+    body_reads = [read for read in reads if read > PAYLOAD_OFFLOAD_THRESHOLD_BYTES]
+    assert len(body_reads) == 2, (
+        f"eight records alternating between two chunks read them {len(body_reads)} times; a "
+        "one-entry cache thrashes on this order, so read-once has to come from the memo"
     )

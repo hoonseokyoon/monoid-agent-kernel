@@ -439,37 +439,33 @@ def _extracted(terms: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bytes]]
 def split_request_payload(preimage: bytes, request_digest: str) -> SplitRequestPayload | None:
     """A verified recipe for ``preimage``, or ``None`` when no verifiable record can exist.
 
-    Refuses -- rather than records -- three times. If ``request_digest`` is not the digest of
+    Refuses -- rather than records -- twice. If ``request_digest`` is not the digest of
     ``preimage``, the caller is asking for a record whose key contradicts its own bytes, and a
-    corpus entry that fails its own join is worse than an absent one. If the replay reader's
-    parser refuses ``preimage``, the record would exist and testify to nothing -- see the gate
-    below for why that has to be asked here and cannot be asked of the record line. And if
-    neither the chunked recipe nor the verbatim fallback reassembles to ``preimage`` (the
-    decode/encode identity itself broken), nothing this function could write would survive
-    ``validate_run_dir``, so nothing is written. All three refusals are the `_digest` doctrine:
+    corpus entry that fails its own join is worse than an absent one. And if neither the
+    chunked recipe nor the verbatim fallback reassembles to ``preimage`` (the decode/encode
+    identity itself broken), nothing this function could write would survive
+    ``validate_run_dir``, so nothing is written. Both refusals are the `_digest` doctrine:
     no fabricated identities.
 
-    Each costs the request record only. The answer recorded beside it is a separate record and
-    stays servable, which is what makes refusing here cheaper than recording a lie.
+    Both are about a record that would contradict *itself*. A record the replay reader cannot
+    parse is a different thing -- it is honest about what was sent and merely useless to one
+    consumer -- and is deliberately still written; see the comment on the parse below.
     """
 
     if sha256_bytes(preimage) != request_digest:
         return None
+    # No ingress gate here, and that is a decision rather than an omission -- see
+    # ``test_a_deep_tool_result_still_gets_its_request_record``. A term is lifted into a chunk
+    # once its encoding reaches MARKER_ENCODED_BYTES, so a value deep enough to pass the
+    # reader's nesting bound is always lifted, and refusing it here would refuse the record for
+    # every LATER call in the run too: a tool result stays in the by-value message log, so one
+    # deep result makes every subsequent preimage deep. That trades a record the replay reader
+    # cannot use for the only copy of what was actually sent, on a kernel whose purpose is
+    # verifiable provenance. The reader's refusal is instead made visible where it costs
+    # nothing to say so: ``validate_run_dir`` reports such a record, and the corpus counts it
+    # rather than silently narrowing the identities it derives from.
     try:
-        text = preimage.decode("utf-8")
-        # The reader's own question, asked at the writer -- deliberately the parser and not a
-        # list of rules. A term is lifted into a chunk once its encoding reaches
-        # MARKER_ENCODED_BYTES, and a chunk's brackets live inside the record line's JSON
-        # string, which the line gate does not count; so nothing downstream of here asks a
-        # request preimage anything the reader asks. Enumerating instead was wrong twice: the
-        # canonical encoder bounds non-finite values, cycles and surrogates but NOT nesting,
-        # and ``json_ingress`` fixes its integer-digit limit on purpose while the encoder's
-        # ``str(int)`` tracks whatever the host set. The parse result is discarded rather than
-        # reused: it normalizes unicode scalars, and the recipe below is compared to
-        # ``preimage`` byte for byte, so building from it could drop records that are fine.
-        # This gate only ever adds refusals.
-        loads_json_ingress(text)
-        value = json.loads(text)
+        value = json.loads(preimage.decode("utf-8"))
     except Exception:
         return None
 

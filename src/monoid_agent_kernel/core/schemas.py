@@ -1781,9 +1781,20 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                 continue
             chunks[sha] = data
 
+    # One slot, deliberately. Caching every resolved chunk beside the inline ones turned this
+    # command's footprint from O(largest chunk) into O(total offloaded corpus) -- measured at
+    # 42.1 MB against 3.2 MB over forty 1 MB chunks, and with an 8 MB ceiling per chunk and no
+    # bound on the count, a large run directory costs gigabytes on the one command an operator
+    # runs before trusting it. Records that name one chunk are adjacent, so a single slot keeps
+    # the re-read the memo was added to stop, without keeping the corpus.
+    last_resolved: tuple[str, bytes] | None = None
+
     def resolve(sha: str) -> bytes:
+        nonlocal last_resolved
         if sha in chunks:
             return chunks[sha]
+        if last_resolved is not None and last_resolved[0] == sha:
+            return last_resolved[1]
         # A reference becomes a filename here, so this is where the writer's constraint has to be
         # re-established: everything it writes is 64 hex, and an absolute or ``..``-relative string
         # joined onto ``chunk_dir`` discards the base and names any file on the machine. The hash
@@ -1795,10 +1806,10 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             raise ValueError(f"offloaded chunk {sha} is not a readable run-directory file")
         if sha256_bytes(data) != sha:
             raise ValueError(f"offloaded chunk {sha} does not match its name")
-        # Cached beside the inline chunks, because N response records may name ONE chunk and
-        # every one of them used to re-read it. A content-addressed name means the bytes cannot
-        # have changed between two reads of the same run directory.
-        chunks[sha] = data
+        # Held for the next caller only, because N records may name ONE chunk and every one of
+        # them used to re-read it. A content-addressed name means the bytes cannot have changed
+        # between two reads of the same run directory.
+        last_resolved = (sha, data)
         return data
 
     parsed_bodies: dict[str, str | None] = {}
@@ -1861,6 +1872,15 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                     )
                 )
             elif shape == RESPONSE_REFERENCE:
+                if sha in parsed_bodies:
+                    # The verdict is a property of the bytes and the bytes are named by their
+                    # hash, so a second record naming this chunk needs neither the read nor the
+                    # re-hash that produced it. Skipping the resolve entirely -- rather than
+                    # resolving and then not parsing -- is what keeps the bytes transient.
+                    problem = parsed_bodies[sha]
+                    if problem is not None:
+                        issues.append(ValidationIssue(f"{path.name}:{index}", problem))
+                    continue
                 try:
                     resolved = resolve(sha)
                 except Exception:

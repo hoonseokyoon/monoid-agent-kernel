@@ -685,6 +685,20 @@ class ReplayCorpus:
             terms for digest in self._requests if (terms := self._request_terms(digest)) is not None
         )
 
+    def unreadable_requests(self) -> int:
+        """How many request records exist that :meth:`request_terms_view` could not include.
+
+        The difference between "the corpus says nothing about X" and "the corpus cannot be
+        read on X", which every derivation over the view needs and none of them could ask.
+        A record is written whenever it honors its own digest -- deliberately, because a deep
+        tool result stays in the by-value message log and refusing it would cost the run its
+        request provenance from that call onward -- so the reader's own nesting bound can
+        leave a record present and mute. Silence then stops being evidence: a derivation that
+        treats a narrowed view as a complete one concludes MORE confidently from LESS.
+        """
+
+        return sum(1 for digest in self._requests if self._request_terms(digest) is None)
+
     def response_bodies_view(self) -> tuple[Mapping[str, Any], ...]:
         """Every materializable answer body, grouped by key then in file order, cursors
         untouched.
