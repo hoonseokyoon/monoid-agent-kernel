@@ -12,6 +12,7 @@ import ast
 import asyncio
 import gc
 import json
+import time
 import weakref
 from pathlib import Path
 from typing import Any
@@ -1551,20 +1552,22 @@ def test_the_adapter_reaches_the_cursor_only_through_a_take() -> None:
     by hand, which is precisely how three of the six routes were introduced. This fails the day it
     happens, which is the only reason wrapping is safe.
 
-    ``_compact_releases`` is the one reviewed exception, and it is scoped to that function rather
-    than waived for the file. It runs when the take is already closed and the run has thrown the
-    answer away, so there is no block left to leave and ``release`` is the only primitive that can
-    give the slot back. Widening the exemption to the whole module would re-earn exactly the defect
-    the census exists to catch -- the interpolation census next door failed that way twice.
+    ``discard_turn`` is the one reviewed exception, and it is scoped to that function rather than
+    waived for the file. It runs when the take is already closed and the run has thrown the answer
+    away, so there is no block left to leave and ``release`` is the only primitive that can give
+    the slot back. Widening the exemption to the whole module would re-earn exactly the defect the
+    census exists to catch -- the interpolation census next door failed that way twice.
 
-    The exemption moved once already, from ``discard_turn``, when the retry loop was split out.
-    That it had to be moved rather than silently kept working is the point: a function-scoped
-    exemption follows the code it justifies instead of quietly covering whatever grows into it.
+    The exemption has moved twice now: out to ``_compact_releases`` when a retry loop was written
+    in this class, and back when that loop turned out to belong in the corpus -- because
+    ``ReplayTake`` releases too, and a rule living here released straight past it. Both times the
+    census demanded the move rather than quietly covering whatever had grown into the exempt name,
+    which is why it is scoped to a function instead of to a file.
     """
 
     tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
     guarded = {"consume", "spend_refused", "release"}
-    exempt = {("_compact_releases", "release")}
+    exempt = {("discard_turn", "release")}
 
     scope: dict[int, str] = {}
 
@@ -1829,6 +1832,56 @@ def test_two_in_flight_answers_for_one_key_are_tracked_separately(tmp_path: Path
         "the first in-flight answer was forgotten when the second was served, so discarding it "
         f"gave nothing back and the next call was served a different call's answer: "
         f"{served.final_text!r}"
+    )
+
+
+def test_an_answer_landing_during_the_abandonment_grace_gives_its_slot_back(
+    tmp_path: Path,
+) -> None:
+    """The discard hook was bound to one of the two ways a produced answer is thrown away.
+
+    A boundary winning over an *already completed* call was closed. A boundary winning while the
+    worker is still inside `next_turn` was not: `task.done()` is false, so the hook is skipped, and
+    the awaiter goes to `detach_unfinished_call`. The worker then finishes during the grace
+    interval, `deliver` finds the waiter already cancelled, and the produced turn is dropped where
+    only awaitables get disposed of -- a `ModelTurn` simply vanishes.
+
+    For this adapter the cursor moved before any of that: `consume` advanced when the recording was
+    handed to the worker. So the slot is spent, never delivered, and never given back, and the next
+    caller gets the answer recorded for a different call. Same failure as the one already closed,
+    reached by the arm that was not.
+
+    Driven through the real runner rather than the hook, because the point is which paths reach the
+    hook at all.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="ANSWER-1"), ModelTurn(final_text="ANSWER-2")]),
+        [_request(), _request()],
+    )
+    token = CancellationToken()
+
+    class _LandsDuringGrace(ReplayModelAdapter):
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            # The boundary becomes observable while this worker is still running, so the awaiter
+            # gives up before the result is delivered -- and the worker settles inside the grace.
+            token.cancel()
+            time.sleep(0.05)
+            return super().next_turn(request)
+
+    adapter = _LandsDuringGrace([tmp_path / "runs" / "run-1"])
+    runner = ModelCallRunner(
+        adapter=adapter, current_cancellation_token=lambda: token, cancel_grace_s=2.0
+    )
+    with pytest.raises(BaseException):
+        asyncio.run(runner.acall(_request()))
+
+    served = adapter.next_turn(_request())
+
+    assert served.final_text == "ANSWER-1", (
+        "the abandoned worker's answer landed after the run gave up and was dropped without the "
+        f"adapter hearing about it, so its slot stayed spent: {served.final_text!r}"
     )
 
 

@@ -327,6 +327,7 @@ class ReplayCorpus:
         self._request_runs: dict[str, list[str]] = {}
         self._responses: dict[str, list[_ResponseEntry]] = {}
         self._cursors: dict[str, int] = {}
+        self._pending_releases: dict[str, set[int]] = {}
         self._chunks: dict[str, bytes] = {}
         self._chunk_dirs: list[Path] = []
         self._generations: list[str] = []
@@ -634,10 +635,15 @@ class ReplayCorpus:
     def release(self, digest: str, slot: int) -> bool:
         """Give back an answer :meth:`consume` handed out that the caller could not use.
 
-        Answers whether the cursor moved, because "not now" and "not ever" are different and only
-        the caller can tell them apart: a slot the cursor has run past is releasable again once
-        the slots above it come back, and a caller that dropped the refusal on the first failure
-        lost an answer permanently. The adapter retries its pending set on every later release.
+        A slot the cursor cannot reach yet **waits** rather than being refused outright, and
+        every release compacts the whole consecutive run it can now reach. Without that, giving a
+        slot back depended on which of two concurrent callers gave up first: releasing 0 while the
+        cursor stood at 2 did nothing, and the 1 behind it rewound only to 1, leaving slot 0
+        consumed and undelivered so the next caller took a different call's answer.
+
+        Answers whether the cursor moved. Held here rather than in a caller because there are two
+        callers -- the adapter's discard hook and this class's own reconstruction-failure release
+        -- and fixing the first left the second releasing straight past it.
 
         Only that exact slot, and only while nothing else has moved: under concurrent callers
         another turn may already hold the next one, and rewinding then would hand it out twice.
@@ -651,12 +657,25 @@ class ReplayCorpus:
 
         with self._lock:
             queue = self._responses.get(digest)
-            if not queue:
+            if not queue or not 0 <= slot < len(queue):
+                # Bounds first, so nothing out of range can enter the pending set and sit there
+                # waiting for a cursor that could only reach it by being wrong.
                 return False
-            if 0 <= slot < len(queue) and self._cursors.get(digest, 0) == slot + 1:
-                self._cursors[digest] = slot
-                return True
-            return False
+            pending = self._pending_releases.setdefault(digest, set())
+            pending.add(slot)
+            moved = False
+            while pending:
+                top = max(pending)
+                if self._cursors.get(digest, 0) != top + 1:
+                    # Consecutive only. A slot whose successor was delivered and kept stays put:
+                    # rewinding past a live taker is what would hand one answer to two calls.
+                    break
+                self._cursors[digest] = top
+                pending.discard(top)
+                moved = True
+            if not pending:
+                self._pending_releases.pop(digest, None)
+            return moved
 
     def take(self, digest: str, *, generation: str) -> ReplayTake:
         """A take on the next unconsumed answer, settled by the block that receives it.

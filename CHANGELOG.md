@@ -23,8 +23,20 @@ out in commit messages and here.
   why a recorded body (up to the 8 MB payload ceiling) stays in memory. A discard the cursor
   cannot honour yet stays pending rather than being dropped, and every release retries the highest
   pending slot, so two concurrent calls give both slots back whichever order their discards
-  arrive in; `ReplayCorpus.release` now reports whether it rewound, because "not now" and "not
-  ever" are different and only the caller can tell them apart.
+  arrive in. `ReplayCorpus.release` holds that pending set and reports whether it rewound, because
+  "not now" and "not ever" are different and only the cursor can tell them apart — in the corpus
+  rather than above it, since `ReplayTake`'s own reconstruction-failure release is a second caller
+  and a rule living in the adapter released straight past it. Compaction walks *consecutive* slots
+  only, so a slot whose successor was delivered and kept is still not given back.
+- **A discarded outcome is handed back on every path that drops one, not just the first.** A run
+  boundary can throw away a real result in four places: the boundary check finding the call already
+  done, the awaiter's own cleanup finding it done a moment later, an async callee settling after
+  detach, and a synchronous worker settling inside the abandonment grace once its waiter is
+  cancelled. Only the first was wired. The last is the one that mattered most for replay — the
+  worker had already advanced the cursor, and its answer was dropped where only awaitables are
+  disposed of, so a `ModelTurn` simply vanished and the slot stayed spent. All four now go through
+  one `hand_back_discarded` rule, and `AbandonableSyncCall` carries a `set_discard_hook` the
+  awaiter installs.
 - **Deriving the adapter no longer materializes the response corpus.** `response_bodies_view()`
   built a tuple of every answer body so the impersonation derivation could ask one boolean per
   body. Bodies reach the 8 MB payload ceiling and nothing bounds how many there are, so

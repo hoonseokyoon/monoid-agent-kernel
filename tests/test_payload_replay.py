@@ -361,6 +361,47 @@ def test_a_released_answer_is_handed_out_again_and_only_that_one(tmp_path: Path)
     assert isinstance(corpus.consume(digest, generation=_GEN), ReplayMissReason)
 
 
+def test_a_release_the_cursor_cannot_reach_yet_waits_instead_of_being_dropped(
+    tmp_path: Path,
+) -> None:
+    """Giving a slot back must not depend on which of two concurrent callers gives up first.
+
+    ``release`` moves the cursor only when it stands one past the slot, so two callers holding
+    slots 0 and 1 could give both back in one order and only one back in the other: releasing 0
+    first did nothing at all, and the 1 behind it rewound to 1, leaving slot 0 consumed and
+    undelivered. The next caller then got slot 1 -- an answer recorded for a different call.
+
+    The bound this waits on is unchanged and is the point: compaction walks *consecutive* slots
+    only, so a slot whose successor was delivered and kept is still not given back. Waiting is
+    the difference between "not yet" and "not ever", and only the cursor can say which.
+
+    Fixed in the corpus rather than above it. The adapter's discard hook and ``ReplayTake``'s own
+    reconstruction-failure release are two callers of one primitive, and repairing the first left
+    the second releasing straight past it -- the twin this repository keeps paying for. One
+    primitive, both callers.
+    """
+
+    run_dir = tmp_path / "runs" / "run-1"
+    digest = _recorded_pair(run_dir, answers=["first", "second"])
+    corpus = ReplayCorpus.load([run_dir])
+
+    first = corpus.consume(digest, generation=_GEN)
+    second = corpus.consume(digest, generation=_GEN)
+    assert isinstance(first, ReplayedResponse) and isinstance(second, ReplayedResponse)
+    assert (first.slot, second.slot) == (0, 1)
+
+    assert corpus.release(digest, first.slot) is False, "the cursor is at 2; slot 0 cannot move yet"
+    assert corpus.release(digest, second.slot) is True
+
+    again = corpus.consume(digest, generation=_GEN)
+
+    assert isinstance(again, ReplayedResponse)
+    assert (again.slot, again.body["final_text"]) == (0, "first"), (
+        "the earlier release was dropped rather than held, so the slot it gave back was lost and "
+        "the retry took the answer belonging to the call after it"
+    )
+
+
 def test_a_failed_call_leaves_a_request_with_no_answer(tmp_path: Path) -> None:
     """[P6] The original call failed: its key and preimage were recorded, its answer was not
     (there was none). Replay finds the request known and the answer absent -- with a detail

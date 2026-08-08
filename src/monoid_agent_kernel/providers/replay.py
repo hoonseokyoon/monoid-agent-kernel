@@ -297,7 +297,6 @@ class ReplayModelAdapter:
             media_seen if supports_multimodal is _AUTO else bool(supports_multimodal)
         )
         self._served_slots: dict[str, list[tuple[int, weakref.ref[ModelTurn]]]] = {}
-        self._pending_releases: dict[str, set[int]] = {}
         self._served_lock = threading.Lock()
         self.wire_image_encoding = wire_image_encoding
         if config is not None:
@@ -512,46 +511,11 @@ class ReplayModelAdapter:
                 self._served_slots.pop(digest, None)
         if slot is None:
             return
-        with self._served_lock:
-            self._pending_releases.setdefault(digest, set()).add(slot)
-        self._compact_releases(digest)
-
-    def _compact_releases(self, digest: str) -> None:
-        """Give back every consecutively discarded slot the cursor can still reach.
-
-        ``release`` takes only the slot the cursor stands one past, so discard order decided
-        whether an answer came back at all: two concurrent calls on one key take slots 0 and 1,
-        and a slot-0 discard arriving first was simply dropped -- the cursor was already at 2 --
-        leaving that answer consumed and undelivered while the next caller took a later one.
-        Concurrent identical calls arrive in no order at all, so honouring one of the two is
-        honouring neither.
-
-        A discard that cannot be honoured yet therefore stays pending, and every release retries
-        the highest pending slot: releasing 1 puts the cursor where 0 becomes releasable, and the
-        loop walks the whole consecutive run back. A slot the cursor can never reach again --
-        because the answer above it was delivered and kept -- simply stays in the set, which is
-        bounded by the key's own queue length.
-
-        The corpus call stays outside ``_served_lock``: it takes its own, and this is the only
-        place that would hold both. Each iteration re-reads the set under the lock, so two
-        concurrent discards can interleave without either losing its slot -- a release that loses
-        the race fails rather than corrupting, and the winner's own loop picks the slot up.
-        """
-
-        while True:
-            with self._served_lock:
-                pending = self._pending_releases.get(digest)
-                if not pending:
-                    return
-                slot = max(pending)
-            if not self._corpus.release(digest, slot):
-                return
-            with self._served_lock:
-                remaining = self._pending_releases.get(digest)
-                if remaining is not None:
-                    remaining.discard(slot)
-                    if not remaining:
-                        self._pending_releases.pop(digest, None)
+        # Outside the lock: the corpus takes its own, and this is the only place holding both.
+        # The corpus also owns the retry -- a slot it cannot reach yet waits there rather than
+        # here, so ``ReplayTake``'s own reconstruction-failure release gets the same treatment
+        # instead of releasing straight past a rule that lived in this class.
+        self._corpus.release(digest, slot)
 
     def _serve_miss(
         self,
