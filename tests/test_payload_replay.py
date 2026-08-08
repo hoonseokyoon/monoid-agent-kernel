@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from monoid_agent_kernel.core import model_payloads, payload_gc, payload_replay
+from monoid_agent_kernel.core import model_payloads, payload_gc, payload_replay, schemas
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
 from monoid_agent_kernel.core.model_payloads import (
@@ -1546,6 +1546,10 @@ def _nested(depth: int) -> Any:
     return node
 
 
+def _write_lines(path: Path, lines: list[str]) -> None:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _corpus_records(run_dir: Path, kind: str) -> list[dict[str, Any]]:
     lines = (run_dir / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8").splitlines()
     return [record for record in map(json.loads, lines) if record.get("kind") == kind]
@@ -1635,6 +1639,70 @@ def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -
     assert not (directory.exists() and any(directory.iterdir())), (
         "the refused body was stored anyway, as an orphan chunk no record names"
     )
+
+
+def test_validate_reads_and_parses_one_chunk_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One chunk, however many records name it.
+
+    An offloaded body is content-addressed, so whether it parses is a property of the bytes --
+    and the bytes cannot change between two reads of one run directory. Answering per RECORD
+    made the parse the dominant cost of the command: measured, 4,000 records naming one 8 MB
+    chunk took ~62 minutes on a benign body and hours on an adversarial one, where a single
+    parse takes about a second. That is a regression this branch introduced, on the one command
+    an operator runs to inspect a run directory that arrived from somewhere else.
+
+    Counted rather than timed: a timing assertion on a shared runner is a flake, and the claim
+    is about how many times the work happens, not how long it takes.
+    """
+
+    recorder = _recorder(tmp_path)
+    _drive(
+        recorder,
+        _ScriptedAdapter(
+            [
+                ModelTurn(
+                    response_id="r",
+                    final_text="x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096),
+                )
+            ]
+        ),
+        [_request()],
+    )
+    recorder.close()
+
+    run_dir = tmp_path / "runs" / "run-1"
+    corpus_path = run_dir / MODEL_PAYLOADS_FILENAME
+    lines = corpus_path.read_text(encoding="utf-8").splitlines()
+    answers = [line for line in lines if json.loads(line).get("kind") == MODEL_RESPONSE_KIND]
+    assert len(answers) == 1, "the fixture must offload exactly one answer"
+    _write_lines(corpus_path, lines + answers * 5)
+
+    # Sized rather than counted: this module parses corpus LINES through the same function, and
+    # only the offloaded body is over the threshold, so size is what separates the two.
+    parses: list[int] = []
+    reads: list[int] = []
+    real_parse, real_read = schemas.loads_json_ingress, schemas.read_verified_bytes
+
+    def counting_parse(text: str, *args: Any, **kwargs: Any) -> Any:
+        parses.append(len(text))
+        return real_parse(text, *args, **kwargs)
+
+    def counting_read(*args: Any, **kwargs: Any) -> Any:
+        data = real_read(*args, **kwargs)
+        reads.append(len(data or b""))
+        return data
+
+    monkeypatch.setattr(schemas, "loads_json_ingress", counting_parse)
+    monkeypatch.setattr(schemas, "read_verified_bytes", counting_read)
+
+    validate_run_dir(run_dir)
+
+    body_parses = [size for size in parses if size > PAYLOAD_OFFLOAD_THRESHOLD_BYTES]
+    body_reads = [size for size in reads if size > PAYLOAD_OFFLOAD_THRESHOLD_BYTES]
+    assert len(body_parses) == 1, f"six records naming one chunk parsed it {len(body_parses)}x"
+    assert len(body_reads) == 1, f"six records naming one chunk read it {len(body_reads)}x"
 
 
 def test_a_hostile_corpus_cannot_write_a_megabyte_of_diagnosis(tmp_path: Path) -> None:

@@ -1795,8 +1795,13 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             raise ValueError(f"offloaded chunk {sha} is not a readable run-directory file")
         if sha256_bytes(data) != sha:
             raise ValueError(f"offloaded chunk {sha} does not match its name")
+        # Cached beside the inline chunks, because N response records may name ONE chunk and
+        # every one of them used to re-read it. A content-addressed name means the bytes cannot
+        # have changed between two reads of the same run directory.
+        chunks[sha] = data
         return data
 
+    parsed_bodies: dict[str, str | None] = {}
     for index, payload in records:
         kind = payload.get("kind")
         if kind == MODEL_REQUEST_KIND:
@@ -1851,22 +1856,28 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                         )
                     )
                     continue
-                try:
-                    # Resolving is not believing. Re-hashing proves the bytes are the ones the
-                    # writer named, not that they are a body any reader will accept: the sha
-                    # names whatever was planted, so an offloaded body could carry JSON the
-                    # ingress rules forbid and still pass every check here. The replay reader
-                    # refuses such a body; without this arm ``monoid validate`` would certify
-                    # the corpus clean and the operator would meet the refusal at run time
-                    # with a green integrity report in hand.
-                    loads_json_ingress(resolved.decode("utf-8"))
-                except Exception:
-                    issues.append(
-                        ValidationIssue(
-                            f"{path.name}:{index}",
-                            "response body is not JSON this kernel's readers accept",
+                # Resolving is not believing. Re-hashing proves the bytes are the ones the
+                # writer named, not that they are a body any reader will accept: the sha names
+                # whatever was planted, so an offloaded body could carry JSON the ingress rules
+                # forbid and still pass every check here. The replay reader refuses such a body;
+                # without this arm ``monoid validate`` would certify the corpus clean and the
+                # operator would meet the refusal at run time with a green integrity report.
+                #
+                # Memoized by sha, because the answer is a property of the bytes and the bytes
+                # are named by their hash. Parsing per RECORD instead of per CHUNK made this the
+                # dominant cost of the command: 4,000 records naming one 8 MB chunk took ~62
+                # minutes, where one parse takes about a second.
+                if sha not in parsed_bodies:
+                    try:
+                        loads_json_ingress(resolved.decode("utf-8"))
+                        parsed_bodies[sha] = None
+                    except Exception:
+                        parsed_bodies[sha] = (
+                            "response body is not JSON this kernel's readers accept"
                         )
-                    )
+                problem = parsed_bodies[sha]
+                if problem is not None:
+                    issues.append(ValidationIssue(f"{path.name}:{index}", problem))
 
 
 def _validate_jsonl_file(
