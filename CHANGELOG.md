@@ -36,7 +36,12 @@ out in commit messages and here.
   (`retry_delay_s` in `providers/_common`, one function for all three loops) and runs under
   the same cancel/deadline race as the attempts, so a cancellation wakes it; a backoff that
   cannot fit the remaining deadline re-raises the transient provider error instead of
-  sleeping into a `RunTimeout` that names nothing.
+  sleeping into a `RunTimeout` that names nothing. `max_delay_s` now caps the exponent and
+  not only the product: `max_attempts` and `backoff_multiplier` are validated with a lower
+  bound and no upper one, so a policy the spec accepts could overflow
+  `multiplier ** (attempt - 1)` before the cap was consulted — and `float ** int` raises
+  there, inside the handler for the retryable `ModelAdapterError`, replacing the provider's
+  taxonomy with an unclassified `OverflowError`.
 - **The replay key does not move.** The identity projection already excluded the retry block
   (W6-4b's `_model_identity` named this exact field addition as its reason); the exclusion
   matrix now pins `retry.layer` per-field, and a retried run's corpus is shape-identical to

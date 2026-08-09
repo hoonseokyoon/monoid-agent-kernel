@@ -3760,6 +3760,51 @@ def test_the_backoff_respects_the_deadline_instead_of_sleeping_into_it(
     assert observer.captures[0].receipt.attempts == 1
 
 
+def test_an_extreme_schedule_does_not_replace_the_provider_error_with_an_arithmetic_one() -> None:
+    """The kernel loop's backoff may not lose the failure taxonomy to its own arithmetic.
+
+    Every field here passes `ModelRetryConfig.from_json`: `backoff_multiplier` is checked for
+    finiteness and positivity, never for an upper bound, and `max_attempts` only for being an
+    integer above zero. The fourth attempt's schedule therefore raises the exponent to two, and
+    a cap applied only to the product would let `1e308 ** 2` overflow INSIDE the handler for the
+    retryable `ModelAdapterError` -- so the caller would see an `OverflowError` carrying no
+    `retryable`, no `code`, and no `http_status`, and the receipt would stop at three attempts.
+    """
+
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(
+        instruction="hi",
+        system_prompt="sys",
+        tools=(),
+        model=ModelConfig(
+            retry=ModelRetryConfig(
+                layer="kernel",
+                max_attempts=4,
+                initial_delay_s=0.001,
+                max_delay_s=0.001,
+                backoff_multiplier=1e308,
+                jitter_s=0.0,
+            )
+        ),
+    )
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 4
+    assert observer.captures[0].receipt.attempts == 4
+
+
 def test_a_cancellation_interrupts_the_backoff_wait(monkeypatch: Any) -> None:
     """The backoff runs under the same race as the attempts, so a cancel wakes it."""
 

@@ -852,6 +852,29 @@ def test_both_waits_follow_one_schedule() -> None:
     assert gateway._retry_delay(9, 0.5, 4.0, 2.0, 0.0) == 4.0
 
 
+def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
+    """A policy the spec accepts must not turn a wait into an `OverflowError`.
+
+    `backoff_multiplier` is validated as any positive finite number and `max_attempts` as any
+    integer above zero, so `multiplier ** (attempt - 1)` can leave the float range while the
+    CONFIGURED delay is still four seconds -- `1e308` on the third attempt, the default `2.0`
+    on the 1025th. `float ** int` raises there rather than saturating at infinity, and all
+    three loops evaluate the schedule inside an `except` handler for a retryable
+    `ModelAdapterError`: an arithmetic error raised there replaces the provider's failure
+    with an unclassified one. Hence the cap binds the exponent, before the power is taken.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    assert gateway._retry_delay(3, 0.5, 4.0, 1e308, 0.0) == 4.0
+    assert gateway._retry_delay(1025, 0.5, 4.0, 2.0, 0.0) == 4.0
+    # Below the saturation point the schedule is the one it always was, and the degenerate
+    # arms (no growth, no initial delay, no cap) still answer what the product answered.
+    assert gateway._retry_delay(3, 0.5, 4.0, 2.0, 0.0) == 2.0
+    assert gateway._retry_delay(4, 0.5, 4.0, 0.5, 0.0) == 0.0625
+    assert gateway._retry_delay(4, 0.0, 4.0, 2.0, 0.0) == 0.0
+    assert gateway._retry_delay(4, 0.5, 0.0, 2.0, 0.0) == 0.0
+
+
 def test_the_streamed_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) -> None:
     """The streamed twin of `test_the_retry_is_reported_before_the_wait_not_after_it`.
 

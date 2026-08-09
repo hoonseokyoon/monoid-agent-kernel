@@ -7,11 +7,17 @@ common pieces here so the two adapters cannot drift.
 
 from __future__ import annotations
 
+import math
 import random
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
+
+# ``log(float_max)``. Past this many multiplier-steps the POWER alone leaves the float range,
+# whatever the capped product would have been. Read by :func:`_capped_backoff`.
+_MAX_FINITE_LOG = math.log(sys.float_info.max)
 
 
 def retry_delay_s(
@@ -30,10 +36,58 @@ def retry_delay_s(
     because that module's tests pin and monkeypatch the schedule through the old name.
     """
 
-    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
+    delay = _capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
     if jitter_s > 0:
         delay += random.uniform(0, jitter_s)
     return delay
+
+
+def _capped_backoff(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+) -> float:
+    """``initial_delay_s * backoff_multiplier ** (attempt - 1)``, never above ``max_delay_s``.
+
+    ``max_delay_s`` caps the arithmetic, not only its result. Capping only the result --
+    ``min(max_delay_s, initial * multiplier ** (attempt - 1))`` -- lets the power leave the float
+    range before the cap is ever consulted, and ``float ** int`` raises ``OverflowError`` there
+    rather than saturating at infinity. A policy the spec ACCEPTS reaches that: ``max_attempts``
+    is validated as an integer above zero and ``backoff_multiplier`` as any positive finite
+    number, neither with an upper bound, so ``1e308`` overflows on the third attempt and the
+    default ``2.0`` on the 1025th -- while the configured cap still says four seconds.
+
+    All three loops evaluate the schedule inside an ``except`` handler for a retryable
+    ``ModelAdapterError``. An arithmetic error raised there does not merely add noise: it
+    REPLACES the failure being reported, so the layer above gets an unclassified
+    ``OverflowError`` instead of the taxonomy (``retryable``, ``code``, ``http_status``) it
+    retries, reports and stamps receipts on. So the exponent is bounded before the power.
+
+    Two bounds and the smaller wins. At ``saturating`` the product has already reached the cap,
+    so the answer IS the cap and no larger exponent can change it -- that bound is exact, and it
+    is the one every real policy meets. ``representable`` is the arithmetic's own ceiling: it can
+    only bind first when ``max_delay_s / initial_delay_s`` exceeds the entire float range, and
+    the answer saturates there too, at most one step earlier than the product would have.
+    """
+
+    exponent = max(0, attempt - 1)
+    # Nothing to grow (the first attempt), or nothing a growth could change: a zero initial
+    # delay keeps the product at zero and a zero cap keeps the answer there. Settled here so
+    # the logarithms below only ever see a positive finite input.
+    if exponent == 0 or initial_delay_s <= 0.0 or max_delay_s <= 0.0:
+        return min(max_delay_s, initial_delay_s)
+    # A multiplier that does not grow drives the power toward zero, never out of range.
+    if backoff_multiplier <= 1.0:
+        return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
+    growth_per_step = math.log(backoff_multiplier)
+    saturating = (math.log(max_delay_s) - math.log(initial_delay_s)) / growth_per_step
+    representable = _MAX_FINITE_LOG / growth_per_step
+    # ``int >= float`` compares exactly in Python, so ``attempt`` is never itself converted --
+    # the guard against an oversized exponent cannot be defeated by the exponent's own size.
+    if exponent >= min(saturating, representable):
+        return max_delay_s
+    return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
