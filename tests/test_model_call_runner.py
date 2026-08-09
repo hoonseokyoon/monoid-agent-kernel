@@ -3964,6 +3964,111 @@ def test_a_turn_the_normalizer_refuses_still_logs_its_dispatch() -> None:
     assert entry.error_code == receipt.error_code
 
 
+def test_a_refused_turn_does_not_inherit_an_earlier_attempts_retry_report() -> None:
+    """The fallback arm's retry flag is attempt-scoped too, and it was the whole call's fold.
+
+    The entry for a turn the normalizer refuses is built from the failed receipt, because that
+    is where the exception's facts were already extracted. ``provider_retried`` is the one field
+    on that receipt which is NOT this attempt's: the settle handler folds the call's whole retry
+    history onto the escaping error first (``if progress.retried: mark_provider_retried(exc)``),
+    and ``with_error`` reads it back. So an adapter that retried internally during dispatch one
+    and then returned an unusable turn on dispatch two marked dispatch TWO as having reported a
+    retry it never made -- an audit log that misattributes the fact it exists to attribute.
+
+    The sibling arms already avoid exactly this: the in-loop entry probes the exception before
+    the fold is applied, and the success entry counts channel reports across its own dispatch.
+    This is the third construction site, holding the rule the other two hold.
+    """
+
+    class ReportsThenRefuses:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                report_provider_retried()
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=ReportsThenRefuses(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    first, second = receipt.attempt_log
+    assert first.provider_retried is True
+    assert second.provider_retried is False
+    # The receipt keeps the fold: one call did see a provider retry. Only the per-attempt row
+    # narrows, which is the whole reason the log exists beside the count.
+    assert receipt.provider_retried is True
+
+
+def test_every_attempt_entry_scopes_its_retry_flag_to_its_own_dispatch() -> None:
+    """Derived census over all three construction sites, not a pin on the arm that was wrong.
+
+    ``ModelCallAttempt`` is built in three places -- the absorbed-attempt probe, the
+    normalizer-refusal fallback, and the answering attempt -- and ``provider_retried`` is the
+    field with a wrong source lying right next to the right one: the receipt in scope carries the
+    whole CALL's fold, so reading it is a one-word slip that produces a plausible, wrong log.
+    Two sites had the rule and the third did not, which is precisely the asymmetry this
+    repository keeps re-earning, so the instrument enumerates the sites instead of asserting
+    against the one that got fixed.
+
+    The rule is spelled as provenance rather than value: every entry's ``provider_retried`` is
+    computed from ``reports_before`` -- the channel count snapshotted when THIS dispatch began --
+    and none of them reaches into ``failed``, the settled receipt whose flag the outer handler
+    has already folded. A fourth construction site, or a fold creeping back into any of the
+    three, reddens here before any behaviour test would notice.
+    """
+
+    import ast
+    from pathlib import Path as _Path
+
+    source = (
+        _Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "model_call.py"
+    ).read_text(encoding="utf-8")
+    sites = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelCallAttempt"
+    ]
+    assert len(sites) == 3, {"construction_sites": [node.lineno for node in sites]}
+
+    expressions: dict[int, str] = {}
+    for node in sites:
+        flags = [keyword for keyword in node.keywords if keyword.arg == "provider_retried"]
+        assert len(flags) == 1, {
+            "line": node.lineno,
+            "hint": "an entry that omits the flag defaults it, which is a claim not a reading",
+        }
+        expressions[node.lineno] = ast.unparse(flags[0].value)
+
+    unscoped = {
+        line: expression
+        for line, expression in expressions.items()
+        if "reports_before" not in expression or "failed." in expression
+    }
+    assert unscoped == {}, {
+        "sites_not_scoped_to_their_own_dispatch": unscoped,
+        "hint": "count this dispatch's own reports: progress.count > reports_before",
+    }
+
+
 class _FlakyStream:
     """A stream that dies once -- before its first chunk, or after delivering one."""
 

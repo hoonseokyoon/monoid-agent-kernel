@@ -786,7 +786,15 @@ class ModelCallRunner:
                         # The failure happened between the dispatch's return and the settle
                         # (the normalizer refused the turn), so no attempt-scoped probe exists;
                         # the entry mirrors the receipt, which extracted the same facts from
-                        # the same exception.
+                        # the same exception -- every fact except one. ``provider_retried`` on
+                        # that receipt is the whole CALL's fold: the handler above stamps
+                        # ``progress.retried`` onto the escaping error before ``with_error``
+                        # reads it, so mirroring it here would credit this dispatch with a
+                        # report an earlier absorbed one made. Counted on this attempt's own
+                        # channel instead, the way both sibling construction sites count it.
+                        # The refused turn's own declaration is not consulted: the normalizer
+                        # rejected that turn, and a fact read off a value the call refused is
+                        # not a fact the call may report.
                         attempt_log.append(
                             ModelCallAttempt(
                                 index=attempts_made,
@@ -796,7 +804,7 @@ class ModelCallRunner:
                                 retryable=failed.retryable,
                                 config_recoverable=failed.config_recoverable,
                                 http_status=failed.http_status,
-                                provider_retried=failed.provider_retried,
+                                provider_retried=progress.count > reports_before,
                                 usage=failed.usage,
                                 stream_committed=delivered,
                             )
