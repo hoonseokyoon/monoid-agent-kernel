@@ -74,7 +74,6 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
-    provider_usage_of,
     resolved_provider_name,
 )
 from monoid_agent_kernel.providers._common import retry_delay_s
