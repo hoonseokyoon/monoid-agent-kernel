@@ -1142,6 +1142,11 @@ def test_the_new_arms_backfill_and_never_overwrite_a_refusal_that_named_itself()
     broken" one hop out.
     """
 
+    # ``next_turn`` does ``from openai import OpenAI`` and refuses with a code-less
+    # "openai package is not installed" BEFORE it reaches ``_classified_payload`` -- so without
+    # the SDK this asserts a property of a path the environment prevents it from entering.
+    pytest.importorskip("openai")
+
     adapter = _adapter()
     unserializable = ModelRequest(
         instruction="hi", system_prompt="", tools=(), output_schema={"enum": {1, 2}}

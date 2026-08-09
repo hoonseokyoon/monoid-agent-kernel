@@ -1745,8 +1745,18 @@ send.
   honors. A retryable failure stays `pending` and redrives up to `outbox_max_attempts`, then
   dead-letters as `failed`. No sender → requests stay durably `pending`.
 - **Backoff + redrive (retry decoupled from run activity)**: a retryable failure stamps a durable
-  `next_attempt_at` on the request — capped exponential backoff with **full jitter** (`uniform(0,
-  min(outbox_retry_cap_s, outbox_retry_base_s * outbox_retry_factor**attempts))`). The drain only
+  `next_attempt_at` on the request — capped exponential backoff with **full jitter**
+  (`uniform(0, ceiling)`, the ceiling being `outbox_retry_base_s * outbox_retry_factor**attempts`
+  bounded by `outbox_retry_cap_s`). The cap binds the **exponent**, not only the product it
+  multiplies out to, and the schedule is the model-retry loops' own
+  (`providers/_common.capped_backoff`): these four fields carry no validation, computing the power
+  first lets it leave the float range before the cap is ever consulted, and the schedule is
+  evaluated *after* `sender.send` returns — so an arithmetic error there would lose the receipt for
+  a side effect that already happened. Hence one rule, applied ahead of every shortcut that reasons
+  about the base or the cap: **growth the schedule cannot resolve resolves upward, to the cap** — a
+  `NaN` factor (which raises rather than orders), an infinite one, and a zero base under either
+  (`0 * inf` is `nan`, not zero). The other end of that range is a zero ceiling, `uniform(0, 0)`,
+  an unthrottled resend against the endpoint that just refused. The drain only
   dispatches **due** requests (`loop.due_outbox(now)`; a freshly staged one has `next_attempt_at=0.0`
   → due immediately, so the happy path is unchanged), and because the schedule is on the checkpoint
   it survives a restart. The backend's **watchdog tick** also runs `_redrive_outbox()`: for each live
