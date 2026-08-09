@@ -40,26 +40,55 @@ out in commit messages and here.
   `unrecorded_reason` is checked the same way, by membership in the schema's own enum: coerced, a
   missing marker or a `false` became `""` — the value meaning "recorded normally" — so a damaged
   record with a well-formed body beside it replayed as a successful turn.
-- **The reader and `monoid validate` now agree on what a damaged payload record is.** Three
-  successive review rounds found the same shape — the reader validating what it *keys* on and
-  indexing what the schema calls corrupt, so `rejected_records` stayed zero and the replay preflight
-  reported a damaged corpus as sound. Rather than add the reported field a fourth time, the
-  comparison is now made by machine over every field of every record kind, and it found five groups
-  where reading had found two: an unknown or missing `kind` (silently ignored, *after* its run id
-  had been taken for `attributes.replay_from`), a request with no `payload`, a negative
-  `call_index`, and a `response` that is neither an object nor null. Full schema validation in the
-  reader was measured and rejected: `is_valid` costs ~650µs per record against this schema — 41× a
-  `json.loads` — which is 6.5 seconds of startup for a 10,000-record corpus, so the exhaustive
-  comparison runs in the suite and the reader keeps cheap hand-written guards that it pins.
+- **The reader and `monoid validate` now agree on what a damaged payload record is, because the
+  reader *is* the schema.** Four successive review rounds found the same shape — the reader
+  validating what it *keys* on and indexing what the schema calls corrupt, so `rejected_records`
+  stayed zero and the replay preflight reported a damaged corpus as sound. `_index` no longer
+  restates the schema field by field; it runs `MODEL_PAYLOADS_RECORD_SCHEMA`'s own branch, selected
+  by `kind`, which is equivalent to the top-level `oneOf` because each branch pins `kind` with
+  `const`. That closes the class rather than the reported field: unknown and cross-kind properties
+  are refused (every branch is `additionalProperties: false`), along with the unknown `kind`,
+  absent `payload`, negative `call_index` and non-object `response` earlier rounds each found one
+  at a time. The two checks the schema cannot make are all that stay hand-written — a chunk's
+  bytes re-hashed against its name, and the empty response digest, which is legal and unjoinable
+  rather than damaged.
+
+  The measurement that had ruled this out was of the wrong placement. The whole `oneOf` costs
+  ~232µs per record because it tries all three branches; the branch alone costs ~14.8µs, 4.5× a
+  `json.loads` of the same line and 0.15s for a 10,000-record corpus at construction.
+  `test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is` is now the equivalence proof
+  for the dispatch and runs in both directions — reader-looser is the defect, reader-stricter has
+  to be enumerated and now *fails* when it is not.
+- **A union whose sources disagree about the recorded provider declaration is refused.** The rule
+  that declines to declare was made run-scoped in an earlier round; the positive half beside it
+  stayed a global flag, so one source carrying an injected reasoning block declared for the whole
+  union — including a source whose own history and reasoning-bearing answers prove its original did
+  not declare. Replay then injected blocks that source's preimages never had, recomputing every key
+  from its second turn on, while the preflight saw one provider and one model across the union and
+  said nothing. Within a run the two co-occur by construction and the positive evidence still wins;
+  across runs it is a contradiction, and the corpus is refused with both run sets named.
+- **A duplicate request record must hash to the key it claims to share.** A request recorded by two
+  runs is credited to both, which is what lets a run holding both halves of the evidence intersect
+  itself — but it credited on digest equality alone. The first record's payload has always been
+  re-hashed before its terms are believed; every duplicate behind it was believed for repeating a
+  name, which is the one claim an edited record can make for free. An altered run could therefore
+  be reported as carrying another run's assistant history. Each contributor now keeps its own
+  payload and is re-hashed against the shared digest before its run is credited.
 - **A discarded outcome is handed back on every path that drops one, not just the first.** A run
-  boundary can throw away a real result in four places: the boundary check finding the call already
+  boundary can throw away a real result in five places: the boundary check finding the call already
   done, the awaiter's own cleanup finding it done a moment later, an async callee settling after
-  detach, and a synchronous worker settling inside the abandonment grace once its waiter is
-  cancelled. Only the first was wired. The last is the one that mattered most for replay — the
-  worker had already advanced the cursor, and its answer was dropped where only awaitables are
-  disposed of, so a `ModelTurn` simply vanished and the slot stayed spent. All four now go through
-  one `hand_back_discarded` rule, and `AbandonableSyncCall` carries a `set_discard_hook` the
-  awaiter installs.
+  detach, a synchronous worker settling inside the abandonment grace once its waiter is cancelled,
+  and a caller abandoning a call it never got to wait on — `ModelCallRunner` resolves its grace
+  accessor after the call is already live, so an accessor that raises takes an exit that carried no
+  hook. Only the first was wired. The grace one mattered most for replay — the worker had already
+  advanced the cursor, and its answer was dropped where only awaitables are disposed of, so a
+  `ModelTurn` simply vanished and the slot stayed spent. All five now go through one
+  `hand_back_discarded` rule, `AbandonableSyncCall` carries a `set_discard_hook` the awaiter
+  installs, and `abandon_unwaited_call` carries the hook for both of its own halves. The count is
+  no longer taken by reading: a previous round counted four by reading `core/_sync_bridge.py`, and
+  the fifth was a caller's other exit in another module, so
+  `test_every_abandonable_call_site_routes_its_discards` censuses call sites and requires a
+  function that routes discards on one exit to route them on all of them.
 - **Deriving the adapter no longer materializes the response corpus.** `response_bodies_view()`
   built a tuple of every answer body so the impersonation derivation could ask one boolean per
   body. Bodies reach the 8 MB payload ceiling and nothing bounds how many there are, so

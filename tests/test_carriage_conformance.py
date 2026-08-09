@@ -7247,3 +7247,75 @@ def test_each_sse_frame_writer_escapes_the_unicode_line_separators(module: str, 
             "hint": "U+2028/U+2029/U+0085 survive ensure_ascii=False and split the frame for "
             "every str.splitlines reader (httpx aiter_lines); pass ensure_ascii=True",
         }
+
+
+# --------------------------------------------------------------------------------------
+# Abandonable calls: every exit that drops a produced answer hands it back
+# --------------------------------------------------------------------------------------
+
+_ABANDONABLE_ENTRIES = ("await_abandonable_call", "abandon_unwaited_call")
+"""The two ways a caller hands a live call to ``core/_sync_bridge.py``.
+
+Not ``detach_unfinished_call``: it is the bridge's own plumbing, reached only through these two,
+and the bridge is the module whose internal drop paths a previous round already counted.
+"""
+
+
+def _abandonable_call_sites() -> dict[str, list[tuple[ast.Call, bool]]]:
+    """Every call to an abandonable-call entry point in the package, grouped by the function
+    that makes it, with whether it passes ``on_discarded``."""
+
+    sites: dict[str, list[tuple[ast.Call, bool]]] = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        for owner in ast.walk(_module_tree(relative)):
+            if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            found = [
+                (node, any(keyword.arg == "on_discarded" for keyword in node.keywords))
+                for node in ast.walk(owner)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _ABANDONABLE_ENTRIES
+            ]
+            if found:
+                sites[f"{relative}:{owner.name}"] = found
+    return sites
+
+
+def test_every_abandonable_call_site_routes_its_discards() -> None:
+    """A caller that knows where a discarded answer belongs says so on *every* exit it has.
+
+    The rule this pins was already written down: a callee holding shared state cannot tell which
+    of its caller's exits was taken, so an answer dropped on any of them leaves that state saying
+    work was delivered that never was. The replay adapter advances a per-key cursor when it hands
+    an answer over, so one unrouted exit means the next caller is served a different call's
+    recording -- structurally valid, and wrong.
+
+    A previous round counted the drop paths and found four, wired all four, and said so in a
+    commit message. The count was taken by reading ``core/_sync_bridge.py``; the fifth was a
+    *caller's* other exit, in ``model_call.py``, where an accessor raising before the wait is
+    entered abandons a call that is already live. Reading a module cannot find a site outside it,
+    which is why this census is over call sites and not over a file -- the same correction, one
+    level up, as the reader/schema census that stopped being a hand-kept field table.
+
+    Stated as consistency rather than as a list, so it needs no exemption for the callers that
+    correctly pass nothing: the native tool handler's callee holds no cursor, and a function that
+    routes discards nowhere is not the failure. A function that routes them on one exit and not
+    its twin is.
+    """
+
+    inconsistent = {
+        owner: {
+            "routed": [call.lineno for call, routed in found if routed],
+            "unrouted": [call.lineno for call, routed in found if not routed],
+        }
+        for owner, found in _abandonable_call_sites().items()
+        if len({routed for _call, routed in found}) > 1
+    }
+    assert not inconsistent, {
+        "sites": inconsistent,
+        "hint": "this function abandons a live call on one exit without the discard hook it "
+        "passes on another; the callee cannot tell the exits apart, so a replay slot stays "
+        "spent and the next caller receives the following recording",
+    }

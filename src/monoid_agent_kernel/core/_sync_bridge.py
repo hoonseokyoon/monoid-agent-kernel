@@ -410,7 +410,9 @@ async def await_abandonable_call(
             consume_and_hand_back(task, on_discarded)
 
 
-async def abandon_unwaited_call(pending: Any, *, grace_s: float) -> None:
+async def abandon_unwaited_call(
+    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None
+) -> None:
     """Release a call that was started but whose wait will never be entered.
 
     ``await_abandonable_call`` sets up its cleanup *inside* itself, so anything that fails between
@@ -419,11 +421,24 @@ async def abandon_unwaited_call(pending: Any, *, grace_s: float) -> None:
     when it is collected. Normalizes ``pending`` the same way the wait does, so the two cannot
     disagree about what a call is, and then hands it to the ordinary detach path -- an abandonment
     here is a real abandonment and is reported like one.
+
+    It carries the discard hook for the same reason the wait does, and the omission was the fifth
+    drop path after a previous round counted four and said so. The four were counted by reading
+    *this file*; this one is a caller's other exit, so the census that would have found it has to
+    be over call sites rather than over a module --
+    ``test_every_abandonable_call_site_routes_its_discards`` is that census. A callee holding
+    shared state cannot tell which exit the caller took: a replay worker that returns a hit after
+    an accessor raised has already advanced its cursor, so the answer is dropped, the slot stays
+    spent, and the next caller is handed the following recording.
     """
 
     sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
     task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
-    await detach_unfinished_call(task, sync_call, grace_s=grace_s)
+    if sync_call is not None:
+        # Both halves, not just the detach: a blocking worker still inside the provider delivers
+        # through `deliver`, which reads this hook and never the argument below.
+        sync_call.set_discard_hook(on_discarded)
+    await detach_unfinished_call(task, sync_call, grace_s=grace_s, on_discarded=on_discarded)
 
 
 async def detach_unfinished_call(

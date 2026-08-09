@@ -41,8 +41,6 @@ from monoid_agent_kernel.core.model_payloads import (
     PAYLOAD_OFFLOAD_THRESHOLD_BYTES,
     chunk_record,
     model_request_record,
-    chunk_record,
-    model_request_record,
     model_response_record,
     read_corpus_records,
 )
@@ -917,21 +915,21 @@ Being stricter is never the failure this census is looking for; being *looser* i
 
 
 def test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is(tmp_path: Path) -> None:
-    """The divergence class, closed by machine instead of one field per review round.
+    """The divergence class, and the proof that the reader now *is* the schema.
 
-    Three consecutive rounds found the same shape -- the reader validating what it *keys* on and
+    Four consecutive rounds found the same shape -- the reader validating what it *keys* on and
     accepting what ``monoid validate`` calls corrupt -- and each was repaired by adding the field
-    that had been reported. This asks the question the way it should have been asked from the
-    start: for every field of every record kind, does the reader count as damage exactly what the
-    schema rejects? It found five groups where three rounds of reading had found two.
+    that had been reported. The reader now runs ``MODEL_PAYLOADS_RECORD_SCHEMA``'s own branch
+    rather than restating it, so this census stopped being a drift alarm over two hand-kept
+    tables and became the equivalence proof for that dispatch: selecting a branch by ``kind`` and
+    validating it must reject exactly what the top-level ``oneOf`` rejects.
 
-    The check lives here rather than in ``_index`` because it cannot afford to live there.
-    Measured: ``Draft202012Validator.is_valid`` costs ~650us per record against this schema --
-    41x a ``json.loads`` of the same line, and a top-level ``oneOf`` over three branches with
-    ``additionalProperties: False`` is inherently that. A 10,000-record corpus would pay 6.5
-    seconds on every replay run, at adapter construction, before a single call is served. So the
-    exhaustive comparison runs where it is free and the reader keeps its hand-written guards --
-    with this test as the thing that stops them drifting apart again.
+    Its previous shape is why it needed one. It mutated ``for field in base`` -- every field
+    *present in the fixture* -- so a record carrying an **unknown extra** property was a case it
+    could not express, and every branch of the schema is ``additionalProperties: False``. Reading
+    found that gap no faster than it had found the four before it; the review did. An enumeration
+    is only as complete as the shapes it can generate, which is the same lesson as the fields,
+    one level up.
 
     Reader-stricter is fine and enumerated; reader-looser is the defect.
     """
@@ -976,10 +974,16 @@ def test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is(tmp_path: P
         return ReplayCorpus.load([run_dir]).rejected_records > 0
 
     looser: list[str] = []
+    stricter: list[str] = []
     case = 0
     for kind, base in bases.items():
         assert validator.is_valid(base), f"the {kind} fixture must be a record the schema accepts"
-        for field in base:
+        # The fields the fixture has, plus the ones it must not: every branch is
+        # `additionalProperties: False`, so a property that belongs to a *different* kind is as
+        # corrupt as a garbage one, and neither could be generated while the loop only walked
+        # `base`. `unknown_property` is the plain case the review reported.
+        strangers = {name for other in bases.values() for name in other} - set(base)
+        for field in (*base, *sorted(strangers), "unknown_property"):
             for value in planted:
                 case += 1
                 record = (
@@ -987,16 +991,30 @@ def test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is(tmp_path: P
                     if value is drop
                     else {**base, field: value}
                 )
-                if validator.is_valid(record) or (kind, field) in _READER_STRICTER_THAN_SCHEMA:
-                    continue
-                if not reader_calls_it_damage(record, case):
-                    shown = "absent" if value is drop else repr(value)
+                exempt = (kind, field) in _READER_STRICTER_THAN_SCHEMA
+                damage = reader_calls_it_damage(record, case)
+                shown = "absent" if value is drop else repr(value)
+                if validator.is_valid(record):
+                    # The other direction, and it was missing: the loop used to `continue` here,
+                    # so the exemption table was a skip list nobody checked rather than a claim
+                    # anything had to earn. A reader that is stricter than the schema in a way
+                    # no one wrote down reports sound corpora as damaged, which is the same
+                    # silence inverted -- and the table is only load-bearing if being absent
+                    # from it fails.
+                    if damage and not exempt:
+                        stricter.append(f"{kind}.{field}={shown}")
+                elif not damage and not exempt:
                     looser.append(f"{kind}.{field}={shown}")
 
     assert not looser, (
         "the reader indexed records `monoid validate` calls corrupt, so `rejected_records` stays "
         "zero and the replay preflight reports a damaged corpus as sound: "
         + ", ".join(looser)
+    )
+    assert not stricter, (
+        "the reader called damage what the schema accepts, without an entry in "
+        "`_READER_STRICTER_THAN_SCHEMA` saying why: "
+        + ", ".join(stricter)
     )
 
 

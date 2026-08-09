@@ -989,11 +989,22 @@ class ModelCallRunner:
         #
         # The static field is what the detach is given, not `_grace_s()`: that is the accessor which
         # may have just raised.
+        #
+        # The discard hook is the same one the wait below is given, and this exit went without it
+        # for a round. The callee cannot tell which exit its caller took: a replay adapter that
+        # answers after `_grace_s()` raised has already advanced its cursor, so dropping the turn
+        # here leaves the slot spent and hands the following recording to the next caller. Both
+        # exits of this function carry it, and
+        # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
         try:
             token = self._token()
             grace_s = self._grace_s()
         except BaseException:
-            await abandon_unwaited_call(pending, grace_s=self.cancel_grace_s)
+            await abandon_unwaited_call(
+                pending,
+                grace_s=self.cancel_grace_s,
+                on_discarded=_discard_hook(adapter, request),
+            )
             raise
         try:
             return await await_abandonable_call(

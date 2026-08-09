@@ -23,6 +23,7 @@ from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.media import WIRE_MEDIA_CARRIERS
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_FILENAME,
+    MODEL_REQUEST_KIND,
     RECORDED_TURN_FIELDS,
     model_response_record,
 )
@@ -2054,3 +2055,171 @@ def test_a_falsy_recorded_container_is_refused_rather_than_defaulted(
         f"a recorded {field} of {planted!r} was defaulted to an empty container instead of "
         f"earning a refusal, so a damaged corpus was answered: {caught.value}"
     )
+
+
+def test_an_answer_landing_after_a_failed_accessor_gives_its_slot_back(tmp_path: Path) -> None:
+    """The fifth way a produced answer is dropped, after a previous round counted four.
+
+    Those four were counted by reading `core/_sync_bridge.py`, and all four were wired. This one
+    is not in that module: `ModelCallRunner._aawait` resolves `current_cancel_grace_s` *after* the
+    call is already live -- on the blocking path a daemon worker is inside the provider -- so an
+    accessor that raises takes the early exit, which abandoned the call without saying where a
+    late answer belongs. A module-scoped census cannot see a caller's other exit; the call-site
+    census `test_every_abandonable_call_site_routes_its_discards` is what does.
+
+    The harm is the adapter's, not the bridge's: `consume` advanced when the recording was handed
+    to that worker, so the answer is dropped, the slot stays spent, and the next call is served
+    the recording that belongs to the one after it.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="ANSWER-1"), ModelTurn(final_text="ANSWER-2")]),
+        [_request(), _request()],
+    )
+
+    class _SettlesAfterTheAccessorRaises(ReplayModelAdapter):
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            # Still inside the provider when the awaiter's accessor raises, and settling after.
+            time.sleep(0.05)
+            return super().next_turn(request)
+
+    def _raises() -> float:
+        raise RuntimeError("the grace accessor failed after the call went live")
+
+    adapter = _SettlesAfterTheAccessorRaises([tmp_path / "runs" / "run-1"])
+    runner = ModelCallRunner(
+        adapter=adapter, current_cancel_grace_s=_raises, cancel_grace_s=2.0
+    )
+    with pytest.raises(RuntimeError):
+        asyncio.run(runner.acall(_request()))
+
+    served = adapter.next_turn(_request())
+
+    assert served.final_text == "ANSWER-1", (
+        "the answer produced after the accessor raised was dropped without the adapter hearing "
+        f"about it, so its slot stayed spent: {served.final_text!r}"
+    )
+
+
+def test_a_duplicate_request_must_hash_to_the_key_it_claims_to_share(tmp_path: Path) -> None:
+    """Repeating a digest is the one claim a forged record can make for free.
+
+    A request recorded by two runs is credited to both, which is right and was added to stop a run
+    that holds both halves of the evidence from failing to intersect itself. It credited on digest
+    equality alone: the *first* record's payload is re-hashed before its terms are believed, and
+    every duplicate behind it was believed on the strength of repeating its name.
+
+    So an edited run-2 that repeats run-1's key with a payload that is not that preimage is
+    reported as carrying run-1's assistant history. Run 2 also holds a reasoning-bearing answer,
+    and the correlation then intersects a continuation run 2 never recorded -- declining a
+    declaration the corpus does not actually contradict, and turning a corpus that replays into
+    one that misses from turn one.
+
+    The direction matters: this is the same rule the first record has always been held to, missing
+    on the records beside it.
+    """
+
+    continuation = _request(
+        "continued",
+        model=ModelConfig(provider="gateway"),
+        messages=[{"role": "assistant", "content": "prior turn"}],
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="plain")], provider_name="openai"),
+        [continuation],
+        run_id="run-1",
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="thought", reasoning=({"type": "reasoning", "id": "o"},))],
+            provider_name="openai",
+        ),
+        [_request("something else entirely")],
+        run_id="run-2",
+    )
+
+    # Run 2's request record now claims run 1's key while holding its own, different preimage --
+    # the shape an edited or truncated corpus produces, and the only thing it had to assert.
+    stolen = json.loads(
+        (tmp_path / "runs" / "run-1" / MODEL_PAYLOADS_FILENAME).read_text(encoding="utf-8")
+        .splitlines()[0]
+    )["request_digest"]
+    path = tmp_path / "runs" / "run-2" / MODEL_PAYLOADS_FILENAME
+    lines = path.read_text(encoding="utf-8").splitlines()
+    forged = []
+    for line in lines:
+        record = json.loads(line)
+        if record.get("kind") == MODEL_REQUEST_KIND:
+            record["request_digest"] = stolen
+        forged.append(json.dumps(record))
+    path.write_text("\n".join(forged) + "\n", encoding="utf-8")
+
+    corpus = ReplayCorpus.load([tmp_path / "runs" / "run-1", tmp_path / "runs" / "run-2"])
+    credited = {run_id for run_id, _terms in corpus.request_terms_view()}
+
+    assert "run-2" not in credited, (
+        "run-2's request record was credited with run-1's continuation on the strength of "
+        f"repeating its digest, without its own payload hashing to it: {sorted(credited)}"
+    )
+
+
+def test_a_union_whose_sources_disagree_about_declaring_is_refused(tmp_path: Path) -> None:
+    """The twin of the run-correlation repair, one line above the repair itself.
+
+    Round 1 of this review made the *negative* evidence run-scoped, because two global `any`s let
+    a union reach a conclusion neither source supported. The positive evidence stayed a global
+    flag: one source carrying an injected reasoning block declares for the whole union, including
+    a source whose own history and reasoning-bearing answers prove its original did not declare.
+
+    Declaring for that source makes the loop inject blocks its recorded preimages never had, so
+    every key from its second turn on is recomputed to something the corpus does not hold -- valid
+    recordings, missing, with a preflight that sees one provider and one model across the union
+    and says nothing.
+
+    Within one run these co-occur by construction (a declaring original both injects and records
+    reasoning), which is why the positive branch wins there. Across runs it is a contradiction,
+    and the corpus cannot be replayed as one adapter under either answer.
+    """
+
+    declared_continuation = _request(
+        "continued",
+        model=ModelConfig(provider="gateway"),
+        messages=[
+            {
+                "role": "assistant",
+                "content": "prior turn",
+                "reasoning": {"provider": "openai", "items": [{"type": "reasoning", "id": "o"}]},
+            }
+        ],
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="declared")], provider_name="openai"),
+        [declared_continuation],
+        run_id="run-1",
+    )
+
+    undeclared_continuation = _request(
+        "continued elsewhere",
+        model=ModelConfig(provider="gateway"),
+        messages=[{"role": "assistant", "content": "prior turn"}],
+    )
+    _record(
+        tmp_path,
+        _OriginalAdapter(
+            [ModelTurn(final_text="thought", reasoning=({"type": "reasoning", "id": "o"},))],
+            provider_name="openai",
+        ),
+        [undeclared_continuation],
+        run_id="run-2",
+    )
+
+    with pytest.raises(ValueError, match="disagree about whether the recorded adapter declared"):
+        _replay(tmp_path, "run-1", "run-2")
+
+    # Each source alone still reaches its own answer -- the refusal is about combining them.
+    assert getattr(_replay(tmp_path, "run-1"), "provider_name", None) == "openai"
+    assert getattr(_replay(tmp_path, "run-2"), "provider_name", None) is None

@@ -76,6 +76,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from jsonschema import Draft202012Validator
+
 from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, sha256_bytes
 from monoid_agent_kernel.core._verified_file import (
     VerifiedFileIdentity,
@@ -85,10 +87,8 @@ from monoid_agent_kernel.core._verified_file import (
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import MAX_MODEL_PAYLOAD_BYTES
 from monoid_agent_kernel.core.model_payloads import (
-    UNRECORDED_REASONS,
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
-    MODEL_PAYLOADS_SCHEMA_VERSION,
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
@@ -99,15 +99,43 @@ from monoid_agent_kernel.core.model_payloads import (
     reassemble_request_preimage,
     response_reference,
 )
+from monoid_agent_kernel.core.schemas import MODEL_PAYLOADS_RECORD_SCHEMA
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.core.payload_replay")
 
-_MISSING: Any = object()
-"""Absent, told apart from a recorded ``null`` -- which is legal and means the body is elsewhere."""
 
-_PAYLOAD_RECORD_KINDS = (PAYLOAD_CHUNK_KIND, MODEL_REQUEST_KIND, MODEL_RESPONSE_KIND)
-"""The three kinds ``MODEL_PAYLOADS_RECORD_SCHEMA`` discriminates on. A record outside them is
-one the schema refuses, so the reader refuses it too rather than ignoring it."""
+def _branch_validators() -> dict[str, Draft202012Validator]:
+    """``MODEL_PAYLOADS_RECORD_SCHEMA``'s three branches, pre-compiled and keyed by their kind.
+
+    Derived from the schema rather than restated beside it. Four consecutive review rounds found
+    the same defect -- the reader validating what it *keys* on while indexing a record
+    ``monoid validate`` calls corrupt, so ``rejected_records`` stayed zero and the preflight, whose
+    soundness claim is its silence, said nothing. Every one of those was a field the reader's
+    hand-written table did not mention, and repairing the reported field left the next one.
+
+    Selecting the branch by ``kind`` is equivalent to the top-level ``oneOf`` because each branch
+    pins ``kind`` with ``const`` to a distinct value, so a record can satisfy at most one; a
+    missing, non-string or unknown ``kind`` matches none, which is the same refusal ``oneOf``
+    gives. That equivalence is not left to this paragraph --
+    ``test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is`` asserts it against the
+    real validator over every planted mutation of every field, and the added-property case that
+    census used to be unable to express.
+
+    Selecting is also what makes it affordable, which reverses the previous round's decision on a
+    measurement of the placement that decision was actually about. The whole ``oneOf`` costs
+    ~232us per record because it tries all three branches and ``additionalProperties: False``
+    makes each failure expensive; the branch alone costs ~14.8us, 4.5x a ``json.loads`` of the
+    same line and 0.15s for a 10,000-record corpus at construction. The number that ruled this
+    out measured the ``oneOf``, not the question.
+    """
+
+    compiled: dict[str, Draft202012Validator] = {}
+    for branch in MODEL_PAYLOADS_RECORD_SCHEMA["oneOf"]:
+        compiled[branch["properties"]["kind"]["const"]] = Draft202012Validator(branch)
+    return compiled
+
+
+_PAYLOAD_BRANCH_VALIDATORS = _branch_validators()
 
 MISS_NO_KEY = "no_key"
 MISS_ABSENT = "absent"
@@ -163,31 +191,6 @@ class ReplayMissReason:
     """The position this refusal is standing on, when a record earned it -- the coordinate
     :meth:`ReplayCorpus.spend_refused` needs to move past exactly that one and no other. An
     integer position discloses nothing; it is the same kind of fact as ``call_index``."""
-
-
-def _has_sound_envelope(record: Mapping[str, Any]) -> bool:
-    """Whether a payload record carries the envelope every kind of it must carry.
-
-    The same three terms ``schemas.py`` requires of all three kinds -- non-empty ``run_id`` and
-    ``root_run_id``, a ``Z``-suffixed ``recorded_at`` -- checked here so the reader and
-    ``monoid validate`` cannot disagree about whether a corpus is damaged. They disagreed: the
-    reader validated the two fields it *keys* on and substituted the three it *reports* with, so a
-    record the validator calls corrupt was queued, served as a successful turn, and left
-    ``rejected_records`` at zero, which is what the preflight reads before telling an operator the
-    corpus is sound.
-
-    ``run_id`` in particular stopped being merely descriptive when it became the unit the
-    impersonation evidence correlates on: two damaged records in two unrelated runs both coerced
-    to ``""``, so they *intersected*, reintroducing the cross-run contamination that correlation
-    exists to prevent.
-    """
-
-    for name in ("run_id", "root_run_id"):
-        value = record.get(name)
-        if not isinstance(value, str) or not value:
-            return False
-    recorded_at = record.get("recorded_at")
-    return isinstance(recorded_at, str) and recorded_at.endswith("Z")
 
 
 @dataclass(frozen=True)
@@ -371,7 +374,12 @@ class ReplayCorpus:
 
     def __init__(self) -> None:
         self._requests: dict[str, _RequestEntry] = {}
-        self._request_runs: dict[str, list[str]] = {}
+        self._request_contributors: dict[str, list[_RequestEntry]] = {}
+        """Every record that claimed this digest, one per run, each still holding its **own**
+        payload. Held as entries rather than as bare run ids because a duplicate has to earn its
+        provenance the same way the first record does: it was credited with the first record's
+        terms on the strength of repeating its digest, which is the one thing an edited record can
+        assert for free."""
         self._responses: dict[str, list[_ResponseEntry]] = {}
         self._cursors: dict[str, int] = {}
         self._pending_releases: dict[str, set[int]] = {}
@@ -388,7 +396,7 @@ class ReplayCorpus:
         self._response_run: dict[str, str] = {}
         self._crossed: set[str] = set()
         self._crossed_within_one_run: set[str] = set()
-        self._terms_cache: dict[str, Mapping[str, Any] | None] = {}
+        self._terms_cache: dict[tuple[str, int], Mapping[str, Any] | None] = {}
         self._profiles: tuple[dict[str, Any], ...] | None = None
         self._lock = threading.Lock()
 
@@ -480,79 +488,53 @@ class ReplayCorpus:
         return os.path.normcase(os.path.realpath(path))
 
     def _index(self, record: Mapping[str, Any], *, source: int = 0) -> None:
-        if record.get("schema_version") != MODEL_PAYLOADS_SCHEMA_VERSION:
-            # The validator enforces this on the same bytes, and a reader that skipped it
-            # would serve a corpus the kernel's own `monoid validate` calls corrupt -- or,
-            # after a version bump, serve v2 answers as though the v1 field semantics still
-            # held. A version is a promise about what the other fields mean.
-            self._rejected += 1
-            return
-        if not _has_sound_envelope(record):
-            # Before the kind dispatch, because the envelope is common to all three kinds and
-            # the coercions it replaces were spread across two of them. Validating it in the
-            # answer arm alone would leave the identical `str(... or "")` standing one branch up
-            # in the request arm -- the half-bound rule this reader keeps paying for.
-            self._rejected += 1
-            return
         kind = record.get("kind")
-        if kind not in _PAYLOAD_RECORD_KINDS:
-            # Before the run id is collected, not after. The dispatch below had no rejection arm,
-            # so a record with a valid version and envelope and an unknown `kind` was counted
-            # nowhere and dropped silently -- while its run id had already been taken, which is
-            # what `attributes.replay_from` stamps. A corpus could therefore contribute
-            # provenance from a line the schema's top-level `oneOf` refuses outright.
+        # One question, one authority. The reader used to re-state the schema field by field --
+        # version, envelope, kind, digest patterns, `call_index`, `refs`, `digest_generation`,
+        # `payload`, `response`, `unrecorded_reason` -- and every review round for four rounds
+        # running found another field the restatement had not reached. What the schema says is
+        # damaged is now asked of the schema, so there is no second table left to drift.
+        #
+        # Before the run id is collected, not after: a record the schema refuses used to be
+        # ignored silently *after* its run id had been taken, and that set is what
+        # `attributes.replay_from` stamps -- so a line `monoid validate` rejects outright could
+        # still contribute provenance.
+        validator = _PAYLOAD_BRANCH_VALIDATORS.get(kind) if isinstance(kind, str) else None
+        if validator is None or not validator.is_valid(record):
             self._rejected += 1
             return
         run_id = record["run_id"]
         if run_id not in self._run_ids:
             self._run_ids.append(run_id)
         if kind == PAYLOAD_CHUNK_KIND:
-            text = record.get("text")
-            sha = record.get("sha256")
-            if not isinstance(text, str) or not is_chunk_sha256(sha):
-                self._rejected += 1
-                return
-            data = text.encode("utf-8")
-            # Re-hashed before it is believed, exactly like the validator: an inline chunk
-            # that lies about its name must not become resolvable under that name.
+            sha = record["sha256"]
+            data = record["text"].encode("utf-8")
+            # The one check that stays hand-written, because it is the one the schema cannot make:
+            # `text` is only "a string" to it. Re-hashed before it is believed, exactly like the
+            # validator does on the same bytes -- an inline chunk that lies about its name must
+            # not become resolvable under that name. Reader-stricter is the enumerated exemption
+            # in the reader/schema census; reader-looser is what that census exists to catch.
             if sha256_bytes(data) != sha:
                 self._rejected += 1
                 return
             self._chunks.setdefault(sha, data)
         elif kind == MODEL_REQUEST_KIND:
-            digest = record.get("request_digest")
-            refs = record.get("refs")
-            generation = record.get("digest_generation")
-            if (
-                not is_chunk_sha256(digest)
-                or not isinstance(refs, bool)
-                or not isinstance(generation, str)
-                or not generation
-            ):
-                self._rejected += 1
-                return
+            digest = record["request_digest"]
+            refs = record["refs"]
+            generation = record["digest_generation"]
             if generation not in self._generations:
                 self._generations.append(generation)
             # First-wins across duplicates: a durable resume re-records the same digest with
             # an empty seen-set, and the earliest record is the one whose activation the
             # file-order answers below it belong to.
             record_run = record["run_id"]
-            if "payload" not in record:
-                # Required by the schema, and its absence is not the same as a payload that is
-                # merely unreadable: a record with no preimage at all cannot be re-hashed against
-                # its own key, so treating it as a narrowed-but-honest corpus would let a forged
-                # key testify.
-                self._rejected += 1
-                return
-            self._requests.setdefault(
-                digest,
-                _RequestEntry(
-                    generation=generation,
-                    refs=refs,
-                    payload=record.get("payload"),
-                    run_id=record_run,
-                ),
+            entry = _RequestEntry(
+                generation=generation,
+                refs=refs,
+                payload=record["payload"],
+                run_id=record_run,
             )
+            self._requests.setdefault(digest, entry)
             # The runs, however, accumulate. First-wins is right for the PAYLOAD and wrong for
             # provenance: a request recorded by two runs was recorded by both of them, and the
             # evidence correlation downstream asks which runs hold a given continuation. Keeping
@@ -561,55 +543,37 @@ class ReplayCorpus:
             # proves it must not -- and a wrong declaration injects blocks the recorded preimages
             # never had. Duplicate digests across a resume or a union are supported, not exotic:
             # `crossed_keys` exists to count them.
-            runs = self._request_runs.setdefault(digest, [])
-            if record_run not in runs:
-                runs.append(record_run)
+            #
+            # Each contributor keeps its own payload, because repeating a digest is not evidence
+            # of holding the continuation it names -- it is the single claim a forged record can
+            # make at no cost. `request_terms_view` re-hashes each one before it credits the run,
+            # which is the rule the first record has always been held to and the duplicates were
+            # not. Lazily, there: a chunk this payload references may be read after it, or out of
+            # another source of the union, so nothing can be reassembled while indexing.
+            #
+            # One entry per run, first-wins within a run too. A run that records one digest twice
+            # with *different* preimages is asserting a hash collision, so preferring its later
+            # record could only ever prefer a forgery.
+            contributors = self._request_contributors.setdefault(digest, [])
+            if all(held.run_id != record_run for held in contributors):
+                contributors.append(entry)
         elif kind == MODEL_RESPONSE_KIND:
-            digest = record.get("request_digest")
-            if not is_chunk_sha256(digest):
-                # The empty digest, and only it. It is legal and deliberate -- a keyless call
-                # still records its answer -- but it can never be *asked for* by digest, so it
-                # has no queue to join. That is the reader declining to index a healthy record,
-                # not damage: counting it as damage made every corpus holding one `too_large`
-                # call (an operational condition, not a defect) announce itself as broken to an
-                # operator whose `monoid validate` says it is clean.
-                #
-                # Anything else here is damage by construction. `schemas.py` allows exactly
-                # `^(|[0-9a-f]{64})$` and the writer emits only those two shapes, so a
-                # non-empty value that is not a name is a record `monoid validate` calls
-                # corrupt -- and calling it healthy is the same silence, mirrored: the
-                # preflight says nothing, and the miss it causes is diagnosed `absent`, which
-                # blames the original call for a failure that is the corpus's.
-                if digest == "":
-                    self._unjoinable += 1
-                else:
-                    self._rejected += 1
+            digest = record["request_digest"]
+            if digest == "":
+                # The empty digest, and only it -- `schemas.py` allows exactly
+                # `^(|[0-9a-f]{64})$` here, so the check above has already refused every other
+                # non-name. It is legal and deliberate -- a keyless call still records its answer
+                # -- but it can never be *asked for* by digest, so it has no queue to join. That
+                # is the reader declining to index a healthy record, not damage: counting it as
+                # damage made every corpus holding one `too_large` call (an operational
+                # condition, not a defect) announce itself as broken to an operator whose
+                # `monoid validate` says it is clean. This distinction is the reader's alone and
+                # cannot come from the schema, which is why it survives the consolidation above.
+                self._unjoinable += 1
                 return
-            call_index = record.get("call_index")
-            if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 0:
-                # The schema's minimum is zero, and it is the position of a call: negative is not
-                # a weaker version of a position, it is not one.
-                self._rejected += 1
-                return
-            body = record.get("response", _MISSING)
-            if not (body is None or isinstance(body, dict)):
-                # `object | null` per the schema. Anything else reaches `response_reference` as a
-                # malformed shape, which refuses the call at serve time -- but by then the record
-                # has been counted healthy, so the preflight already told the operator the corpus
-                # was sound. Damage is a property of the corpus, not of when it is noticed.
-                self._rejected += 1
-                return
-            reason = record.get("unrecorded_reason")
-            if reason not in UNRECORDED_REASONS:
-                # Declared as an enum by `schemas.py` and required, so anything else is a record
-                # `monoid validate` calls corrupt. Coerced, a missing marker or a `false` became
-                # `""` -- the value that means "recorded normally" -- so a damaged record with a
-                # well-formed body replayed as a successful turn while `rejected_records` stayed
-                # zero. Checked by membership rather than by type: `isinstance(reason, str)` is
-                # what was here, and a string outside the enum is the same defect wearing the
-                # right type. `True` cannot slip through either -- `True in ("", ...)` is False.
-                self._rejected += 1
-                return
+            call_index = record["call_index"]
+            body = record["response"]
+            reason = record["unrecorded_reason"]
             # "File order, each answer once" is a rule about one corpus. Across a union it
             # quietly becomes "the order the sources were named in", and the operator is told
             # nothing: two recordings of the same conversation -- the same prompt run twice, or
@@ -618,8 +582,8 @@ class ReplayCorpus:
             # a different conversation, or, where one source recorded a refusal at that
             # position and the other the answer, turns a union that demonstrably holds the
             # answer into a miss. This is the only place that can see it happen.
-            # Read directly: `_has_sound_envelope` proved these are non-empty strings before
-            # the kind dispatch. They used to be stringified here, and planted, a 123 or True or
+            # Read directly: the branch validator proved these are non-empty strings before the
+            # kind dispatch. They used to be stringified here, and planted, a 123 or True or
             # ["P"] compared equal across two unrelated sources and fired the family warning --
             # telling the operator to name children "in spawn order" for a parent that never
             # spawned anything. Leaving the coercion behind the check would keep that reasoning
@@ -844,15 +808,23 @@ class ReplayCorpus:
 
         One pair per *contributing run*, not per digest: a request two runs recorded belongs to
         both, and reporting it under the first alone stopped a run that holds both halves from
-        intersecting itself. The terms are the first-wins payload either way -- duplicates share
-        a digest, so they share their terms; only the provenance differs.
+        intersecting itself.
+
+        Each contributor is re-hashed against the shared digest **from its own payload** before
+        its run is credited. Crediting on digest equality alone treated "this record repeats a
+        name" as "this run held that continuation", and repeating a name is exactly what an
+        edited record can do for free: run B could be reported as carrying run A's assistant
+        history, and a reasoning-bearing answer in B would then intersect evidence B never had.
+        The first record has been held to this re-hash since it was written; the duplicates
+        beside it were not, which is the same rule-on-one-half shape one layer in from where it
+        was last found.
         """
 
         return tuple(
-            (run_id, terms)
+            (entry.run_id, terms)
             for digest in self._requests
-            if (terms := self._request_terms(digest)) is not None
-            for run_id in self._request_runs.get(digest, ())
+            for slot, entry in enumerate(self._request_contributors.get(digest, ()))
+            if (terms := self._entry_terms(entry, digest, slot)) is not None
         )
 
     def unreadable_requests(self) -> int:
@@ -1168,12 +1140,30 @@ class ReplayCorpus:
         )
 
     def _request_terms(self, digest: str) -> Mapping[str, Any] | None:
-        """The reassembled terms of one request record, or ``None`` when it cannot honor
-        its own digest -- a corpus lying about a key must not testify about it either."""
+        """The reassembled terms of the first-wins record under ``digest``, or ``None`` when it
+        cannot honor that digest -- a corpus lying about a key must not testify about it either.
 
-        if digest in self._terms_cache:
-            return self._terms_cache[digest]
-        entry = self._requests[digest]
+        The serving and diagnosis paths ask about a *key*, so they ask about the record that key
+        resolves to. :meth:`request_terms_view` asks about provenance instead, and puts every
+        contributor through :meth:`_entry_terms` on its own payload.
+        """
+
+        return self._entry_terms(self._requests[digest], digest, 0)
+
+    def _entry_terms(
+        self, entry: _RequestEntry, digest: str, slot: int
+    ) -> Mapping[str, Any] | None:
+        """One request record's terms, reassembled from **its own** payload and re-hashed.
+
+        Cached per contributor rather than per digest: duplicates share a digest and must not
+        share an answer to this question, which is the whole point of asking it of each of them.
+        Slot 0 is the first-wins entry, so the cache line the rest of the class reads is the same
+        one it always was.
+        """
+
+        cache_key = (digest, slot)
+        if cache_key in self._terms_cache:
+            return self._terms_cache[cache_key]
         terms: Mapping[str, Any] | None = None
         try:
             preimage = reassemble_request_preimage(
@@ -1190,7 +1180,7 @@ class ReplayCorpus:
                     terms = inner
         except Exception:  # noqa: BLE001 - an unreassemblable candidate is no candidate
             terms = None
-        self._terms_cache[digest] = terms
+        self._terms_cache[cache_key] = terms
         return terms
 
     # --- reporting -------------------------------------------------------------------------

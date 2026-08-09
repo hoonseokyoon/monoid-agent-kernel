@@ -218,9 +218,9 @@ class ReplayModelAdapter:
                 self._inner_closer = closer
 
         providers: list[str] = []
-        injected_reasoning = False
         media_seen = False
         runs_with_history: set[str] = set()
+        runs_with_injected_reasoning: set[str] = set()
         for run_id, terms in corpus.request_terms_view():
             provider = terms.get("provider")
             if isinstance(provider, str) and provider not in providers:
@@ -228,7 +228,7 @@ class ReplayModelAdapter:
             messages = terms.get("messages")
             for message in messages if isinstance(messages, list) else ():
                 if _is_injected_reasoning(message):
-                    injected_reasoning = True
+                    runs_with_injected_reasoning.add(run_id)
                 if _is_assistant_message(message):
                     runs_with_history.add(run_id)
                 for carrier in WIRE_MEDIA_CARRIERS:
@@ -243,11 +243,41 @@ class ReplayModelAdapter:
 
         if provider_name is _AUTO:
             recorded = providers[0] if providers else None
-            if injected_reasoning:
+            # Both halves of the evidence, correlated on the run, and then compared. Round 1 of
+            # this review made the *negative* half run-scoped and left the positive one a global
+            # flag one line above it -- the untouched twin of the repair itself, which is the
+            # shape this file keeps producing.
+            #
+            # Within one run the two co-occur by construction: an original that declared injects
+            # blocks into its continuations AND records answers carrying reasoning, which is why
+            # the positive evidence is checked first and wins. Across runs it is not co-occurrence
+            # but contradiction -- one source's original declared and another's did not -- and
+            # letting the positive branch answer for both declares for the source that proves the
+            # opposite. The loop then injects blocks into that source's later requests, changing
+            # their digests, so recordings that are entirely valid miss; the preflight sees one
+            # provider and one model across the union and says nothing.
+            undeclared_runs = (
+                runs_with_history
+                & {
+                    run_id
+                    for run_id, body in corpus.response_bodies_view()
+                    if body.get("reasoning")
+                }
+            ) - runs_with_injected_reasoning
+            if runs_with_injected_reasoning and undeclared_runs:
+                raise ValueError(
+                    "replay sources disagree about whether the recorded adapter declared its "
+                    "provider: "
+                    f"{_short(', '.join(sorted(runs_with_injected_reasoning)))} recorded injected "
+                    "reasoning blocks and "
+                    f"{_short(', '.join(sorted(undeclared_runs)))} recorded a continuation whose "
+                    "answers carried reasoning that was never injected. One declaration has to be "
+                    "wrong for one of them, so replay them separately, or name the provider "
+                    "explicitly to say which is intended"
+                )
+            if runs_with_injected_reasoning:
                 declared = recorded
-            elif runs_with_history & {
-                run_id for run_id, body in corpus.response_bodies_view() if body.get("reasoning")
-            }:
+            elif undeclared_runs:
                 # Answers carried reasoning, and a recorded request had a turn behind it in
                 # which the block would have appeared: the original did not declare, so
                 # neither may this adapter -- declaring would make the loop inject blocks the
