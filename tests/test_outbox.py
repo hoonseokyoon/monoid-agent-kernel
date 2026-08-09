@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import random
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +26,11 @@ from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.loop import AgentLoop, AgentToolContext
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.reference.backend.outbox_dispatch import (
+    OutboxDispatchContext,
+    OutboxDispatchService,
+    OutboxRetryPolicy,
+)
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
@@ -455,6 +462,91 @@ def test_backoff_delay_saturates_at_the_cap_instead_of_overflowing(backend_facto
     # The shipped default needs no exotic factor at all -- only an attempts count.
     backend.outbox_retry_factor = 2.0
     assert 0.0 <= backend._outbox_backoff_delay(1100) <= 10.0
+
+
+def test_backoff_delay_answers_the_cap_for_a_factor_with_no_ordering(backend_factory: Any) -> None:
+    """NaN is the one factor no comparison screens, and it must answer a wait, not raise.
+
+    Every guard in the shared schedule is an ordering, and no ordering holds against NaN: it is
+    not ``<= 1.0``, and it is not above the saturation threshold either, so it falls THROUGH
+    each one into ``int(log-budget / log(nan))``, where ``int(nan)`` raises ``ValueError``. The
+    four outbox knobs carry no validation at all, so this is a policy the service ACCEPTS -- and
+    the answer has to be the cap, which is what ``min(cap_s, base_s * nan ** attempts)`` gave
+    before these loops shared a schedule. The other end of the range is worse than the raise: a
+    zero ceiling makes every failure due again immediately, spinning on the endpoint that just
+    refused.
+    """
+    sender = RecordingOutboxSender()
+    backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
+    backend.outbox_retry_base_s, backend.outbox_retry_cap_s = 1.0, 10.0
+    backend.outbox_retry_factor = float("nan")
+    # The ceiling itself, not a jittered draw from it: under full jitter a sample says nothing
+    # about which end of the range the ceiling sat at, and both ends are answers here.
+    backend._outbox_rng = SimpleNamespace(uniform=lambda _low, high: high)
+    assert [backend._outbox_backoff_delay(n) for n in (1, 3, 1100)] == [10.0, 10.0, 10.0]
+    # The first attempt has no growth for a NaN to confuse, and answers what it always did.
+    assert backend._outbox_backoff_delay(0) == 1.0
+
+
+def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_happened() -> None:
+    """The schedule is evaluated AFTER ``sender.send`` returns, so it must not be able to raise.
+
+    ``drain_outbox`` sends, then stamps the next attempt, then records the result. An exception
+    between the first and the third loses the receipt for a side effect that DID happen: the
+    request stays ``pending`` and the next drain sends it again. At-least-once is the contract
+    for a FAILED send; a backoff policy is not entitled to make a SUCCEEDED one re-sendable.
+    """
+    sent: list[str] = []
+    recorded: list[tuple[str, bool, float]] = []
+    request = OutboxRequest(destination="email", id="o1")
+
+    class _Sender:
+        def send(self, req: OutboxRequest) -> OutboxReceipt:
+            sent.append(req.id)
+            return OutboxReceipt(ok=True, reference="ref-1")
+
+    class _Loop:
+        def due_outbox(self, now: float) -> list[OutboxRequest]:
+            return [request]
+
+        def record_outbox_result(
+            self,
+            request_id: str,
+            receipt: OutboxReceipt,
+            *,
+            max_attempts: int = 5,
+            next_attempt_at: float = 0.0,
+        ) -> str:
+            recorded.append((request_id, receipt.ok, next_attempt_at))
+            return "dispatched"
+
+        def snapshot(self) -> None:
+            return None
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    service = OutboxDispatchService(
+        OutboxDispatchContext(
+            retry_policy_provider=lambda: OutboxRetryPolicy(
+                max_attempts=5, base_s=1.0, factor=float("nan"), cap_s=10.0
+            ),
+            max_message_queue_depth_provider=lambda: 100,
+            checkpoint_store_provider=lambda: None,
+            rng_provider=lambda: random.Random(7),
+            live_outbox_runs=lambda: [],
+            call_soon=lambda *_a, **_k: None,
+            record_terminal=lambda _record: False,
+        )
+    )
+    before = time.time()
+    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+
+    assert sent == ["o1"]
+    [(request_id, ok, next_attempt_at)] = recorded
+    assert (request_id, ok) == ("o1", True)
+    # Bounded on both sides, so a NaN schedule fails this rather than riding through it.
+    assert before <= next_attempt_at <= before + 11.0
 
 
 def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path) -> None:

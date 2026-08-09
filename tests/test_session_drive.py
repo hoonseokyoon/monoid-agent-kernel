@@ -162,6 +162,41 @@ def test_turn_retry_backoff_saturates_at_the_cap_instead_of_overflowing(
     assert slept == [4.0, 4.0]
 
 
+def test_turn_retry_backoff_answers_the_cap_for_a_multiplier_with_no_ordering(
+    monkeypatch: Any,
+) -> None:
+    """The schedule's OTHER door, driven with the one value no comparison screens.
+
+    ``ModelRetryConfig.from_json`` rejects every non-finite number (``_model_control_number``
+    -> ``math.isfinite``), so nothing arriving as JSON carries a NaN. The dataclass itself has
+    no ``__post_init__``, and a config built in Python -- which is how this module's own callers
+    and the test above build one -- carries whatever it was handed. Reached with a NaN
+    multiplier the schedule fell through every guard into ``int(nan)`` and raised ``ValueError``
+    here, inside the turn-failure handler, replacing the failure being retried with an
+    arithmetic one. So the multiplier's NaN is settled in the schedule and not at one door.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    for attempt in (1, 4, 1100):
+        asyncio.run(
+            session_drive._async_sleep_before_retry(
+                attempt,
+                ModelRetryConfig(
+                    initial_delay_s=0.5,
+                    max_delay_s=4.0,
+                    backoff_multiplier=float("nan"),
+                    jitter_s=0.0,
+                ),
+            )
+        )
+    # The first attempt has no growth for a NaN to confuse; the rest answer the cap.
+    assert slept == [0.5, 4.0, 4.0]
+
+
 def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: Path) -> None:
     service = _service(tmp_path)
     record = _Record()

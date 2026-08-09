@@ -884,6 +884,57 @@ def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
     assert gateway._retry_delay(4, 0.5, 0.0, 2.0, 0.0) == 0.0
 
 
+def test_the_schedule_is_total_over_every_non_finite_control() -> None:
+    """A control the schedule cannot order still has to come back as a wait, not an exception.
+
+    Every guard in `capped_backoff` is an ordering, and no ordering holds against NaN, so a NaN
+    falls THROUGH all of them. Only the multiplier's is load-bearing: it reaches
+    `int(_CHUNK_LOG_BUDGET / math.log(nan))` and `int(nan)` raises `ValueError` -- while a NaN
+    initial delay or cap merely reaches `math.log`, which answers `nan` rather than raising.
+    Pinned as the whole 3x3 surface and not as the one cell a reviewer named: the reference
+    backend's four outbox knobs carry no validation at all, so any of the three can arrive
+    non-finite through that door, and `ModelRetryConfig` validates only what it builds
+    `from_json`.
+
+    The oracle is the expression this schedule replaced -- `min(cap, initial * multiplier ** n)`
+    -- wherever that expression itself answers. So what is pinned is that bounding the exponent
+    changed no policy for these inputs; it removed a raise and nothing else. NaN is compared as
+    NaN because it is never equal to itself.
+    """
+    import math
+
+    from monoid_agent_kernel.providers._common import capped_backoff
+
+    def same(left: float, right: float) -> bool:
+        return (math.isnan(left) and math.isnan(right)) or left == right
+
+    nan, inf = float("nan"), float("inf")
+    finite = {"initial_delay_s": 1.0, "max_delay_s": 300.0, "backoff_multiplier": 2.0}
+    compared = 0
+    for attempt in (1, 2, 4, 1101):
+        for knob in finite:
+            for value in (nan, inf, -inf):
+                policy = {**finite, knob: value}
+                answer = capped_backoff(attempt, **policy)  # must not raise, for any cell
+                try:
+                    open_coded = min(
+                        policy["max_delay_s"],
+                        policy["initial_delay_s"]
+                        * (policy["backoff_multiplier"] ** max(0, attempt - 1)),
+                    )
+                except OverflowError:
+                    continue  # the cell this whole helper exists to remove; no oracle there
+                assert same(answer, open_coded), (attempt, knob, value, answer, open_coded)
+                compared += 1
+    # The oracle has to have actually run, or "no policy changed" is a claim about nothing. 36
+    # cells, less the 6 the oracle cannot judge: at attempt 1101 a non-finite delay or cap
+    # leaves the multiplier at `2.0`, and `2.0 ** 1100` is the OverflowError this helper exists
+    # to remove -- so those 6 have no pre-existing answer to be equal to.
+    assert compared == 30
+    # And the cell that raised, named outright rather than left to the oracle.
+    assert capped_backoff(4, 1.0, 300.0, nan) == 300.0
+
+
 def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:
     """The schedule answers with a number, and every one of its inputs is validated finite.
 

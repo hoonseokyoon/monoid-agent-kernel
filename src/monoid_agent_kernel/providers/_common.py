@@ -37,7 +37,12 @@ def retry_delay_s(
     layer became the third caller; ``gateway._retry_delay`` remains as an import alias
     because that module's tests pin and monkeypatch the schedule through the old name.
 
-    Every input is validated finite and every answer is too. Jitter rides ON TOP of the cap
+    Every input that arrives as JSON is validated finite (``ModelRetryConfig.from_json`` ->
+    ``spec._model_control_number``) and every answer is too -- but that dataclass has no
+    ``__post_init__``, so a config built in Python carries whatever it was handed, and that is
+    a door :func:`capped_backoff` answers through rather than raising through.
+
+    Jitter rides ON TOP of the cap
     -- deliberately, since the moment a herd most needs smearing is the moment every member
     is sitting at ``max_delay_s`` -- but ``max_delay_s`` and ``jitter_s`` are each bounded
     below and not above, and float addition returns ``inf`` rather than raising when their
@@ -80,6 +85,14 @@ def capped_backoff(
     (``uniform(0, ceiling)``) rather than jitter on top, so it needs the bounded ceiling itself
     rather than :func:`retry_delay_s`.
 
+    So it is TOTAL: every input, non-finite ones included, gets an answer rather than an
+    exception. The non-finite answers are the ones the open-coded ``min(max_delay_s, initial *
+    multiplier ** n)`` always gave -- a NaN cap still answers ``nan``, a negative-infinite one
+    still answers ``-inf`` -- because a schedule three layers now share is not the place to
+    change what a policy MEANS. What is not preserved is the raise. Validating the policy at one
+    caller's boundary instead would leave the other callers' boundaries to be found later; the
+    arithmetic has to be total regardless of what validation any of them later grows.
+
     One bound decides, and it is the exact one: at ``saturating`` the product has already reached
     the cap, so the answer IS the cap and no larger exponent can change it. Below that point the
     product is representable even where the power on its own is not -- a subnormal
@@ -90,13 +103,27 @@ def capped_backoff(
 
     exponent = max(0, attempt - 1)
     # Nothing to grow (the first attempt), or nothing a growth could change: a zero initial
-    # delay keeps the product at zero and a zero cap keeps the answer there. Settled here so
-    # the logarithms below only ever see a positive finite input.
+    # delay keeps the product at zero and a zero cap keeps the answer there. Settled here so the
+    # logarithms below never see zero or a negative -- ``<= 0.0`` is an ordering, so ``-inf``
+    # rides out on it too. It does NOT screen a NaN, because no ordering does; a NaN delay or cap
+    # reaches ``math.log``, which answers ``nan`` rather than raising, and every comparison that
+    # answer feeds stays False. Only the MULTIPLIER's NaN is load-bearing -- see just below.
     if exponent == 0 or initial_delay_s <= 0.0 or max_delay_s <= 0.0:
         return min(max_delay_s, initial_delay_s)
     # A multiplier that does not grow drives the power toward zero, never out of range.
     if backoff_multiplier <= 1.0:
         return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
+    # A NaN multiplier is neither that nor a growth this can size, and neither guard screens it:
+    # it falls THROUGH both into ``int(_CHUNK_LOG_BUDGET / math.log(nan))``, where ``int(nan)``
+    # raises ``ValueError``. Same shape as the ``OverflowError`` the exponent bound exists to
+    # remove, in the same handlers -- and worse at the outbox, which evaluates its schedule AFTER
+    # ``sender.send`` has returned, so a raise here loses the receipt for a side effect that
+    # already happened and the request is dispatched a second time. The answer is the cap: what
+    # ``min(max_delay_s, initial * nan ** n)`` answered before these loops shared a schedule, and
+    # the conservative end of the range -- the other end is a zero wait spinning on the endpoint
+    # that just refused.
+    if math.isnan(backoff_multiplier):
+        return max_delay_s
     growth_per_step = math.log(backoff_multiplier)
     # ``int >= float`` compares exactly in Python, so ``attempt`` is never itself converted --
     # the guard against an oversized exponent cannot be defeated by the exponent's own size.
