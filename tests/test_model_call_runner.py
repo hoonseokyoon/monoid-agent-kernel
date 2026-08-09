@@ -52,6 +52,7 @@ from monoid_agent_kernel.providers.base import (
     collect_retry_reports,
     mark_provider_usage,
     normalize_model_request,
+    provider_usage_of,
     report_provider_retried,
 )
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
@@ -3738,6 +3739,231 @@ def test_a_refused_backoff_does_not_bill_its_attempt_twice(monkeypatch: Any) -> 
     assert receipt.usage["output_tokens"] == 5
 
 
+def test_the_attempt_log_names_every_dispatch_and_sums_to_the_receipt() -> None:
+    """One entry per kernel dispatch, in order, whose usage totals are the receipt's usage.
+
+    The absorbed attempt keeps its own taxonomy and its own bill; the answering attempt keeps
+    the turn's. The receipt's `usage` is exactly their sum on the success exit -- the invariant
+    that makes the log auditable instead of decorative.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=1, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    assert [entry.index for entry in receipt.attempt_log] == [1, 2]
+    first, second = receipt.attempt_log
+    assert first.succeeded is False
+    assert first.retryable is True
+    assert dict(first.usage) == {"output_tokens": 5}
+    assert first.stream_committed is False
+    assert second.succeeded is True
+    # The answering entry mirrors the receipt's own normalized reading (`_recordable_usage`
+    # zero-fills the core three) -- the same shape, or the sum below could not close.
+    assert second.usage["output_tokens"] == 7
+    assert all(entry.elapsed_ms >= 0 for entry in receipt.attempt_log)
+    summed: dict[str, int] = {}
+    for entry in receipt.attempt_log:
+        for key, value in entry.usage.items():
+            summed[key] = summed.get(key, 0) + value
+    assert summed == dict(receipt.usage)
+
+
+def test_a_single_dispatch_call_logs_one_entry_and_a_refused_call_logs_none() -> None:
+    """The log is not a kernel-layer exclusive: every settled call names its dispatches.
+
+    Under the default layer a call is one dispatch, so the log is one entry mirroring the
+    receipt. A call refused before the adapter was reached made no dispatch, and its empty
+    log says so beside `attempts == 0` -- the two-armed invariant, exercised on both arms.
+    """
+
+    observer = _acall(SyncAdapter(), REQUEST)
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert entry.index == 1
+    assert entry.succeeded is True
+    assert dict(entry.usage) == dict(receipt.usage)
+
+    refused_observer = RecordingObserver()
+
+    async def refuse() -> None:
+        await ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(
+                    observer=refused_observer, policy=CapturePolicy(mode="digest")
+                ),
+            ),
+        ).acall(REQUEST, deadline=time.time() - 1.0)
+
+    with pytest.raises(RunTimeout):
+        asyncio.run(refuse())
+
+    refused = refused_observer.captures[0].receipt
+    assert refused.attempts == 0
+    assert refused.attempt_log == ()
+
+
+def test_an_exhausted_call_logs_every_attempt_and_restamps_the_cumulative_cost() -> None:
+    """The terminal error leaves carrying what the whole logical call cost.
+
+    The loop's failure accounting reads the escaping error's stamp (`_billed_usage`), and a
+    stamp naming only the last attempt under-counts every absorbed one. Restamped after the
+    failed receipt is built -- `with_error` reads this same stamp, and a cumulative stamp read
+    back there would land the absorbed spend on the receipt twice. The log names all three
+    dispatches with their own bills; the receipt and the stamp agree on the sum.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert [entry.index for entry in receipt.attempt_log] == [1, 2, 3]
+    assert all(not entry.succeeded for entry in receipt.attempt_log)
+    assert all(dict(entry.usage) == {"output_tokens": 5} for entry in receipt.attempt_log)
+    assert receipt.usage["output_tokens"] == 15
+    assert provider_usage_of(caught.value) == {"output_tokens": 15}
+
+
+def test_a_refused_backoff_logs_its_attempt_once_and_keeps_the_stamp_it_earned(
+    monkeypatch: Any,
+) -> None:
+    """The deadline-refusal arm of the absorb commit point, at log level.
+
+    The attempt whose backoff cannot fit the deadline is the terminal one: one entry, its own
+    bill, and the escaping error still carries its own stamp untouched -- nothing was absorbed,
+    so there is nothing cumulative to say.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert dict(entry.usage) == {"output_tokens": 5}
+    assert receipt.usage["output_tokens"] == 5
+    assert provider_usage_of(caught.value) == {"output_tokens": 5}
+
+
+def test_the_channel_report_lands_on_the_attempt_that_made_it() -> None:
+    """Per-attempt attribution: the adapter's own loop reported during dispatch two, so entry
+    two carries it and entry one does not. The receipt's flag stays the whole call's."""
+
+    class SecondDispatchReports:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            report_provider_retried()
+            return ModelTurn(final_text="answer", usage={"output_tokens": 7})
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(SecondDispatchReports(), request)
+
+    receipt = observer.captures[0].receipt
+    first, second = receipt.attempt_log
+    assert first.provider_retried is False
+    assert second.provider_retried is True
+    assert receipt.provider_retried is True
+
+
+def test_a_turn_declared_retry_lands_on_the_attempt_that_answered() -> None:
+    """The outcome-carried flag is attempt-scoped too: the turn that declares it belongs to
+    exactly one dispatch."""
+
+    class TurnDeclares:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer", provider_retried=True)
+
+    observer = _acall(TurnDeclares(), REQUEST)
+
+    receipt = observer.captures[0].receipt
+    (entry,) = receipt.attempt_log
+    assert entry.provider_retried is True
+    assert receipt.provider_retried is True
+
+
+def test_a_turn_the_normalizer_refuses_still_logs_its_dispatch() -> None:
+    """The fallback arm: the failure happened between the dispatch's return and the settle,
+    so no attempt-scoped probe exists and the entry mirrors the receipt -- driven, not
+    assumed, because the two arms build the entry from different sources."""
+
+    class MalformedTurn:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=MalformedTurn(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert entry.succeeded is False
+    assert entry.error_code == receipt.error_code
+
+
 class _FlakyStream:
     """A stream that dies once -- before its first chunk, or after delivering one."""
 
@@ -3780,6 +4006,43 @@ def test_a_delivered_chunk_closes_the_retry_window() -> None:
     assert observer.captures[0].receipt.attempts == 2
     texts = [chunk.text for chunk in delivered if isinstance(chunk, TextDelta)]
     assert texts == ["whole"]
+
+
+def test_stream_committed_marks_only_the_attempt_that_delivered() -> None:
+    """The commit flag is per-entry and can only be true on the final one.
+
+    A stream that died before its first chunk logs an uncommitted failure; the attempt that
+    answered logs committed. And on the mid-stream death -- delivery already made -- the one
+    terminal entry records that the window was closed when it settled.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    sink: list[Any] = []
+
+    pre_first = _FlakyStream(fail_before_first=True)
+    observer = _acall(pre_first, request, delta_consumer=sink.append)
+    first, second = observer.captures[0].receipt.attempt_log
+    assert first.stream_committed is False
+    assert second.stream_committed is True
+
+    sink.clear()
+    mid_stream = _FlakyStream(fail_before_first=False)
+    mid_observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=mid_stream,
+            subscriptions=(
+                ModelIOSubscription(observer=mid_observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, delta_consumer=sink.append)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    (terminal,) = mid_observer.captures[0].receipt.attempt_log
+    assert terminal.succeeded is False
+    assert terminal.stream_committed is True
 
 
 def test_the_backoff_respects_the_deadline_instead_of_sleeping_into_it(
