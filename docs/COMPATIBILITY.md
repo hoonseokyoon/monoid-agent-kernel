@@ -427,8 +427,19 @@ roll-up) now read the settled receipt's usage, which folds spend from attempts a
 retry absorbed — including on a run the boundary ended, where a cancelled, timed-out or
 interrupted call's absorbed attempts now reach the totals as well; transcript `model_turn`
 rows keep the turn's own usage, so a reader reconciles totals as transcript rows plus
-absorbed spend. Old readers of any of these surfaces see only values that were always legal
-— larger totals, an extra ledger key they ignore.
+absorbed spend. Old readers of the *totals* surfaces see only values that were always legal:
+larger numbers, which every one of those readers already accepted.
+
+The ledger is not one of those surfaces and must not be described as one. `model_calls.jsonl`
+has **no released reader**: the artifact, its writer, `MODEL_CALLS_RECORD_SCHEMA` and the
+`monoid.model-calls.v1` identifier all arrive in the same unreleased v0.21 line that adds
+`attempt_log` — nothing at or below `v0.20.1` mentions any of them. So there is no population
+of older readers to be compatible *with* here, and the additive-key reasoning that applies to
+the open-`additionalProperties` surfaces above does not transfer: this record schema is closed
+(`additionalProperties: false`), and by the rule stated in the `model_calls.jsonl` section
+above, adding a key to it is a schema change like any other. The backward property that does
+hold is the reader-side one already stated: the schema declares `attempt_log` without requiring
+it, so a v0.21 validator still accepts lines a pre-`attempt_log` v0.21 build wrote.
 
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
