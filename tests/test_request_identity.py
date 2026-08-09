@@ -115,6 +115,7 @@ def test_the_generations_are_namespaced_ids() -> None:
         pytest.param(ModelConfig(gateway_url="http://elsewhere.invalid/x"), id="gateway_url"),
         pytest.param(ModelConfig(retry=ModelRetryConfig(max_attempts=5)), id="retry.max_attempts"),
         pytest.param(ModelConfig(retry=ModelRetryConfig(jitter_s=0.9)), id="retry.jitter_s"),
+        pytest.param(ModelConfig(retry=ModelRetryConfig(layer="kernel")), id="retry.layer"),
         pytest.param(
             ModelConfig(retry=ModelRetryConfig(retry_on=("gateway_timeout",))), id="retry.retry_on"
         ),
