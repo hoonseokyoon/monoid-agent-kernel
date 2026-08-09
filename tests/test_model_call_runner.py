@@ -3685,6 +3685,44 @@ def test_an_exhausted_call_still_accounts_every_billed_attempt() -> None:
     assert observer.captures[0].receipt.usage["output_tokens"] == 15
 
 
+def test_a_refused_backoff_does_not_bill_its_attempt_twice(monkeypatch: Any) -> None:
+    """The attempt whose backoff cannot fit the deadline is the terminal one, billed once.
+
+    `with_error` reads the escaping error's own `provider_usage` stamp, so an attempt belongs
+    in `spent_usage` only once the loop has committed to ABSORBING it. Recorded any earlier,
+    the one error the deadline check then re-raises is both the swallowed attempt and the
+    terminal outcome, and the receipt carries its cost twice -- a meter reading double for a
+    call that reached the provider once. The counter-arm is the test above: attempts the loop
+    really did absorb still sum, 15 for three billed calls at 5.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    assert adapter.calls == 1
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    assert receipt.usage["output_tokens"] == 5
+
+
 class _FlakyStream:
     """A stream that dies once -- before its first chunk, or after delivering one."""
 

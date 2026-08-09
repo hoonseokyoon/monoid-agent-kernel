@@ -685,10 +685,6 @@ class ModelCallRunner:
                             or not _kernel_retryable(exc)
                         ):
                             raise
-                        # What the refused attempt already cost, kept before the loop
-                        # absorbs its error: past this line the receipt is the only
-                        # carrier left.
-                        spent_usage = _merged_usage(spent_usage, provider_usage_of(exc))
                         delay = retry_delay_s(
                             attempts_made,
                             retry_plan.initial_delay_s,
@@ -702,6 +698,15 @@ class ModelCallRunner:
                         # the better answer.
                         if deadline is not None and time.time() + delay >= deadline:
                             raise
+                        # What the absorbed attempt already cost, recorded only once the loop
+                        # has committed to absorbing it -- which is here, past every `raise`
+                        # that would make THIS error the call's outcome. Recorded any earlier,
+                        # the error the deadline check re-raises is both the swallowed attempt
+                        # and the terminal one, and `receipt.with_error` reads its stamp again:
+                        # a single billed call landing on the receipt twice. Past this line the
+                        # receipt is the only carrier left -- a boundary raised by the wait
+                        # below reports itself, not the provider failure it interrupted.
+                        spent_usage = _merged_usage(spent_usage, provider_usage_of(exc))
                         await self._abackoff(delay, deadline)
                 turn = normalize_model_turn(turn)
             except BaseException as exc:
