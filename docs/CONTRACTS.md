@@ -447,10 +447,14 @@ as 1, which is what older records mean.
 elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
 the adapter's loop reported *during that dispatch* (the receipt's `provider_retried` stays the
 whole call's fold), and whether a delivered chunk had closed the retry window when the attempt
-settled — possible only on the final entry. The log is empty or complete: its length is 0 (a
-refused call, or a record written before the field existed) or exactly `attempts`, a log naming
-some attempts but not others is refused as a writer bug, and entry usage sums to the receipt's
-`usage` on either settle exit. Entries carry no wall-clock instant — the receipt's own rule; the
+settled — possible only on the final entry. The log is empty or complete, and the record enforces
+both halves rather than trusting its writer: either there are no entries (a refused call, or a
+record written before the field existed) or their indices are exactly `1..attempts` in order, and
+their usage sums to the receipt's `usage`. A log that names one dispatch twice has the right
+length and still cannot answer what the second one did; a log whose rows do not add up to the bill
+they itemize leaves a reader with two numbers and no way to tell which to believe. Both are
+refused at construction, which is also why the runner builds the log and the merged total in a
+single `replace`. Entries carry no wall-clock instant — the receipt's own rule; the
 ledger line's `recorded_at` anchors the call — and backoff waits fall between entries, so entry
 times sum to less than `latency_ms`.
 

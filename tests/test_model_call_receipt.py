@@ -348,6 +348,63 @@ def test_the_attempt_log_is_empty_or_names_every_attempt() -> None:
         ModelCallReceipt(attempts=1, attempt_log=({"index": 1},))  # type: ignore[arg-type]
 
 
+def test_the_attempt_log_names_each_dispatch_once_and_in_order() -> None:
+    """"Exactly once" is what the refusal says; counting was all it did.
+
+    A length check accepts `[1, 1]` for `attempts=2` -- the right number of entries naming the
+    same dispatch twice, with dispatch two absent. A consumer of that record cannot answer the
+    question the log exists for (what did attempt 2 do) and cannot tell that it is unanswerable,
+    because every other field is well-formed. The indices are the record's own claim about which
+    dispatch each row is, so they carry the claim: `1..attempts`, ascending, no gaps, no repeats.
+    """
+
+    def _log(*indices: int) -> tuple[ModelCallAttempt, ...]:
+        return tuple(ModelCallAttempt(index=index) for index in indices)
+
+    assert ModelCallReceipt(attempts=2, attempt_log=_log(1, 2)).attempts == 2
+
+    for indices in ((1, 1), (2, 1), (2, 3), (1, 3)):
+        with pytest.raises(ValueError, match="attempt_log"):
+            ModelCallReceipt(attempts=2, attempt_log=_log(*indices))
+
+
+def test_the_attempt_logs_usage_adds_up_to_the_receipts() -> None:
+    """The entries are the receipt's breakdown of its bill, so they add up to it or they are not.
+
+    A record whose entries say 3 while its total says 99 cannot be reconciled by its reader, and
+    carries nothing that says which number to believe. This was the stated reason the log is
+    all-or-nothing and it went unchecked, so the class documented a property it did not hold.
+
+    The writer builds the log and the merged total in a single ``replace`` for exactly this
+    reason: ``__post_init__`` re-runs on every ``replace``, so a two-step build would have to
+    pass through a receipt that carries its entries beside a total they do not sum to.
+    """
+
+    def _entry(index: int, output: int) -> ModelCallAttempt:
+        return ModelCallAttempt(index=index, usage={"output_tokens": output})
+
+    ModelCallReceipt(
+        attempts=2,
+        attempt_log=(_entry(1, 5), _entry(2, 7)),
+        usage={"output_tokens": 12},
+    )
+
+    with pytest.raises(ValueError, match="sum"):
+        ModelCallReceipt(
+            attempts=2,
+            attempt_log=(_entry(1, 5), _entry(2, 7)),
+            usage={"output_tokens": 99},
+        )
+    # And a key on one side only is a disagreement too: a total nobody's dispatch reported is
+    # exactly the shape a reader cannot attribute.
+    with pytest.raises(ValueError, match="sum"):
+        ModelCallReceipt(
+            attempts=1,
+            attempt_log=(_entry(1, 5),),
+            usage={"output_tokens": 5, "input_tokens": 4},
+        )
+
+
 def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
     """Absent on every receipt written before the field existed, which is legal and reads as
     an empty log beside an intact `attempts` count; present-but-mistyped is refused, like

@@ -851,11 +851,13 @@ class ModelCallReceipt:
     destination_status: str = "not_reached"
     destination_digest: str = ""
     # One entry per kernel dispatch, in order. Empty on receipts written before the field
-    # existed and on refused calls (``attempts == 0``); otherwise the runner writes one entry
-    # per attempt, so the log is either absent or complete — a log naming some attempts but
-    # not others could not answer the question it exists for, and a sum over its usage would
-    # silently disagree with the receipt's. Appended last so positional construction predating
-    # this field keeps meaning what it meant.
+    # existed and on refused calls (``attempts == 0``); otherwise one entry per attempt, so the
+    # log is either absent or complete. Both halves of "complete" are enforced below rather
+    # than left to the writer: the indices are ``1..attempts`` in order (a log naming some
+    # attempts twice and others not at all could not answer the question it exists for, and
+    # counting alone cannot tell the two apart), and the entries' usage sums to this receipt's
+    # (a breakdown that disagrees with its total leaves a reader nothing to believe). Appended
+    # last so positional construction predating this field keeps meaning what it meant.
     attempt_log: tuple[ModelCallAttempt, ...] = ()
 
     def __post_init__(self) -> None:
@@ -868,7 +870,13 @@ class ModelCallReceipt:
                 raise WireValidationError(
                     "model call attempt_log entries must be ModelCallAttempt records"
                 )
-        if self.attempt_log and len(self.attempt_log) != self.attempts:
+        # "Exactly once" is the claim, so the indices carry it rather than the count. A length
+        # check accepts a log of the right size naming one dispatch twice and another not at
+        # all -- well-formed in every other field, and unanswerable for the question the log
+        # exists for, with nothing in the record to say so.
+        if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
+            range(1, self.attempts + 1)
+        ):
             raise ValueError(
                 "model call attempt_log must be empty or name every attempt exactly once"
             )
@@ -900,6 +908,19 @@ class ModelCallReceipt:
             if value < 0:
                 raise WireValidationError(f"model call usage {key!r} must not be negative")
         object.__setattr__(self, "usage", dict(self.usage))
+        # The entries are this receipt's own breakdown of its bill, so a log that does not add up
+        # to that bill is not a breakdown of it -- and nothing else in the record says which of
+        # the two is wrong. The docstring above gave "a sum over its usage would silently
+        # disagree with the receipt's" as the reason the log is all-or-nothing; unchecked, that
+        # was a rationale rather than a rule. Read after the normalization above, so the sum and
+        # the total are compared on the same terms.
+        if self.attempt_log:
+            summed: dict[str, int] = {}
+            for entry in self.attempt_log:
+                for key, value in entry.usage.items():
+                    summed[key] = summed.get(key, 0) + value
+            if summed != self.usage:
+                raise ValueError("model call attempt_log usage must sum to the receipt's usage")
 
     @property
     def succeeded(self) -> bool:

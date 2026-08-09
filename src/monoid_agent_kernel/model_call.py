@@ -809,9 +809,14 @@ class ModelCallRunner:
                                 stream_committed=delivered,
                             )
                         )
-                failed = replace(failed, attempt_log=tuple(attempt_log))
-                if spent_usage:
-                    failed = replace(failed, usage=_merged_usage(spent_usage, failed.usage))
+                # One ``replace`` for the same reason the answering path takes one: the entries
+                # must sum to the usage they are entries for, and a two-step build holds a
+                # receipt that does not -- which ``__post_init__`` now refuses.
+                failed = replace(
+                    failed,
+                    attempt_log=tuple(attempt_log),
+                    usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
+                )
                 with contextlib.suppress(Exception):
                     self._publish(
                         request,
@@ -844,24 +849,25 @@ class ModelCallRunner:
             # the receipt. Its retry flag is attempt-scoped on both channels: what the adapter
             # reported during THIS dispatch, plus what this turn itself declared -- not the
             # whole-call `progress.retried` fold the receipt carries.
+            answering_entry = ModelCallAttempt(
+                index=attempts_made,
+                elapsed_ms=self._ms_since(attempt_started),
+                provider_retried=progress.count > reports_before or _turn_reported_retry(turn),
+                usage=completed.usage,
+                stream_committed=delivered,
+            )
+            # One ``replace``, not two. The log and the merged bill are the same fact stated two
+            # ways, and the receipt refuses a log whose entries do not sum to its usage -- so a
+            # receipt carrying the log beside the not-yet-merged usage is a state this record is
+            # not allowed to hold, however briefly. ``replace`` re-runs ``__post_init__``, which
+            # is what makes "briefly" indistinguishable from "at all".
             completed = replace(
                 completed,
-                attempt_log=(
-                    *attempt_log,
-                    ModelCallAttempt(
-                        index=attempts_made,
-                        elapsed_ms=self._ms_since(attempt_started),
-                        provider_retried=progress.count > reports_before
-                        or _turn_reported_retry(turn),
-                        usage=completed.usage,
-                        stream_committed=delivered,
-                    ),
+                attempt_log=(*attempt_log, answering_entry),
+                usage=(
+                    _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
                 ),
             )
-            if spent_usage:
-                completed = replace(
-                    completed, usage=_merged_usage(spent_usage, completed.usage)
-                )
             settled = self._publish(
                 request,
                 turn,
