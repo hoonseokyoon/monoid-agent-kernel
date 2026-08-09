@@ -41,7 +41,9 @@ out in commit messages and here.
   bound and no upper one, so a policy the spec accepts could overflow
   `multiplier ** (attempt - 1)` before the cap was consulted — and `float ** int` raises
   there, inside the handler for the retryable `ModelAdapterError`, replacing the provider's
-  taxonomy with an unclassified `OverflowError`.
+  taxonomy with an unclassified `OverflowError`. The jittered sum saturates for the sibling
+  reason: jitter rides on top of the cap, `max_delay_s` and `jitter_s` are both unbounded
+  above, and float addition answers `inf` rather than raising — a wait no timer can fire.
 - **The replay key does not move.** The identity projection already excluded the retry block
   (W6-4b's `_model_identity` named this exact field addition as its reason); the exclusion
   matrix now pins `retry.layer` per-field, and a retried run's corpus is shape-identical to

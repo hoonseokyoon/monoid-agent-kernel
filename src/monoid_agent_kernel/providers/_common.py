@@ -36,11 +36,18 @@ def retry_delay_s(
     them would be a difference nobody chose. Moved here from ``gateway`` when the kernel
     layer became the third caller; ``gateway._retry_delay`` remains as an import alias
     because that module's tests pin and monkeypatch the schedule through the old name.
+
+    Every input is validated finite and every answer is too. Jitter rides ON TOP of the cap
+    -- deliberately, since the moment a herd most needs smearing is the moment every member
+    is sitting at ``max_delay_s`` -- but ``max_delay_s`` and ``jitter_s`` are each bounded
+    below and not above, and float addition returns ``inf`` rather than raising when their
+    sum leaves the range. A non-finite wait is not a long wait: ``asyncio.sleep(inf)`` is a
+    timer that never fires, so the loop stops being a loop. Hence the saturating add.
     """
 
     delay = _capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
     if jitter_s > 0:
-        delay += random.uniform(0, jitter_s)
+        delay = min(delay + random.uniform(0, jitter_s), sys.float_info.max)
     return delay
 
 

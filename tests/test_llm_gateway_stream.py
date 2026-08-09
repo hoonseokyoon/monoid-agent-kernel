@@ -884,6 +884,30 @@ def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
     assert gateway._retry_delay(4, 0.5, 0.0, 2.0, 0.0) == 0.0
 
 
+def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:
+    """The schedule answers with a number, and every one of its inputs is validated finite.
+
+    Jitter is added ON TOP of the cap -- deliberately, because the moment a herd most needs
+    smearing is the moment every member is sitting at `max_delay_s` -- and float addition
+    returns `inf` instead of raising when the sum leaves the range. `jitter_s` and
+    `max_delay_s` are both bounded below and not above, so two finite controls can produce a
+    non-finite wait, and `asyncio.sleep(inf)` is a timer that never fires. The sum saturates
+    at the largest finite float: the closest representable value to the delay the policy
+    asked for.
+
+    Sixteen draws, not one, because the failing sum needs a jitter above zero -- and the
+    counter-arm below needs one too: the additive jitter is unchanged wherever the sum is
+    representable, which this pins by demanding a delay ABOVE the cap.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    float_max = 1.7976931348623157e308
+    for _ in range(16):
+        assert gateway._retry_delay(1, float_max, float_max, 2.0, float_max) <= float_max
+    jittered = max(gateway._retry_delay(9, 0.5, 4.0, 2.0, 1.0) for _ in range(16))
+    assert 4.0 < jittered <= 5.0
+
+
 def test_the_streamed_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) -> None:
     """The streamed twin of `test_the_retry_is_reported_before_the_wait_not_after_it`.
 
