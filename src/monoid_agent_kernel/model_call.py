@@ -72,8 +72,10 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
+    provider_usage_of,
     resolved_provider_name,
 )
+from monoid_agent_kernel.providers._common import retry_delay_s
 from monoid_agent_kernel.providers._request_identity import (
     _REQUEST_DIGEST_GENERATION,
     _digest,
@@ -158,6 +160,37 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
         and type(value) is int
         and value >= 0
     }
+
+
+def _kernel_retryable(exc: BaseException) -> bool:
+    """Whether the kernel's own loop may pay for another attempt at this failure.
+
+    Judged by the taxonomy, not by `retry_on`: that list is the adapter loop's
+    provider-specific code selector (its defaults are gateway codes), while `retryable` is
+    the cross-provider signal CONTRACTS names "automatic retry eligibility". Run boundaries
+    (`RunCancelled`, `RunTimeout`, `ModelCallAborted`) are not `ModelAdapterError` and fall
+    out structurally -- a run that stopped is not a failure to retry -- and
+    `config_recoverable` refuses even when marked retryable, because re-sending cannot help
+    a call whose config must change first.
+    """
+
+    if not isinstance(exc, ModelAdapterError):
+        return False
+    return bool(exc.retryable) and not bool(exc.config_recoverable)
+
+
+def _merged_usage(spent: Mapping[str, int], usage: Mapping[str, int]) -> dict[str, int]:
+    """Key-wise sum of two already-normalized usage mappings.
+
+    Both inputs arrive clean -- `provider_usage_of` and `_recordable_usage` apply the same
+    exact-int rule -- so this is arithmetic, not validation. One helper for both settle
+    exits, so success and failure cannot disagree about what a retried call cost.
+    """
+
+    merged = dict(usage)
+    for key, value in spent.items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
 
 
 def _safe_repr(value: Any) -> str:
@@ -528,11 +561,16 @@ class ModelCallRunner:
         # `None`, which is truthful -- there is no preimage for a call that never got a key.
         request_preimage: bytes | None = None
         with collect_retry_reports() as progress:
-            # Whether the kernel got as far as reaching into the adapter, which is what `attempts`
-            # counts. A run already cancelled or past its deadline is refused below without the
-            # adapter being touched, and the receipt for that used to carry the default `attempts=1`
-            # -- telling a consumer summing the field that provider work happened when none did.
-            reached_adapter = False
+            # How many times the kernel reached into the adapter, which is what `attempts`
+            # counts. A run already cancelled or past its deadline is refused below without
+            # the adapter being touched and reports 0 -- the receipt used to carry the
+            # default `attempts=1` there, telling a consumer summing the field that provider
+            # work happened when none did. Under the kernel retry layer each re-dispatch
+            # counts one more.
+            attempts_made = 0
+            # Usage the loop's swallowed attempts already paid for; merged into whichever
+            # receipt settles this call, success or failure, by the same helper.
+            spent_usage: dict[str, int] = {}
             try:
                 # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
                 # already been crossed, but by then the adapter has been invoked and the provider has
@@ -553,6 +591,21 @@ class ModelCallRunner:
                     context if context is not None else InvocationContext()
                 )
                 model, dispatch_model = self._effective_model(request, adapter)
+                # The kernel loops only when the effective config assigns it the loop.
+                retry_plan = model.retry if model.retry.layer == "kernel" else None
+                if retry_plan is not None:
+                    # The dispatch copy is neutralized -- `max_attempts=1` -- so any
+                    # config-honoring adapter cannot loop under this layer even if it never
+                    # learned `layer` exists; the layer value itself still travels so an
+                    # adapter whose loop lives outside the config (the OpenAI SDK) can
+                    # comply on its own. The receipt is keyed from `model`, not this copy,
+                    # so it describes the call as configured -- and the replay key excludes
+                    # the retry block entirely, so neither the layer nor the neutralization
+                    # can move it.
+                    dispatch_model = replace(
+                        dispatch_model if dispatch_model is not None else model,
+                        retry=replace(model.retry, max_attempts=1),
+                    )
                 if dispatch_model is not None:
                     request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
@@ -595,8 +648,53 @@ class ModelCallRunner:
                     destination_status=destination_status,
                     destination_digest=destination_digest(where),
                 )
-                reached_adapter = True
-                turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
+                consumer = delta_consumer
+                delivered = False
+                if retry_plan is not None and delta_consumer is not None:
+                    inner_consumer = delta_consumer
+
+                    def _marking_consumer(chunk: ModelStreamChunk) -> None:
+                        # Delivery is what closes the retry window (see the loop below),
+                        # and delivery means the consumer received it -- the same line the
+                        # `acall` docstring draws for `should_abort`.
+                        nonlocal delivered
+                        delivered = True
+                        inner_consumer(chunk)
+
+                    consumer = _marking_consumer
+                while True:
+                    attempts_made += 1
+                    try:
+                        turn = await self._adrive(
+                            request, deadline, should_abort, consumer, adapter
+                        )
+                        break
+                    except BaseException as exc:
+                        if (
+                            retry_plan is None
+                            or attempts_made >= retry_plan.max_attempts
+                            or delivered
+                            or not _kernel_retryable(exc)
+                        ):
+                            raise
+                        # What the refused attempt already cost, kept before the loop
+                        # absorbs its error: past this line the receipt is the only
+                        # carrier left.
+                        spent_usage = _merged_usage(spent_usage, provider_usage_of(exc))
+                        delay = retry_delay_s(
+                            attempts_made,
+                            retry_plan.initial_delay_s,
+                            retry_plan.max_delay_s,
+                            retry_plan.backoff_multiplier,
+                            retry_plan.jitter_s,
+                        )
+                        # Sleeping into a boundary would waste wall clock the run has
+                        # already spent and then mask the provider failure with a
+                        # `RunTimeout` that names nothing; the transient error itself is
+                        # the better answer.
+                        if deadline is not None and time.time() + delay >= deadline:
+                            raise
+                        await self._abackoff(delay, deadline)
                 turn = normalize_model_turn(turn)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
@@ -611,9 +709,9 @@ class ModelCallRunner:
                 # whatever the observer threw. Turning capture on must not change how a provider
                 # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
                 # arriving during delivery should still stop everything.
-                failed = receipt.with_error(exc)
-                if not reached_adapter:
-                    failed = replace(failed, attempts=0)
+                failed = replace(receipt.with_error(exc), attempts=attempts_made)
+                if spent_usage:
+                    failed = replace(failed, usage=_merged_usage(spent_usage, failed.usage))
                 with contextlib.suppress(Exception):
                     self._publish(
                         request,
@@ -627,10 +725,18 @@ class ModelCallRunner:
             # the call returns. Honoured only on failure, it would be a reporting seam that
             # silently stops working for adapters that retry and then succeed -- which is most of
             # the time a retry loop runs.
+            completed = replace(
+                self._completed(receipt, turn, retried=progress.retried),
+                attempts=attempts_made,
+            )
+            if spent_usage:
+                completed = replace(
+                    completed, usage=_merged_usage(spent_usage, completed.usage)
+                )
             settled = self._publish(
                 request,
                 turn,
-                self._completed(receipt, turn, retried=progress.retried),
+                completed,
                 elapsed_ms=self._ms_since(started),
                 request_preimage=request_preimage,
             )
@@ -955,6 +1061,26 @@ class ModelCallRunner:
                 consume_task_outcome(closing)
             else:
                 closing.add_done_callback(consume_task_outcome)
+
+    async def _abackoff(self, delay_s: float, deadline: float | None) -> None:
+        """Wait between kernel attempts under the same race the attempts run under.
+
+        The sleep is `pending` to the shared bridge: a cancellation wakes it through the
+        token callback, the deadline bounds it through the wait timeout, and the boundary
+        check re-raises the same `RunCancelled`/`RunTimeout` an in-flight attempt reports.
+        A backoff cannot outlive a run that stopped wanting the answer.
+        """
+
+        if delay_s <= 0:
+            self._check_cancel_or_deadline(deadline)
+            return
+        await await_abandonable_call(
+            asyncio.sleep(delay_s),
+            deadline=deadline,
+            token=self._token(),
+            grace_s=0.0,
+            check_boundary=self._check_cancel_or_deadline,
+        )
 
     async def _aawait(
         self,

@@ -7,10 +7,33 @@ common pieces here so the two adapters cannot drift.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
+
+
+def retry_delay_s(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+    jitter_s: float,
+) -> float:
+    """How long to wait after ``attempt`` failed, before the next one.
+
+    The schedule itself, separated from waiting on it: the gateway's two loops and the
+    kernel runner's loop all wait differently, and a backoff policy that differed between
+    them would be a difference nobody chose. Moved here from ``gateway`` when the kernel
+    layer became the third caller; ``gateway._retry_delay`` remains as an import alias
+    because that module's tests pin and monkeypatch the schedule through the old name.
+    """
+
+    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
+    if jitter_s > 0:
+        delay += random.uniform(0, jitter_s)
+    return delay
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:

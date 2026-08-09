@@ -6587,6 +6587,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "loop.py",
             # Joined in the carriage sweep: metrics.json states the failed run's verdict.
             "loop_phases.py",
+            # Joined in W7-0: the kernel retry predicate refuses a config-recoverable failure
+            # even when it is marked retryable -- re-sending cannot help a call whose config
+            # must change first.
+            "model_call.py",
             "providers/gateway.py",
             "providers/openai.py",
             # Joined in W6-4b: a replay miss is the client-side park shape by construction --
@@ -6672,6 +6676,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # Joined in the burn-down: turn.failed declares what the refused call cost.
             "core/schemas.py",
             "loop.py",
+            # Joined in W7-0: the kernel retry loop reads the stamp off each attempt it
+            # swallows (`provider_usage_of`) so the receipt can sum what the whole logical
+            # call cost -- past the loop, the receipt is the only carrier left.
+            "model_call.py",
             "providers/base.py",
             "providers/gateway.py",
             # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in

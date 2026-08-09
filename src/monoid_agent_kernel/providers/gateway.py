@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
@@ -25,6 +24,7 @@ from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.providers._common import retry_delay_s as _retry_delay
 from monoid_agent_kernel.providers._common import (
     build_generation_payload,
     build_reasoning_payload,
@@ -1969,26 +1969,6 @@ def _should_retry(
         and bool(error.provider_error_code)
         and error.provider_error_code in retry_on
     )
-
-
-def _retry_delay(
-    attempt: int,
-    initial_delay_s: float,
-    max_delay_s: float,
-    backoff_multiplier: float,
-    jitter_s: float,
-) -> float:
-    """How long to wait after ``attempt`` failed, before the next one.
-
-    The schedule itself, separated from waiting on it, because the two callers wait differently and
-    a backoff policy that differed between the sync and the streamed path would be a difference
-    nobody chose.
-    """
-
-    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
-    if jitter_s > 0:
-        delay += random.uniform(0, jitter_s)
-    return delay
 
 
 def _sleep_before_retry(

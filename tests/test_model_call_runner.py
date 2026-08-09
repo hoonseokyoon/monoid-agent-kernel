@@ -7,6 +7,7 @@ import contextlib
 import json
 import threading
 import time
+from urllib.error import URLError
 from dataclasses import replace
 from typing import Any
 
@@ -20,7 +21,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelCallCapture,
     ModelIOSubscription,
 )
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.errors import (
@@ -48,6 +49,7 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     TurnComplete,
     assemble_streamed_turn,
+    mark_provider_usage,
     normalize_model_request,
     report_provider_retried,
 )
@@ -3508,3 +3510,366 @@ def test_the_preimage_is_not_captured_unless_asked_for() -> None:
     assert recorded[0].request_preimage is None
     assert receipt.request_digest != ""
     assert receipt.digest_status == "ok"
+
+
+# --- the kernel retry layer ---------------------------------------------------------------------
+
+
+def _kernel_model(max_attempts: int = 3) -> ModelConfig:
+    """A kernel-layer policy with a zero schedule, so tests never actually wait."""
+
+    return ModelConfig(
+        retry=ModelRetryConfig(
+            layer="kernel", max_attempts=max_attempts, initial_delay_s=0.0, jitter_s=0.0
+        )
+    )
+
+
+class _FlakyAdapter:
+    """Fails `failures` times through `error_factory`, then answers with billed usage."""
+
+    def __init__(self, failures: int, error_factory: Any = None) -> None:
+        self.calls = 0
+        self.failures = failures
+        self.error_factory = error_factory or (
+            lambda: ModelAdapterError("transient", retryable=True)
+        )
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.error_factory()
+        return ModelTurn(final_text="answer", usage={"output_tokens": 7})
+
+
+def _acall(adapter: Any, request: ModelRequest, **kwargs: Any) -> RecordingObserver:
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, **kwargs)
+
+    asyncio.run(run())
+    return observer
+
+
+def test_the_kernel_layer_pays_for_another_attempt_and_the_receipt_counts_it() -> None:
+    """Under `layer="kernel"` the runner re-dispatches a retryable failure; `attempts` counts it.
+
+    `provider_retried` stays False on purpose: kernel attempts are the kernel's own fact,
+    carried by `attempts`, and the adapter flag keeps meaning what it always meant -- a loop
+    BELOW the adapter boundary ran. One settled capture for the whole logical call, because
+    retry is transport: the request was keyed once and answered once.
+    """
+
+    adapter = _FlakyAdapter(failures=1)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    assert adapter.calls == 2
+    assert len(observer.captures) == 1
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is True
+    assert receipt.attempts == 2
+    assert receipt.provider_retried is False
+
+
+def test_the_default_layer_still_makes_exactly_one_attempt() -> None:
+    adapter = _FlakyAdapter(failures=1)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+    with pytest.raises(ModelAdapterError):
+        _acall(adapter, request)
+
+    assert adapter.calls == 1
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        pytest.param(lambda: ModelAdapterError("terminal", retryable=False), id="not-retryable"),
+        pytest.param(
+            lambda: ModelAdapterError("fix config", retryable=True, config_recoverable=True),
+            id="config-recoverable",
+        ),
+        pytest.param(lambda: RuntimeError("not an adapter error"), id="untyped"),
+    ],
+)
+def test_the_kernel_loop_refuses_what_the_taxonomy_refuses(error_factory: Any) -> None:
+    """The kernel judges by the taxonomy alone: no `ModelAdapterError`, no retry; marked
+    non-retryable or config-recoverable, no retry -- re-sending cannot help a call whose
+    config must change first."""
+
+    adapter = _FlakyAdapter(failures=99, error_factory=error_factory)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    with pytest.raises((ModelAdapterError, RuntimeError)):
+        _acall(adapter, request)
+
+    assert adapter.calls == 1
+
+
+def test_exhaustion_re_raises_the_last_error_with_the_attempts_it_cost() -> None:
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 3
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert receipt.succeeded is False
+
+
+def test_swallowed_attempts_usage_reaches_the_receipt() -> None:
+    """An attempt the loop absorbed still cost tokens, and the receipt is the only carrier left.
+
+    The turn keeps the final answer's own usage -- it describes what the model said -- while
+    the receipt sums what the whole logical call cost, which is what an audit or a meter
+    reads. The run's cumulative token budget still counts settled turns; that boundary is
+    documented, not accidental.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=1, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert receipt.usage["output_tokens"] == 12
+    assert receipt.succeeded is True
+
+
+def test_an_exhausted_call_still_accounts_every_billed_attempt() -> None:
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    # Two swallowed attempts at 5 plus the final error's own stamp, which `with_error` reads.
+    assert observer.captures[0].receipt.usage["output_tokens"] == 15
+
+
+class _FlakyStream:
+    """A stream that dies once -- before its first chunk, or after delivering one."""
+
+    def __init__(self, *, fail_before_first: bool) -> None:
+        self.opens = 0
+        self.fail_before_first = fail_before_first
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        del request
+        self.opens += 1
+        if self.opens == 1:
+            if self.fail_before_first:
+                raise ModelAdapterError("dead before the first frame", retryable=True)
+            yield TextDelta("partial")
+            raise ModelAdapterError("dead mid-stream", retryable=True)
+        yield TextDelta("whole")
+        yield TurnComplete(response_id="r2", usage={"output_tokens": 2}, stop_reason="stop")
+
+
+def test_a_delivered_chunk_closes_the_retry_window() -> None:
+    """Once the consumer holds a chunk, a retry would replay it downstream; the loop refuses.
+
+    The counter-arm retries a stream that died before delivering anything, and the consumer
+    sees only the second attempt's chunks -- the same commit line every lower loop already
+    draws (the gateway's `committed`, the SDK's pre-stream retry window).
+    """
+
+    delivered: list[Any] = []
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    mid_stream = _FlakyStream(fail_before_first=False)
+    with pytest.raises(ModelAdapterError):
+        _acall(mid_stream, request, delta_consumer=delivered.append)
+    assert mid_stream.opens == 1
+
+    delivered.clear()
+    pre_first = _FlakyStream(fail_before_first=True)
+    observer = _acall(pre_first, request, delta_consumer=delivered.append)
+    assert pre_first.opens == 2
+    assert observer.captures[0].receipt.attempts == 2
+    texts = [chunk.text for chunk in delivered if isinstance(chunk, TextDelta)]
+    assert texts == ["whole"]
+
+
+def test_the_backoff_respects_the_deadline_instead_of_sleeping_into_it(
+    monkeypatch: Any,
+) -> None:
+    """Sleeping into a certain timeout wastes wall clock and masks the provider's own error.
+
+    When the remaining deadline cannot fit the scheduled backoff, the loop re-raises the
+    transient failure itself -- the actual problem -- rather than waiting to convert it into
+    a `RunTimeout` that names nothing.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 1
+    assert observer.captures[0].receipt.attempts == 1
+
+
+def test_a_cancellation_interrupts_the_backoff_wait(monkeypatch: Any) -> None:
+    """The backoff runs under the same race as the attempts, so a cancel wakes it."""
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 30.0)
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    token = CancellationToken()
+    timer = threading.Timer(0.2, token.cancel)
+    started = time.monotonic()
+
+    async def run() -> None:
+        timer.start()
+        await ModelCallRunner(adapter=adapter, current_cancellation_token=lambda: token).acall(
+            request, deadline=time.time() + 300.0
+        )
+
+    try:
+        with pytest.raises(RunCancelled):
+            asyncio.run(run())
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 10.0
+    assert adapter.calls == 1
+
+
+def test_the_kernel_hands_the_adapter_a_neutralized_policy() -> None:
+    """The dispatch copy carries `max_attempts=1` with the layer preserved.
+
+    `max_attempts=1` silences any config-honoring loop -- even a third-party adapter that
+    never learned `layer` exists -- while the preserved layer value lets an adapter whose
+    loop lives outside the config (the OpenAI SDK) comply on its own. The receipt keeps the
+    caller's policy: it describes the call as configured, not the neutralized dispatch copy.
+    """
+
+    seen: list[ModelConfig] = []
+
+    class RecordingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            assert request.model is not None
+            seen.append(request.model)
+            return ModelTurn(final_text="answer")
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(RecordingAdapter(), request)
+
+    assert seen[0].retry.max_attempts == 1
+    assert seen[0].retry.layer == "kernel"
+    receipt = observer.captures[0].receipt
+    assert receipt.model.retry.max_attempts == 3
+    assert receipt.model.retry.layer == "kernel"
+
+
+def test_the_retry_layer_leaves_the_replay_key_where_it_was() -> None:
+    """Neither the layer nor the neutralized dispatch copy may reach the request identity."""
+
+    kernel_request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=_kernel_model()
+    )
+    plain_request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=ModelConfig()
+    )
+
+    kernel_receipt = _acall(_FlakyAdapter(failures=1), kernel_request).captures[0].receipt
+    plain_receipt = _acall(SyncAdapter(), plain_request).captures[0].receipt
+
+    assert kernel_receipt.request_digest == plain_receipt.request_digest
+    assert kernel_receipt.digest_status == "ok"
+
+
+def test_the_two_layers_do_not_multiply(monkeypatch: Any) -> None:
+    """The end-to-end dedup pin: kernel loop x gateway adapter = kernel attempts, not the product.
+
+    Three configured attempts under `layer="kernel"` must reach the wire exactly three times
+    -- the gateway's own loop, which would have made three per dispatch, answers one under
+    the kernel's layer. `provider_retried` stays False because the adapter's loop never ran;
+    the three attempts are the kernel's, on `attempts`.
+    """
+
+    calls: list[int] = []
+
+    def _refused(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append(1)
+        raise URLError("unreachable")
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", _refused)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.0)
+
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(layer="kernel", max_attempts=3),
+        ),
+        token="run-token",
+    )
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(ModelRequest(instruction="hi", system_prompt="sys", tools=()))
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    assert len(calls) == 3
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert receipt.provider_retried is False
