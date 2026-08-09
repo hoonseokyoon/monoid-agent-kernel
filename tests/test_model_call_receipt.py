@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from http import HTTPStatus
 from dataclasses import fields, replace
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
@@ -866,6 +867,39 @@ def test_every_wire_field_that_is_not_nullable_refuses_an_explicit_null(record: 
         "nullable_and_therefore_exempt": sorted(nullable),
         "hint": "absent = legacy default; present-but-null = refused",
     }
+
+
+def test_with_error_still_accepts_the_int_subclass_it_documents() -> None:
+    """The bool rule must not become an exact-type rule. It did, and this is that regression.
+
+    ``with_error`` reads ``http_status`` off an arbitrary exception and guards it with
+    ``isinstance(http_status, bool) or not isinstance(http_status, int)`` -- excluding ``bool``
+    by name while deliberately admitting every other ``int`` subclass, because an
+    ``http.HTTPStatus`` is exactly what an HTTP client hands back. The count census added in
+    ``a8faa8f`` then spelled ``type(value) is not int`` and the ``replace()`` inside ``with_error``
+    re-ran it, so this record refused a value its own reader had just accepted.
+
+    The shape is worth naming: ``http_status`` was correctly exempted from the *null* rule
+    (it is declared ``int | None``) and then handed the *bool* rule without anyone asking
+    whether it had an acceptance of its own. One field, two rules, exempted from one and not
+    the other.
+
+    The repair narrows the predicate to the defect it was written for -- ``bool`` is refused,
+    every other ``int`` is not -- rather than exempting the one field that was noticed. That
+    restores the prior acceptance on all seven enumerated counts at once, which is the only
+    version of this fix that cannot leave a second field broken the same way.
+
+    ``usage`` is deliberately NOT covered by this: its own loop keeps ``type(value) is not int``
+    because its four sibling readers spell the same, and an ``IntEnum`` token count accepted here
+    would be dropped by every one of them.
+    """
+    failed = ModelCallReceipt().with_error(
+        ModelAdapterError("rate limited", http_status=HTTPStatus.TOO_MANY_REQUESTS)
+    )
+
+    assert failed.http_status == 429
+    # And it still leaves as a JSON integer, which is the only thing the wire cares about.
+    assert json.loads(json.dumps(failed.to_json()))["http_status"] == 429
 
 
 @pytest.mark.parametrize("record", [ModelCallAttempt, ModelCallReceipt], ids=["attempt", "receipt"])

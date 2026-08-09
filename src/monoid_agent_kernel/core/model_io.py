@@ -757,7 +757,24 @@ def _validate_counts(record: Any, label: str) -> None:
         value = getattr(record, name)
         if value is None and name in nullable:
             continue
-        if type(value) is not int:
+        # ``isinstance`` minus ``bool``, NOT ``type(value) is int``. The first spelling of this
+        # rule was the stricter one and it broke a documented acceptance: ``with_error`` reads
+        # ``http_status`` off an arbitrary exception under
+        # ``isinstance(http_status, bool) or not isinstance(http_status, int)`` -- excluding
+        # ``bool`` by name while admitting every other ``int`` subclass, because an
+        # ``http.HTTPStatus`` is what an HTTP client hands back -- and the ``replace()`` inside
+        # it then re-ran this check and refused the value its own reader had just accepted.
+        #
+        # Narrowed to the defect this census was written for rather than exempting the one field
+        # that was noticed: the finding was ``bool``, and only ``bool``. A per-field exemption
+        # would have left the same over-reach standing on the other six counts.
+        #
+        # ``usage`` keeps the stricter ``type(value) is not int`` in its own loop, deliberately
+        # and for a reason that does not apply here: its four sibling readers spell the same, so
+        # an ``IntEnum`` token count accepted there would be dropped by every one of them. These
+        # scalars have no such readers -- they are emitted straight to JSON, where an ``IntEnum``
+        # serializes as the integer it is.
+        if isinstance(value, bool) or not isinstance(value, int):
             raise WireValidationError(f"{label} {name} must be an integer")
 
 
