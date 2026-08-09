@@ -28,7 +28,17 @@ from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 from functools import lru_cache
-from typing import Any, Literal, Protocol, runtime_checkable
+from types import UnionType
+from typing import (
+    Any,
+    Literal,
+    Protocol,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+    runtime_checkable,
+)
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -694,6 +704,86 @@ def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset
     return str(value)
 
 
+def _annotation_admits(annotation: Any, wanted: Any) -> bool:
+    """Whether ``annotation`` names ``wanted`` outright or as a union member.
+
+    A parameterized container is not a match: ``Mapping[str, int]`` has ``int`` among its args and
+    is not an integer field. Only a bare annotation or a union of them counts, which is what keeps
+    the two censuses below off ``usage`` -- whose *values* are governed by their own loop.
+    """
+
+    if annotation is wanted:
+        return True
+    return get_origin(annotation) in (Union, UnionType) and wanted in get_args(annotation)
+
+
+@lru_cache(maxsize=None)
+def _field_names_admitting(cls: type, wanted: Any) -> frozenset[str]:
+    """The record's own fields whose declared type admits ``wanted``.
+
+    Derived from the annotations rather than restated beside them, for the reason the wire-key
+    tuple below already gives: a field added tomorrow joins the rule the day it exists, not the
+    day someone remembers a list. Cached because both censuses run on every construction and
+    every read of these records.
+    """
+
+    hints = get_type_hints(cls)
+    return frozenset(
+        entry.name
+        for entry in dataclass_fields(cls)
+        if _annotation_admits(hints.get(entry.name), wanted)
+    )
+
+
+def _validate_counts(record: Any, label: str) -> None:
+    """Every count on ``record`` is a real integer -- one predicate, applied by enumeration.
+
+    ``bool`` is an ``int`` subclass, so a count validated by comparison alone admits ``True``:
+    ``True < 1`` is ``False``, so a bounds check passes it, ``True == 1`` satisfies the receipt's
+    ordered-index invariant, and ``to_json`` then emits a JSON boolean where
+    ``MODEL_CALLS_RECORD_SCHEMA`` requires an integer -- a record this kernel writes and its own
+    schema refuses to read back.
+
+    The rule itself is not new here. The usage loops on both records already spell
+    ``type(value) is not int`` and explain why; it had simply been applied to the mapping values
+    and to none of the scalar counts standing beside them. Stated once and enumerated so the two
+    records cannot drift apart again, which is exactly how they got here.
+
+    A field declared nullable may hold ``None``; that too is read off the annotation.
+    """
+
+    nullable = _field_names_admitting(type(record), type(None))
+    for name in sorted(_field_names_admitting(type(record), int)):
+        value = getattr(record, name)
+        if value is None and name in nullable:
+            continue
+        if type(value) is not int:
+            raise WireValidationError(f"{label} {name} must be an integer")
+
+
+def _refuse_null_wire_values(payload: Mapping[str, Any], cls: type, label: str) -> None:
+    """A key present and holding ``null`` is a corrupt record, not an absent one.
+
+    Absence on these records means one thing -- a writer that predates the field -- and the
+    defaults reconstruct what that writer meant. ``null`` means a writer that had the field and
+    wrote nothing into it, which no writer here has ever done: ``to_json`` emits an object for
+    every one of them. Collapsing the two put an explicit null onto the field's legacy default,
+    and the defaults are load-bearing: an empty ``usage`` still satisfies the receipt's
+    cross-entry sum invariant, and an empty ``attempt_log`` reads as "no ledger was ever written"
+    rather than as the erasure it is.
+
+    Enumerated over the record's own fields, minus the ones declared nullable, so this cannot be
+    the rule for the fields someone remembered. The per-field required-key pin is a different
+    question and remains one: it asks whether the key is present, and a key holding null is.
+    """
+
+    nullable = _field_names_admitting(cls, type(None))
+    required = frozenset(entry.name for entry in dataclass_fields(cls)) - nullable
+    nulls = sorted(key for key in required if key in payload and payload[key] is None)
+    if nulls:
+        raise WireValidationError(f"{label} fields must not be null: {', '.join(nulls)}")
+
+
 @dataclass(frozen=True)
 class ModelCallAttempt:
     """One kernel dispatch inside a settled call, as the receipt's log records it.
@@ -730,6 +820,9 @@ class ModelCallAttempt:
     stream_committed: bool = False
 
     def __post_init__(self) -> None:
+        # Type before bounds: a comparison cannot tell an integer from a bool, so the bounds
+        # checks below are only meaningful once every count is known to be one.
+        _validate_counts(self, "model call attempt")
         if self.index < 1:
             raise ValueError("model call attempt index must be positive")
         if self.elapsed_ms < 0:
@@ -782,6 +875,9 @@ class ModelCallAttempt:
             raise WireValidationError(
                 "model call attempt is missing required fields: " + ", ".join(missing)
             )
+        # Present-and-null is the other half of the same question, and the pin above cannot ask
+        # it: a key holding ``null`` satisfies ``name in payload``.
+        _refuse_null_wire_values(payload, cls, "model call attempt")
         raw_status = payload.get("http_status")
         return cls(
             index=parse_int(payload, "index", default=1),
@@ -884,6 +980,9 @@ class ModelCallReceipt:
     attempt_log: tuple[ModelCallAttempt, ...] = ()
 
     def __post_init__(self) -> None:
+        # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
+        # so a comparison admits the bool it exists to bound.
+        _validate_counts(self, "model call")
         if self.attempts < 0:
             raise ValueError("model call attempts must not be negative")
         if type(self.attempt_log) is not tuple:
@@ -1079,6 +1178,11 @@ class ModelCallReceipt:
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
+        # Absence on this record is legacy and reads as the field's default; ``null`` is a writer
+        # that had the field and wrote nothing, which no writer here has ever done. Applied over
+        # the record's own fields, so ``context``, ``model`` and ``usage`` -- which collapsed the
+        # same way ``attempt_log`` did -- are covered by the rule rather than by three checks.
+        _refuse_null_wire_values(payload, cls, "model call receipt")
         usage = _optional_object(payload, "usage") or {}
         # Absent on every receipt written before this field existed, which is legal and reads
         # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,

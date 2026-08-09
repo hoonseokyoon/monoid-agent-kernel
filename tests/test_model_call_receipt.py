@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import fields, replace
+from types import UnionType
+from typing import Union, get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -700,8 +702,42 @@ def test_from_json_rejects_a_falsy_malformed_nested_payload(payload: dict[str, o
 
 
 @pytest.mark.parametrize("key", ["context", "model", "usage"])
-def test_from_json_still_treats_absent_and_null_nested_payloads_as_defaults(key: str) -> None:
-    assert ModelCallReceipt.from_json({key: None}) == ModelCallReceipt()
+def test_from_json_treats_an_absent_nested_payload_as_a_default(key: str) -> None:
+    """The half of the old contract that is real: a writer that predates the field.
+
+    ``183e197`` settled this as "absent and null keep their defaults; anything present reaches
+    validation", and the absent half is still exactly right -- it is what lets a receipt written
+    before a field existed be read back.
+    """
+    assert ModelCallReceipt.from_json({}) == ModelCallReceipt()
+
+    payload = ModelCallReceipt().to_json()
+    del payload[key]
+
+    assert ModelCallReceipt.from_json(payload) == ModelCallReceipt()
+
+
+@pytest.mark.parametrize("key", ["context", "model", "usage"])
+def test_from_json_refuses_a_nested_payload_that_is_present_and_null(key: str) -> None:
+    """The other half of ``183e197`` is withdrawn here, and the file had already withdrawn it.
+
+    That commit lumped ``null`` in with absent while reasoning about *falsy wrong types*
+    (``{"context": []}`` read as an anonymous invocation). At the time the conflation was
+    harmless: both landed on the same default, and no default meant anything beyond "empty".
+
+    ``_parsed_status`` is where this record stopped believing that, in its own words -- "a key
+    present and holding ``null`` is a corrupt record ... conflating the two was harmless while
+    both landed on the default and stopped being harmless the moment absence began to infer".
+    Two fields since made the defaults load-bearing in exactly that way: ``attempt_log``'s
+    absence *infers* a writer predating the ledger, so a null there erases a real ledger and
+    reads as legacy; and ``usage``'s default is an empty mapping that then satisfies the
+    receipt's own cross-entry sum invariant, so a nulled total agrees with any breakdown.
+
+    ``http_status`` stays nullable and is covered by its own test above, because it is declared
+    ``int | None`` -- the annotation is what decides, not this list.
+    """
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json({key: None})
 
 
 @pytest.mark.parametrize(
@@ -766,3 +802,104 @@ def test_from_json_tolerates_a_receipt_written_before_config_recoverable_existed
     del payload["config_recoverable"]
 
     assert ModelCallReceipt.from_json(payload).config_recoverable is False
+
+
+def _admits(annotation: object, wanted: object) -> bool:
+    """Whether ``annotation`` names ``wanted`` directly or as a union member.
+
+    Deliberately re-derived here rather than imported from the module under test: an enumeration
+    that shares its definition with the code it audits agrees with that code by construction, and
+    would go green with it if the definition were the thing that broke.
+    """
+    if annotation is wanted:
+        return True
+    return get_origin(annotation) in (Union, UnionType) and wanted in get_args(annotation)
+
+
+def _nullable_names(cls: type) -> set[str]:
+    hints = get_type_hints(cls)
+    return {entry.name for entry in fields(cls) if _admits(hints.get(entry.name), type(None))}
+
+
+def _numeric_names(cls: type) -> list[str]:
+    hints = get_type_hints(cls)
+    return sorted(entry.name for entry in fields(cls) if _admits(hints.get(entry.name), int))
+
+
+@pytest.mark.parametrize("record", [ModelCallAttempt, ModelCallReceipt], ids=["attempt", "receipt"])
+def test_every_wire_field_that_is_not_nullable_refuses_an_explicit_null(record: type) -> None:
+    """Derived census: "absent" and "present and null" are different answers on both records.
+
+    ``from_json`` read a key holding ``null`` as if the key were missing, so an explicit null
+    landed on the field's legacy default. On ``usage`` that produced an empty mapping which then
+    *satisfied* the receipt's cross-entry sum invariant; on ``attempt_log`` it erased the whole
+    per-dispatch ledger and read as a writer predating the field -- while the ledger schema
+    rejects null and no writer that ever existed emitted one.
+
+    The per-field required-key pin added for the earlier partial-entry finding was green through
+    every one of these, and structurally had to be: it asks whether the key is *in* the payload,
+    and a key holding null is in the payload. Presence and non-nullness are different questions,
+    and only the first had an instrument.
+
+    Enumerated over each record's own fields rather than over the two the review named, because
+    the receipt's ``usage``, ``context`` and ``model`` had the identical shape and were not
+    named. ``http_status`` is declared ``int | None``, so a wire null is a value there rather
+    than a collapse -- read off the annotation, so a field that becomes nullable tomorrow stops
+    being required here on the same day.
+    """
+    complete = json.loads(json.dumps(record().to_json()))
+    nullable = _nullable_names(record)
+    collapsed = []
+    for key in sorted(complete):
+        if key in nullable:
+            continue
+        payload = dict(complete)
+        payload[key] = None
+        try:
+            record.from_json(payload)
+        except WireValidationError:
+            continue
+        collapsed.append(key)
+
+    assert collapsed == [], {
+        "fields_reading_an_explicit_null_as_their_default": collapsed,
+        "nullable_and_therefore_exempt": sorted(nullable),
+        "hint": "absent = legacy default; present-but-null = refused",
+    }
+
+
+@pytest.mark.parametrize("record", [ModelCallAttempt, ModelCallReceipt], ids=["attempt", "receipt"])
+def test_every_numeric_field_on_both_records_refuses_a_boolean(record: type) -> None:
+    """Derived census: one predicate for every count, not a comparison written per field.
+
+    ``__post_init__`` validated its counts by comparison alone, and ``True < 1`` is ``False`` --
+    so ``ModelCallAttempt(index=True)`` was stored, and ``to_json`` emitted a JSON boolean where
+    ``MODEL_CALLS_RECORD_SCHEMA`` requires an integer: a record this kernel writes and its own
+    schema refuses. ``True == 1`` also satisfied the receipt's ordered-index invariant, so a
+    bool-indexed entry passed the one check that exists to make the log answerable.
+
+    The rule was already written down in this same file, one dataclass over: the usage loop on
+    both records spells ``type(value) is not int`` and carries a comment explaining that ``bool``
+    is an ``int`` subclass and a boolean count is a bug. It was applied to the mapping values and
+    to none of the scalar counts beside them -- the rule stated on one sibling and not the other.
+
+    Enumerated from the annotations, so the seventh count added tomorrow is covered the day it
+    exists. The review named two of the seven that were open; ``http_status`` on both records was
+    not validated at all.
+    """
+    numeric = _numeric_names(record)
+    assert numeric, f"{record.__name__} has no numeric fields to enumerate"
+
+    accepted = []
+    for name in numeric:
+        try:
+            built = record(**{name: True})
+        except WireValidationError:
+            continue
+        accepted.append((name, built.to_json()[name]))
+
+    assert accepted == [], {
+        "numeric_fields_that_stored_a_boolean": accepted,
+        "enumerated": numeric,
+        "hint": "type(value) is not int -- the rule the usage loop already spells",
+    }
