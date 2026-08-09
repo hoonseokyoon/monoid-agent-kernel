@@ -34,6 +34,7 @@ from monoid_agent_kernel.core.model_calls import (
     MODEL_CALL_KIND,
     MODEL_CALLS_FILENAME,
     MODEL_CALLS_SCHEMA_VERSION,
+    _recorded_attempt,
     _recorded_context,
     _recorded_model,
     model_call_record,
@@ -210,11 +211,20 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
 
     Checked both ways. A schema key the writer never emits is a required field that fails every
     real record; a writer key the schema does not declare fails every record too, just later.
+
+    ``required`` is one explicit key short of ``properties``: ``validate_run_dir`` sweeps run
+    directories that v0.20 writers filled, and requiring ``attempt_log`` would fail every ledger
+    written before the field existed. The writer still always emits it -- the ``set(record)``
+    equality above is the writer-side pin -- so absence keeps meaning exactly one thing, a
+    pre-W7-1 writer. The optional set is pinned exactly: a future key cannot slip into it
+    without arguing with this test.
     """
     record = _record()
 
     assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
-    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["required"])
+    assert set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - set(
+        MODEL_CALLS_RECORD_SCHEMA["required"]
+    ) == {"attempt_log"}
     assert _errors(record) == []
     assert record["schema_version"] == MODEL_CALLS_SCHEMA_VERSION
     assert record["kind"] == MODEL_CALL_KIND
@@ -243,6 +253,86 @@ def test_the_schema_advertises_one_namespace_because_the_ledger_has_only_ever_ha
 )
 def test_a_malformed_record_is_refused_by_the_schema(mutation: dict[str, object]) -> None:
     assert _errors({**_record(), **mutation})
+
+
+def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
+    """The record carries the receipt's per-dispatch log; a line written before the field
+    existed carries no key and stays valid -- the sweep validator reads directories that
+    v0.20 writers filled, and a required key there would fail every one of them."""
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    entry = ModelCallAttempt(
+        index=1,
+        elapsed_ms=42,
+        usage={"input_tokens": 12, "output_tokens": 3},
+        stream_committed=True,
+    )
+    record = _record(attempt_log=(entry,))
+
+    assert record["attempt_log"] == [entry.to_json()]
+    assert _errors(record) == []
+
+    legacy = _record()
+    del legacy["attempt_log"]
+    assert _errors(legacy) == []
+
+
+@pytest.mark.parametrize(
+    "attempt_log",
+    [
+        "two",
+        [{"index": 1}],
+        [
+            {
+                "index": 0,
+                "elapsed_ms": 0,
+                "error_code": "",
+                "provider_error_code": "",
+                "retryable": False,
+                "config_recoverable": False,
+                "http_status": None,
+                "provider_retried": False,
+                "usage": {},
+                "stream_committed": False,
+            }
+        ],
+        [
+            {
+                "index": 1,
+                "elapsed_ms": 0,
+                "error_code": "",
+                "provider_error_code": "",
+                "retryable": False,
+                "config_recoverable": False,
+                "http_status": None,
+                "provider_retried": False,
+                "usage": {"output_tokens": -1},
+                "stream_committed": False,
+            }
+        ],
+        [
+            {
+                "index": 1,
+                "elapsed_ms": 0,
+                "error_code": "",
+                "provider_error_code": "",
+                "retryable": False,
+                "config_recoverable": False,
+                "http_status": None,
+                "provider_retried": False,
+                "usage": {},
+                "stream_committed": False,
+                "unexpected": True,
+            }
+        ],
+    ],
+)
+def test_a_malformed_attempt_log_is_refused_by_the_schema(attempt_log: object) -> None:
+    """An entry is written whole or not at all: a partial one, a zero index, a negative count,
+    or a stray key is a writer bug the schema refuses -- the same closed-shape rule the record
+    itself follows."""
+
+    assert _errors({**_record(), "attempt_log": attempt_log})
 
 
 def test_an_empty_digest_is_a_valid_record_because_a_status_explains_it() -> None:
@@ -324,6 +414,12 @@ _PROJECTION_ALLOWLIST = {
     "config_recoverable",
     "http_status",
     "capture_downgrades",
+    # the attempt-log block (W7-1): the taxonomy names above are shared with the receipt's
+    # own recorded fields; these three are the entry's alone.
+    "attempt_log",
+    "index",
+    "elapsed_ms",
+    "stream_committed",
 }
 
 
@@ -358,8 +454,8 @@ def _assert_the_projection_reflects_over_nothing(source: str) -> None:
 
 @pytest.mark.parametrize(
     "projection",
-    [model_call_record, _recorded_model, _recorded_context],
-    ids=["record", "model", "context"],
+    [model_call_record, _recorded_model, _recorded_context, _recorded_attempt],
+    ids=["record", "model", "context", "attempt"],
 )
 def test_the_recorded_call_projection_is_hand_listed(projection: object) -> None:
     _assert_the_projection_reflects_over_nothing(inspect.getsource(projection))  # type: ignore[arg-type]

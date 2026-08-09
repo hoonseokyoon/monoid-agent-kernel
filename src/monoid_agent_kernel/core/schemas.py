@@ -1075,6 +1075,44 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "latency_ms": {"type": "integer", "minimum": 0},
         "attempts": {"type": "integer", "minimum": 0},
+        # Declared but not required: the sweep validator reads ledgers v0.20 writers filled,
+        # and absence means exactly one thing -- a writer that predates the field. A present
+        # entry is written whole or refused: the closed shape is the record's own rule, one
+        # level down.
+        "attempt_log": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "index",
+                    "elapsed_ms",
+                    "error_code",
+                    "provider_error_code",
+                    "retryable",
+                    "config_recoverable",
+                    "http_status",
+                    "provider_retried",
+                    "usage",
+                    "stream_committed",
+                ],
+                "properties": {
+                    "index": {"type": "integer", "minimum": 1},
+                    "elapsed_ms": {"type": "integer", "minimum": 0},
+                    "error_code": {"type": "string"},
+                    "provider_error_code": {"type": "string"},
+                    "retryable": {"type": "boolean"},
+                    "config_recoverable": {"type": "boolean"},
+                    "http_status": {"type": ["integer", "null"]},
+                    "provider_retried": {"type": "boolean"},
+                    "usage": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer", "minimum": 0},
+                    },
+                    "stream_committed": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
         "provider_retried": {"type": "boolean"},
         "error_code": {"type": "string"},
         "provider_error_code": {"type": "string"},
