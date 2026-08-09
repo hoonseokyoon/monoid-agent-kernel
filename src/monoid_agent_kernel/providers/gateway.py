@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
@@ -25,6 +24,7 @@ from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.identifiers import namespaced_id
+from monoid_agent_kernel.providers._common import retry_delay_s as _retry_delay
 from monoid_agent_kernel.providers._common import (
     build_generation_payload,
     build_reasoning_payload,
@@ -124,6 +124,22 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
             retryable=False,
             config_recoverable=True,
         ) from exc
+
+
+def _adapter_layer_attempts(retry: Any) -> int:
+    """How many attempts THIS adapter's own loop may make under ``retry``.
+
+    Under ``layer="kernel"`` the runner owns the retry loop and a compliant adapter must not
+    multiply it, so the answer is one regardless of ``max_attempts`` -- the schedule fields
+    govern whichever layer loops, and here that layer is not this one. The kernel also hands
+    a neutralized policy down when it dispatches, but a directly-driven adapter honors the
+    contract on its own. One function for both loops (blocking and streamed), so the rule
+    cannot drift between them.
+    """
+
+    if retry.layer == "kernel":
+        return 1
+    return max(1, retry.max_attempts)
 
 
 def _stamp_retry(error: BaseException, attempt: int) -> None:
@@ -245,7 +261,7 @@ class GatewayModelAdapter:
         url = self._resolve_gateway_url(config)
         body = _encode_request_body(self._payload(request))
         retry = config.retry
-        max_attempts = max(1, retry.max_attempts)
+        max_attempts = _adapter_layer_attempts(retry)
         last_error: ModelAdapterError | None = None
         attempt = 0
         try:
@@ -410,7 +426,7 @@ class GatewayModelAdapter:
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
         body = _encode_request_body(self._payload(request))
         retry = config.retry
-        max_attempts = max(1, retry.max_attempts)
+        max_attempts = _adapter_layer_attempts(retry)
         last_error: ModelAdapterError | None = None
         attempt = 0
         # Bound before the client exists, because the client's own lifecycle can fail: `__aexit__`
@@ -1953,26 +1969,6 @@ def _should_retry(
         and bool(error.provider_error_code)
         and error.provider_error_code in retry_on
     )
-
-
-def _retry_delay(
-    attempt: int,
-    initial_delay_s: float,
-    max_delay_s: float,
-    backoff_multiplier: float,
-    jitter_s: float,
-) -> float:
-    """How long to wait after ``attempt`` failed, before the next one.
-
-    The schedule itself, separated from waiting on it, because the two callers wait differently and
-    a backoff policy that differed between the sync and the streamed path would be a difference
-    nobody chose.
-    """
-
-    delay = min(max_delay_s, initial_delay_s * (backoff_multiplier ** max(0, attempt - 1)))
-    if jitter_s > 0:
-        delay += random.uniform(0, jitter_s)
-    return delay
 
 
 def _sleep_before_retry(

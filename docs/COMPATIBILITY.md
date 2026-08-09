@@ -402,6 +402,15 @@ it always did. Relatedly, a run cancelled at a park now commits an ordinary
 `monoid.checkpoint.v1` park snapshot at the ack (`cancellation_requested`, an existing field)
 and a terminal one at close; pre-existing readers need no migration.
 
+`ModelRetryConfig` grows `layer` (`"adapter"` | `"kernel"`), naming the single owner of the
+retry loop for a model call. `to_json` emits the key only when it departs the default, so a
+config that never chose a layer serializes byte-identically to one written before the field
+existed and keeps its runtime-config hash; `from_json` reads an absent key as `"adapter"`,
+which is what pre-W7 configs meant. The request-identity projection already excluded the
+whole `retry` block, so recorded replay keys do not move either way. A pre-W7 reader handed
+a `"kernel"` config ignores the unknown key and behaves as `"adapter"` — it retries in the
+adapter loop — which is the pre-W7 behavior, never a multiplication.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

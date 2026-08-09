@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel.core.spec import (
+    RETRY_LAYERS,
     ModelConfig,
     validate_generation_config,
     validate_reasoning_config,
@@ -596,6 +597,13 @@ def _normalize_required_text(value: Any, field_name: str) -> str:
     return normalize_unicode_scalars(value)
 
 
+def _model_layer(value: Any) -> str:
+    if value not in RETRY_LAYERS:
+        rendered = ", ".join(RETRY_LAYERS)
+        raise ValueError(f"model.retry.layer must be one of: {rendered}")
+    return value
+
+
 def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError("model.retry.retry_on must be an array of non-empty strings")
@@ -716,6 +724,10 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
             inclusive=True,
         ),
         retry_on=_normalize_retry_codes(config.retry.retry_on),
+        # Membership against the tuple the JSON codec validates with, not a local edition of
+        # it: a layer value accepted by one construction route and refused by the other would
+        # select different retry loops for the same config.
+        layer=_model_layer(config.retry.layer),
     )
     # validate_generation_config enforces the enum, so a passing on_unsupported is already
     # inside the portable ASCII domain -- no per-field text normalization step is needed.

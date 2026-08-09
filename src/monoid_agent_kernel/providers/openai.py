@@ -380,7 +380,7 @@ class OpenAIModelAdapter:
                 # is the same final ``httpx.Request`` the exception probe reads -- one parser,
                 # both verdicts. ``getattr`` with a default for the hop the probe cannot make
                 # itself, exactly as the streaming path hops ``stream.response``.
-                raw_calls = client.responses.with_raw_response
+                raw_calls = _call_client(client, config).responses.with_raw_response
                 try:
                     raw = raw_calls.create(**payload, timeout=config.timeout_s)
                 except TypeError:
@@ -521,12 +521,13 @@ class OpenAIModelAdapter:
             # what failed -- there is nothing to release then, and it must not raise looking.
             stream: Any = None
             try:
+                stream_calls = _call_client(client, config).responses
                 try:
-                    stream = await client.responses.create(
+                    stream = await stream_calls.create(
                         **payload, stream=True, timeout=config.timeout_s
                     )
                 except TypeError:
-                    stream = await client.responses.create(**payload, stream=True)
+                    stream = await stream_calls.create(**payload, stream=True)
 
                 # The SDK's retry loop runs entirely before the stream object exists -- a stream
                 # is only handed back once a response committed -- so the evidence is complete
@@ -839,6 +840,25 @@ def _config_shaped_refusal(status: int | None, *, retryable: bool) -> bool:
         and 400 <= status < 500
         and status not in _TRANSIENT_4XX_STATUSES
     )
+
+
+def _call_client(client: Any, config: ModelConfig) -> Any:
+    """The client one SDK call goes through, honoring the retry-layer contract.
+
+    The SDK's own retry loop is not governed by ``ModelRetryConfig`` -- this adapter only
+    reads its evidence (``_provider_retried_by_the_sdk``) -- so ``layer="kernel"`` can only
+    reach it through client options, and this helper is the single place that happens:
+    ``test_the_kernel_layer_reaches_every_sdk_call_through_one_helper`` derives every
+    ``.responses`` route from the source and requires it to sit on this call.
+
+    Identity under the default layer, an options copy only under the kernel one. The client
+    may be scope-cached (`use_client_scope`), and ``with_options`` copies share the cached
+    transport without owning it, so the copy is never the object the close paths release.
+    """
+
+    if config.retry.layer == "kernel":
+        return client.with_options(max_retries=0)
+    return client
 
 
 def _provider_retried_by_the_sdk(source: Any) -> bool:

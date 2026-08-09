@@ -852,6 +852,62 @@ def test_both_waits_follow_one_schedule() -> None:
     assert gateway._retry_delay(9, 0.5, 4.0, 2.0, 0.0) == 4.0
 
 
+def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
+    """A policy the spec accepts must not turn a wait into an `OverflowError`.
+
+    `backoff_multiplier` is validated as any positive finite number and `max_attempts` as any
+    integer above zero, so `multiplier ** (attempt - 1)` can leave the float range while the
+    CONFIGURED delay is still four seconds -- `1e308` on the third attempt, the default `2.0`
+    on the 1025th. `float ** int` raises there rather than saturating at infinity, and all
+    three loops evaluate the schedule inside an `except` handler for a retryable
+    `ModelAdapterError`: an arithmetic error raised there replaces the provider's failure
+    with an unclassified one. Hence the cap binds the exponent, before the power is taken.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    assert gateway._retry_delay(3, 0.5, 4.0, 1e308, 0.0) == 4.0
+    assert gateway._retry_delay(1025, 0.5, 4.0, 2.0, 0.0) == 4.0
+    # ...and the cap must not stand in for a step the arithmetic CAN still reach. A subnormal
+    # initial delay keeps the PRODUCT small while the power alone leaves the float range, so a
+    # bound taken on the power by itself would answer `max_delay_s` -- 1.8e308 seconds -- for a
+    # wait of 1.8 seconds. Both arms: one chunk of growth, and (below) enough of them that the
+    # power cannot be taken in one piece at all.
+    float_max = 1.7976931348623157e308
+    assert gateway._retry_delay(2, 1e-308, float_max, float_max, 0.0) == 1e-308 * float_max
+    chunked = gateway._retry_delay(1800, 5e-324, 4.0, 1.5, 0.0)
+    assert chunked == pytest.approx(3.0336e-07, rel=1e-6)
+    # Below the saturation point the schedule is the one it always was, and the degenerate
+    # arms (no growth, no initial delay, no cap) still answer what the product answered.
+    assert gateway._retry_delay(3, 0.5, 4.0, 2.0, 0.0) == 2.0
+    assert gateway._retry_delay(4, 0.5, 4.0, 0.5, 0.0) == 0.0625
+    assert gateway._retry_delay(4, 0.0, 4.0, 2.0, 0.0) == 0.0
+    assert gateway._retry_delay(4, 0.5, 0.0, 2.0, 0.0) == 0.0
+
+
+def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:
+    """The schedule answers with a number, and every one of its inputs is validated finite.
+
+    Jitter is added ON TOP of the cap -- deliberately, because the moment a herd most needs
+    smearing is the moment every member is sitting at `max_delay_s` -- and float addition
+    returns `inf` instead of raising when the sum leaves the range. `jitter_s` and
+    `max_delay_s` are both bounded below and not above, so two finite controls can produce a
+    non-finite wait, and `asyncio.sleep(inf)` is a timer that never fires. The sum saturates
+    at the largest finite float: the closest representable value to the delay the policy
+    asked for.
+
+    Sixteen draws, not one, because the failing sum needs a jitter above zero -- and the
+    counter-arm below needs one too: the additive jitter is unchanged wherever the sum is
+    representable, which this pins by demanding a delay ABOVE the cap.
+    """
+    from monoid_agent_kernel.providers import gateway
+
+    float_max = 1.7976931348623157e308
+    for _ in range(16):
+        assert gateway._retry_delay(1, float_max, float_max, 2.0, float_max) <= float_max
+    jittered = max(gateway._retry_delay(9, 0.5, 4.0, 2.0, 1.0) for _ in range(16))
+    assert 4.0 < jittered <= 5.0
+
+
 def test_the_streamed_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) -> None:
     """The streamed twin of `test_the_retry_is_reported_before_the_wait_not_after_it`.
 
@@ -1513,3 +1569,58 @@ def test_a_pool_teardown_after_the_terminal_frame_reports_what_the_hop_metered(
 
     assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
     assert provider_usage_of(caught.value) == _DROPPED_STREAM_USAGE
+
+
+def test_the_kernel_layer_turns_the_streamed_loop_off_too(monkeypatch: Any) -> None:
+    """The blocking loop's twin: `layer="kernel"` means one connection attempt, streamed too.
+
+    The rule lives in one helper (`_adapter_layer_attempts`) precisely so the two loops
+    cannot drift; this test is the streamed half's own binding, because a rule proven on the
+    blocking loop alone is the house defect shape. Same control structure as the blocking
+    test: the default layer retries the identical refusal, so the kernel half is not
+    passing on an error that was never loop-eligible.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    attempts: list[int] = []
+
+    class _Refusing:
+        def __init__(self, **_kwargs: Any) -> None: ...
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            attempts.append(1)
+            raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Refusing)
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+
+    kernel = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3, layer="kernel"),
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(kernel)
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert caught.value.retryable is True
+    assert len(attempts) == 1
+
+    attempts.clear()
+    adapter_layer = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3),
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError):
+        _stream(adapter_layer)
+    assert len(attempts) == 3

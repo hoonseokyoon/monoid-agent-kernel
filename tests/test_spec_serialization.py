@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.spec import (
 )
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.permissions import PermissionPolicy, matches_path_patterns
+from monoid_agent_kernel.providers.base import normalize_model_config
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
 pytestmark = pytest.mark.unit
@@ -138,6 +139,44 @@ def test_model_retry_json_requires_an_explicit_retry_code_sequence(retry_on: obj
 def test_model_retry_json_requires_nonempty_string_codes(entry: object) -> None:
     with pytest.raises(ValueError, match="model.retry.retry_on entries"):
         ModelRetryConfig.from_json({"retry_on": ["gateway_timeout", entry]})
+
+
+def test_model_retry_json_reads_the_layer_and_defaults_it_to_adapter() -> None:
+    assert ModelRetryConfig.from_json(None).layer == "adapter"
+    assert ModelRetryConfig.from_json({}).layer == "adapter"
+    assert ModelRetryConfig.from_json({"layer": "adapter"}).layer == "adapter"
+    assert ModelRetryConfig.from_json({"layer": "kernel"}).layer == "kernel"
+
+
+@pytest.mark.parametrize("value", ("provider", "", 1, True, None))
+def test_model_retry_json_rejects_an_unknown_layer(value: object) -> None:
+    with pytest.raises(ValueError, match="model.retry.layer"):
+        ModelRetryConfig.from_json({"layer": value})
+
+
+def test_model_retry_layer_serializes_only_when_it_departs_the_default() -> None:
+    # The exact key set of the default serialization: this dict feeds the runtime-config
+    # semantic hash, so a config that never chose a layer must serialize byte-identically to
+    # one written before the field existed -- and the NEXT field added here must land in this
+    # pin rather than silently widening that surface.
+    assert set(ModelRetryConfig().to_json()) == {
+        "max_attempts",
+        "initial_delay_s",
+        "max_delay_s",
+        "backoff_multiplier",
+        "jitter_s",
+        "retry_on",
+    }
+    kernel = ModelRetryConfig(layer="kernel")
+    assert kernel.to_json()["layer"] == "kernel"
+    assert ModelRetryConfig.from_json(kernel.to_json()) == kernel
+
+
+def test_direct_python_retry_layer_is_validated_like_every_other_control() -> None:
+    normalized = normalize_model_config(ModelConfig(retry=ModelRetryConfig(layer="kernel")))
+    assert normalized is not None and normalized.retry.layer == "kernel"
+    with pytest.raises(ValueError, match="model.retry.layer"):
+        normalize_model_config(ModelConfig(retry=ModelRetryConfig(layer="upstream")))
 
 
 def test_model_json_controls_preserve_valid_numeric_semantics() -> None:

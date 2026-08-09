@@ -269,8 +269,31 @@ def validate_generation_config(generation: GenerationConfig) -> GenerationConfig
     return generation
 
 
+RETRY_LAYERS: tuple[str, ...] = ("adapter", "kernel")
+"""Who runs the retry loop for a model call: the adapter's own transport loop, or the kernel.
+
+Module-level and unprefixed because the direct-construction normalizer in ``providers.base``
+validates against the same tuple — the literals live once. A second spelling is how the
+reasoning enums briefly grew a third, hand-copied edition (see ``_runtime_config_ingress``'s
+note), and a layer value accepted by one route and refused by the other would select
+*different loops* for the same config.
+"""
+
+
 @dataclass(frozen=True)
 class ModelRetryConfig:
+    """Transport retry policy: the schedule, the codes, and who runs the loop (``layer``).
+
+    ``layer`` names the single owner of the retry loop for a call, so attempts cannot be
+    multiplied by two loops stacking. ``"adapter"`` (the default) is the shipped behavior:
+    the adapter's own loop retries and the kernel makes exactly one adapter call.
+    ``"kernel"`` moves the loop into ``ModelCallRunner``: the runner re-dispatches the
+    already-keyed request and hands the adapter a neutralized policy, and a compliant
+    adapter seeing ``layer="kernel"`` must not run a loop of its own. The schedule fields
+    govern whichever layer loops; ``retry_on`` remains the adapter loop's code selector —
+    the kernel judges by the error taxonomy (``retryable``), not by this list.
+    """
+
     max_attempts: int = 3
     initial_delay_s: float = 0.5
     max_delay_s: float = 4.0
@@ -282,6 +305,7 @@ class ModelRetryConfig:
         "gateway_rate_limited",
         "gateway_server_error",
     )
+    layer: str = "adapter"
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ModelRetryConfig:
@@ -316,10 +340,13 @@ class ModelRetryConfig:
                 allow_zero=True,
             ),
             retry_on=_model_retry_codes(payload.get("retry_on", defaults.retry_on)),
+            layer=_model_choice(
+                payload.get("layer", defaults.layer), "model.retry.layer", RETRY_LAYERS
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "max_attempts": self.max_attempts,
             "initial_delay_s": self.initial_delay_s,
             "max_delay_s": self.max_delay_s,
@@ -327,6 +354,13 @@ class ModelRetryConfig:
             "jitter_s": self.jitter_s,
             "retry_on": list(self.retry_on),
         }
+        # Emitted only when configured, for the reason `ModelConfig.to_json` gives for
+        # `generation`: this dict feeds the runtime-config semantic hash, so a config that
+        # never chose a layer must serialize byte-identically to one written before the
+        # field existed.
+        if self.layer != "adapter":
+            payload["layer"] = self.layer
+        return payload
 
 
 @dataclass(frozen=True)
