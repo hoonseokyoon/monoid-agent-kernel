@@ -2031,7 +2031,7 @@ def test_validate_refuses_a_request_record_the_reader_cannot_parse(tmp_path: Pat
         "the fixture must be the offloaded shape -- a verbatim payload is caught by the line "
         "reader, which is the arm that never had this defect"
     )
-    assert _load(tmp_path).request_terms_view() == (), (
+    assert list(_load(tmp_path).request_terms_view()) == [], (
         "the fixture must be one the reader actually refuses, or it pins nothing"
     )
 
@@ -2206,6 +2206,9 @@ _REVIEWED_INTERPOLATIONS = {
         ("__init__", "type(inner).__name__"),
         # Bounded by every producer: each ReplayMissReason detail is built through _short/_where.
         ("_serve_miss", "miss.detail"),
+        # A count of parts, not a value from one. An integer position discloses nothing and has
+        # no length -- the same fact as `call_index` and the take's slot.
+        ("_serve_miss", "unresolved"),
     },
 }
 
@@ -2914,3 +2917,56 @@ def test_a_settle_that_raises_does_not_discard_a_paid_answer(tmp_path: Path) -> 
     )
 
     take.served()
+
+
+def test_the_request_evidence_scan_does_not_hold_the_whole_expanded_corpus(
+    tmp_path: Path,
+) -> None:
+    """The twin of the answer-side retention above, on the half not carried over.
+
+    ``response_bodies_view`` was made a generator one round earlier for exactly this reason. Its
+    neighbour ``request_terms_view`` stayed a tuple *and* wrote every expansion into a cache the
+    corpus held for its whole life -- so constructing the adapter reassembled every offloaded
+    request, parsed it, and kept it. The recipe records that name those preimages are a handful
+    of chunk references each; the preimages are up to the 8 MB payload ceiling and unbounded in
+    number, so the peak tracked the *expanded* corpus rather than the indexed one, before a
+    single call was served.
+
+    Slope rather than an absolute bound, for the reason the answer-side test gives: one
+    expansion's transient is several times its own size, and what must not happen is the peak
+    tracking the corpus.
+    """
+
+    size = PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096
+
+    def peak_for(count: int, run_id: str) -> int:
+        recorder = _recorder(tmp_path, run_id=run_id)
+        _drive(
+            recorder,
+            _ScriptedAdapter(
+                [ModelTurn(response_id=f"r{n}", final_text="ok") for n in range(count)]
+            ),
+            # A distinct oversized instruction per call, so each request offloads its own chunk
+            # instead of sharing one and measuring deduplication.
+            [_request(chr(ord("a") + n) * size) for n in range(count)],
+        )
+        recorder.close()
+        corpus = ReplayCorpus.load([tmp_path / "runs" / run_id])
+        tracemalloc.reset_peak()
+        seen = {run for run, terms in corpus.request_terms_view() if terms.get("messages")}
+        peak = tracemalloc.get_traced_memory()[1]
+        assert seen == set(), "the fixture records no messages; the scan must find none"
+        return peak
+
+    tracemalloc.start()
+    try:
+        small = peak_for(4, "terms-small")
+        large = peak_for(16, "terms-large")
+    finally:
+        tracemalloc.stop()
+
+    added = 12 * size
+    assert large - small < added / 4, (
+        f"twelve more offloaded requests ({added:,} bytes) raised the evidence scan's peak by "
+        f"{large - small:,}; it is expanding the corpus into memory and keeping it"
+    )

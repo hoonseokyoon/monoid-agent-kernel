@@ -69,7 +69,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayedResponse,
 )
 from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
-from monoid_agent_kernel.core.media import WIRE_MEDIA_CARRIERS
+from monoid_agent_kernel.core.media import WIRE_FORWARDABLE_PART_TYPES, WIRE_MEDIA_CARRIERS
 from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -142,6 +142,43 @@ def _is_media_block(part: Any) -> bool:
         return False
     source = part.get("source")
     return isinstance(source, Mapping) and source.get("type") == "base64"
+
+
+def _is_text_part(part: Any) -> bool:
+    """A part :func:`~core.media.resolve_wire_messages` would pass through untouched.
+
+    The question is not "is this media" but "would resolving rewrite it", and those differ:
+    the resolver passes ``text`` through, rewrites forwardable media, and **drops** everything
+    else. So a corpus is safe to resolve without changing a single recorded key only when every
+    part of every carrier list is text -- which is what lets a text-only corpus inherit a
+    multimodal inner's capability without moving its own digests.
+    """
+
+    return isinstance(part, Mapping) and part.get("type") == "text"
+
+
+def _unresolved_media_parts(messages: Any) -> int:
+    """How many by-reference media parts a request still carries.
+
+    Non-zero here on the fallthrough path means the loop did not resolve them -- it gates
+    resolution on this adapter's ``supports_multimodal`` -- so the live adapter would be handed
+    a ``source_ref`` its mapper cannot forward and would drop.
+    """
+
+    count = 0
+    for message in messages if isinstance(messages, Sequence) else ():
+        if not isinstance(message, Mapping):
+            continue
+        for carrier in WIRE_MEDIA_CARRIERS:
+            parts = message.get(carrier)
+            for part in parts if isinstance(parts, list) else ():
+                if (
+                    isinstance(part, Mapping)
+                    and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
+                    and not _is_media_block(part)
+                ):
+                    count += 1
+    return count
 
 
 class ReplayModelAdapter:
@@ -219,6 +256,7 @@ class ReplayModelAdapter:
 
         providers: list[str] = []
         media_seen = False
+        only_text_parts = True
         runs_with_history: set[str] = set()
         runs_with_injected_reasoning: set[str] = set()
         for run_id, terms in corpus.request_terms_view():
@@ -233,8 +271,12 @@ class ReplayModelAdapter:
                     runs_with_history.add(run_id)
                 for carrier in WIRE_MEDIA_CARRIERS:
                     parts = message.get(carrier) if isinstance(message, Mapping) else None
-                    if isinstance(parts, list) and any(_is_media_block(p) for p in parts):
+                    if not isinstance(parts, list):
+                        continue
+                    if any(_is_media_block(p) for p in parts):
                         media_seen = True
+                    if not all(_is_text_part(p) for p in parts):
+                        only_text_parts = False
         if len(providers) > 1:
             raise ValueError(
                 "replay sources recorded more than one provider "
@@ -323,9 +365,36 @@ class ReplayModelAdapter:
         if declared:
             self.provider_name = declared
 
-        self.supports_multimodal = (
-            media_seen if supports_multimodal is _AUTO else bool(supports_multimodal)
-        )
+        if supports_multimodal is not _AUTO:
+            self.supports_multimodal = bool(supports_multimodal)
+        elif media_seen:
+            # The recorded preimages hold *resolved* media, so the original resolved and this
+            # adapter must too, or every key from that turn on is computed over references the
+            # recording does not have.
+            self.supports_multimodal = True
+        elif only_text_parts and self._inner is not None and not corpus.unreadable_requests():
+            # Derived from the corpus alone, this said "text only", and under
+            # `--replay-fallthrough` that answer was applied to the *live* adapter behind it:
+            # `AgentLoop` gates `resolve_wire_messages` on this flag, so a new image request
+            # missed the text-only corpus and reached a paid provider call with its media still
+            # by reference -- which the OpenAI mapper forwards only when it is already base64,
+            # so the call happened, was charged, and silently had no image in it.
+            #
+            # Inheriting is safe only where resolution cannot move a recorded digest, and
+            # `resolve_wire_messages` rewrites more than media: it passes `text` through,
+            # resolves forwardable parts, and *drops* everything else. So the condition is that
+            # every part of every carrier list is text, not merely that no media was seen.
+            #
+            # `unreadable_requests()` joins it for the reason the reasoning derivation two
+            # branches up gives: a request the reader could not parse is exactly the one that
+            # could have carried the media this scan did not see, and a narrowed view must not
+            # be read as a silent one. `--replay-fallthrough` without an inner keeps the strict
+            # answer, since there is no live call to preserve a capability for.
+            self.supports_multimodal = bool(
+                getattr(self._inner, "supports_multimodal", False)
+            )
+        else:
+            self.supports_multimodal = False
         self._served_slots: dict[str, list[tuple[int, weakref.ref[ModelTurn]]]] = {}
         self._served_lock = threading.Lock()
         self.wire_image_encoding = wire_image_encoding
@@ -333,6 +402,24 @@ class ReplayModelAdapter:
             # Inert under the loop (it always authors request.model); a standalone
             # ModelCallRunner caller may want the effective-config probe to answer.
             self.config = config
+        elif self._inner is not None:
+            # Otherwise the probe -- `getattr(adapter, "config", None)`, and it can only see this
+            # wrapper -- finds nothing and answers with the *default* model for a request whose
+            # `model` is None. That is wrong twice over: the recording was keyed under the
+            # configuration the original adapter carried, so a valid recording misses; and the
+            # fallthrough then serves the call with the inner's own non-default config while the
+            # receipt stamps the default, recording a real answer under a model identity that
+            # never produced it.
+            #
+            # Type-checked and tolerant of a raising probe for the reasons `_effective_model`
+            # gives: an adapter that cannot answer must not thereby lose its call, and a
+            # non-`ModelConfig` must not become one by being assigned here.
+            try:
+                inherited = getattr(self._inner, "config", None)
+            except Exception:  # noqa: BLE001 - a probe is bookkeeping, never the verdict
+                inherited = None
+            if isinstance(inherited, ModelConfig):
+                self.config = inherited
 
     # --- the call ----------------------------------------------------------------------------
 
@@ -572,6 +659,29 @@ class ReplayModelAdapter:
         """
 
         if self._inner is not None:
+            unresolved = _unresolved_media_parts(getattr(request, "messages", ()))
+            if unresolved and not self.supports_multimodal:
+                # Refused *before* the call, because the call is the harm. The loop gates
+                # `resolve_wire_messages` on this adapter's flag, so these parts are still
+                # `source_ref`s, and a provider mapper forwards media only once it is base64 --
+                # the paid call would happen, be charged and recorded, and simply not contain
+                # the image. A miss that is loud is this adapter's whole contract; a live answer
+                # to a question the model was never shown is the failure it exists to prevent.
+                #
+                # Reachable only where the capability could not be inherited: a corpus holding
+                # by-reference media (resolving would move its own recorded keys), one with
+                # unreadable requests, or a text-only inner. Named in the message, because the
+                # three have different remedies.
+                raise ModelAdapterError(
+                    f"a fallthrough call carries {unresolved} unresolved media part(s) while "
+                    "this replay adapter reports text-only, so the live call would be made "
+                    "without them; the corpus could not lend the inner adapter its multimodal "
+                    "capability (it records media by reference, or holds unreadable requests, "
+                    "or the inner adapter is text-only). Pass supports_multimodal=True to "
+                    "state the capability explicitly, or replay without --replay-fallthrough",
+                    retryable=False,
+                    config_recoverable=True,
+                )
             turn = self._inner.next_turn(request)
             if inspect.isawaitable(turn):
                 # `_adrive` awaits whatever a synchronous adapter hands back, so this return

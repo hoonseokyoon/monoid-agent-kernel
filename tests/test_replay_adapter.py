@@ -1693,7 +1693,8 @@ def test_a_request_the_reader_cannot_parse_is_not_evidence_of_absence(tmp_path: 
     corpus = _corpus(tmp_path)
     assert corpus.unreadable_requests() == 1, (
         "the fixture must leave exactly one request record present and unreadable, or it pins "
-        f"nothing: view={len(corpus.request_terms_view())} unreadable={corpus.unreadable_requests()}"
+        f"nothing: view={len(list(corpus.request_terms_view()))} "
+        f"unreadable={corpus.unreadable_requests()}"
     )
 
     adapter = _replay(tmp_path)
@@ -2223,3 +2224,161 @@ def test_a_union_whose_sources_disagree_about_declaring_is_refused(tmp_path: Pat
     # Each source alone still reaches its own answer -- the refusal is about combining them.
     assert getattr(_replay(tmp_path, "run-1"), "provider_name", None) == "openai"
     assert getattr(_replay(tmp_path, "run-2"), "provider_name", None) is None
+
+
+class _MultimodalInner:
+    """A live adapter that declares the capability every real provider declares."""
+
+    supports_multimodal = True
+
+    def __init__(self) -> None:
+        self.seen: list[Any] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.seen.append(request)
+        return ModelTurn(final_text="live answer")
+
+
+def _image_request(text: str = "look at this") -> ModelRequest:
+    return _request(
+        text,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source_ref": "img.png", "mime_type": "image/png"},
+                ],
+            }
+        ],
+    )
+
+
+def test_a_text_only_corpus_lends_a_multimodal_inner_its_capability(tmp_path: Path) -> None:
+    """`--replay-fallthrough` must not apply the corpus's answer to the live adapter behind it.
+
+    `supports_multimodal` is derived from what the recorded preimages hold, which is right for
+    the recorded calls and wrong for the live ones: `AgentLoop` gates `resolve_wire_messages` on
+    this one flag, so a text-only corpus made the loop skip resolution for a *new* image request,
+    which then missed the corpus and reached a paid provider call with its media still by
+    reference. Provider mappers forward media only once it is base64, so the call happened, was
+    charged and recorded, and had no image in it.
+
+    Rejecting the combination instead is not available: `openai` and `gateway` both declare
+    `supports_multimodal = True` unconditionally, so it would reject nearly every fallthrough
+    against a real provider whose corpus happens to be text-only.
+
+    Inheriting is sound here precisely because resolution cannot move a recorded key: every part
+    of every recorded carrier list is text, and the resolver passes text through unchanged.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="recorded")]),
+        [_request("plain")],
+    )
+    inner = _MultimodalInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    assert adapter.supports_multimodal is True, (
+        "the corpus answered for the live adapter, so the loop skips resolution and the paid "
+        "call is made without the image"
+    )
+    # The recorded call still replays: resolution is the identity on a text-only preimage, so
+    # the key is unchanged.
+    assert adapter.next_turn(_request("plain")).final_text == "recorded"
+
+
+def test_an_unresolved_media_fallthrough_is_refused_rather_than_paid_for(tmp_path: Path) -> None:
+    """Where the capability cannot be inherited, the live call is refused, not made blind.
+
+    A corpus holding media *by reference* cannot lend the capability: resolving would rewrite
+    the very preimages it recorded, moving every key from that turn on. So the flag stays False
+    and the loop keeps skipping resolution — and a fallthrough would hand the provider a
+    `source_ref` its mapper drops. The refusal is `config_recoverable`, because the remedy is the
+    operator's: declare the capability or drop the fallthrough.
+    """
+
+    _record(
+        tmp_path,
+        _OriginalAdapter([ModelTurn(final_text="recorded")]),
+        [_image_request()],
+    )
+    inner = _MultimodalInner()
+    adapter = _replay(tmp_path, inner=inner)
+
+    assert adapter.supports_multimodal is False, (
+        "this corpus records media by reference, so resolving would move its own recorded keys"
+    )
+    with pytest.raises(ModelAdapterError, match="unresolved media part") as caught:
+        adapter.next_turn(_image_request("a new image the corpus never saw"))
+    assert caught.value.config_recoverable is True
+    assert inner.seen == [], "the paid call must not have been made without the image"
+
+
+def test_a_wrapper_without_a_config_answers_with_the_inner_adapters(tmp_path: Path) -> None:
+    """The effective-model probe can only see this wrapper, so an omitted config invents a model.
+
+    `_effective_model` reads `getattr(adapter, "config", None)` for a request whose `model` is
+    None. With no config on the wrapper it answers `ModelConfig()` -- the default -- while the
+    recording was keyed under the configuration the original adapter carried, so a valid
+    recording misses. Fallthrough then serves the call with the inner's own non-default config
+    and the receipt stamps the default, recording a real answer under a model identity that
+    never produced it.
+
+    Inheriting is what makes the key right rather than what changes it: the wrapper stands where
+    the original adapter stood, and the original's config is what the original's key was taken
+    over.
+    """
+
+    configured = ModelConfig(provider="openai", model="gpt-4.1-mini")
+
+    class _ConfiguredInner:
+        config = configured
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live answer")
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="recorded")]), [_request()])
+
+    inherited = _replay(tmp_path, inner=_ConfiguredInner())
+    assert getattr(inherited, "config", None) == configured, (
+        "the probe sees only this wrapper, so an omitted config makes it answer with the default "
+        "model for a request that carries none"
+    )
+
+    # An explicit config still wins, and an inner without one leaves the wrapper silent.
+    explicit = ModelConfig(provider="gateway", model="explicit")
+    assert _replay(tmp_path, inner=_ConfiguredInner(), config=explicit).config == explicit
+    assert getattr(_replay(tmp_path, inner=_MultimodalInner()), "config", None) is None
+
+
+def test_an_inner_config_that_is_not_one_is_not_adopted(tmp_path: Path) -> None:
+    """A probe answers with whatever it likes; only a `ModelConfig` may become this wrapper's.
+
+    The same rule the effective-model probe applies one seam over, and for the same reason: an
+    adapter is operator-supplied, and a string or a raising property must not become the identity
+    a receipt is stamped with.
+    """
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="recorded")]), [_request()])
+
+    class _Nonsense:
+        config = "gpt-4.1-mini"
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live")
+
+    class _Raising:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="live")
+
+        @property
+        def config(self) -> ModelConfig:
+            raise RuntimeError("this probe fails")
+
+    assert getattr(_replay(tmp_path, inner=_Nonsense()), "config", None) is None
+    assert getattr(_replay(tmp_path, inner=_Raising()), "config", None) is None

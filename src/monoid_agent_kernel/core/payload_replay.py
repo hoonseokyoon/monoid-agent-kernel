@@ -404,7 +404,7 @@ class ReplayCorpus:
         self._response_run: dict[str, str] = {}
         self._crossed: set[str] = set()
         self._crossed_within_one_run: set[str] = set()
-        self._terms_cache: dict[tuple[str, int], Mapping[str, Any] | None] = {}
+        self._unreadable: int | None = None
         self._profiles: tuple[dict[str, Any], ...] | None = None
         self._lock = threading.Lock()
 
@@ -800,7 +800,7 @@ class ReplayCorpus:
 
     # --- cursor-free evidence views ----------------------------------------------------------
 
-    def request_terms_view(self) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    def request_terms_view(self) -> Iterator[tuple[str, Mapping[str, Any]]]:
         """The reassembled terms of every readable request record, in index order, with its run.
 
         For derivation-time evidence scans (the replay adapter's impersonation rules read
@@ -826,14 +826,20 @@ class ReplayCorpus:
         The first record has been held to this re-hash since it was written; the duplicates
         beside it were not, which is the same rule-on-one-half shape one layer in from where it
         was last found.
+
+        Yields rather than returning a tuple, and retains nothing it yields. A reassembled
+        preimage can approach the 8 MB payload ceiling while the record that names it is a
+        handful of chunk references, and nothing bounds how many there are -- so materializing
+        the view held the *entire expanded* request corpus at once, at construction, before a
+        single call was served. Its twin ``response_bodies_view`` was made a generator for this
+        exact reason one round earlier; this one was the half not carried over.
         """
 
-        return tuple(
-            (entry.run_id, terms)
-            for digest in self._requests
-            for slot, entry in enumerate(self._request_contributors.get(digest, ()))
-            if (terms := self._entry_terms(entry, digest, slot)) is not None
-        )
+        for digest in self._requests:
+            for entry in self._request_contributors.get(digest, ()):
+                terms = self._entry_terms(entry, digest)
+                if terms is not None:
+                    yield entry.run_id, terms
 
     def unreadable_requests(self) -> int:
         """How many request records exist that :meth:`request_terms_view` could not include.
@@ -845,9 +851,19 @@ class ReplayCorpus:
         request provenance from that call onward -- so the reader's own nesting bound can
         leave a record present and mute. Silence then stops being evidence: a derivation that
         treats a narrowed view as a complete one concludes MORE confidently from LESS.
+
+        Counted once and remembered, because the count is the only part worth keeping: the
+        derivation asks three times and the CLI preflight twice, and each pass reassembles every
+        request record. The corpus is immutable after :meth:`load` -- ``_index`` runs only while
+        it is being built -- so one answer is the answer. An ``int`` retained here is what lets
+        the expanded preimages behind it be dropped as they are produced.
         """
 
-        return sum(1 for digest in self._requests if self._request_terms(digest) is None)
+        if self._unreadable is None:
+            self._unreadable = sum(
+                1 for digest in self._requests if self._request_terms(digest) is None
+            )
+        return self._unreadable
 
     def response_bodies_view(self) -> Iterator[tuple[str, Mapping[str, Any]]]:
         """Every materializable answer body with its run, grouped by key then in file order,
@@ -1156,22 +1172,23 @@ class ReplayCorpus:
         contributor through :meth:`_entry_terms` on its own payload.
         """
 
-        return self._entry_terms(self._requests[digest], digest, 0)
+        return self._entry_terms(self._requests[digest], digest)
 
-    def _entry_terms(
-        self, entry: _RequestEntry, digest: str, slot: int
-    ) -> Mapping[str, Any] | None:
+    def _entry_terms(self, entry: _RequestEntry, digest: str) -> Mapping[str, Any] | None:
         """One request record's terms, reassembled from **its own** payload and re-hashed.
 
-        Cached per contributor rather than per digest: duplicates share a digest and must not
-        share an answer to this question, which is the whole point of asking it of each of them.
-        Slot 0 is the first-wins entry, so the cache line the rest of the class reads is the same
-        one it always was.
+        Nothing is cached. A reassembled preimage can approach the 8 MB payload ceiling while the
+        record naming it is a few chunk references, so a cache here is a copy of the entire
+        *expanded* corpus keyed by a corpus that is much smaller -- held for the adapter's whole
+        life, filled at construction by the evidence scan, and reachable before a single call is
+        served. Each caller now gets one expansion and drops it; the only thing kept is the
+        ``unreadable_requests`` count, which is an ``int``.
+
+        Takes the entry rather than a slot index, because there is no longer anything to key by
+        position and a parameter that survives its only use is how a later reader concludes the
+        thing it named is still happening.
         """
 
-        cache_key = (digest, slot)
-        if cache_key in self._terms_cache:
-            return self._terms_cache[cache_key]
         terms: Mapping[str, Any] | None = None
         try:
             preimage = reassemble_request_preimage(
@@ -1188,7 +1205,6 @@ class ReplayCorpus:
                     terms = inner
         except Exception:  # noqa: BLE001 - an unreassemblable candidate is no candidate
             terms = None
-        self._terms_cache[cache_key] = terms
         return terms
 
     # --- reporting -------------------------------------------------------------------------

@@ -66,6 +66,35 @@ out in commit messages and here.
   `test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is` is now the equivalence proof
   for the dispatch and runs in both directions — reader-looser is the defect, reader-stricter has
   to be enumerated and now *fails* when it is not.
+- **`--replay-fallthrough` no longer applies the corpus's multimodal answer to the live adapter.**
+  `supports_multimodal` is derived from what the recorded preimages hold, which is right for the
+  recorded calls and wrong for the live ones: `AgentLoop` gates `resolve_wire_messages` on this one
+  flag, so a text-only corpus made the loop skip resolution for a *new* image request, which then
+  missed the corpus and reached a paid provider call with its media still by reference — and
+  provider mappers forward media only once it is base64, so the call happened, was charged, and had
+  no image in it. A corpus whose recorded parts are all text now lends the inner adapter its
+  capability, which is sound exactly there because resolution passes text through unchanged and so
+  cannot move a recorded key. Where it cannot be lent — a corpus recording media *by reference*
+  (resolving would rewrite its own preimages), one with unreadable requests, or a text-only inner —
+  a fallthrough carrying unresolved media is refused as `config_recoverable` before the call rather
+  than paid for blind. Rejecting the combination outright was not available: `openai` and `gateway`
+  both declare `supports_multimodal = True` unconditionally.
+- **The request evidence scan no longer holds the whole expanded corpus.** `request_terms_view()`
+  returned a tuple *and* wrote every expansion into a cache the corpus kept for its lifetime, so
+  constructing `ReplayModelAdapter` reassembled and parsed every offloaded request and retained it —
+  the recipes that name those preimages are a handful of chunk references each, the preimages are up
+  to the 8 MB ceiling and unbounded in number, so the peak tracked the *expanded* corpus before a
+  single call was served. It yields now and retains nothing; the only thing kept is the
+  `unreadable_requests` count, computed once because the derivation asks three times and the CLI
+  preflight twice. Its twin `response_bodies_view` was made a generator one round earlier for the
+  same reason.
+- **A fallthrough wrapper with no config of its own answers with the inner adapter's.** The
+  effective-model probe reads `getattr(adapter, "config", None)` and can only see the wrapper, so a
+  request whose `model` is None resolved to the *default* model: a recording keyed under the
+  original adapter's configuration missed, and the fallthrough then served the call with the inner's
+  own non-default config while the receipt stamped the default — a real answer recorded under a
+  model identity that never produced it. A validated `ModelConfig` on the inner is adopted when no
+  explicit one is given; a raising probe or a non-`ModelConfig` leaves the wrapper silent.
 - **A union whose sources disagree about the recorded provider declaration is refused.** The rule
   that declines to declare was made run-scoped in an earlier round; the positive half beside it
   stayed a global flag, so one source carrying an injected reasoning block declared for the whole
