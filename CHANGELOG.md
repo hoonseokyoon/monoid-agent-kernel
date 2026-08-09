@@ -7,6 +7,41 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the kernel owns the retry when the config says so: `ModelRetryConfig.layer`
+
+- **`ModelRetryConfig` names who runs the retry loop.** `layer: "adapter" | "kernel"`
+  (default `"adapter"`, serialized only when it departs the default, so a config that never
+  chose keeps its pre-field `config_hash`). Under `"kernel"`, `ModelCallRunner` loops around
+  the one dispatch point all four adapter shapes share: the request is normalized and keyed
+  once, one receipt settles with `attempts=N`, and observers see one capture. The predicate
+  is the taxonomy — a retryable, non-config-recoverable `ModelAdapterError`; run boundaries
+  fall out structurally, and `retry_on` stays the adapter loop's code selector.
+- **Exactly one layer loops.** The dispatch copy is neutralized to `max_attempts=1` with the
+  layer preserved (silencing any config-honoring loop, including third-party adapters that
+  never learned `layer` exists); the gateway client answers one attempt under `"kernel"` on
+  both its loops, and the OpenAI adapter passes the SDK `max_retries=0` through the one
+  helper every `.responses` route is census-bound to. Kernel × adapter stays the kernel's
+  count, not the product — pinned end-to-end through the runner and the gateway wire.
+- **A delivered chunk closes the retry window.** Once the delta consumer holds output, a
+  retry would replay it downstream, so the loop refuses — the same commit line the gateway's
+  `committed` flag and the OpenAI SDK's pre-stream retry window already draw. A stream that
+  dies before delivering anything retries, and the consumer sees only the attempt that
+  answered.
+- **A swallowed attempt still cost tokens.** Usage stamped on errors the kernel loop absorbs
+  (`mark_provider_usage`) is summed into the receipt on either settle exit; the receipt is
+  the audit surface for the whole logical call. The run token budget still meters settled
+  turns and parked failures — per-attempt spend absorbed by any retry layer is a receipt
+  fact, documented as such.
+- **The backoff answers to the run.** The wait shares the gateway's schedule
+  (`retry_delay_s` in `providers/_common`, one function for all three loops) and runs under
+  the same cancel/deadline race as the attempts, so a cancellation wakes it; a backoff that
+  cannot fit the remaining deadline re-raises the transient provider error instead of
+  sleeping into a `RunTimeout` that names nothing.
+- **The replay key does not move.** The identity projection already excluded the retry block
+  (W6-4b's `_model_identity` named this exact field addition as its reason); the exclusion
+  matrix now pins `retry.layer` per-field, and a retried run's corpus is shape-identical to
+  an unretried one because recording is settle-driven — failed attempts leave no records.
+
 ### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
 
 - **`discard_turn` now takes back the answer it served, not the last one it remembers.** The

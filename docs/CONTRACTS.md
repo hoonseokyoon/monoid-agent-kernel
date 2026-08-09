@@ -431,13 +431,16 @@ another attempt. The kernel counts one adapter call per turn however many attemp
 so without this a call that failed twice and succeeded on the third try is recorded as a clean
 single attempt. Report on the *decision*, before waiting or reconnecting: a call the run cancels or
 times out mid-retry never returns an outcome to carry the fact, and for a blocking `next_turn` the
-worker's eventual result is discarded entirely. Calling it is optional and inert outside a run.
+worker's eventual result is discarded entirely. Calling it is optional and inert outside a run. Under `ModelRetryConfig.layer="kernel"`
+this channel keeps exactly that meaning: the kernel's own re-dispatches are counted by
+`attempts`, never reported here.
 
 `ModelCallReceipt.attempts` may be **0**. A run whose cancellation or deadline was already past when
 the call was requested is refused before the adapter is reached, and a receipt is still written
 because a refused call belongs in the audit trail — so a consumer summing `attempts` must treat 0 as
 "no adapter call was made" rather than as a missing value. A failure *while* reaching into the
-adapter still counts as 1: the kernel did begin the call there. A payload that omits the field reads
+adapter still counts as 1: the kernel did begin the call there. Under the kernel retry
+layer each re-dispatch adds one, so N means N adapter calls for one logical request. A payload that omits the field reads
 as 1, which is what older records mean.
 
 #### Generation parameters, reasoning, output schema, and the applied echoes
@@ -2527,6 +2530,38 @@ connection reset mid-read) with backoff. An `HTTPError` is a real response and i
 retried as a connection error. The model adapter's retry is policy-driven by
 `ModelRetryConfig.retry_on` (default codes: `gateway_timeout`, `gateway_network_error`,
 `gateway_rate_limited`, `gateway_server_error`).
+
+### The retry layer (`ModelRetryConfig.layer`)
+
+`layer` names the single owner of the retry loop for a model call, so two loops cannot
+multiply attempts. The default, `"adapter"`, is the behavior above: the adapter's own loop
+retries and the kernel makes exactly one adapter call. Under `"kernel"` the
+`ModelCallRunner` owns the loop: it re-dispatches the already-keyed request on a retryable,
+non-config-recoverable `ModelAdapterError` — the taxonomy, not `retry_on`, which stays the
+adapter loop's provider-specific code selector — waits on the same schedule fields under the
+run's cancel/deadline race, and refuses to back off into a deadline it cannot fit,
+re-raising the transient error instead of converting it into a `RunTimeout` that names
+nothing. A delivered stream chunk closes the retry window: once a consumer holds output, a
+retry would replay it — the same commit line the gateway's streamed loop and the OpenAI
+SDK's pre-stream window already draw.
+
+Compliance is two-sided. The runner hands the adapter a dispatch copy whose policy is
+neutralized to `max_attempts=1` (silencing any config-honoring loop, including a
+third-party adapter that never learned `layer` exists) with the layer value preserved, and
+a compliant adapter whose loop lives outside the config honors the value itself: the
+gateway client answers one attempt under `"kernel"` on both its loops, and the OpenAI
+adapter passes `max_retries=0` to the SDK. The receipt keeps the caller's configured
+policy, and the replay key excludes the whole retry block, so neither the layer nor the
+neutralization moves any recorded identity. Layers below one process stay out of scope: an
+upstream gateway deployment owns its own transport policy, and its retries surface as
+`provider_retried` evidence, not as attempts.
+
+Under `"kernel"`, `ModelCallReceipt.attempts` counts every dispatch, `provider_retried`
+keeps meaning a loop *below* the adapter boundary ran, and usage stamped on attempts the
+loop swallowed is summed into the receipt's `usage` on either settle exit — the receipt is
+the audit surface for what the whole logical call cost. The run's cumulative token budget
+still meters settled turns and parked failures; per-attempt spend absorbed by any retry
+layer (this one, or an adapter's own) is visible on receipts rather than in the budget.
 
 ## Run Artifacts
 
