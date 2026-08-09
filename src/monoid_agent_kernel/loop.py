@@ -202,6 +202,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolObservation,
     format_async_result_text,
+    mark_provider_retried,
     mark_provider_usage,
     portable_usage_value,
     provider_usage_of,
@@ -2355,7 +2356,12 @@ class AgentLoop:
             outcome_status = "interrupted"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "interrupted"
-            raise TurnInterrupted("turn interrupted") from exc
+            # Through the carrying rule for the same reason the translator below is: this replaces
+            # one exception with another, and a freshly built ``TurnInterrupted`` carries none of
+            # what the runner stamped on the abort -- including the bill for every attempt a kernel
+            # retry absorbed before the turn was stopped. Those attempts completed and were charged
+            # for; the interrupt did not un-spend them.
+            raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
         except RunCancelled:
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
@@ -3534,6 +3540,41 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
+    def _account_billed_model_call(
+        self,
+        exc: BaseException,
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> dict[str, int]:
+        """The one route a failed model call's already-billed spend takes into the run's totals.
+
+        Two arms end a model call by re-raising, and the accounting was written into one of them.
+        A rule living inside a handler is a rule bound to the exception types that handler
+        catches: ``except ModelAdapterError`` covers a provider's refusal and nothing else, so a
+        run boundary -- which is a ``NativeAgentError`` and takes the next arm -- carried its
+        absorbed attempts' bill out of the loop with no one reading it. Written once here so the
+        arms cannot answer the question differently; each arm still decides whether it has a
+        transcript row to write, which is the part that genuinely differs between them.
+
+        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
+        the totals moved, and a meter that publishes only when a turn *settles* leaves a run whose
+        model calls all failed billed reporting a cost of zero.
+        """
+
+        billed = _billed_usage(exc)
+        if not billed:
+            return {}
+        _accumulate_usage_mapping(state.total_usage, billed)
+        self._emit_metrics_updated(
+            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
+        )
+        return billed
+
     def _emit_metrics_updated(
         self,
         recorder: AgentRecorder,
@@ -3957,9 +3998,6 @@ class AgentLoop:
                 # never reaches the accumulation below. Counted here, or the cumulative token
                 # budget silently under-counts every refused call and the metrics report a run
                 # cheaper than it was.
-                billed = _billed_usage(exc)
-                if billed:
-                    _accumulate_usage_mapping(state.total_usage, billed)
                 recorder.transcript(
                     {
                         "kind": "model_turn",
@@ -3967,7 +4005,7 @@ class AgentLoop:
                         "response_id": None,
                         "final_text": None,
                         "tool_calls": [],
-                        "usage": dict(billed),
+                        "usage": dict(_billed_usage(exc)),
                         "error": str(exc),
                         "error_code": exc.error_code,
                         "provider_error_code": exc.provider_error_code,
@@ -3977,21 +4015,34 @@ class AgentLoop:
                         "provider_retried": exc.provider_retried,
                     }
                 )
-                if billed:
-                    # The billed cost of a refused call reached the totals and never reached the
-                    # live stream: this arm accumulated and returned, while the success path
-                    # below published one metrics.updated per turn. A run whose only model call
-                    # failed billed therefore never published its cost at all.
-                    self._emit_metrics_updated(
-                        recorder,
-                        state,
-                        context,
-                        step=step,
-                        turn_id=turn_id,
-                        parent_id=turn_started.event_id,
-                    )
+                self._account_billed_model_call(
+                    exc,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                )
                 raise
-            except NativeAgentError:
+            except NativeAgentError as exc:
+                # The twin of the arm above, and for a while the one that accounted for nothing.
+                # Every run boundary is a ``NativeAgentError`` -- ``RunCancelled``, ``RunTimeout``,
+                # the ``TurnInterrupted`` the abort is translated into -- so a call the run itself
+                # ended landed here and dropped whatever a kernel retry had already absorbed. Those
+                # attempts are completed, billed wire calls that finished before anything was
+                # cancelled: the ledger names them, and the totals did not. No transcript row goes
+                # with it -- there is no model_turn to describe and no taxonomy to describe it
+                # with; the boundary writes its own record, and this arm answers only for the bill.
+                self._account_billed_model_call(
+                    exc,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                )
                 raise
             except Exception as exc:
                 # The same translator ``_acall_model`` raises through, so the two doors into this
@@ -5685,10 +5736,30 @@ def _as_model_adapter_error(exc: BaseException) -> BaseException:
 
     if isinstance(exc, NativeAgentError) or not isinstance(exc, Exception):
         return exc
-    probe = ModelCallReceipt().with_error(exc)
-    wrapped = ModelAdapterError(str(exc), provider_retried=probe.provider_retried)
-    mark_provider_usage(wrapped, probe.usage)
-    return wrapped
+    return _carrying_stamps(ModelAdapterError(str(exc)), exc)
+
+
+def _carrying_stamps(replacement: BaseException, original: BaseException) -> BaseException:
+    """Move what was stamped on an escaping error onto the error that replaces it.
+
+    Every fact the runner writes onto a failure -- the bill through ``mark_provider_usage``, the
+    adapter's own retry through ``mark_provider_retried`` -- is written *onto the exception*
+    precisely so it survives the exception's escape. Building a replacement out of the original's
+    message alone therefore does the one thing those stamps exist to prevent, and the loop spelled
+    that rebuild in two places: the translator below, and the ``ModelCallAborted`` handler that
+    hands the turn layer a ``TurnInterrupted``. One of them carried the stamps.
+
+    Read back through ``ModelCallReceipt.with_error`` -- the single reader of exception-carried
+    facts -- so a translation cannot disagree with the receipt built for the same call. Only the
+    stamps travel: taxonomy stays with the type that classified itself, since ``retryable`` and
+    ``http_status`` decide park-vs-terminal and no replacement may inherit a fate it was not given.
+    """
+
+    probe = ModelCallReceipt().with_error(original)
+    mark_provider_usage(replacement, probe.usage)
+    if probe.provider_retried:
+        mark_provider_retried(replacement)
+    return replacement
 
 
 def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:

@@ -22,7 +22,12 @@ from monoid_agent_kernel.core.checkpoint import (
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
-from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.errors import (
+    ModelAdapterError,
+    ModelCallAborted,
+    RunCancelled,
+    RunTimeout,
+)
 from monoid_agent_kernel.loop import AgentLoop, _recoverable_turn_error
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
@@ -2704,6 +2709,55 @@ def test_a_kernel_absorbed_bill_survives_a_non_adapter_terminal_error(tmp_path: 
         loop.close()
 
 
+@pytest.mark.parametrize(
+    ("boundary", "reason"),
+    [
+        (RunCancelled("run cancelled"), "terminal"),
+        (RunTimeout("run exceeded max duration"), "terminal"),
+        (ModelCallAborted("aborted"), "interrupted"),
+    ],
+    ids=["cancelled", "timed_out", "aborted"],
+)
+def test_a_kernel_absorbed_bill_survives_every_boundary_exit(
+    tmp_path: Path, boundary: BaseException, reason: str
+) -> None:
+    """The remaining twins of the accounting arm: a call the run's own boundary ended.
+
+    The generic-exception door was closed by routing it through the translator, which lands the
+    failure in ``except ModelAdapterError`` where the bill is read. A run boundary lands nowhere
+    near it: ``RunCancelled``, ``RunTimeout`` and the ``ModelCallAborted`` the loop turns into
+    ``TurnInterrupted`` are all ``NativeAgentError``, so they take the arm one line below --
+    which re-raised and accounted for nothing. The absorbed attempts on the other side of that
+    boundary are completed, billed wire calls; they finished before anything was cancelled, and
+    the ledger has them while ``total_usage`` did not.
+
+    The abort arm loses them twice over: it replaces ``ModelCallAborted`` with a freshly built
+    ``TurnInterrupted``, and a fresh exception carries no stamps -- the same rebuild-from-nothing
+    that cost the generic arm its bill, in the one place the loop still spelled it by hand.
+
+    Attempt one fails retryable with a billed body; attempt two raises the boundary. Each row
+    ends the run differently -- a cancelled or timed-out run is terminal, an aborted turn parks
+    alive for the next message -- and the bill is the same on all three.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+
+    adapter = _ScriptedAdapter([absorbed, boundary])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == reason
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
 def test_a_model_failure_the_adapter_did_not_classify_keeps_its_stamps() -> None:
     """The translator's own contract, stated as the split it makes: stamps travel, taxonomy does not.
 
@@ -2819,6 +2873,129 @@ def test_every_model_failure_the_loop_re_raises_goes_through_one_translator() ->
         "built_with_a_caught_error_in_scope": constructed_where_an_error_was_caught,
         "hint": "_as_model_adapter_error is the only thing that turns a caught error into one",
     }
+
+    # Naming ``ModelAdapterError`` is what the three clauses above have in common, and it is the
+    # part of the rule that was never the rule: the boundary also replaces ``ModelCallAborted``
+    # with a ``TurnInterrupted``, a different class doing the identical thing, and every clause
+    # above walks past it. Scoped to the function that makes the model call rather than to a
+    # class, so a fourth replacement of a fifth type is covered on the day it is written.
+    boundary = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and any(
+            isinstance(call.func, ast.Attribute) and call.func.attr == "acall"
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+        )
+    )
+    carried = {"_carrying_stamps", "_as_model_adapter_error"}
+    replacements: dict[int, str] = {}
+    for node in ast.walk(boundary):
+        if not isinstance(node, ast.Raise) or node.cause is None or node.exc is None:
+            continue
+        raised = node.exc
+        if isinstance(raised, ast.Name):
+            # ``failure = <expr>`` ... ``raise failure from exc``: resolve the one assignment
+            # that binds the name, so the spelling this file prefers is judged by what it built.
+            raised = next(
+                (
+                    assigned.value
+                    for assigned in ast.walk(boundary)
+                    if isinstance(assigned, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == raised.id  # type: ignore[union-attr]
+                        for target in assigned.targets
+                    )
+                ),
+                raised,
+            )
+        reached = {
+            call.func.id
+            for call in ast.walk(raised)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+        if not reached & carried:
+            replacements[node.lineno] = ast.unparse(node)
+    assert replacements == {}, {
+        "replacements_that_drop_what_was_stamped_on_the_original": replacements,
+        "hint": "_carrying_stamps(<replacement>, exc) -- the bill is on the exception, not the type",
+    }
+
+    # And the carrying rule is reached from both replacements, so deleting one cannot pass by
+    # deleting the shape the clause above looks for.
+    carriers = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_carrying_stamps"
+    )
+    assert len(carriers) == 2, {"call_sites": carriers}
+
+
+def test_every_arm_that_re_raises_a_model_call_accounts_for_what_it_billed() -> None:
+    """Derived census: the accounting is a property of the ``try``, not of one of its handlers.
+
+    The bill reaches ``total_usage`` from inside an ``except`` clause, which binds it to the types
+    that clause catches. ``except ModelAdapterError`` was the arm someone drove, so it was the arm
+    that accounted; the ``except NativeAgentError`` beside it -- where every run boundary lands,
+    cancel, timeout, and the translated abort -- re-raised an exception the runner had just stamped
+    with the whole call's bill and read nothing off it. Same shape as the generic-arm defect this
+    file already carries an instrument for, one arm further along, and invisible to that instrument
+    because nothing here is a ``ModelAdapterError``.
+
+    Enumerated from the ``try`` that wraps the model call: every handler that re-raises what it
+    caught reaches the accounting. A handler that raises something *else* is out of scope and must
+    be -- it is a replacement, which the carrying census above governs, and the exception it lets
+    escape is not the one the runner stamped.
+    """
+
+    import ast
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "loop.py").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def _calls(node: ast.AST, name: str) -> list[ast.Call]:
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == name
+        ]
+
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(_calls(statement, "_acall_model") for statement in node.body)
+    ]
+    assert len(guarded) == 1, {"try_blocks_wrapping_the_model_call": [n.lineno for n in guarded]}
+
+    unaccounted = {
+        ast.unparse(handler.type) if handler.type else "bare": handler.lineno
+        for handler in guarded[0].handlers
+        if any(
+            isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler)
+        )
+        and not _calls(handler, "_account_billed_model_call")
+    }
+    assert unaccounted == {}, {
+        "arms_re_raising_a_billed_failure_without_counting_it": unaccounted,
+        "hint": "self._account_billed_model_call(exc, ...) -- one route into the totals",
+    }
+    # Both arms reached it, so deleting the accounting from both cannot pass by emptying the file
+    # of the shape this census looks for.
+    accounting = [
+        handler.lineno
+        for handler in guarded[0].handlers
+        if _calls(handler, "_account_billed_model_call")
+    ]
+    assert len(accounting) == 2, {"arms_that_account": accounting}
 
 
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------
