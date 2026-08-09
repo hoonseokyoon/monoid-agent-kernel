@@ -32,6 +32,7 @@ from monoid_agent_kernel.core.checkpoint import (
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
+    ModelCallReceipt,
     ModelIOSubscription,
     close_model_io_subscriptions,
 )
@@ -2226,12 +2227,18 @@ class AgentLoop:
         invocation_context: InvocationContext,
         step: int,
         turn_id: str,
-    ) -> ModelTurn:
+    ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
         The dispatch, the cancel/deadline race and the receipt live in ``ModelCallRunner``. What
         stays here is the part that is genuinely about *this* run: which consumer the chunks go to,
         and whether a cooperative stop applies.
+
+        The receipt comes back beside the turn because the two answer different questions and
+        the caller needs both: the turn is what the model said, the receipt is what the call
+        cost. Under the kernel retry layer the receipt's ``usage`` carries absorbed attempts'
+        spend the turn cannot know about, and the accumulation that feeds ``total_usage``, the
+        metrics event, and the token budget reads the receipt for exactly that reason.
 
         A live ``RunStream`` relays every provider chunk and does **not** honour the turn interrupt
         -- that has always been a step-boundary signal on this path. Autonomous streaming honours
@@ -2336,7 +2343,7 @@ class AgentLoop:
         outcome_retryable = False
         outcome_config_recoverable = False
         try:
-            turn, _receipt = await runner.acall(
+            turn, receipt = await runner.acall(
                 request,
                 context=invocation_context,
                 deadline=deadline,
@@ -2408,7 +2415,7 @@ class AgentLoop:
                         writer.close(outcome)
                     except Exception:  # observers cannot replace the provider outcome
                         _LOGGER.debug("model stream observer close failed", exc_info=True)
-        return turn
+        return turn, receipt
 
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:
         """Bind caller provenance to this loop's durable, monotonic model-call address."""
@@ -3925,7 +3932,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(
+                turn, call_receipt = await self._acall_model(
                     request,
                     deadline,
                     res.model_runner,
@@ -3981,7 +3988,12 @@ class AgentLoop:
             except Exception as exc:
                 raise ModelAdapterError(str(exc)) from exc
             self._check_run_boundary(deadline)
-            _accumulate_usage(state.total_usage, turn)
+            # The receipt, not the turn: the two agree everywhere except under a retry layer,
+            # where the receipt's usage carries absorbed attempts' spend the turn cannot know
+            # about. The transcript row below keeps ``turn.usage`` -- the model's statement --
+            # so the reconciliation rule is: totals == transcript rows + absorbed spend, and
+            # the ledger's receipt is the per-call authority for both.
+            _accumulate_usage_mapping(state.total_usage, call_receipt.usage)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
             # Append the assistant reply to the by-value log (text + any tool calls).
             assistant_message: dict[str, Any] = {
@@ -5636,23 +5648,17 @@ def _billed_usage(exc: BaseException) -> dict[str, int]:
 
 
 def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:
-    """The mapping form of :func:`_accumulate_usage` -- one summation rule, two carriers."""
+    """The one summation rule for every usage carrier that feeds the run's totals.
+
+    The core three always exist in the totals; optional priced sub-counts
+    (cache_read/cache_creation/reasoning/audio) accumulate too when reported, so they reach
+    metrics and the token-budget check. Fed by the settled receipt -- whose usage folds
+    absorbed attempts' spend the turn cannot know about -- and by billed failure stamps at
+    the park. The old turn-reading twin is gone: two summation functions over one rule was
+    the drift shape, and its last caller switched to the receipt.
+    """
 
     for key, value in usage.items():
-        if not portable_usage_value(value):
-            raise ModelAdapterError(
-                f"model usage {key} must be a non-negative integer",
-                provider_error_code="model_bad_response",
-                retryable=False,
-            )
-        total_usage[key] = total_usage.get(key, 0) + value
-
-
-def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
-    """Sum every integer usage field across turns. The core three always exist; optional
-    priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
-    adapter reports them, so they reach metrics and the token-budget check."""
-    for key, value in turn.usage.items():
         if not portable_usage_value(value):
             raise ModelAdapterError(
                 f"model usage {key} must be a non-negative integer",

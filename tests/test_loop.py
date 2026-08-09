@@ -2559,6 +2559,114 @@ def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
         loop.close()
 
 
+def _kernel_retry_loop(
+    tmp_path: Path, adapter: _ScriptedAdapter
+) -> tuple[AgentLoop, MemoryEventSink, Path]:
+    """A loop whose runtime config assigns the retry loop to the kernel, zero schedule."""
+
+    from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    run_root = tmp_path / "runs"
+    sink = MemoryEventSink()
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=run_root),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(
+            runtime_config(
+                "run.finish",
+                model=ModelConfig(
+                    retry=ModelRetryConfig(
+                        layer="kernel", max_attempts=2, initial_delay_s=0.0, jitter_s=0.0
+                    )
+                ),
+            )
+        ),
+        event_sinks=(sink,),
+    )
+    return loop, sink, run_root
+
+
+def test_a_kernel_absorbed_attempts_bill_reaches_the_run_budget(tmp_path: Path) -> None:
+    """The receipt was the only carrier of absorbed spend; now the run's totals read it.
+
+    Attempt one fails retryable with a billed body; the kernel absorbs it and attempt two
+    answers. The turn still says what the model said -- the transcript row keeps the final
+    attempt's own usage -- while ``total_usage``, the metrics event, and therefore the token
+    budget and the child roll-up carry what the whole logical call cost. Before this, the
+    loop discarded the receipt at the call site and accumulated ``turn.usage``: metrics
+    reported a run cheaper than it was, and the cumulative budget was a bound that did not
+    hold across absorbed attempts.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    adapter = _ScriptedAdapter(
+        [
+            absorbed,
+            ModelTurn(
+                response_id="r2",
+                final_text="recovered",
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            ),
+        ]
+    )
+    loop, sink, run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "settled"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 12
+    finally:
+        loop.close()
+
+    # The transcript's model_turn row keeps the turn's own usage -- the model's statement,
+    # not the call's bill. The ledger (receipt) and the metrics carry the call-level truth;
+    # reconciliation is: metrics == transcript rows + absorbed spend.
+    run_dir = next(iter(run_root.iterdir()))
+    turn_rows = [
+        json.loads(line)
+        for line in (run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") == "model_turn"
+    ]
+    assert turn_rows[0]["usage"]["total_tokens"] == 7
+
+
+def test_a_kernel_exhausted_calls_whole_bill_reaches_the_run_budget(tmp_path: Path) -> None:
+    """The failure arm of the rule above, green by design and guarded here.
+
+    Both attempts fail billed; the kernel exhausts its budget and re-raises the second
+    error restamped with the merged total, so the loop's existing failure accounting
+    (``_billed_usage`` at the park) adds the whole call -- not the last attempt -- to
+    ``total_usage``. A restamp that stops happening, or a park arm that reads the turn
+    instead of the stamp, turns this red.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    first = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(first, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    second = ModelAdapterError("still overloaded", retryable=True)
+    mark_provider_usage(second, {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7})
+
+    adapter = _ScriptedAdapter([first, second])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 12
+    finally:
+        loop.close()
+
+
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------
 
 _ITEMS_A: tuple[dict, ...] = (
