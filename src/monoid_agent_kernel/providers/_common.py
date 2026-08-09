@@ -42,12 +42,12 @@ def retry_delay_s(
     ``__post_init__``, so a config built in Python carries whatever it was handed, and that is
     a door :func:`capped_backoff` answers through rather than raising through.
 
-    Jitter rides ON TOP of the cap
-    -- deliberately, since the moment a herd most needs smearing is the moment every member
-    is sitting at ``max_delay_s`` -- but ``max_delay_s`` and ``jitter_s`` are each bounded
-    below and not above, and float addition returns ``inf`` rather than raising when their
-    sum leaves the range. A non-finite wait is not a long wait: ``asyncio.sleep(inf)`` is a
-    timer that never fires, so the loop stops being a loop. Hence the saturating add.
+    Jitter rides ON TOP of the cap -- deliberately, since the moment a herd most needs smearing
+    is the moment every member is sitting at ``max_delay_s`` -- but ``max_delay_s`` and
+    ``jitter_s`` are each bounded below and not above, and float addition returns ``inf`` rather
+    than raising when their sum leaves the range. A non-finite wait is not a long wait:
+    ``asyncio.sleep(inf)`` is a timer that never fires, so the loop stops being a loop. Hence
+    the saturating add.
     """
 
     delay = capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
