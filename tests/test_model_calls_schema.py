@@ -74,6 +74,20 @@ def _record(**changes: object) -> dict[str, object]:
     )
 
 
+_ATTEMPT: dict[str, object] = {
+    "index": 1,
+    "elapsed_ms": 0,
+    "error_code": "",
+    "provider_error_code": "",
+    "retryable": False,
+    "config_recoverable": False,
+    "http_status": None,
+    "provider_retried": False,
+    "usage": {},
+    "stream_committed": False,
+}
+
+
 def _errors(record: dict[str, object]) -> list[str]:
     return [
         error.message
@@ -360,6 +374,94 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
     issues = validate_run_dir(tmp_path)
 
     assert any(issue.path.startswith(MODEL_CALLS_FILENAME) for issue in issues)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            {
+                "attempts": 2,
+                "attempt_log": [
+                    {**_ATTEMPT, "index": 1, "usage": {"input_tokens": 12}},
+                    {**_ATTEMPT, "index": 1, "usage": {"output_tokens": 3}},
+                ],
+            },
+            "exactly once",
+        ),
+        (
+            {
+                "attempts": 1,
+                "attempt_log": [{**_ATTEMPT, "index": 1, "usage": {"output_tokens": 3}}],
+            },
+            "sum",
+        ),
+    ],
+    ids=["indices", "usage"],
+)
+def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
+    tmp_path: Path, mutation: dict[str, object], message: str
+) -> None:
+    """The two cross-entry invariants the record refuses, refused on the sweep as well.
+
+    A JSON Schema validates each entry against its own shape and cannot relate one entry to
+    another, so `attempts: 2` under indices `[1, 1]`, and entries billing 3 beside a receipt
+    billing 15, are both structurally perfect lines. ``ModelCallReceipt`` refuses exactly these
+    at construction -- but nothing constructs a receipt on the way through ``monoid validate``,
+    which reads the ledger as JSON. A directory the record could not have produced was reported
+    clean, which is the one answer a validator must never give.
+
+    Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
+    cross-record claims -- manifest against workspace index, proposal against its hashes,
+    settled text against its digests, payloads against their keys. The ledger had none because
+    until this field it made no claim spanning two values; now it makes two.
+    """
+
+    (tmp_path / MODEL_CALLS_FILENAME).write_text(
+        json.dumps({**_record(), **mutation}) + "\n", encoding="utf-8"
+    )
+
+    issues = validate_run_dir(tmp_path)
+
+    assert [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)], (
+        f"expected a {message!r} issue, got {issues}"
+    )
+    assert any(
+        message in issue.message for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)
+    ), [issue.message for issue in issues]
+
+
+def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path) -> None:
+    """The other side of the pin: the writer's own output passes the sweep.
+
+    A semantic check that refused a legitimate line would be worse than none, and the record
+    the runner actually writes is the one case that must never be flagged -- entries indexed
+    ``1..attempts`` whose usage sums to the receipt's, which is what ``__post_init__`` already
+    guarantees at construction.
+    """
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    line = _record(
+        attempts=2,
+        attempt_log=(
+            ModelCallAttempt(index=1, usage={"input_tokens": 12}),
+            ModelCallAttempt(index=2, usage={"output_tokens": 3}),
+        ),
+    )
+    (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    issues = validate_run_dir(tmp_path)
+
+    assert not [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)]
+
+    # And a line written before the field existed still sweeps clean: no key, no claim to check.
+    legacy = _record()
+    del legacy["attempt_log"]
+    (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    assert not [
+        issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)
+    ]
 
 
 # --- the projection reflects over nothing ---------------------------------------------------

@@ -1603,11 +1603,13 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
         )
         _validate_settled_text_digests(model_content_path, issues)
     # Optional like the content sidecar beside it, and for the same reason: it exists only for a
-    # run that asked for it, so its absence is a configuration, not a defect. There is no digest
-    # recomputation pass to go with it -- the ledger holds no content-addressed field.
+    # run that asked for it, so its absence is a configuration, not a defect. No digest
+    # recomputation pass -- the ledger holds no content-addressed field -- but it does now carry
+    # claims that span two of its own values, and a schema cannot relate one entry to another.
     model_calls_path = run_dir / MODEL_CALLS_FILENAME
     if model_calls_path.exists():
         _validate_jsonl_file(model_calls_path, MODEL_CALLS_RECORD_SCHEMA, issues)
+        _validate_model_call_attempt_logs(model_calls_path, issues)
     # Optional for the same reason as its two sidecar siblings. Unlike the ledger, this one DOES
     # get a recomputation pass: the corpus's whole contract is that every request record
     # reassembles to the exact bytes its key was taken over, and a validator that only
@@ -1667,6 +1669,83 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
         claimed_len = record.get("final_text_len")
         if claimed_len != content_length(text):
             issues.append(ValidationIssue(label, "settled_text length does not match final_text"))
+
+
+def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
+    """Relate each ledger line's ``attempt_log`` to the two record fields it itemizes.
+
+    A JSON Schema validates every entry against its own shape and can say nothing about how one
+    entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``
+    refuses two cross-entry claims -- indices exactly ``1..attempts`` in order, and entry usage
+    summing to the receipt's -- and nothing constructs a receipt on the way through ``monoid
+    validate``, which reads the ledger as JSON. So a line the record could not have produced
+    (``attempts: 2`` under indices ``[1, 1]``; entries billing 3 beside a total of 99) passed the
+    sweep clean, which is the one answer a validator must never give about a corrupt artifact.
+
+    The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
+    (manifest against workspace index, proposal against its hashes, settled text against its
+    digests, payload records against their keys). Absence is still legal: a line with no
+    ``attempt_log`` is a v0.20 writer's, which makes no claim there is anything to check.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return  # already reported by the schema pass
+    for index, raw_line in enumerate(raw.split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # already reported by the schema pass
+        if not line.strip():
+            continue
+        try:
+            record = loads_json_ingress(line)
+        except (ValueError, RecursionError):
+            continue  # already reported by the schema pass
+        if not isinstance(record, dict):
+            continue
+        entries = record.get("attempt_log")
+        if not isinstance(entries, list) or not entries:
+            continue  # absent, or shape the schema already refused
+        if not all(isinstance(entry, dict) for entry in entries):
+            continue  # shape is the schema's job
+        label = f"{path.name}:{index}"
+        attempts = record.get("attempts")
+        if isinstance(attempts, int) and not isinstance(attempts, bool):
+            named = [entry.get("index") for entry in entries]
+            if named != list(range(1, attempts + 1)):
+                issues.append(
+                    ValidationIssue(
+                        label, "attempt_log must name every attempt exactly once, in order"
+                    )
+                )
+        usage = record.get("usage")
+        if not isinstance(usage, dict):
+            continue  # shape is the schema's job
+        summed: dict[str, int] | None = _summed_attempt_usage(entries)
+        if summed is not None and summed != usage:
+            issues.append(
+                ValidationIssue(label, "attempt_log usage must sum to the record's usage")
+            )
+
+
+def _summed_attempt_usage(entries: list[Any]) -> dict[str, int] | None:
+    """Key-wise total of the entries' usage, or ``None`` when a count is not one.
+
+    ``None`` rather than a partial sum: a malformed count is the schema's finding, already
+    reported, and a total computed around it would be a second and *wrong* finding on the same
+    line -- a validator inventing a disagreement out of corruption it did not cause.
+    """
+    summed: dict[str, int] = {}
+    for entry in entries:
+        counts = entry.get("usage")
+        if not isinstance(counts, dict):
+            return None
+        for key, value in counts.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                return None
+            summed[key] = summed.get(key, 0) + value
+    return summed
 
 
 def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
