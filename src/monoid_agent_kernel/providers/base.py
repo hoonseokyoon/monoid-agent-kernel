@@ -21,7 +21,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_unicode_scalars,
 )
 from monoid_agent_kernel.errors import ModelAdapterError
-from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
 from monoid_agent_kernel.tools.base import ToolSpec, normalize_tool_spec
 
 # Why a model turn ended, promoted from the raw provider payload onto the typed turn surface.
@@ -915,15 +915,54 @@ def _normalize_model_turn(turn: Any) -> Any:
         return ModelTurn(**changes)
 
 
+def _refused_turn_usage(turn: Any) -> dict[str, int]:
+    """What a turn the normalizer refused reported spending.
+
+    ``usage_reported_by`` owns the verdict on a count -- real non-negative ints, names unjudged,
+    nothing raised on a failure path -- and reads a wire *payload*. A turn reaches the normalizer
+    as either shape: the gateway hands it a decoded object, the kernel hands it a ``ModelTurn``.
+    Both are reduced to the one shape that function reads, so "what counts as a reported cost"
+    stays in a single place rather than gaining a sixth spelling here.
+    """
+
+    if isinstance(turn, Mapping):
+        return usage_reported_by(turn)
+    try:
+        usage = getattr(turn, "usage", None)
+        return usage_reported_by({"usage": dict(usage)}) if isinstance(usage, Mapping) else {}
+    except Exception:
+        return {}
+
+
 def normalize_model_turn(turn: Any) -> Any:
-    """Normalize provider output and classify an unusable response as a model failure."""
+    """Normalize provider output and classify an unusable response as a model failure.
+
+    A refusal here is about the turn's *shape*, and the shape being wrong does not un-bill the
+    counts sitting beside it: the upstream produced this turn and charged for it before anything
+    looked at it. ``usage_reported_by`` is that rule -- "the refusal is the only carrier left for
+    its cost" -- and this function is where the raw turn and the escaping error are both in hand,
+    which is the only place the two can be joined.
+
+    Stamped here rather than at the call sites because there are four of them and one is an
+    inline expression (``normalize_model_turn(adapter.next_turn(...))`` in the gateway service),
+    where the raw turn is never bound to a name and no handler could reach it. A stamp applied
+    per caller is also a rule three callers can be written without; applied here, a fifth caller
+    added tomorrow carries the bill on the day it exists.
+
+    ``ModelAdapterError`` from the normalizer below is re-raised rather than rebuilt, and is
+    stamped on the way past for the same reason -- it is equally fresh, and equally carries
+    nothing.
+    """
 
     try:
         return _normalize_model_turn(turn)
-    except ModelAdapterError:
+    except ModelAdapterError as already_classified:
+        mark_provider_usage(already_classified, _refused_turn_usage(turn))
         raise
     except Exception as exc:
-        raise ModelAdapterError("model adapter returned a non-portable response") from exc
+        refusal = ModelAdapterError("model adapter returned a non-portable response")
+        mark_provider_usage(refusal, _refused_turn_usage(turn))
+        raise refusal from exc
 
 
 def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:

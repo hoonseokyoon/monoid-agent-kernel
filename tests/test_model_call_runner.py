@@ -9,6 +9,7 @@ import threading
 import time
 from urllib.error import URLError
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -3699,6 +3700,162 @@ def test_an_exhausted_call_still_accounts_every_billed_attempt() -> None:
 
     # Two swallowed attempts at 5 plus the final error's own stamp, which `with_error` reads.
     assert observer.captures[0].receipt.usage["output_tokens"] == 15
+
+
+def test_a_turn_the_normalizer_refuses_still_reports_what_it_was_billed() -> None:
+    """The refusal is about the turn's shape; the counts beside it were still charged.
+
+    ``normalize_model_turn`` builds a *fresh* ``ModelAdapterError``, so the escaping error
+    carried no ``provider_usage`` and ``with_error`` -- which reads exactly that stamp -- put an
+    empty usage on the receipt, while the raw turn holding well-formed counts was still in
+    scope one frame away. A paid call then left no trace in the metrics or in the cumulative
+    token budget, which is the failure ``mark_provider_usage`` exists to prevent and already
+    prevents for the applied-parameters refusals that parse a turn, read its usage, and only
+    then reject it.
+
+    The malformed field is deliberately NOT the usage: a bad count is dropped by
+    ``_recordable_usage`` and there is nothing to carry. This is the shape where the bill is
+    intact and something else about the turn is not.
+
+    The entry the log gets for this dispatch carries the same counts, because the sum invariant
+    is what would otherwise refuse the receipt -- one attempt, and the receipt's total is that
+    attempt's.
+    """
+
+    class BilledButMalformedAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(
+                final_text="answer",
+                usage={"input_tokens": 7, "output_tokens": 11},
+                provider_retried="yes",  # type: ignore[arg-type]
+            )
+
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=BilledButMalformedAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST)
+
+    with pytest.raises(ModelAdapterError, match="non-portable response") as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is False
+    assert dict(receipt.usage) == {"input_tokens": 7, "output_tokens": 11}
+    # The stamp itself, so a receipt that got the counts some other way cannot pass this.
+    assert provider_usage_of(caught.value) == {"input_tokens": 7, "output_tokens": 11}
+    # And the ledger still adds up to the bill it is a breakdown of.
+    assert [dict(entry.usage) for entry in receipt.attempt_log] == [
+        {"input_tokens": 7, "output_tokens": 11}
+    ]
+    # The refused turn's own retry claim is still not consulted -- only its counts travel.
+    assert receipt.attempt_log[0].provider_retried is False
+
+
+def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> None:
+    """Derived census, widened off ``loop.py`` to the function every caller goes through.
+
+    This is the third appearance of one shape -- a fresh exception built where a stamped one was
+    available. ``loop.py``'s wrap was the first, its boundary arms the second, and the existing
+    census in ``test_loop.py`` is scoped to that file, so it walked straight past this one. The
+    widening is deliberately not "the same AST rule over more files": the carrier here is a
+    single function, so the instrument asserts that *it* carries on every arm that can leave,
+    and that no caller re-implements the carrying.
+
+    Scoped to the function rather than to its four call sites because one of them --
+    ``normalize_model_turn(adapter.next_turn(...))`` in the gateway service -- never binds the
+    raw turn to a name, so a per-caller stamp is not merely duplicated there, it is impossible.
+
+    What this census still cannot see, stated because a green census that is blind is worse than
+    no census:
+
+    - It reads ``providers/base.py`` only. A *different* function that refuses a billed turn
+      somewhere else is a fourth appearance of the shape, and nothing here enumerates it.
+    - It proves each arm calls the stamper, not that the stamper was handed the right value: a
+      site passing ``{}`` or the wrong object still satisfies it. The behavioural test above is
+      what pins the value, and only for the one arm it drives.
+    - ``_refused_turn_usage`` returning ``{}`` for a shape it does not recognize is invisible
+      here and would look identical to a turn that reported nothing.
+    - It does not forbid a caller from stamping too. It cannot: ``model_call.py`` legitimately
+      stamps the *cumulative* whole-call bill on the escaping error, which is a different fact
+      about a different total, and no syntactic rule separates that from a re-implementation of
+      this one. An earlier draft of this census asserted "no caller stamps" and reddened on that
+      correct site -- an instrument needing an exemption list for a legitimate caller is
+      measuring the wrong thing, so the clause was removed rather than given one.
+    """
+
+    import ast
+
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "monoid_agent_kernel"
+        / "providers"
+        / "base.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    normalizer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "normalize_model_turn"
+    )
+
+    # Every handler that lets an exception leave -- re-raised or rebuilt -- stamps first.
+    unstamped = {}
+    for handler in ast.walk(normalizer):
+        if not isinstance(handler, ast.ExceptHandler):
+            continue
+        leaves = any(isinstance(node, ast.Raise) for node in ast.walk(handler))
+        stamps = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "mark_provider_usage"
+            for node in ast.walk(handler)
+        )
+        if leaves and not stamps:
+            unstamped[handler.lineno] = ast.unparse(handler).splitlines()[0]
+
+    assert unstamped == {}, {
+        "arms_that_leave_without_carrying_the_bill": unstamped,
+        "hint": "mark_provider_usage(<escaping error>, _refused_turn_usage(turn))",
+    }
+
+    # Both arms exist, so deleting one cannot pass by deleting the shape above.
+    stamp_sites = [
+        node.lineno
+        for node in ast.walk(normalizer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "mark_provider_usage"
+    ]
+    assert len(stamp_sites) == 2, {"stamp_sites": stamp_sites}
+
+    # Every caller reaches the normalizer by that name, so the carrying above is on the path of
+    # all of them. Enumerated rather than asserted about one, because the count is the part that
+    # goes stale: a fifth caller is covered by construction, and a caller that stopped going
+    # through this function would drop out of this set and be visible here.
+    repo_src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        str(path.relative_to(repo_src)).replace("\\", "/")
+        for path in repo_src.rglob("*.py")
+        if path != source_path
+        and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "normalize_model_turn"
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    )
+    assert callers == [
+        "monoid_agent_kernel/model_call.py",
+        "monoid_agent_kernel/reference/llm_gateway/service.py",
+    ], {"callers": callers}
 
 
 def test_a_refused_backoff_does_not_bill_its_attempt_twice(monkeypatch: Any) -> None:
