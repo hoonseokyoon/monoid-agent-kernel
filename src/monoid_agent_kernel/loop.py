@@ -202,6 +202,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolObservation,
     format_async_result_text,
+    mark_provider_usage,
     portable_usage_value,
     provider_usage_of,
     resolved_provider_name,
@@ -2389,7 +2390,14 @@ class AgentLoop:
                 )
             except Exception:
                 outcome_config_recoverable = False
-            raise
+            # Translated here for the same reason ``ModelCallAborted`` is: the runner raises what
+            # the adapter raised, and the caller answers for a model call in one arm typed to
+            # ``ModelAdapterError``. An untranslated third-party exception took the generic arm
+            # instead and arrived there stripped of the bill the runner had just stamped on it.
+            failure = _as_model_adapter_error(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
         else:
             outcome_status = "completed"
             outcome_final_text = turn.final_text
@@ -3986,7 +3994,11 @@ class AgentLoop:
             except NativeAgentError:
                 raise
             except Exception as exc:
-                raise ModelAdapterError(str(exc)) from exc
+                # The same translator ``_acall_model`` raises through, so the two doors into this
+                # handler cannot disagree about what a model failure carries. Reached only by an
+                # exception raised *around* the call rather than by it, since the boundary below
+                # already speaks this vocabulary.
+                raise _as_model_adapter_error(exc) from exc
             self._check_run_boundary(deadline)
             # The receipt, not the turn: the two agree everywhere except under a retry layer,
             # where the receipt's usage carries absorbed attempts' spend the turn cannot know
@@ -5645,6 +5657,38 @@ def _billed_usage(exc: BaseException) -> dict[str, int]:
     """
 
     return provider_usage_of(exc)
+
+
+def _as_model_adapter_error(exc: BaseException) -> BaseException:
+    """What the loop raises in place of a provider failure the adapter did not classify.
+
+    A model call's failure accounting lives in one arm -- ``except ModelAdapterError`` -- because
+    that is the type the runner raises. A third-party adapter is free to raise its own, and the
+    generic arm used to build a fresh ``ModelAdapterError`` out of the message alone: the stamps
+    the runner had just written onto the original died with it, so every absorbed attempt's bill
+    fell out of ``total_usage``, the metrics event and the token budget. That is the same hole the
+    receipt handover closed on the arm that *was* a ``ModelAdapterError``, left open on its twin.
+
+    What travels is what ``mark_provider_usage`` and ``mark_provider_retried`` wrote -- facts
+    stamped onto an escaping error precisely so they survive it -- read back through
+    ``ModelCallReceipt.with_error``, which is where "what did this exception carry" is spelled
+    once. What deliberately does NOT travel is classification: ``retryable``, ``http_status`` and
+    their siblings decide whether a run parks or terminalizes, and synthesizing them from
+    attributes that merely happen to exist on an arbitrary exception would change that outcome
+    for shapes nobody specified. An unclassified failure stays unclassified; it stops being
+    unbilled.
+
+    Returns its argument unchanged when that is already the loop's vocabulary (any
+    ``NativeAgentError``, which includes ``ModelAdapterError`` itself) or is not an ``Exception``
+    at all -- a ``KeyboardInterrupt`` is not a model failure.
+    """
+
+    if isinstance(exc, NativeAgentError) or not isinstance(exc, Exception):
+        return exc
+    probe = ModelCallReceipt().with_error(exc)
+    wrapped = ModelAdapterError(str(exc), provider_retried=probe.provider_retried)
+    mark_provider_usage(wrapped, probe.usage)
+    return wrapped
 
 
 def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:

@@ -2667,6 +2667,136 @@ def test_a_kernel_exhausted_calls_whole_bill_reaches_the_run_budget(tmp_path: Pa
         loop.close()
 
 
+def test_a_kernel_absorbed_bill_survives_a_non_adapter_terminal_error(tmp_path: Path) -> None:
+    """The twin door of the rule above: the terminal error is not a ``ModelAdapterError``.
+
+    A third-party adapter is free to raise its own exception type, and the kernel's settle
+    handler stamps the merged bill on whatever escapes -- but the loop's failure accounting
+    reads that stamp in its ``except ModelAdapterError`` arm only. An exception arriving as
+    anything else took the generic arm instead, which built a *fresh* ``ModelAdapterError``
+    from the message and dropped the stamp with the original, so every absorbed attempt fell
+    out of ``total_usage``, the metrics event and the token budget -- the exact accounting
+    hole this branch exists to close, surviving on the arm nobody drove.
+
+    Attempt one fails retryable with a billed body; attempt two raises ``RuntimeError``. The
+    run ends ``terminal`` on both sides of the fix -- an exception that is not a
+    ``ModelAdapterError`` carries no classification, so the error the loop speaks in its place
+    is not retryable and the run does not park -- so nothing but the bill distinguishes the
+    fixed code from the broken code. That is what makes the usage the assertion here, and the
+    park reason a pinned constant beside it.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    first = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(first, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+
+    adapter = _ScriptedAdapter([first, RuntimeError("adapter blew up")])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "terminal"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
+def test_a_model_failure_the_adapter_did_not_classify_keeps_its_stamps() -> None:
+    """The translator's own contract, stated as the split it makes: stamps travel, taxonomy does not.
+
+    ``mark_provider_usage`` and ``mark_provider_retried`` exist to put a fact on an error so it
+    survives the error's escape; rebuilding the error from its message alone is exactly the event
+    they were written for, and it dropped them. Classification is the other half and moves the
+    other way: ``retryable`` decides whether the run parks or terminalizes, so reading it off
+    whatever attribute an arbitrary exception happens to expose would let a third-party error
+    change a run's fate through a name collision.
+    """
+
+    from monoid_agent_kernel.loop import _as_model_adapter_error
+    from monoid_agent_kernel.providers.base import (
+        mark_provider_retried,
+        mark_provider_usage,
+        provider_usage_of,
+    )
+
+    raw = RuntimeError("adapter blew up")
+    mark_provider_usage(raw, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    mark_provider_retried(raw)
+
+    translated = _as_model_adapter_error(raw)
+    assert isinstance(translated, ModelAdapterError)
+    assert str(translated) == "adapter blew up"
+    assert provider_usage_of(translated) == {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "total_tokens": 5,
+    }
+    assert translated.provider_retried is True
+    assert translated.retryable is False
+    assert translated.http_status is None
+
+    # Already the loop's vocabulary: returned unchanged, so the caller re-raises bare and the
+    # original traceback and classification survive untouched.
+    already = ModelAdapterError("classified", retryable=True, http_status=503)
+    assert _as_model_adapter_error(already) is already
+    # And not an ``Exception`` at all: a KeyboardInterrupt is not a model failure.
+    interrupt = KeyboardInterrupt()
+    assert _as_model_adapter_error(interrupt) is interrupt
+
+
+def test_every_model_failure_the_loop_re_raises_goes_through_one_translator() -> None:
+    """Derived census: no second spelling of "replace this exception with a model error".
+
+    The bill was lost because two doors into the same handler disagreed -- one arm carried what
+    the runner stamped, its twin rebuilt the error from the message -- so the instrument that
+    keeps it closed is not a test of the fixed arm but an enumeration of the shape. Every
+    ``raise ModelAdapterError(...) from <cause>`` in ``loop.py`` is a site that replaces one
+    exception with another, and each must be the translator, which is where the carrying rule
+    lives. A new wrap site anywhere in the file reddens this until it goes through the same
+    function.
+
+    Bare ``raise ModelAdapterError(...)`` with no cause is deliberately out of scope: it
+    originates a failure rather than replacing one, so it has no stamps to carry (two such sites
+    exist today, and they stay legal).
+    """
+
+    import ast
+
+    loop_source = (
+        Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "loop.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(loop_source)
+
+    rebuilt = [
+        (node.lineno, ast.unparse(node))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Raise)
+        and node.cause is not None
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "ModelAdapterError"
+    ]
+    assert rebuilt == [], {
+        "sites_rebuilding_an_error_instead_of_translating_it": rebuilt,
+        "hint": "raise _as_model_adapter_error(exc) from exc -- one translator, every door",
+    }
+
+    # And the translator is actually reached, from both doors: the boundary that raises what the
+    # runner let escape, and the caller's generic arm around it. A census that only refused the
+    # bad shape would stay green if the good shape were deleted with it.
+    translations = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_as_model_adapter_error"
+    )
+    assert len(translations) == 2, {"call_sites": translations}
+
+
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------
 
 _ITEMS_A: tuple[dict, ...] = (
