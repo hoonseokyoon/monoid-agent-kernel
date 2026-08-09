@@ -411,6 +411,21 @@ whole `retry` block, so recorded replay keys do not move either way. A pre-W7 re
 a `"kernel"` config ignores the unknown key and behaves as `"adapter"` — it retries in the
 adapter loop — which is the pre-W7 behavior, never a multiplication.
 
+`ModelCallReceipt` grows `attempt_log` — one record per kernel dispatch (index, elapsed,
+the failure taxonomy, that attempt's billed usage, per-attempt `provider_retried`, and
+whether a streamed chunk had committed the call when the attempt settled) — and the
+`model-calls.v1` ledger line carries it. Additive on both surfaces: `from_json` reads an
+absent key as an empty log beside an intact `attempts` count, which is what every record
+written before the field existed means; the ledger schema declares the key without
+requiring it, so `monoid validate` still passes directories older writers filled; and a
+present log that does not name every attempt exactly once is refused — that shape is a
+writer bug, not a legacy to absorb. Run totals (`metrics.json`, `state.total_usage`, the
+token budget, the child roll-up) now read the settled receipt's usage, which folds spend
+from attempts a kernel retry absorbed; transcript `model_turn` rows keep the turn's own
+usage, so a reader reconciles totals as transcript rows plus absorbed spend. Old readers
+of any of these surfaces see only values that were always legal — larger totals, an extra
+ledger key they ignore.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

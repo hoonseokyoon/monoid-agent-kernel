@@ -4008,6 +4008,153 @@ def test_a_delivered_chunk_closes_the_retry_window() -> None:
     assert texts == ["whole"]
 
 
+def test_delivery_is_marked_before_the_consumer_runs() -> None:
+    """The ordering proof, promoted from the W7-0 reassessment probe.
+
+    The consumer receives the chunk and then raises an error dressed retryable. If `delivered`
+    were marked AFTER the inner consumer ran, the predicate would see an undelivered retryable
+    failure and reopen the stream -- replaying the side effect the consumer already performed.
+    Correct order: one open, one side effect, the failure propagates.
+    """
+
+    class OneChunkStream:
+        def __init__(self) -> None:
+            self.opens = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            self.opens += 1
+            yield TextDelta("side-effectful chunk")
+            yield TurnComplete(response_id="r", stop_reason="stop")
+
+    stream = OneChunkStream()
+    side_effects: list[Any] = []
+
+    def poisoned_consumer(chunk: Any) -> None:
+        side_effects.append(chunk)
+        raise ModelAdapterError("consumer failure dressed as retryable", retryable=True)
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    with pytest.raises(ModelAdapterError):
+        _acall(stream, request, delta_consumer=poisoned_consumer)
+
+    assert stream.opens == 1
+    assert len(side_effects) == 1
+
+
+def test_a_consumer_exception_is_not_retried_and_keeps_its_type() -> None:
+    """A consumer bug must not masquerade as a provider failure.
+
+    The RuntimeError propagates untouched -- retrying it would replay the delivered chunk, and
+    reclassifying it would blame a provider for the caller's own consumer.
+    """
+
+    class OneChunkStream:
+        def __init__(self) -> None:
+            self.opens = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            self.opens += 1
+            yield TextDelta("chunk")
+            yield TurnComplete(response_id="r", stop_reason="stop")
+
+    stream = OneChunkStream()
+
+    def raising_consumer(chunk: Any) -> None:
+        del chunk
+        raise RuntimeError("consumer bug")
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    with pytest.raises(RuntimeError, match="consumer bug"):
+        _acall(stream, request, delta_consumer=raising_consumer)
+
+    assert stream.opens == 1
+
+
+def test_the_kernel_loop_retries_the_anext_and_awaitable_shapes_too() -> None:
+    """The two dispatch shapes W7-0's tests did not drive, promoted from the reassessment.
+
+    All four shapes share the one dispatch point the kernel loop wraps, but a rule proven on
+    two of four parallel halves is this codebase's house defect -- so the other two are driven,
+    not assumed.
+    """
+
+    class AnextFlaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="ok")
+
+    class AwaitableFlaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls += 1
+            me = self
+
+            async def answer() -> ModelTurn:
+                if me.calls == 1:
+                    raise ModelAdapterError("transient", retryable=True)
+                return ModelTurn(final_text="ok")
+
+            return answer()
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    coroutine_shape = AnextFlaky()
+    observer = _acall(coroutine_shape, request)
+    assert coroutine_shape.calls == 2
+    assert observer.captures[0].receipt.attempts == 2
+
+    awaitable_shape = AwaitableFlaky()
+    observer = _acall(awaitable_shape, request)
+    assert awaitable_shape.calls == 2
+    assert observer.captures[0].receipt.attempts == 2
+
+
+def test_kernel_retry_rides_the_replay_fallthrough_without_spinning_the_corpus() -> None:
+    """The composite the reassessment drove by hand: miss -> flaky inner -> retry -> miss ->
+    inner answers. The miss itself is never retried (`replay_miss` pins retryable=False), so
+    the kernel's second attempt walks the same miss-then-inner path instead of spinning on
+    the corpus, and the answer is the inner's."""
+
+    from monoid_agent_kernel.providers.replay import ReplayModelAdapter
+
+    class FlakyInner:
+        provider_name = "flaky"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient under fallthrough", retryable=True)
+            return ModelTurn(final_text="served live", usage={"total_tokens": 7})
+
+    inner = FlakyInner()
+    adapter = ReplayModelAdapter([], inner=inner)
+    request = ModelRequest(
+        instruction="never recorded", system_prompt="sys", tools=(), model=_kernel_model()
+    )
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert inner.calls == 2
+    assert receipt.attempts == 2
+    assert receipt.succeeded is True
+    assert receipt.usage["total_tokens"] == 7
+
+
 def test_stream_committed_marks_only_the_attempt_that_delivered() -> None:
     """The commit flag is per-entry and can only be true on the final one.
 
