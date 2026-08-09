@@ -122,11 +122,19 @@ def _branch_validators() -> dict[str, Draft202012Validator]:
     census used to be unable to express.
 
     Selecting is also what makes it affordable, which reverses the previous round's decision on a
-    measurement of the placement that decision was actually about. The whole ``oneOf`` costs
-    ~232us per record because it tries all three branches and ``additionalProperties: False``
-    makes each failure expensive; the branch alone costs ~14.8us, 4.5x a ``json.loads`` of the
-    same line and 0.15s for a 10,000-record corpus at construction. The number that ruled this
-    out measured the ``oneOf``, not the question.
+    measurement of the placement that decision was actually about. On a record the schema
+    **accepts**, the whole ``oneOf`` costs ~257us because it tries all three branches; the branch
+    alone costs ~66us, which is 0.66s for a 10,000-record corpus at construction and ~16% of what
+    ``ReplayCorpus.load`` already spends on that corpus -- reading, verifying and parsing it is
+    ~410us per record, so this rides on a cost that dominates it.
+
+    Both numbers are of a *valid* record, and that is the correction rather than a detail. The
+    first pass at this measured 232us and 14.8us against a fixture whose ``schema_version`` was
+    misspelled, so ``is_valid`` short-circuited on the first keyword and what got timed was a
+    rejection -- 4.8x cheaper than the acceptance that actually runs on every healthy record. A
+    benchmark that never reaches the work is the same defect as a census that cannot generate the
+    case, one field over. Cross-checked three ways since: in situ against a neutered validator
+    (14-18% of load), per record kind on a recorder-produced corpus (55-82us), and here.
     """
 
     compiled: dict[str, Draft202012Validator] = {}

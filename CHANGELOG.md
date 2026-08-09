@@ -53,9 +53,16 @@ out in commit messages and here.
   bytes re-hashed against its name, and the empty response digest, which is legal and unjoinable
   rather than damaged.
 
-  The measurement that had ruled this out was of the wrong placement. The whole `oneOf` costs
-  ~232µs per record because it tries all three branches; the branch alone costs ~14.8µs, 4.5× a
-  `json.loads` of the same line and 0.15s for a 10,000-record corpus at construction.
+  The measurement that had ruled this out was of the wrong placement — and the replacement
+  measurement was of the wrong record, which took two more passes to catch. On a record the schema
+  **accepts**, the whole `oneOf` costs ~257µs because it tries all three branches; the branch alone
+  costs ~66µs, or 0.66s for a 10,000-record corpus at construction. That is ~16% of what
+  `ReplayCorpus.load` already spends on the same corpus (~410µs per record to read, verify and
+  parse it), and load is per replay invocation over the sources named, not a global index: a single
+  50-call run is ~100 records, and a 200-run union is ~20,000. The first figures quoted here (232µs
+  and 14.8µs) were timed against a fixture with a misspelled `schema_version`, so `is_valid`
+  short-circuited on the first keyword and measured a rejection rather than the acceptance every
+  healthy record pays.
   `test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is` is now the equivalence proof
   for the dispatch and runs in both directions — reader-looser is the defect, reader-stricter has
   to be enumerated and now *fails* when it is not.
