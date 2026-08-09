@@ -12,6 +12,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
+    ModelCallAttempt,
     ModelCallReceipt,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -247,6 +248,26 @@ def test_json_round_trip_preserves_every_field() -> None:
         digest_status="ok",
         destination_status="resolved",
         destination_digest="sha-destination",
+        attempt_log=(
+            ModelCallAttempt(
+                index=1,
+                elapsed_ms=800,
+                error_code="model_error",
+                provider_error_code="rate_limit_exceeded",
+                retryable=True,
+                config_recoverable=False,
+                http_status=429,
+                provider_retried=True,
+                usage={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                stream_committed=False,
+            ),
+            ModelCallAttempt(
+                index=2,
+                elapsed_ms=434,
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                stream_committed=True,
+            ),
+        ),
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt
@@ -270,6 +291,78 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
         "never_exercised_by_the_round_trip": missing,
         "hint": "a field the enumeration does not name is a field it does not cover",
     }
+
+
+def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
+    """One kernel dispatch as the log records it: same metadata-only rule, same usage
+    validation, same error_code-empty success convention as the receipt that carries it."""
+
+    entry = ModelCallAttempt(
+        index=2,
+        elapsed_ms=125,
+        error_code="model_error",
+        provider_error_code="overloaded",
+        retryable=True,
+        config_recoverable=False,
+        http_status=529,
+        provider_retried=True,
+        usage={"total_tokens": 5},
+        stream_committed=True,
+    )
+
+    assert ModelCallAttempt.from_json(json.loads(json.dumps(entry.to_json()))) == entry
+    assert entry.succeeded is False
+    assert ModelCallAttempt().succeeded is True
+
+    with pytest.raises(ValueError, match="index"):
+        ModelCallAttempt(index=0)
+    with pytest.raises(ValueError, match="elapsed_ms"):
+        ModelCallAttempt(elapsed_ms=-1)
+    with pytest.raises(WireValidationError):
+        ModelCallAttempt(usage={"total_tokens": -5})
+
+
+def test_the_attempt_entry_wire_shape_names_every_field_there_is() -> None:
+    """The same completeness guard the receipt's round trip carries, for the entry type:
+    a field added to the dataclass without joining the wire shape reads back at its default
+    and every historical log silently drops it."""
+
+    declared = {field_.name for field_ in fields(ModelCallAttempt)}
+    assert set(ModelCallAttempt().to_json()) == declared
+
+
+def test_the_attempt_log_is_empty_or_names_every_attempt() -> None:
+    """`len(attempt_log)` is 0 (a legacy or refused receipt) or exactly `attempts` -- a log
+    naming some attempts but not others cannot answer the question it exists for, and a sum
+    over its usage would silently disagree with the receipt's."""
+
+    entry = ModelCallAttempt(index=1)
+
+    assert ModelCallReceipt(attempts=1, attempt_log=(entry,)).attempt_log == (entry,)
+    assert ModelCallReceipt(attempts=0).attempt_log == ()
+    assert ModelCallReceipt(attempts=3).attempt_log == ()
+
+    with pytest.raises(ValueError, match="attempt_log"):
+        ModelCallReceipt(attempts=2, attempt_log=(entry,))
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt(attempts=1, attempt_log=({"index": 1},))  # type: ignore[arg-type]
+
+
+def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
+    """Absent on every receipt written before the field existed, which is legal and reads as
+    an empty log beside an intact `attempts` count; present-but-mistyped is refused, like
+    every other field here."""
+
+    payload = ModelCallReceipt(attempts=3).to_json()
+    del payload["attempt_log"]
+
+    restored = ModelCallReceipt.from_json(payload)
+
+    assert restored.attempt_log == ()
+    assert restored.attempts == 3
+
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json({**payload, "attempt_log": "two"})
 
 
 def test_a_receipt_that_never_reached_the_probe_says_so() -> None:

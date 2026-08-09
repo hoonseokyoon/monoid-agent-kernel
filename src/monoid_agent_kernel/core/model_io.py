@@ -693,6 +693,95 @@ def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset
 
 
 @dataclass(frozen=True)
+class ModelCallAttempt:
+    """One kernel dispatch inside a settled call, as the receipt's log records it.
+
+    Same rule as the receipt that carries it: metadata only — taxonomy, counts, timings — so the
+    log is as safe to hand to a ``none``-mode observer as the receipt is. Success is spelled the
+    way the receipt spells it: an empty ``error_code``. There is no separate outcome enum, because
+    the receipt's own convention already answers the question and a second vocabulary for the same
+    fact is a divergence waiting to be recorded.
+
+    No wall-clock instant, deliberately — the receipt carries ``latency_ms`` and no instant, and
+    the ledger line's ``recorded_at`` is the anchor for the whole call (see
+    ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only; backoff
+    waits fall between entries, so the entries sum to less than the receipt's ``latency_ms``.
+
+    ``provider_retried`` here is what the adapter reported through the progress channel *during
+    this attempt's dispatch*, plus what this attempt's own outcome object declared. The receipt's
+    flag additionally folds whole-call evidence, so the entry can read ``False`` where the receipt
+    reads ``True`` — the entry is the per-attempt attribution, the receipt is the call's.
+
+    ``stream_committed`` is whether a streamed chunk had been delivered when this attempt settled.
+    Delivery closes the retry window, so it can only be ``True`` on the final entry.
+    """
+
+    index: int = 1
+    elapsed_ms: int = 0
+    error_code: str = ""
+    provider_error_code: str = ""
+    retryable: bool = False
+    config_recoverable: bool = False
+    http_status: int | None = None
+    provider_retried: bool = False
+    usage: Mapping[str, int] = field(default_factory=dict)
+    stream_committed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.index < 1:
+            raise ValueError("model call attempt index must be positive")
+        if self.elapsed_ms < 0:
+            raise ValueError("model call attempt elapsed_ms must not be negative")
+        # The same usage rule the receipt enforces, spelled the same way: a log whose entries
+        # admitted what the receipt refuses could not honor the sum invariant the runner pins
+        # (entry usage totals equal the receipt's usage on either settle exit).
+        for key, value in self.usage.items():
+            if not isinstance(key, str) or type(value) is not int:
+                raise WireValidationError("model call attempt usage must be a mapping of str to int")
+            if value < 0:
+                raise WireValidationError(
+                    f"model call attempt usage {key!r} must not be negative"
+                )
+        object.__setattr__(self, "usage", dict(self.usage))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether this dispatch produced the turn — the receipt's own convention."""
+        return self.error_code == ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "elapsed_ms": self.elapsed_ms,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
+            "http_status": self.http_status,
+            "provider_retried": self.provider_retried,
+            "usage": dict(self.usage),
+            "stream_committed": self.stream_committed,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Any) -> ModelCallAttempt:
+        payload = require_object(payload, "model_call_attempt")
+        raw_status = payload.get("http_status")
+        return cls(
+            index=parse_int(payload, "index", default=1),
+            elapsed_ms=parse_int(payload, "elapsed_ms"),
+            error_code=parse_str(payload, "error_code"),
+            provider_error_code=parse_str(payload, "provider_error_code"),
+            retryable=parse_bool(payload, "retryable"),
+            config_recoverable=parse_bool(payload, "config_recoverable"),
+            http_status=None if raw_status is None else parse_int(payload, "http_status"),
+            provider_retried=parse_bool(payload, "provider_retried"),
+            usage=_optional_object(payload, "usage") or {},
+            stream_committed=parse_bool(payload, "stream_committed"),
+        )
+
+
+@dataclass(frozen=True)
 class ModelCallReceipt:
     """What happened on one model call, without any of what was said.
 
@@ -761,10 +850,28 @@ class ModelCallReceipt:
     # receipt into a guessing oracle for an internal hostname.
     destination_status: str = "not_reached"
     destination_digest: str = ""
+    # One entry per kernel dispatch, in order. Empty on receipts written before the field
+    # existed and on refused calls (``attempts == 0``); otherwise the runner writes one entry
+    # per attempt, so the log is either absent or complete — a log naming some attempts but
+    # not others could not answer the question it exists for, and a sum over its usage would
+    # silently disagree with the receipt's. Appended last so positional construction predating
+    # this field keeps meaning what it meant.
+    attempt_log: tuple[ModelCallAttempt, ...] = ()
 
     def __post_init__(self) -> None:
         if self.attempts < 0:
             raise ValueError("model call attempts must not be negative")
+        if type(self.attempt_log) is not tuple:
+            object.__setattr__(self, "attempt_log", tuple(self.attempt_log))
+        for entry in self.attempt_log:
+            if not isinstance(entry, ModelCallAttempt):
+                raise WireValidationError(
+                    "model call attempt_log entries must be ModelCallAttempt records"
+                )
+        if self.attempt_log and len(self.attempt_log) != self.attempts:
+            raise ValueError(
+                "model call attempt_log must be empty or name every attempt exactly once"
+            )
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")
         if self.capture_downgrades < 0:
@@ -913,12 +1020,26 @@ class ModelCallReceipt:
             "digest_status": self.digest_status,
             "destination_status": self.destination_status,
             "destination_digest": self.destination_digest,
+            # Always emitted, even one-entry and empty — absence means exactly one thing, a
+            # writer that predates the field, rather than doubling as "nothing noteworthy".
+            "attempt_log": [entry.to_json() for entry in self.attempt_log],
         }
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
         usage = _optional_object(payload, "usage") or {}
+        # Absent on every receipt written before this field existed, which is legal and reads
+        # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,
+        # like every other field here. A present log of the wrong length is refused by
+        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb.
+        raw_attempt_log = payload.get("attempt_log")
+        if raw_attempt_log is None:
+            attempt_log: tuple[ModelCallAttempt, ...] = ()
+        elif isinstance(raw_attempt_log, list):
+            attempt_log = tuple(ModelCallAttempt.from_json(item) for item in raw_attempt_log)
+        else:
+            raise WireValidationError("attempt_log must be an array")
         context_payload = _optional_object(payload, "context")
         model_payload = _optional_object(payload, "model")
         raw_status = payload.get("http_status")
@@ -973,6 +1094,7 @@ class ModelCallReceipt:
                 witnessed="resolved",
             ),
             destination_digest=parse_str(payload, "destination_digest"),
+            attempt_log=attempt_log,
         )
 
 
