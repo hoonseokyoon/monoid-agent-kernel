@@ -419,12 +419,16 @@ absent key as an empty log beside an intact `attempts` count, which is what ever
 written before the field existed means; the ledger schema declares the key without
 requiring it, so `monoid validate` still passes directories older writers filled; and a
 present log that does not name every attempt exactly once is refused — that shape is a
-writer bug, not a legacy to absorb. Run totals (`metrics.json`, `state.total_usage`, the
-token budget, the child roll-up) now read the settled receipt's usage, which folds spend
-from attempts a kernel retry absorbed; transcript `model_turn` rows keep the turn's own
-usage, so a reader reconciles totals as transcript rows plus absorbed spend. Old readers
-of any of these surfaces see only values that were always legal — larger totals, an extra
-ledger key they ignore.
+writer bug, not a legacy to absorb, and `monoid validate` now says so too rather than only
+the constructor. Leniency stops at the key: an *entry* has no writer predating it, so all
+ten of its fields are required and a partial one is refused instead of completed from
+defaults. Run totals (`metrics.json`, `state.total_usage`, the token budget, the child
+roll-up) now read the settled receipt's usage, which folds spend from attempts a kernel
+retry absorbed — including on a run the boundary ended, where a cancelled, timed-out or
+interrupted call's absorbed attempts now reach the totals as well; transcript `model_turn`
+rows keep the turn's own usage, so a reader reconciles totals as transcript rows plus
+absorbed spend. Old readers of any of these surfaces see only values that were always legal
+— larger totals, an extra ledger key they ignore.
 
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —

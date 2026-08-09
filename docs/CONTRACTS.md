@@ -454,9 +454,13 @@ their usage sums to the receipt's `usage`. A log that names one dispatch twice h
 length and still cannot answer what the second one did; a log whose rows do not add up to the bill
 they itemize leaves a reader with two numbers and no way to tell which to believe. Both are
 refused at construction, which is also why the runner builds the log and the merged total in a
-single `replace`. Entries carry no wall-clock instant — the receipt's own rule; the
-ledger line's `recorded_at` anchors the call — and backoff waits fall between entries, so entry
-times sum to less than `latency_ms`.
+single `replace` — and refused again by `monoid validate`, which reads the ledger as JSON and
+constructs no receipt, so a JSON Schema that can only judge one entry at a time would have
+reported such a line clean. The log is optional; an *entry* is not: it has no writer predating
+it, so all ten of its keys are required on the wire and a partial one is refused rather than
+completed from defaults — defaults there turn a corrupt line into a plausible dispatch. Entries
+carry no wall-clock instant — the receipt's own rule; the ledger line's `recorded_at` anchors the
+call — and backoff waits fall between entries, so entry times sum to less than `latency_ms`.
 
 #### Generation parameters, reasoning, output schema, and the applied echoes
 
@@ -2598,9 +2602,13 @@ before a turn begins — and `max_attempts` is the bound on what one logical cal
 inside itself. Spend absorbed by an adapter's *own* loop is different: the client never
 sees those attempts' bills — each hop meters its own wire calls, the way the reference
 gateway's tenant meter counts them server-side — so a deployment that wants absorbed spend
-in run accounting assigns the loop to the kernel. Boundary-terminated calls (cancelled or
-timed out mid-call) keep their absorbed spend on the receipt and the ledger only: the run's
-totals never counted a boundary-ended call's own bill, before this layer or under it.
+in run accounting assigns the loop to the kernel. A call the run's own boundary ends —
+cancelled, timed out, or a turn interrupted mid-call — counts the same: every arm the loop
+re-raises a model failure through reaches the accounting, not only the one typed to
+`ModelAdapterError`. The attempts a kernel retry absorbed before the boundary are completed,
+billed wire calls that finished before anything was cancelled, and the interrupt does not
+un-spend them; what a cancelled run still does not count is the terminating dispatch's own
+bill, which no layer has ever reported for a call that never settled.
 
 ## Run Artifacts
 

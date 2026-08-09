@@ -38,6 +38,39 @@ out in commit messages and here.
   as transcript rows plus absorbed spend. Spend absorbed by an adapter's *own* loop stays
   client-invisible (each hop meters its own wire calls); a deployment that wants absorbed
   spend in run accounting assigns the loop to the kernel.
+- **Every arm the loop re-raises a model failure through reaches that accounting, not the
+  one that was driven.** The bill is read inside an `except` clause, which binds it to the
+  types that clause catches: `except ModelAdapterError` covered a provider's refusal and
+  nothing else, so a third-party exception (rebuilt from its message, stamps dropped) and
+  every run boundary (`RunCancelled`, `RunTimeout`, and the `ModelCallAborted` translated
+  into a `TurnInterrupted` — all `NativeAgentError`, all one arm further along) carried the
+  absorbed spend out of the loop with no one reading it. One translator now carries what was
+  stamped onto any error it replaces, and one accounting function is reached from both
+  re-raising arms. Visible change: a cancelled, timed-out or interrupted run's
+  `metrics.json` and `total_usage` now include attempts a kernel retry completed and paid
+  for before the boundary; the terminating dispatch's own bill is still not counted, as it
+  never was for a call that did not settle.
+- **An `attempt_log` entry is read whole or refused, and the sweep checks the two claims
+  that span entries.** The entry reader defaulted all ten fields, so `[{}]` beside
+  `attempts: 1` deserialized into a plausible successful dispatch — an entry has no writer
+  predating it, and the ledger schema had required all ten since the field shipped. And
+  because `monoid validate` reads the ledger as JSON without constructing a receipt, the
+  index and usage-sum invariants `__post_init__` refuses were unenforced there; a
+  relationship pass now applies both, alongside the ones the manifest, proposal, transcript
+  and payload surfaces already had.
+- **`stream_committed` answers on both retry layers, not only the one that reads it.** The
+  delivery marker was installed on the consumer only when the kernel owns the loop — where
+  the flag is *used*, to refuse a retry that would replay a chunk — while the flag is
+  *recorded* on every call and `layer` defaults to `"adapter"`. Every shipped streaming call
+  therefore wrote a definite `stream_committed: false` onto its ledger line with the
+  consumer holding its chunks, and a present `false` cannot be told from "this arm never
+  answered".
+- **`ModelCallReceipt.with_error` cannot fail the call it is reporting.** Every read in that
+  method is guarded so a description of a failure never replaces it; the usage-sum invariant
+  reopened that door, because the method overwrites `usage` from the exception's stamp and
+  leaves `attempt_log` alone — so calling it on a receipt already carrying entries raised
+  `ValueError` out of the reporting path. A receipt that already carries its own breakdown
+  now keeps its total, the rule `provider_retried` already followed.
 - **Promoted from the post-W7-0 reassessment probes, now permanent pins:** delivery is
   marked before the consumer runs (a consumer raising a retryable-dressed error cannot
   reopen the stream and replay its own side effect); a consumer exception propagates with
