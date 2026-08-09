@@ -197,6 +197,48 @@ def test_turn_retry_backoff_answers_the_cap_for_a_multiplier_with_no_ordering(
     assert slept == [0.5, 4.0, 4.0]
 
 
+def test_turn_retry_backoff_keeps_the_cap_when_a_zero_delay_meets_unresolvable_growth(
+    monkeypatch: Any,
+) -> None:
+    """``initial_delay_s = 0.0`` stops meaning "no wait" the moment the multiplier is non-finite.
+
+    ``0 * inf`` and ``0 * nan`` are ``nan``, and ``min(max_delay_s, nan)`` keeps ``max_delay_s``
+    -- so the open-coded schedule waited the cap here, while the zero-delay early exit answers
+    ``0.0`` instead: ``delay > 0`` is then False and the turn is retried with no backoff at all.
+    ``initial_delay_s`` is validated ``allow_zero=True`` (``_model_control_number``), so zero is
+    a value the spec explicitly permits, and this door builds its config in Python, where the
+    multiplier's finiteness is not enforced at all.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    for multiplier in (float("inf"), float("-inf"), float("nan")):
+        for attempt in (2, 5):
+            asyncio.run(
+                session_drive._async_sleep_before_retry(
+                    attempt,
+                    ModelRetryConfig(
+                        initial_delay_s=0.0,
+                        max_delay_s=4.0,
+                        backoff_multiplier=multiplier,
+                        jitter_s=0.0,
+                    ),
+                )
+            )
+    assert slept == [4.0] * 6
+    # A zero initial delay under ordinary growth still waits nothing, and `delay > 0` keeps the
+    # sleep from being reached at all -- so the list does not grow.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            5, ModelRetryConfig(initial_delay_s=0.0, max_delay_s=4.0, jitter_s=0.0)
+        )
+    )
+    assert slept == [4.0] * 6
+
+
 def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: Path) -> None:
     service = _service(tmp_path)
     record = _Record()

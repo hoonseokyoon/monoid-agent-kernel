@@ -488,6 +488,40 @@ def test_backoff_delay_answers_the_cap_for_a_factor_with_no_ordering(backend_fac
     assert backend._outbox_backoff_delay(0) == 1.0
 
 
+def test_backoff_delay_keeps_the_cap_when_a_zero_base_meets_growth_it_cannot_resolve(
+    backend_factory: Any,
+) -> None:
+    """A zero base does NOT keep the product at zero once the factor is non-finite.
+
+    ``0 * inf`` and ``0 * nan`` are ``nan``, not zero, and ``min(cap_s, nan)`` keeps ``cap_s``
+    -- so the expression this schedule replaced answered the CAP for every one of these, on
+    every attempt past the first. Taking the zero-delay early exit instead answers ``0.0``, and
+    the outbox reads that ceiling as ``uniform(0, 0)``: no backoff at all, every failure due
+    again immediately, a resend loop against the endpoint that just refused. Worse than the
+    exception the previous round removed, out of a policy the service equally accepts.
+
+    Six shapes, not the one a reviewer named: the base is zero in both signs (``-0.0 <= 0.0``
+    holds too) and the growth is unresolvable in all three ways a float can be.
+    """
+    sender = RecordingOutboxSender()
+    backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
+    backend.outbox_retry_cap_s = 10.0
+    backend._outbox_rng = SimpleNamespace(uniform=lambda _low, high: high)
+    for base in (0.0, -0.0):
+        for factor in (float("inf"), float("-inf"), float("nan")):
+            backend.outbox_retry_base_s, backend.outbox_retry_factor = base, factor
+            assert [backend._outbox_backoff_delay(n) for n in (1, 3, 1100)] == [10.0] * 3, (
+                base,
+                factor,
+            )
+            # ...and the first attempt still answers zero, because `factor ** 0` is `1.0` for
+            # every factor including these three, so there the product really is zero.
+            assert backend._outbox_backoff_delay(0) == 0.0
+    # A zero base under ORDINARY growth is untouched: zero really does stay zero there.
+    backend.outbox_retry_base_s, backend.outbox_retry_factor = 0.0, 2.0
+    assert [backend._outbox_backoff_delay(n) for n in (0, 1, 3, 1100)] == [0.0] * 4
+
+
 def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_happened() -> None:
     """The schedule is evaluated AFTER ``sender.send`` returns, so it must not be able to raise.
 

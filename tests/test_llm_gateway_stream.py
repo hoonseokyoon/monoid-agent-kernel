@@ -884,22 +884,30 @@ def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
     assert gateway._retry_delay(4, 0.5, 0.0, 2.0, 0.0) == 0.0
 
 
-def test_the_schedule_is_total_over_every_non_finite_control() -> None:
-    """A control the schedule cannot order still has to come back as a wait, not an exception.
+def test_the_schedule_answers_what_the_expression_it_replaced_answered() -> None:
+    """Cell-by-cell equality against the open-coded schedule, over a lattice, not a raise check.
 
-    Every guard in `capped_backoff` is an ordering, and no ordering holds against NaN, so a NaN
-    falls THROUGH all of them. Only the multiplier's is load-bearing: it reaches
-    `int(_CHUNK_LOG_BUDGET / math.log(nan))` and `int(nan)` raises `ValueError` -- while a NaN
-    initial delay or cap merely reaches `math.log`, which answers `nan` rather than raising.
-    Pinned as the whole 3x3 surface and not as the one cell a reviewer named: the reference
-    backend's four outbox knobs carry no validation at all, so any of the three can arrive
-    non-finite through that door, and `ModelRetryConfig` validates only what it builds
-    `from_json`.
+    The oracle is `min(max_delay_s, initial * multiplier ** (attempt - 1))` -- the expression
+    `capped_backoff` replaced -- and the claim is *equality*, not merely that the new code does
+    not raise. Absence-of-raise is the oracle this test used to carry, and it is blind to the
+    defect that matters most here: a cell that raised in NEITHER version and simply answers
+    something different. One did. `initial_delay_s = 0.0` with a non-finite multiplier took the
+    zero-delay early exit and answered `0.0`, where `min(cap, 0.0 * inf ** n)` answered the CAP,
+    because `0 * inf` is `nan` and `min(cap, nan)` keeps `cap`. Read as an outbox ceiling that
+    is `uniform(0, 0)` -- no backoff at all, a hot resend loop against an endpoint that just
+    failed, which is worse than the exception the previous round removed.
 
-    The oracle is the expression this schedule replaced -- `min(cap, initial * multiplier ** n)`
-    -- wherever that expression itself answers. So what is pinned is that bounding the exponent
-    changed no policy for these inputs; it removed a raise and nothing else. NaN is compared as
-    NaN because it is never equal to itself.
+    So the lattice is not a non-finite sweep. The defect needs a ZERO and a non-finite TOGETHER,
+    and a sweep that substitutes one non-finite value into an otherwise-ordinary policy cannot
+    express that. Every value class the guards branch on is here: both signed zeros (the
+    `<= 0.0` exits), a negative (out of domain, but reachable through four unvalidated outbox
+    fields), a subnormal and `1e308` (the chunked path), `1.0` and below (the no-growth branch),
+    and the three non-finite values.
+
+    Three outcomes, each asserted rather than tolerated: the new code must never raise; where
+    the old expression raised (`OverflowError`, this helper's whole reason) the new one answers;
+    and where both answer they agree -- except for one named family, which is checked to BE that
+    family rather than waved through.
     """
     import math
 
@@ -909,30 +917,42 @@ def test_the_schedule_is_total_over_every_non_finite_control() -> None:
         return (math.isnan(left) and math.isnan(right)) or left == right
 
     nan, inf = float("nan"), float("inf")
-    finite = {"initial_delay_s": 1.0, "max_delay_s": 300.0, "backoff_multiplier": 2.0}
-    compared = 0
+    lattice = (0.0, -0.0, 5e-324, 0.5, 1.0, 2.0, 300.0, 1e308, -1.0, nan, inf, -inf)
+    fixed = agreed = 0
+    divergences: list[tuple[int, float, float, float, float, float]] = []
     for attempt in (1, 2, 4, 1101):
-        for knob in finite:
-            for value in (nan, inf, -inf):
-                policy = {**finite, knob: value}
-                answer = capped_backoff(attempt, **policy)  # must not raise, for any cell
-                try:
-                    open_coded = min(
-                        policy["max_delay_s"],
-                        policy["initial_delay_s"]
-                        * (policy["backoff_multiplier"] ** max(0, attempt - 1)),
-                    )
-                except OverflowError:
-                    continue  # the cell this whole helper exists to remove; no oracle there
-                assert same(answer, open_coded), (attempt, knob, value, answer, open_coded)
-                compared += 1
-    # The oracle has to have actually run, or "no policy changed" is a claim about nothing. 36
-    # cells, less the 6 the oracle cannot judge: at attempt 1101 a non-finite delay or cap
-    # leaves the multiplier at `2.0`, and `2.0 ** 1100` is the OverflowError this helper exists
-    # to remove -- so those 6 have no pre-existing answer to be equal to.
-    assert compared == 30
-    # And the cell that raised, named outright rather than left to the oracle.
-    assert capped_backoff(4, 1.0, 300.0, nan) == 300.0
+        for initial in lattice:
+            for cap in lattice:
+                for multiplier in lattice:
+                    answer = capped_backoff(attempt, initial, cap, multiplier)
+                    try:
+                        open_coded = min(cap, initial * (multiplier ** max(0, attempt - 1)))
+                    except OverflowError:
+                        fixed += 1  # the cell this helper exists to remove; no oracle there
+                        continue
+                    if same(answer, open_coded):
+                        agreed += 1
+                        continue
+                    divergences.append((attempt, initial, cap, multiplier, answer, open_coded))
+
+    # Every remaining disagreement is ONE family and it is named: a negative initial delay,
+    # which is not a wait any schedule can mean. The new answer is `min(cap, initial)` (or the
+    # cap when the multiplier is `+inf`), the old one was the more-negative product; both are
+    # below zero, so both call sites floor them identically -- the outbox through
+    # `uniform(0, max(0.0, ceiling))` and the retry loops through `if delay > 0`. Asserted as a
+    # property of every divergence, so a divergence of any OTHER shape reddens this test.
+    for attempt, initial, cap, multiplier, answer, open_coded in divergences:
+        assert initial < 0.0, (attempt, initial, cap, multiplier, answer, open_coded)
+        assert max(0.0, answer) == max(0.0, open_coded) or answer == cap, (
+            attempt, initial, cap, multiplier, answer, open_coded,
+        )
+    # Counts, so a lattice or a schedule that quietly stops exercising a branch cannot pass by
+    # comparing nothing. 12**3 * 4 = 6912 cells.
+    assert fixed + agreed + len(divergences) == 6912
+    assert (fixed, agreed, len(divergences)) == (576, 6226, 110)
+    # And the two cells behind the two review rounds, named outright rather than left to counts.
+    assert capped_backoff(4, 1.0, 300.0, nan) == 300.0  # int(nan) raised here
+    assert capped_backoff(4, 0.0, 300.0, inf) == 300.0  # the zero-delay exit answered 0.0 here
 
 
 def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:

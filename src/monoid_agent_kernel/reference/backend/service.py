@@ -475,7 +475,10 @@ class RunnerBackend:
     # the power first lets it leave the float range before the cap is consulted, and the schedule
     # runs AFTER sender.send returns, where a raise would lose the receipt for a side effect that
     # already happened. It is `providers/_common.capped_backoff`, the model-retry loops' own
-    # schedule, and it is total: a factor it cannot order (NaN) answers the cap. The next-attempt
+    # schedule, under one rule standing ahead of every base/cap shortcut: growth it cannot resolve
+    # resolves UPWARD, to the cap -- a NaN factor, an infinite one, and a zero base under either
+    # (`0 * inf` is nan, not zero). A zero ceiling is uniform(0, 0), which is not a slower retry
+    # but an unthrottled one. The next-attempt
     # time is stamped on the request (durable), so the schedule survives a restart; the watchdog
     # redrive tick (below) dispatches a request once its time arrives, decoupling retry timing
     # from run activity.

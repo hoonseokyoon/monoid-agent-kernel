@@ -86,12 +86,24 @@ def capped_backoff(
     rather than :func:`retry_delay_s`.
 
     So it is TOTAL: every input, non-finite ones included, gets an answer rather than an
-    exception. The non-finite answers are the ones the open-coded ``min(max_delay_s, initial *
-    multiplier ** n)`` always gave -- a NaN cap still answers ``nan``, a negative-infinite one
-    still answers ``-inf`` -- because a schedule three layers now share is not the place to
-    change what a policy MEANS. What is not preserved is the raise. Validating the policy at one
-    caller's boundary instead would leave the other callers' boundaries to be found later; the
-    arithmetic has to be total regardless of what validation any of them later grows.
+    exception -- and the answer is the one the open-coded ``min(max_delay_s, initial *
+    multiplier ** n)`` gave, because a schedule three layers now share is not the place to change
+    what a policy MEANS. A NaN cap still answers ``nan``, a negative-infinite one still answers
+    ``-inf``. What is not preserved is the raise. Measured rather than asserted: over a
+    lattice per argument (both signed zeros, a negative, a subnormal, ``1e308``, and the three
+    non-finite values) the only cells that answer differently are a NEGATIVE ``initial_delay_s``
+    -- not a wait any schedule can mean -- and one cell where the saturation threshold answers
+    the cap for a product one ULP below it.
+
+    The rule that makes it total is one rule, and its ORDER is the whole of it: growth this
+    cannot resolve resolves UPWARD, to ``max_delay_s``, decided before any shortcut that reasons
+    about the delay or the cap. Every such shortcut is a claim about what the growth does to the
+    product, and none of them holds when the growth is not a number -- ``0 * inf`` is ``nan``,
+    not zero, so the zero-delay exit standing FIRST answered ``0.0`` where the schedule was the
+    cap: at the outbox a ``uniform(0, 0)`` ceiling, which is not a slower retry but an
+    unthrottled one. Validating the policy at one caller's boundary instead would leave the
+    other callers' boundaries to be found later; the arithmetic has to be total regardless of
+    what validation any of them later grows.
 
     One bound decides, and it is the exact one: at ``saturating`` the product has already reached
     the cap, so the answer IS the cap and no larger exponent can change it. Below that point the
@@ -101,29 +113,48 @@ def capped_backoff(
     would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
     """
 
+    # The MULTIPLIER is settled first, before any shortcut that reasons about the delay or the
+    # cap. Every one of those shortcuts rests on what the growth does to the product, and that
+    # premise holds only for a growth that is a number -- see the zero-delay exit at the bottom,
+    # which is the one that got this wrong by standing above it.
     exponent = max(0, attempt - 1)
-    # Nothing to grow (the first attempt), or nothing a growth could change: a zero initial
-    # delay keeps the product at zero and a zero cap keeps the answer there. Settled here so the
-    # logarithms below never see zero or a negative -- ``<= 0.0`` is an ordering, so ``-inf``
-    # rides out on it too. It does NOT screen a NaN, because no ordering does; a NaN delay or cap
-    # reaches ``math.log``, which answers ``nan`` rather than raising, and every comparison that
-    # answer feeds stays False. Only the MULTIPLIER's NaN is load-bearing -- see just below.
-    if exponent == 0 or initial_delay_s <= 0.0 or max_delay_s <= 0.0:
+    # Nothing to grow: the first attempt applies no power at all, and ``multiplier ** 0`` is
+    # ``1.0`` for every multiplier, non-finite ones included, so which one it is cannot matter.
+    if exponent == 0:
         return min(max_delay_s, initial_delay_s)
-    # A multiplier that does not grow drives the power toward zero, never out of range.
+    # A multiplier that does not grow drives the power toward zero, never out of range. ``<=``
+    # is an ordering, so this also takes ``-inf``, whose power is already infinite and so cannot
+    # overflow INTO one; the product here is the open-coded answer exactly.
     if backoff_multiplier <= 1.0:
         return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
-    # A NaN multiplier is neither that nor a growth this can size, and neither guard screens it:
-    # it falls THROUGH both into ``int(_CHUNK_LOG_BUDGET / math.log(nan))``, where ``int(nan)``
-    # raises ``ValueError``. Same shape as the ``OverflowError`` the exponent bound exists to
-    # remove, in the same handlers -- and worse at the outbox, which evaluates its schedule AFTER
-    # ``sender.send`` has returned, so a raise here loses the receipt for a side effect that
-    # already happened and the request is dispatched a second time. The answer is the cap: what
-    # ``min(max_delay_s, initial * nan ** n)`` answered before these loops shared a schedule, and
-    # the conservative end of the range -- the other end is a zero wait spinning on the endpoint
-    # that just refused.
-    if math.isnan(backoff_multiplier):
+    # What is left is growth this cannot size: NaN, or ``+inf``. No ordering screens a NaN, so it
+    # fell THROUGH every guard into ``int(_CHUNK_LOG_BUDGET / math.log(nan))``, where ``int(nan)``
+    # raises ``ValueError`` -- the same shape as the ``OverflowError`` the exponent bound exists
+    # to remove, in the same handlers, and worse at the outbox, which evaluates its schedule
+    # AFTER ``sender.send`` has returned: a raise there loses the receipt for a side effect that
+    # already happened, and the request is dispatched a second time.
+    #
+    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD.
+    # That is what ``min(max_delay_s, initial * multiplier ** n)`` answered for every one of
+    # these (``initial * inf`` is ``inf``, ``initial * nan`` is ``nan``, and ``min`` keeps the cap
+    # against either), and it is the only safe direction independently of that -- the opposite
+    # end of the range is a zero wait, an unthrottled resend against the endpoint that just
+    # refused. One deliberate departure from the old product: a NEGATIVE initial delay under
+    # ``+inf`` used to answer ``-inf``. A negative wait is not a wait, and the cap is strictly
+    # safer than the "no backoff" both of them floor to.
+    if not math.isfinite(backoff_multiplier):
         return max_delay_s
+    # Nothing a growth could change: a zero initial delay keeps the product at zero, and a zero
+    # cap keeps the answer there. This has to come AFTER the multiplier is settled -- "zero times
+    # the growth is zero" is a claim about a growth that is a number, and ``0 * inf`` and
+    # ``0 * nan`` are both ``nan``, which ``min(cap, .)`` resolves to the CAP. Standing above the
+    # multiplier, this exit answered ``0.0`` for a policy whose schedule was the cap, i.e. no
+    # backoff where the cap was owed. Settled here, the logarithms below never see zero or a
+    # negative; ``<= 0.0`` is an ordering, so ``-inf`` rides out on it too, and a NaN delay or cap
+    # reaches ``math.log``, which answers ``nan`` rather than raising and leaves every comparison
+    # that answer feeds False.
+    if initial_delay_s <= 0.0 or max_delay_s <= 0.0:
+        return min(max_delay_s, initial_delay_s)
     growth_per_step = math.log(backoff_multiplier)
     # ``int >= float`` compares exactly in Python, so ``attempt`` is never itself converted --
     # the guard against an oversized exponent cannot be defeated by the exponent's own size.
