@@ -867,6 +867,15 @@ def test_the_delay_cap_binds_the_arithmetic_and_not_only_its_result() -> None:
 
     assert gateway._retry_delay(3, 0.5, 4.0, 1e308, 0.0) == 4.0
     assert gateway._retry_delay(1025, 0.5, 4.0, 2.0, 0.0) == 4.0
+    # ...and the cap must not stand in for a step the arithmetic CAN still reach. A subnormal
+    # initial delay keeps the PRODUCT small while the power alone leaves the float range, so a
+    # bound taken on the power by itself would answer `max_delay_s` -- 1.8e308 seconds -- for a
+    # wait of 1.8 seconds. Both arms: one chunk of growth, and (below) enough of them that the
+    # power cannot be taken in one piece at all.
+    float_max = 1.7976931348623157e308
+    assert gateway._retry_delay(2, 1e-308, float_max, float_max, 0.0) == 1e-308 * float_max
+    chunked = gateway._retry_delay(1800, 5e-324, 4.0, 1.5, 0.0)
+    assert chunked == pytest.approx(3.0336e-07, rel=1e-6)
     # Below the saturation point the schedule is the one it always was, and the degenerate
     # arms (no growth, no initial delay, no cap) still answer what the product answered.
     assert gateway._retry_delay(3, 0.5, 4.0, 2.0, 0.0) == 2.0

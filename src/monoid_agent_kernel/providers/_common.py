@@ -15,9 +15,11 @@ from typing import Any
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
-# ``log(float_max)``. Past this many multiplier-steps the POWER alone leaves the float range,
-# whatever the capped product would have been. Read by :func:`_capped_backoff`.
-_MAX_FINITE_LOG = math.log(sys.float_info.max)
+# Half of ``log(float_max)``: the per-chunk log budget :func:`_capped_backoff` sizes its power
+# by. Half, not all of it, so the chunk stays safe through the rounding of the division that
+# sizes it -- the power lands at or under ``sqrt(float_max)`` -- at the cost of at most doubling
+# a loop that runs four times in the worst case anyone can configure.
+_CHUNK_LOG_BUDGET = math.log(sys.float_info.max) / 2.0
 
 
 def retry_delay_s(
@@ -64,11 +66,12 @@ def _capped_backoff(
     ``OverflowError`` instead of the taxonomy (``retryable``, ``code``, ``http_status``) it
     retries, reports and stamps receipts on. So the exponent is bounded before the power.
 
-    Two bounds and the smaller wins. At ``saturating`` the product has already reached the cap,
-    so the answer IS the cap and no larger exponent can change it -- that bound is exact, and it
-    is the one every real policy meets. ``representable`` is the arithmetic's own ceiling: it can
-    only bind first when ``max_delay_s / initial_delay_s`` exceeds the entire float range, and
-    the answer saturates there too, at most one step earlier than the product would have.
+    One bound decides, and it is the exact one: at ``saturating`` the product has already reached
+    the cap, so the answer IS the cap and no larger exponent can change it. Below that point the
+    product is representable even where the power on its own is not -- a subnormal
+    ``initial_delay_s`` under a large multiplier -- so the power is taken in chunks small enough
+    not to overflow and folded into the running delay as it goes. A ceiling on the power alone
+    would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
     """
 
     exponent = max(0, attempt - 1)
@@ -81,13 +84,24 @@ def _capped_backoff(
     if backoff_multiplier <= 1.0:
         return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
     growth_per_step = math.log(backoff_multiplier)
-    saturating = (math.log(max_delay_s) - math.log(initial_delay_s)) / growth_per_step
-    representable = _MAX_FINITE_LOG / growth_per_step
     # ``int >= float`` compares exactly in Python, so ``attempt`` is never itself converted --
     # the guard against an oversized exponent cannot be defeated by the exponent's own size.
-    if exponent >= min(saturating, representable):
+    if exponent >= (math.log(max_delay_s) - math.log(initial_delay_s)) / growth_per_step:
         return max_delay_s
-    return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
+    # One chunk covers every schedule a real policy writes, and then this is the arithmetic it
+    # always was. Growth is monotone, so an intermediate that reaches the cap settles the answer
+    # for every step still owed -- which is also what keeps a chunk product that saturates to
+    # infinity (multiplication, so no ``OverflowError``) from escaping as one.
+    chunk = max(1, int(_CHUNK_LOG_BUDGET / growth_per_step))
+    delay = initial_delay_s
+    remaining = exponent
+    while remaining > 0:
+        taken = min(remaining, chunk)
+        delay *= backoff_multiplier**taken
+        if delay >= max_delay_s:
+            return max_delay_s
+        remaining -= taken
+    return min(max_delay_s, delay)
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
