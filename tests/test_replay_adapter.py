@@ -2382,3 +2382,101 @@ def test_an_inner_config_that_is_not_one_is_not_adopted(tmp_path: Path) -> None:
 
     assert getattr(_replay(tmp_path, inner=_Nonsense()), "config", None) is None
     assert getattr(_replay(tmp_path, inner=_Raising()), "config", None) is None
+
+
+_EXPOSED_ATTRIBUTE_ORIGINS = {
+    "provider_name": (
+        "the corpus, deliberately not the inner: it answers *whose recording this key is from*, "
+        "which only the corpus can say, and the module docstring plus docs/CONTRACTS.md's third "
+        "ledger delta carry the consequence for a fallthrough answer"
+    ),
+    "supports_multimodal": (
+        "the inner where the corpus cannot be harmed by it -- resolution is done for whichever "
+        "adapter will actually run, and a corpus of all-text parts cannot have its own keys moved "
+        "by turning resolution on"
+    ),
+    "wire_image_encoding": (
+        "the inner, travelling with the capability above: the loop reads the encoding off "
+        "whichever adapter it asked about supports_multimodal, so lending one without the other "
+        "hands the inner bytes in a shape this wrapper chose for it"
+    ),
+    "config": (
+        "the inner when this wrapper has none, because the effective-model probe can only see "
+        "this wrapper and would otherwise answer with a default model that nothing served"
+    ),
+}
+"""Every public attribute :class:`ReplayModelAdapter` exposes, and where its value comes from.
+
+Two of these were review findings one round apart, and they were the same question asked of two
+attributes: is this fact about *the recording* or about *the thing that will actually run*? The
+answer differs per attribute and cannot be defaulted, so the table is the disposition and this
+test is what makes a new attribute demand one.
+"""
+
+
+def test_every_exposed_capability_states_where_it_comes_from() -> None:
+    """A capability the wrapper exposes is either the corpus's answer or the inner's, and which
+    one it is has to be written down before a reviewer has to work it out.
+
+    `supports_multimodal` and `config` were both found by review, one round apart, as the corpus
+    answering for a live call the fallthrough makes. Both fixes were correct and neither bound
+    the *next* attribute -- which is this file's oldest shape, and the reason the disposition is
+    a table a new attribute fails without rather than a paragraph someone has to notice.
+
+    Read off the class by AST rather than from a hand-kept list, for the reason the drop-site
+    census is over call sites: an enumeration I write is an enumeration of what I remembered.
+    """
+
+    source = Path(replay_module.__file__).read_text(encoding="utf-8")
+    cls = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ClassDef) and node.name == "ReplayModelAdapter"
+    )
+    exposed = {
+        target.attr
+        for node in ast.walk(cls)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+        and not target.attr.startswith("_")
+    }
+
+    assert exposed == set(_EXPOSED_ATTRIBUTE_ORIGINS), {
+        "undocumented": sorted(exposed - set(_EXPOSED_ATTRIBUTE_ORIGINS)),
+        "stale": sorted(set(_EXPOSED_ATTRIBUTE_ORIGINS) - exposed),
+        "hint": "a public attribute this wrapper exposes to the loop and the runner is either "
+        "the corpus's answer or the inner's; say which above, because getting it wrong is a "
+        "recorded answer stamped with an identity that never produced it, or a paid live call "
+        "made without a capability the adapter behind this one has",
+    }
+
+
+def test_the_encoding_travels_with_the_capability_it_governs(tmp_path: Path) -> None:
+    """Lending `supports_multimodal` created a coupling that `wire_image_encoding` had to follow.
+
+    `AgentLoop` reads the encoding off whichever adapter it asked about `supports_multimodal`, so
+    once the capability can come from the inner the resolution is being done *for* the inner --
+    and leaving the encoding on this wrapper hands it bytes in a shape this wrapper chose. Inert
+    today, because `resolve_wire_messages` accepts only "base64" and the two cannot yet differ.
+    Bound anyway: the coupling was created by the previous round's fix, and a latent mismatch
+    left for the next encoding to discover is the shape this file keeps paying for.
+    """
+
+    _record(tmp_path, _OriginalAdapter([ModelTurn(final_text="recorded")]), [_request()])
+
+    class _OtherEncoding(_MultimodalInner):
+        wire_image_encoding = "raw-bytes"
+
+    assert _replay(tmp_path, inner=_OtherEncoding()).wire_image_encoding == "raw-bytes"
+    # An explicit argument still wins, the way an explicit config does.
+    assert (
+        _replay(tmp_path, inner=_OtherEncoding(), wire_image_encoding="base64")
+        .wire_image_encoding
+        == "base64"
+    )
+    # No inner, or an inner that says nothing, keeps the documented default.
+    assert _replay(tmp_path).wire_image_encoding == "base64"
+    assert _replay(tmp_path, inner=_MultimodalInner()).wire_image_encoding == "base64"

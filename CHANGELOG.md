@@ -79,6 +79,18 @@ out in commit messages and here.
   a fallthrough carrying unresolved media is refused as `config_recoverable` before the call rather
   than paid for blind. Rejecting the combination outright was not available: `openai` and `gateway`
   both declare `supports_multimodal = True` unconditionally.
+- **Every capability the replay wrapper exposes now states whether it is the corpus's answer or
+  the inner's.** Two review rounds found the same question asked of two attributes —
+  `supports_multimodal` and `config` — and neither fix bound the next one. A declaration answers
+  "whose recording is this key from", which only the corpus can say; a capability answers "what can
+  the thing that will actually run do", which under fallthrough is the inner. `wire_image_encoding`
+  travels with the capability it governs, because `AgentLoop` reads it off whichever adapter it
+  asked about `supports_multimodal` — lending one without the other hands the inner bytes in a shape
+  the wrapper chose for it. Latent today (only `base64` is accepted) and bound now, because the
+  coupling was created by the preceding fix. `provider_name` stays the corpus's, as the module
+  docstring and `docs/CONTRACTS.md`'s third ledger delta already record. A new public attribute with
+  no stated origin fails `test_every_exposed_capability_states_where_it_comes_from`, read off the
+  class by AST rather than from a list someone maintains.
 - **The request evidence scan no longer holds the whole expanded corpus.** `request_terms_view()`
   returned a tuple *and* wrote every expansion into a cache the corpus kept for its lifetime, so
   constructing `ReplayModelAdapter` reassembled and parsed every offloaded request and retained it —

@@ -43,9 +43,19 @@ whose destination resolved is documented rather than imitated.
 this adapter, so a live answer the inner produced is stamped with whatever *this* adapter
 declares -- the corpus-derived provider, or nothing at all where the derivation declined, which
 the receipt records as ``""`` -- and with ``not_declared``. The inner's own declaration and
-destination do not reach it, and its ``supports_multimodal``/``astream_turn`` do not either. That is forced rather than chosen: the
-declaration is what makes recorded keys reachable, so it cannot also report who served a miss.
-``docs/CONTRACTS.md`` carries it as the third ledger delta, the one only fallthrough produces.
+destination do not reach it, and neither does ``astream_turn``. That is forced rather than
+chosen: the declaration is what makes recorded keys reachable, so it cannot also report who
+served a miss. ``docs/CONTRACTS.md`` carries it as the third ledger delta, the one only
+fallthrough produces.
+
+The *capabilities* are the other way round, and the split is the point. A declaration answers
+"whose recording is this key from", which only the corpus can say; a capability answers "what
+can the thing that will actually run do", which under fallthrough is the inner. So
+``supports_multimodal``, its ``wire_image_encoding``, and ``config`` are taken from the inner
+where the corpus cannot be harmed by it, and ``provider_name`` is not. Every public attribute
+this class sets has to state which of the two it is --
+``test_every_exposed_capability_states_where_it_comes_from`` is where, and a new one with no
+entry fails rather than quietly inheriting the last reviewer's assumption.
 """
 
 from __future__ import annotations
@@ -200,7 +210,7 @@ class ReplayModelAdapter:
         inner: Any = None,
         provider_name: Any = _AUTO,
         supports_multimodal: Any = _AUTO,
-        wire_image_encoding: str = "base64",
+        wire_image_encoding: Any = _AUTO,
         config: ModelConfig | None = None,
     ) -> None:
         corpus = (
@@ -397,7 +407,23 @@ class ReplayModelAdapter:
             self.supports_multimodal = False
         self._served_slots: dict[str, list[tuple[int, weakref.ref[ModelTurn]]]] = {}
         self._served_lock = threading.Lock()
-        self.wire_image_encoding = wire_image_encoding
+        # Travels with the capability above rather than beside it, because the resolution it
+        # governs is now done *for the inner*: `AgentLoop` reads the encoding off whichever
+        # adapter it asked about `supports_multimodal`, so lending the capability without the
+        # encoding hands the inner bytes in a shape this wrapper chose for it. Inert today --
+        # `resolve_wire_messages` accepts only "base64", so the two cannot yet differ -- and
+        # bound now because the coupling was created by lending the capability, and a latent
+        # mismatch left for the next encoding to discover is how this file has repeatedly paid
+        # for the same shape. An explicit argument still wins, the way an explicit `config` does.
+        if wire_image_encoding is not _AUTO:
+            self.wire_image_encoding = str(wire_image_encoding)
+        else:
+            probe = (
+                getattr(self._inner, "wire_image_encoding", None)
+                if self._inner is not None
+                else None
+            )
+            self.wire_image_encoding = probe if isinstance(probe, str) else "base64"
         if config is not None:
             # Inert under the loop (it always authors request.model); a standalone
             # ModelCallRunner caller may want the effective-config probe to answer.
