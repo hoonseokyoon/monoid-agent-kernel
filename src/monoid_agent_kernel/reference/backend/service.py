@@ -470,9 +470,18 @@ class RunnerBackend:
     # a retryable failure before it is dead-lettered as failed.
     outbox_max_attempts: int = 5
     # Retry schedule for a failed outbox send: capped exponential backoff with **full jitter**
-    # (delay = uniform(0, min(cap, base * factor**attempts))). The next-attempt time is stamped on
-    # the request (durable), so the schedule survives a restart; the watchdog redrive tick (below)
-    # dispatches a request once its time arrives, decoupling retry timing from run activity.
+    # (delay = uniform(0, ceiling); ceiling = base * factor**attempts, bounded by cap). The cap
+    # binds the EXPONENT and not only the product -- these four fields carry no validation, taking
+    # the power first lets it leave the float range before the cap is consulted, and the schedule
+    # runs AFTER sender.send returns, where a raise would lose the receipt for a side effect that
+    # already happened. It is `providers/_common.capped_backoff`, the model-retry loops' own
+    # schedule, under one rule standing ahead of every base/cap shortcut: growth it cannot resolve
+    # resolves UPWARD, to the cap -- a NaN factor, an infinite one, and a zero base under either
+    # (`0 * inf` is nan, not zero). A zero ceiling is uniform(0, 0), which is not a slower retry
+    # but an unthrottled one. The next-attempt
+    # time is stamped on the request (durable), so the schedule survives a restart; the watchdog
+    # redrive tick (below) dispatches a request once its time arrives, decoupling retry timing
+    # from run activity.
     outbox_retry_base_s: float = 1.0
     outbox_retry_factor: float = 2.0
     outbox_retry_cap_s: float = 300.0

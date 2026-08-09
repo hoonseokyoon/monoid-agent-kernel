@@ -16,6 +16,7 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
 )
+from monoid_agent_kernel.reference.backend import session_drive
 from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.reference.backend.session_drive import (
     SessionDriveContext,
@@ -125,6 +126,117 @@ def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=2)
 
     assert service.session_should_stop(record, started=started, turns=2) is True
+
+
+def test_turn_retry_backoff_saturates_at_the_cap_instead_of_overflowing(
+    monkeypatch: Any,
+) -> None:
+    """``max_delay_s`` bounds the exponent, not only the product it multiplies out to.
+
+    ``ModelRetryConfig`` validates ``backoff_multiplier`` as any positive finite number and
+    ``max_attempts`` as an integer above zero, neither with an upper bound, so both arms below
+    are policies the spec ACCEPTS. Capping only the result lets ``float ** int`` leave the float
+    range before the cap is consulted, and that raises ``OverflowError`` rather than saturating
+    -- here inside the turn-failure handler, where it would REPLACE the failure being retried.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            3,
+            ModelRetryConfig(
+                initial_delay_s=0.5, max_delay_s=4.0, backoff_multiplier=1e308, jitter_s=0.0
+            ),
+        )
+    )
+    # The shipped default multiplier needs no exotic policy at all -- only an attempt count.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            1100, ModelRetryConfig(initial_delay_s=0.5, max_delay_s=4.0, jitter_s=0.0)
+        )
+    )
+    assert slept == [4.0, 4.0]
+
+
+def test_turn_retry_backoff_answers_the_cap_for_a_multiplier_with_no_ordering(
+    monkeypatch: Any,
+) -> None:
+    """The schedule's OTHER door, driven with the one value no comparison screens.
+
+    ``ModelRetryConfig.from_json`` rejects every non-finite number (``_model_control_number``
+    -> ``math.isfinite``), so nothing arriving as JSON carries a NaN. The dataclass itself has
+    no ``__post_init__``, and a config built in Python -- which is how this module's own callers
+    and the test above build one -- carries whatever it was handed. Reached with a NaN
+    multiplier the schedule fell through every guard into ``int(nan)`` and raised ``ValueError``
+    here, inside the turn-failure handler, replacing the failure being retried with an
+    arithmetic one. So the multiplier's NaN is settled in the schedule and not at one door.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    for attempt in (1, 4, 1100):
+        asyncio.run(
+            session_drive._async_sleep_before_retry(
+                attempt,
+                ModelRetryConfig(
+                    initial_delay_s=0.5,
+                    max_delay_s=4.0,
+                    backoff_multiplier=float("nan"),
+                    jitter_s=0.0,
+                ),
+            )
+        )
+    # The first attempt has no growth for a NaN to confuse; the rest answer the cap.
+    assert slept == [0.5, 4.0, 4.0]
+
+
+def test_turn_retry_backoff_keeps_the_cap_when_a_zero_delay_meets_unresolvable_growth(
+    monkeypatch: Any,
+) -> None:
+    """``initial_delay_s = 0.0`` stops meaning "no wait" the moment the multiplier is non-finite.
+
+    ``0 * inf`` and ``0 * nan`` are ``nan``, and ``min(max_delay_s, nan)`` keeps ``max_delay_s``
+    -- so the open-coded schedule waited the cap here, while the zero-delay early exit answers
+    ``0.0`` instead: ``delay > 0`` is then False and the turn is retried with no backoff at all.
+    ``initial_delay_s`` is validated ``allow_zero=True`` (``_model_control_number``), so zero is
+    a value the spec explicitly permits, and this door builds its config in Python, where the
+    multiplier's finiteness is not enforced at all.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    for multiplier in (float("inf"), float("-inf"), float("nan")):
+        for attempt in (2, 5):
+            asyncio.run(
+                session_drive._async_sleep_before_retry(
+                    attempt,
+                    ModelRetryConfig(
+                        initial_delay_s=0.0,
+                        max_delay_s=4.0,
+                        backoff_multiplier=multiplier,
+                        jitter_s=0.0,
+                    ),
+                )
+            )
+    assert slept == [4.0] * 6
+    # A zero initial delay under ordinary growth still waits nothing, and `delay > 0` keeps the
+    # sleep from being reached at all -- so the list does not grow.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            5, ModelRetryConfig(initial_delay_s=0.0, max_delay_s=4.0, jitter_s=0.0)
+        )
+    )
+    assert slept == [4.0] * 6
 
 
 def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: Path) -> None:
