@@ -405,14 +405,39 @@ def test_the_ledger_does_not_share_the_replay_key_s_projection() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module is not None
     } | {
-        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
     }
-    assert not any(name.startswith("monoid_agent_kernel.model_call") for name in imported), {
+    # Both homes, because the projection has moved once already: it lived in `model_call`
+    # when this guard was written and now lives in `providers._request_identity`, and for the
+    # length of that move `from ..._request_identity import _model_identity as _mi` satisfied
+    # every assertion here -- wrong module prefix for the first, and an `ast.alias` is neither
+    # a Name nor an Attribute, so the imported name never reached the second.
+    # The current home is *derived*, so a third move cannot silently empty this guard the way
+    # the first move emptied its predecessor. The old home stays listed by history: a ledger
+    # reaching for `model_call` is reaching for the projection wherever it re-exports from.
+    from monoid_agent_kernel.providers._request_identity import _model_identity
+
+    home = inspect.getmodule(_model_identity)
+    assert home is not None
+    forbidden = ("monoid_agent_kernel.model_call", home.__name__)
+    assert not any(name.startswith(forbidden) for name in imported), {
         "imported": sorted(imported),
         "hint": "the ledger must not reach into the replay key's module",
     }
 
-    referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
-        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
-    }
+    referenced = (
+        {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        | {
+            name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+            for name in (alias.name, alias.asname)
+            if name
+        }
+    )
     assert "_model_identity" not in referenced

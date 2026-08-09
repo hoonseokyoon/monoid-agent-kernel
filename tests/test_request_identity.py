@@ -17,32 +17,44 @@ reads through. Mutating it must turn all four red -- if one survives, the bindin
 A literal alone cannot see *conditional* inclusion -- `if model.timeout_s != 600: ...` keeps
 the default-config key stable and changes every other one -- which is why 3 and 4 are
 parameterized matrices rather than a single golden value.
+
+**Where these functions live.** W6-4b moved the derivation DOWN to
+`providers/_request_identity.py` so the replay adapter can share the exact functions instead
+of mirroring them; `model_call` re-imports the names for its own callers. These pins moved
+WITH the functions -- a move, not a loosening -- and the re-export identity test below is
+what makes a quiet re-derivation in either home fail loudly.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import textwrap
+from pathlib import Path
 
 import pytest
 
+import monoid_agent_kernel.model_call as model_call
 from monoid_agent_kernel.core.spec import (
     GenerationConfig,
     ModelConfig,
     ModelRetryConfig,
     ReasoningConfig,
 )
-from monoid_agent_kernel.model_call import (
+from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.providers import _request_identity
+from monoid_agent_kernel.providers._request_identity import (
     _PROMPT_DIGEST_GENERATION,
     _REQUEST_DIGEST_GENERATION,
-    ModelCallRunner,
     _digest,
     _model_identity,
     _prompt_payload,
     _request_payload,
+    replay_lookup,
+    replay_lookup_digest,
 )
-from monoid_agent_kernel.providers.base import ModelRequest
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 
 _REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
 
@@ -135,7 +147,9 @@ def test_the_projection_carries_no_transport_terms() -> None:
     (
         pytest.param(ModelConfig(model="gpt-5.5-mini"), id="model"),
         pytest.param(ModelConfig(reasoning=ReasoningConfig(effort="high")), id="reasoning.effort"),
-        pytest.param(ModelConfig(reasoning=ReasoningConfig(summary="auto")), id="reasoning.summary"),
+        pytest.param(
+            ModelConfig(reasoning=ReasoningConfig(summary="auto")), id="reasoning.summary"
+        ),
         pytest.param(
             ModelConfig(reasoning=ReasoningConfig(on_unsupported="omit")),
             id="reasoning.on_unsupported",
@@ -335,3 +349,152 @@ def test_the_replay_key_is_taken_after_normalization() -> None:
     keyed_at = source.index("_request_payload(")
 
     assert normalized_at < keyed_at, "the key must cover the request the adapter is handed"
+
+
+# --- the lookup is the runner's composition, shared rather than mirrored ----------------
+#
+# `replay_lookup` exists so a replay adapter can ask "what key would the runner stamp for the
+# request I was just handed" -- and the only proof that matters is end to end: the runner's own
+# receipt, on the object every dispatch shape forwards uncopied. Three shapes because the
+# effective config has three sources (request, adapter config, neither), and the declared-name
+# shape is the one where reading the declaration twice once split a receipt from its key.
+
+
+class _RecordingAdapter:
+    """Keeps the dispatched request object, like the shipped fake; declares only what the
+    parametrization hands it, so the absent-attribute probes stay genuinely absent."""
+
+    def __init__(self, provider_name: str | None = None, config: ModelConfig | None = None):
+        if provider_name is not None:
+            self.provider_name = provider_name
+        if config is not None:
+            self.config = config
+        self.requests: list[ModelRequest] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.requests.append(request)
+        return ModelTurn(final_text="ok")
+
+
+@pytest.mark.parametrize(
+    "adapter,request_model",
+    (
+        pytest.param(
+            _RecordingAdapter(),
+            ModelConfig(model="m-1", provider="gateway", timeout_s=30),
+            id="request-authored",
+        ),
+        pytest.param(
+            _RecordingAdapter(config=ModelConfig(model="m-2", provider="gateway")),
+            None,
+            id="adapter-config",
+        ),
+        pytest.param(_RecordingAdapter(provider_name="openai"), None, id="declared-provider"),
+    ),
+)
+def test_replay_lookup_reproduces_the_runner_stamp(
+    adapter: _RecordingAdapter, request_model: ModelConfig | None
+) -> None:
+    """Recompute == stamp, end to end, per effective-config source.
+
+    This is the pin that makes the shared composition falsifiable without instrumenting the
+    runner: the receipt's digest is the runner's answer, the lookup runs on the very request
+    object the adapter recorded, and any divergence between the two compositions -- a missed
+    normalization, a second declaration read, a re-derived projection -- lands here first.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=request_model)
+    _turn, receipt = asyncio.run(ModelCallRunner(adapter=adapter).acall(request))
+    assert receipt.digest_status == "ok"
+
+    dispatched = adapter.requests[0]
+    lookup = replay_lookup(dispatched, adapter)
+
+    assert lookup.result.status == "ok"
+    assert lookup.result.digest == receipt.request_digest
+    assert replay_lookup_digest(dispatched, adapter) == lookup.result
+
+
+def test_the_lookup_reads_the_declaration_once() -> None:
+    """One read, handed in -- the runner's own rule, inherited rather than imitated.
+
+    A `provider_name` property that answers once and then raises is the shape that split a
+    receipt (`openai`) from its key (`gateway`) before W6-0; a lookup that probed twice would
+    re-open the same seam between the key and the miss diagnosis beside it.
+    """
+
+    class _OneAnswer:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def provider_name(self) -> str:
+            self.reads += 1
+            if self.reads > 1:
+                raise RuntimeError("a declaration read twice can answer twice")
+            return "openai"
+
+    adapter = _OneAnswer()
+    lookup = replay_lookup(ModelRequest(instruction="hi", system_prompt="sys", tools=()), adapter)
+
+    assert adapter.reads == 1
+    assert lookup.result.status == "ok"
+    assert lookup.payload[_REQUEST_DIGEST_GENERATION]["provider"] == "openai"
+
+
+def test_model_call_reexports_the_same_objects() -> None:
+    """`model_call` re-imports these names; identity is what rules out a quiet mirror.
+
+    The census is the two modules' **attributes**, intersected. Three wrong versions preceded
+    it, each defeated by a different artifact.
+
+    Hand-listing named four names and left the rest free to regrow. Deriving from
+    `model_call`'s import block used the artifact the mutation edits, so dropping a name from
+    the block merely shrank the census. Deriving from the *consumers* -- what the tree reaches
+    through `model_call` -- looked immune and was not: it covers only the names something
+    happens to import today, which measured seven against the block's eleven, and the four it
+    lost included `effective_model_for`, the projection whose single implementation is the
+    reason for the move. A locally regrown copy of it passed.
+
+    An attribute intersection is not an artifact either module's author edits when they add a
+    mirror: regrowing a function *creates* the attribute the census then compares, so the only
+    way to leave the census is to stop re-exporting the name, which is the change this test
+    exists to notice.
+    """
+
+    census = sorted(
+        name
+        for name in vars(_request_identity)
+        if not name.startswith("__") and hasattr(model_call, name)
+    )
+
+    assert len(census) >= 11, f"the census shrank to {len(census)}: {census}"
+    for name in census:
+        assert getattr(model_call, name) is getattr(_request_identity, name), name
+    # The consumer view is now a subset check rather than the census itself: anything the tree
+    # imports through the old home must be in it, or the two disagree about what moved.
+    root = Path(model_call.__file__).parent.parent.parent
+    reached: set[str] = set()
+    for path in (*root.joinpath("src").rglob("*.py"), *root.joinpath("tests").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - a tree we cannot read is not a claim
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "monoid_agent_kernel.model_call":
+                reached |= {
+                    alias.name for alias in node.names if hasattr(_request_identity, alias.name)
+                }
+    assert reached <= set(census), sorted(reached - set(census))
+
+
+def test_the_runner_delegates_effective_model_resolution() -> None:
+    """The runner's `_effective_model` must stay a delegating wrapper.
+
+    A regrown body is a twin: the lookup and the receipt would resolve the effective config
+    through two implementations that can drift apart, which is exactly what the move to
+    `_request_identity` closed.
+    """
+
+    source = inspect.getsource(ModelCallRunner._effective_model)
+    assert "effective_model_for(" in source

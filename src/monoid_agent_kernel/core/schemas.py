@@ -25,10 +25,12 @@ from monoid_agent_kernel.core.model_payloads import (
     MODEL_REQUEST_KIND,
     MODEL_RESPONSE_KIND,
     PAYLOAD_CHUNK_KIND,
-    PAYLOAD_CHUNK_REF_KEY,
+    RESPONSE_MALFORMED,
+    RESPONSE_REFERENCE,
     UNRECORDED_REASONS,
     is_chunk_sha256,
     reassemble_request_preimage,
+    response_reference,
 )
 from monoid_agent_kernel.core._verified_file import read_verified_bytes
 from monoid_agent_kernel.core.model_io import (
@@ -1084,6 +1086,7 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
 def _payloads_envelope(kind: str) -> dict[str, Any]:
     return {
         "schema_version": {"enum": [MODEL_PAYLOADS_SCHEMA_VERSION]},
@@ -1165,7 +1168,6 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
 }
 
 PROPOSAL_SCHEMA: dict[str, Any] = {
-
     "type": "object",
     "required": [
         "schema_version",
@@ -1711,7 +1713,9 @@ def _validate_object(
         location = detail.json_path
         where = "" if location in ("$", "") else f" at {location}"
         issues.append(
-            ValidationIssue(issue_path, f"does not satisfy the {detail.validator} constraint{where}")
+            ValidationIssue(
+                issue_path, f"does not satisfy the {detail.validator} constraint{where}"
+            )
         )
 
 
@@ -1772,16 +1776,25 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             data = text.encode("utf-8")
             if sha256_bytes(data) != sha:
                 issues.append(
-                    ValidationIssue(
-                        f"{path.name}:{index}", "chunk text does not match its sha256"
-                    )
+                    ValidationIssue(f"{path.name}:{index}", "chunk text does not match its sha256")
                 )
                 continue
             chunks[sha] = data
 
+    # One slot, deliberately. Caching every resolved chunk beside the inline ones turned this
+    # command's footprint from O(largest chunk) into O(total offloaded corpus) -- measured at
+    # 42.1 MB against 3.2 MB over forty 1 MB chunks, and with an 8 MB ceiling per chunk and no
+    # bound on the count, a large run directory costs gigabytes on the one command an operator
+    # runs before trusting it. Records that name one chunk are adjacent, so a single slot keeps
+    # the re-read the memo was added to stop, without keeping the corpus.
+    last_resolved: tuple[str, bytes] | None = None
+
     def resolve(sha: str) -> bytes:
+        nonlocal last_resolved
         if sha in chunks:
             return chunks[sha]
+        if last_resolved is not None and last_resolved[0] == sha:
+            return last_resolved[1]
         # A reference becomes a filename here, so this is where the writer's constraint has to be
         # re-established: everything it writes is 64 hex, and an absolute or ``..``-relative string
         # joined onto ``chunk_dir`` discards the base and names any file on the machine. The hash
@@ -1793,8 +1806,13 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             raise ValueError(f"offloaded chunk {sha} is not a readable run-directory file")
         if sha256_bytes(data) != sha:
             raise ValueError(f"offloaded chunk {sha} does not match its name")
+        # Held for the next caller only, because N records may name ONE chunk and every one of
+        # them used to re-read it. A content-addressed name means the bytes cannot have changed
+        # between two reads of the same run directory.
+        last_resolved = (sha, data)
         return data
 
+    parsed_bodies: dict[str, str | None] = {}
     for index, payload in records:
         kind = payload.get("kind")
         if kind == MODEL_REQUEST_KIND:
@@ -1803,14 +1821,10 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
             if not isinstance(digest, str) or not isinstance(refs, bool):
                 continue  # shape issues are the schema pass's report
             try:
-                rebuilt = reassemble_request_preimage(
-                    payload.get("payload"), resolve, refs=refs
-                )
+                rebuilt = reassemble_request_preimage(payload.get("payload"), resolve, refs=refs)
             except Exception:
                 issues.append(
-                    ValidationIssue(
-                        f"{path.name}:{index}", "request payload cannot be reassembled"
-                    )
+                    ValidationIssue(f"{path.name}:{index}", "request payload cannot be reassembled")
                 )
                 continue
             if sha256_bytes(rebuilt) != digest:
@@ -1820,15 +1834,55 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                         "request payload does not reassemble to its request_digest",
                     )
                 )
+                continue
+            # Resolving is not believing -- on this half too. What stood here instead was a
+            # comment declining this arm, on the reasoning that reassembly is a canonical
+            # encode and a digest-valid preimage is therefore canonical JSON by construction.
+            # That enumerated three of the encoder's refusals (non-finite values, over-long
+            # ints, surrogates) and omitted nesting, which the encoder does not bound and the
+            # reader does. The writer now refuses such a preimage, but corpora written before
+            # that gate still hold these records, and this is the command an operator runs on a
+            # run directory that arrived from somewhere else. A record that reassembles and
+            # hashes correctly and *still* cannot be read testifies to nothing, and saying so
+            # here is the difference between an unreadable corpus and a silent one.
+            try:
+                loads_json_ingress(rebuilt.decode("utf-8"))
+            except Exception as error:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        # Bounded: these messages come from the parser's own fixed vocabulary
+                        # and carry positions rather than content, but the corpus is untrusted
+                        # input and a validator report is not the place to find that out.
+                        f"request payload is not readable by the replay reader: {str(error)[:200]}",
+                    )
+                )
         elif kind == MODEL_RESPONSE_KIND:
-            response = payload.get("response")
-            if (
-                isinstance(response, dict)
-                and set(response.keys()) == {PAYLOAD_CHUNK_REF_KEY}
-                and isinstance(response.get(PAYLOAD_CHUNK_REF_KEY), str)
-            ):
+            # Through the shared trichotomy, not an inline shape test: the replay reader
+            # refuses through the same function, so the two consumers cannot disagree about
+            # which objects are references. The ``malformed`` arm is new strictness this
+            # gained from the share -- a single-key marker object carrying a non-sha value
+            # used to be skipped as data here while being unmistakably writer-shaped.
+            shape, sha = response_reference(payload.get("response"))
+            if shape == RESPONSE_MALFORMED:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        "response reference is not a content-addressed name",
+                    )
+                )
+            elif shape == RESPONSE_REFERENCE:
+                if sha in parsed_bodies:
+                    # The verdict is a property of the bytes and the bytes are named by their
+                    # hash, so a second record naming this chunk needs neither the read nor the
+                    # re-hash that produced it. Skipping the resolve entirely -- rather than
+                    # resolving and then not parsing -- is what keeps the bytes transient.
+                    problem = parsed_bodies[sha]
+                    if problem is not None:
+                        issues.append(ValidationIssue(f"{path.name}:{index}", problem))
+                    continue
                 try:
-                    resolve(response[PAYLOAD_CHUNK_REF_KEY])
+                    resolved = resolve(sha)
                 except Exception:
                     issues.append(
                         ValidationIssue(
@@ -1836,6 +1890,29 @@ def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]
                             "response reference does not resolve to a recorded chunk",
                         )
                     )
+                    continue
+                # Resolving is not believing. Re-hashing proves the bytes are the ones the
+                # writer named, not that they are a body any reader will accept: the sha names
+                # whatever was planted, so an offloaded body could carry JSON the ingress rules
+                # forbid and still pass every check here. The replay reader refuses such a body;
+                # without this arm ``monoid validate`` would certify the corpus clean and the
+                # operator would meet the refusal at run time with a green integrity report.
+                #
+                # Memoized by sha, because the answer is a property of the bytes and the bytes
+                # are named by their hash. Parsing per RECORD instead of per CHUNK made this the
+                # dominant cost of the command: 4,000 records naming one 8 MB chunk took ~62
+                # minutes, where one parse takes about a second.
+                if sha not in parsed_bodies:
+                    try:
+                        loads_json_ingress(resolved.decode("utf-8"))
+                        parsed_bodies[sha] = None
+                    except Exception:
+                        parsed_bodies[sha] = (
+                            "response body is not JSON this kernel's readers accept"
+                        )
+                problem = parsed_bodies[sha]
+                if problem is not None:
+                    issues.append(ValidationIssue(f"{path.name}:{index}", problem))
 
 
 def _validate_jsonl_file(

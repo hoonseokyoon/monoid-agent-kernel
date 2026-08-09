@@ -45,21 +45,19 @@ import time
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from monoid_agent_kernel.core._verified_file import (
     VerifiedFileIdentity,
     directory_metadata_is_safe,
     file_identity,
-    open_verified_regular_fd,
     write_once_temp_stem,
 )
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
     corpus_keep_set,
     is_chunk_sha256,
+    read_corpus_records,
 )
 
 
@@ -162,59 +160,11 @@ class PayloadGcReport:
     reclaimed_bytes: int
 
 
-def _corpus_records(path: Path) -> tuple[str, list[dict[str, Any]], list[int]]:
-    """(state, parseable records, damaged line numbers).
-
-    The read goes through the verified opener because this reader's conclusions *delete*: a
-    corpus reached through a planted link is not this run's corpus, and judging from it would
-    turn the swap into a purge. A hard link is accepted (``require_single_link=False``) for the
-    reason the chunk reader accepts one -- a hardlink-deduplicated archive is still these bytes.
-    The line loop mirrors ``_validate_model_payload_digests`` exactly: blank lines skip
-    silently, a line that fails ingress parsing or is not an object is damaged, the rest count.
-    """
-
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return "absent", [], []
-    except OSError:
-        return "unreadable", [], []
-    descriptor = open_verified_regular_fd(path, os.O_RDONLY, require_single_link=False)
-    if descriptor is None:
-        return "unreadable", [], []
-    handle = None
-    try:
-        handle = os.fdopen(descriptor, "rb")
-        descriptor = None  # owned by ``handle`` from here
-        data = handle.read()
-    except (OSError, ValueError):
-        return "unreadable", [], []
-    finally:
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
-        elif descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-    records: list[dict[str, Any]] = []
-    damaged: list[int] = []
-    for index, raw_line in enumerate(data.split(b"\n"), start=1):
-        if not raw_line.strip():
-            continue
-        try:
-            payload = loads_json_ingress(raw_line.decode("utf-8"))
-        except Exception:  # noqa: BLE001 - unparseable is a classification here, not a failure
-            damaged.append(index)
-            continue
-        if not isinstance(payload, dict):
-            damaged.append(index)
-            continue
-        records.append(payload)
-    return "ok", records, damaged
+# The collector's line reader IS the shared one (W6-4b moved it whole to model_payloads so the
+# replay reader consumes the same function instead of a mirror). The alias keeps this module's
+# vocabulary -- its callers and comments say "corpus records" in collector terms -- and the
+# reader tests pin the identity, so a re-definition here would fail loudly rather than drift.
+_corpus_records = read_corpus_records
 
 
 def _directory_still_approved(chunk_dir: Path, approved: VerifiedFileIdentity) -> str:

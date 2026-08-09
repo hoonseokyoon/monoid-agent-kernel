@@ -1,0 +1,774 @@
+"""An adapter that answers from a recorded corpus, and refuses everything it cannot prove.
+
+W6-4b B3. ``core/payload_replay.py`` owns reading; this owns *standing where a provider
+stood*: the impersonation that makes recorded keys reachable, the reconstruction that hands
+the loop real ``ModelTurn``/``ToolCall`` objects verbatim (``raw={}`` -- an honest "this is a
+replay"), and the miss semantics D-c/D-d fixed: fail by default with a typed, content-free
+:class:`ReplayMiss`, or fall through to exactly one live ``inner`` adapter.
+
+**Impersonation is derived from evidence, not copied from a field (D-h).** The corpus's
+``provider`` term is a *resolved* value -- the original adapter's declaration when it had
+one, else its config's provider -- so the term alone cannot say whether the original
+*declared*. The loop's reasoning re-injection gate reads only the declaration
+(``loop.py``'s assistant-message append), which makes the difference load-bearing: declare
+for a corpus whose original did not, and every second-turn preimage grows a reasoning block
+the recorded ones never had -- a silent 100% miss from turn two. So the adapter reads the
+evidence: recorded request messages carrying the injected block mean the original declared
+(declare); recorded answers carrying reasoning where a recorded request *had a turn behind
+it* and still carried no injected trace mean it did not (do not declare -- the key's provider
+term is then authored by the replay run's config, which the preflight checks); anything else
+declares, because declaring is inert for injection and pins the key's provider term
+independent of the run config.
+
+That third branch includes the corpus that cannot testify. The block is appended *after* a
+call, so only a request with an assistant message in front of it could ever have carried one:
+a corpus whose every recorded run settled in a single turn is silent on the question, not
+evidence for the negative. Reading its silence as a refusal broke the shipped gateway default
+outright -- ``GatewayModelAdapter`` declares the relayed provider (``openai``) while
+``ModelConfig.provider`` names the transport (``gateway``), so the recorded key term is
+``openai`` and a non-declaring replay computes ``gateway``: every lookup in the run misses,
+and the preflight refuses a config and a corpus that are both correct.
+
+**Heterogeneous sources are rejected at construction.** One adapter serves one provider's
+answers; a family that mixed providers cannot exist under the kernel (children share the
+parent's adapter instance), so arriving here it is an assembly mistake, said early.
+
+``astream_turn`` is deliberately absent: the runner's structural fallback serves streamed runs
+one-shot, and ``docs/CLI.md`` names that degradation under the v1 limits rather than leaving
+it to be discovered. ``resolve_destination`` is deliberately absent too (D-f):
+``not_declared`` is the honest answer, and the ledger delta it causes against an original
+whose destination resolved is documented rather than imitated.
+
+**Under fallthrough the wrapper still speaks for the call.** The receipt is built by probing
+this adapter, so a live answer the inner produced is stamped with whatever *this* adapter
+declares -- the corpus-derived provider, or nothing at all where the derivation declined, which
+the receipt records as ``""`` -- and with ``not_declared``. The inner's own declaration and
+destination do not reach it, and neither does ``astream_turn``. That is forced rather than
+chosen: the declaration is what makes recorded keys reachable, so it cannot also report who
+served a miss. ``docs/CONTRACTS.md`` carries it as the third ledger delta, the one only
+fallthrough produces.
+
+The *capabilities* are the other way round, and the split is the point. A declaration answers
+"whose recording is this key from", which only the corpus can say; a capability answers "what
+can the thing that will actually run do", which under fallthrough is the inner. So
+``supports_multimodal``, its ``wire_image_encoding``, and ``config`` are taken from the inner
+where the corpus cannot be harmed by it, and ``provider_name`` is not. Every public attribute
+this class sets has to state which of the two it is --
+``test_every_exposed_capability_states_where_it_comes_from`` is where, and a new one with no
+entry fails rather than quietly inheriting the last reviewer's assumption.
+"""
+
+from __future__ import annotations
+
+import inspect
+import threading
+import weakref
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from monoid_agent_kernel.core.payload_replay import (
+    _short,
+    _where,
+    MISS_ABSENT,
+    MISS_NO_KEY,
+    MISS_NOT_RECORDED,
+    REPLAY_MISS_REASONS,
+    ReplayCorpus,
+    ReplayMissReason,
+    ReplayTake,
+    ReplayedResponse,
+)
+from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
+from monoid_agent_kernel.core.media import WIRE_FORWARDABLE_PART_TYPES, WIRE_MEDIA_CARRIERS
+from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
+from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.providers._request_identity import (
+    _REQUEST_DIGEST_GENERATION,
+    replay_lookup,
+)
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    ToolCall,
+    unportable_usage_key,
+)
+
+_AUTO: Any = object()
+"""Derive from corpus evidence. Distinct from ``None``, which is an explicit non-answer."""
+
+
+class ReplayMiss(ModelAdapterError):
+    """The corpus cannot truthfully answer this call, and no fallthrough was configured.
+
+    ``error_code="replay_miss"`` with ``retryable=False`` -- asking the same disk the same
+    question is not a transient condition, and the W7 kernel retry must not spin on it --
+    and ``config_recoverable=True``: the remedy is operator-shaped (fix the config the
+    preflight named, add the missing family run directory, or rerun live), which is the
+    park-not-kill classification a 4xx gets. ``provider_error_code`` carries the sub-reason
+    and is a door, not a convention: only the six approved reasons pass.
+    """
+
+    def __init__(self, message: str, *, provider_error_code: str) -> None:
+        if provider_error_code not in REPLAY_MISS_REASONS:
+            raise ValueError(
+                f"unknown replay miss reason {provider_error_code!r}; "
+                f"the vocabulary is {', '.join(REPLAY_MISS_REASONS)}"
+            )
+        super().__init__(
+            message,
+            error_code="replay_miss",
+            retryable=False,
+            config_recoverable=True,
+            provider_error_code=provider_error_code,
+        )
+
+
+def _is_injected_reasoning(message: Any) -> bool:
+    """The loop's re-injected reasoning block, as the assistant-message append writes it."""
+
+    if not isinstance(message, Mapping):
+        return False
+    block = message.get("reasoning")
+    return isinstance(block, Mapping) and "provider" in block and "items" in block
+
+
+def _is_assistant_message(message: Any) -> bool:
+    """A recorded request that already had a turn behind it.
+
+    The witness for whether the corpus can testify at all. The loop appends the reasoning
+    block *after* a call, so only a request with an assistant message in front of it could
+    ever have carried one -- a corpus of first turns is silent on the question, not evidence
+    for the negative.
+    """
+
+    return isinstance(message, Mapping) and message.get("role") == "assistant"
+
+
+def _is_media_block(part: Any) -> bool:
+    """The neutral resolved media block (``core/media.py``'s base64 source shape)."""
+
+    if not isinstance(part, Mapping):
+        return False
+    source = part.get("source")
+    return isinstance(source, Mapping) and source.get("type") == "base64"
+
+
+def _is_text_part(part: Any) -> bool:
+    """A part :func:`~core.media.resolve_wire_messages` would pass through untouched.
+
+    The question is not "is this media" but "would resolving rewrite it", and those differ:
+    the resolver passes ``text`` through, rewrites forwardable media, and **drops** everything
+    else. So a corpus is safe to resolve without changing a single recorded key only when every
+    part of every carrier list is text -- which is what lets a text-only corpus inherit a
+    multimodal inner's capability without moving its own digests.
+    """
+
+    return isinstance(part, Mapping) and part.get("type") == "text"
+
+
+def _unresolved_media_parts(messages: Any) -> int:
+    """How many by-reference media parts a request still carries.
+
+    Non-zero here on the fallthrough path means the loop did not resolve them -- it gates
+    resolution on this adapter's ``supports_multimodal`` -- so the live adapter would be handed
+    a ``source_ref`` its mapper cannot forward and would drop.
+    """
+
+    count = 0
+    for message in messages if isinstance(messages, Sequence) else ():
+        if not isinstance(message, Mapping):
+            continue
+        for carrier in WIRE_MEDIA_CARRIERS:
+            parts = message.get(carrier)
+            for part in parts if isinstance(parts, list) else ():
+                if (
+                    isinstance(part, Mapping)
+                    and part.get("type") in WIRE_FORWARDABLE_PART_TYPES
+                    and not _is_media_block(part)
+                ):
+                    count += 1
+    return count
+
+
+class ReplayModelAdapter:
+    """Serves ``next_turn`` from a :class:`ReplayCorpus`; see the module docstring.
+
+    ``sources`` is a sequence of run directories (the family union -- children record to
+    their own run dirs, so replaying a spawning run means naming the children too) or an
+    already-loaded corpus. Construction is where everything early-checkable fails: unreadable
+    sources, heterogeneous providers, an inner adapter this wrapper could not drive or could
+    not release.
+    """
+
+    wire_image_encoding: str
+
+    def __init__(
+        self,
+        sources: Sequence[Path] | ReplayCorpus,
+        *,
+        inner: Any = None,
+        provider_name: Any = _AUTO,
+        supports_multimodal: Any = _AUTO,
+        wire_image_encoding: Any = _AUTO,
+        config: ModelConfig | None = None,
+    ) -> None:
+        corpus = (
+            sources
+            if isinstance(sources, ReplayCorpus)
+            else ReplayCorpus.load([Path(source) for source in sources])
+        )
+        self._corpus = corpus
+        self._inner = inner
+        self._inner_opener = None
+        self._inner_closer = None
+        if inner is not None:
+            next_turn = getattr(inner, "next_turn", None)
+            if not callable(next_turn):
+                raise ValueError(
+                    "the fallthrough inner adapter exposes no synchronous next_turn; this "
+                    "wrapper is synchronous and cannot drive an anext_turn-only adapter"
+                )
+            # Both halves resolved before either is ever called -- the CLI's own lifecycle
+            # doctrine, enforced here because the CLI's probe only sees this wrapper.
+            opener = getattr(inner, "open", None)
+            closer = getattr(inner, "close", None)
+            if callable(opener) != callable(closer):
+                raise ValueError(
+                    f"inner adapter {type(inner).__name__} exposes open() or close() "
+                    "without its pair; nothing would release what open() allocates"
+                )
+            # Every callable this wrapper forwards, gated by one predicate over the census
+            # rather than by a hand-picked member. `next_turn` earned this check and `open`/
+            # `close` inherited nothing from it, so an `async def` lifecycle pair passed the
+            # pairing test above and then neither half ran: `open()` called the coroutine
+            # function, discarded the coroutine, and reported success to a CLI probe that has
+            # only this wrapper to ask -- the exact outcome the pairing check exists to
+            # prevent. Three hand-written checks can be half-applied; a census cannot.
+            asynchronous = [
+                name
+                for name, member in (
+                    ("next_turn", next_turn),
+                    ("open", opener),
+                    ("close", closer),
+                )
+                if callable(member) and is_async_callable(member)
+            ]
+            if asynchronous:
+                raise ValueError(
+                    f"the fallthrough inner adapter's {', '.join(asynchronous)} "
+                    f"{'is' if len(asynchronous) == 1 else 'are'} asynchronous; this wrapper "
+                    "is synchronous and would hand back a coroutine nothing awaits"
+                )
+            if callable(opener):
+                self._inner_opener = opener
+                self._inner_closer = closer
+
+        providers: list[str] = []
+        media_seen = False
+        only_text_parts = True
+        runs_with_history: set[str] = set()
+        runs_with_injected_reasoning: set[str] = set()
+        for run_id, terms in corpus.request_terms_view():
+            provider = terms.get("provider")
+            if isinstance(provider, str) and provider not in providers:
+                providers.append(provider)
+            messages = terms.get("messages")
+            for message in messages if isinstance(messages, list) else ():
+                if _is_injected_reasoning(message):
+                    runs_with_injected_reasoning.add(run_id)
+                if _is_assistant_message(message):
+                    runs_with_history.add(run_id)
+                for carrier in WIRE_MEDIA_CARRIERS:
+                    parts = message.get(carrier) if isinstance(message, Mapping) else None
+                    if not isinstance(parts, list):
+                        continue
+                    if any(_is_media_block(p) for p in parts):
+                        media_seen = True
+                    if not all(_is_text_part(p) for p in parts):
+                        only_text_parts = False
+        if len(providers) > 1:
+            raise ValueError(
+                "replay sources recorded more than one provider "
+                f"({_short(', '.join(sorted(providers)))}); replay one provider per adapter"
+            )
+
+        if provider_name is _AUTO:
+            recorded = providers[0] if providers else None
+            # Both halves of the evidence, correlated on the run, and then compared. Round 1 of
+            # this review made the *negative* half run-scoped and left the positive one a global
+            # flag one line above it -- the untouched twin of the repair itself, which is the
+            # shape this file keeps producing.
+            #
+            # Within one run the two co-occur by construction: an original that declared injects
+            # blocks into its continuations AND records answers carrying reasoning, which is why
+            # the positive evidence is checked first and wins. Across runs it is not co-occurrence
+            # but contradiction -- one source's original declared and another's did not -- and
+            # letting the positive branch answer for both declares for the source that proves the
+            # opposite. The loop then injects blocks into that source's later requests, changing
+            # their digests, so recordings that are entirely valid miss; the preflight sees one
+            # provider and one model across the union and says nothing.
+            undeclared_runs = (
+                runs_with_history
+                & {
+                    run_id
+                    for run_id, body in corpus.response_bodies_view()
+                    if body.get("reasoning")
+                }
+            ) - runs_with_injected_reasoning
+            if runs_with_injected_reasoning and undeclared_runs:
+                raise ValueError(
+                    "replay sources disagree about whether the recorded adapter declared its "
+                    "provider: "
+                    f"{_short(', '.join(sorted(runs_with_injected_reasoning)))} recorded injected "
+                    "reasoning blocks and "
+                    f"{_short(', '.join(sorted(undeclared_runs)))} recorded a continuation whose "
+                    "answers carried reasoning that was never injected. One declaration has to be "
+                    "wrong for one of them, so replay them separately, or name the provider "
+                    "explicitly to say which is intended"
+                )
+            if runs_with_injected_reasoning:
+                declared = recorded
+            elif undeclared_runs:
+                # Answers carried reasoning, and a recorded request had a turn behind it in
+                # which the block would have appeared: the original did not declare, so
+                # neither may this adapter -- declaring would make the loop inject blocks the
+                # recorded preimages never had.
+                #
+                # Both halves must come from ONE run. "The block would have appeared" is a claim
+                # about a continuation of the conversation the reasoning came from; of a
+                # continuation in some other run it is simply false. Two global `any`s let a
+                # union combine a single-turn source that recorded reasoning with a multi-turn
+                # source that recorded none -- neither evidence alone, both declaring alone --
+                # and decline, which drops the declaration and, under the shipped gateway
+                # default, makes every recomputed key name the transport instead of the relayed
+                # provider: the preflight then refuses a corpus and a config that are both right.
+                #
+                # The run is a NARROWING, not a proof. One run can still hold a single-turn call
+                # that recorded reasoning alongside a continuation of a different conversation
+                # whose own upstream answer carried none. Proving it needs the continuation
+                # matched to the answer it continues from -- message-prefix against the recorded
+                # requests -- which the corpus does not model today. Both error directions fail
+                # closed (a wrong decline refuses at preflight; a wrong declaration injects
+                # blocks the preimages never had and misses), so this buys the reachable half.
+                declared = None
+            elif corpus.unreadable_requests():
+                # A request record the reader could not parse is present, hashes correctly, and
+                # says nothing -- so this corpus is not silent, it is NARROWED, and the two must
+                # not take the same horn. The evidence for not declaring lives in the requests,
+                # so the ones that went missing are exactly the ones that could have carried it:
+                # taking the "cannot testify" horn here concludes more confidently from strictly
+                # less. Measured -- with both requests readable the derivation declines; with the
+                # one carrying assistant history unreadable it declared, and the loop would
+                # inject blocks the recorded preimages never had.
+                declared = None
+            else:
+                # Including the corpus that cannot testify: every recorded request is a first
+                # turn, so no injected block could exist either way. Silence is not evidence
+                # for the negative, and reading it as one breaks the shipped gateway default,
+                # whose key term is the RELAYED provider ("openai") while the config names the
+                # transport ("gateway") -- declining there misses every lookup in the run.
+                # Reachable only when every request record was readable; see the branch above.
+                declared = recorded
+        else:
+            declared = provider_name
+        if declared:
+            self.provider_name = declared
+
+        if supports_multimodal is not _AUTO:
+            self.supports_multimodal = bool(supports_multimodal)
+        elif media_seen:
+            # The recorded preimages hold *resolved* media, so the original resolved and this
+            # adapter must too, or every key from that turn on is computed over references the
+            # recording does not have.
+            self.supports_multimodal = True
+        elif only_text_parts and self._inner is not None and not corpus.unreadable_requests():
+            # Derived from the corpus alone, this said "text only", and under
+            # `--replay-fallthrough` that answer was applied to the *live* adapter behind it:
+            # `AgentLoop` gates `resolve_wire_messages` on this flag, so a new image request
+            # missed the text-only corpus and reached a paid provider call with its media still
+            # by reference -- which the OpenAI mapper forwards only when it is already base64,
+            # so the call happened, was charged, and silently had no image in it.
+            #
+            # Inheriting is safe only where resolution cannot move a recorded digest, and
+            # `resolve_wire_messages` rewrites more than media: it passes `text` through,
+            # resolves forwardable parts, and *drops* everything else. So the condition is that
+            # every part of every carrier list is text, not merely that no media was seen.
+            #
+            # `unreadable_requests()` joins it for the reason the reasoning derivation two
+            # branches up gives: a request the reader could not parse is exactly the one that
+            # could have carried the media this scan did not see, and a narrowed view must not
+            # be read as a silent one. `--replay-fallthrough` without an inner keeps the strict
+            # answer, since there is no live call to preserve a capability for.
+            self.supports_multimodal = bool(
+                getattr(self._inner, "supports_multimodal", False)
+            )
+        else:
+            self.supports_multimodal = False
+        self._served_slots: dict[str, list[tuple[int, weakref.ref[ModelTurn]]]] = {}
+        self._served_lock = threading.Lock()
+        # Travels with the capability above rather than beside it, because the resolution it
+        # governs is now done *for the inner*: `AgentLoop` reads the encoding off whichever
+        # adapter it asked about `supports_multimodal`, so lending the capability without the
+        # encoding hands the inner bytes in a shape this wrapper chose for it. Inert today --
+        # `resolve_wire_messages` accepts only "base64", so the two cannot yet differ -- and
+        # bound now because the coupling was created by lending the capability, and a latent
+        # mismatch left for the next encoding to discover is how this file has repeatedly paid
+        # for the same shape. An explicit argument still wins, the way an explicit `config` does.
+        if wire_image_encoding is not _AUTO:
+            self.wire_image_encoding = str(wire_image_encoding)
+        else:
+            probe = (
+                getattr(self._inner, "wire_image_encoding", None)
+                if self._inner is not None
+                else None
+            )
+            self.wire_image_encoding = probe if isinstance(probe, str) else "base64"
+        if config is not None:
+            # Inert under the loop (it always authors request.model); a standalone
+            # ModelCallRunner caller may want the effective-config probe to answer.
+            self.config = config
+        elif self._inner is not None:
+            # Otherwise the probe -- `getattr(adapter, "config", None)`, and it can only see this
+            # wrapper -- finds nothing and answers with the *default* model for a request whose
+            # `model` is None. That is wrong twice over: the recording was keyed under the
+            # configuration the original adapter carried, so a valid recording misses; and the
+            # fallthrough then serves the call with the inner's own non-default config while the
+            # receipt stamps the default, recording a real answer under a model identity that
+            # never produced it.
+            #
+            # Type-checked and tolerant of a raising probe for the reasons `_effective_model`
+            # gives: an adapter that cannot answer must not thereby lose its call, and a
+            # non-`ModelConfig` must not become one by being assigned here.
+            try:
+                inherited = getattr(self._inner, "config", None)
+            except Exception:  # noqa: BLE001 - a probe is bookkeeping, never the verdict
+                inherited = None
+            if isinstance(inherited, ModelConfig):
+                self.config = inherited
+
+    # --- the call ----------------------------------------------------------------------------
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        lookup = replay_lookup(request, self)
+        if lookup.result.status != "ok":
+            return self._serve_miss(
+                request,
+                ReplayMissReason(
+                    MISS_NO_KEY,
+                    "no replay key could be issued for this request "
+                    # Labelled, because the statuses overlap the miss vocabulary by name:
+                    # an unlabelled `(absent)` two words after `(no_key)` reads as a second,
+                    # contradicting reason rather than as the key derivation's own verdict.
+                    f"(key status: {lookup.result.status}); an unkeyable call was never "
+                    "recorded either",
+                ),
+                take=None,
+            )
+        digest = lookup.result.digest
+        # Everything from here settles by leaving the block. The two ways a take goes unusable
+        # settle in opposite directions -- a standing refusal is spent forward, a rejected
+        # record is given back -- and choosing between them at the call site is what every
+        # route into the substitution failure got wrong. The take owns that choice now; this
+        # function only ever says whether the call happened.
+        with self._corpus.take(digest, generation=_REQUEST_DIGEST_GENERATION) as take:
+            if take.hit is not None:
+                outcome = self._reconstruct(take.hit)
+                if isinstance(outcome, ModelTurn):
+                    take.served()
+                    self._note_served(digest, take.hit.slot, outcome)
+                    return outcome
+                miss = outcome
+            else:
+                miss = take.miss
+                if miss.reason == MISS_ABSENT:
+                    # Re-authored for the operator, not re-settled: the take still remembers
+                    # the slot the original refusal stood on, so a diagnosis cannot drop it.
+                    miss = self._corpus.diagnose(
+                        lookup.payload,
+                        generation=_REQUEST_DIGEST_GENERATION,
+                        digest=digest,
+                    )
+            return self._serve_miss(request, miss, take=take)
+
+    def _reconstruct(self, hit: ReplayedResponse) -> ModelTurn | ReplayMissReason:
+        """The recorded body as a real ``ModelTurn``, or the refusal it earns.
+
+        Strict on arrival for the same reason the reader re-hashes chunks: the loop consumes
+        ``ToolCall`` attributes and ``turn.reasoning`` items structurally, and a corpus is
+        run-directory data -- replaying a fabrication is the one thing this adapter exists
+        to never do. Every raise below names structure, never values; the text lands on
+        public surfaces.
+        """
+
+        body = hit.body
+        try:
+            missing = [name for name in RECORDED_TURN_FIELDS if name not in body]
+            if missing:
+                # Without this the answer below reconstructs into an *empty* turn, which the
+                # loop rejects as "neither final text nor tool calls" -- a `model_error` that
+                # kills the run and blames a model that was never called. A recorded turn
+                # carries every field the writer declares; anything else is not one.
+                raise ValueError(
+                    "the recorded answer is missing the fields a recorded turn carries "
+                    f"({', '.join(missing)})"
+                )
+            # One table rather than three hand-written guards, because the first repair here
+            # bounded `provider_retried` alone and left `or ()` / `or {}` standing three lines
+            # up: a damaged `false`, `0` or `""` became an empty container, and for `tool_calls`
+            # that reconstructs into a perfectly successful final-text turn -- the corpus's
+            # damage answered rather than refused. The writer projects these through `list(...)`
+            # and `dict(...)`, so no recorded body legitimately carries anything else.
+            for name, kind, noun in (
+                ("tool_calls", list, "a list"),
+                ("reasoning", list, "a list"),
+                ("usage", Mapping, "an object"),
+            ):
+                if not isinstance(body.get(name), kind):
+                    raise ValueError(f"the recorded {name} is not {noun}")
+            calls: list[ToolCall] = []
+            for call in body["tool_calls"]:
+                if (
+                    not isinstance(call, Mapping)
+                    or not isinstance(call.get("id"), str)
+                    or not isinstance(call.get("name"), str)
+                    or not isinstance(call.get("arguments"), dict)
+                ):
+                    raise ValueError("a recorded tool call is missing its id/name/arguments triple")
+                calls.append(
+                    ToolCall(id=call["id"], name=call["name"], arguments=dict(call["arguments"]))
+                )
+            reasoning: list[dict[str, Any]] = []
+            for item in body["reasoning"]:
+                if not isinstance(item, Mapping):
+                    raise ValueError("a recorded reasoning item is not an object")
+                reasoning.append(dict(item))
+            usage = body["usage"]
+            unportable = unportable_usage_key(usage)
+            if unportable is not None:
+                # The loop refuses these too, three layers down, as `model_bad_response` --
+                # a kill, reported against the adapter. Refusing here keeps a corrupt corpus
+                # inside the miss vocabulary, where the operator can act on it.
+                raise ValueError(
+                    f"the recorded usage {_short(str(unportable))} is not a non-negative integer"
+                )
+            for name in ("response_id", "final_text", "stop_reason"):
+                if body.get(name) is not None and not isinstance(body.get(name), str):
+                    raise ValueError(f"the recorded {name} is neither null nor a string")
+            retried = body.get("provider_retried", False)
+            if not isinstance(retried, bool):
+                # ``bool()`` accepts every JSON scalar, and the string "false" is truthy: coercing
+                # replays a recorded "not retried" as RETRIED. Bodies are deliberately open-shaped
+                # in the payload schema, so a damaged corpus reaches here, and inventing an audit
+                # value from one is the single thing every neighbour above refuses to do.
+                raise ValueError("the recorded provider_retried is not a boolean")
+            return ModelTurn(
+                response_id=body.get("response_id"),
+                final_text=body.get("final_text"),
+                tool_calls=tuple(calls),
+                usage=dict(usage),
+                raw={},
+                reasoning=tuple(reasoning),
+                stop_reason=body.get("stop_reason"),
+                provider_retried=retried,
+            )
+        except Exception as error:  # noqa: BLE001 - one unreplayable record, one refusal
+            return ReplayMissReason(
+                MISS_NOT_RECORDED,
+                f"the recorded answer could not be reconstructed ({_short(str(error))}); "
+                + _where(hit),
+            )
+
+    def _note_served(self, digest: str, slot: int, turn: ModelTurn) -> None:
+        """Remember which slot produced ``turn``, weakly and per in-flight call.
+
+        Per call, not per key: nothing serialises ``next_turn`` against a shared adapter, and a
+        family of sibling subagents shares one. A single note per key let whichever of two
+        concurrent calls served last overwrite the other's turn-to-slot association, so discarding
+        both gave back at most one slot and the lost one stayed consumed but undelivered -- the
+        next caller then received the answer recorded for a different call.
+
+        Weakly, because the note must not be the reason a recorded body stays in memory. Holding
+        the turn made every accepted hit a permanent retention: one ``ModelTurn`` per key, with its
+        copied tool-call/reasoning/usage containers, for the adapter's whole life, and recorded
+        bodies reach the 8 MB payload ceiling. The turn is alive at the only moment this is read --
+        the runner holds it across the boundary check that discards it -- so a weak reference does
+        the job and stops doing it afterwards, with no accept-side hook to invent.
+
+        Dead references are pruned here rather than on a timer: the next call on a key is the only
+        moment that key's list can grow, so it is the moment to shrink it.
+        """
+
+        with self._served_lock:
+            held = [pair for pair in self._served_slots.get(digest, ()) if pair[1]() is not None]
+            held.append((slot, weakref.ref(turn)))
+            self._served_slots[digest] = held
+
+    def discard_turn(self, request: ModelRequest, turn: ModelTurn) -> None:
+        """Take back an answer the run threw away without ever seeing it.
+
+        ``consume`` advances the cursor when the answer is handed over, so by the time a run
+        boundary wins the race the recording is already spent. Without this the next call on this
+        corpus -- a sibling subagent, or a later call in a run that reused the adapter -- is
+        served the FOLLOWING recording: a structurally valid turn belonging to a different call,
+        exit 0, ledger success, ``monoid validate`` clean. That is the whole failure class.
+
+        Keyed by recomputing the request's own digest rather than by object identity, so a
+        recycled ``id()`` can never release a slot belonging to a different key. The digest alone
+        is not enough, though, and the first version of this shipped believing it was: the entry
+        is cleared by nothing on success, so it outlives its call, and a LATER call on the same
+        key -- exhausted by then, so served live through the fallthrough -- would pop the earlier
+        call's slot when discarded. ``release`` cannot catch that, because an exhausted call never
+        moved the cursor, so ``cursor == slot + 1`` still holds for the delivered slot and the
+        rewind succeeds. A recording already handed to one call gets handed to another: this
+        module's whole failure class, arriving through the repair meant to close it.
+
+        So the served turn travels with the slot and is compared by identity here. The dict holds
+        the object, which is what makes identity sound -- an ``id()`` cannot be recycled while the
+        entry that would match it is still reachable.
+
+        A live fallthrough answer is deliberately NOT taken back -- that call reached a provider
+        and was paid for, and the corpus has no unspend primitive for a refusal spent forward --
+        and the identity check is now what enforces that, rather than the docstring. See
+        ``docs/CONTRACTS.md``.
+        """
+
+        lookup = replay_lookup(request, self)
+        if lookup.result.status != "ok":
+            return
+        digest = lookup.result.digest
+        slot: int | None = None
+        with self._served_lock:
+            remaining: list[tuple[int, weakref.ref[ModelTurn]]] = []
+            for pair in self._served_slots.get(digest, ()):
+                alive = pair[1]()
+                if alive is None:
+                    continue
+                if slot is None and alive is turn:
+                    slot = pair[0]
+                    continue
+                remaining.append(pair)
+            if remaining:
+                self._served_slots[digest] = remaining
+            else:
+                self._served_slots.pop(digest, None)
+        if slot is None:
+            return
+        # Outside the lock: the corpus takes its own, and this is the only place holding both.
+        # The corpus also owns the retry -- a slot it cannot reach yet waits there rather than
+        # here, so ``ReplayTake``'s own reconstruction-failure release gets the same treatment
+        # instead of releasing straight past a rule that lived in this class.
+        self._corpus.release(digest, slot)
+
+    def _serve_miss(
+        self,
+        request: ModelRequest,
+        miss: ReplayMissReason,
+        *,
+        take: ReplayTake | None,
+    ) -> ModelTurn:
+        """Fall through to the inner adapter, or refuse.
+
+        Three exits, and only one of them is a call that happened. Serving it live moves the
+        conversation past this slot, so the take is told the call happened and the next call
+        meets the next recording. Raising -- because there is no inner, or because the inner
+        raised, or because it handed back an awaitable this wrapper cannot drive -- parks
+        the turn for an idempotent re-attempt, and leaving the block without the declaration is
+        what gives the slot back. An inner returning some *other* non-turn is not refused here:
+        it goes to the runner, which classifies it terminally, and the slot is spent because the
+        call did happen. Two review axes read the earlier wording as a promise to check the
+        shape. There is nothing to remember here and nothing to choose between: this
+        function knows only whether the call happened, which is the only thing it can know.
+
+        ``take`` is None for the one call that took nothing: an unkeyable request never
+        reached the corpus, so no slot is owed either way.
+        """
+
+        if self._inner is not None:
+            unresolved = _unresolved_media_parts(getattr(request, "messages", ()))
+            if unresolved and not self.supports_multimodal:
+                # Refused *before* the call, because the call is the harm. The loop gates
+                # `resolve_wire_messages` on this adapter's flag, so these parts are still
+                # `source_ref`s, and a provider mapper forwards media only once it is base64 --
+                # the paid call would happen, be charged and recorded, and simply not contain
+                # the image. A miss that is loud is this adapter's whole contract; a live answer
+                # to a question the model was never shown is the failure it exists to prevent.
+                #
+                # Reachable only where the capability could not be inherited: a corpus holding
+                # by-reference media (resolving would move its own recorded keys), one with
+                # unreadable requests, or a text-only inner. Named in the message, because the
+                # three have different remedies.
+                raise ModelAdapterError(
+                    f"a fallthrough call carries {unresolved} unresolved media part(s) while "
+                    "this replay adapter reports text-only, so the live call would be made "
+                    "without them; the corpus could not lend the inner adapter its multimodal "
+                    "capability (it records media by reference, or holds unreadable requests, "
+                    "or the inner adapter is text-only). Pass supports_multimodal=True to "
+                    "state the capability explicitly, or replay without --replay-fallthrough",
+                    retryable=False,
+                    config_recoverable=True,
+                )
+            turn = self._inner.next_turn(request)
+            if inspect.isawaitable(turn):
+                # `_adrive` awaits whatever a synchronous adapter hands back, so this return
+                # means the provider has not been called yet -- the awaited call still has
+                # every chance to fail, and declaring it served would pay for a call that has
+                # not happened. No declaration-side gate can see this shape:
+                # `iscoroutinefunction` is False for a plain `def` that returns a coroutine,
+                # so the result is the only place left to ask.
+                # Not on a loop thread: this is the abandonable daemon worker. On the live-
+                # loop default the disposal itself raises under asyncio debug mode and
+                # REPLACES the typed error below, losing the config_recoverable
+                # classification the guard exists to carry. Disposal is hygiene; it must
+                # never become the verdict.
+                dispose_unawaited(turn, on_live_loop=False)
+                raise ModelAdapterError(
+                    "the fallthrough inner adapter returned an awaitable from a "
+                    "synchronous next_turn; this wrapper cannot drive it",
+                    retryable=False,
+                    # The remedy is operator-shaped -- build the wrapper around an inner it
+                    # can drive -- so the session survives to be resumed against a fixed
+                    # configuration, rather than dying as an unclassified kill that takes the
+                    # checkpoints with it.
+                    config_recoverable=True,
+                )
+            if take is not None:
+                take.served()
+            return turn
+        raise ReplayMiss(
+            f"replay miss ({miss.reason}): {miss.detail}", provider_error_code=miss.reason
+        )
+
+    # --- lifecycle ----------------------------------------------------------------------------
+
+    def _forward_lifecycle(self, name: str, member: Any) -> None:
+        """Drive one forwarded lifecycle half, refusing a result nothing will await.
+
+        The constructor's census already rejects an async pair, so this is the second binding
+        of one rule rather than its only one: an inner that resolves ``open`` to a coroutine
+        function at call time -- a ``__getattr__``, a hot-swapped attribute -- is invisible to
+        a check that ran at construction, and it fails the same way. The coroutine is
+        discarded, the inner is never entered, and the CLI's synchronous probe has only this
+        wrapper to ask, so it reports success on a lifecycle that did not happen.
+        """
+
+        result = member()
+        if inspect.isawaitable(result):
+            # The CLI thread, not a loop thread -- same reason as the call site above.
+            dispose_unawaited(result, on_live_loop=False)
+            raise ValueError(
+                f"the fallthrough inner adapter's {name}() returned an awaitable; this "
+                "wrapper is synchronous and nothing would await it, so the inner would never "
+                f"be {'opened' if name == 'open' else 'closed'}"
+            )
+
+    def open(self) -> None:
+        """Forwarded when the inner has a lifecycle; a no-op otherwise, so the CLI's
+        open/close probe drives the wrapper it sees and reaches what that wrapper wraps."""
+
+        if self._inner_opener is not None:
+            self._forward_lifecycle("open", self._inner_opener)
+
+    def close(self) -> None:
+        if self._inner_closer is not None:
+            self._forward_lifecycle("close", self._inner_closer)

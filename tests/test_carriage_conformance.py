@@ -307,7 +307,7 @@ KNOWN_GAPS: tuple[CarriageGap, ...] = (
         "to_json omits a default generation block by design: this dict feeds the runtime-config "
         "semantic hash, so a never-configured block must serialize byte-identically to a config "
         "predating the field. The replay key holds the same omission but no longer through this "
-        "serializer -- W6-0 gave it a hand-listed projection (model_call._model_identity)",
+        "serializer -- W6-0 gave it a hand-listed projection (providers._request_identity._model_identity)",
         "by-design",
     ),
     CarriageGap(
@@ -414,7 +414,7 @@ FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
         "timeout bounds the call to the gateway, the server's bounds the call to the provider. "
         "The test that separates 'must ride' from 'per-hop' is whether a default silently "
         "*overrides a caller's stated intent*, which is exactly why on_unsupported was added. "
-        "W6-0 made the replay key agree with the wire on this: model_call._model_identity omits "
+        "W6-0 made the replay key agree with the wire on this: providers._request_identity._model_identity omits "
         "timeout_s/retry/gateway_url, so an ops change to per-hop policy no longer rekeys a corpus",
         "by-design",
     ),
@@ -6589,6 +6589,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "loop_phases.py",
             "providers/gateway.py",
             "providers/openai.py",
+            # Joined in W6-4b: a replay miss is the client-side park shape by construction --
+            # ReplayMiss pins config_recoverable=True so a session survives a miss and only a
+            # closing one-shot facade promotes it, the same classification a provider 4xx gets.
+            "providers/replay.py",
             # Joined in the carriage sweep: status.json (the live sink) carries the same set
             # its offline twin projects.
             "recorder.py",
@@ -6638,6 +6642,11 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "providers/gateway.py",
             # Joined in the burn-down: the classifier reports the retries its own SDK made.
             "providers/openai.py",
+            # Joined in W6-4b: the replay adapter reconstructs the flag the corpus recorded
+            # (see core/model_payloads.py above) back onto the replayed ModelTurn -- dropping
+            # it here would replay a retried call as a clean one, the exact lie W6-2 recorded
+            # the field to prevent.
+            "providers/replay.py",
             "recorder.py",
             # Joined in the carriage sweep: the backend record carries all five park facts
             # (type, protocol, event capture, the driver's promotion, and the projections
@@ -7238,3 +7247,75 @@ def test_each_sse_frame_writer_escapes_the_unicode_line_separators(module: str, 
             "hint": "U+2028/U+2029/U+0085 survive ensure_ascii=False and split the frame for "
             "every str.splitlines reader (httpx aiter_lines); pass ensure_ascii=True",
         }
+
+
+# --------------------------------------------------------------------------------------
+# Abandonable calls: every exit that drops a produced answer hands it back
+# --------------------------------------------------------------------------------------
+
+_ABANDONABLE_ENTRIES = ("await_abandonable_call", "abandon_unwaited_call")
+"""The two ways a caller hands a live call to ``core/_sync_bridge.py``.
+
+Not ``detach_unfinished_call``: it is the bridge's own plumbing, reached only through these two,
+and the bridge is the module whose internal drop paths a previous round already counted.
+"""
+
+
+def _abandonable_call_sites() -> dict[str, list[tuple[ast.Call, bool]]]:
+    """Every call to an abandonable-call entry point in the package, grouped by the function
+    that makes it, with whether it passes ``on_discarded``."""
+
+    sites: dict[str, list[tuple[ast.Call, bool]]] = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        for owner in ast.walk(_module_tree(relative)):
+            if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            found = [
+                (node, any(keyword.arg == "on_discarded" for keyword in node.keywords))
+                for node in ast.walk(owner)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _ABANDONABLE_ENTRIES
+            ]
+            if found:
+                sites[f"{relative}:{owner.name}"] = found
+    return sites
+
+
+def test_every_abandonable_call_site_routes_its_discards() -> None:
+    """A caller that knows where a discarded answer belongs says so on *every* exit it has.
+
+    The rule this pins was already written down: a callee holding shared state cannot tell which
+    of its caller's exits was taken, so an answer dropped on any of them leaves that state saying
+    work was delivered that never was. The replay adapter advances a per-key cursor when it hands
+    an answer over, so one unrouted exit means the next caller is served a different call's
+    recording -- structurally valid, and wrong.
+
+    A previous round counted the drop paths and found four, wired all four, and said so in a
+    commit message. The count was taken by reading ``core/_sync_bridge.py``; the fifth was a
+    *caller's* other exit, in ``model_call.py``, where an accessor raising before the wait is
+    entered abandons a call that is already live. Reading a module cannot find a site outside it,
+    which is why this census is over call sites and not over a file -- the same correction, one
+    level up, as the reader/schema census that stopped being a hand-kept field table.
+
+    Stated as consistency rather than as a list, so it needs no exemption for the callers that
+    correctly pass nothing: the native tool handler's callee holds no cursor, and a function that
+    routes discards nowhere is not the failure. A function that routes them on one exit and not
+    its twin is.
+    """
+
+    inconsistent = {
+        owner: {
+            "routed": [call.lineno for call, routed in found if routed],
+            "unrouted": [call.lineno for call, routed in found if not routed],
+        }
+        for owner, found in _abandonable_call_sites().items()
+        if len({routed for _call, routed in found}) > 1
+    }
+    assert not inconsistent, {
+        "sites": inconsistent,
+        "hint": "this function abandons a live call on one exit without the discard hook it "
+        "passes on another; the callee cannot tell the exits apart, so a replay slot stays "
+        "spent and the next caller receives the following recording",
+    }

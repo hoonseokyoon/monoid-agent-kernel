@@ -7,6 +7,297 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
+
+- **`discard_turn` now takes back the answer it served, not the last one it remembers.** The
+  per-key served-slot note was written on every hit and cleared by nothing, so it outlived its
+  call: a later call on the same key — exhausted by then, so served live through the fallthrough —
+  released the *earlier* call's slot when discarded. Nothing caught it, because an exhausted call
+  never moves the cursor, so the `cursor == slot + 1` guard still held for the delivered slot. A
+  recording already handed to one call was handed to another, at exit 0 with a clean
+  `monoid validate`. Each in-flight answer is now noted separately and matched by identity, which
+  is what makes the documented "a live fallthrough answer is not taken back" true in code. The note
+  is per call rather than per key — nothing serialises `next_turn` against the adapter a sibling
+  family shares, and one note per key let whichever of two concurrent calls served last overwrite
+  the other's turn-to-slot association — and it holds the turn weakly, so the bookkeeping is never
+  why a recorded body (up to the 8 MB payload ceiling) stays in memory. A discard the cursor
+  cannot honour yet stays pending rather than being dropped, and every release retries the highest
+  pending slot, so two concurrent calls give both slots back whichever order their discards
+  arrive in. `ReplayCorpus.release` holds that pending set and reports whether it rewound, because
+  "not now" and "not ever" are different and only the cursor can tell them apart — in the corpus
+  rather than above it, since `ReplayTake`'s own reconstruction-failure release is a second caller
+  and a rule living in the adapter released straight past it. Compaction walks *consecutive* slots
+  only, so a slot whose successor was delivered and kept is still not given back.
+- **A payload record whose envelope is corrupt is damage, not something to coerce.** The reader
+  type-checked the fields it *keys* on and substituted the ones it *reports* with: a missing or
+  wrongly typed `run_id`, `root_run_id` or `recorded_at` became `""` or `str(...)` and the record
+  was indexed anyway. `schemas.py` requires all three, so those are records `monoid validate` calls
+  corrupt while `rejected_records` stayed zero — the preflight then told the operator a damaged
+  corpus was sound, and the adapter served the record as a successful turn with its provenance lost
+  or invented. The check sits above the kind dispatch, so chunks, requests and answers all get it.
+  The coercion had also stopped being merely advisory: `run_id` correlates the impersonation
+  evidence now, so two damaged records in two unrelated runs both collapsed to `""` and intersected.
+  `unrecorded_reason` is checked the same way, by membership in the schema's own enum: coerced, a
+  missing marker or a `false` became `""` — the value meaning "recorded normally" — so a damaged
+  record with a well-formed body beside it replayed as a successful turn.
+- **The reader and `monoid validate` now agree on what a damaged payload record is, because the
+  reader *is* the schema.** Four successive review rounds found the same shape — the reader
+  validating what it *keys* on and indexing what the schema calls corrupt, so `rejected_records`
+  stayed zero and the replay preflight reported a damaged corpus as sound. `_index` no longer
+  restates the schema field by field; it runs `MODEL_PAYLOADS_RECORD_SCHEMA`'s own branch, selected
+  by `kind`, which is equivalent to the top-level `oneOf` because each branch pins `kind` with
+  `const`. That closes the class rather than the reported field: unknown and cross-kind properties
+  are refused (every branch is `additionalProperties: false`), along with the unknown `kind`,
+  absent `payload`, negative `call_index` and non-object `response` earlier rounds each found one
+  at a time. The two checks the schema cannot make are all that stay hand-written — a chunk's
+  bytes re-hashed against its name, and the empty response digest, which is legal and unjoinable
+  rather than damaged.
+
+  The measurement that had ruled this out was of the wrong placement — and the replacement
+  measurement was of the wrong record, which took two more passes to catch. On a record the schema
+  **accepts**, the whole `oneOf` costs ~257µs because it tries all three branches; the branch alone
+  costs ~66µs, or 0.66s for a 10,000-record corpus at construction. That is ~16% of what
+  `ReplayCorpus.load` already spends on the same corpus (~410µs per record to read, verify and
+  parse it), and load is per replay invocation over the sources named, not a global index: a single
+  50-call run is ~100 records, and a 200-run union is ~20,000. The first figures quoted here (232µs
+  and 14.8µs) were timed against a fixture with a misspelled `schema_version`, so `is_valid`
+  short-circuited on the first keyword and measured a rejection rather than the acceptance every
+  healthy record pays.
+  `test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is` is now the equivalence proof
+  for the dispatch and runs in both directions — reader-looser is the defect, reader-stricter has
+  to be enumerated and now *fails* when it is not.
+- **`--replay-fallthrough` no longer applies the corpus's multimodal answer to the live adapter.**
+  `supports_multimodal` is derived from what the recorded preimages hold, which is right for the
+  recorded calls and wrong for the live ones: `AgentLoop` gates `resolve_wire_messages` on this one
+  flag, so a text-only corpus made the loop skip resolution for a *new* image request, which then
+  missed the corpus and reached a paid provider call with its media still by reference — and
+  provider mappers forward media only once it is base64, so the call happened, was charged, and had
+  no image in it. A corpus whose recorded parts are all text now lends the inner adapter its
+  capability, which is sound exactly there because resolution passes text through unchanged and so
+  cannot move a recorded key. Where it cannot be lent — a corpus recording media *by reference*
+  (resolving would rewrite its own preimages), one with unreadable requests, or a text-only inner —
+  a fallthrough carrying unresolved media is refused as `config_recoverable` before the call rather
+  than paid for blind. Rejecting the combination outright was not available: `openai` and `gateway`
+  both declare `supports_multimodal = True` unconditionally.
+- **Every capability the replay wrapper exposes now states whether it is the corpus's answer or
+  the inner's.** Two review rounds found the same question asked of two attributes —
+  `supports_multimodal` and `config` — and neither fix bound the next one. A declaration answers
+  "whose recording is this key from", which only the corpus can say; a capability answers "what can
+  the thing that will actually run do", which under fallthrough is the inner. `wire_image_encoding`
+  travels with the capability it governs, because `AgentLoop` reads it off whichever adapter it
+  asked about `supports_multimodal` — lending one without the other hands the inner bytes in a shape
+  the wrapper chose for it. Latent today (only `base64` is accepted) and bound now, because the
+  coupling was created by the preceding fix. `provider_name` stays the corpus's, as the module
+  docstring and `docs/CONTRACTS.md`'s third ledger delta already record. A new public attribute with
+  no stated origin fails `test_every_exposed_capability_states_where_it_comes_from`, read off the
+  class by AST rather than from a list someone maintains.
+- **The request evidence scan no longer holds the whole expanded corpus.** `request_terms_view()`
+  returned a tuple *and* wrote every expansion into a cache the corpus kept for its lifetime, so
+  constructing `ReplayModelAdapter` reassembled and parsed every offloaded request and retained it —
+  the recipes that name those preimages are a handful of chunk references each, the preimages are up
+  to the 8 MB ceiling and unbounded in number, so the peak tracked the *expanded* corpus before a
+  single call was served. It yields now and retains nothing; the only thing kept is the
+  `unreadable_requests` count, computed once because the derivation asks three times and the CLI
+  preflight twice. Its twin `response_bodies_view` was made a generator one round earlier for the
+  same reason.
+- **A fallthrough wrapper with no config of its own answers with the inner adapter's.** The
+  effective-model probe reads `getattr(adapter, "config", None)` and can only see the wrapper, so a
+  request whose `model` is None resolved to the *default* model: a recording keyed under the
+  original adapter's configuration missed, and the fallthrough then served the call with the inner's
+  own non-default config while the receipt stamped the default — a real answer recorded under a
+  model identity that never produced it. A validated `ModelConfig` on the inner is adopted when no
+  explicit one is given; a raising probe or a non-`ModelConfig` leaves the wrapper silent.
+- **A union whose sources disagree about the recorded provider declaration is refused.** The rule
+  that declines to declare was made run-scoped in an earlier round; the positive half beside it
+  stayed a global flag, so one source carrying an injected reasoning block declared for the whole
+  union — including a source whose own history and reasoning-bearing answers prove its original did
+  not declare. Replay then injected blocks that source's preimages never had, recomputing every key
+  from its second turn on, while the preflight saw one provider and one model across the union and
+  said nothing. Within a run the two co-occur by construction and the positive evidence still wins;
+  across runs it is a contradiction, and the corpus is refused with both run sets named.
+- **A duplicate request record must hash to the key it claims to share.** A request recorded by two
+  runs is credited to both, which is what lets a run holding both halves of the evidence intersect
+  itself — but it credited on digest equality alone. The first record's payload has always been
+  re-hashed before its terms are believed; every duplicate behind it was believed for repeating a
+  name, which is the one claim an edited record can make for free. An altered run could therefore
+  be reported as carrying another run's assistant history. Each contributor now keeps its own
+  payload and is re-hashed against the shared digest before its run is credited.
+- **A discarded outcome is handed back on every path that drops one, not just the first.** A run
+  boundary can throw away a real result in five places: the boundary check finding the call already
+  done, the awaiter's own cleanup finding it done a moment later, an async callee settling after
+  detach, a synchronous worker settling inside the abandonment grace once its waiter is cancelled,
+  and a caller abandoning a call it never got to wait on — `ModelCallRunner` resolves its grace
+  accessor after the call is already live, so an accessor that raises takes an exit that carried no
+  hook. Only the first was wired. The grace one mattered most for replay — the worker had already
+  advanced the cursor, and its answer was dropped where only awaitables are disposed of, so a
+  `ModelTurn` simply vanished and the slot stayed spent. All five now go through one
+  `hand_back_discarded` rule, `AbandonableSyncCall` carries a `set_discard_hook` the awaiter
+  installs, and `abandon_unwaited_call` carries the hook for both of its own halves. The count is
+  no longer taken by reading: a previous round counted four by reading `core/_sync_bridge.py`, and
+  the fifth was a caller's other exit in another module, so
+  `test_every_abandonable_call_site_routes_its_discards` censuses call sites and requires a
+  function that routes discards on one exit to route them on all of them.
+- **Deriving the adapter no longer materializes the response corpus.** `response_bodies_view()`
+  built a tuple of every answer body so the impersonation derivation could ask one boolean per
+  body. Bodies reach the 8 MB payload ceiling and nothing bounds how many there are, so
+  constructing a `ReplayModelAdapter` over a large run directory resolved the whole corpus into
+  memory before serving a single call. It yields now, keeping one body alive at a time.
+- **The multimodal derivation reads both media carriers.** A user turn carries parts in `content`;
+  a tool message carries returned media in a top-level `media` list. Only the first was scanned, so
+  a corpus whose images came back from a tool derived text-only — and since the flag is a preimage
+  term, replay then left the re-executed media by reference while the recorded digest covered its
+  resolved base64 form, missing every lookup after that turn. `core.media.WIRE_MEDIA_CARRIERS` is
+  now one list with two readers rather than two hand-maintained copies.
+- **Reasoning evidence no longer crosses recorded runs.** The rule that declines to declare reads
+  "answers carried reasoning, and a request had a turn behind it in which the block would have
+  appeared" — a claim about a continuation of the conversation the reasoning came from. Both halves
+  were global scans over the whole union, so a family union could combine a single-turn source that
+  recorded reasoning with a multi-turn source that recorded none, and decline where each source
+  alone declares. Under the shipped gateway default that drops the declaration and makes every
+  recomputed key name the transport instead of the relayed provider, so the preflight refused a
+  corpus and a config that were both correct. `request_terms_view()` and `response_bodies_view()`
+  now carry each item's `run_id` and the derivation intersects them, and a request recorded by two
+  runs reports under *both* — first-wins is right for the payload and wrong for provenance, and
+  keeping only the first stopped a run holding both halves from intersecting itself. This narrows
+  the inference rather than proving it: correlating a continuation with the answer it continues
+  from needs message-prefix matching the corpus does not model. Both error directions fail closed.
+- **A malformed recorded scalar or container is refused rather than defaulted.** Bodies are
+  deliberately open-shaped, so a damaged corpus can carry a string where a bool belongs, or `false`
+  where a list does. `bool("false")` is `True`, so a recorded "not retried" replayed as retried; and
+  `or ()` turned a damaged `tool_calls` into an empty one, reconstructing a perfectly successful
+  final-text turn — the corpus's damage answered rather than refused. `provider_retried`,
+  `tool_calls`, `reasoning` and `usage` now all earn the `not_recorded` refusal, checked from one
+  declared table rather than four hand-written guards.
+- **A replay corpus can be narrowed rather than silent, and the two are no longer confused.**
+  A request record that reassembles and hashes correctly can still be past the reader's JSON
+  nesting bound, and it was then simply absent from `request_terms_view()`. The impersonation
+  derivation reads those terms, so a corpus missing exactly the records that argue against
+  declaring looked identical to one that never had them — and took the opposite horn, declaring
+  a provider and making the loop inject reasoning blocks the recorded preimages never had.
+  `ReplayCorpus.unreadable_requests()` counts them, the derivation declines while it is
+  non-zero, `monoid validate` reports each such record instead of certifying the corpus clean,
+  and the preflight says so even when enough records remain to derive an identity. The records
+  are still *written*: a deep tool result stays in the by-value message log, so refusing them
+  would cost the run its request provenance from that call onward.
+- **The replay preflight no longer blames the runtime config for the corpus's silence.** With no
+  readable request record there is nothing for a config to match or to diverge from, so "fix the
+  runtime config" named the one cause that was ruled out. It now points at `monoid validate`.
+- **A discarded model call can now be taken back: `ModelCallRunner` offers adapters an optional
+  `discard_turn(request, turn)`.** A run boundary is checked before a completed call's result is
+  read, so a call can finish and still have its answer thrown away — on every dispatch shape, not
+  just the abandonable-worker one. For `ReplayModelAdapter` that meant a discarded call
+  permanently consumed a recorded answer, and the next consumer of that corpus was served the
+  following one: a structurally valid turn belonging to a different call, at exit 0 with a clean
+  `monoid validate`. The hook releases the slot, keyed by recomputing the request's digest. A
+  fallthrough answer served live is deliberately not taken back; `docs/CONTRACTS.md` states it.
+- **A settle that raises no longer becomes the verdict.** A corpus whose `release` raised inside
+  `ReplayTake.__exit__` replaced the typed `ReplayMiss` with a bare `RuntimeError`, turning a
+  `config_recoverable` park into an unclassified kill; through `served()` it discarded a live
+  answer already paid for. Both call sites now contain it and log, the way disposal already did.
+- **`monoid validate` no longer retains every chunk it reads.** Memoizing resolved bytes beside
+  the inline chunks made its footprint O(total offloaded corpus) with an 8 MB per-chunk ceiling
+  and no bound on the count. A chunk whose verdict is already known is no longer resolved at all,
+  so read-once now holds however the records are ordered, and the bytes stay transient.
+- **Three diagnosis sentences were still unbounded**, and the census meant to prevent that could
+  not see them: it matched attribute names, and all three interpolate plain locals. The census is
+  now an allow-list — every interpolation must be bounded or reviewed by name.
+
+
+- **`ReplayModelAdapter` and `ReplayMiss` (`monoid_agent_kernel.providers`), the corpus reader
+  behind them (`core/payload_replay.py`), and `monoid run --replay-from RUN_DIR_OR_ID`
+  (repeatable) with `--replay-fallthrough`.** A recorded run replays through the engine to the
+  same answer, and the replay run's own ledger recomputes the same request keys line for line —
+  the runner's recomputation is the proof. Answers replay in recorded order, each once; misses
+  are typed (`no_key` / `absent` / `not_recorded` / `identity_mismatch` / `exhausted` /
+  `generation_mismatch`), content-free, and park-shaped (`error_code: "replay_miss"`,
+  `retryable: false`, `config_recoverable: true`), so a session survives a miss and a one-shot
+  run promotes it to `failure.json`. Pure replay builds no live adapter — no gateway URL, no
+  token, no `--allow-direct-provider-api` — and a preflight refuses a run whose config cannot
+  match anything recorded, naming expected and actual. Provider impersonation is derived from
+  corpus evidence (declared originals re-inject reasoning into the record; undeclared ones do
+  not), heterogeneous-provider unions are rejected at construction, tools re-execute for real,
+  and every ledger line of a `monoid run --replay-from` run carries `attributes.replay_from`
+  (a stamp of that command, not of the adapter). A refused record
+  keeps its slot until the caller moves past it, so a parked turn's re-attempt earns the same
+  refusal rather than the next call's answer, whether the corpus refused it or reconstruction
+  did; a source named twice is one source, on volumes that report an inode and on those that do
+  not; a key more than one named source can answer is counted and warned about, because across
+  a union "file order" is the order of the flags; a miss whose diverging term is the model
+  identity says `identity_mismatch` and names both sides in plaintext rather than blaming the
+  conversation; and a body that is not a recorded turn — wrong fields, or a count the loop would
+  refuse — is a typed miss rather than a model error blamed on a model that was never called. Known v1 limits,
+  documented: a spawning run's post-spawn parent turn cannot replay (the spawn observation
+  embeds per-run identifiers), though the children themselves replay from the family union;
+  concurrent callers of one key divide its recordings in scheduler order, because the
+  recording never fixed that order either; the consumption cursor is per-process, so a durably
+  resumed replay counts from the start again; and replay serves whole turns, so a streaming
+  run degrades to one-shot.
+- **Settlement is a property of leaving a take, not a rule each call site re-attaches.**
+  `ReplayCorpus.take(digest, generation=...)` is a context manager: its block declares
+  `served()` when the call happened, and every other exit — a raise, a rejected reconstruction,
+  a refusal with no fallthrough — settles unserved. The two directions are opposite (a standing
+  refusal is spent forward, a record handed over and rejected is given back) and which one is
+  held is not visible from the call site, so the choice moved into the object that owns the
+  cursor. Leaving the block having declared nothing raises rather than defaulting, because a
+  silent default is another way to serve one answer twice. It also closes a route nobody had
+  named: any exception escaping between the take and the settle now gives the slot back, where
+  before it was lost, so a Ctrl-C landing inside reconstruction no longer costs the re-attempt
+  its position. A synchronous wrapper now also
+  refuses an inner that hands back an *awaitable*: such a call returns having done no provider
+  work, so nothing may be settled on its behalf, and no declaration-side check can see the shape
+  (`iscoroutinefunction` is false for a plain `def` returning a coroutine). The same rule is
+  bound over `next_turn`, `open` and `close` as one census rather than three hand-written
+  checks.
+- **An offloaded response body is held to the same ingress rules as an inline one**, and
+  `monoid validate` now parses a resolved chunk rather than only re-hashing it. Re-hashing
+  proves the bytes are the ones the writer named, not that they are a body any reader will
+  accept — so a planted chunk could carry JSON the ingress rules forbid, and, since tools
+  re-execute for real, a non-finite number in recorded tool arguments could reach a live tool
+  invocation as a value that exists in no recording.
+- **The recorder no longer writes an answer the reader will refuse to read.** The record line's
+  depth gate cannot see an offloaded body, whose brackets live in a chunk file rather than in
+  the line, so a body deeper than the reader parses was stored with `unrecorded_reason: ""` —
+  the writer stating it recorded the answer — and then refused at replay as `not_recorded`. It
+  is refused at write time now, as `unencodable`, which is exactly what the inline half has
+  always done with the same body. The bound stays on the writer rather than moving off the
+  reader because without the lexical scan the decoder's own stack limit decides instead, and
+  the same corpus would replay or not depending on how deep the call stack already is.
+- **A miss message is bounded in every channel, not only in its values.** The identity bound
+  covered one quoted value and left the clause *count*, the term *names*, and the identifiers
+  (`run_id`, `unrecorded_reason`, the generation tags, a resolver's error text) unbounded — all
+  of them corpus-supplied, on a corpus this reader's own threat model does not trust, and all
+  landing on `turn.failed`, in `failure.json`, in `status.json` and on stderr where nothing
+  downstream truncates.
+- **The family union is not key-disjoint, and the warning says which remedy applies.** Nothing
+  run-scoped is in a replay key, so two subagents with the same definition and the same prompt
+  record one key in two run directories and the `--replay-from` order decides which child gets
+  which answer. Disjointness is a property of the prompts, not of the family shape. Where the
+  crossing sources are children of one run — sharing a `root_run_id` *and* differing in
+  `run_id` — the preflight asks for them in spawn order, because reversing the flags is not an
+  actionable instruction for a fan-out. The run-id test is what keeps that sentence true: a run
+  named beside an archived copy of itself shares a root as well, and `--replay-from` takes a
+  directory or an id, so naming both is an ordinary slip that would otherwise be reported as a
+  fan-out with a spawn order that does not exist.
+- **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
+  shares the exact functions the runner stamps receipts with; `model_call` re-imports every
+  name, so embedder imports and behavior are unchanged, and the identity pins moved with the
+  functions. A checked-in golden corpus now turns any composition change that forgets to bump
+  the digest generation into a failing test instead of a silently rekeyed fleet.
+
+### Changed
+
+- **`monoid validate` answers per chunk what it used to answer per record.** An offloaded body
+  is content-addressed, so whether it reads back is a property of the bytes, and the bytes
+  cannot change between two reads of one run directory — but N response records may name one
+  chunk, and each re-read and re-parsed it. Measured at eight records over one 8 MB chunk, the
+  command took 7.4 s; the read and the parse verdict are now memoized by sha, so the cost tracks
+  a corpus's distinct chunk bytes rather than its record count.
+- **`monoid validate` now reports a malformed response reference as its own integrity issue**
+  ("response reference is not a content-addressed name"). A single-key chunk-marker object
+  carrying a non-sha value is unmistakably writer-shaped corruption; it used to be skipped as
+  data (non-string values) or reported in resolution-failure vocabulary (string values). The
+  validator and the replay reader now interpret references through one shared trichotomy.
+
 ### Added — the recording switches are reachable from the shipped shapes
 
 - **`--model-calls-file`, `--model-payload-file` and `--model-content-file` on both `monoid run`

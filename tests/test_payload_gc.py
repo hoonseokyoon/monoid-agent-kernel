@@ -525,9 +525,11 @@ def test_chunks_referenced_only_by_damaged_lines_are_collectable_and_the_lines_a
     )
     lost_line = json.dumps(lost_record, ensure_ascii=False)
     (tmp_path / MODEL_PAYLOADS_FILENAME).write_text(
-        json.dumps(kept_record, ensure_ascii=False) + "\n"
+        json.dumps(kept_record, ensure_ascii=False)
         + "\n"
-        + lost_line[: len(lost_line) // 2] + "\n",
+        + "\n"
+        + lost_line[: len(lost_line) // 2]
+        + "\n",
         encoding="utf-8",
     )
     before = _issues(tmp_path)
@@ -554,7 +556,8 @@ def test_gc_and_the_validator_agree_which_lines_are_damaged(tmp_path: Path) -> N
     damaged is a line the validator flags."""
     record = chunk_record(CANONICAL_JSON_ENCODER.encode({"k": "v"}).encode("utf-8"), **_ENVELOPE)
     (tmp_path / MODEL_PAYLOADS_FILENAME).write_text(
-        json.dumps(record, ensure_ascii=False) + "\n"
+        json.dumps(record, ensure_ascii=False)
+        + "\n"
         + "not json at all\n"
         + "\n"
         + "[1, 2, 3]\n"
@@ -567,9 +570,7 @@ def test_gc_and_the_validator_agree_which_lines_are_damaged(tmp_path: Path) -> N
 
     assert report.damaged_lines == (2, 4, 5)
     flagged = {issue.path for issue in issues}
-    assert {
-        f"{MODEL_PAYLOADS_FILENAME}:{index}" for index in report.damaged_lines
-    } <= flagged
+    assert {f"{MODEL_PAYLOADS_FILENAME}:{index}" for index in report.damaged_lines} <= flagged
 
 
 def test_a_symlinked_corpus_refuses_content_collection_but_still_sweeps_temps(
@@ -711,8 +712,7 @@ def test_report_mode_leaves_the_directory_byte_identical(tmp_path: Path) -> None
     temp.write_bytes(b"y" * 50)
     _backdate(temp)
     snapshot = {
-        path.name: (path.lstat().st_size, path.lstat().st_mtime_ns)
-        for path in chunk_dir.iterdir()
+        path.name: (path.lstat().st_size, path.lstat().st_mtime_ns) for path in chunk_dir.iterdir()
     }
     before = _issues(run_dir)
 
@@ -723,8 +723,7 @@ def test_report_mode_leaves_the_directory_byte_identical(tmp_path: Path) -> None
     assert _entry(report, temp.name).deleted is False
     assert report.candidate_bytes == 150 and report.reclaimed_bytes == 0
     assert {
-        path.name: (path.lstat().st_size, path.lstat().st_mtime_ns)
-        for path in chunk_dir.iterdir()
+        path.name: (path.lstat().st_size, path.lstat().st_mtime_ns) for path in chunk_dir.iterdir()
     } == snapshot
     assert _issues(run_dir) == before
 
@@ -1070,6 +1069,7 @@ def test_the_safety_gate_judges_the_stat_it_already_holds(
 
     assert report.chunk_dir_state == "ok"
     assert _entry(report, "f" * 64).classification == "orphan"
+
 
 def test_reclaimed_bytes_are_attributable_to_the_entry_that_freed_them(tmp_path: Path) -> None:
     """A script summing per-entry sizes over `deleted` entries got a different number from the
@@ -1542,3 +1542,25 @@ def test_gc_reports_the_directory_it_actually_swept(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["run_dir"] == str(run_dir.resolve())
+
+
+def test_the_text_report_says_which_question_the_corpus_state_answered(tmp_path: Path) -> None:
+    """`corpus_state` means READABLE, not valid -- and "ok" printed beside a damaged-line count
+    that proves it is not reads as a verdict.
+
+    The same corpus already gets three different answers from `validate`, `gc` and `run`; a word
+    that overstates what this pass checked makes an operator trust the wrong one. The `--json`
+    field keeps its machine-facing value; only the human line is relabelled.
+    """
+
+    run_dir, _sha = _recorded_run(tmp_path)
+    corpus = run_dir / MODEL_PAYLOADS_FILENAME
+    corpus.write_text(corpus.read_text(encoding="utf-8") + "{ not json\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["gc", str(run_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert "corpus: readable" in result.output
+    assert "corpus: ok" not in result.output, (
+        "the pass checked whether the file could be read, not whether it was valid"
+    )

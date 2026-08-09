@@ -60,13 +60,24 @@ from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
-from monoid_agent_kernel.providers.base import ModelAdapter
+from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.payload_replay import ReplayCorpus
+from monoid_agent_kernel.providers._request_identity import (
+    _REQUEST_DIGEST_GENERATION,
+    _model_identity,
+)
+from monoid_agent_kernel.providers.base import (
+    ModelAdapter,
+    normalize_model_config,
+    resolved_provider_name,
+)
 from monoid_agent_kernel.providers.gateway import (
     DEFAULT_RELAYED_PROVIDER as _DEFAULT_RELAYED_PROVIDER,
     GatewayModelAdapter,
     resolve_relayed_provider,
 )
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
+from monoid_agent_kernel.providers.replay import ReplayModelAdapter
 from monoid_agent_kernel.recorder import StdoutJsonlSink, append_event_to_run
 from monoid_agent_kernel.skills import SkillProvider, load_skill_definitions
 from monoid_agent_kernel.subagent_loader import load_subagent_definitions
@@ -240,6 +251,29 @@ main.add_command(builder_group)
         "reasoning text of each call. Content, like the replay corpus. Selects provider streaming."
     ),
 )
+@click.option(
+    "--replay-from",
+    "replay_from",
+    multiple=True,
+    type=str,
+    metavar="RUN_DIR_OR_ID",
+    help=(
+        "Serve model calls from a recorded run's replay corpus (a run directory, or a run id "
+        "under --run-root) instead of a live provider. Repeatable: a run that spawned "
+        "subagents records each child in its own run directory, so name the children too, and "
+        "the sources form an ordered union. Tools re-execute for real; only the model answers "
+        "are replayed."
+    ),
+)
+@click.option(
+    "--replay-fallthrough",
+    is_flag=True,
+    help=(
+        "On a replay miss, fall through to the live adapter this command would have built "
+        "without --replay-from. Without this flag a miss fails the turn (error_code "
+        "replay_miss) and no provider is ever contacted."
+    ),
+)
 @click.option("--stream-json", is_flag=True, help="Stream public events as JSONL on stdout.")
 @click.option("--no-status-file", is_flag=True, help="Disable status.json updates.")
 @click.pass_context
@@ -280,6 +314,8 @@ def run(
     model_calls_file: bool,
     model_payload_file: bool,
     model_content_file: bool,
+    replay_from: tuple[str, ...],
+    replay_fallthrough: bool,
     stream_json: bool,
     no_status_file: bool,
 ) -> None:
@@ -381,15 +417,50 @@ def run(
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
-    model_adapter = _model_adapter(
-        runtime_config.model or ModelConfig(),
-        llm_gateway_url=llm_gateway_url
-        or (runtime_config.model.gateway_url if runtime_config.model else None),
-        llm_gateway_token_env=llm_gateway_token_env,
-        llm_gateway_token_file=llm_gateway_token_file,
-        llm_gateway_provider=llm_gateway_provider,
-        allow_direct_provider_api=allow_direct_provider_api,
-    )
+    replay_corpus: ReplayCorpus | None = None
+    if replay_from:
+        # Pure replay deliberately BYPASSES the live-adapter branch and its gates: an
+        # offline replay needs no gateway URL, no --allow-direct-provider-api, and no
+        # recognized provider name -- demanding any of them would block exactly the runs
+        # this flag exists for. The live branch is built only as a fallthrough inner.
+        try:
+            replay_corpus = ReplayCorpus.load(
+                [_resolve_run_dir(item, run_root) for item in replay_from]
+            )
+            model_adapter = ReplayModelAdapter(
+                replay_corpus,
+                inner=(
+                    _model_adapter(
+                        runtime_config.model or ModelConfig(),
+                        llm_gateway_url=llm_gateway_url
+                        or (runtime_config.model.gateway_url if runtime_config.model else None),
+                        llm_gateway_token_env=llm_gateway_token_env,
+                        llm_gateway_token_file=llm_gateway_token_file,
+                        llm_gateway_provider=llm_gateway_provider,
+                        allow_direct_provider_api=allow_direct_provider_api,
+                    )
+                    if replay_fallthrough
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        _replay_preflight(
+            replay_corpus,
+            runtime_config.model or ModelConfig(),
+            model_adapter,
+            fallthrough=replay_fallthrough,
+        )
+    else:
+        model_adapter = _model_adapter(
+            runtime_config.model or ModelConfig(),
+            llm_gateway_url=llm_gateway_url
+            or (runtime_config.model.gateway_url if runtime_config.model else None),
+            llm_gateway_token_env=llm_gateway_token_env,
+            llm_gateway_token_file=llm_gateway_token_file,
+            llm_gateway_provider=llm_gateway_provider,
+            allow_direct_provider_api=allow_direct_provider_api,
+        )
     # One adapter serves every turn of this run, so an adapter that can hold its provider client
     # open across turns should: the direct-OpenAI one builds a client per call otherwise, which
     # costs far more than the request it carries. Duck-typed because only some adapters have a
@@ -434,6 +505,15 @@ def run(
             model_calls_file=model_calls_file,
             model_payload_file=model_payload_file,
             model_content_file=model_content_file,
+            # Run-level provenance (D-e): which corpora served this run, as the corpus
+            # envelopes name them -- comma-joined (run ids carry no commas), landing
+            # verbatim on every ledger line and inherited by children. Never in the
+            # replay run's own corpus envelope; provenance is the ledger's business.
+            invocation_context=(
+                InvocationContext(attributes={"replay_from": ",".join(replay_corpus.run_ids())})
+                if replay_corpus is not None
+                else None
+            ),
             status_file=not no_status_file,
             permission_policy=spec.permission_policy,
             runtime_config_provider=StaticRuntimeConfigProvider(runtime_config),
@@ -855,10 +935,14 @@ def gc_command(
         # under ``OSError.__str__``; the states and the numbers are ours.
         click.echo(f"run_dir: {report.run_dir!r}")
         click.echo(f"swept_at: {report.swept_at}")
-        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {report.corpus_state}")
+        # `corpus_state` means READABLE, not valid -- but "ok" printed next to a damaged-line
+        # count that proves it is not reads as a verdict, and the same corpus already gets
+        # three different answers from `validate`, `gc` and `run`. Say which question was
+        # answered.
+        corpus_state = "readable" if report.corpus_state == "ok" else report.corpus_state
+        click.echo(f"chunk_dir: {report.chunk_dir_state}  corpus: {corpus_state}")
         click.echo(
-            f"mode: {'apply' if report.applied else 'report-only'}"
-            f"  min_age_s: {report.min_age_s!r}"
+            f"mode: {'apply' if report.applied else 'report-only'}  min_age_s: {report.min_age_s!r}"
         )
         kept = sum(1 for entry in report.entries if entry.classification == "kept")
         click.echo(f"kept: {kept}")
@@ -872,8 +956,7 @@ def gc_command(
             # or is not a candidate: a month-old orphan and one written a second ago rendered
             # identically, and the gate is the only thing standing between them.
             line = (
-                f"{entry.classification:>8} {entry.size:>10} {entry.age_s:>12.1f}s "
-                f"{entry.name!r}"
+                f"{entry.classification:>8} {entry.size:>10} {entry.age_s:>12.1f}s {entry.name!r}"
             )
             if entry.deleted:
                 line += f"  deleted (freed {entry.reclaimed})"
@@ -1607,6 +1690,131 @@ def _build_web_provider(
             context_provider=selected_context_provider,
         )
     raise ValueError(f"unsupported web provider: {provider}")
+
+
+def _replay_preflight(
+    corpus: ReplayCorpus,
+    config: ModelConfig,
+    adapter: Any,
+    *,
+    fallthrough: bool,
+) -> None:
+    """Refuse (or warn into) a run whose every lookup is already doomed.
+
+    The replay key's model identity is authored by the RUN'S runtime config, not by the
+    corpus (the loop always sets ``request.model``), so the most common total miss is a
+    config that does not match what was recorded -- discoverable before the run starts, by
+    the same comparison ``diagnose`` uses on a live miss (one function, two moments). A
+    zero-identity match is a rejection in fail mode and a warning under
+    ``--replay-fallthrough`` (an all-live run is a valid run); a partial match -- several
+    recorded identities, at least one reachable -- warns, because the unreachable ones will
+    miss and the operator should hear it here rather than at turn N.
+    """
+
+    if corpus.damaged_lines or corpus.rejected_records:
+        # The reader knows; without this the operator never hears it, and the miss it causes
+        # is diagnosed as `absent` -- "the original call failed, or its activation ended
+        # before answering" -- which sends them to read the recorded run instead of the file
+        # that is actually broken.
+        click.echo(
+            "warning: replay source is damaged: "
+            f"{corpus.damaged_lines} unparseable line(s), "
+            f"{corpus.rejected_records} record(s) the reader could not accept; "
+            # Conditional, because a corpus damaged only where this run asks nothing completes
+            # with no miss at all -- and a categorical "will miss" beside a clean exit 0 is how
+            # an operator learns to ignore the warning. The reader cannot know the key of a
+            # record whose key is what got damaged, so the conditional is the only honest form.
+            "any call that needed one of them will miss",
+            err=True,
+        )
+    if corpus.repeated_sources:
+        click.echo(
+            f"warning: {corpus.repeated_sources} replay source(s) named a corpus already "
+            "given; each was counted once",
+            err=True,
+        )
+    if corpus.crossed_keys:
+        # The one property of a union the operator cannot read off their own command line:
+        # "each answer once, in file order" is a rule about one corpus, and across sources the
+        # file order is the flag order. Reversing two --replay-from arguments then replays a
+        # different conversation, and where one source recorded a refusal at that position it
+        # turns a union that holds the answer into a miss.
+        click.echo(
+            f"warning: {corpus.crossed_keys} recorded call key(s) can be answered by more "
+            "than one --replay-from source; the order the sources were named in decides "
+            "which answer each call gets",
+            err=True,
+        )
+    if corpus.crossed_within_one_run:
+        # "Reverse the flags" is not actionable for a family: the children are one run's
+        # fan-out, their ids are minted hex in no meaningful order, and glob order sorts by
+        # that hex. Say which order is the right one instead.
+        click.echo(
+            f"warning: {corpus.crossed_within_one_run} of those key(s) were recorded by "
+            "children of one run -- identical subagents record the same key, because nothing "
+            "run-scoped is in it; name the child run directories in the order the parent "
+            "spawned them",
+            err=True,
+        )
+    generation = corpus.generation_divergence(_REQUEST_DIGEST_GENERATION)
+    if generation is not None:
+        message = f"replay preflight: {generation}"
+        if fallthrough:
+            click.echo(f"warning: {message}", err=True)
+            return
+        raise click.ClickException(
+            f"{message}. Replay a corpus recorded under this generation, or rerun live."
+        )
+    model = normalize_model_config(config) or ModelConfig()
+    provider = resolved_provider_name(adapter, model) or ""
+    if corpus.unreadable_requests():
+        # Said even when enough records remain to derive an identity, because that is the case
+        # where nothing else would say it: the derivation quietly narrows to the readable ones
+        # and reaches a confident answer from an incomplete corpus.
+        click.echo(
+            f"warning: replay preflight: {corpus.unreadable_requests()} request record(s) are "
+            "present but unreadable, so anything derived from recorded requests is derived from "
+            "an incomplete corpus; run 'monoid validate' on the recorded run directory to see "
+            "which",
+            err=True,
+        )
+    if not corpus.identity_profiles():
+        # Not a config mismatch, and saying so sends the operator to the one place the fault
+        # is ruled out. No readable request record means the corpus cannot state what it was
+        # recorded against, so there is nothing for this run's config to match OR diverge
+        # from. The remedy is the command that names the unreadable records, not the config.
+        message = (
+            "replay preflight: the corpus holds no readable request identities -- it cannot "
+            "say what model identity it was recorded against"
+        )
+        if fallthrough:
+            click.echo(f"warning: {message}", err=True)
+            return
+        raise click.ClickException(
+            f"{message}. Run 'monoid validate' on the recorded run directory to see which "
+            "request records are unreadable, or pass --replay-fallthrough to serve the "
+            "misses live."
+        )
+    divergence = corpus.identity_divergence(model=_model_identity(model), provider=provider)
+    if divergence is None:
+        if len(corpus.identity_profiles()) > 1:
+            click.echo(
+                "warning: replay preflight: the corpus recorded "
+                f"{len(corpus.identity_profiles())} model identities and this run's config "
+                "reaches one of them; calls recorded under the others will miss",
+                err=True,
+            )
+        return
+    message = (
+        f"replay preflight: no recorded request matches this run's model identity -- {divergence}"
+    )
+    if fallthrough:
+        click.echo(f"warning: {message}", err=True)
+        return
+    raise click.ClickException(
+        f"{message}. Fix the runtime config to match the recorded run, or pass "
+        "--replay-fallthrough to serve the misses live."
+    )
 
 
 def _model_adapter(

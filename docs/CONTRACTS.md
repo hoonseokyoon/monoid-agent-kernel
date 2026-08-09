@@ -793,6 +793,106 @@ which excludes `gateway_url` by construction. `reasoning` *is* recorded, encrypt
 included, because the loop re-injects it into the next by-value turn — a corpus without it would
 derail one turn after every replayed answer.
 
+#### Replaying the corpus
+
+`ReplayModelAdapter` (`monoid_agent_kernel.providers`, W6-4b; `monoid run --replay-from` is its
+CLI face, [CLI.md](CLI.md)) serves `next_turn` from one or more recorded run directories and
+refuses everything it cannot prove. The contract:
+
+- **Selection is file order, each answer once.** The corpus records what happened; the adapter
+  hands answers back in that order. Consuming a record whose body cannot be given back
+  (`unrecorded_reason`, an unresolvable reference, a body that is not a recorded turn) is a
+  `not_recorded` miss that **leaves the cursor standing**. The loop's contract for a
+  `config_recoverable` failure is an idempotent re-attempt of the *same* call, so a refusal that
+  advanced would answer that re-attempt with the recording belonging to the call after it —
+  silently, as a structurally valid turn. A slot is spent only when the caller moves the
+  conversation past it by serving that call another way (`--replay-fallthrough`); a record the
+  reader handed over that reconstruction then rejected is given back.
+  Both settlements are properties of *leaving a take*, not calls a caller remembers to make:
+  `ReplayCorpus.take(digest, generation=...)` is a context manager whose block declares
+  `served()` when the call happened and settles unserved by every other exit. The two
+  directions are opposite — a standing refusal is spent forward, a rejected record is given
+  back — and choosing between them at the call site is what repeatedly went wrong.
+  Duplicate request records and a restarting `call_index` are the ordinary durable-resume shape
+  and collapse by digest, exactly as the previous section specifies.
+  Across a union, "file order" spans the sources in the order they were named, and it is
+  decisive wherever two sources can answer one key. That includes families: keys are disjoint
+  across a family only when no two children share a definition and a prompt, because nothing
+  run-scoped is in the key, so an ordinary fan-out of two identical children records one key in
+  two run directories. The reader counts the keys more than one source can answer
+  (`crossed_keys`) and the CLI preflight warns; it is not otherwise visible.
+- **Misses are typed and content-free.** Six reasons, fixed: `no_key` (the live request could
+  not be keyed), `absent` (nothing recorded under the key — including the failed-original-call
+  shape, whose request record has no answer beside it), `not_recorded` (an answer slot exists
+  but cannot yield a turn), `identity_mismatch`, `exhausted`, `generation_mismatch`. Without a
+  fallthrough adapter a miss raises `ReplayMiss` — `error_code: "replay_miss"`, the sub-reason
+  in `provider_error_code`, `retryable: false`, `config_recoverable: true`, so it parks a
+  session and promotes to the failure record only when a one-shot facade closes. The message
+  names generations, config values (which the ledger already records in plaintext) and term
+  names with digests — never conversation content, and that is pinned adversarially on the
+  public `turn.failed` payload.
+- **The replay run's config authors the key's model identity** (the loop always sets
+  `request.model`), so the commonest total miss is a config that does not match the recording.
+  The CLI preflights exactly this comparison before the run starts, through the same function
+  the miss diagnosis uses.
+- **Impersonation is derived from evidence.** The corpus `provider` term is a resolved value
+  that cannot say whether the original adapter *declared* a provider, and the loop's reasoning
+  re-injection reads only the declaration — so the adapter declares when the recorded requests
+  carry re-injected reasoning blocks, refuses to declare when answers carry reasoning that no
+  recorded request re-injected, and declares (for key stability) when there is no reasoning at
+  all. Unions that recorded more than one provider are rejected at construction; a kernel-driven
+  family cannot produce one (children share the parent's adapter instance).
+- **Tools re-execute for real.** Only model answers are replayed; a tool that answers
+  differently than it did changes the next request and that turn misses `absent`, the diagnosis
+  naming the diverging terms. The same mechanism bounds families: children replay from the
+  union of their run directories (naming them is a requirement, not a convenience), and the
+  parent's first post-spawn turn is a documented v1 limit — the spawn observation embeds
+  per-run identifiers a replay honestly cannot reproduce, and fabricating them would be exactly
+  the invented identity the key doctrine forbids.
+- **Ledger deltas, four, all here on purpose** (the fourth, `attributes.replay_from`, is the
+  provenance stamp described under Provenance in [CLI.md](CLI.md) and is added by `monoid run`
+  rather than by the adapter)**:** the adapter declares no `resolve_destination`,
+  so a replay run's `destination_status` reads `not_declared` even when the original resolved;
+  when the no-reasoning rule declares a provider an undeclared original did not, the replay
+  ledger's `provider_name` is non-empty where the original's was `""`; and under
+  `--replay-fallthrough` a call the *inner* adapter served is still stamped with whatever the
+  wrapper declares — the corpus's provider term, or `""` where the derivation declined to
+  declare at all — and with `not_declared`, because the declaration is what makes recorded keys
+  reachable and cannot simultaneously report who answered a miss. Whether a corpus recorded
+  through fallthrough is interchangeable with a live recording therefore depends on which
+  branch the derivation took: where it declares, the term it declares *is* the original's
+  resolved provider and the keys agree; where it declined, the live calls are keyed under a
+  term a correctly-configured live run will not compute.
+- **A miss message names run ids as well as terms.** The content-free rule bounds *values*, not
+  identifiers. Three message families carry those identifiers. A term-by-term diagnosis
+  names up to four diverging terms with a 12-hex digest prefix on each side and the run id of
+  the record it compared against; a `not_recorded` refusal names the run id and `call_index` of
+  the record it refused; and an `identity_mismatch` diagnosis names the run id of the closest
+  recorded request together with the identity values on each side — in plaintext, because they
+  are config vocabulary the ledger already records in the clear, and bounded to 120 characters
+  per value because the corpus is not trusted to keep them short. All three reach the public
+  `turn.failed` payload, in `failure.json`, and on CLI stderr. Run ids are minted hex, but they
+  are foreign run ids when the corpus is foreign, so an event stream relayed to end users
+  carries them.
+- **Sources are read, never written**, and they are content: replaying a foreign run directory
+  means reading that run's conversation bytes, so the corpus's privacy classification travels
+  with the replay. A replay run's own recording switches write into its own directory only.
+
+The generation rule above is what retires a corpus: a composition change bumps
+`monoid.model-request-digest.v1`, and a replay whose sources carry **only** the retired tag
+answers `generation_mismatch` naming both tags, at the CLI preflight and again from the miss
+diagnosis, instead of silently missing.
+
+Two limits on that sentence, because it used to be written without them. The comparison is
+whether this run's tag appears **anywhere in the union**, so a union mixing a current source
+with a retired one does not report `generation_mismatch` at all: the current tag is present, the
+retired source's keys were composed differently and therefore match nothing, and its calls come
+back `absent` with a term-by-term diagnosis that names conversation terms rather than the
+generation. And the tag is consulted when a key is *looked up*, not when an answer is handed
+back — a record whose own `digest_generation` differs is not re-checked at the moment it is
+served, because after a real bump its digest cannot match the key being asked for in the first
+place. Both are visible only on a corpus whose tags were edited without recomposing its keys.
+
 The Reference backend can attach one `LiveModelStreamBroker` through
 `RunnerBackend.model_stream_broker`. Its observer factory is bound to the authoritative root run
 and inherited by in-process descendants, producing one passive root-multiplexed presentation
@@ -819,7 +919,27 @@ inside `async_model_cancel_grace_s` settles normally and is not abandoned, so th
 reported once the worker has stopped rather than while it races run finalization. Only a call still
 running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
 worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
-the grace is not an extension of the deadline. Sync adapters should still enforce their own provider
+the grace is not an extension of the deadline.
+
+"Discarded" is about the *result*, not about everything the call touched on its way there, and
+an adapter holding shared state needs a way to hear about it. Two routes reach a discarded
+outcome, and neither is the worker: a boundary is checked **before** the completed task's result
+is read — deliberately, so a boundary landing in the same tick still wins — so even a call that
+finished can have its answer thrown away.
+
+`ModelCallRunner` therefore offers adapters an optional `discard_turn(request, turn)`, invoked at
+exactly that point, because it is the only place that knows both that a result exists and that
+nobody will see it. Absent, behaviour is unchanged. `ReplayModelAdapter` is the shipped
+implementer: `consume` advances its per-key cursor when the answer is handed over, so without the
+hook a discarded call permanently consumed a recorded answer and every later consumer of that
+corpus was served the following one — a structurally valid turn belonging to a different call,
+reachable wherever the adapter outlives the call, which a subagent family already does. The hook
+releases the slot, keyed by recomputing the request's own digest so a recycled object identity
+cannot release a slot belonging to another key.
+
+One residue, stated rather than closed: a **fallthrough** answer served live is not taken back.
+That call reached a provider and was paid for, and the corpus has no unspend primitive for a
+refusal spent forward. Sync adapters should still enforce their own provider
 I/O timeout and idempotency policy, because the kernel can stop waiting for a call it cannot stop.
 
 Abandonment is not free, and this is a known limitation rather than a settled guarantee: nothing can

@@ -23,13 +23,18 @@ The run-directory artifact set is:
 - `model_payloads.jsonl` + `model_payloads/`: optional private replay corpus — request preimages
   as verified reassembly recipes whose chunks deduplicate per tool definition, per message and per
   observation, and settled response bodies including provider reasoning
-  (`monoid.model-payloads.v1`)
+  (`monoid.model-payloads.v1`). `monoid run --replay-from RUN_DIR_OR_ID` reads it back as the model
+  ([CLI.md](CLI.md)); a `monoid run --replay-from` run's ledger lines carry
+  `attributes.replay_from` naming the source run ids — the ledger is opt-in, and a run driven
+  programmatically through `ReplayModelAdapter` carries no such stamp
 - `status.json`: latest run lifecycle projection for polling (`state` plus `terminal`). Every
   non-terminal park is visible here, including a cooperative pause (`state: "paused"`, projected
   from the `session.state.changed` event). While a run is parked on a recoverable turn failure
   the file carries the failure's full classification beside `error`/`error_code` —
   `provider_error_code`, `http_status`, `retryable`, `config_recoverable`, `provider_retried` —
-  copied off the `turn.failed` event. A model turn starting clears the block (the new turn
+  copied off the `turn.failed` event. (A replay miss parks exactly this way:
+  `error_code: "replay_miss"` with the sub-reason in `provider_error_code` and
+  `config_recoverable: true` — the remedy is a config or source fix, then resend.) A model turn starting clears the block (the new turn
   supersedes the dead one), and a non-failed terminal heals it; on a failed terminal the
   `run.failed` classification remains (minus `provider_retried`, a per-call fact the terminal
   vocabulary drops). Absent keys mean "no live failure to classify" — which is also what their

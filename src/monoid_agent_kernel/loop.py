@@ -201,6 +201,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolObservation,
     format_async_result_text,
+    portable_usage_value,
     provider_usage_of,
     resolved_provider_name,
 )
@@ -5638,7 +5639,7 @@ def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, i
     """The mapping form of :func:`_accumulate_usage` -- one summation rule, two carriers."""
 
     for key, value in usage.items():
-        if type(value) is not int or value < 0:
+        if not portable_usage_value(value):
             raise ModelAdapterError(
                 f"model usage {key} must be a non-negative integer",
                 provider_error_code="model_bad_response",
@@ -5652,7 +5653,7 @@ def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
     priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
     adapter reports them, so they reach metrics and the token-budget check."""
     for key, value in turn.usage.items():
-        if type(value) is not int or value < 0:
+        if not portable_usage_value(value):
             raise ModelAdapterError(
                 f"model usage {key} must be a non-negative integer",
                 provider_error_code="model_bad_response",
