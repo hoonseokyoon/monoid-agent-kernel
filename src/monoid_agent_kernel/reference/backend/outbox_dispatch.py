@@ -10,6 +10,7 @@ from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
+from monoid_agent_kernel.providers._common import capped_backoff
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, queued_message_snapshot
 
 
@@ -56,9 +57,22 @@ class OutboxDispatchService:
         self._context = context
 
     def backoff_delay(self, attempts: int) -> float:
-        """Capped exponential backoff with full jitter."""
+        """Capped exponential backoff with full jitter.
+
+        ``cap_s`` bounds the exponent, not only the product -- see
+        :func:`~monoid_agent_kernel.providers._common.capped_backoff`, which is the model-retry
+        loops' schedule and now this one's. Computing the power first and capping after lets it
+        leave the float range before the cap is consulted, and ``float ** int`` raises
+        ``OverflowError`` there; raised in this loop it would replace the send failure being
+        scheduled around with an unclassified arithmetic error. ``factor`` and ``max_attempts``
+        arrive from operator-settable fields with no upper-bound validation, so a policy the
+        service accepts reaches it: ``1e308`` on the third attempt, the default ``2.0`` on the
+        1024th. Full jitter (``uniform(0, ceiling)``) is why this takes the bounded ceiling
+        rather than ``retry_delay_s``, which rides its jitter on top of the cap.
+        """
         policy = self._context.retry_policy_provider()
-        ceiling = min(policy.cap_s, policy.base_s * (policy.factor**attempts))
+        # ``capped_backoff`` grows by ``attempt - 1``; the outbox schedules off ``attempts``.
+        ceiling = capped_backoff(attempts + 1, policy.base_s, policy.cap_s, policy.factor)
         return self._context.rng_provider().uniform(0.0, max(0.0, ceiling))
 
     def drain_outbox(self, record: MutableRunRecordPort, loop: OutboxLoopPort) -> None:

@@ -15,7 +15,7 @@ from typing import Any
 
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
-# Half of ``log(float_max)``: the per-chunk log budget :func:`_capped_backoff` sizes its power
+# Half of ``log(float_max)``: the per-chunk log budget :func:`capped_backoff` sizes its power
 # by. Half, not all of it, so the chunk stays safe through the rounding of the division that
 # sizes it -- the power lands at or under ``sqrt(float_max)`` -- at the cost of at most doubling
 # a loop that runs four times in the worst case anyone can configure.
@@ -45,13 +45,13 @@ def retry_delay_s(
     timer that never fires, so the loop stops being a loop. Hence the saturating add.
     """
 
-    delay = _capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
+    delay = capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
     if jitter_s > 0:
         delay = min(delay + random.uniform(0, jitter_s), sys.float_info.max)
     return delay
 
 
-def _capped_backoff(
+def capped_backoff(
     attempt: int,
     initial_delay_s: float,
     max_delay_s: float,
@@ -65,13 +65,20 @@ def _capped_backoff(
     rather than saturating at infinity. A policy the spec ACCEPTS reaches that: ``max_attempts``
     is validated as an integer above zero and ``backoff_multiplier`` as any positive finite
     number, neither with an upper bound, so ``1e308`` overflows on the third attempt and the
-    default ``2.0`` on the 1025th -- while the configured cap still says four seconds.
+    default ``2.0`` on the 1025th -- while the configured cap still says four seconds. The
+    reference backend's outbox knobs (``outbox_max_attempts``, ``outbox_retry_factor``) are
+    plain operator-settable fields with no validation at all, so they reach it more cheaply.
 
-    All three loops evaluate the schedule inside an ``except`` handler for a retryable
-    ``ModelAdapterError``. An arithmetic error raised there does not merely add noise: it
-    REPLACES the failure being reported, so the layer above gets an unclassified
-    ``OverflowError`` instead of the taxonomy (``retryable``, ``code``, ``http_status``) it
-    retries, reports and stamps receipts on. So the exponent is bounded before the power.
+    Every caller evaluates the schedule inside a failure handler -- the three model-retry loops
+    around a retryable ``ModelAdapterError``, the reference backend's turn-retry handler, and its
+    outbox dispatcher scheduling around a failed send. An arithmetic error raised there does not
+    merely add noise: it REPLACES the failure being reported, so the layer above gets an
+    unclassified ``OverflowError`` instead of the taxonomy (``retryable``, ``code``,
+    ``http_status``) it retries, reports and stamps receipts on. So the exponent is bounded
+    before the power -- which is also why this is one function and not a shape each loop
+    re-derives. It is public for exactly that reason: the outbox applies FULL jitter
+    (``uniform(0, ceiling)``) rather than jitter on top, so it needs the bounded ceiling itself
+    rather than :func:`retry_delay_s`.
 
     One bound decides, and it is the exact one: at ``saturating`` the product has already reached
     the cap, so the answer IS the cap and no larger exponent can change it. Below that point the

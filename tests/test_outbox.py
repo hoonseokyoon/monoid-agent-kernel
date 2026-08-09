@@ -436,6 +436,27 @@ def test_backoff_delay_is_capped_with_full_jitter(backend_factory: Any) -> None:
     )  # never exceeds the cap
 
 
+def test_backoff_delay_saturates_at_the_cap_instead_of_overflowing(backend_factory: Any) -> None:
+    """The cap bounds the exponent, not only the product it multiplies out to.
+
+    ``outbox_retry_factor`` and ``outbox_max_attempts`` are plain operator-settable fields with
+    no upper-bound validation anywhere, so both arms below are policies the service ACCEPTS.
+    Capping only the result lets ``float ** int`` leave the float range before the cap is ever
+    consulted, and that raises ``OverflowError`` rather than saturating -- inside a dispatch
+    loop, where an arithmetic error REPLACES the send failure being scheduled around.
+    """
+    sender = RecordingOutboxSender()
+    backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
+    backend.outbox_retry_base_s, backend.outbox_retry_cap_s = 1.0, 10.0
+    backend._outbox_rng.seed(4321)
+    # A large factor needs only the third attempt to overflow the power.
+    backend.outbox_retry_factor = 1e308
+    assert 0.0 <= backend._outbox_backoff_delay(3) <= 10.0
+    # The shipped default needs no exotic factor at all -- only an attempts count.
+    backend.outbox_retry_factor = 2.0
+    assert 0.0 <= backend._outbox_backoff_delay(1100) <= 10.0
+
+
 def test_retryable_failure_stamps_future_schedule_and_is_not_due(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
+from monoid_agent_kernel.providers._common import retry_delay_s
 from monoid_agent_kernel.reference.backend.ports import (
     LoopPort,
     MutableRunRecordPort,
@@ -72,10 +72,23 @@ def _studio_retry_resume_event(message: Any) -> tuple[dict[str, Any], str | None
 
 
 async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
-    """Awaitable, cancellable exponential backoff with jitter for turn-level retries."""
-    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
-    if retry.jitter_s > 0:
-        delay += random.uniform(0, retry.jitter_s)
+    """Awaitable, cancellable exponential backoff with jitter for turn-level retries.
+
+    The schedule is :func:`~monoid_agent_kernel.providers._common.retry_delay_s` -- the same one
+    the model-retry loops wait on -- because this loop reads the same ``ModelRetryConfig`` fields
+    and a backoff that differed between them would be a difference nobody chose. It also bounds
+    the exponent rather than only the product: the open-coded ``min(max_delay_s, initial *
+    multiplier ** (attempt - 1))`` this replaces raised ``OverflowError`` for a multiplier the
+    spec accepts (``1e308`` on the third attempt, the default ``2.0`` on the 1025th), and raised
+    HERE it would replace the turn failure being retried with an unclassified arithmetic error.
+    """
+    delay = retry_delay_s(
+        attempt,
+        retry.initial_delay_s,
+        retry.max_delay_s,
+        retry.backoff_multiplier,
+        retry.jitter_s,
+    )
     if delay > 0:
         await asyncio.sleep(delay)
 

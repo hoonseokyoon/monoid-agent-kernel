@@ -16,6 +16,7 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
 )
+from monoid_agent_kernel.reference.backend import session_drive
 from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.reference.backend.session_drive import (
     SessionDriveContext,
@@ -125,6 +126,40 @@ def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=2)
 
     assert service.session_should_stop(record, started=started, turns=2) is True
+
+
+def test_turn_retry_backoff_saturates_at_the_cap_instead_of_overflowing(
+    monkeypatch: Any,
+) -> None:
+    """``max_delay_s`` bounds the exponent, not only the product it multiplies out to.
+
+    ``ModelRetryConfig`` validates ``backoff_multiplier`` as any positive finite number and
+    ``max_attempts`` as an integer above zero, neither with an upper bound, so both arms below
+    are policies the spec ACCEPTS. Capping only the result lets ``float ** int`` leave the float
+    range before the cap is consulted, and that raises ``OverflowError`` rather than saturating
+    -- here inside the turn-failure handler, where it would REPLACE the failure being retried.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            3,
+            ModelRetryConfig(
+                initial_delay_s=0.5, max_delay_s=4.0, backoff_multiplier=1e308, jitter_s=0.0
+            ),
+        )
+    )
+    # The shipped default multiplier needs no exotic policy at all -- only an attempt count.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            1100, ModelRetryConfig(initial_delay_s=0.5, max_delay_s=4.0, jitter_s=0.0)
+        )
+    )
+    assert slept == [4.0, 4.0]
 
 
 def test_manual_retry_emits_durable_identity_before_replacement_turn(tmp_path: Path) -> None:
