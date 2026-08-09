@@ -3858,6 +3858,64 @@ def test_the_kernel_hands_the_adapter_a_neutralized_policy() -> None:
     assert receipt.model.retry.layer == "kernel"
 
 
+class _TenantRetryConfig(ModelRetryConfig):
+    """An extension retry policy whose convenience constructor is narrower than its fields.
+
+    The kernel supports these deliberately: `providers/base._copy_with_fields` (and
+    `model_call`'s own copy of it) exist so an ingress boundary rewrites a config by copying
+    fields instead of calling `dataclasses.replace`, which would dispatch back through this
+    narrower `__init__` with every inherited field.
+    """
+
+    def __init__(self, layer: str = "kernel") -> None:
+        super().__init__(layer=layer, initial_delay_s=0.0, jitter_s=0.0)
+
+
+class _TenantModelConfig(ModelConfig):
+    """The `ModelConfig` twin of the probe above."""
+
+    def __init__(self, retry: ModelRetryConfig) -> None:
+        super().__init__(retry=retry)
+
+
+def test_the_neutralized_policy_does_not_re_run_an_extension_constructor() -> None:
+    """The kernel layer's dispatch copy obeys the rule every other config rewrite obeys.
+
+    `normalize_model_config` copies fields precisely so a public subclass with a smaller
+    constructor survives ingress; the layer's neutralization is another rewrite of the same
+    object and must copy too. `dataclasses.replace` would re-run both constructors with every
+    inherited field and raise `TypeError` before the adapter is ever reached -- a config the
+    kernel accepts on every other path refused by the one layer that rewrites it, and only
+    under `layer="kernel"`.
+    """
+
+    seen: list[ModelConfig] = []
+
+    class RecordingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            assert request.model is not None
+            seen.append(request.model)
+            return ModelTurn(final_text="answer")
+
+    request = ModelRequest(
+        instruction="hi",
+        system_prompt="sys",
+        tools=(),
+        model=_TenantModelConfig(retry=_TenantRetryConfig()),
+    )
+    observer = _acall(RecordingAdapter(), request)
+
+    dispatched = seen[0]
+    assert isinstance(dispatched, _TenantModelConfig)
+    assert isinstance(dispatched.retry, _TenantRetryConfig)
+    assert dispatched.retry.max_attempts == 1
+    assert dispatched.retry.layer == "kernel"
+    # The receipt still describes the call as configured, extension type included.
+    receipt_retry = observer.captures[0].receipt.model.retry
+    assert isinstance(receipt_retry, _TenantRetryConfig)
+    assert receipt_retry.max_attempts == 3
+
+
 def test_the_retry_layer_leaves_the_replay_key_where_it_was() -> None:
     """Neither the layer nor the neutralized dispatch copy may reach the request identity."""
 

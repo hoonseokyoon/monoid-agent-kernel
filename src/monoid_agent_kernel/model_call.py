@@ -602,9 +602,17 @@ class ModelCallRunner:
                     # so it describes the call as configured -- and the replay key excludes
                     # the retry block entirely, so neither the layer nor the neutralization
                     # can move it.
-                    dispatch_model = replace(
+                    #
+                    # Copied field-wise rather than through `dataclasses.replace`, for the
+                    # reason `_copy_with_fields` exists: a public extension config with a
+                    # narrower convenience constructor is supported everywhere else -- ingress
+                    # normalization rewrites it this same way -- and `replace` would dispatch
+                    # back through that constructor with every inherited field, raising
+                    # `TypeError` before the adapter is reached. Only this layer rewrites a
+                    # config after ingress, so only this layer could refuse one.
+                    dispatch_model = _copy_with_fields(
                         dispatch_model if dispatch_model is not None else model,
-                        retry=replace(model.retry, max_attempts=1),
+                        retry=_copy_with_fields(model.retry, max_attempts=1),
                     )
                 if dispatch_model is not None:
                     request = copy(request)
