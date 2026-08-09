@@ -680,7 +680,14 @@ class ModelCallRunner:
                 )
                 consumer = delta_consumer
                 delivered = False
-                if retry_plan is not None and delta_consumer is not None:
+                # Installed for any consumer, not only under the kernel's loop. The flag is
+                # *used* where a retry window exists -- delivery closes it -- but it is
+                # *recorded* on every call, and `layer` defaults to `"adapter"`: gating the
+                # wrapper on the loop that reads the flag wrote `stream_committed: false`
+                # onto every shipped streaming call's ledger line while the consumer was
+                # holding its chunks. The key is present either way, so a reader cannot tell
+                # a definite "nothing was delivered" from "this arm never answered".
+                if delta_consumer is not None:
                     inner_consumer = delta_consumer
 
                     def _marking_consumer(chunk: ModelStreamChunk) -> None:

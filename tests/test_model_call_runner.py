@@ -4297,6 +4297,57 @@ def test_stream_committed_marks_only_the_attempt_that_delivered() -> None:
     assert terminal.stream_committed is True
 
 
+class _StreamingAdapter:
+    """Delivers a chunk and settles -- no failure, so the call takes exactly one dispatch.
+
+    Answers the non-streaming door too, so the same adapter can be called with and without a
+    consumer: the point of the second call is a settled turn that delivered nothing.
+    """
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        del request
+        yield TextDelta("whole")
+        yield TurnComplete(response_id="r1", usage={"output_tokens": 2}, stop_reason="stop")
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        return ModelTurn(response_id="r1", final_text="whole", usage={"output_tokens": 2})
+
+
+@pytest.mark.parametrize(
+    "model",
+    [ModelConfig(), _kernel_model()],
+    ids=["adapter_layer_default", "kernel_layer"],
+)
+def test_stream_committed_reports_delivery_under_either_retry_layer(model: ModelConfig) -> None:
+    """The field says "was a chunk delivered", and it was answered only where a window existed.
+
+    ``delivered`` was tracked by wrapping the consumer, and the wrapper was installed only when
+    the kernel owns the retry loop -- because that is where the flag is *used*, to refuse a retry
+    that would replay a chunk the consumer already holds. But the flag is also *recorded*, on
+    every call, and ``layer`` defaults to ``"adapter"``: every shipped streaming call wrote
+    ``stream_committed: false`` onto its ledger line while the consumer was holding its chunks.
+    A definite ``false`` is not "the question does not apply here" -- the key is present and the
+    reader has no way to tell those apart.
+
+    The sibling arm was the one the earlier per-entry test drove, and it was right the whole
+    time; the parametrization is the point, not the second row.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=model)
+    sink: list[Any] = []
+
+    observer = _acall(_StreamingAdapter(), request, delta_consumer=sink.append)
+
+    (entry,) = observer.captures[0].receipt.attempt_log
+    assert sink, "the adapter delivered nothing, so this proves nothing"
+    assert entry.stream_committed is True
+
+    # And a call with no consumer at all still says False: nothing was delivered *to anyone*.
+    silent = _acall(_StreamingAdapter(), request)
+    assert silent.captures[0].receipt.attempt_log[0].stream_committed is False
+
+
 def test_the_backoff_respects_the_deadline_instead_of_sleeping_into_it(
     monkeypatch: Any,
 ) -> None:

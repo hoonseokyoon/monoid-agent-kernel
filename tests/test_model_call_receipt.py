@@ -422,6 +422,72 @@ def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
         ModelCallReceipt.from_json({**payload, "attempt_log": "two"})
 
 
+def test_an_attempt_entry_is_read_whole_or_refused() -> None:
+    """The closed shape the schema already declares, enforced by the reader that builds the record.
+
+    `attempt_log` is all-or-nothing one level up because absence there means one thing -- a writer
+    that predates the field. An *entry* has no such predecessor: it arrived whole or it did not
+    arrive, and the ledger schema says so by requiring all ten keys. The reader defaulted every
+    one of them, so `{}` deserialized into a plausible lie -- a successful, zero-duration,
+    unbilled dispatch numbered 1 -- and `attempts=1` beside it satisfied both cross-entry
+    invariants. A corrupt audit record that reads as data is worse than one that fails to read.
+
+    Enumerated from the dataclass rather than listed here, so a field added later is covered by
+    this test on the day it is added rather than on the day someone remembers to extend a list.
+    """
+
+    from dataclasses import fields as dataclass_fields
+
+    whole = ModelCallAttempt(index=1).to_json()
+    declared = {field.name for field in dataclass_fields(ModelCallAttempt)}
+
+    assert set(whole) == declared, {"projection_and_fields_disagree": set(whole) ^ declared}
+    assert ModelCallAttempt.from_json(whole) == ModelCallAttempt(index=1)
+
+    for key in sorted(declared):
+        partial = {name: value for name, value in whole.items() if name != key}
+        with pytest.raises(WireValidationError, match=key):
+            ModelCallAttempt.from_json(partial)
+
+
+def test_with_error_never_fails_the_call_it_is_reporting() -> None:
+    """A receipt already holding its breakdown keeps its total, rather than raising over it.
+
+    ``with_error`` exists to mark a receipt failed, and every read inside it is guarded for one
+    reason: a surface that describes a failure must not be able to *replace* that failure with an
+    error of its own. The usage-sum invariant put a way to do exactly that back in -- the method
+    overwrites ``usage`` from the exception's stamp and does not touch ``attempt_log``, so calling
+    it on a settled receipt that carries entries raised ``ValueError`` out of the reporting path.
+
+    Not reached from ``src`` today (the runner probes a fresh receipt and merges in one
+    ``replace``), which is what makes it worth pinning: the safety is an ordering the runner
+    happens to have, and both the class and this method are public.
+
+    The entries are the receipt's own per-dispatch breakdown; a total read off an exception cannot
+    restate them, so the existing "a receipt that already carried counts keeps them" rule extends
+    to the receipt that already carried rows.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage, provider_usage_of
+
+    settled = ModelCallReceipt(attempts=1, attempt_log=(ModelCallAttempt(index=1),))
+    later = RuntimeError("failed after the log was built")
+    mark_provider_usage(later, {"input_tokens": 4})
+
+    failed = settled.with_error(later)
+
+    assert failed.error_code == "RuntimeError"
+    assert failed.usage == {}
+    assert failed.attempt_log == settled.attempt_log
+    # The stamp is not lost, only not written over a breakdown that would contradict it: it is
+    # still on the exception, which is where every reader of it looks.
+    assert provider_usage_of(later) == {"input_tokens": 4}
+
+    # A log-less receipt still adopts the stamp -- the path the runner actually takes.
+    adopted = ModelCallReceipt().with_error(later)
+    assert adopted.usage == {"input_tokens": 4}
+
+
 def test_a_receipt_that_never_reached_the_probe_says_so() -> None:
     """The default is a fact, not a blank.
 

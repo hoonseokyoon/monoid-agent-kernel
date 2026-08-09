@@ -24,7 +24,9 @@ import copy
 import re
 import secrets
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from functools import lru_cache
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -766,6 +768,20 @@ class ModelCallAttempt:
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallAttempt:
         payload = require_object(payload, "model_call_attempt")
+        # An entry is read whole or refused, which is not the rule one level up and must not be.
+        # ``attempt_log`` itself is optional because its absence means exactly one thing -- a
+        # writer that predates the field -- and defaults there reconstruct what that writer meant.
+        # An entry has no predecessor to be lenient toward: it was written by a writer that knew
+        # all ten keys or it was not written by this record at all. Defaulting them turned `{}`
+        # into a successful, zero-duration, unbilled dispatch numbered 1, which then satisfied
+        # both of the receipt's cross-entry invariants -- a corrupt audit line reading as data,
+        # the one outcome an audit surface may not produce. The ledger schema has required all
+        # ten since the field shipped; this is the reader agreeing with it.
+        missing = [name for name in _ATTEMPT_WIRE_KEYS if name not in payload]
+        if missing:
+            raise WireValidationError(
+                "model call attempt is missing required fields: " + ", ".join(missing)
+            )
         raw_status = payload.get("http_status")
         return cls(
             index=parse_int(payload, "index", default=1),
@@ -779,6 +795,13 @@ class ModelCallAttempt:
             usage=_optional_object(payload, "usage") or {},
             stream_committed=parse_bool(payload, "stream_committed"),
         )
+
+
+# Derived from the record, not restated beside it: a field added to ``ModelCallAttempt`` becomes
+# required on the wire the moment it exists, rather than the moment someone remembers a list.
+_ATTEMPT_WIRE_KEYS: tuple[str, ...] = tuple(
+    entry.name for entry in dataclass_fields(ModelCallAttempt)
+)
 
 
 @dataclass(frozen=True)
@@ -990,7 +1013,14 @@ class ModelCallReceipt:
         except Exception:
             stamped_usage = None
         usage = self.usage
-        if not usage and isinstance(stamped_usage, Mapping):
+        # ``and not self.attempt_log``: the entries are this receipt's own per-dispatch breakdown
+        # of its bill, and a total read off an exception cannot restate them -- writing one over
+        # them produces a record ``__post_init__`` refuses, which would come out of this method as
+        # a ``ValueError`` *instead of* the failure it was called to report. Every read here is
+        # guarded for that reason; the sum invariant added one more way to break the same promise.
+        # The same rule the line below already follows for ``provider_retried``, one field wider:
+        # a receipt that already carried the fact keeps what it carried.
+        if not usage and not self.attempt_log and isinstance(stamped_usage, Mapping):
             try:
                 usage = {
                     str(key): int(value)
