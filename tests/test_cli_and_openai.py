@@ -19,7 +19,7 @@ from support.http import serving
 from support.runtime import runtime_config, tool_binding
 
 from monoid_agent_kernel.cli import main
-from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -38,6 +38,7 @@ from monoid_agent_kernel.providers.fake import (
     FakeStreamingModelAdapter,
     fake_tool_call,
 )
+import monoid_agent_kernel.providers.openai as openai_module
 from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
@@ -2102,3 +2103,60 @@ def test_backend_serve_releases_the_backend_when_the_socket_cannot_be_taken(
         "the bind failure must be a reported CLI error, not a traceback"
     )
     assert "could not listen on" in result.output, result.output
+
+
+def test_the_kernel_layer_reaches_every_sdk_call_through_one_helper() -> None:
+    """The census: every `.responses` access in the adapter sits on a `_call_client(...)` result.
+
+    The OpenAI SDK's own retry loop is not governed by `ModelRetryConfig` -- the adapter only
+    reads its evidence -- so the layer contract can only reach it through client options, and
+    `_call_client` is the single place that happens. Derived from the source rather than
+    listed, so a new SDK call site joins the census by existing instead of by being
+    remembered.
+    """
+
+    import ast as ast_module
+
+    source = Path(openai_module.__file__).read_text(encoding="utf-8")
+    accesses = [
+        node
+        for node in ast_module.walk(ast_module.parse(source))
+        if isinstance(node, ast_module.Attribute) and node.attr == "responses"
+    ]
+    assert accesses, "the census matched no SDK call route; the adapter moved -- re-derive it"
+    bypassing = [
+        node.lineno
+        for node in accesses
+        if not (
+            isinstance(node.value, ast_module.Call)
+            and isinstance(node.value.func, ast_module.Name)
+            and node.value.func.id == "_call_client"
+        )
+    ]
+    assert not bypassing, f"SDK call routes bypassing _call_client at lines {bypassing}"
+
+
+def test_the_kernel_layer_disables_the_sdks_own_retries() -> None:
+    """`layer="kernel"` reaches the SDK as `max_retries=0`; the default leaves it untouched.
+
+    Identity for the default layer matters as much as the option for the kernel one: the
+    client may be scope-cached, and an options copy taken on every call under the default
+    would be a behavior change nobody asked for.
+    """
+
+    class _Recording:
+        def __init__(self) -> None:
+            self.options: dict[str, Any] | None = None
+
+        def with_options(self, **kwargs: Any) -> _Recording:
+            self.options = dict(kwargs)
+            return self
+
+    kernel_client = _Recording()
+    kernel_config = ModelConfig(retry=ModelRetryConfig(layer="kernel"))
+    assert openai_module._call_client(kernel_client, kernel_config) is kernel_client
+    assert kernel_client.options == {"max_retries": 0}
+
+    default_client = _Recording()
+    assert openai_module._call_client(default_client, ModelConfig()) is default_client
+    assert default_client.options is None

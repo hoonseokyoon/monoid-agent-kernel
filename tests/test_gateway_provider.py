@@ -1292,3 +1292,47 @@ def test_the_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) ->
         adapter.next_turn(ModelRequest(system_prompt="s", instruction="hi", tools=()))
 
     assert order == ["report", "wait", "report", "wait"]
+
+
+def test_the_kernel_layer_turns_the_adapters_own_loop_off(monkeypatch: Any) -> None:
+    """Exactly one layer may multiply attempts, and `layer` names it.
+
+    Under `layer="kernel"` the runner owns the retry loop, so this adapter must make exactly
+    one HTTP attempt no matter what `max_attempts` says -- the schedule fields govern
+    whichever layer loops, not this one. The default-layer half is the control: the same
+    refused call IS loop-eligible (retryable, its code in `retry_on`), so the kernel half
+    passing cannot mean the error was never retryable to begin with.
+    """
+
+    calls: list[int] = []
+
+    def _refused(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append(1)
+        raise URLError("unreachable")
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", _refused)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
+
+    kernel = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, layer="kernel"),
+        ),
+        token="run-token",
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        kernel.next_turn(ModelRequest("go", "sys", (), None))
+    assert caught.value.retryable is True
+    assert len(calls) == 1
+
+    calls.clear()
+    adapter_layer = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3),
+        ),
+        token="run-token",
+    )
+    with pytest.raises(ModelAdapterError):
+        adapter_layer.next_turn(ModelRequest("go", "sys", (), None))
+    assert len(calls) == 3

@@ -1513,3 +1513,58 @@ def test_a_pool_teardown_after_the_terminal_frame_reports_what_the_hop_metered(
 
     assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
     assert provider_usage_of(caught.value) == _DROPPED_STREAM_USAGE
+
+
+def test_the_kernel_layer_turns_the_streamed_loop_off_too(monkeypatch: Any) -> None:
+    """The blocking loop's twin: `layer="kernel"` means one connection attempt, streamed too.
+
+    The rule lives in one helper (`_adapter_layer_attempts`) precisely so the two loops
+    cannot drift; this test is the streamed half's own binding, because a rule proven on the
+    blocking loop alone is the house defect shape. Same control structure as the blocking
+    test: the default layer retries the identical refusal, so the kernel half is not
+    passing on an error that was never loop-eligible.
+    """
+
+    httpx = pytest.importorskip("httpx")
+    attempts: list[int] = []
+
+    class _Refusing:
+        def __init__(self, **_kwargs: Any) -> None: ...
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> Any:
+            attempts.append(1)
+            raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Refusing)
+    monkeypatch.setattr(gateway_module, "_retry_delay", lambda *_a: 0.0)
+
+    kernel = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3, layer="kernel"),
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        _stream(kernel)
+    assert caught.value.provider_error_code == GATEWAY_NETWORK_ERROR
+    assert caught.value.retryable is True
+    assert len(attempts) == 1
+
+    attempts.clear()
+    adapter_layer = GatewayModelAdapter(
+        config=ModelConfig(
+            gateway_url="http://gateway.invalid",
+            retry=ModelRetryConfig(max_attempts=3),
+        ),
+        token="t",
+    )
+    with pytest.raises(ModelAdapterError):
+        _stream(adapter_layer)
+    assert len(attempts) == 3

@@ -126,6 +126,22 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
         ) from exc
 
 
+def _adapter_layer_attempts(retry: Any) -> int:
+    """How many attempts THIS adapter's own loop may make under ``retry``.
+
+    Under ``layer="kernel"`` the runner owns the retry loop and a compliant adapter must not
+    multiply it, so the answer is one regardless of ``max_attempts`` -- the schedule fields
+    govern whichever layer loops, and here that layer is not this one. The kernel also hands
+    a neutralized policy down when it dispatches, but a directly-driven adapter honors the
+    contract on its own. One function for both loops (blocking and streamed), so the rule
+    cannot drift between them.
+    """
+
+    if retry.layer == "kernel":
+        return 1
+    return max(1, retry.max_attempts)
+
+
 def _stamp_retry(error: BaseException, attempt: int) -> None:
     """Record on an escaping error that the adapter's retry loop had already run.
 
@@ -245,7 +261,7 @@ class GatewayModelAdapter:
         url = self._resolve_gateway_url(config)
         body = _encode_request_body(self._payload(request))
         retry = config.retry
-        max_attempts = max(1, retry.max_attempts)
+        max_attempts = _adapter_layer_attempts(retry)
         last_error: ModelAdapterError | None = None
         attempt = 0
         try:
@@ -410,7 +426,7 @@ class GatewayModelAdapter:
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
         body = _encode_request_body(self._payload(request))
         retry = config.retry
-        max_attempts = max(1, retry.max_attempts)
+        max_attempts = _adapter_layer_attempts(retry)
         last_error: ModelAdapterError | None = None
         attempt = 0
         # Bound before the client exists, because the client's own lifecycle can fail: `__aexit__`
