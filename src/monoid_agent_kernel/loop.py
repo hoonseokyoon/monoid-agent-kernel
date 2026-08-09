@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import fnmatch
 import inspect
 import json
@@ -4050,6 +4051,44 @@ class AgentLoop:
                 # exception raised *around* the call rather than by it, since the boundary below
                 # already speaks this vocabulary.
                 raise _as_model_adapter_error(exc) from exc
+            except (asyncio.CancelledError, KeyboardInterrupt) as exc:
+                # A stop, not a failure -- and not an ``Exception`` either, so it reached none of
+                # the three arms above. Not "fell through" them: there was no arm, which is why an
+                # enumeration of arms could not see it. The runner stamps the cumulative bill onto
+                # whatever escapes, and on these two nothing read it.
+                #
+                # These two account and the arm below does not, because the difference is whether
+                # the run outlives the stop. A host that cancels the driving task still finalizes
+                # the run and reports its totals; a Ctrl-C leaves the recorder and its sinks open.
+                # The spend was incurred by attempts that completed *before* the stop arrived.
+                #
+                # Guarded, unlike its siblings, and that difference is deliberate: accounting
+                # publishes ``metrics.updated`` through the recorder, an observer there may raise,
+                # and an exception escaping this handler would REPLACE the stop -- a coroutine
+                # that swallows a ``CancelledError`` is a broken coroutine, which is a worse
+                # outcome than a lost meter. The accumulation happens before the publish inside
+                # the call, so the totals still move when only the event fails.
+                with contextlib.suppress(Exception):
+                    self._account_billed_model_call(
+                        exc,
+                        recorder,
+                        state,
+                        context,
+                        step=step,
+                        turn_id=turn_id,
+                        parent_id=turn_started.event_id,
+                    )
+                raise
+            except BaseException:
+                # ``SystemExit`` and ``GeneratorExit`` -- everything outside ``Exception`` that the
+                # arm above does not name -- and by convention anything else raised outside the
+                # ``Exception`` hierarchy means "do not run ordinary cleanup". Interpreter and
+                # generator teardown is where a recorder's sinks are closing or already closed, and
+                # an accounting side effect there buys a meter nobody will read at the price of
+                # touching a closing file. Deliberately silent, and written down rather than left
+                # to an absent arm: an arm that does not exist records no decision, which is how
+                # the cancellation above went four rounds without one.
+                raise
             self._check_run_boundary(deadline)
             # The receipt, not the turn: the two agree everywhere except under a retry layer,
             # where the receipt's usage carries absorbed attempts' spend the turn cannot know

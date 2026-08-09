@@ -2610,6 +2610,15 @@ billed wire calls that finished before anything was cancelled, and the interrupt
 un-spend them; what a cancelled run still does not count is the terminating dispatch's own
 bill, which no layer has ever reported for a call that never settled.
 
+That holds below `Exception` too: a host cancelling the task that drives `asubmit`/`arun_once`
+raises `asyncio.CancelledError` into the call, and a `KeyboardInterrupt` arrives the same way —
+neither is a `NativeAgentError`, neither is an `Exception`, and both leave a live run behind that
+the host still finalizes and still reports totals for. Both account, and both are re-raised
+unchanged: accounting there is guarded so a raising observer cannot replace the stop, because a
+coroutine that swallows a cancellation is a broken coroutine. `SystemExit` and `GeneratorExit`
+deliberately do **not** account — teardown is where a recorder's sinks are closing, and a meter
+nobody will read is not worth touching a closing file for.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:

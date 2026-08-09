@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Mapping
@@ -2758,6 +2759,74 @@ def test_a_kernel_absorbed_bill_survives_every_boundary_exit(
         loop.close()
 
 
+class _StallsAfterAbsorbing:
+    """Fails once, billed and retryable, then parks forever inside the second dispatch.
+
+    The stall is what makes the cancellation a *host* cancellation: the second attempt is
+    suspended at an ``await`` when the driving task is cancelled, so the ``CancelledError`` is
+    delivered into the runner rather than raised by the adapter. The runner tells those two
+    apart on purpose -- an adapter that cancels its own call becomes a
+    ``model_adapter_cancelled`` ``ModelAdapterError`` (`CalleeCancelled`), which lands in the
+    accounting arm and always did. Only the delivered one escapes as itself.
+    """
+
+    def __init__(self, absorbed: BaseException) -> None:
+        self.absorbed = absorbed
+        self.calls = 0
+        self.stalled = asyncio.Event()
+
+    async def anext_turn(self, request: Any) -> ModelTurn:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            raise self.absorbed
+        self.stalled.set()
+        await asyncio.Event().wait()  # never returns; the host cancels us here
+        raise AssertionError("unreachable")
+
+
+def test_a_kernel_absorbed_bill_survives_a_host_cancellation(tmp_path: Path) -> None:
+    """The arms below `Exception`: a stop that ends the call without being a failure.
+
+    `asyncio.CancelledError` has inherited straight from `BaseException` since 3.8, so it is
+    neither a `NativeAgentError` nor an `Exception` and matches none of the three arms that
+    answer for a model call. It does not fall through them -- it never reaches them, and an
+    arm that does not exist is invisible to a census that enumerates arms. The runner had
+    already stamped the cumulative bill onto it (every attempt a kernel retry absorbed), and
+    nothing read the stamp.
+
+    The run object outlives the cancellation: the host that cancelled the task still finalizes
+    the run and still reports its totals, and the spend it drops completed *before* the cancel
+    arrived. Accounting for it must not swallow it -- a coroutine that absorbs a
+    `CancelledError` is a broken coroutine -- so the cancellation is re-raised and asserted.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    adapter = _StallsAfterAbsorbing(absorbed)
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+
+    async def drive() -> None:
+        loop.open()
+        task = asyncio.ensure_future(loop.arun_until_suspended("hello"))
+        await asyncio.wait_for(adapter.stalled.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(drive())
+        assert adapter.calls == 2
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
 def test_a_model_failure_the_adapter_did_not_classify_keeps_its_stamps() -> None:
     """The translator's own contract, stated as the split it makes: stamps travel, taxonomy does not.
 
@@ -2949,6 +3018,25 @@ def test_every_arm_that_re_raises_a_model_call_accounts_for_what_it_billed() -> 
     caught reaches the accounting. A handler that raises something *else* is out of scope and must
     be -- it is a replacement, which the carrying census above governs, and the exception it lets
     escape is not the one the runner stamped.
+
+    What this test could not see, and now can
+    -----------------------------------------
+    The first version enumerated ``guarded[0].handlers`` and required each to account. That reads
+    as "every arm answers for its bill" and means something strictly narrower: *of the arms that
+    exist*, each accounts. A class with no arm contributes **no row** -- it is not an unaccounted
+    handler, it is zero handlers -- so the census could only ever catch an arm that answers wrongly
+    and never a class that reaches no arm at all. The arms stopped at ``Exception``, and
+    ``asyncio.CancelledError`` has inherited straight from ``BaseException`` since 3.8: a host
+    cancelling the driving task walked past every arm, carrying the stamp the runner had just
+    written, and this test stayed green because there was nothing for it to enumerate. It was
+    green *because* the defect was total rather than partial.
+
+    The rule is about escape routes; the encoding was about handlers, and the two agree only where
+    an arm exists. So the coverage clause comes first now: the handler set must be **total** --
+    some arm must catch ``BaseException`` -- which makes "no arm" unrepresentable and forces every
+    class outside ``Exception`` to be a decision someone wrote down rather than an omission nobody
+    could see. The split between the classes that account and the ones that must not is then a
+    policy this test states, because no static reading of the source can derive it.
     """
 
     import ast
@@ -2968,6 +3056,13 @@ def test_every_arm_that_re_raises_a_model_call_accounts_for_what_it_billed() -> 
             and call.func.attr == name
         ]
 
+    def _caught(handler: ast.ExceptHandler) -> frozenset[str]:
+        if handler.type is None:
+            return frozenset({"BaseException"})
+        if isinstance(handler.type, ast.Tuple):
+            return frozenset(ast.unparse(element) for element in handler.type.elts)
+        return frozenset({ast.unparse(handler.type)})
+
     guarded = [
         node
         for node in ast.walk(tree)
@@ -2976,26 +3071,58 @@ def test_every_arm_that_re_raises_a_model_call_accounts_for_what_it_billed() -> 
     ]
     assert len(guarded) == 1, {"try_blocks_wrapping_the_model_call": [n.lineno for n in guarded]}
 
+    arms = [(_caught(handler), handler) for handler in guarded[0].handlers]
+    caught = frozenset[str]().union(*(types for types, _ in arms))
+
+    # (a) Coverage, first, because the clauses after it can only speak about arms that exist.
+    assert "BaseException" in caught, {
+        "widest_arm_in_the_handler_chain": sorted(caught),
+        "hint": (
+            "an exception class with no arm is invisible to an enumeration of arms; "
+            "catch BaseException so every class outside Exception is a written decision"
+        ),
+    }
+
+    # (b) The stops that the run outlives are named by an arm of their own rather than left to the
+    #     widest one. Stated here because no reading of the source can derive which BaseException
+    #     subclasses leave a live recorder behind: a cancelled task and a Ctrl-C do, interpreter
+    #     and generator teardown do not.
+    stopping = {"asyncio.CancelledError", "KeyboardInterrupt"}
+    assert stopping <= caught, {
+        "stopping_classes_with_no_arm_of_their_own": sorted(stopping - caught),
+        "hint": "these two carry a stamped bill and the run outlives them, so they account",
+    }
+
+    # (c) Every arm that re-raises what it caught accounts -- except the teardown arm, which is
+    #     exactly the arm catching nothing but ``BaseException``: what reaches it is SystemExit,
+    #     GeneratorExit, and anything else raised outside the Exception hierarchy, all of which
+    #     mean "do not run ordinary cleanup".
+    teardown = frozenset({"BaseException"})
     unaccounted = {
-        ast.unparse(handler.type) if handler.type else "bare": handler.lineno
-        for handler in guarded[0].handlers
-        if any(
-            isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler)
-        )
+        ", ".join(sorted(types)): handler.lineno
+        for types, handler in arms
+        if types != teardown
+        and any(isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler))
         and not _calls(handler, "_account_billed_model_call")
     }
     assert unaccounted == {}, {
         "arms_re_raising_a_billed_failure_without_counting_it": unaccounted,
         "hint": "self._account_billed_model_call(exc, ...) -- one route into the totals",
     }
-    # Both arms reached it, so deleting the accounting from both cannot pass by emptying the file
-    # of the shape this census looks for.
-    accounting = [
+    # And the teardown arm stays silent on purpose: if it ever starts accounting, that is a
+    # decision to publish a meter through a closing recorder, and it should not pass unread.
+    assert not [
         handler.lineno
-        for handler in guarded[0].handlers
-        if _calls(handler, "_account_billed_model_call")
+        for types, handler in arms
+        if types == teardown and _calls(handler, "_account_billed_model_call")
+    ], {"hint": "teardown must not publish through a recorder whose sinks are closing"}
+
+    # (d) All three answering arms reached it, so deleting the accounting everywhere cannot pass by
+    #     emptying the file of the shape this census looks for.
+    accounting = [
+        handler.lineno for _types, handler in arms if _calls(handler, "_account_billed_model_call")
     ]
-    assert len(accounting) == 2, {"arms_that_account": accounting}
+    assert len(accounting) == 3, {"arms_that_account": accounting}
 
 
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------

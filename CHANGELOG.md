@@ -50,6 +50,15 @@ out in commit messages and here.
   `metrics.json` and `total_usage` now include attempts a kernel retry completed and paid
   for before the boundary; the terminating dispatch's own bill is still not counted, as it
   never was for a call that did not settle.
+- **…including the stops that are not `Exception`s.** `asyncio.CancelledError` has inherited
+  straight from `BaseException` since 3.8, so a host cancelling the task driving
+  `asubmit`/`arun_once` — and a `KeyboardInterrupt` — reached *no* arm rather than the wrong
+  one, carrying the stamp the runner had just written. Both now account and both are
+  re-raised unchanged, guarded so a raising observer cannot replace the stop; the run
+  outlives them and its totals are still reported. `SystemExit` and `GeneratorExit` reach an
+  explicit arm that deliberately stays silent: teardown is where a recorder's sinks are
+  closing. The handler chain is now total, so a class outside `Exception` is a written
+  decision rather than an omission.
 - **An `attempt_log` entry is read whole or refused, and the sweep checks the two claims
   that span entries.** The entry reader defaulted all ten fields, so `[{}]` beside
   `attempts: 1` deserialized into a plausible successful dispatch — an entry has no writer
