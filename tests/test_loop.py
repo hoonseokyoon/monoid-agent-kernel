@@ -2761,6 +2761,15 @@ def test_every_model_failure_the_loop_re_raises_goes_through_one_translator() ->
     Bare ``raise ModelAdapterError(...)`` with no cause is deliberately out of scope: it
     originates a failure rather than replacing one, so it has no stamps to carry (two such sites
     exist today, and they stay legal).
+
+    Enumerating the ``raise ... from`` form alone leaves one spelling open, and it is the one
+    this very file makes idiomatic: ``_acall_model`` builds its failure into a name and raises
+    *that*, so ``failure = ModelAdapterError(str(exc)); raise failure from exc`` is a single
+    assignment away from restoring the defect under a green census. The second clause below
+    therefore refuses the construction itself anywhere a caught error is in scope. Every site
+    that legitimately builds one sits outside every ``except`` -- a turn that settled with
+    neither text nor tool calls, a usage value that is not a count, a driver's give-up promoted
+    to the terminal record -- because there is no stamped original there to lose.
     """
 
     import ast
@@ -2795,6 +2804,21 @@ def test_every_model_failure_the_loop_re_raises_goes_through_one_translator() ->
         and node.func.id == "_as_model_adapter_error"
     )
     assert len(translations) == 2, {"call_sites": translations}
+
+    # The assignment spelling, refused at the construction rather than at the raise.
+    constructed_where_an_error_was_caught = sorted(
+        (node.lineno, ast.unparse(node))
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.ExceptHandler)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelAdapterError"
+    )
+    assert constructed_where_an_error_was_caught == [], {
+        "built_with_a_caught_error_in_scope": constructed_where_an_error_was_caught,
+        "hint": "_as_model_adapter_error is the only thing that turns a caught error into one",
+    }
 
 
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------
