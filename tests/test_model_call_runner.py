@@ -49,6 +49,7 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     TurnComplete,
     assemble_streamed_turn,
+    collect_retry_reports,
     mark_provider_usage,
     normalize_model_request,
     report_provider_retried,
@@ -2196,6 +2197,20 @@ def test_the_retry_channel_does_not_leak_between_calls() -> None:
 def test_reporting_a_retry_outside_a_runner_is_inert() -> None:
     """An adapter used directly is not broken by calling the seam with nobody listening."""
     report_provider_retried()  # must not raise
+
+
+def test_the_retry_channel_counts_every_report() -> None:
+    """`retried` answers "did any loop below run" and is monotone, so a second report is
+    invisible to it -- which is exactly what per-attempt attribution cannot live with. `count`
+    carries what the bool discards; the bool stays, derived, so every existing reader keeps
+    meaning what it meant."""
+
+    with collect_retry_reports() as progress:
+        assert (progress.count, progress.retried) == (0, False)
+        report_provider_retried()
+        assert (progress.count, progress.retried) == (1, True)
+        report_provider_retried()
+        assert (progress.count, progress.retried) == (2, True)
 
 
 # --- a broken adapter must not cost the call, the receipt, or the run ----------------------------

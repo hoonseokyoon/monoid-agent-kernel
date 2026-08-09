@@ -1269,9 +1269,15 @@ class RetryProgress:
     Mutated rather than replaced, because that is what crosses a thread: the worker runs under a
     copy of the caller's context, so `ContextVar.set` there is invisible here, while a write to the
     object both sides already hold is not.
+
+    `retried` is monotone, which makes a second report invisible to it -- the exact property
+    per-attempt attribution cannot live with when the kernel retry layer asks "did a loop below
+    run during *this* dispatch". `count` carries what the bool discards; the bool stays, kept in
+    step by the one reporter, so every existing reader keeps meaning what it meant.
     """
 
     retried: bool = False
+    count: int = 0
 
 
 _RETRY_PROGRESS: ContextVar[RetryProgress | None] = ContextVar(
@@ -1291,6 +1297,9 @@ def report_provider_retried() -> None:
     progress = _RETRY_PROGRESS.get()
     if progress is not None:
         progress.retried = True
+        # One writer keeps the pair consistent; per-call there is one worker, so the
+        # read-modify-write needs no lock the bool beside it never needed.
+        progress.count += 1
 
 
 @contextmanager
