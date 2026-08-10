@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any
 
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.model_io import ModelCallReceipt
+from monoid_agent_kernel.core.model_io import ModelCallAttempt, ModelCallReceipt
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -122,6 +122,29 @@ def _recorded_context(context: InvocationContext) -> dict[str, Any]:
     }
 
 
+def _recorded_attempt(entry: ModelCallAttempt) -> dict[str, Any]:
+    """One dispatch, hand-listed like every projection in this module.
+
+    Not ``entry.to_json()``, although today the two agree key for key: a field added to
+    ``ModelCallAttempt`` must be added HERE by name to reach the artifact, or every field of
+    the source type becomes an author of the audit record -- the exact rule the reflection
+    census on these projections enforces.
+    """
+
+    return {
+        "index": entry.index,
+        "elapsed_ms": entry.elapsed_ms,
+        "error_code": entry.error_code,
+        "provider_error_code": entry.provider_error_code,
+        "retryable": entry.retryable,
+        "config_recoverable": entry.config_recoverable,
+        "http_status": entry.http_status,
+        "provider_retried": entry.provider_retried,
+        "usage": dict(entry.usage),
+        "stream_committed": entry.stream_committed,
+    }
+
+
 def model_call_record(
     receipt: ModelCallReceipt,
     *,
@@ -180,6 +203,11 @@ def model_call_record(
         "usage": dict(receipt.usage),
         "latency_ms": receipt.latency_ms,
         "attempts": receipt.attempts,
+        # One object per dispatch, hand-projected below. Always written -- absence on a line
+        # means exactly one thing, a writer that predates the field -- which is why the
+        # schema declares it and does not require it: ``validate_run_dir`` sweeps directories
+        # that v0.20 writers filled.
+        "attempt_log": [_recorded_attempt(entry) for entry in receipt.attempt_log],
         "provider_retried": receipt.provider_retried,
         "error_code": receipt.error_code,
         "provider_error_code": receipt.provider_error_code,

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import inspect
 import json
+from http import HTTPStatus
 from dataclasses import fields, replace
+from types import UnionType
+from typing import Union, get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -12,6 +15,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
+    ModelCallAttempt,
     ModelCallReceipt,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -247,6 +251,26 @@ def test_json_round_trip_preserves_every_field() -> None:
         digest_status="ok",
         destination_status="resolved",
         destination_digest="sha-destination",
+        attempt_log=(
+            ModelCallAttempt(
+                index=1,
+                elapsed_ms=800,
+                error_code="model_error",
+                provider_error_code="rate_limit_exceeded",
+                retryable=True,
+                config_recoverable=False,
+                http_status=429,
+                provider_retried=True,
+                usage={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                stream_committed=False,
+            ),
+            ModelCallAttempt(
+                index=2,
+                elapsed_ms=434,
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                stream_committed=True,
+            ),
+        ),
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt
@@ -270,6 +294,201 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
         "never_exercised_by_the_round_trip": missing,
         "hint": "a field the enumeration does not name is a field it does not cover",
     }
+
+
+def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
+    """One kernel dispatch as the log records it: same metadata-only rule, same usage
+    validation, same error_code-empty success convention as the receipt that carries it."""
+
+    entry = ModelCallAttempt(
+        index=2,
+        elapsed_ms=125,
+        error_code="model_error",
+        provider_error_code="overloaded",
+        retryable=True,
+        config_recoverable=False,
+        http_status=529,
+        provider_retried=True,
+        usage={"total_tokens": 5},
+        stream_committed=True,
+    )
+
+    assert ModelCallAttempt.from_json(json.loads(json.dumps(entry.to_json()))) == entry
+    assert entry.succeeded is False
+    assert ModelCallAttempt().succeeded is True
+
+    with pytest.raises(ValueError, match="index"):
+        ModelCallAttempt(index=0)
+    with pytest.raises(ValueError, match="elapsed_ms"):
+        ModelCallAttempt(elapsed_ms=-1)
+    with pytest.raises(WireValidationError):
+        ModelCallAttempt(usage={"total_tokens": -5})
+
+
+def test_the_attempt_entry_wire_shape_names_every_field_there_is() -> None:
+    """The same completeness guard the receipt's round trip carries, for the entry type:
+    a field added to the dataclass without joining the wire shape reads back at its default
+    and every historical log silently drops it."""
+
+    declared = {field_.name for field_ in fields(ModelCallAttempt)}
+    assert set(ModelCallAttempt().to_json()) == declared
+
+
+def test_the_attempt_log_is_empty_or_names_every_attempt() -> None:
+    """`len(attempt_log)` is 0 (a legacy or refused receipt) or exactly `attempts` -- a log
+    naming some attempts but not others cannot answer the question it exists for, and a sum
+    over its usage would silently disagree with the receipt's."""
+
+    entry = ModelCallAttempt(index=1)
+
+    assert ModelCallReceipt(attempts=1, attempt_log=(entry,)).attempt_log == (entry,)
+    assert ModelCallReceipt(attempts=0).attempt_log == ()
+    assert ModelCallReceipt(attempts=3).attempt_log == ()
+
+    with pytest.raises(ValueError, match="attempt_log"):
+        ModelCallReceipt(attempts=2, attempt_log=(entry,))
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt(attempts=1, attempt_log=({"index": 1},))  # type: ignore[arg-type]
+
+
+def test_the_attempt_log_names_each_dispatch_once_and_in_order() -> None:
+    """"Exactly once" is what the refusal says; counting was all it did.
+
+    A length check accepts `[1, 1]` for `attempts=2` -- the right number of entries naming the
+    same dispatch twice, with dispatch two absent. A consumer of that record cannot answer the
+    question the log exists for (what did attempt 2 do) and cannot tell that it is unanswerable,
+    because every other field is well-formed. The indices are the record's own claim about which
+    dispatch each row is, so they carry the claim: `1..attempts`, ascending, no gaps, no repeats.
+    """
+
+    def _log(*indices: int) -> tuple[ModelCallAttempt, ...]:
+        return tuple(ModelCallAttempt(index=index) for index in indices)
+
+    assert ModelCallReceipt(attempts=2, attempt_log=_log(1, 2)).attempts == 2
+
+    for indices in ((1, 1), (2, 1), (2, 3), (1, 3)):
+        with pytest.raises(ValueError, match="attempt_log"):
+            ModelCallReceipt(attempts=2, attempt_log=_log(*indices))
+
+
+def test_the_attempt_logs_usage_adds_up_to_the_receipts() -> None:
+    """The entries are the receipt's breakdown of its bill, so they add up to it or they are not.
+
+    A record whose entries say 3 while its total says 99 cannot be reconciled by its reader, and
+    carries nothing that says which number to believe. This was the stated reason the log is
+    all-or-nothing and it went unchecked, so the class documented a property it did not hold.
+
+    The writer builds the log and the merged total in a single ``replace`` for exactly this
+    reason: ``__post_init__`` re-runs on every ``replace``, so a two-step build would have to
+    pass through a receipt that carries its entries beside a total they do not sum to.
+    """
+
+    def _entry(index: int, output: int) -> ModelCallAttempt:
+        return ModelCallAttempt(index=index, usage={"output_tokens": output})
+
+    ModelCallReceipt(
+        attempts=2,
+        attempt_log=(_entry(1, 5), _entry(2, 7)),
+        usage={"output_tokens": 12},
+    )
+
+    with pytest.raises(ValueError, match="sum"):
+        ModelCallReceipt(
+            attempts=2,
+            attempt_log=(_entry(1, 5), _entry(2, 7)),
+            usage={"output_tokens": 99},
+        )
+    # And a key on one side only is a disagreement too: a total nobody's dispatch reported is
+    # exactly the shape a reader cannot attribute.
+    with pytest.raises(ValueError, match="sum"):
+        ModelCallReceipt(
+            attempts=1,
+            attempt_log=(_entry(1, 5),),
+            usage={"output_tokens": 5, "input_tokens": 4},
+        )
+
+
+def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
+    """Absent on every receipt written before the field existed, which is legal and reads as
+    an empty log beside an intact `attempts` count; present-but-mistyped is refused, like
+    every other field here."""
+
+    payload = ModelCallReceipt(attempts=3).to_json()
+    del payload["attempt_log"]
+
+    restored = ModelCallReceipt.from_json(payload)
+
+    assert restored.attempt_log == ()
+    assert restored.attempts == 3
+
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json({**payload, "attempt_log": "two"})
+
+
+def test_an_attempt_entry_is_read_whole_or_refused() -> None:
+    """The closed shape the schema already declares, enforced by the reader that builds the record.
+
+    `attempt_log` is all-or-nothing one level up because absence there means one thing -- a writer
+    that predates the field. An *entry* has no such predecessor: it arrived whole or it did not
+    arrive, and the ledger schema says so by requiring all ten keys. The reader defaulted every
+    one of them, so `{}` deserialized into a plausible lie -- a successful, zero-duration,
+    unbilled dispatch numbered 1 -- and `attempts=1` beside it satisfied both cross-entry
+    invariants. A corrupt audit record that reads as data is worse than one that fails to read.
+
+    Enumerated from the dataclass rather than listed here, so a field added later is covered by
+    this test on the day it is added rather than on the day someone remembers to extend a list.
+    """
+
+    from dataclasses import fields as dataclass_fields
+
+    whole = ModelCallAttempt(index=1).to_json()
+    declared = {field.name for field in dataclass_fields(ModelCallAttempt)}
+
+    assert set(whole) == declared, {"projection_and_fields_disagree": set(whole) ^ declared}
+    assert ModelCallAttempt.from_json(whole) == ModelCallAttempt(index=1)
+
+    for key in sorted(declared):
+        partial = {name: value for name, value in whole.items() if name != key}
+        with pytest.raises(WireValidationError, match=key):
+            ModelCallAttempt.from_json(partial)
+
+
+def test_with_error_never_fails_the_call_it_is_reporting() -> None:
+    """A receipt already holding its breakdown keeps its total, rather than raising over it.
+
+    ``with_error`` exists to mark a receipt failed, and every read inside it is guarded for one
+    reason: a surface that describes a failure must not be able to *replace* that failure with an
+    error of its own. The usage-sum invariant put a way to do exactly that back in -- the method
+    overwrites ``usage`` from the exception's stamp and does not touch ``attempt_log``, so calling
+    it on a settled receipt that carries entries raised ``ValueError`` out of the reporting path.
+
+    Not reached from ``src`` today (the runner probes a fresh receipt and merges in one
+    ``replace``), which is what makes it worth pinning: the safety is an ordering the runner
+    happens to have, and both the class and this method are public.
+
+    The entries are the receipt's own per-dispatch breakdown; a total read off an exception cannot
+    restate them, so the existing "a receipt that already carried counts keeps them" rule extends
+    to the receipt that already carried rows.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage, provider_usage_of
+
+    settled = ModelCallReceipt(attempts=1, attempt_log=(ModelCallAttempt(index=1),))
+    later = RuntimeError("failed after the log was built")
+    mark_provider_usage(later, {"input_tokens": 4})
+
+    failed = settled.with_error(later)
+
+    assert failed.error_code == "RuntimeError"
+    assert failed.usage == {}
+    assert failed.attempt_log == settled.attempt_log
+    # The stamp is not lost, only not written over a breakdown that would contradict it: it is
+    # still on the exception, which is where every reader of it looks.
+    assert provider_usage_of(later) == {"input_tokens": 4}
+
+    # A log-less receipt still adopts the stamp -- the path the runner actually takes.
+    adopted = ModelCallReceipt().with_error(later)
+    assert adopted.usage == {"input_tokens": 4}
 
 
 def test_a_receipt_that_never_reached_the_probe_says_so() -> None:
@@ -484,8 +703,42 @@ def test_from_json_rejects_a_falsy_malformed_nested_payload(payload: dict[str, o
 
 
 @pytest.mark.parametrize("key", ["context", "model", "usage"])
-def test_from_json_still_treats_absent_and_null_nested_payloads_as_defaults(key: str) -> None:
-    assert ModelCallReceipt.from_json({key: None}) == ModelCallReceipt()
+def test_from_json_treats_an_absent_nested_payload_as_a_default(key: str) -> None:
+    """The half of the old contract that is real: a writer that predates the field.
+
+    ``183e197`` settled this as "absent and null keep their defaults; anything present reaches
+    validation", and the absent half is still exactly right -- it is what lets a receipt written
+    before a field existed be read back.
+    """
+    assert ModelCallReceipt.from_json({}) == ModelCallReceipt()
+
+    payload = ModelCallReceipt().to_json()
+    del payload[key]
+
+    assert ModelCallReceipt.from_json(payload) == ModelCallReceipt()
+
+
+@pytest.mark.parametrize("key", ["context", "model", "usage"])
+def test_from_json_refuses_a_nested_payload_that_is_present_and_null(key: str) -> None:
+    """The other half of ``183e197`` is withdrawn here, and the file had already withdrawn it.
+
+    That commit lumped ``null`` in with absent while reasoning about *falsy wrong types*
+    (``{"context": []}`` read as an anonymous invocation). At the time the conflation was
+    harmless: both landed on the same default, and no default meant anything beyond "empty".
+
+    ``_parsed_status`` is where this record stopped believing that, in its own words -- "a key
+    present and holding ``null`` is a corrupt record ... conflating the two was harmless while
+    both landed on the default and stopped being harmless the moment absence began to infer".
+    Two fields since made the defaults load-bearing in exactly that way: ``attempt_log``'s
+    absence *infers* a writer predating the ledger, so a null there erases a real ledger and
+    reads as legacy; and ``usage``'s default is an empty mapping that then satisfies the
+    receipt's own cross-entry sum invariant, so a nulled total agrees with any breakdown.
+
+    ``http_status`` stays nullable and is covered by its own test above, because it is declared
+    ``int | None`` -- the annotation is what decides, not this list.
+    """
+    with pytest.raises(WireValidationError):
+        ModelCallReceipt.from_json({key: None})
 
 
 @pytest.mark.parametrize(
@@ -550,3 +803,137 @@ def test_from_json_tolerates_a_receipt_written_before_config_recoverable_existed
     del payload["config_recoverable"]
 
     assert ModelCallReceipt.from_json(payload).config_recoverable is False
+
+
+def _admits(annotation: object, wanted: object) -> bool:
+    """Whether ``annotation`` names ``wanted`` directly or as a union member.
+
+    Deliberately re-derived here rather than imported from the module under test: an enumeration
+    that shares its definition with the code it audits agrees with that code by construction, and
+    would go green with it if the definition were the thing that broke.
+    """
+    if annotation is wanted:
+        return True
+    return get_origin(annotation) in (Union, UnionType) and wanted in get_args(annotation)
+
+
+def _nullable_names(cls: type) -> set[str]:
+    hints = get_type_hints(cls)
+    return {entry.name for entry in fields(cls) if _admits(hints.get(entry.name), type(None))}
+
+
+def _numeric_names(cls: type) -> list[str]:
+    hints = get_type_hints(cls)
+    return sorted(entry.name for entry in fields(cls) if _admits(hints.get(entry.name), int))
+
+
+@pytest.mark.parametrize("record", [ModelCallAttempt, ModelCallReceipt], ids=["attempt", "receipt"])
+def test_every_wire_field_that_is_not_nullable_refuses_an_explicit_null(record: type) -> None:
+    """Derived census: "absent" and "present and null" are different answers on both records.
+
+    ``from_json`` read a key holding ``null`` as if the key were missing, so an explicit null
+    landed on the field's legacy default. On ``usage`` that produced an empty mapping which then
+    *satisfied* the receipt's cross-entry sum invariant; on ``attempt_log`` it erased the whole
+    per-dispatch ledger and read as a writer predating the field -- while the ledger schema
+    rejects null and no writer that ever existed emitted one.
+
+    The per-field required-key pin added for the earlier partial-entry finding was green through
+    every one of these, and structurally had to be: it asks whether the key is *in* the payload,
+    and a key holding null is in the payload. Presence and non-nullness are different questions,
+    and only the first had an instrument.
+
+    Enumerated over each record's own fields rather than over the two the review named, because
+    the receipt's ``usage``, ``context`` and ``model`` had the identical shape and were not
+    named. ``http_status`` is declared ``int | None``, so a wire null is a value there rather
+    than a collapse -- read off the annotation, so a field that becomes nullable tomorrow stops
+    being required here on the same day.
+    """
+    complete = json.loads(json.dumps(record().to_json()))
+    nullable = _nullable_names(record)
+    collapsed = []
+    for key in sorted(complete):
+        if key in nullable:
+            continue
+        payload = dict(complete)
+        payload[key] = None
+        try:
+            record.from_json(payload)
+        except WireValidationError:
+            continue
+        collapsed.append(key)
+
+    assert collapsed == [], {
+        "fields_reading_an_explicit_null_as_their_default": collapsed,
+        "nullable_and_therefore_exempt": sorted(nullable),
+        "hint": "absent = legacy default; present-but-null = refused",
+    }
+
+
+def test_with_error_still_accepts_the_int_subclass_it_documents() -> None:
+    """The bool rule must not become an exact-type rule. It did, and this is that regression.
+
+    ``with_error`` reads ``http_status`` off an arbitrary exception and guards it with
+    ``isinstance(http_status, bool) or not isinstance(http_status, int)`` -- excluding ``bool``
+    by name while deliberately admitting every other ``int`` subclass, because an
+    ``http.HTTPStatus`` is exactly what an HTTP client hands back. The count census added in
+    ``a8faa8f`` then spelled ``type(value) is not int`` and the ``replace()`` inside ``with_error``
+    re-ran it, so this record refused a value its own reader had just accepted.
+
+    The shape is worth naming: ``http_status`` was correctly exempted from the *null* rule
+    (it is declared ``int | None``) and then handed the *bool* rule without anyone asking
+    whether it had an acceptance of its own. One field, two rules, exempted from one and not
+    the other.
+
+    The repair narrows the predicate to the defect it was written for -- ``bool`` is refused,
+    every other ``int`` is not -- rather than exempting the one field that was noticed. That
+    restores the prior acceptance on all seven enumerated counts at once, which is the only
+    version of this fix that cannot leave a second field broken the same way.
+
+    ``usage`` is deliberately NOT covered by this: its own loop keeps ``type(value) is not int``
+    because its four sibling readers spell the same, and an ``IntEnum`` token count accepted here
+    would be dropped by every one of them.
+    """
+    failed = ModelCallReceipt().with_error(
+        ModelAdapterError("rate limited", http_status=HTTPStatus.TOO_MANY_REQUESTS)
+    )
+
+    assert failed.http_status == 429
+    # And it still leaves as a JSON integer, which is the only thing the wire cares about.
+    assert json.loads(json.dumps(failed.to_json()))["http_status"] == 429
+
+
+@pytest.mark.parametrize("record", [ModelCallAttempt, ModelCallReceipt], ids=["attempt", "receipt"])
+def test_every_numeric_field_on_both_records_refuses_a_boolean(record: type) -> None:
+    """Derived census: one predicate for every count, not a comparison written per field.
+
+    ``__post_init__`` validated its counts by comparison alone, and ``True < 1`` is ``False`` --
+    so ``ModelCallAttempt(index=True)`` was stored, and ``to_json`` emitted a JSON boolean where
+    ``MODEL_CALLS_RECORD_SCHEMA`` requires an integer: a record this kernel writes and its own
+    schema refuses. ``True == 1`` also satisfied the receipt's ordered-index invariant, so a
+    bool-indexed entry passed the one check that exists to make the log answerable.
+
+    The rule was already written down in this same file, one dataclass over: the usage loop on
+    both records spells ``type(value) is not int`` and carries a comment explaining that ``bool``
+    is an ``int`` subclass and a boolean count is a bug. It was applied to the mapping values and
+    to none of the scalar counts beside them -- the rule stated on one sibling and not the other.
+
+    Enumerated from the annotations, so the seventh count added tomorrow is covered the day it
+    exists. The review named two of the seven that were open; ``http_status`` on both records was
+    not validated at all.
+    """
+    numeric = _numeric_names(record)
+    assert numeric, f"{record.__name__} has no numeric fields to enumerate"
+
+    accepted = []
+    for name in numeric:
+        try:
+            built = record(**{name: True})
+        except WireValidationError:
+            continue
+        accepted.append((name, built.to_json()[name]))
+
+    assert accepted == [], {
+        "numeric_fields_that_stored_a_boolean": accepted,
+        "enumerated": numeric,
+        "hint": "type(value) is not int -- the rule the usage loop already spells",
+    }

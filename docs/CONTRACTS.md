@@ -443,6 +443,25 @@ adapter still counts as 1: the kernel did begin the call there. Under the kernel
 layer each re-dispatch adds one, so N means N adapter calls for one logical request. A payload that omits the field reads
 as 1, which is what older records mean.
 
+`ModelCallReceipt.attempt_log` itemizes what `attempts` counts: per dispatch, the index, the
+elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
+the adapter's loop reported *during that dispatch* (the receipt's `provider_retried` stays the
+whole call's fold), and whether a delivered chunk had closed the retry window when the attempt
+settled — possible only on the final entry. The log is empty or complete, and the record enforces
+both halves rather than trusting its writer: either there are no entries (a refused call, or a
+record written before the field existed) or their indices are exactly `1..attempts` in order, and
+their usage sums to the receipt's `usage`. A log that names one dispatch twice has the right
+length and still cannot answer what the second one did; a log whose rows do not add up to the bill
+they itemize leaves a reader with two numbers and no way to tell which to believe. Both are
+refused at construction, which is also why the runner builds the log and the merged total in a
+single `replace` — and refused again by `monoid validate`, which reads the ledger as JSON and
+constructs no receipt, so a JSON Schema that can only judge one entry at a time would have
+reported such a line clean. The log is optional; an *entry* is not: it has no writer predating
+it, so all ten of its keys are required on the wire and a partial one is refused rather than
+completed from defaults — defaults there turn a corrupt line into a plausible dispatch. Entries
+carry no wall-clock instant — the receipt's own rule; the ledger line's `recorded_at` anchors the
+call — and backoff waits fall between entries, so entry times sum to less than `latency_ms`.
+
 #### Generation parameters, reasoning, output schema, and the applied echoes
 
 `ModelConfig.generation: GenerationConfig` carries per-call sampling controls — `temperature`
@@ -852,7 +871,7 @@ refuses everything it cannot prove. The contract:
   parent's first post-spawn turn is a documented v1 limit — the spawn observation embeds
   per-run identifiers a replay honestly cannot reproduce, and fabricating them would be exactly
   the invented identity the key doctrine forbids.
-- **Ledger deltas, four, all here on purpose** (the fourth, `attributes.replay_from`, is the
+- **Ledger deltas, five, all here on purpose** (the fourth, `attributes.replay_from`, is the
   provenance stamp described under Provenance in [CLI.md](CLI.md) and is added by `monoid run`
   rather than by the adapter)**:** the adapter declares no `resolve_destination`,
   so a replay run's `destination_status` reads `not_declared` even when the original resolved;
@@ -865,7 +884,12 @@ refuses everything it cannot prove. The contract:
   through fallthrough is interchangeable with a live recording therefore depends on which
   branch the derivation took: where it declares, the term it declares *is* the original's
   resolved provider and the keys agree; where it declined, the live calls are keyed under a
-  term a correctly-configured live run will not compute.
+  term a correctly-configured live run will not compute. The fifth is the retry layer's: an
+  original that retried under `ModelRetryConfig.layer="kernel"` records `attempts=N`, an
+  N-entry `attempt_log`, and usage summing every billed attempt, while its replay — served
+  from disk without re-spending — records the one dispatch it actually made. Both lines are
+  true; the ledger describes its own run's transport, and recording is settle-driven, so the
+  corpus the two runs share is shape-identical either way.
 - **A miss message names run ids as well as terms.** The content-free rule bounds *values*, not
   identifiers. Three message families carry those identifiers. A term-by-term diagnosis
   names up to four diverging terms with a 12-hex digest prefix on each side and the run id of
@@ -2569,9 +2593,31 @@ upstream gateway deployment owns its own transport policy, and its retries surfa
 Under `"kernel"`, `ModelCallReceipt.attempts` counts every dispatch, `provider_retried`
 keeps meaning a loop *below* the adapter boundary ran, and usage stamped on attempts the
 loop swallowed is summed into the receipt's `usage` on either settle exit — the receipt is
-the audit surface for what the whole logical call cost. The run's cumulative token budget
-still meters settled turns and parked failures; per-attempt spend absorbed by any retry
-layer (this one, or an adapter's own) is visible on receipts rather than in the budget.
+the per-call audit surface for what the whole logical call cost, and `attempt_log` itemizes
+it per dispatch. The run's accounting consumes it: the settled path accumulates the
+receipt's usage, and the failure path restamps the terminal error with the merged total
+before it escapes, so `metrics.json`, `state.total_usage`, the cumulative token budget and
+the child roll-up all carry absorbed spend. The budget stays a pre-call gate — checked
+before a turn begins — and `max_attempts` is the bound on what one logical call may spend
+inside itself. Spend absorbed by an adapter's *own* loop is different: the client never
+sees those attempts' bills — each hop meters its own wire calls, the way the reference
+gateway's tenant meter counts them server-side — so a deployment that wants absorbed spend
+in run accounting assigns the loop to the kernel. A call the run's own boundary ends —
+cancelled, timed out, or a turn interrupted mid-call — counts the same: every arm the loop
+re-raises a model failure through reaches the accounting, not only the one typed to
+`ModelAdapterError`. The attempts a kernel retry absorbed before the boundary are completed,
+billed wire calls that finished before anything was cancelled, and the interrupt does not
+un-spend them; what a cancelled run still does not count is the terminating dispatch's own
+bill, which no layer has ever reported for a call that never settled.
+
+That holds below `Exception` too: a host cancelling the task that drives `asubmit`/`arun_once`
+raises `asyncio.CancelledError` into the call, and a `KeyboardInterrupt` arrives the same way —
+neither is a `NativeAgentError`, neither is an `Exception`, and both leave a live run behind that
+the host still finalizes and still reports totals for. Both account, and both are re-raised
+unchanged: accounting there is guarded so a raising observer cannot replace the stop, because a
+coroutine that swallows a cancellation is a broken coroutine. `SystemExit` and `GeneratorExit`
+deliberately do **not** account — teardown is where a recorder's sinks are closing, and a meter
+nobody will read is not worth touching a closing file for.
 
 ## Run Artifacts
 

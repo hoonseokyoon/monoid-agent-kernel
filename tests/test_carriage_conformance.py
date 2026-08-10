@@ -6677,8 +6677,10 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "core/schemas.py",
             "loop.py",
             # Joined in W7-0: the kernel retry loop reads the stamp off each attempt it
-            # swallows (`provider_usage_of`) so the receipt can sum what the whole logical
-            # call cost -- past the loop, the receipt is the only carrier left.
+            # swallows so the receipt can sum what the whole logical call cost. W7-1 moved
+            # the read behind `with_error`'s probe and added the write: the terminal error
+            # is restamped (`mark_provider_usage`) with the merged total, so the loop's
+            # failure accounting sees the whole call, not the last attempt.
             "model_call.py",
             "providers/base.py",
             "providers/gateway.py",

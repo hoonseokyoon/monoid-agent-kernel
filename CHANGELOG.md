@@ -7,6 +7,87 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — every dispatch on the record, and the record in the totals: `attempt_log`
+
+- **`ModelCallReceipt.attempt_log` itemizes what `attempts` counts.** One entry per kernel
+  dispatch: index, elapsed, the failure taxonomy `with_error` reads (probed on the attempt,
+  before the whole-call retry fold can colour it), per-attempt billed usage, per-attempt
+  `provider_retried` (the progress channel — which now counts reports instead of only
+  remembering one — plus what that attempt's own outcome declared), and whether a delivered
+  chunk had closed the retry window when the attempt settled. The log is empty or complete:
+  `len(attempt_log)` is 0 (a refused call, or a record written before the field existed) or
+  exactly `attempts`, and entry usage sums to the receipt's `usage` on either settle exit.
+  No wall-clock instant, the receipt's own rule — the ledger line's `recorded_at` anchors
+  the call, and backoff waits fall between entries.
+- **The `model-calls.v1` line carries the log, and old lines stay valid.** A fourth
+  hand-listed projection writes it (the reflection census refused `to_json()`, exactly as
+  designed); the schema declares the key without requiring it, because `monoid validate`
+  sweeps directories v0.20 writers filled. The writer always emits it, so absence means
+  exactly one thing: a writer that predates the field.
+- **The run's totals now read the receipt the call site used to discard.** On the settled
+  path the loop accumulates `receipt.usage` — which folds absorbed attempts' spend the turn
+  cannot know about — and on the failure path the terminal error is restamped with the
+  merged total before it escapes, so the existing park accounting adds the whole call.
+  `metrics.json`, `state.total_usage`, the cumulative token budget and the child roll-up
+  all see what a kernel-retried call actually cost. This supersedes W7-0's framing below
+  ("the receipt is the audit surface... the budget still meters settled turns"): the receipt
+  remains the per-call authority, and the run's accounting now consumes it. Stated
+  precisely: the token budget is a pre-call gate — checked before a turn begins —
+  and `max_attempts` is the intra-call bound on what one logical call may spend; transcript
+  `model_turn` rows keep the turn's own usage (the model's statement), so totals reconcile
+  as transcript rows plus absorbed spend. Spend absorbed by an adapter's *own* loop stays
+  client-invisible (each hop meters its own wire calls); a deployment that wants absorbed
+  spend in run accounting assigns the loop to the kernel.
+- **Every arm the loop re-raises a model failure through reaches that accounting, not the
+  one that was driven.** The bill is read inside an `except` clause, which binds it to the
+  types that clause catches: `except ModelAdapterError` covered a provider's refusal and
+  nothing else, so a third-party exception (rebuilt from its message, stamps dropped) and
+  every run boundary (`RunCancelled`, `RunTimeout`, and the `ModelCallAborted` translated
+  into a `TurnInterrupted` — all `NativeAgentError`, all one arm further along) carried the
+  absorbed spend out of the loop with no one reading it. One translator now carries what was
+  stamped onto any error it replaces, and one accounting function is reached from both
+  re-raising arms. Visible change: a cancelled, timed-out or interrupted run's
+  `metrics.json` and `total_usage` now include attempts a kernel retry completed and paid
+  for before the boundary; the terminating dispatch's own bill is still not counted, as it
+  never was for a call that did not settle.
+- **…including the stops that are not `Exception`s.** `asyncio.CancelledError` has inherited
+  straight from `BaseException` since 3.8, so a host cancelling the task driving
+  `asubmit`/`arun_once` — and a `KeyboardInterrupt` — reached *no* arm rather than the wrong
+  one, carrying the stamp the runner had just written. Both now account and both are
+  re-raised unchanged, guarded so a raising observer cannot replace the stop; the run
+  outlives them and its totals are still reported. `SystemExit` and `GeneratorExit` reach an
+  explicit arm that deliberately stays silent: teardown is where a recorder's sinks are
+  closing. The handler chain is now total, so a class outside `Exception` is a written
+  decision rather than an omission.
+- **An `attempt_log` entry is read whole or refused, and the sweep checks the two claims
+  that span entries.** The entry reader defaulted all ten fields, so `[{}]` beside
+  `attempts: 1` deserialized into a plausible successful dispatch — an entry has no writer
+  predating it, and the ledger schema had required all ten since the field shipped. And
+  because `monoid validate` reads the ledger as JSON without constructing a receipt, the
+  index and usage-sum invariants `__post_init__` refuses were unenforced there; a
+  relationship pass now applies both, alongside the ones the manifest, proposal, transcript
+  and payload surfaces already had.
+- **`stream_committed` answers on both retry layers, not only the one that reads it.** The
+  delivery marker was installed on the consumer only when the kernel owns the loop — where
+  the flag is *used*, to refuse a retry that would replay a chunk — while the flag is
+  *recorded* on every call and `layer` defaults to `"adapter"`. Every shipped streaming call
+  therefore wrote a definite `stream_committed: false` onto its ledger line with the
+  consumer holding its chunks, and a present `false` cannot be told from "this arm never
+  answered".
+- **`ModelCallReceipt.with_error` cannot fail the call it is reporting.** Every read in that
+  method is guarded so a description of a failure never replaces it; the usage-sum invariant
+  reopened that door, because the method overwrites `usage` from the exception's stamp and
+  leaves `attempt_log` alone — so calling it on a receipt already carrying entries raised
+  `ValueError` out of the reporting path. A receipt that already carries its own breakdown
+  now keeps its total, the rule `provider_retried` already followed.
+- **Promoted from the post-W7-0 reassessment probes, now permanent pins:** delivery is
+  marked before the consumer runs (a consumer raising a retryable-dressed error cannot
+  reopen the stream and replay its own side effect); a consumer exception propagates with
+  its type intact, never retried; the anext-coroutine and awaitable-returning dispatch
+  shapes retry under the kernel layer like their two siblings; and kernel retry rides the
+  replay fallthrough — miss, flaky inner, retry, miss again, inner answers — without
+  spinning the corpus.
+
 ### Added — the kernel owns the retry when the config says so: `ModelRetryConfig.layer`
 
 - **`ModelRetryConfig` names who runs the retry loop.** `layer: "adapter" | "kernel"`

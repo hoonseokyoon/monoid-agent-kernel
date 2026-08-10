@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Mapping
@@ -22,7 +23,12 @@ from monoid_agent_kernel.core.checkpoint import (
 from monoid_agent_kernel.core.schemas import validate_run_dir
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolQuota
-from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.errors import (
+    ModelAdapterError,
+    ModelCallAborted,
+    RunCancelled,
+    RunTimeout,
+)
 from monoid_agent_kernel.loop import AgentLoop, _recoverable_turn_error
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelTurn, ReasoningDelta, TextDelta, TurnComplete
@@ -2557,6 +2563,566 @@ def test_a_failure_that_reports_no_usage_adds_nothing(tmp_path: Path) -> None:
         }
     finally:
         loop.close()
+
+
+def _kernel_retry_loop(
+    tmp_path: Path, adapter: _ScriptedAdapter
+) -> tuple[AgentLoop, MemoryEventSink, Path]:
+    """A loop whose runtime config assigns the retry loop to the kernel, zero schedule."""
+
+    from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    run_root = tmp_path / "runs"
+    sink = MemoryEventSink()
+    loop = AgentLoop(
+        spec=AgentRunSpec(workspace_root=workspace, run_root=run_root),
+        model_adapter=adapter,
+        runtime_config_provider=runtime_provider(
+            runtime_config(
+                "run.finish",
+                model=ModelConfig(
+                    retry=ModelRetryConfig(
+                        layer="kernel", max_attempts=2, initial_delay_s=0.0, jitter_s=0.0
+                    )
+                ),
+            )
+        ),
+        event_sinks=(sink,),
+    )
+    return loop, sink, run_root
+
+
+def test_a_kernel_absorbed_attempts_bill_reaches_the_run_budget(tmp_path: Path) -> None:
+    """The receipt was the only carrier of absorbed spend; now the run's totals read it.
+
+    Attempt one fails retryable with a billed body; the kernel absorbs it and attempt two
+    answers. The turn still says what the model said -- the transcript row keeps the final
+    attempt's own usage -- while ``total_usage``, the metrics event, and therefore the token
+    budget and the child roll-up carry what the whole logical call cost. Before this, the
+    loop discarded the receipt at the call site and accumulated ``turn.usage``: metrics
+    reported a run cheaper than it was, and the cumulative budget was a bound that did not
+    hold across absorbed attempts.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    adapter = _ScriptedAdapter(
+        [
+            absorbed,
+            ModelTurn(
+                response_id="r2",
+                final_text="recovered",
+                usage={"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            ),
+        ]
+    )
+    loop, sink, run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "settled"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 12
+    finally:
+        loop.close()
+
+    # The transcript's model_turn row keeps the turn's own usage -- the model's statement,
+    # not the call's bill. The ledger (receipt) and the metrics carry the call-level truth;
+    # reconciliation is: metrics == transcript rows + absorbed spend.
+    run_dir = next(iter(run_root.iterdir()))
+    turn_rows = [
+        json.loads(line)
+        for line in (run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") == "model_turn"
+    ]
+    assert turn_rows[0]["usage"]["total_tokens"] == 7
+
+
+def test_a_kernel_exhausted_calls_whole_bill_reaches_the_run_budget(tmp_path: Path) -> None:
+    """The failure arm of the rule above, green by design and guarded here.
+
+    Both attempts fail billed; the kernel exhausts its budget and re-raises the second
+    error restamped with the merged total, so the loop's existing failure accounting
+    (``_billed_usage`` at the park) adds the whole call -- not the last attempt -- to
+    ``total_usage``. A restamp that stops happening, or a park arm that reads the turn
+    instead of the stamp, turns this red.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    first = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(first, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    second = ModelAdapterError("still overloaded", retryable=True)
+    mark_provider_usage(second, {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7})
+
+    adapter = _ScriptedAdapter([first, second])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "turn_failed"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 12
+    finally:
+        loop.close()
+
+
+def test_a_kernel_absorbed_bill_survives_a_non_adapter_terminal_error(tmp_path: Path) -> None:
+    """The twin door of the rule above: the terminal error is not a ``ModelAdapterError``.
+
+    A third-party adapter is free to raise its own exception type, and the kernel's settle
+    handler stamps the merged bill on whatever escapes -- but the loop's failure accounting
+    reads that stamp in its ``except ModelAdapterError`` arm only. An exception arriving as
+    anything else took the generic arm instead, which built a *fresh* ``ModelAdapterError``
+    from the message and dropped the stamp with the original, so every absorbed attempt fell
+    out of ``total_usage``, the metrics event and the token budget -- the exact accounting
+    hole this branch exists to close, surviving on the arm nobody drove.
+
+    Attempt one fails retryable with a billed body; attempt two raises ``RuntimeError``. The
+    run ends ``terminal`` on both sides of the fix -- an exception that is not a
+    ``ModelAdapterError`` carries no classification, so the error the loop speaks in its place
+    is not retryable and the run does not park -- so nothing but the bill distinguishes the
+    fixed code from the broken code. That is what makes the usage the assertion here, and the
+    park reason a pinned constant beside it.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    first = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(first, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+
+    adapter = _ScriptedAdapter([first, RuntimeError("adapter blew up")])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == "terminal"
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "reason"),
+    [
+        (RunCancelled("run cancelled"), "terminal"),
+        (RunTimeout("run exceeded max duration"), "terminal"),
+        (ModelCallAborted("aborted"), "interrupted"),
+    ],
+    ids=["cancelled", "timed_out", "aborted"],
+)
+def test_a_kernel_absorbed_bill_survives_every_boundary_exit(
+    tmp_path: Path, boundary: BaseException, reason: str
+) -> None:
+    """The remaining twins of the accounting arm: a call the run's own boundary ended.
+
+    The generic-exception door was closed by routing it through the translator, which lands the
+    failure in ``except ModelAdapterError`` where the bill is read. A run boundary lands nowhere
+    near it: ``RunCancelled``, ``RunTimeout`` and the ``ModelCallAborted`` the loop turns into
+    ``TurnInterrupted`` are all ``NativeAgentError``, so they take the arm one line below --
+    which re-raised and accounted for nothing. The absorbed attempts on the other side of that
+    boundary are completed, billed wire calls; they finished before anything was cancelled, and
+    the ledger has them while ``total_usage`` did not.
+
+    The abort arm loses them twice over: it replaces ``ModelCallAborted`` with a freshly built
+    ``TurnInterrupted``, and a fresh exception carries no stamps -- the same rebuild-from-nothing
+    that cost the generic arm its bill, in the one place the loop still spelled it by hand.
+
+    Attempt one fails retryable with a billed body; attempt two raises the boundary. Each row
+    ends the run differently -- a cancelled or timed-out run is terminal, an aborted turn parks
+    alive for the next message -- and the bill is the same on all three.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+
+    adapter = _ScriptedAdapter([absorbed, boundary])
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+    loop.open()
+    try:
+        assert loop.run_until_suspended("hello").reason == reason
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
+class _StallsAfterAbsorbing:
+    """Fails once, billed and retryable, then parks forever inside the second dispatch.
+
+    The stall is what makes the cancellation a *host* cancellation: the second attempt is
+    suspended at an ``await`` when the driving task is cancelled, so the ``CancelledError`` is
+    delivered into the runner rather than raised by the adapter. The runner tells those two
+    apart on purpose -- an adapter that cancels its own call becomes a
+    ``model_adapter_cancelled`` ``ModelAdapterError`` (`CalleeCancelled`), which lands in the
+    accounting arm and always did. Only the delivered one escapes as itself.
+    """
+
+    def __init__(self, absorbed: BaseException) -> None:
+        self.absorbed = absorbed
+        self.calls = 0
+        self.stalled = asyncio.Event()
+
+    async def anext_turn(self, request: Any) -> ModelTurn:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            raise self.absorbed
+        self.stalled.set()
+        await asyncio.Event().wait()  # never returns; the host cancels us here
+        raise AssertionError("unreachable")
+
+
+def test_a_kernel_absorbed_bill_survives_a_host_cancellation(tmp_path: Path) -> None:
+    """The arms below `Exception`: a stop that ends the call without being a failure.
+
+    `asyncio.CancelledError` has inherited straight from `BaseException` since 3.8, so it is
+    neither a `NativeAgentError` nor an `Exception` and matches none of the three arms that
+    answer for a model call. It does not fall through them -- it never reaches them, and an
+    arm that does not exist is invisible to a census that enumerates arms. The runner had
+    already stamped the cumulative bill onto it (every attempt a kernel retry absorbed), and
+    nothing read the stamp.
+
+    The run object outlives the cancellation: the host that cancelled the task still finalizes
+    the run and still reports its totals, and the spend it drops completed *before* the cancel
+    arrived. Accounting for it must not swallow it -- a coroutine that absorbs a
+    `CancelledError` is a broken coroutine -- so the cancellation is re-raised and asserted.
+    """
+
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    absorbed = ModelAdapterError("transient overload", retryable=True)
+    mark_provider_usage(absorbed, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    adapter = _StallsAfterAbsorbing(absorbed)
+    loop, sink, _run_root = _kernel_retry_loop(tmp_path, adapter)
+
+    async def drive() -> None:
+        loop.open()
+        task = asyncio.ensure_future(loop.arun_until_suspended("hello"))
+        await asyncio.wait_for(adapter.stalled.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(drive())
+        assert adapter.calls == 2
+        totals = dict(loop._session.state.total_usage)  # type: ignore[union-attr]
+        assert totals == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        assert metrics and metrics[-1].data["total_tokens"] == 5
+    finally:
+        loop.close()
+
+
+def test_a_model_failure_the_adapter_did_not_classify_keeps_its_stamps() -> None:
+    """The translator's own contract, stated as the split it makes: stamps travel, taxonomy does not.
+
+    ``mark_provider_usage`` and ``mark_provider_retried`` exist to put a fact on an error so it
+    survives the error's escape; rebuilding the error from its message alone is exactly the event
+    they were written for, and it dropped them. Classification is the other half and moves the
+    other way: ``retryable`` decides whether the run parks or terminalizes, so reading it off
+    whatever attribute an arbitrary exception happens to expose would let a third-party error
+    change a run's fate through a name collision.
+    """
+
+    from monoid_agent_kernel.loop import _as_model_adapter_error
+    from monoid_agent_kernel.providers.base import (
+        mark_provider_retried,
+        mark_provider_usage,
+        provider_usage_of,
+    )
+
+    raw = RuntimeError("adapter blew up")
+    mark_provider_usage(raw, {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
+    mark_provider_retried(raw)
+
+    translated = _as_model_adapter_error(raw)
+    assert isinstance(translated, ModelAdapterError)
+    assert str(translated) == "adapter blew up"
+    assert provider_usage_of(translated) == {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "total_tokens": 5,
+    }
+    assert translated.provider_retried is True
+    assert translated.retryable is False
+    assert translated.http_status is None
+
+    # Already the loop's vocabulary: returned unchanged, so the caller re-raises bare and the
+    # original traceback and classification survive untouched.
+    already = ModelAdapterError("classified", retryable=True, http_status=503)
+    assert _as_model_adapter_error(already) is already
+    # And not an ``Exception`` at all: a KeyboardInterrupt is not a model failure.
+    interrupt = KeyboardInterrupt()
+    assert _as_model_adapter_error(interrupt) is interrupt
+
+
+def test_every_model_failure_the_loop_re_raises_goes_through_one_translator() -> None:
+    """Derived census: no second spelling of "replace this exception with a model error".
+
+    The bill was lost because two doors into the same handler disagreed -- one arm carried what
+    the runner stamped, its twin rebuilt the error from the message -- so the instrument that
+    keeps it closed is not a test of the fixed arm but an enumeration of the shape. Every
+    ``raise ModelAdapterError(...) from <cause>`` in ``loop.py`` is a site that replaces one
+    exception with another, and each must be the translator, which is where the carrying rule
+    lives. A new wrap site anywhere in the file reddens this until it goes through the same
+    function.
+
+    Bare ``raise ModelAdapterError(...)`` with no cause is deliberately out of scope: it
+    originates a failure rather than replacing one, so it has no stamps to carry (two such sites
+    exist today, and they stay legal).
+
+    Enumerating the ``raise ... from`` form alone leaves one spelling open, and it is the one
+    this very file makes idiomatic: ``_acall_model`` builds its failure into a name and raises
+    *that*, so ``failure = ModelAdapterError(str(exc)); raise failure from exc`` is a single
+    assignment away from restoring the defect under a green census. The second clause below
+    therefore refuses the construction itself anywhere a caught error is in scope. Every site
+    that legitimately builds one sits outside every ``except`` -- a turn that settled with
+    neither text nor tool calls, a usage value that is not a count, a driver's give-up promoted
+    to the terminal record -- because there is no stamped original there to lose.
+    """
+
+    import ast
+
+    loop_source = (
+        Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "loop.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(loop_source)
+
+    rebuilt = [
+        (node.lineno, ast.unparse(node))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Raise)
+        and node.cause is not None
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "ModelAdapterError"
+    ]
+    assert rebuilt == [], {
+        "sites_rebuilding_an_error_instead_of_translating_it": rebuilt,
+        "hint": "raise _as_model_adapter_error(exc) from exc -- one translator, every door",
+    }
+
+    # And the translator is actually reached, from both doors: the boundary that raises what the
+    # runner let escape, and the caller's generic arm around it. A census that only refused the
+    # bad shape would stay green if the good shape were deleted with it.
+    translations = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_as_model_adapter_error"
+    )
+    assert len(translations) == 2, {"call_sites": translations}
+
+    # The assignment spelling, refused at the construction rather than at the raise.
+    constructed_where_an_error_was_caught = sorted(
+        (node.lineno, ast.unparse(node))
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.ExceptHandler)
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelAdapterError"
+    )
+    assert constructed_where_an_error_was_caught == [], {
+        "built_with_a_caught_error_in_scope": constructed_where_an_error_was_caught,
+        "hint": "_as_model_adapter_error is the only thing that turns a caught error into one",
+    }
+
+    # Naming ``ModelAdapterError`` is what the three clauses above have in common, and it is the
+    # part of the rule that was never the rule: the boundary also replaces ``ModelCallAborted``
+    # with a ``TurnInterrupted``, a different class doing the identical thing, and every clause
+    # above walks past it. Scoped to the function that makes the model call rather than to a
+    # class, so a fourth replacement of a fifth type is covered on the day it is written.
+    boundary = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and any(
+            isinstance(call.func, ast.Attribute) and call.func.attr == "acall"
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+        )
+    )
+    carried = {"_carrying_stamps", "_as_model_adapter_error"}
+    replacements: dict[int, str] = {}
+    for node in ast.walk(boundary):
+        if not isinstance(node, ast.Raise) or node.cause is None or node.exc is None:
+            continue
+        raised = node.exc
+        if isinstance(raised, ast.Name):
+            # ``failure = <expr>`` ... ``raise failure from exc``: resolve the one assignment
+            # that binds the name, so the spelling this file prefers is judged by what it built.
+            raised = next(
+                (
+                    assigned.value
+                    for assigned in ast.walk(boundary)
+                    if isinstance(assigned, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == raised.id  # type: ignore[union-attr]
+                        for target in assigned.targets
+                    )
+                ),
+                raised,
+            )
+        reached = {
+            call.func.id
+            for call in ast.walk(raised)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+        if not reached & carried:
+            replacements[node.lineno] = ast.unparse(node)
+    assert replacements == {}, {
+        "replacements_that_drop_what_was_stamped_on_the_original": replacements,
+        "hint": "_carrying_stamps(<replacement>, exc) -- the bill is on the exception, not the type",
+    }
+
+    # And the carrying rule is reached from both replacements, so deleting one cannot pass by
+    # deleting the shape the clause above looks for.
+    carriers = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_carrying_stamps"
+    )
+    assert len(carriers) == 2, {"call_sites": carriers}
+
+
+def test_every_arm_that_re_raises_a_model_call_accounts_for_what_it_billed() -> None:
+    """Derived census: the accounting is a property of the ``try``, not of one of its handlers.
+
+    The bill reaches ``total_usage`` from inside an ``except`` clause, which binds it to the types
+    that clause catches. ``except ModelAdapterError`` was the arm someone drove, so it was the arm
+    that accounted; the ``except NativeAgentError`` beside it -- where every run boundary lands,
+    cancel, timeout, and the translated abort -- re-raised an exception the runner had just stamped
+    with the whole call's bill and read nothing off it. Same shape as the generic-arm defect this
+    file already carries an instrument for, one arm further along, and invisible to that instrument
+    because nothing here is a ``ModelAdapterError``.
+
+    Enumerated from the ``try`` that wraps the model call: every handler that re-raises what it
+    caught reaches the accounting. A handler that raises something *else* is out of scope and must
+    be -- it is a replacement, which the carrying census above governs, and the exception it lets
+    escape is not the one the runner stamped.
+
+    What this test could not see, and now can
+    -----------------------------------------
+    The first version enumerated ``guarded[0].handlers`` and required each to account. That reads
+    as "every arm answers for its bill" and means something strictly narrower: *of the arms that
+    exist*, each accounts. A class with no arm contributes **no row** -- it is not an unaccounted
+    handler, it is zero handlers -- so the census could only ever catch an arm that answers wrongly
+    and never a class that reaches no arm at all. The arms stopped at ``Exception``, and
+    ``asyncio.CancelledError`` has inherited straight from ``BaseException`` since 3.8: a host
+    cancelling the driving task walked past every arm, carrying the stamp the runner had just
+    written, and this test stayed green because there was nothing for it to enumerate. It was
+    green *because* the defect was total rather than partial.
+
+    The rule is about escape routes; the encoding was about handlers, and the two agree only where
+    an arm exists. So the coverage clause comes first now: the handler set must be **total** --
+    some arm must catch ``BaseException`` -- which makes "no arm" unrepresentable and forces every
+    class outside ``Exception`` to be a decision someone wrote down rather than an omission nobody
+    could see. The split between the classes that account and the ones that must not is then a
+    policy this test states, because no static reading of the source can derive it.
+    """
+
+    import ast
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "loop.py").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def _calls(node: ast.AST, name: str) -> list[ast.Call]:
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == name
+        ]
+
+    def _caught(handler: ast.ExceptHandler) -> frozenset[str]:
+        if handler.type is None:
+            return frozenset({"BaseException"})
+        if isinstance(handler.type, ast.Tuple):
+            return frozenset(ast.unparse(element) for element in handler.type.elts)
+        return frozenset({ast.unparse(handler.type)})
+
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(_calls(statement, "_acall_model") for statement in node.body)
+    ]
+    assert len(guarded) == 1, {"try_blocks_wrapping_the_model_call": [n.lineno for n in guarded]}
+
+    arms = [(_caught(handler), handler) for handler in guarded[0].handlers]
+    caught = frozenset[str]().union(*(types for types, _ in arms))
+
+    # (a) Coverage, first, because the clauses after it can only speak about arms that exist.
+    assert "BaseException" in caught, {
+        "widest_arm_in_the_handler_chain": sorted(caught),
+        "hint": (
+            "an exception class with no arm is invisible to an enumeration of arms; "
+            "catch BaseException so every class outside Exception is a written decision"
+        ),
+    }
+
+    # (b) The stops that the run outlives are named by an arm of their own rather than left to the
+    #     widest one. Stated here because no reading of the source can derive which BaseException
+    #     subclasses leave a live recorder behind: a cancelled task and a Ctrl-C do, interpreter
+    #     and generator teardown do not.
+    stopping = {"asyncio.CancelledError", "KeyboardInterrupt"}
+    assert stopping <= caught, {
+        "stopping_classes_with_no_arm_of_their_own": sorted(stopping - caught),
+        "hint": "these two carry a stamped bill and the run outlives them, so they account",
+    }
+
+    # (c) Every arm that re-raises what it caught accounts -- except the teardown arm, which is
+    #     exactly the arm catching nothing but ``BaseException``: what reaches it is SystemExit,
+    #     GeneratorExit, and anything else raised outside the Exception hierarchy, all of which
+    #     mean "do not run ordinary cleanup".
+    teardown = frozenset({"BaseException"})
+    unaccounted = {
+        ", ".join(sorted(types)): handler.lineno
+        for types, handler in arms
+        if types != teardown
+        and any(isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler))
+        and not _calls(handler, "_account_billed_model_call")
+    }
+    assert unaccounted == {}, {
+        "arms_re_raising_a_billed_failure_without_counting_it": unaccounted,
+        "hint": "self._account_billed_model_call(exc, ...) -- one route into the totals",
+    }
+    # And the teardown arm stays silent on purpose: if it ever starts accounting, that is a
+    # decision to publish a meter through a closing recorder, and it should not pass unread.
+    assert not [
+        handler.lineno
+        for types, handler in arms
+        if types == teardown and _calls(handler, "_account_billed_model_call")
+    ], {"hint": "teardown must not publish through a recorder whose sinks are closing"}
+
+    # (d) All three answering arms reached it, so deleting the accounting everywhere cannot pass by
+    #     emptying the file of the shape this census looks for.
+    accounting = [
+        handler.lineno for _types, handler in arms if _calls(handler, "_account_billed_model_call")
+    ]
+    assert len(accounting) == 3, {"arms_that_account": accounting}
 
 
 # --- the wire prunes reasoning the provider can no longer replay ------------------------------

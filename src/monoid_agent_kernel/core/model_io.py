@@ -24,9 +24,21 @@ import copy
 import re
 import secrets
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from functools import lru_cache
-from typing import Any, Literal, Protocol, runtime_checkable
+from types import UnionType
+from typing import (
+    Any,
+    Literal,
+    Protocol,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+    runtime_checkable,
+)
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -692,6 +704,219 @@ def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset
     return str(value)
 
 
+def _annotation_admits(annotation: Any, wanted: Any) -> bool:
+    """Whether ``annotation`` names ``wanted`` outright or as a union member.
+
+    A parameterized container is not a match: ``Mapping[str, int]`` has ``int`` among its args and
+    is not an integer field. Only a bare annotation or a union of them counts, which is what keeps
+    the two censuses below off ``usage`` -- whose *values* are governed by their own loop.
+    """
+
+    if annotation is wanted:
+        return True
+    return get_origin(annotation) in (Union, UnionType) and wanted in get_args(annotation)
+
+
+@lru_cache(maxsize=None)
+def _field_names_admitting(cls: type, wanted: Any) -> frozenset[str]:
+    """The record's own fields whose declared type admits ``wanted``.
+
+    Derived from the annotations rather than restated beside them, for the reason the wire-key
+    tuple below already gives: a field added tomorrow joins the rule the day it exists, not the
+    day someone remembers a list. Cached because both censuses run on every construction and
+    every read of these records.
+    """
+
+    hints = get_type_hints(cls)
+    return frozenset(
+        entry.name
+        for entry in dataclass_fields(cls)
+        if _annotation_admits(hints.get(entry.name), wanted)
+    )
+
+
+def _validate_counts(record: Any, label: str) -> None:
+    """Every count on ``record`` is a real integer -- one predicate, applied by enumeration.
+
+    ``bool`` is an ``int`` subclass, so a count validated by comparison alone admits ``True``:
+    ``True < 1`` is ``False``, so a bounds check passes it, ``True == 1`` satisfies the receipt's
+    ordered-index invariant, and ``to_json`` then emits a JSON boolean where
+    ``MODEL_CALLS_RECORD_SCHEMA`` requires an integer -- a record this kernel writes and its own
+    schema refuses to read back.
+
+    The rule itself is not new here. The usage loops on both records already spell
+    ``type(value) is not int`` and explain why; it had simply been applied to the mapping values
+    and to none of the scalar counts standing beside them. Stated once and enumerated so the two
+    records cannot drift apart again, which is exactly how they got here.
+
+    A field declared nullable may hold ``None``; that too is read off the annotation.
+    """
+
+    nullable = _field_names_admitting(type(record), type(None))
+    for name in sorted(_field_names_admitting(type(record), int)):
+        value = getattr(record, name)
+        if value is None and name in nullable:
+            continue
+        # ``isinstance`` minus ``bool``, NOT ``type(value) is int``. The first spelling of this
+        # rule was the stricter one and it broke a documented acceptance: ``with_error`` reads
+        # ``http_status`` off an arbitrary exception under
+        # ``isinstance(http_status, bool) or not isinstance(http_status, int)`` -- excluding
+        # ``bool`` by name while admitting every other ``int`` subclass, because an
+        # ``http.HTTPStatus`` is what an HTTP client hands back -- and the ``replace()`` inside
+        # it then re-ran this check and refused the value its own reader had just accepted.
+        #
+        # Narrowed to the defect this census was written for rather than exempting the one field
+        # that was noticed: the finding was ``bool``, and only ``bool``. A per-field exemption
+        # would have left the same over-reach standing on the other six counts.
+        #
+        # ``usage`` keeps the stricter ``type(value) is not int`` in its own loop, deliberately
+        # and for a reason that does not apply here: its four sibling readers spell the same, so
+        # an ``IntEnum`` token count accepted there would be dropped by every one of them. These
+        # scalars have no such readers -- they are emitted straight to JSON, where an ``IntEnum``
+        # serializes as the integer it is.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise WireValidationError(f"{label} {name} must be an integer")
+
+
+def _refuse_null_wire_values(payload: Mapping[str, Any], cls: type, label: str) -> None:
+    """A key present and holding ``null`` is a corrupt record, not an absent one.
+
+    Absence on these records means one thing -- a writer that predates the field -- and the
+    defaults reconstruct what that writer meant. ``null`` means a writer that had the field and
+    wrote nothing into it, which no writer here has ever done: ``to_json`` emits an object for
+    every one of them. Collapsing the two put an explicit null onto the field's legacy default,
+    and the defaults are load-bearing: an empty ``usage`` still satisfies the receipt's
+    cross-entry sum invariant, and an empty ``attempt_log`` reads as "no ledger was ever written"
+    rather than as the erasure it is.
+
+    Enumerated over the record's own fields, minus the ones declared nullable, so this cannot be
+    the rule for the fields someone remembered. The per-field required-key pin is a different
+    question and remains one: it asks whether the key is present, and a key holding null is.
+    """
+
+    nullable = _field_names_admitting(cls, type(None))
+    required = frozenset(entry.name for entry in dataclass_fields(cls)) - nullable
+    nulls = sorted(key for key in required if key in payload and payload[key] is None)
+    if nulls:
+        raise WireValidationError(f"{label} fields must not be null: {', '.join(nulls)}")
+
+
+@dataclass(frozen=True)
+class ModelCallAttempt:
+    """One kernel dispatch inside a settled call, as the receipt's log records it.
+
+    Same rule as the receipt that carries it: metadata only — taxonomy, counts, timings — so the
+    log is as safe to hand to a ``none``-mode observer as the receipt is. Success is spelled the
+    way the receipt spells it: an empty ``error_code``. There is no separate outcome enum, because
+    the receipt's own convention already answers the question and a second vocabulary for the same
+    fact is a divergence waiting to be recorded.
+
+    No wall-clock instant, deliberately — the receipt carries ``latency_ms`` and no instant, and
+    the ledger line's ``recorded_at`` is the anchor for the whole call (see
+    ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only; backoff
+    waits fall between entries, so the entries sum to less than the receipt's ``latency_ms``.
+
+    ``provider_retried`` here is what the adapter reported through the progress channel *during
+    this attempt's dispatch*, plus what this attempt's own outcome object declared. The receipt's
+    flag additionally folds whole-call evidence, so the entry can read ``False`` where the receipt
+    reads ``True`` — the entry is the per-attempt attribution, the receipt is the call's.
+
+    ``stream_committed`` is whether a streamed chunk had been delivered when this attempt settled.
+    Delivery closes the retry window, so it can only be ``True`` on the final entry.
+    """
+
+    index: int = 1
+    elapsed_ms: int = 0
+    error_code: str = ""
+    provider_error_code: str = ""
+    retryable: bool = False
+    config_recoverable: bool = False
+    http_status: int | None = None
+    provider_retried: bool = False
+    usage: Mapping[str, int] = field(default_factory=dict)
+    stream_committed: bool = False
+
+    def __post_init__(self) -> None:
+        # Type before bounds: a comparison cannot tell an integer from a bool, so the bounds
+        # checks below are only meaningful once every count is known to be one.
+        _validate_counts(self, "model call attempt")
+        if self.index < 1:
+            raise ValueError("model call attempt index must be positive")
+        if self.elapsed_ms < 0:
+            raise ValueError("model call attempt elapsed_ms must not be negative")
+        # The same usage rule the receipt enforces, spelled the same way: a log whose entries
+        # admitted what the receipt refuses could not honor the sum invariant the runner pins
+        # (entry usage totals equal the receipt's usage on either settle exit).
+        for key, value in self.usage.items():
+            if not isinstance(key, str) or type(value) is not int:
+                raise WireValidationError("model call attempt usage must be a mapping of str to int")
+            if value < 0:
+                raise WireValidationError(
+                    f"model call attempt usage {key!r} must not be negative"
+                )
+        object.__setattr__(self, "usage", dict(self.usage))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether this dispatch produced the turn — the receipt's own convention."""
+        return self.error_code == ""
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "elapsed_ms": self.elapsed_ms,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
+            "http_status": self.http_status,
+            "provider_retried": self.provider_retried,
+            "usage": dict(self.usage),
+            "stream_committed": self.stream_committed,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Any) -> ModelCallAttempt:
+        payload = require_object(payload, "model_call_attempt")
+        # An entry is read whole or refused, which is not the rule one level up and must not be.
+        # ``attempt_log`` itself is optional because its absence means exactly one thing -- a
+        # writer that predates the field -- and defaults there reconstruct what that writer meant.
+        # An entry has no predecessor to be lenient toward: it was written by a writer that knew
+        # all ten keys or it was not written by this record at all. Defaulting them turned `{}`
+        # into a successful, zero-duration, unbilled dispatch numbered 1, which then satisfied
+        # both of the receipt's cross-entry invariants -- a corrupt audit line reading as data,
+        # the one outcome an audit surface may not produce. The ledger schema has required all
+        # ten since the field shipped; this is the reader agreeing with it.
+        missing = [name for name in _ATTEMPT_WIRE_KEYS if name not in payload]
+        if missing:
+            raise WireValidationError(
+                "model call attempt is missing required fields: " + ", ".join(missing)
+            )
+        # Present-and-null is the other half of the same question, and the pin above cannot ask
+        # it: a key holding ``null`` satisfies ``name in payload``.
+        _refuse_null_wire_values(payload, cls, "model call attempt")
+        raw_status = payload.get("http_status")
+        return cls(
+            index=parse_int(payload, "index", default=1),
+            elapsed_ms=parse_int(payload, "elapsed_ms"),
+            error_code=parse_str(payload, "error_code"),
+            provider_error_code=parse_str(payload, "provider_error_code"),
+            retryable=parse_bool(payload, "retryable"),
+            config_recoverable=parse_bool(payload, "config_recoverable"),
+            http_status=None if raw_status is None else parse_int(payload, "http_status"),
+            provider_retried=parse_bool(payload, "provider_retried"),
+            usage=_optional_object(payload, "usage") or {},
+            stream_committed=parse_bool(payload, "stream_committed"),
+        )
+
+
+# Derived from the record, not restated beside it: a field added to ``ModelCallAttempt`` becomes
+# required on the wire the moment it exists, rather than the moment someone remembers a list.
+_ATTEMPT_WIRE_KEYS: tuple[str, ...] = tuple(
+    entry.name for entry in dataclass_fields(ModelCallAttempt)
+)
+
+
 @dataclass(frozen=True)
 class ModelCallReceipt:
     """What happened on one model call, without any of what was said.
@@ -761,10 +986,39 @@ class ModelCallReceipt:
     # receipt into a guessing oracle for an internal hostname.
     destination_status: str = "not_reached"
     destination_digest: str = ""
+    # One entry per kernel dispatch, in order. Empty on receipts written before the field
+    # existed and on refused calls (``attempts == 0``); otherwise one entry per attempt, so the
+    # log is either absent or complete. Both halves of "complete" are enforced below rather
+    # than left to the writer: the indices are ``1..attempts`` in order (a log naming some
+    # attempts twice and others not at all could not answer the question it exists for, and
+    # counting alone cannot tell the two apart), and the entries' usage sums to this receipt's
+    # (a breakdown that disagrees with its total leaves a reader nothing to believe). Appended
+    # last so positional construction predating this field keeps meaning what it meant.
+    attempt_log: tuple[ModelCallAttempt, ...] = ()
 
     def __post_init__(self) -> None:
+        # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
+        # so a comparison admits the bool it exists to bound.
+        _validate_counts(self, "model call")
         if self.attempts < 0:
             raise ValueError("model call attempts must not be negative")
+        if type(self.attempt_log) is not tuple:
+            object.__setattr__(self, "attempt_log", tuple(self.attempt_log))
+        for entry in self.attempt_log:
+            if not isinstance(entry, ModelCallAttempt):
+                raise WireValidationError(
+                    "model call attempt_log entries must be ModelCallAttempt records"
+                )
+        # "Exactly once" is the claim, so the indices carry it rather than the count. A length
+        # check accepts a log of the right size naming one dispatch twice and another not at
+        # all -- well-formed in every other field, and unanswerable for the question the log
+        # exists for, with nothing in the record to say so.
+        if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
+            range(1, self.attempts + 1)
+        ):
+            raise ValueError(
+                "model call attempt_log must be empty or name every attempt exactly once"
+            )
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")
         if self.capture_downgrades < 0:
@@ -793,6 +1047,19 @@ class ModelCallReceipt:
             if value < 0:
                 raise WireValidationError(f"model call usage {key!r} must not be negative")
         object.__setattr__(self, "usage", dict(self.usage))
+        # The entries are this receipt's own breakdown of its bill, so a log that does not add up
+        # to that bill is not a breakdown of it -- and nothing else in the record says which of
+        # the two is wrong. The docstring above gave "a sum over its usage would silently
+        # disagree with the receipt's" as the reason the log is all-or-nothing; unchecked, that
+        # was a rationale rather than a rule. Read after the normalization above, so the sum and
+        # the total are compared on the same terms.
+        if self.attempt_log:
+            summed: dict[str, int] = {}
+            for entry in self.attempt_log:
+                for key, value in entry.usage.items():
+                    summed[key] = summed.get(key, 0) + value
+            if summed != self.usage:
+                raise ValueError("model call attempt_log usage must sum to the receipt's usage")
 
     @property
     def succeeded(self) -> bool:
@@ -862,7 +1129,14 @@ class ModelCallReceipt:
         except Exception:
             stamped_usage = None
         usage = self.usage
-        if not usage and isinstance(stamped_usage, Mapping):
+        # ``and not self.attempt_log``: the entries are this receipt's own per-dispatch breakdown
+        # of its bill, and a total read off an exception cannot restate them -- writing one over
+        # them produces a record ``__post_init__`` refuses, which would come out of this method as
+        # a ``ValueError`` *instead of* the failure it was called to report. Every read here is
+        # guarded for that reason; the sum invariant added one more way to break the same promise.
+        # The same rule the line below already follows for ``provider_retried``, one field wider:
+        # a receipt that already carried the fact keeps what it carried.
+        if not usage and not self.attempt_log and isinstance(stamped_usage, Mapping):
             try:
                 usage = {
                     str(key): int(value)
@@ -913,12 +1187,31 @@ class ModelCallReceipt:
             "digest_status": self.digest_status,
             "destination_status": self.destination_status,
             "destination_digest": self.destination_digest,
+            # Always emitted, even one-entry and empty — absence means exactly one thing, a
+            # writer that predates the field, rather than doubling as "nothing noteworthy".
+            "attempt_log": [entry.to_json() for entry in self.attempt_log],
         }
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
+        # Absence on this record is legacy and reads as the field's default; ``null`` is a writer
+        # that had the field and wrote nothing, which no writer here has ever done. Applied over
+        # the record's own fields, so ``context``, ``model`` and ``usage`` -- which collapsed the
+        # same way ``attempt_log`` did -- are covered by the rule rather than by three checks.
+        _refuse_null_wire_values(payload, cls, "model call receipt")
         usage = _optional_object(payload, "usage") or {}
+        # Absent on every receipt written before this field existed, which is legal and reads
+        # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,
+        # like every other field here. A present log of the wrong length is refused by
+        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb.
+        raw_attempt_log = payload.get("attempt_log")
+        if raw_attempt_log is None:
+            attempt_log: tuple[ModelCallAttempt, ...] = ()
+        elif isinstance(raw_attempt_log, list):
+            attempt_log = tuple(ModelCallAttempt.from_json(item) for item in raw_attempt_log)
+        else:
+            raise WireValidationError("attempt_log must be an array")
         context_payload = _optional_object(payload, "context")
         model_payload = _optional_object(payload, "model")
         raw_status = payload.get("http_status")
@@ -973,6 +1266,7 @@ class ModelCallReceipt:
                 witnessed="resolved",
             ),
             destination_digest=parse_str(payload, "destination_digest"),
+            attempt_log=attempt_log,
         )
 
 

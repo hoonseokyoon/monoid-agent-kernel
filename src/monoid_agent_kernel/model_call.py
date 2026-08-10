@@ -49,6 +49,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.model_io import (
+    ModelCallAttempt,
     ModelCallReceipt,
     ModelIOSubscription,
     destination_digest,
@@ -69,10 +70,10 @@ from monoid_agent_kernel.providers.base import (
     assemble_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
+    mark_provider_usage,
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
-    provider_usage_of,
     resolved_provider_name,
 )
 from monoid_agent_kernel.providers._common import retry_delay_s
@@ -177,6 +178,21 @@ def _kernel_retryable(exc: BaseException) -> bool:
     if not isinstance(exc, ModelAdapterError):
         return False
     return bool(exc.retryable) and not bool(exc.config_recoverable)
+
+
+def _turn_reported_retry(turn: ModelTurn) -> bool:
+    """What the outcome object itself declared, probed rather than read as an attribute.
+
+    A third-party adapter may return any turn-shaped object, and a missing flag means "did not
+    retry", which is true of every adapter with no retry loop. One probe for its two readers --
+    the receipt's whole-call fold in `_completed` and the answering attempt's log entry -- so
+    the two cannot drift.
+    """
+
+    try:
+        return bool(getattr(turn, "provider_retried", False))
+    except Exception:
+        return False
 
 
 def _merged_usage(spent: Mapping[str, int], usage: Mapping[str, int]) -> dict[str, int]:
@@ -571,6 +587,12 @@ class ModelCallRunner:
             # Usage the loop's swallowed attempts already paid for; merged into whichever
             # receipt settles this call, success or failure, by the same helper.
             spent_usage: dict[str, int] = {}
+            # One entry per dispatch, appended at the same commit points the counters use:
+            # absorbed attempts at the absorb line below, the terminal one at whichever exit
+            # settles the call. Initialized beside `spent_usage` because the failure exit
+            # reads both for calls refused before the loop was ever entered.
+            attempt_log: list[ModelCallAttempt] = []
+            last_attempt_entry: ModelCallAttempt | None = None
             try:
                 # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
                 # already been crossed, but by then the adapter has been invoked and the provider has
@@ -658,7 +680,14 @@ class ModelCallRunner:
                 )
                 consumer = delta_consumer
                 delivered = False
-                if retry_plan is not None and delta_consumer is not None:
+                # Installed for any consumer, not only under the kernel's loop. The flag is
+                # *used* where a retry window exists -- delivery closes it -- but it is
+                # *recorded* on every call, and `layer` defaults to `"adapter"`: gating the
+                # wrapper on the loop that reads the flag wrote `stream_committed: false`
+                # onto every shipped streaming call's ledger line while the consumer was
+                # holding its chunks. The key is present either way, so a reader cannot tell
+                # a definite "nothing was delivered" from "this arm never answered".
+                if delta_consumer is not None:
                     inner_consumer = delta_consumer
 
                     def _marking_consumer(chunk: ModelStreamChunk) -> None:
@@ -672,12 +701,33 @@ class ModelCallRunner:
                     consumer = _marking_consumer
                 while True:
                     attempts_made += 1
+                    reports_before = progress.count
+                    attempt_started = time.monotonic()
                     try:
                         turn = await self._adrive(
                             request, deadline, should_abort, consumer, adapter
                         )
                         break
                     except BaseException as exc:
+                        # Every fact the entry needs, read through `with_error` on a throwaway
+                        # receipt -- the one census-pinned reader of what an exception carries,
+                        # so the log cannot drift from the receipt built beside it. Probed HERE,
+                        # before the outer handler's whole-call `mark_provider_retried` can
+                        # colour the exception: what this reads is attempt-scoped.
+                        probe = ModelCallReceipt().with_error(exc)
+                        last_attempt_entry = ModelCallAttempt(
+                            index=attempts_made,
+                            elapsed_ms=self._ms_since(attempt_started),
+                            error_code=probe.error_code,
+                            provider_error_code=probe.provider_error_code,
+                            retryable=probe.retryable,
+                            config_recoverable=probe.config_recoverable,
+                            http_status=probe.http_status,
+                            provider_retried=probe.provider_retried
+                            or progress.count > reports_before,
+                            usage=probe.usage,
+                            stream_committed=delivered,
+                        )
                         if (
                             retry_plan is None
                             or attempts_made >= retry_plan.max_attempts
@@ -703,10 +753,15 @@ class ModelCallRunner:
                         # that would make THIS error the call's outcome. Recorded any earlier,
                         # the error the deadline check re-raises is both the swallowed attempt
                         # and the terminal one, and `receipt.with_error` reads its stamp again:
-                        # a single billed call landing on the receipt twice. Past this line the
-                        # receipt is the only carrier left -- a boundary raised by the wait
-                        # below reports itself, not the provider failure it interrupted.
-                        spent_usage = _merged_usage(spent_usage, provider_usage_of(exc))
+                        # a single billed call landing on the receipt twice. The log entry
+                        # commits at this same line for the same reason: appended earlier, the
+                        # attempt the deadline check re-raises would be logged as absorbed AND
+                        # as terminal, and the log would name one dispatch twice. Past this
+                        # line the receipt is the only carrier left -- a boundary raised by
+                        # the wait below reports itself, not the provider failure it
+                        # interrupted.
+                        spent_usage = _merged_usage(spent_usage, probe.usage)
+                        attempt_log.append(last_attempt_entry)
                         await self._abackoff(delay, deadline)
                 turn = normalize_model_turn(turn)
             except BaseException as exc:
@@ -723,8 +778,52 @@ class ModelCallRunner:
                 # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
                 # arriving during delivery should still stop everything.
                 failed = replace(receipt.with_error(exc), attempts=attempts_made)
-                if spent_usage:
-                    failed = replace(failed, usage=_merged_usage(spent_usage, failed.usage))
+                # The terminal entry: the attempt whose outcome this exception is -- unless it
+                # interrupted the WAIT between attempts (a backoff boundary), in which case
+                # every dispatched attempt is already logged and the receipt alone carries the
+                # boundary's taxonomy. A refused call never dispatched, so its log stays empty
+                # beside `attempts == 0`.
+                if attempts_made > len(attempt_log):
+                    if (
+                        last_attempt_entry is not None
+                        and last_attempt_entry.index == attempts_made
+                    ):
+                        attempt_log.append(last_attempt_entry)
+                    else:
+                        # The failure happened between the dispatch's return and the settle
+                        # (the normalizer refused the turn), so no attempt-scoped probe exists;
+                        # the entry mirrors the receipt, which extracted the same facts from
+                        # the same exception -- every fact except one. ``provider_retried`` on
+                        # that receipt is the whole CALL's fold: the handler above stamps
+                        # ``progress.retried`` onto the escaping error before ``with_error``
+                        # reads it, so mirroring it here would credit this dispatch with a
+                        # report an earlier absorbed one made. Counted on this attempt's own
+                        # channel instead, the way both sibling construction sites count it.
+                        # The refused turn's own declaration is not consulted: the normalizer
+                        # rejected that turn, and a fact read off a value the call refused is
+                        # not a fact the call may report.
+                        attempt_log.append(
+                            ModelCallAttempt(
+                                index=attempts_made,
+                                elapsed_ms=self._ms_since(attempt_started),
+                                error_code=failed.error_code,
+                                provider_error_code=failed.provider_error_code,
+                                retryable=failed.retryable,
+                                config_recoverable=failed.config_recoverable,
+                                http_status=failed.http_status,
+                                provider_retried=progress.count > reports_before,
+                                usage=failed.usage,
+                                stream_committed=delivered,
+                            )
+                        )
+                # One ``replace`` for the same reason the answering path takes one: the entries
+                # must sum to the usage they are entries for, and a two-step build holds a
+                # receipt that does not -- which ``__post_init__`` now refuses.
+                failed = replace(
+                    failed,
+                    attempt_log=tuple(attempt_log),
+                    usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
+                )
                 with contextlib.suppress(Exception):
                     self._publish(
                         request,
@@ -733,6 +832,15 @@ class ModelCallRunner:
                         elapsed_ms=self._ms_since(started),
                         request_preimage=request_preimage,
                     )
+                # The terminal error leaves carrying what the whole logical call cost: the
+                # loop's failure accounting reads this stamp (`_billed_usage`), and a stamp
+                # naming only the last attempt under-counts every absorbed one. Stamped AFTER
+                # the receipt above is built -- `with_error` reads this same stamp, and a
+                # cumulative stamp read back there would land the absorbed spend on the
+                # receipt twice (the exact double-count the absorb commit point exists to
+                # prevent).
+                if spent_usage:
+                    mark_provider_usage(exc, failed.usage)
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
@@ -742,10 +850,31 @@ class ModelCallRunner:
                 self._completed(receipt, turn, retried=progress.retried),
                 attempts=attempts_made,
             )
-            if spent_usage:
-                completed = replace(
-                    completed, usage=_merged_usage(spent_usage, completed.usage)
-                )
+            # The answering attempt's entry, built from the settled receipt so its usage is the
+            # same normalized reading `_completed` just made -- and BEFORE the absorbed spend is
+            # merged below, so the entry keeps this attempt's own bill and the entries sum to
+            # the receipt. Its retry flag is attempt-scoped on both channels: what the adapter
+            # reported during THIS dispatch, plus what this turn itself declared -- not the
+            # whole-call `progress.retried` fold the receipt carries.
+            answering_entry = ModelCallAttempt(
+                index=attempts_made,
+                elapsed_ms=self._ms_since(attempt_started),
+                provider_retried=progress.count > reports_before or _turn_reported_retry(turn),
+                usage=completed.usage,
+                stream_committed=delivered,
+            )
+            # One ``replace``, not two. The log and the merged bill are the same fact stated two
+            # ways, and the receipt refuses a log whose entries do not sum to its usage -- so a
+            # receipt carrying the log beside the not-yet-merged usage is a state this record is
+            # not allowed to hold, however briefly. ``replace`` re-runs ``__post_init__``, which
+            # is what makes "briefly" indistinguishable from "at all".
+            completed = replace(
+                completed,
+                attempt_log=(*attempt_log, answering_entry),
+                usage=(
+                    _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
+                ),
+            )
             settled = self._publish(
                 request,
                 turn,
@@ -781,10 +910,7 @@ class ModelCallRunner:
             stop_reason = normalize_unicode_scalars(str(getattr(turn, "stop_reason", "") or ""))
         except Exception:
             stop_reason = ""
-        try:
-            turn_retried = bool(getattr(turn, "provider_retried", False))
-        except Exception:
-            turn_retried = False
+        turn_retried = _turn_reported_retry(turn)
         return replace(
             receipt,
             stop_reason=stop_reason,
