@@ -631,6 +631,89 @@ def test_gateway_retries_retryable_http_error_then_succeeds(monkeypatch) -> None
     assert turn.final_text == "done"
 
 
+def test_gateway_sends_the_request_key_on_every_attempt(monkeypatch) -> None:
+    """The sync route rebuilds headers per attempt so a credential can refresh mid-call; the
+    idempotency key is read off the same request each time and must not move with them. One
+    retry scope on the wire, however many attempts the adapter's loop makes. (urllib stores
+    header names capitalized, so the capture reads ``Idempotency-key``.)"""
+    seen: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        seen.append(request.get_header("Idempotency-key"))
+        if len(seen) == 1:
+            raise HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                {},
+                io.BytesIO(
+                    b'{"error":"rate limited","error_code":"gateway_rate_limited","retryable":true}'
+                ),
+            )
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=2, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(
+        ModelRequest("finish", "sys", (), None, idempotency_key="idem_fixed")
+    )
+
+    assert turn.final_text == "done"
+    assert seen == ["idem_fixed", "idem_fixed"]
+
+
+def test_gateway_sends_no_key_header_for_an_unkeyed_request(monkeypatch) -> None:
+    """A request that carries no key produces no header, not an empty one: the pre-W7-3 wire
+    shape is a contract, and ``_headers()`` with no argument keeps its exact old answer."""
+    seen: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        seen.append(request.get_header("Idempotency-key"))
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert turn.final_text == "done"
+    assert seen == [None]
+    assert "Idempotency-Key" not in adapter._headers()
+
+
 def test_gateway_retries_transient_connection_error_then_succeeds(monkeypatch) -> None:
     # A bare connection-level error (here ConnectionResetError, an OSError that is neither
     # URLError nor TimeoutError) is transient and must be retried, not surfaced as a failed run.
