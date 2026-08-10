@@ -377,8 +377,9 @@ content to OTel spans unless an integrating observer explicitly exports it.
 model-I/O facet synthesizes one `model.attempt {index}` INTERNAL child under that call's `chat`
 span at settle — one per `receipt.attempt_log` entry, in both `span_mode`s. This rides the
 subscription facet (the event stream carries no attempt data, deliberately), so the zero-argument
-event-only quickstart shows `monoid.model.attempts` on the chat span and no children. A
-single-dispatch call synthesizes no child either: the chat span *is* that attempt, and a child
+event-only quickstart shows neither the children nor the `monoid.model.attempts` count that
+summarizes them: both are read off the receipt, and the public turn events carry no attempt count.
+A single-dispatch call synthesizes no child either: the chat span *is* that attempt, and a child
 would restate it at double the span volume. Children carry `monoid.model.attempt.*` attributes —
 `index`, `elapsed_ms`, `backoff_ms`, the failure taxonomy, per-attempt `usage` as a JSON string,
 `provider_retried`, `stream_committed` — and deliberately no `gen_ai.*`, because a GenAI-aware

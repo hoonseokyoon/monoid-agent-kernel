@@ -997,13 +997,14 @@ def test_otel_full_capture_children_stay_content_free() -> None:
         assert "SECRET" not in repr(child.attributes)
 
 
-def test_otel_agent_run_with_kernel_retry_exports_attempt_children(tmp_path: Path) -> None:
-    """End to end through the loop: both facets registered, the kernel absorbs one retryable
-    failure, and the exported trace shows the chat span with its two dispatch children."""
+def _retried_run_spans(tmp_path: Path, *, subscribe: bool):
+    """One kernel-retried run, exported under whichever wiring the caller asks for. The two
+    wirings differ in exactly one argument -- whether the model-I/O facet is registered -- so
+    the arms cannot drift apart, and everything attempt-shaped that one arm sees and the other
+    does not is attributable to that argument alone."""
 
     from monoid_agent_kernel.core.spec import ModelRetryConfig
     from monoid_agent_kernel.errors import ModelAdapterError
-    from opentelemetry.trace.status import StatusCode
 
     class _FlakyOnce:
         def __init__(self) -> None:
@@ -1036,12 +1037,20 @@ def test_otel_agent_run_with_kernel_retry_exports_attempt_children(tmp_path: Pat
             )
         ),
         event_sinks=(preset,),
-        model_io_subscriptions=(preset.model_io_subscription(),),
+        model_io_subscriptions=(preset.model_io_subscription(),) if subscribe else (),
     )
     result = asyncio.run(loop.arun_once("go"))
     assert result.status == "completed"
+    return exporter.get_finished_spans()
 
-    spans = exporter.get_finished_spans()
+
+def test_otel_agent_run_with_kernel_retry_exports_attempt_children(tmp_path: Path) -> None:
+    """End to end through the loop: both facets registered, the kernel absorbs one retryable
+    failure, and the exported trace shows the chat span with its two dispatch children."""
+
+    from opentelemetry.trace.status import StatusCode
+
+    spans = _retried_run_spans(tmp_path, subscribe=True)
     chat = next(span for span in spans if span.name.startswith("chat"))
     children = _attempt_children(spans)
     assert chat.attributes["monoid.model.attempts"] == 2
@@ -1050,3 +1059,16 @@ def test_otel_agent_run_with_kernel_retry_exports_attempt_children(tmp_path: Pat
     assert children[0].status.status_code == StatusCode.ERROR
     assert children[0].attributes["monoid.model.attempt.retryable"] is True
     assert children[1].status.status_code == StatusCode.UNSET
+
+
+def test_otel_event_only_wiring_carries_no_attempt_data_at_all(tmp_path: Path) -> None:
+    """The complement arm, which no test covered until a doc sentence got it wrong: the SAME
+    retried run with the event facet ALONE. Attempt data is read off the receipt, which only the
+    subscription facet delivers, and no public turn event carries an attempt count -- so this
+    wiring shows neither the children nor the `monoid.model.attempts` summary. The chat span is
+    still here, which is what makes the two absences findings rather than an empty export."""
+
+    spans = _retried_run_spans(tmp_path, subscribe=False)
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert _attempt_children(spans) == []
+    assert "monoid.model.attempts" not in chat.attributes
