@@ -245,6 +245,85 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
     assert record["kind"] == MODEL_CALL_KIND
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("", id="unkeyed"),
+        pytest.param("idem_0123456789abcdef", id="minted-shape"),
+        pytest.param("A", id="single-character"),
+        pytest.param("A" * 128, id="at-the-bound"),
+    ],
+)
+def test_the_ledger_accepts_a_key_the_kernel_could_have_issued(key: str) -> None:
+    """Empty included, and admitted explicitly rather than by leaving the field unconstrained:
+    a refused call was never keyed, which is the same reason ``prompt_digest``'s pattern spells
+    ``^(|...)$`` instead of demanding a digest."""
+
+    assert _errors(_record(idempotency_key=key)) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="over-the-bound"),
+        pytest.param("-leading-punctuation", id="bad-first-character"),
+        pytest.param("key with spaces", id="space"),
+        pytest.param("k\u00e9", id="non-ascii"),
+        pytest.param("...", id="punctuation-only"),
+    ],
+)
+def test_the_ledger_refuses_a_key_no_issuer_could_have_minted(key: str) -> None:
+    """``monoid validate`` certifies imported and third-party directories, so a line whose key
+    the rest of the kernel would refuse must not be certified here either. Before this pattern
+    the field was an open string and every one of these validated clean."""
+
+    assert _errors(_record(idempotency_key=key))
+
+
+def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() -> None:
+    """A retyped twin regex is a drift waiting to happen, and this is the check that refuses it.
+
+    ``core`` cannot import ``providers``, so the rule lives in ``core/model_io.py`` and both
+    enforcers read it: the schema states it to ``monoid validate``, and
+    ``is_valid_idempotency_key`` states it to a request being built. Verified as agreement on
+    behaviour and not merely as a shared substring, because two spellings of "the same" regex
+    can still disagree at the edges.
+    """
+
+    from monoid_agent_kernel.core.model_io import (
+        IDEMPOTENCY_KEY_JSON_PATTERN,
+        is_valid_idempotency_key,
+    )
+
+    assert MODEL_CALLS_RECORD_SCHEMA["properties"]["idempotency_key"] == {
+        "type": "string",
+        "pattern": IDEMPOTENCY_KEY_JSON_PATTERN,
+    }
+
+    for candidate in (
+        "",
+        "idem_0123456789abcdef",
+        "A",
+        "A" * 128,
+        "A" * 129,
+        "-leading",
+        "has space",
+        "k\u00e9",
+        "...",
+        "ok\r\n folded",
+    ):
+        schema_accepts = not _errors(_record(idempotency_key=candidate))
+        rule_accepts = candidate == "" or is_valid_idempotency_key(candidate)
+        assert schema_accepts is rule_accepts, {
+            "candidate": candidate,
+            "schema_accepts": schema_accepts,
+            "rule_accepts": rule_accepts,
+            "hint": "the ledger and the kernel disagree about what a key may be",
+        }
+
+
 def test_the_schema_advertises_one_namespace_because_the_ledger_has_only_ever_had_one() -> None:
     """``schema_version_property`` would emit the legacy namespace too, and this artifact never
     existed under it. The registry pin refuses the mismatch; this states the reason."""

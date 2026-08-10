@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import uuid
 from copy import copy
 from collections.abc import AsyncIterator, Iterator, Mapping
@@ -17,6 +16,7 @@ from monoid_agent_kernel.core.spec import (
     validate_generation_config,
     validate_reasoning_config,
 )
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -624,28 +624,6 @@ def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
             raise ValueError("model.retry.retry_on entries must be non-empty strings")
         normalized.append(text)
     return tuple(normalized)
-
-
-# The one rule for what may be spelled as an idempotency key, in the shape this repo already
-# uses for a bounded ASCII token (``conformance/provenance.py:_SAFE_TOKEN_RE``). It exists
-# because this field is the only one that reaches a TRANSPORT HEADER rather than a JSON string:
-# JSON escapes a control character, an HTTP header does not, and neither ``http.client`` nor
-# ``httpx`` refuses an obsolete folded value (``"a\r\n b"``) -- both were probed, both let it
-# through. So a key that is not this shape can split a request header on the way out and a
-# response header or a log line on the way back, and the rule has to live at every edge the
-# value crosses rather than at the one that was noticed.
-IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
-
-
-def is_valid_idempotency_key(value: Any) -> bool:
-    """Whether ``value`` may be presented as an idempotency key on a header or written to a log.
-
-    Empty is *not* valid here: absence is spelled by not calling this, and the callers each say
-    what absence means for them. Bounded at 128 characters so an unauthenticated client cannot
-    choose the length of a log line.
-    """
-
-    return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
 
 
 def new_idempotency_key() -> str:

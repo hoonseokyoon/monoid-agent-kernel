@@ -36,6 +36,7 @@ from monoid_agent_kernel.core._verified_file import read_verified_bytes
 from monoid_agent_kernel.core.model_io import (
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
+    IDEMPOTENCY_KEY_JSON_PATTERN,
     MAX_MODEL_PAYLOAD_BYTES,
 )
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
@@ -1072,9 +1073,16 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "digest_status": {"enum": list(DIGEST_STATUSES)},
         # Declared and not required, the ``attempt_log`` rule: the writer always emits it, so
         # absence on a line means exactly one thing -- a writer that predates the field -- and
-        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled. Empty is a
-        # valid value: a refused call was never keyed.
-        "idempotency_key": {"type": "string"},
+        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled.
+        #
+        # Format-constrained like the two digests beside it rather than left an open string:
+        # this key is a token the kernel MINTS to a closed shape, not an open vocabulary a
+        # provider may extend (which is why ``stop_reason`` and ``provider_error_code`` carry
+        # no pattern and this does). The pattern is DERIVED from the same body
+        # ``is_valid_idempotency_key`` compiles, so an imported or third-party line cannot be
+        # certified against a rule the rest of the kernel does not hold. Empty is admitted
+        # explicitly, the ``^(|...)$`` idiom the digests use: a refused call was never keyed.
+        "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_KEY_JSON_PATTERN},
         "destination_status": {"enum": list(DESTINATION_STATUSES)},
         "stop_reason": {"type": "string"},
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},

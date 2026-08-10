@@ -37,8 +37,13 @@ out in commit messages and here.
   hop has a retry loop of its own and a relayed key would stitch two scopes into one. So
   `ModelCallRunner` is not the only issuer, and both read the same `new_idempotency_key`.
   The OpenAI adapter does not read the field.
-- **A key is a bounded ASCII token, enforced at every edge it crosses.** 1–128 characters
-  from `[A-Za-z0-9._+-]` starting with a letter or digit. This is the only field on the
+- **A key is a bounded ASCII token, enforced at every edge it crosses — including the
+  ledger.** 1–128 characters from `[A-Za-z0-9._+-]` starting with a letter or digit. The
+  `model-calls.v1` schema states it as a pattern (empty admitted, the `^(|...)$` idiom
+  `prompt_digest` uses), so `monoid validate` cannot certify an imported or third-party line
+  whose key the rest of the kernel would refuse; the rule lives once in `core/model_io.py`
+  and both enforcers derive from it, because `core` cannot import `providers` and a retyped
+  twin regex drifts. This is the only field on the
   receipt that reaches a transport header rather than a JSON string — JSON escapes a control
   character, an HTTP header does not, and neither `http.client` nor `httpx` refuses an
   obsolete folded value — so request ingress refuses a non-conforming caller-supplied key,

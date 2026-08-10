@@ -2127,7 +2127,7 @@ def test_the_gateway_keys_the_upstream_hop_it_drives(route: str) -> None:
     said each hop issues one. The inbound key is still not relayed: relaying would stitch two
     retry scopes into one and lie to both, so the two values must differ.
     """
-    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 
     upstream = _HopKeyRecorder()
     manager = _token_manager()
@@ -2153,7 +2153,7 @@ def test_the_gateway_keys_the_upstream_hop_it_drives(route: str) -> None:
 
 def test_the_upstream_key_is_this_hops_own_and_not_the_callers() -> None:
     """Echo yes, relay no -- the two are different jobs and only one of them is safe."""
-    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 
     upstream = _HopKeyRecorder()
     manager = _token_manager()

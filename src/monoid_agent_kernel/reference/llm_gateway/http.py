@@ -17,7 +17,8 @@ from monoid_agent_kernel.reference._shared.http_util import (
     read_json_limited,
     redact_internal_error,
 )
-from monoid_agent_kernel.providers.base import is_valid_idempotency_key, provider_usage_of
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+from monoid_agent_kernel.providers.base import provider_usage_of
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.providers.gateway import (
     GATEWAY_AUTH_ERROR,

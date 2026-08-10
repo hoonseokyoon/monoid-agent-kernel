@@ -3677,7 +3677,8 @@ def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
     Two copies of the expression is how the two issuers would come to differ.
     """
 
-    from monoid_agent_kernel.providers.base import is_valid_idempotency_key, new_idempotency_key
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+    from monoid_agent_kernel.providers.base import new_idempotency_key
 
     for _ in range(64):
         assert is_valid_idempotency_key(new_idempotency_key())

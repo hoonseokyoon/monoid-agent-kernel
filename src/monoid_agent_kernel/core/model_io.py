@@ -453,6 +453,45 @@ invisible because each produced a key that looked fine.
 """
 
 
+_IDEMPOTENCY_KEY_BODY = r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
+"""What an idempotency key may be spelled as, once, so its two enforcers cannot drift.
+
+The rule lives in ``core`` rather than beside its first caller because it has two enforcers on
+opposite sides of an import boundary that cannot be crossed the other way: ``core/schemas.py``
+states it to ``monoid validate``, and ``providers/base.py`` states it to a request being built.
+``core`` never imports ``providers``, so a rule owned there could only have been copied -- and a
+hand-copied twin regex is a drift waiting to happen. Both forms below derive from this body.
+
+Bounded at 128 characters and free of control characters because this is the one field on a model
+call that reaches a *transport header* rather than a JSON string: JSON escapes a control
+character, an HTTP header does not, and neither ``http.client`` nor ``httpx`` refuses an obsolete
+folded value.
+"""
+
+IDEMPOTENCY_KEY_PATTERN = re.compile(rf"{_IDEMPOTENCY_KEY_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+IDEMPOTENCY_KEY_JSON_PATTERN = rf"^(|{_IDEMPOTENCY_KEY_BODY})$"
+"""The ECMA-262 form for JSON Schema, empty-allowed the way ``prompt_digest``'s pattern is.
+
+Empty is a legal recorded value -- a refused call was never keyed -- so the ledger admits it
+explicitly rather than by omitting the constraint, exactly as ``^(|[0-9a-f]{64})$`` does for a
+digest that may not have been issued. ``\\Z`` and ``re.ASCII`` do not exist in ECMA-262, which is
+why this is derived from the body rather than from the compiled pattern's source.
+"""
+
+
+def is_valid_idempotency_key(value: Any) -> bool:
+    """Whether ``value`` may be presented as an idempotency key on a header or written to a log.
+
+    Empty is *not* valid here: absence is spelled by not calling this, and each caller says what
+    absence means for it. Bounded so an unauthenticated client cannot choose the length of a log
+    line.
+    """
+
+    return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+
+
 def destination_digest(value: str) -> str:
     """An id for a call's destination, for a receipt to record *where* without recording *what*.
 

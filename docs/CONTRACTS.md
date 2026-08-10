@@ -484,7 +484,12 @@ the call was refused before the keying block, or the record predates the field.
 
 A key must be a bounded ASCII token — 1–128 characters from `[A-Za-z0-9._+-]`, starting with a
 letter or digit — and that rule is enforced at every edge the value crosses, not only where it is
-minted. It is the one field on this record that reaches a **transport header** rather than a JSON
+minted. The `model-calls.v1` schema states the same rule as a pattern (empty admitted, the
+`^(|...)$` idiom `prompt_digest` uses), because `monoid validate` certifies imported and
+third-party run directories and a line whose key the rest of the kernel would refuse must not be
+certified. Both enforcers derive from one body in `core/model_io.py`: `core` cannot import
+`providers`, so a rule owned on the provider side could only have been copied, and a retyped twin
+regex drifts. It is the one field on this record that reaches a **transport header** rather than a JSON
 string: JSON escapes a control character and an HTTP header does not, and neither `http.client`
 nor `httpx` refuses an obsolete folded value (`"a\r\n b"`). So request ingress *refuses* a
 non-conforming caller-supplied key, the gateway transport *omits* one (an adapter must not lose a

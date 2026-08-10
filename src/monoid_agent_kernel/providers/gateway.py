@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
     normalize_unicode_scalars,
 )
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -45,7 +46,6 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
-    is_valid_idempotency_key,
     mark_provider_retried,
     mark_provider_usage,
     report_provider_retried,
