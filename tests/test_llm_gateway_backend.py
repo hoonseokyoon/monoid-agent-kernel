@@ -1963,3 +1963,64 @@ def test_a_declaration_free_adapter_still_resolves_to_the_configured_provider() 
 
     assert resolved_provider_name(_Plain(), ModelConfig(provider="openai")) == "openai"
     assert resolved_provider_name(_Plain(), None) is None
+
+
+def test_llm_gateway_echoes_the_idempotency_key_on_both_response_routes(caplog) -> None:
+    """The reference gateway logs and echoes the inbound key -- and does nothing else with it:
+    no dedup (retry-scoped carriage is not exactly-once) and no relay upstream (each hop's
+    client issues its own key for its own retry scope). Both response writers echo -- the JSON
+    route and the SSE route are separate ends of ``do_POST`` -- and error responses echo too,
+    because a retried failure is precisely when correlation matters. Absence stays absence."""
+    import logging
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[
+                ModelTurn(response_id="provider_1", final_text="done", usage={"total_tokens": 9})
+            ]
+        ),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        token = _llm_token(manager)
+
+        def _post(path: str, *, key: str | None, bearer: str | None = token):
+            headers = {"Content-Type": "application/json"}
+            if bearer is not None:
+                headers["Authorization"] = f"Bearer {bearer}"
+            if key is not None:
+                headers["Idempotency-Key"] = key
+            return urlopen(
+                Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(_payload()).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                ),
+                timeout=10,
+            )
+
+        with caplog.at_level(logging.INFO, logger="monoid_agent_kernel.llm_gateway.http"):
+            with _post("/internal/llm/turns", key="idem_echo_me") as response:
+                assert response.headers.get("Idempotency-Key") == "idem_echo_me"
+                assert json.loads(response.read())["final_text"] == "done"
+        assert any("idem_echo_me" in record.getMessage() for record in caplog.records)
+
+        with _post("/internal/llm/turns", key=None) as response:
+            assert response.headers.get("Idempotency-Key") is None
+            json.loads(response.read())
+
+        with _post("/internal/llm/turns/stream", key="idem_echo_stream") as response:
+            assert response.headers.get("Idempotency-Key") == "idem_echo_stream"
+            assert b"turn_complete" in response.read()
+
+        with _post("/internal/llm/turns/stream", key=None) as response:
+            assert response.headers.get("Idempotency-Key") is None
+            response.read()
+
+        with pytest.raises(HTTPError) as exc_info:
+            _post("/internal/llm/turns", key="idem_echo_err", bearer="not-a-token")
+        assert exc_info.value.code == 401
+        assert exc_info.value.headers.get("Idempotency-Key") == "idem_echo_err"

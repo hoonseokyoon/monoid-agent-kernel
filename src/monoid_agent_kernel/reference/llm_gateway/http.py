@@ -59,6 +59,14 @@ def make_llm_gateway_handler(
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
+                if parsed.path in ("/internal/llm/turns", "/internal/llm/turns/stream"):
+                    # Logged and echoed (see the response writers), and nothing else: the
+                    # reference gateway does not dedupe on the key -- retry-scoped carriage
+                    # is not exactly-once -- and does not relay it upstream, because each
+                    # hop's client issues its own key for its own retry scope.
+                    key = self.headers.get("Idempotency-Key")
+                    if key:
+                        _LOGGER.info("idempotency-key %s on %s", key, parsed.path)
                 if parsed.path == "/internal/llm/turns":
                     self._write_json(gateway.handle_turn(self._bearer_token(), self._read_json()))
                     return
@@ -202,6 +210,16 @@ def make_llm_gateway_handler(
                 status=status,
             )
 
+        def _echo_idempotency_key(self) -> None:
+            # The echo half of log-and-echo. On EVERY response this request produces -- the
+            # JSON writer serves successes and errors alike (``_write_error`` lands here),
+            # and the SSE writer is the other end of ``do_POST`` -- because a retried
+            # failure is precisely when a client wants the correlation. Absent stays
+            # absent: no key, no header.
+            key = self.headers.get("Idempotency-Key")
+            if key:
+                self.send_header("Idempotency-Key", key)
+
         def _write_json(
             self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
         ) -> None:
@@ -209,6 +227,7 @@ def make_llm_gateway_handler(
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._echo_idempotency_key()
             self.end_headers()
             self.wfile.write(body)
 
@@ -222,6 +241,7 @@ def make_llm_gateway_handler(
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
+            self._echo_idempotency_key()
             self.end_headers()
             try:
                 for frame in frames:
