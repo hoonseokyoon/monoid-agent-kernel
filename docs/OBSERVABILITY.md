@@ -271,14 +271,16 @@ monoid run \
 ```
 invoke_agent
 ├── chat {model}            (one span per model turn)
-│   └── model.attempt {i}   (one child per kernel dispatch, when there was more than one)
+│   └── model.attempt {i}   (one child per kernel dispatch, when there was more than one;
+│                            the only node here the event stream alone cannot produce)
 └── execute_tool {tool}     (one span per tool call)
 ```
 
 `chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
 not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
 `gen_ai.provider.name`, `gen_ai.tool.name`, token usage). The zero-argument form preserves this
-metadata-only behavior:
+metadata-only behavior, minus the `model.attempt` children, which are receipt-derived and need
+the model-I/O facet:
 
 ```python
 from monoid_agent_kernel import AgentLoop
