@@ -1109,7 +1109,11 @@ class ModelCallReceipt:
         # "Exactly once" is the claim, so the indices carry it rather than the count. A length
         # check accepts a log of the right size naming one dispatch twice and another not at
         # all -- well-formed in every other field, and unanswerable for the question the log
-        # exists for, with nothing in the record to say so.
+        # exists for, with nothing in the record to say so. The empty half of the rule also
+        # has a wire side this constructor cannot enforce -- absence and ``[]`` parse to the
+        # same tuple -- so ``from_json`` and ``monoid validate`` refuse the pair no writer
+        # produces (an empty log beside a positive count) at the boundaries where the key is
+        # still visible.
         if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
             range(1, self.attempts + 1)
         ):
@@ -1276,7 +1280,7 @@ class ModelCallReceipt:
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "context": self.context.to_json(),
             "model": self.model.to_json(),
             "provider_name": self.provider_name,
@@ -1298,11 +1302,19 @@ class ModelCallReceipt:
             "digest_status": self.digest_status,
             "destination_status": self.destination_status,
             "destination_digest": self.destination_digest,
-            # Always emitted, even one-entry and empty — absence means exactly one thing, a
-            # writer that predates the field, rather than doubling as "nothing noteworthy".
-            "attempt_log": [entry.to_json() for entry in self.attempt_log],
             "idempotency_key": self.idempotency_key,
         }
+        # Emitted only when there is something to itemize. Presence IS the claim -- one entry
+        # per dispatch, indices ``1..attempts`` -- so an empty log has no spelling of its own
+        # on the wire: absence covers a record that predates the field and a call with zero
+        # dispatches alike, which coincide in every readable fact. Emitting ``[]``
+        # unconditionally made a parsed pre-field receipt re-serialize as an itemization of
+        # nothing beside a positive ``attempts`` -- a line no writer produces, and one both
+        # readers now refuse. ``idempotency_key`` above keeps the opposite rule on purpose:
+        # its absence spelling is the in-band empty string, so the key itself always travels.
+        if self.attempt_log:
+            payload["attempt_log"] = [entry.to_json() for entry in self.attempt_log]
+        return payload
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
@@ -1313,14 +1325,28 @@ class ModelCallReceipt:
         # same way ``attempt_log`` did -- are covered by the rule rather than by three checks.
         _refuse_null_wire_values(payload, cls, "model call receipt")
         usage = _optional_object(payload, "usage") or {}
+        # Parsed ahead of the log so the pair below can be judged together.
+        attempts = parse_int(payload, "attempts", default=1)
         # Absent on every receipt written before this field existed, which is legal and reads
         # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,
         # like every other field here. A present log of the wrong length is refused by
-        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb.
+        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb. A
+        # present log that is EMPTY beside a positive count is refused HERE, where the key is
+        # still visible: after parsing, an empty log is the legal value absence and ``[]``
+        # share, so the constructor cannot ask. No writer produces the pair -- the current one
+        # omits an empty log, its predecessors filled one entry per dispatch -- which leaves
+        # only forgeries and pre-W7-4 re-serializations of legacy receipts to refuse. Beside
+        # ``attempts == 0`` it stays legal: the spelling earlier v0.21 builds used for a
+        # refused call, and an empty itemization of zero dispatches is complete.
         raw_attempt_log = payload.get("attempt_log")
         if raw_attempt_log is None:
             attempt_log: tuple[ModelCallAttempt, ...] = ()
         elif isinstance(raw_attempt_log, list):
+            if not raw_attempt_log and attempts > 0:
+                raise WireValidationError(
+                    "attempt_log must not be empty beside a positive attempts: "
+                    "absence is the one spelling of an unitemized call"
+                )
             attempt_log = tuple(ModelCallAttempt.from_json(item) for item in raw_attempt_log)
         else:
             raise WireValidationError("attempt_log must be an array")
@@ -1340,7 +1366,7 @@ class ModelCallReceipt:
             stop_reason=parse_str(payload, "stop_reason"),
             usage=usage,
             latency_ms=parse_int(payload, "latency_ms"),
-            attempts=parse_int(payload, "attempts", default=1),
+            attempts=attempts,
             provider_retried=parse_bool(payload, "provider_retried"),
             error_code=parse_str(payload, "error_code"),
             provider_error_code=parse_str(payload, "provider_error_code"),

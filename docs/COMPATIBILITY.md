@@ -420,7 +420,11 @@ written before the field existed means; the ledger schema declares the key witho
 requiring it, so `monoid validate` still passes directories older writers filled; and a
 present log that does not name every attempt exactly once is refused — that shape is a
 writer bug, not a legacy to absorb, and `monoid validate` now says so too rather than only
-the constructor. Leniency stops at the key for the fields an entry shipped with: those have
+the constructor. W7-4 closes the empty corner of the same rule: the writers omit an empty
+log — absence is the one wire spelling of "nothing itemized" — a present `[]` beside a
+positive `attempts` is refused by reader and sweep alike as a line no writer produces, and
+beside `attempts: 0` it stays accepted, the spelling earlier v0.21 builds used for a refused
+call, so every directory they filled keeps validating. Leniency stops at the key for the fields an entry shipped with: those have
 no writer predating them, so every one is required and a partial entry is refused instead of
 completed from defaults. (W7-2 later adds `backoff_ms` to the entry; that key has
 predecessors and follows the record-level absence rule — its own paragraph below.) Run totals (`metrics.json`, `state.total_usage`, the token budget, the child

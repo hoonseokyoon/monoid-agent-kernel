@@ -456,7 +456,16 @@ they itemize leaves a reader with two numbers and no way to tell which to believ
 refused at construction, which is also why the runner builds the log and the merged total in a
 single `replace` — and refused again by `monoid validate`, which reads the ledger as JSON and
 constructs no receipt, so a JSON Schema that can only judge one entry at a time would have
-reported such a line clean. The log is optional; an *entry*'s original keys are not: they have
+reported such a line clean. On the wire the empty half has one spelling (W7-4): the writers omit
+an empty log, so absence covers a record that predates the field and a call with zero dispatches
+alike, and a *present* `[]` beside a positive `attempts` — an itemization of nothing, which no
+writer produces — is refused by `from_json` and reported by `monoid validate`; beside
+`attempts: 0` an explicit `[]` stays accepted, because that is what earlier v0.21 builds wrote
+for a refused call. `idempotency_key` cannot draw the same line, and the asymmetry is each
+field's own rule: its absence spelling is the in-band empty string, which a pre-key line and a
+never-keyed call share on a positive-`attempts` line, so there is no pair a validator could
+refuse — the log's rule is checkable precisely because a non-empty log witnesses its own
+generation, and an empty one now has no spelling but absence. The log is optional; an *entry*'s original keys are not: they have
 no writer predating them, so every key the entry shipped with is required on the wire and a
 partial one is refused rather than completed from defaults — defaults there turn a corrupt line
 into a plausible dispatch. A key added after the entry shipped follows the record-level absence

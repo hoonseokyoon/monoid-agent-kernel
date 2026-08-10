@@ -283,12 +283,20 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
 
     `test_json_round_trip_preserves_every_field` builds a receipt by construction, so a field
     added without touching it round-trips at its default and the test passes without covering it.
-    This reads the dataclass instead: every declared field must appear in the wire shape, and the
-    round trip above must set each one to something other than its default.
+    This reads the dataclass instead: every declared field must appear in the wire shape -- on
+    a receipt that has something to say in every field -- and the round trip above must set
+    each one to something other than its default. Two arms since W7-4, the entry's own
+    two-generation rule one level up: a receipt that itemized its dispatches names every
+    declared field, and one with nothing to itemize omits exactly ``attempt_log`` -- absence
+    is the wire's one spelling of an unitemized call, so an empty log has no spelling of its
+    own. ``idempotency_key`` stays in both arms: its absence spelling is the in-band empty
+    string, not a missing key.
     """
 
     declared = {field_.name for field_ in fields(ModelCallReceipt)}
-    assert set(ModelCallReceipt().to_json()) == declared
+    itemized = ModelCallReceipt(attempts=1, attempt_log=(ModelCallAttempt(index=1),))
+    assert set(itemized.to_json()) == declared
+    assert set(ModelCallReceipt().to_json()) == declared - {"attempt_log"}
 
     source = inspect.getsource(test_json_round_trip_preserves_every_field)
     missing = sorted(name for name in declared if f"{name}=" not in source)
@@ -296,6 +304,49 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
         "never_exercised_by_the_round_trip": missing,
         "hint": "a field the enumeration does not name is a field it does not cover",
     }
+
+
+def test_a_pre_field_receipt_re_serializes_as_what_it_is() -> None:
+    """A parsed legacy receipt must not come back wearing the new writer's spelling.
+
+    ``to_json`` used to emit ``attempt_log`` unconditionally, so a pre-field receipt -- absent
+    key beside ``attempts: 3`` -- re-serialized as ``[]`` beside a positive count: an
+    itemization of nothing, which no writer ever produced and both readers now refuse. The
+    round trip has to keep "written before the field existed" expressible, the same rule
+    ``backoff_ms`` states one level down."""
+
+    legacy = {
+        key: value
+        for key, value in ModelCallReceipt(attempts=3).to_json().items()
+        if key != "attempt_log"
+    }
+
+    restored = ModelCallReceipt.from_json(legacy)
+
+    assert restored.attempts == 3
+    assert restored.attempt_log == ()
+    assert "attempt_log" not in restored.to_json()
+    assert ModelCallReceipt.from_json(restored.to_json()) == restored
+
+
+def test_an_empty_log_beside_a_positive_count_is_refused_at_the_wire() -> None:
+    """The constructor cannot see whether the key was present -- after parsing, an empty log
+    is the legal in-memory value absence and ``[]`` share -- so the wire boundary is the one
+    place the forgery is visible. No writer produces the pair: the current writer omits an
+    empty log, its predecessors filled one entry per dispatch. Beside ``attempts: 0`` the
+    pair stays legal, because that is what earlier v0.21 builds wrote for a refused call --
+    an empty itemization of zero dispatches is complete, not missing."""
+
+    with pytest.raises(WireValidationError, match="attempt_log"):
+        ModelCallReceipt.from_json({"attempts": 2, "attempt_log": []})
+    # An absent ``attempts`` reads as 1 -- what older records mean -- so a bare empty log
+    # still claims a dispatch it does not itemize.
+    with pytest.raises(WireValidationError, match="attempt_log"):
+        ModelCallReceipt.from_json({"attempt_log": []})
+
+    refused = ModelCallReceipt.from_json({"attempts": 0, "attempt_log": []})
+    assert refused.attempt_log == ()
+    assert ModelCallReceipt.from_json({"attempts": 2}).attempt_log == ()
 
 
 def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
@@ -451,10 +502,11 @@ def test_the_first_dispatch_records_no_wait_before_it() -> None:
 def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
     """Absent on every receipt written before the field existed, which is legal and reads as
     an empty log beside an intact `attempts` count; present-but-mistyped is refused, like
-    every other field here."""
+    every other field here. Since W7-4 the writer itself spells an unitemized call this way,
+    so the keyless payload below is the legacy shape and the current one at once."""
 
     payload = ModelCallReceipt(attempts=3).to_json()
-    del payload["attempt_log"]
+    assert "attempt_log" not in payload
 
     restored = ModelCallReceipt.from_json(payload)
 

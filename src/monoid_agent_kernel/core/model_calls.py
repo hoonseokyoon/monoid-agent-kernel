@@ -197,7 +197,7 @@ def model_call_record(
     issuance, never evidence a request was sent.
     """
 
-    return {
+    record: dict[str, Any] = {
         "schema_version": MODEL_CALLS_SCHEMA_VERSION,
         "kind": MODEL_CALL_KIND,
         "run_id": run_id,
@@ -217,11 +217,6 @@ def model_call_record(
         "usage": dict(receipt.usage),
         "latency_ms": receipt.latency_ms,
         "attempts": receipt.attempts,
-        # One object per dispatch, hand-projected below. Always written -- absence on a line
-        # means exactly one thing, a writer that predates the field -- which is why the
-        # schema declares it and does not require it: ``validate_run_dir`` sweeps directories
-        # that v0.20 writers filled.
-        "attempt_log": [_recorded_attempt(entry) for entry in receipt.attempt_log],
         "provider_retried": receipt.provider_retried,
         "error_code": receipt.error_code,
         "provider_error_code": receipt.provider_error_code,
@@ -230,3 +225,13 @@ def model_call_record(
         "http_status": receipt.http_status,
         "capture_downgrades": receipt.capture_downgrades,
     }
+    # One object per dispatch, hand-projected in ``_recorded_attempt`` -- and the key emitted
+    # only when there is a dispatch to itemize, the receipt's own wire rule. Absence on a line
+    # means nothing was itemized: a writer that predates the field (beside a positive
+    # ``attempts``) or a refused call that never dispatched. The schema declares the key and
+    # does not require it for the first reason -- ``validate_run_dir`` sweeps directories that
+    # earlier v0.21 builds filled -- and the sweep refuses the pair no writer produces, an
+    # empty log beside a positive count.
+    if receipt.attempt_log:
+        record["attempt_log"] = [_recorded_attempt(entry) for entry in receipt.attempt_log]
+    return record

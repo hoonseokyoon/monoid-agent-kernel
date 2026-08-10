@@ -227,19 +227,32 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
     real record; a writer key the schema does not declare fails every record too, just later.
 
     ``required`` is two explicit keys short of ``properties``: ``validate_run_dir`` sweeps run
-    directories that earlier writers filled, and requiring ``attempt_log`` would fail every ledger
-    written before that field existed, just as requiring ``idempotency_key`` would fail every
-    line a pre-W7-3 v0.21 build wrote. The writer still always emits both -- the ``set(record)``
-    equality above is the writer-side pin -- so absence keeps meaning exactly one thing, a
-    writer that predates the field. The optional set is pinned exactly: a future key cannot
-    slip into it without arguing with this test.
+    directories that earlier v0.21 builds filled, and requiring ``attempt_log`` would fail every
+    ledger written before that field existed, just as requiring ``idempotency_key`` would fail
+    every line a pre-W7-3 build wrote. The two optional keys spell absence differently, and the
+    asymmetry is deliberate: ``idempotency_key`` is always emitted, with the in-band empty
+    string for "never keyed", while ``attempt_log`` is emitted only when there is something to
+    itemize -- an empty log's one wire spelling is absence. So the maximal record here carries
+    an itemized log and names every declared key, and the zero-dispatch record omits exactly
+    that one. The optional set is pinned exactly: a future key cannot slip into it without
+    arguing with this test.
     """
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    itemized = _record(
+        attempts=1,
+        attempt_log=(
+            ModelCallAttempt(index=1, usage={"input_tokens": 12, "output_tokens": 3}),
+        ),
+    )
     record = _record()
 
-    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
+    assert set(itemized) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
+    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - {"attempt_log"}
     assert set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - set(
         MODEL_CALLS_RECORD_SCHEMA["required"]
     ) == {"attempt_log", "idempotency_key"}
+    assert _errors(itemized) == []
     assert _errors(record) == []
     assert record["schema_version"] == MODEL_CALLS_SCHEMA_VERSION
     assert record["kind"] == MODEL_CALL_KIND
@@ -365,7 +378,7 @@ def test_a_malformed_record_is_refused_by_the_schema(mutation: dict[str, object]
 def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     """The record carries the receipt's per-dispatch log; a line written before the field
     existed carries no key and stays valid -- the sweep validator reads directories that
-    v0.20 writers filled, and a required key there would fail every one of them.
+    earlier v0.21 builds filled, and a required key there would fail every one of them.
 
     The same rule holds one level down since W7-2: an entry written before ``backoff_ms``
     existed carries ten keys and stays valid, because requiring the eleventh would fail every
@@ -392,8 +405,7 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     ten_key_entry = {name: value for name, value in entry.to_json().items() if name != "backoff_ms"}
     assert _errors({**_record(), "attempts": 1, "attempt_log": [ten_key_entry]}) == []
 
-    legacy = _record()
-    del legacy["attempt_log"]
+    legacy = {key: value for key, value in _record().items() if key != "attempt_log"}
     assert _errors(legacy) == []
 
 
@@ -571,13 +583,23 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "first",
         ),
+        (
+            # An empty log beside a positive count. Neither writer generation produces it --
+            # the current one omits an empty log, its predecessors filled one entry per
+            # dispatch -- so the only line it describes is a forgery: a pre-field line
+            # re-serialized by a pre-W7-4 build, or a hand-made one. Beside ``attempts: 0``
+            # the same pair stays accepted below, as the spelling earlier v0.21 builds used
+            # for a refused call.
+            {"attempts": 2, "attempt_log": []},
+            "empty",
+        ),
     ],
-    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff"],
+    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff", "present_empty"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The four cross-entry invariants, refused on the sweep as well.
+    """The five relational claims, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
     another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
@@ -586,18 +608,21 @@ def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     ``monoid validate``, which reads the ledger as JSON, so a directory the record could not have
     produced was reported clean -- the one answer a validator must never give.
 
-    Three of the four the record also refuses at construction. The timeline one is this surface's
+    Three of the five the record also refuses at construction. The timeline one is this surface's
     alone, and deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
     ``_publish`` stamps the measured duration afterwards on every exit (``model_call.py`` builds
     the log at the failure and answering exits, then times the receipt inside ``_publish``). A
     constructor check would therefore fire on every retried call, comparing real dispatch
     durations against a latency of zero. The ledger line is the first place both facts are
-    settled and present, which makes it the first place the claim can be checked at all.
+    settled and present, which makes it the first place the claim can be checked at all. The
+    empty-log claim is sweep-only for a different reason: the constructor cannot see whether
+    the key was present -- after parsing, an empty log is the legal value absence and ``[]``
+    share -- so only the wire's readers (``from_json`` and this sweep) can refuse the pair.
 
     Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
     cross-record claims -- manifest against workspace index, proposal against its hashes,
     settled text against its digests, payloads against their keys. The ledger had none because
-    until this field it made no claim spanning two values; now it makes three.
+    until this field it made no claim spanning two values; now it makes five.
     """
 
     (tmp_path / MODEL_CALLS_FILENAME).write_text(
@@ -642,13 +667,26 @@ def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path
     assert not [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)]
 
     # And a line written before the field existed still sweeps clean: no key, no claim to check.
-    legacy = _record()
-    del legacy["attempt_log"]
+    legacy = {key: value for key, value in _record().items() if key != "attempt_log"}
     (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(legacy) + "\n", encoding="utf-8")
 
     assert not [
         issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)
     ]
+
+
+def test_validate_run_dir_accepts_the_empty_log_an_earlier_build_wrote(tmp_path: Path) -> None:
+    """``attempts: 0, attempt_log: []`` is what W7-1..W7-3 builds wrote for a refused call --
+    the current writer omits the key -- and the sweep keeps certifying the directories they
+    filled: the refusal above is about a positive count beside an empty log, never about
+    emptiness itself."""
+
+    line = {**_record(), "attempts": 0, "attempt_log": []}
+    (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    issues = validate_run_dir(tmp_path)
+
+    assert not [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)]
 
 
 # --- the projection reflects over nothing ---------------------------------------------------

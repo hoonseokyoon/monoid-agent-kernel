@@ -7,6 +7,24 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — one spelling for an unitemized call: `attempt_log` presence rules (W7-4)
+
+- **The writers omit an empty `attempt_log`, and a present-but-empty log beside a positive
+  `attempts` is refused.** Absence on a line now means exactly "nothing itemized" — a record
+  that predates the field, or a refused call that never dispatched — and it is the only
+  spelling of that fact: `ModelCallReceipt.to_json` and the ledger projection emit the key
+  only when there is an entry to carry, `from_json` refuses `[]` beside `attempts > 0`, and
+  `monoid validate` reports the same pair on a ledger line (the fifth relational claim
+  there). Beside `attempts: 0` an explicit `[]` stays accepted — the spelling earlier v0.21
+  builds wrote for a refused call — so every directory they filled keeps validating. This
+  supersedes the W7-1 sentence below ("the writer always emits it, so absence means exactly
+  one thing: a writer that predates the field"): unconditional emission made a parsed
+  pre-field receipt re-serialize as `[]` beside a positive count — an itemization of nothing,
+  a line no writer produces — and no reader could use the distinction it claimed to preserve.
+  `idempotency_key` deliberately keeps always-emit: its absence spelling is the in-band empty
+  string, which a pre-key line and a never-keyed call share, so the log's refusal has no
+  analogue there — a non-empty log witnesses its own generation, an empty string cannot.
+
 ### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
 
 - **`OtelEventSink` synthesizes one `model.attempt {index}` child span per kernel dispatch**
@@ -141,7 +159,7 @@ out in commit messages and here.
 - **The `model-calls.v1` line carries the log, and old lines stay valid.** A fourth
   hand-listed projection writes it (the reflection census refused `to_json()`, exactly as
   designed); the schema declares the key without requiring it, because `monoid validate`
-  sweeps directories v0.20 writers filled. The writer always emits it, so absence means
+  sweeps directories earlier v0.21 builds filled. The writer always emits it, so absence means
   exactly one thing: a writer that predates the field.
 - **The run's totals now read the receipt the call site used to discard.** On the settled
   path the loop accumulates `receipt.usage` — which folds absorbed attempts' spend the turn

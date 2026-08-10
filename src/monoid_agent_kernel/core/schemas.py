@@ -1085,9 +1085,11 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
         "digest_generation": {"type": "string"},
         "digest_status": {"enum": list(DIGEST_STATUSES)},
-        # Declared and not required, the ``attempt_log`` rule: the writer always emits it, so
-        # absence on a line means exactly one thing -- a writer that predates the field -- and
-        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled.
+        # Declared and not required: the writer always emits it -- the in-band empty string
+        # is its absence spelling -- so absence on a line means exactly one thing, a writer
+        # that predates the field, and ``validate_run_dir`` keeps passing directories
+        # pre-W7-3 builds filled. (``attempt_log`` below spells absence by omitting the key
+        # instead; the asymmetry is each field's own rule.)
         #
         # Format-constrained like the two digests beside it rather than left an open string:
         # this key is a token the kernel MINTS to a closed shape, not an open vocabulary a
@@ -1102,10 +1104,13 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "latency_ms": {"type": "integer", "minimum": 0},
         "attempts": {"type": "integer", "minimum": 0},
-        # Declared but not required: the sweep validator reads ledgers v0.20 writers filled,
-        # and absence means exactly one thing -- a writer that predates the field. A present
-        # entry is written whole or refused: the closed shape is the record's own rule, one
-        # level down.
+        # Declared but not required: the sweep validator reads ledgers earlier v0.21 builds
+        # filled, and absence means nothing was itemized -- a writer that predates the field,
+        # or a refused call that never dispatched (the current writer omits an empty log).
+        # ``_validate_model_call_attempt_logs`` refuses the pair no writer produces, an empty
+        # log beside a positive ``attempts`` -- a relational claim a JSON Schema cannot state.
+        # A present entry is written whole or refused: the closed shape is the record's own
+        # rule, one level down.
         "attempt_log": {
             "type": "array",
             "items": {
@@ -1704,8 +1709,8 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
 
 
 def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
-    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, and to
-    the one rule its entries owe each other.
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, to
+    the one rule its entries owe each other, and to the one spelling an empty log may take.
 
     A JSON Schema validates every entry against its own shape and can say nothing about how one
     entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``
@@ -1731,7 +1736,11 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
     The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
     (manifest against workspace index, proposal against its hashes, settled text against its
     digests, payload records against their keys). Absence is still legal: a line with no
-    ``attempt_log`` is a v0.20 writer's, which makes no claim there is anything to check.
+    ``attempt_log`` is an earlier v0.21 build's -- or the current writer's spelling of a call
+    with nothing to itemize -- and makes no claim there is anything to check. A *present*
+    empty log is different: beside ``attempts: 0`` it is what pre-W7-4 builds wrote for a
+    refused call and stays accepted, and beside a positive count it is an itemization of
+    nothing -- a pair no writer has ever produced -- which the sweep now reports.
     """
     try:
         raw = path.read_bytes()
@@ -1751,13 +1760,28 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
         if not isinstance(record, dict):
             continue
         entries = record.get("attempt_log")
-        if not isinstance(entries, list) or not entries:
+        if not isinstance(entries, list):
             continue  # absent, or shape the schema already refused
-        if not all(isinstance(entry, dict) for entry in entries):
-            continue  # shape is the schema's job
         label = f"{path.name}:{index}"
         attempts = record.get("attempts")
-        if isinstance(attempts, int) and not isinstance(attempts, bool):
+        counted = isinstance(attempts, int) and not isinstance(attempts, bool)
+        if not entries:
+            # An empty log is the old spelling of a refused call (``attempts: 0``) and
+            # nothing else: the current writer omits the key, its predecessors filled one
+            # entry per dispatch, so an empty itemization beside a positive count is a line
+            # no writer produces. Beside zero attempts there is nothing left to relate.
+            if counted and attempts > 0:
+                issues.append(
+                    ValidationIssue(
+                        label,
+                        "attempt_log must not be empty beside a positive attempts: "
+                        "absence is the one spelling of an unitemized call",
+                    )
+                )
+            continue
+        if not all(isinstance(entry, dict) for entry in entries):
+            continue  # shape is the schema's job
+        if counted:
             named = [entry.get("index") for entry in entries]
             if named != list(range(1, attempts + 1)):
                 issues.append(
