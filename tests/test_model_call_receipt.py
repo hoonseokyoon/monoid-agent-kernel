@@ -420,6 +420,34 @@ def test_the_attempt_logs_usage_adds_up_to_the_receipts() -> None:
         )
 
 
+def test_the_first_dispatch_records_no_wait_before_it() -> None:
+    """`backoff_ms` is the wait BETWEEN dispatches, so the first entry has none by construction.
+
+    The class and the contract both said "0 on the first entry" and neither checked it, which
+    let a line claim the kernel waited before a dispatch it had not yet made -- a record no
+    runner writes (`pending_backoff_ms` starts at 0 and is only updated after a backoff
+    completes), reading as data. Unlike the timeline inequality one field over, this claim needs
+    only the log: `latency_ms` is not yet stamped when the runner attaches the entries, but their
+    own waits are already final, so the record can refuse this one itself and does.
+
+    Absence still means the record predates the field, so it is not a wait of zero and not a
+    violation either -- the only two things the first entry may say are "no wait" and "I cannot
+    say".
+    """
+
+    def _entry(index: int, backoff: int | None) -> ModelCallAttempt:
+        return ModelCallAttempt(index=index, backoff_ms=backoff)
+
+    assert ModelCallReceipt(attempts=2, attempt_log=(_entry(1, 0), _entry(2, 40))).attempts == 2
+    assert ModelCallReceipt(attempts=1, attempt_log=(_entry(1, None),)).attempts == 1
+    assert ModelCallReceipt(attempts=1, attempt_log=(_entry(1, 0),)).attempts == 1
+
+    with pytest.raises(ValueError, match="backoff_ms"):
+        ModelCallReceipt(attempts=1, attempt_log=(_entry(1, 1),))
+    with pytest.raises(ValueError, match="backoff_ms"):
+        ModelCallReceipt(attempts=2, attempt_log=(_entry(1, 40), _entry(2, 0)))
+
+
 def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
     """Absent on every receipt written before the field existed, which is legal and reads as
     an empty log beside an intact `attempts` count; present-but-mistyped is refused, like

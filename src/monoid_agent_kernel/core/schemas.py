@@ -1704,19 +1704,22 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
 
 
 def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
-    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes.
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, and to
+    the one rule its entries owe each other.
 
     A JSON Schema validates every entry against its own shape and can say nothing about how one
     entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``
-    refuses two cross-entry claims -- indices exactly ``1..attempts`` in order, and entry usage
-    summing to the receipt's -- and nothing constructs a receipt on the way through ``monoid
-    validate``, which reads the ledger as JSON. So a line the record could not have produced
-    (``attempts: 2`` under indices ``[1, 1]``; entries billing 3 beside a total of 99) passed the
-    sweep clean, which is the one answer a validator must never give about a corrupt artifact.
+    refuses three cross-entry claims -- indices exactly ``1..attempts`` in order, entry usage
+    summing to the receipt's, and no wait recorded before the first dispatch -- and nothing
+    constructs a receipt on the way through ``monoid validate``, which reads the ledger as JSON.
+    So a line the record could not have produced (``attempts: 2`` under indices ``[1, 1]``;
+    entries billing 3 beside a total of 99; a wait booked ahead of the call's own first reach
+    into the adapter) passed the sweep clean, which is the one answer a validator must never
+    give about a corrupt artifact.
 
-    The third claim -- the dispatches, plus the waits between them, fitting inside the call's own
-    ``latency_ms`` -- is checked here and *only* here, which is a fact about when the two values
-    exist rather than an omission. ``model_call.py`` attaches the log at its failure and its
+    One claim is this surface's alone -- the dispatches, plus the waits between them, fitting
+    inside the call's own ``latency_ms`` -- which is a fact about when the two values exist
+    rather than an omission. ``model_call.py`` attaches the log at its failure and its
     answering exit while ``latency_ms`` is still the field's default; ``_publish`` stamps the
     measured duration afterwards, on every exit. A constructor check would therefore fire on
     every retried call, weighing real dispatch durations against a latency of zero. This line is
@@ -1762,6 +1765,23 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
                         label, "attempt_log must name every attempt exactly once, in order"
                     )
                 )
+        # The wait that separates two dispatches cannot precede the first one. The record refuses
+        # this itself; repeated here because nothing constructs a record on this path, and a line
+        # can satisfy every other claim -- indices in order, usage summing, durations fitting --
+        # while still reporting a wait before the call had done anything to wait after.
+        first_backoff = entries[0].get("backoff_ms")
+        if (
+            isinstance(first_backoff, int)
+            and not isinstance(first_backoff, bool)
+            and first_backoff != 0
+        ):
+            issues.append(
+                ValidationIssue(
+                    label,
+                    "attempt_log first entry backoff_ms must be 0: "
+                    "nothing precedes the first dispatch",
+                )
+            )
         # Checked before the usage block, which returns early on a shape the schema owns: two
         # independent claims about one line, and the second must not be skipped by the first's
         # excuse for leaving.

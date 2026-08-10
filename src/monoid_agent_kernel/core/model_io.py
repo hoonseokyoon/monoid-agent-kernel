@@ -857,8 +857,10 @@ class ModelCallAttempt:
     No wall-clock instant, deliberately — the receipt carries ``latency_ms`` and no instant, and
     the ledger line's ``recorded_at`` is the anchor for the whole call (see
     ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only;
-    ``backoff_ms`` is the measured wait the kernel imposed *before* it (0 on the first entry,
-    ``None`` on records that predate the field). Every duration here is the floor of the same
+    ``backoff_ms`` is the measured wait the kernel imposed *between* this dispatch and the one
+    before it, so the first entry has none to report and a receipt refuses any other value there
+    (``None`` is the field's absence -- a record predating it -- and stays legal). Every
+    duration here is the floor of the same
     monotonic clock, and floors sum to at most the floor of the sum, so
     ``sum(elapsed_ms) + sum(backoff_ms) <= latency_ms`` exactly — the remainder is the keying
     and settle overhead that falls outside the dispatch loop.
@@ -882,12 +884,13 @@ class ModelCallAttempt:
     provider_retried: bool = False
     usage: Mapping[str, int] = field(default_factory=dict)
     stream_committed: bool = False
-    # The measured wait before this dispatch (W7-2). A duration and never an instant -- the
-    # entry's own timing rule -- and measured around the wait rather than copied from the
-    # schedule, so a capped sleep records what happened. ``None`` means the record predates the
-    # field, which is why ``to_json`` omits the key instead of inventing a null no writer ever
-    # wrote or a 0 that claims a measurement never taken. Appended last under the
-    # positional-stability rule the receipt states.
+    # The measured wait between this dispatch and the one before it (W7-2) -- so on the first
+    # entry there is nothing to measure and the receipt refuses anything but 0. A duration and
+    # never an instant -- the entry's own timing rule -- and measured around the wait rather
+    # than copied from the schedule, so a capped sleep records what happened. ``None`` means the
+    # record predates the field, which is why ``to_json`` omits the key instead of inventing a
+    # null no writer ever wrote or a 0 that claims a measurement never taken. Appended last
+    # under the positional-stability rule the receipt states.
     backoff_ms: int | None = None
 
     def __post_init__(self) -> None:
@@ -1112,6 +1115,20 @@ class ModelCallReceipt:
         ):
             raise ValueError(
                 "model call attempt_log must be empty or name every attempt exactly once"
+            )
+        # A wait is what separates two dispatches, so the first entry has none to report:
+        # nothing of this call precedes its first dispatch, and a line saying otherwise claims
+        # the kernel waited for something it had not yet done. Checkable here -- unlike the
+        # timeline inequality the same field takes part in, which needs a `latency_ms` the
+        # runner has not stamped yet when it attaches the log -- because this one reads the
+        # entries alone, and their own waits are final by the time they arrive. `None` is the
+        # field's absence and not a wait of zero, so it stays legal: a record that predates the
+        # field says nothing here rather than saying nothing happened.
+        first_backoff = self.attempt_log[0].backoff_ms if self.attempt_log else None
+        if first_backoff is not None and first_backoff != 0:
+            raise ValueError(
+                "model call attempt_log first entry backoff_ms must be 0: "
+                "nothing precedes the first dispatch"
             )
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")

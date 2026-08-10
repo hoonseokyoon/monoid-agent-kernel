@@ -995,9 +995,9 @@ def test_otel_attempt_children_never_start_before_the_call_did(span_mode: str) -
         attempts=2,
         attempt_log=(
             ModelCallAttempt(
-                index=1, elapsed_ms=5, backoff_ms=30, error_code="model_error", retryable=True
+                index=1, elapsed_ms=5, backoff_ms=0, error_code="model_error", retryable=True
             ),
-            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=40, usage={"output_tokens": 7}),
+            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=70, usage={"output_tokens": 7}),
         ),
     )
     provider, exporter = _provider_and_exporter()

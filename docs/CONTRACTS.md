@@ -460,8 +460,11 @@ reported such a line clean. The log is optional; an *entry*'s original keys are 
 no writer predating them, so every key the entry shipped with is required on the wire and a
 partial one is refused rather than completed from defaults — defaults there turn a corrupt line
 into a plausible dispatch. A key added after the entry shipped follows the record-level absence
-rule instead, named per key: `backoff_ms` (W7-2) is the measured wait the kernel imposed before
-that dispatch — 0 on the first entry, absent on lines a W7-1 writer filled, where absence means
+rule instead, named per key: `backoff_ms` (W7-2) is the measured wait the kernel imposed *between*
+that dispatch and the one before it — so the first entry has nothing to report, and any other
+value there is refused by the record and by `monoid validate` alike, because a line claiming the
+kernel waited before its own first reach into the adapter is one no runner
+writes — absent on lines a W7-1 writer filled, where absence means
 exactly what the whole log's absence means one level up, and refused when null, by reader and
 schema alike, because no writer omits by writing null. Entries carry no wall-clock instant — the
 receipt's own rule; the ledger line's `recorded_at` anchors the call. Every entry duration is

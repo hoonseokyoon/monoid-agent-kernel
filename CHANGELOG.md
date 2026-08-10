@@ -22,6 +22,10 @@ out in commit messages and here.
   GenAI-aware backend aggregating usage or operations over spans would double-count the
   parent; no capture content, whatever the policy — the attempt log is metadata by
   construction. SpanKind INTERNAL, so service maps keep counting one egress per call.
+- **A wait cannot precede the dispatch it separates from nothing.** `backoff_ms` is the wait
+  *between* two dispatches, so the first entry's is 0 — stated since the field landed, checked
+  now: the receipt refuses any other value there, and `monoid validate` reports a ledger line
+  that books one. Absence stays legal and distinct, meaning a record written before the field.
 - **The timeline is bounded at both ends of its own claim.** `monoid validate` now reports a
   ledger line whose dispatches and recorded waits outlast the `latency_ms` of the call that
   made them — the third cross-entry claim on that line, after the indices and the usage sum,

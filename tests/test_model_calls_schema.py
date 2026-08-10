@@ -373,17 +373,20 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     schema admits it (``additionalProperties: false`` would refuse an undeclared key)."""
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
+    # Two dispatches, because a recorded wait can only ride the entry it delayed: the first
+    # dispatch has nothing before it, so its wait is 0 and the 7ms belongs to the retry.
+    first = ModelCallAttempt(index=1, elapsed_ms=5, usage={"input_tokens": 12}, backoff_ms=0)
     entry = ModelCallAttempt(
-        index=1,
-        elapsed_ms=42,
-        usage={"input_tokens": 12, "output_tokens": 3},
+        index=2,
+        elapsed_ms=30,
+        usage={"output_tokens": 3},
         stream_committed=True,
         backoff_ms=7,
     )
-    record = _record(attempt_log=(entry,))
+    record = _record(attempts=2, attempt_log=(first, entry))
 
-    assert record["attempt_log"] == [entry.to_json()]
-    assert record["attempt_log"][0]["backoff_ms"] == 7
+    assert record["attempt_log"] == [first.to_json(), entry.to_json()]
+    assert record["attempt_log"][1]["backoff_ms"] == 7
     assert _errors(record) == []
 
     ten_key_entry = {name: value for name, value in entry.to_json().items() if name != "backoff_ms"}
@@ -543,23 +546,48 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "latency_ms",
         ),
+        (
+            # A wait recorded before the dispatch that had nothing before it. The totals fit
+            # inside `latency_ms`, so the timeline claim above has nothing to say about this
+            # line -- it is well-formed in every way except that no runner writes it.
+            {
+                "attempts": 2,
+                "attempt_log": [
+                    {
+                        **_ATTEMPT,
+                        "index": 1,
+                        "elapsed_ms": 5,
+                        "backoff_ms": 3,
+                        "usage": {"input_tokens": 12},
+                    },
+                    {
+                        **_ATTEMPT,
+                        "index": 2,
+                        "elapsed_ms": 3,
+                        "backoff_ms": 0,
+                        "usage": {"output_tokens": 3},
+                    },
+                ],
+            },
+            "first",
+        ),
     ],
-    ids=["indices", "usage", "timeline", "timeline_legacy"],
+    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The three cross-entry invariants, refused on the sweep as well.
+    """The four cross-entry invariants, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
     another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
-    15, and dispatches that outlast the call that made them are all structurally perfect lines.
-    Nothing constructs a receipt on the way through ``monoid validate``, which reads the ledger
-    as JSON, so a directory the record could not have produced was reported clean -- the one
-    answer a validator must never give.
+    15, dispatches that outlast the call that made them, and a wait booked before the first
+    dispatch are all structurally perfect lines. Nothing constructs a receipt on the way through
+    ``monoid validate``, which reads the ledger as JSON, so a directory the record could not have
+    produced was reported clean -- the one answer a validator must never give.
 
-    The first two the record also refuses at construction. The third is this surface's alone, and
-    deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
+    Three of the four the record also refuses at construction. The timeline one is this surface's
+    alone, and deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
     ``_publish`` stamps the measured duration afterwards on every exit (``model_call.py`` builds
     the log at the failure and answering exits, then times the receipt inside ``_publish``). A
     constructor check would therefore fire on every retried call, comparing real dispatch
