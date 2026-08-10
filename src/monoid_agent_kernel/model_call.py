@@ -39,7 +39,6 @@ import contextlib
 import inspect
 import logging
 import time
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, replace
@@ -79,6 +78,7 @@ from monoid_agent_kernel.providers.base import (
     collect_retry_reports,
     mark_provider_retried,
     mark_provider_usage,
+    new_idempotency_key,
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
@@ -249,16 +249,9 @@ def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
     return cloned
 
 
-def _new_idempotency_key() -> str:
-    """One retry-scope token, minted per call at the keying block.
-
-    Random rather than derived, and that is the contract: two byte-identical requests share a
-    replay slot by design -- content cannot separate them -- so the token that separates their
-    provider work must be content-independent. Prefixed the way the kernel's other minted ids
-    are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
-    """
-
-    return f"idem_{uuid.uuid4().hex}"
+# The minter itself lives in ``providers.base`` beside the rule it satisfies, because the
+# runner is not its only caller: the reference gateway's service keys the upstream hop it
+# drives, which has a retry loop of its own. One expression, both issuers.
 
 
 def _normalize_invocation_context(context: InvocationContext) -> InvocationContext:
@@ -668,7 +661,7 @@ class ModelCallRunner:
                 # would let one request object hand two calls the same retry scope, the
                 # collision per-call issuance exists to prevent. Issuance is uniform across
                 # adapters; presenting the token on a wire is the gateway transport's alone.
-                object.__setattr__(request, "idempotency_key", _new_idempotency_key())
+                object.__setattr__(request, "idempotency_key", new_idempotency_key())
                 if dispatch_model is not None:
                     object.__setattr__(request, "model", dispatch_model)
                 where, destination_status = self._resolved_destination(model, adapter)

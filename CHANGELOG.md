@@ -32,8 +32,11 @@ out in commit messages and here.
   keeps its exact pre-W7-3 wire shape (no empty header). The reference `llm_gateway` logs
   the inbound key on the two turn routes and echoes it on every response those requests
   produce — JSON, SSE, and error responses alike — and deliberately does **not** dedupe on
-  it (retry-scoped carriage is not exactly-once) nor relay it upstream (each hop issues its
-  own key for its own retry scope). The OpenAI adapter does not read the field.
+  it (retry-scoped carriage is not exactly-once) nor relay it upstream — it **issues its own**
+  key for the upstream hop it drives, on both the one-shot and streaming paths, because that
+  hop has a retry loop of its own and a relayed key would stitch two scopes into one. So
+  `ModelCallRunner` is not the only issuer, and both read the same `new_idempotency_key`.
+  The OpenAI adapter does not read the field.
 - **A key is a bounded ASCII token, enforced at every edge it crosses.** 1–128 characters
   from `[A-Za-z0-9._+-]` starting with a letter or digit. This is the only field on the
   receipt that reaches a transport header rather than a JSON string — JSON escapes a control

@@ -3670,13 +3670,17 @@ def test_the_runner_is_the_single_issuer_and_overwrites_a_caller_value() -> None
 
 def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
     """The mint and the validator must not drift: every edge omits or refuses a key outside
-    the token shape, so a mint that ever left it would silently stop being carried."""
+    the token shape, so a mint that ever left it would silently stop being carried.
 
-    from monoid_agent_kernel.model_call import _new_idempotency_key
-    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+    Read off ``providers.base``, where the minter lives because the runner is not its only
+    caller -- the reference gateway keys the upstream hop it drives with the same function.
+    Two copies of the expression is how the two issuers would come to differ.
+    """
+
+    from monoid_agent_kernel.providers.base import is_valid_idempotency_key, new_idempotency_key
 
     for _ in range(64):
-        assert is_valid_idempotency_key(_new_idempotency_key())
+        assert is_valid_idempotency_key(new_idempotency_key())
 
 
 @pytest.mark.parametrize(

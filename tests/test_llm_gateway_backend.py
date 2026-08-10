@@ -2099,3 +2099,88 @@ def test_llm_gateway_refuses_to_log_or_echo_an_unspellable_key(caplog, raw_key: 
     )
     # Bounded: no log line this request produced can be sized by the client.
     assert max(len(message) for message in messages) < 512
+
+
+class _HopKeyRecorder:
+    """An upstream adapter that records the key the gateway keyed ITS call with."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def next_turn(self, request):  # noqa: ANN001, ANN201
+        self.seen.append(request.idempotency_key)
+        return ModelTurn(response_id="provider_1", final_text="done")
+
+    async def astream_turn(self, request):  # noqa: ANN001, ANN201
+        self.seen.append(request.idempotency_key)
+        for chunk in (TextDelta("done"), TurnComplete(response_id="provider_1")):
+            yield chunk
+
+
+@pytest.mark.parametrize("route", ["one-shot", "stream"])
+def test_the_gateway_keys_the_upstream_hop_it_drives(route: str) -> None:
+    """A hop with its own retry loop needs its own scope.
+
+    The service builds the upstream ``ModelRequest`` itself -- it never goes through
+    ``ModelCallRunner``, which is what mints for a kernel-driven call -- so without this the
+    upstream hop of a chained gateway carried no key at all, while this PR's own documentation
+    said each hop issues one. The inbound key is still not relayed: relaying would stitch two
+    retry scopes into one and lie to both, so the two values must differ.
+    """
+    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+
+    upstream = _HopKeyRecorder()
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    claims_token = _llm_token(manager)
+
+    if route == "one-shot":
+        gateway.handle_turn(claims_token, _payload())
+        gateway.handle_turn(claims_token, _payload())
+    else:
+        for _ in range(2):
+            list(gateway.handle_turn_stream(claims_token, _payload()))
+
+    assert len(upstream.seen) == 2
+    for key in upstream.seen:
+        assert is_valid_idempotency_key(key), key
+    # One scope per inbound turn, not one per process: two turns are two upstream calls.
+    assert upstream.seen[0] != upstream.seen[1]
+
+
+def test_the_upstream_key_is_this_hops_own_and_not_the_callers() -> None:
+    """Echo yes, relay no -- the two are different jobs and only one of them is safe."""
+    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+
+    upstream = _HopKeyRecorder()
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        response = urlopen(
+            Request(
+                f"{base_url}/internal/llm/turns",
+                data=json.dumps(_payload()).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {_llm_token(manager)}",
+                    "Idempotency-Key": "idem_from_the_caller",
+                },
+                method="POST",
+            ),
+            timeout=10,
+        )
+        with response:
+            assert json.loads(response.read())["final_text"] == "done"
+            assert response.headers.get("Idempotency-Key") == "idem_from_the_caller"
+
+    # Both halves, because "not the caller's" is satisfied by an empty key too -- the mutant
+    # that removed issuance passed this test until it also had to be a real key.
+    assert upstream.seen and is_valid_idempotency_key(upstream.seen[0])
+    assert upstream.seen[0] != "idem_from_the_caller"

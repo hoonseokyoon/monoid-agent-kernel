@@ -473,7 +473,10 @@ them, so the token that separates their provider work is random, never derived �
 value means *issued*, not *sent*. Three limits are the contract, not gaps: carriage is
 retry-scoped and **not exactly-once** — the reference gateway logs and echoes the header
 (`Idempotency-Key`, on every response including errors) but does not dedupe on it, and does not
-relay it upstream, because each hop's client issues its own key for its own retry scope; a
+relay it upstream: instead it *issues its own* for the upstream hop it drives, because that hop
+has a retry loop of its own and relaying would stitch two retry scopes into one and misdescribe
+both. `ModelCallRunner` is not the only issuer for that reason, and both read the same
+`new_idempotency_key`; a
 **resumed run reissues** — a call never spans a park, so recovery re-runs the step and the rerun
 is a new call with a new key; and only the **gateway transport presents it** — the OpenAI adapter
 does not read the field, so nothing is sent there. A receipt whose key is empty was never keyed:

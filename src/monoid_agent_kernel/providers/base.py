@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import uuid
 from copy import copy
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
@@ -645,6 +646,25 @@ def is_valid_idempotency_key(value: Any) -> bool:
     """
 
     return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+
+
+def new_idempotency_key() -> str:
+    """Mint one retry-scope token, for whoever owns a call's retry scope.
+
+    Public and shared because there is more than one such owner: ``ModelCallRunner`` for a call
+    the kernel drives, and the reference gateway's service for the upstream hop it drives
+    itself -- a hop with its own retry loop, hence its own scope. A second copy of this
+    expression is how the two would come to differ; the same reasoning promoted
+    ``capped_backoff`` out of one module when its second caller appeared.
+
+    Random rather than derived, and that is the contract: two byte-identical requests share a
+    replay slot by design -- content cannot separate them -- so the token that separates their
+    provider work must be content-independent. Prefixed the way the kernel's other minted ids
+    are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
+    Conforms to :data:`IDEMPOTENCY_KEY_PATTERN` by construction, which is pinned by test.
+    """
+
+    return f"idem_{uuid.uuid4().hex}"
 
 
 def _normalize_optional_text(value: Any, field_name: str) -> str | None:
