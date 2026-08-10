@@ -7,6 +7,59 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
+
+- **`OtelEventSink` synthesizes one `model.attempt {index}` child span per kernel dispatch**
+  under the call's `chat` span, at settle, from `receipt.attempt_log` — in both `span_mode`s,
+  through the model-I/O facet. No public event changes: the event stream still carries no
+  attempt data, so the children appear only where the subscription facet is registered. Only
+  when the kernel dispatched more than once — a single-attempt call's chat span IS that
+  attempt, and a child would restate it at double the span volume of every subscribed call.
+- **Children are `monoid.model.attempt.*` and never `gen_ai.*`.** Index, `elapsed_ms`,
+  `backoff_ms`, the failure taxonomy, per-attempt usage (JSON string), `provider_retried`,
+  `stream_committed`; a failed dispatch gets `error.type` + ERROR status under the parent's
+  rule (`model_call_aborted` stays an interruption). No GenAI attributes, because a
+  GenAI-aware backend aggregating usage or operations over spans would double-count the
+  parent; no capture content, whatever the policy — the attempt log is metadata by
+  construction. SpanKind INTERNAL, so service maps keep counting one egress per call.
+- **A wait cannot precede the dispatch it separates from nothing.** `backoff_ms` is the wait
+  *between* two dispatches, so the first entry's is 0 — stated since the field landed, checked
+  now: the receipt refuses any other value there, and `monoid validate` reports a ledger line
+  that books one. Absence stays legal and distinct, meaning a record written before the field.
+- **The timeline is bounded at both ends of its own claim.** `monoid validate` now reports a
+  ledger line whose dispatches and recorded waits outlast the `latency_ms` of the call that
+  made them — the third cross-entry claim on that line, after the indices and the usage sum,
+  and the first surface where both values are settled together (the runner attaches the log
+  before `_publish` stamps the duration, so the receipt constructor cannot ask). The OTel
+  children bound their own walk by the same inequality instead of trusting it, so a hand-built
+  or corrupted receipt can no longer place a child before the call that dispatched it.
+- **Placement is the recorded timeline, walked backward from settle**: each child spans its
+  measured `elapsed_ms` preceded by its `backoff_ms` gap (that field lands in the entry one
+  section below); entries parsed from lines that predate the field pack edge to edge —
+  durations and order exact, unknown gaps collapsed. Duplicate `on_model_call` deliveries do
+  not duplicate children; a receipt with no matching open chat span synthesizes no orphans.
+
+### Added — the wait between dispatches, on the record: `attempt_log[].backoff_ms`
+
+- **Each attempt entry records the measured backoff that preceded its dispatch.**
+  `ModelCallAttempt.backoff_ms` — 0 on the first entry, the floored monotonic measurement of
+  the sleep that actually ran otherwise, `None` on entries parsed from lines written before
+  the field existed. Measured around the wait rather than copied from the schedule, so a
+  capped sleep records what happened. The entry's timeline algebra closes with it: every
+  duration is the floor of the same monotonic clock, and floors sum to at most the floor of
+  the sum, so `sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` holds exactly — the remainder
+  is keying and settle overhead. Landed ahead of the per-attempt OTel spans (W7-2) so they
+  can sit on the real timeline instead of being packed edge to edge.
+- **The first key added to the entry after the entry shipped, and the wire rule now names
+  that boundary.** The entry stays read-whole-or-refused for the keys it was born with;
+  `backoff_ms` follows the record-level absence rule instead (`_ATTEMPT_OPTIONAL_WIRE_KEYS`,
+  a named policy with its reason beside it): absent = a W7-1 writer's line, still valid to
+  `monoid validate`; null = refused by reader and schema alike, since no writer omits by
+  writing null; `to_json` and the `model-calls.v1` projection omit the key when the value is
+  unknown, so a legacy line round-trips unchanged instead of refusing itself on the next
+  read. Same unreleased-window reasoning as `attempt_log` and `idempotency_key` — no released
+  reader, `monoid.model-calls.v1` identifier unchanged (COMPATIBILITY.md).
+
 ### Added — one retry scope per call, carried where the call is keyed: `idempotency_key`
 
 - **Every model call is keyed with a retry-scope token.** `ModelCallRunner` mints

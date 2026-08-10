@@ -270,14 +270,17 @@ monoid run \
 
 ```
 invoke_agent
-├── chat {model}          (one span per model turn)
-└── execute_tool {tool}   (one span per tool call)
+├── chat {model}            (one span per model turn)
+│   └── model.attempt {i}   (one child per kernel dispatch, when there was more than one;
+│                            the only node here the event stream alone cannot produce)
+└── execute_tool {tool}     (one span per tool call)
 ```
 
 `chat` and `execute_tool` are siblings under `invoke_agent` (linked by a `turn_id` attribute,
 not nested), and spans carry GenAI attributes (`gen_ai.operation.name`, `gen_ai.request.model`,
 `gen_ai.provider.name`, `gen_ai.tool.name`, token usage). The zero-argument form preserves this
-metadata-only behavior:
+metadata-only behavior, minus the `model.attempt` children, which are receipt-derived and need
+the model-I/O facet:
 
 ```python
 from monoid_agent_kernel import AgentLoop
@@ -371,6 +374,25 @@ Treat those two modes as content-bearing exports and configure collector access 
 accordingly. Capture never changes `events.jsonl`, and raw delta events are not mirrored into span
 attributes. Model-stream observers are a separate live/private content channel and do not add
 content to OTel spans unless an integrating observer explicitly exports it.
+
+**Per-attempt spans (W7-2).** When the kernel retry layer dispatched a call more than once, the
+model-I/O facet synthesizes one `model.attempt {index}` INTERNAL child under that call's `chat`
+span at settle — one per `receipt.attempt_log` entry, in both `span_mode`s. This rides the
+subscription facet (the event stream carries no attempt data, deliberately), so the zero-argument
+event-only quickstart shows neither the children nor the `monoid.model.attempts` count that
+summarizes them: both are read off the receipt, and the public turn events carry no attempt count.
+A single-dispatch call synthesizes no child either: the chat span *is* that attempt, and a child
+would restate it at double the span volume. Children carry `monoid.model.attempt.*` attributes —
+`index`, `elapsed_ms`, `backoff_ms`, the failure taxonomy, per-attempt `usage` as a JSON string,
+`provider_retried`, `stream_committed` — and deliberately no `gen_ai.*`, because a GenAI-aware
+backend aggregating usage or operation counts over those spans would double-count the parent;
+capture content never propagates down, whatever the policy, since the attempt log is metadata by
+construction. A failed dispatch gets `error.type` and ERROR status under the parent's own rule
+(`model_call_aborted` is an interruption, not an error). Placement walks backward from the settle
+instant: each child spans its measured `elapsed_ms`, preceded by its recorded `backoff_ms` gap;
+entries read from ledger lines that predate `backoff_ms` pack edge to edge — durations and order
+stay exact, the unknown gaps collapse. The instants combine a wall-clock anchor with monotonic
+durations, the same stated limitation as the standalone `model_call` span.
 
 Fresh sinks created for a restored activation lazily open `invoke_agent` on the first child event,
 because recovery does not replay `run.started`. Model receipts then update the runtime provider and

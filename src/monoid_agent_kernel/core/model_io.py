@@ -856,8 +856,14 @@ class ModelCallAttempt:
 
     No wall-clock instant, deliberately — the receipt carries ``latency_ms`` and no instant, and
     the ledger line's ``recorded_at`` is the anchor for the whole call (see
-    ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only; backoff
-    waits fall between entries, so the entries sum to less than the receipt's ``latency_ms``.
+    ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only;
+    ``backoff_ms`` is the measured wait the kernel imposed *between* this dispatch and the one
+    before it, so the first entry has none to report and a receipt refuses any other value there
+    (``None`` is the field's absence -- a record predating it -- and stays legal). Every
+    duration here is the floor of the same
+    monotonic clock, and floors sum to at most the floor of the sum, so
+    ``sum(elapsed_ms) + sum(backoff_ms) <= latency_ms`` exactly — the remainder is the keying
+    and settle overhead that falls outside the dispatch loop.
 
     ``provider_retried`` here is what the adapter reported through the progress channel *during
     this attempt's dispatch*, plus what this attempt's own outcome object declared. The receipt's
@@ -878,6 +884,14 @@ class ModelCallAttempt:
     provider_retried: bool = False
     usage: Mapping[str, int] = field(default_factory=dict)
     stream_committed: bool = False
+    # The measured wait between this dispatch and the one before it (W7-2) -- so on the first
+    # entry there is nothing to measure and the receipt refuses anything but 0. A duration and
+    # never an instant -- the entry's own timing rule -- and measured around the wait rather
+    # than copied from the schedule, so a capped sleep records what happened. ``None`` means the
+    # record predates the field, which is why ``to_json`` omits the key instead of inventing a
+    # null no writer ever wrote or a 0 that claims a measurement never taken. Appended last
+    # under the positional-stability rule the receipt states.
+    backoff_ms: int | None = None
 
     def __post_init__(self) -> None:
         # Type before bounds: a comparison cannot tell an integer from a bool, so the bounds
@@ -887,6 +901,8 @@ class ModelCallAttempt:
             raise ValueError("model call attempt index must be positive")
         if self.elapsed_ms < 0:
             raise ValueError("model call attempt elapsed_ms must not be negative")
+        if self.backoff_ms is not None and self.backoff_ms < 0:
+            raise ValueError("model call attempt backoff_ms must not be negative")
         # The same usage rule the receipt enforces, spelled the same way: a log whose entries
         # admitted what the receipt refuses could not honor the sum invariant the runner pins
         # (entry usage totals equal the receipt's usage on either settle exit).
@@ -905,7 +921,7 @@ class ModelCallAttempt:
         return self.error_code == ""
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "index": self.index,
             "elapsed_ms": self.elapsed_ms,
             "error_code": self.error_code,
@@ -917,6 +933,12 @@ class ModelCallAttempt:
             "usage": dict(self.usage),
             "stream_committed": self.stream_committed,
         }
+        # Omitted, not nulled: absence is the wire spelling of "written before the field
+        # existed", and it must survive a round trip -- a legacy line re-serialized with an
+        # unconditional key would refuse itself on the next read.
+        if self.backoff_ms is not None:
+            payload["backoff_ms"] = self.backoff_ms
+        return payload
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallAttempt:
@@ -924,13 +946,20 @@ class ModelCallAttempt:
         # An entry is read whole or refused, which is not the rule one level up and must not be.
         # ``attempt_log`` itself is optional because its absence means exactly one thing -- a
         # writer that predates the field -- and defaults there reconstruct what that writer meant.
-        # An entry has no predecessor to be lenient toward: it was written by a writer that knew
-        # all ten keys or it was not written by this record at all. Defaulting them turned `{}`
-        # into a successful, zero-duration, unbilled dispatch numbered 1, which then satisfied
-        # both of the receipt's cross-entry invariants -- a corrupt audit line reading as data,
-        # the one outcome an audit surface may not produce. The ledger schema has required all
-        # ten since the field shipped; this is the reader agreeing with it.
-        missing = [name for name in _ATTEMPT_WIRE_KEYS if name not in payload]
+        # The keys an entry was BORN with have no predecessor to be lenient toward: they were
+        # written by a writer that knew all of them or the entry was not written by this record
+        # at all. Defaulting them turned `{}` into a successful, zero-duration, unbilled dispatch
+        # numbered 1, which then satisfied both of the receipt's cross-entry invariants -- a
+        # corrupt audit line reading as data, the one outcome an audit surface may not produce.
+        # The ledger schema has required every one of them since the field shipped; this is the
+        # reader agreeing with it. A key added AFTER the entry shipped is the other generation:
+        # it does have predecessors -- every line the earlier writer filled -- so it follows the
+        # record-level absence rule instead, named per key in ``_ATTEMPT_OPTIONAL_WIRE_KEYS``.
+        missing = [
+            name
+            for name in _ATTEMPT_WIRE_KEYS
+            if name not in payload and name not in _ATTEMPT_OPTIONAL_WIRE_KEYS
+        ]
         if missing:
             raise WireValidationError(
                 "model call attempt is missing required fields: " + ", ".join(missing)
@@ -950,6 +979,13 @@ class ModelCallAttempt:
             provider_retried=parse_bool(payload, "provider_retried"),
             usage=_optional_object(payload, "usage") or {},
             stream_committed=parse_bool(payload, "stream_committed"),
+            # Absent means the line predates the field; present must be an integer. ``null`` is
+            # neither generation -- no writer omits by writing null -- and ``parse_int`` refuses
+            # it, which keeps this reader saying what the schema says (``"type": "integer"``)
+            # instead of re-opening the reader-lenient/schema-strict split one field over.
+            backoff_ms=(
+                None if "backoff_ms" not in payload else parse_int(payload, "backoff_ms")
+            ),
         )
 
 
@@ -958,6 +994,13 @@ class ModelCallAttempt:
 _ATTEMPT_WIRE_KEYS: tuple[str, ...] = tuple(
     entry.name for entry in dataclass_fields(ModelCallAttempt)
 )
+
+# The exemption is a policy with a reason, not a forgotten field: a key added after the entry
+# shipped (``backoff_ms``, W7-2) has predecessors -- every line the earlier writer filled -- and
+# requiring it would refuse ledgers this same package wrote. Absence of a key in this set reads
+# as "written before the field existed", the record-level rule applied per key; everything not
+# named here stays required the moment it exists, which is the derivation above doing its job.
+_ATTEMPT_OPTIONAL_WIRE_KEYS: frozenset[str] = frozenset({"backoff_ms"})
 
 
 @dataclass(frozen=True)
@@ -1072,6 +1115,20 @@ class ModelCallReceipt:
         ):
             raise ValueError(
                 "model call attempt_log must be empty or name every attempt exactly once"
+            )
+        # A wait is what separates two dispatches, so the first entry has none to report:
+        # nothing of this call precedes its first dispatch, and a line saying otherwise claims
+        # the kernel waited for something it had not yet done. Checkable here -- unlike the
+        # timeline inequality the same field takes part in, which needs a `latency_ms` the
+        # runner has not stamped yet when it attaches the log -- because this one reads the
+        # entries alone, and their own waits are final by the time they arrive. `None` is the
+        # field's absence and not a wait of zero, so it stays legal: a record that predates the
+        # field says nothing here rather than saying nothing happened.
+        first_backoff = self.attempt_log[0].backoff_ms if self.attempt_log else None
+        if first_backoff is not None and first_backoff != 0:
+            raise ValueError(
+                "model call attempt_log first entry backoff_ms must be 0: "
+                "nothing precedes the first dispatch"
             )
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")

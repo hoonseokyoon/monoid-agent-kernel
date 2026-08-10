@@ -1136,6 +1136,11 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
                         "additionalProperties": {"type": "integer", "minimum": 0},
                     },
                     "stream_committed": {"type": "boolean"},
+                    # W7-2: declared and not required -- an entry a W7-1 writer filled carries
+                    # ten keys and stays valid, absence meaning the line predates the field.
+                    # Integer only, never null: no writer omits by writing null, and the reader
+                    # (``ModelCallAttempt.from_json``) refuses it under the same rule.
+                    "backoff_ms": {"type": "integer", "minimum": 0},
                 },
                 "additionalProperties": False,
             },
@@ -1699,15 +1704,29 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
 
 
 def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
-    """Relate each ledger line's ``attempt_log`` to the two record fields it itemizes.
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, and to
+    the one rule its entries owe each other.
 
     A JSON Schema validates every entry against its own shape and can say nothing about how one
     entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``
-    refuses two cross-entry claims -- indices exactly ``1..attempts`` in order, and entry usage
-    summing to the receipt's -- and nothing constructs a receipt on the way through ``monoid
-    validate``, which reads the ledger as JSON. So a line the record could not have produced
-    (``attempts: 2`` under indices ``[1, 1]``; entries billing 3 beside a total of 99) passed the
-    sweep clean, which is the one answer a validator must never give about a corrupt artifact.
+    refuses three cross-entry claims -- indices exactly ``1..attempts`` in order, entry usage
+    summing to the receipt's, and no wait recorded before the first dispatch -- and nothing
+    constructs a receipt on the way through ``monoid validate``, which reads the ledger as JSON.
+    So a line the record could not have produced (``attempts: 2`` under indices ``[1, 1]``;
+    entries billing 3 beside a total of 99; a wait booked ahead of the call's own first reach
+    into the adapter) passed the sweep clean, which is the one answer a validator must never
+    give about a corrupt artifact.
+
+    One claim is this surface's alone -- the dispatches, plus the waits between them, fitting
+    inside the call's own ``latency_ms`` -- which is a fact about when the two values exist
+    rather than an omission. ``model_call.py`` attaches the log at its failure and its
+    answering exit while ``latency_ms`` is still the field's default; ``_publish`` stamps the
+    measured duration afterwards, on every exit. A constructor check would therefore fire on
+    every retried call, weighing real dispatch durations against a latency of zero. This line is
+    the first place both values are settled and present together. Consumers that lay the entries
+    out on a timeline -- the OTel preset's per-attempt children -- bound their own arithmetic
+    rather than trust the record, because reporting a corrupt line is not the same as stopping
+    one from being read back.
 
     The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
     (manifest against workspace index, proposal against its hashes, settled text against its
@@ -1746,6 +1765,39 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
                         label, "attempt_log must name every attempt exactly once, in order"
                     )
                 )
+        # The wait that separates two dispatches cannot precede the first one. The record refuses
+        # this itself; repeated here because nothing constructs a record on this path, and a line
+        # can satisfy every other claim -- indices in order, usage summing, durations fitting --
+        # while still reporting a wait before the call had done anything to wait after.
+        first_backoff = entries[0].get("backoff_ms")
+        if (
+            isinstance(first_backoff, int)
+            and not isinstance(first_backoff, bool)
+            and first_backoff != 0
+        ):
+            issues.append(
+                ValidationIssue(
+                    label,
+                    "attempt_log first entry backoff_ms must be 0: "
+                    "nothing precedes the first dispatch",
+                )
+            )
+        # Checked before the usage block, which returns early on a shape the schema owns: two
+        # independent claims about one line, and the second must not be skipped by the first's
+        # excuse for leaving.
+        latency_ms = record.get("latency_ms")
+        occupied: int | None = _attempt_timeline_ms(entries)
+        if (
+            occupied is not None
+            and isinstance(latency_ms, int)
+            and not isinstance(latency_ms, bool)
+            and occupied > latency_ms
+        ):
+            issues.append(
+                ValidationIssue(
+                    label, "attempt_log dispatches and waits must fit inside the line's latency_ms"
+                )
+            )
         usage = record.get("usage")
         if not isinstance(usage, dict):
             continue  # shape is the schema's job
@@ -1773,6 +1825,32 @@ def _summed_attempt_usage(entries: list[Any]) -> dict[str, int] | None:
                 return None
             summed[key] = summed.get(key, 0) + value
     return summed
+
+
+def _attempt_timeline_ms(entries: list[Any]) -> int | None:
+    """Total time the entries account for: every dispatch plus every wait they recorded.
+
+    ``None`` rather than a partial total when a duration is not a count, for the reason
+    ``_summed_attempt_usage`` gives -- a figure computed around corruption the schema already
+    reported would be a second and wrong finding on the same line.
+
+    An absent ``backoff_ms`` contributes zero and is not corruption: it is a line written before
+    the field, whose unrecorded waits can only make the true total larger than this one. That
+    direction is the safe one for a check that reports totals which are *too large*, so a legacy
+    line is never accused on the strength of what it could not say.
+    """
+    total = 0
+    for entry in entries:
+        elapsed = entry.get("elapsed_ms")
+        if not isinstance(elapsed, int) or isinstance(elapsed, bool):
+            return None
+        backoff = entry.get("backoff_ms", 0)
+        if backoff is None:
+            backoff = 0
+        if not isinstance(backoff, int) or isinstance(backoff, bool):
+            return None
+        total += elapsed + backoff
+    return total
 
 
 def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:

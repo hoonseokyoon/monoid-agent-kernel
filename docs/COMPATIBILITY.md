@@ -420,9 +420,10 @@ written before the field existed means; the ledger schema declares the key witho
 requiring it, so `monoid validate` still passes directories older writers filled; and a
 present log that does not name every attempt exactly once is refused — that shape is a
 writer bug, not a legacy to absorb, and `monoid validate` now says so too rather than only
-the constructor. Leniency stops at the key: an *entry* has no writer predating it, so all
-ten of its fields are required and a partial one is refused instead of completed from
-defaults. Run totals (`metrics.json`, `state.total_usage`, the token budget, the child
+the constructor. Leniency stops at the key for the fields an entry shipped with: those have
+no writer predating them, so every one is required and a partial entry is refused instead of
+completed from defaults. (W7-2 later adds `backoff_ms` to the entry; that key has
+predecessors and follows the record-level absence rule — its own paragraph below.) Run totals (`metrics.json`, `state.total_usage`, the token budget, the child
 roll-up) now read the settled receipt's usage, which folds spend from attempts a kernel
 retry absorbed — including on a run the boundary ended, where a cancelled, timed-out or
 interrupted call's absorbed attempts now reach the totals as well; transcript `model_turn`
@@ -454,6 +455,18 @@ per call, so replaying a corpus issues fresh keys without touching the equivalen
 reads the payloads corpus and never opens the ledger. The value never reaches `status.json`,
 `metrics.json`, or the event stream — carriage is receipt and ledger only, plus the
 `Idempotency-Key` HTTP header on the gateway transport.
+
+W7-2 adds `backoff_ms` to the attempt *entry*, on the receipt and the same ledger line — the
+measured wait the kernel imposed before that dispatch, 0 on the first entry — inside the same
+unreleased window and under the same closed-schema reasoning. It is the first key added to the
+entry after the entry shipped, so the read-whole-or-refused rule gains its stated boundary:
+keys the entry was born with stay required; `backoff_ms` is declared without being required,
+absence meaning a line a W7-1 writer filled, and `monoid validate` keeps passing those
+directories. `to_json` and the ledger projection omit the key when the value is unknown rather
+than emitting null (a value no writer ever wrote) or 0 (a measurement never taken), so legacy
+lines round-trip unchanged; a present null is refused by reader and schema alike. Timing stays
+duration-only — no wall-clock instant joins the entry — and the recorded durations satisfy
+`sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` on one monotonic clock.
 
 In the same window, every `pattern` across the artifact schemas stops accepting a trailing
 newline. `jsonschema` evaluates `pattern` with Python's `re`, where `$` matches immediately before

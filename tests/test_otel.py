@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.events import make_agent_event
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
+    ModelCallAttempt,
     ModelCallCapture,
     ModelCallReceipt,
     RedactionPolicy,
@@ -719,3 +720,405 @@ def test_otel_successful_redaction_records_policy_and_masks_content(tmp_path: Pa
     assert "[redacted]" in chat.attributes["monoid.model.capture.content"]
     assert "monoid.model.capture.digests" in chat.attributes
     assert "monoid.model.capture.lengths" in chat.attributes
+
+
+# --- W7-2: per-attempt children synthesized from the settled attempt log ----------------------
+
+
+def _attempt_receipt() -> ModelCallReceipt:
+    """Two dispatches: a billed retryable failure, then the answering attempt after a 40ms wait."""
+
+    return ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        provider_name="gateway",
+        stop_reason="stop",
+        usage={"input_tokens": 3, "output_tokens": 7},
+        latency_ms=60,
+        attempts=2,
+        attempt_log=(
+            ModelCallAttempt(
+                index=1,
+                elapsed_ms=5,
+                backoff_ms=0,
+                error_code="model_error",
+                provider_error_code="overloaded",
+                retryable=True,
+                http_status=529,
+                usage={"output_tokens": 2},
+            ),
+            ModelCallAttempt(
+                index=2,
+                elapsed_ms=3,
+                backoff_ms=40,
+                usage={"input_tokens": 3, "output_tokens": 5},
+                stream_committed=True,
+            ),
+        ),
+    )
+
+
+def _mode_preset(span_mode: str, provider) -> OtelEventSink:
+    return OtelEventSink(
+        tracer_provider=provider,
+        span_mode=span_mode,  # type: ignore[arg-type]
+        capture_policy=CapturePolicy(mode="none"),
+    )
+
+
+def _deliver(preset: OtelEventSink, receipt: ModelCallReceipt, span_mode: str) -> None:
+    """One settled call, through whichever wiring the mode uses."""
+
+    if span_mode == "agent":
+        preset.emit(make_agent_event(run_id="run-attempts", seq=1, event_type="run.started"))
+        preset.emit(
+            make_agent_event(
+                run_id="run-attempts",
+                seq=2,
+                event_type="model.turn.started",
+                turn_id="turn_0001",
+            )
+        )
+    preset.on_model_call(ModelCallCapture(receipt=receipt))
+
+
+def _attempt_children(spans):
+    return sorted(
+        (span for span in spans if span.name.startswith("model.attempt")),
+        key=lambda span: span.attributes["monoid.model.attempt.index"],
+    )
+
+
+@pytest.mark.parametrize("span_mode", ["agent", "model_call"])
+def test_otel_synthesizes_attempt_children_under_the_chat_span(span_mode: str) -> None:
+    """One INTERNAL child per logged dispatch, in BOTH wirings -- the mode census. Widths are
+    the entries' own `elapsed_ms`, the gap is the recorded backoff, the failed dispatch
+    carries the error and the answering one does not."""
+
+    from opentelemetry.trace import SpanKind
+    from opentelemetry.trace.status import StatusCode
+
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset(span_mode, provider)
+    _deliver(preset, _attempt_receipt(), span_mode)
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    first, second = _attempt_children(spans)
+
+    assert [first.name, second.name] == ["model.attempt 1", "model.attempt 2"]
+    for child in (first, second):
+        assert child.kind is SpanKind.INTERNAL
+        assert child.parent is not None
+        assert child.parent.span_id == chat.context.span_id
+    assert first.end_time - first.start_time == 5_000_000
+    assert second.end_time - second.start_time == 3_000_000
+    assert second.start_time - first.end_time == 40_000_000
+    assert first.status.status_code == StatusCode.ERROR
+    assert first.attributes["error.type"] == "overloaded"
+    assert first.attributes["monoid.model.attempt.error_code"] == "model_error"
+    assert first.attributes["monoid.model.attempt.http_status"] == 529
+    assert first.attributes["monoid.model.attempt.retryable"] is True
+    assert second.status.status_code == StatusCode.UNSET
+    assert "error.type" not in second.attributes
+    assert second.attributes["monoid.model.attempt.backoff_ms"] == 40
+    assert second.attributes["monoid.model.attempt.stream_committed"] is True
+    assert "output_tokens" in second.attributes["monoid.model.attempt.usage"]
+    assert chat.attributes["monoid.model.attempts"] == 2
+
+
+@pytest.mark.parametrize("span_mode", ["agent", "model_call"])
+def test_otel_attempt_children_carry_only_their_own_namespace(span_mode: str) -> None:
+    """The attribute rule as a class, not a key list: everything on a child is
+    `monoid.model.attempt.*` or `error.type`. `gen_ai.*` stays on the parent -- a GenAI-aware
+    backend aggregating usage or operation counts over those spans would double-count the
+    call otherwise -- and capture content never propagates down."""
+
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset(span_mode, provider)
+    _deliver(preset, _attempt_receipt(), span_mode)
+    preset.close()
+
+    children = _attempt_children(exporter.get_finished_spans())
+    assert children
+    for child in children:
+        for key in child.attributes:
+            assert key == "error.type" or key.startswith("monoid.model.attempt."), key
+
+
+@pytest.mark.parametrize("span_mode", ["agent", "model_call"])
+def test_otel_single_dispatch_and_legacy_logs_synthesize_no_children(span_mode: str) -> None:
+    """The threshold's other arm, both ways it happens: one dispatch (the chat span IS that
+    attempt, a child would restate it at double the span volume) and a legacy receipt whose
+    log predates the field (`attempts` says 3, the log says nothing to draw)."""
+
+    single = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        stop_reason="stop",
+        usage={"output_tokens": 7},
+        attempts=1,
+        attempt_log=(ModelCallAttempt(index=1, usage={"output_tokens": 7}),),
+    )
+    legacy = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        stop_reason="stop",
+        attempts=3,
+    )
+    for receipt in (single, legacy):
+        provider, exporter = _provider_and_exporter()
+        preset = _mode_preset(span_mode, provider)
+        _deliver(preset, receipt, span_mode)
+        preset.close()
+        names = [span.name for span in exporter.get_finished_spans()]
+        assert not [name for name in names if name.startswith("model.attempt")], names
+
+
+def test_otel_an_aborted_final_attempt_is_not_an_error() -> None:
+    """The parent's abort rule, held per entry: the dispatch the abort ended reads UNSET, and
+    the billed failure before it stays the error."""
+
+    from opentelemetry.trace.status import StatusCode
+
+    receipt = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        usage={"output_tokens": 2},
+        latency_ms=60,
+        attempts=2,
+        error_code="model_call_aborted",
+        attempt_log=(
+            ModelCallAttempt(
+                index=1,
+                elapsed_ms=5,
+                backoff_ms=0,
+                error_code="model_error",
+                provider_error_code="overloaded",
+                retryable=True,
+                usage={"output_tokens": 2},
+            ),
+            ModelCallAttempt(
+                index=2, elapsed_ms=3, backoff_ms=40, error_code="model_call_aborted"
+            ),
+        ),
+    )
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset("agent", provider)
+    _deliver(preset, receipt, "agent")
+    preset.emit(make_agent_event(run_id="run-attempts", seq=3, event_type="turn.interrupted"))
+    preset.close()
+
+    first, second = _attempt_children(exporter.get_finished_spans())
+    assert first.status.status_code == StatusCode.ERROR
+    assert second.status.status_code == StatusCode.UNSET
+    assert "error.type" not in second.attributes
+
+
+def test_otel_duplicate_delivery_does_not_duplicate_children() -> None:
+    """`on_model_call` is public and may be called directly; the agent-mode enrich is
+    idempotent on attributes, and the synthesized children must not multiply with it."""
+
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset("agent", provider)
+    receipt = _attempt_receipt()
+    _deliver(preset, receipt, "agent")
+    preset.on_model_call(ModelCallCapture(receipt=receipt))
+    preset.close()
+
+    assert len(_attempt_children(exporter.get_finished_spans())) == 2
+
+
+def test_otel_receipt_without_an_open_chat_span_synthesizes_no_orphans() -> None:
+    """No matching chat span (the existing enrich no-op) means no children either -- attempt
+    spans annotate a call the trace already shows, they do not invent one."""
+
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset("agent", provider)
+    preset.on_model_call(ModelCallCapture(receipt=_attempt_receipt()))
+    preset.close()
+
+    assert exporter.get_finished_spans() == ()
+
+
+def test_otel_legacy_backoff_packs_children_edge_to_edge() -> None:
+    """Entries parsed from pre-`backoff_ms` lines carry None: durations and order stay exact,
+    the unknown gaps collapse to zero, and no backoff attribute is invented."""
+
+    receipt = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        stop_reason="stop",
+        usage={"output_tokens": 7},
+        latency_ms=60,
+        attempts=2,
+        attempt_log=(
+            ModelCallAttempt(
+                index=1, elapsed_ms=5, error_code="model_error", retryable=True
+            ),
+            ModelCallAttempt(index=2, elapsed_ms=3, usage={"output_tokens": 7}),
+        ),
+    )
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset("agent", provider)
+    _deliver(preset, receipt, "agent")
+    preset.close()
+
+    first, second = _attempt_children(exporter.get_finished_spans())
+    assert second.start_time - first.end_time == 0
+    assert "monoid.model.attempt.backoff_ms" not in first.attributes
+    assert "monoid.model.attempt.backoff_ms" not in second.attributes
+
+
+@pytest.mark.parametrize("span_mode", ["agent", "model_call"])
+def test_otel_attempt_children_never_start_before_the_call_did(span_mode: str) -> None:
+    """A receipt the kernel could not have produced still has to render as a well-formed tree.
+
+    On the kernel's clock the entries always fit: every dispatch and every wait is a disjoint
+    sub-interval of the same window `latency_ms` measures, so their floors sum to at most its
+    floor. But the sink renders receipts it did not build -- hand-built ones, and lines read
+    back from a corrupted ledger -- and for those the backward walk would place the earliest
+    children before the call began. In `model_call` mode that is literally before the parent
+    span starts, because that parent starts at exactly this floor. Clamped rather than refused:
+    the entries' taxonomy and billing are still worth reading, and `monoid validate` is the
+    surface that calls such a record corrupt.
+    """
+
+    receipt = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        stop_reason="stop",
+        usage={"output_tokens": 7},
+        # The call claims 4ms while its entries claim 8ms of dispatch and 70ms of waiting.
+        latency_ms=4,
+        attempts=2,
+        attempt_log=(
+            ModelCallAttempt(
+                index=1, elapsed_ms=5, backoff_ms=0, error_code="model_error", retryable=True
+            ),
+            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=70, usage={"output_tokens": 7}),
+        ),
+    )
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset(span_mode, provider)
+    _deliver(preset, receipt, span_mode)
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    children = _attempt_children(spans)
+    assert [child.name for child in children] == ["model.attempt 1", "model.attempt 2"]
+    # The rule, in both wirings: the children occupy no more than the call the receipt describes.
+    # Unclamped, this walk reaches 78ms back from the anchor for a call that claims 4.
+    assert children[-1].end_time - children[0].start_time <= receipt.latency_ms * 1_000_000
+    assert all(child.end_time <= chat.end_time for child in children)
+    if span_mode == "model_call":
+        # The corollary, and only where the parent is receipt-derived too: that parent begins at
+        # exactly this floor, so the rule becomes containment. An `agent`-mode chat span starts
+        # from `model.turn.started` instead -- an instant this sink cannot read back off the
+        # span, and one a real run opens before the call it is about.
+        assert all(child.start_time >= chat.start_time for child in children)
+
+
+def test_otel_full_capture_children_stay_content_free() -> None:
+    """Content is the parent's opt-in; the children are metadata by construction, whatever the
+    policy says."""
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(
+        tracer_provider=provider,
+        span_mode="model_call",
+        capture_policy=CapturePolicy(mode="full"),
+    )
+    preset.on_model_call(
+        ModelCallCapture(
+            receipt=_attempt_receipt(),
+            mode="full",
+            content={"instruction": "SECRET input", "output_text": "SECRET output"},
+        )
+    )
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert "SECRET" in chat.attributes["monoid.model.capture.content"]
+    for child in _attempt_children(spans):
+        assert "SECRET" not in repr(child.attributes)
+
+
+def _retried_run_spans(tmp_path: Path, *, subscribe: bool):
+    """One kernel-retried run, exported under whichever wiring the caller asks for. The two
+    wirings differ in exactly one argument -- whether the model-I/O facet is registered -- so
+    the arms cannot drift apart, and everything attempt-shaped that one arm sees and the other
+    does not is attributable to that argument alone."""
+
+    from monoid_agent_kernel.core.spec import ModelRetryConfig
+    from monoid_agent_kernel.errors import ModelAdapterError
+
+    class _FlakyOnce:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request):  # noqa: ANN001
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(response_id="r1", final_text="done", stop_reason="stop")
+
+    provider, exporter = _provider_and_exporter()
+    preset = OtelEventSink(tracer_provider=provider, capture_policy=CapturePolicy(mode="none"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            workspace_root=workspace, run_root=tmp_path / "runs", limits=RunLimits(max_steps=2)
+        ),
+        model_adapter=_FlakyOnce(),
+        runtime_config_provider=runtime_provider(
+            runtime_config(
+                "run.finish",
+                model=ModelConfig(
+                    retry=ModelRetryConfig(
+                        layer="kernel", max_attempts=2, initial_delay_s=0.0, jitter_s=0.0
+                    )
+                ),
+            )
+        ),
+        event_sinks=(preset,),
+        model_io_subscriptions=(preset.model_io_subscription(),) if subscribe else (),
+    )
+    result = asyncio.run(loop.arun_once("go"))
+    assert result.status == "completed"
+    return exporter.get_finished_spans()
+
+
+def test_otel_agent_run_with_kernel_retry_exports_attempt_children(tmp_path: Path) -> None:
+    """End to end through the loop: both facets registered, the kernel absorbs one retryable
+    failure, and the exported trace shows the chat span with its two dispatch children."""
+
+    from opentelemetry.trace.status import StatusCode
+
+    spans = _retried_run_spans(tmp_path, subscribe=True)
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    children = _attempt_children(spans)
+    assert chat.attributes["monoid.model.attempts"] == 2
+    assert [child.name for child in children] == ["model.attempt 1", "model.attempt 2"]
+    assert all(child.parent.span_id == chat.context.span_id for child in children)
+    assert children[0].status.status_code == StatusCode.ERROR
+    assert children[0].attributes["monoid.model.attempt.retryable"] is True
+    assert children[1].status.status_code == StatusCode.UNSET
+
+
+def test_otel_event_only_wiring_carries_no_attempt_data_at_all(tmp_path: Path) -> None:
+    """The complement arm, which no test covered until a doc sentence got it wrong: the SAME
+    retried run with the event facet ALONE. Attempt data is read off the receipt, which only the
+    subscription facet delivers, and no public turn event carries an attempt count -- so this
+    wiring shows neither the children nor the `monoid.model.attempts` summary. The chat span is
+    still here, which is what makes the two absences findings rather than an empty export."""
+
+    spans = _retried_run_spans(tmp_path, subscribe=False)
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    assert _attempt_children(spans) == []
+    assert "monoid.model.attempts" not in chat.attributes

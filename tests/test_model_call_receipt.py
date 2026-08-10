@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
+    _ATTEMPT_OPTIONAL_WIRE_KEYS,
     ModelCallAttempt,
     ModelCallReceipt,
 )
@@ -312,6 +313,7 @@ def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
         provider_retried=True,
         usage={"total_tokens": 5},
         stream_committed=True,
+        backoff_ms=42,
     )
 
     assert ModelCallAttempt.from_json(json.loads(json.dumps(entry.to_json()))) == entry
@@ -322,6 +324,8 @@ def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
         ModelCallAttempt(index=0)
     with pytest.raises(ValueError, match="elapsed_ms"):
         ModelCallAttempt(elapsed_ms=-1)
+    with pytest.raises(ValueError, match="backoff_ms"):
+        ModelCallAttempt(backoff_ms=-1)
     with pytest.raises(WireValidationError):
         ModelCallAttempt(usage={"total_tokens": -5})
 
@@ -329,10 +333,17 @@ def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
 def test_the_attempt_entry_wire_shape_names_every_field_there_is() -> None:
     """The same completeness guard the receipt's round trip carries, for the entry type:
     a field added to the dataclass without joining the wire shape reads back at its default
-    and every historical log silently drops it."""
+    and every historical log silently drops it.
+
+    Two arms since W7-2, because the entry now has two writer generations: an entry that knows
+    its wait names every declared field, and one that does not (parsed from a pre-`backoff_ms`
+    line) omits exactly the optional set -- ``to_json`` must keep "written before the field
+    existed" expressible, or a legacy line stops round-tripping the day it is re-serialized."""
 
     declared = {field_.name for field_ in fields(ModelCallAttempt)}
-    assert set(ModelCallAttempt().to_json()) == declared
+    assert set(ModelCallAttempt(backoff_ms=0).to_json()) == declared
+    assert set(ModelCallAttempt().to_json()) == declared - _ATTEMPT_OPTIONAL_WIRE_KEYS
+    assert _ATTEMPT_OPTIONAL_WIRE_KEYS == {"backoff_ms"}
 
 
 def test_the_attempt_log_is_empty_or_names_every_attempt() -> None:
@@ -409,6 +420,34 @@ def test_the_attempt_logs_usage_adds_up_to_the_receipts() -> None:
         )
 
 
+def test_the_first_dispatch_records_no_wait_before_it() -> None:
+    """`backoff_ms` is the wait BETWEEN dispatches, so the first entry has none by construction.
+
+    The class and the contract both said "0 on the first entry" and neither checked it, which
+    let a line claim the kernel waited before a dispatch it had not yet made -- a record no
+    runner writes (`pending_backoff_ms` starts at 0 and is only updated after a backoff
+    completes), reading as data. Unlike the timeline inequality one field over, this claim needs
+    only the log: `latency_ms` is not yet stamped when the runner attaches the entries, but their
+    own waits are already final, so the record can refuse this one itself and does.
+
+    Absence still means the record predates the field, so it is not a wait of zero and not a
+    violation either -- the only two things the first entry may say are "no wait" and "I cannot
+    say".
+    """
+
+    def _entry(index: int, backoff: int | None) -> ModelCallAttempt:
+        return ModelCallAttempt(index=index, backoff_ms=backoff)
+
+    assert ModelCallReceipt(attempts=2, attempt_log=(_entry(1, 0), _entry(2, 40))).attempts == 2
+    assert ModelCallReceipt(attempts=1, attempt_log=(_entry(1, None),)).attempts == 1
+    assert ModelCallReceipt(attempts=1, attempt_log=(_entry(1, 0),)).attempts == 1
+
+    with pytest.raises(ValueError, match="backoff_ms"):
+        ModelCallReceipt(attempts=1, attempt_log=(_entry(1, 1),))
+    with pytest.raises(ValueError, match="backoff_ms"):
+        ModelCallReceipt(attempts=2, attempt_log=(_entry(1, 40), _entry(2, 0)))
+
+
 def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
     """Absent on every receipt written before the field existed, which is legal and reads as
     an empty log beside an intact `attempts` count; present-but-mistyped is refused, like
@@ -430,11 +469,19 @@ def test_an_attempt_entry_is_read_whole_or_refused() -> None:
     """The closed shape the schema already declares, enforced by the reader that builds the record.
 
     `attempt_log` is all-or-nothing one level up because absence there means one thing -- a writer
-    that predates the field. An *entry* has no such predecessor: it arrived whole or it did not
-    arrive, and the ledger schema says so by requiring all ten keys. The reader defaulted every
-    one of them, so `{}` deserialized into a plausible lie -- a successful, zero-duration,
-    unbilled dispatch numbered 1 -- and `attempts=1` beside it satisfied both cross-entry
-    invariants. A corrupt audit record that reads as data is worse than one that fails to read.
+    that predates the field. The keys an *entry* was born with have no such predecessor: they
+    arrived whole or the entry did not arrive, and the ledger schema says so by requiring every
+    one of them. The reader defaulted every one of them, so `{}` deserialized into a plausible
+    lie -- a successful, zero-duration, unbilled dispatch numbered 1 -- and `attempts=1` beside
+    it satisfied both cross-entry invariants. A corrupt audit record that reads as data is worse
+    than one that fails to read.
+
+    A key added after the entry shipped (`backoff_ms`, W7-2) is the other generation: absence
+    there means exactly what absence of the whole log means one level up -- a writer that
+    predates the field -- so it reads as None, never as a default the writer might have meant.
+    Null is neither generation: no writer omits by writing null, so it is refused, which keeps
+    the reader saying what the schema says (`"type": "integer"`) instead of re-opening the
+    reader-lenient/schema-strict split one field over.
 
     Enumerated from the dataclass rather than listed here, so a field added later is covered by
     this test on the day it is added rather than on the day someone remembers to extend a list.
@@ -442,16 +489,25 @@ def test_an_attempt_entry_is_read_whole_or_refused() -> None:
 
     from dataclasses import fields as dataclass_fields
 
-    whole = ModelCallAttempt(index=1).to_json()
+    whole = ModelCallAttempt(index=1, backoff_ms=0).to_json()
     declared = {field.name for field in dataclass_fields(ModelCallAttempt)}
 
     assert set(whole) == declared, {"projection_and_fields_disagree": set(whole) ^ declared}
-    assert ModelCallAttempt.from_json(whole) == ModelCallAttempt(index=1)
+    assert ModelCallAttempt.from_json(whole) == ModelCallAttempt(index=1, backoff_ms=0)
 
-    for key in sorted(declared):
+    for key in sorted(declared - _ATTEMPT_OPTIONAL_WIRE_KEYS):
         partial = {name: value for name, value in whole.items() if name != key}
         with pytest.raises(WireValidationError, match=key):
             ModelCallAttempt.from_json(partial)
+
+    legacy = {name: value for name, value in whole.items() if name != "backoff_ms"}
+    restored = ModelCallAttempt.from_json(legacy)
+    assert restored.backoff_ms is None
+    assert "backoff_ms" not in restored.to_json()
+    with pytest.raises(WireValidationError, match="backoff_ms"):
+        ModelCallAttempt.from_json({**whole, "backoff_ms": None})
+    with pytest.raises(WireValidationError, match="backoff_ms"):
+        ModelCallAttempt.from_json({**whole, "backoff_ms": "3"})
 
 
 def test_with_error_never_fails_the_call_it_is_reporting() -> None:

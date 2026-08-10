@@ -365,19 +365,32 @@ def test_a_malformed_record_is_refused_by_the_schema(mutation: dict[str, object]
 def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     """The record carries the receipt's per-dispatch log; a line written before the field
     existed carries no key and stays valid -- the sweep validator reads directories that
-    v0.20 writers filled, and a required key there would fail every one of them."""
+    v0.20 writers filled, and a required key there would fail every one of them.
+
+    The same rule holds one level down since W7-2: an entry written before ``backoff_ms``
+    existed carries ten keys and stays valid, because requiring the eleventh would fail every
+    ledger the W7-1 writer filled -- while a writer that knows its wait records it and the
+    schema admits it (``additionalProperties: false`` would refuse an undeclared key)."""
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
+    # Two dispatches, because a recorded wait can only ride the entry it delayed: the first
+    # dispatch has nothing before it, so its wait is 0 and the 7ms belongs to the retry.
+    first = ModelCallAttempt(index=1, elapsed_ms=5, usage={"input_tokens": 12}, backoff_ms=0)
     entry = ModelCallAttempt(
-        index=1,
-        elapsed_ms=42,
-        usage={"input_tokens": 12, "output_tokens": 3},
+        index=2,
+        elapsed_ms=30,
+        usage={"output_tokens": 3},
         stream_committed=True,
+        backoff_ms=7,
     )
-    record = _record(attempt_log=(entry,))
+    record = _record(attempts=2, attempt_log=(first, entry))
 
-    assert record["attempt_log"] == [entry.to_json()]
+    assert record["attempt_log"] == [first.to_json(), entry.to_json()]
+    assert record["attempt_log"][1]["backoff_ms"] == 7
     assert _errors(record) == []
+
+    ten_key_entry = {name: value for name, value in entry.to_json().items() if name != "backoff_ms"}
+    assert _errors({**_record(), "attempts": 1, "attempt_log": [ten_key_entry]}) == []
 
     legacy = _record()
     del legacy["attempt_log"]
@@ -432,6 +445,9 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
                 "unexpected": True,
             }
         ],
+        [{**_ATTEMPT, "backoff_ms": -1}],
+        [{**_ATTEMPT, "backoff_ms": None}],
+        [{**_ATTEMPT, "backoff_ms": "3"}],
     ],
 )
 def test_a_malformed_attempt_log_is_refused_by_the_schema(attempt_log: object) -> None:
@@ -489,25 +505,99 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "sum",
         ),
+        (
+            {
+                "latency_ms": 7,
+                "attempts": 2,
+                # Every entry records its wait, so this arm turns on the check existing and
+                # nothing else. The legacy arm below is the one that turns on reading an
+                # absent wait as zero -- kept apart so a mutant cannot satisfy both at once.
+                "attempt_log": [
+                    {
+                        **_ATTEMPT,
+                        "index": 1,
+                        "elapsed_ms": 5,
+                        "backoff_ms": 0,
+                        "usage": {"input_tokens": 12},
+                    },
+                    {
+                        **_ATTEMPT,
+                        "index": 2,
+                        "elapsed_ms": 3,
+                        "backoff_ms": 40,
+                        "usage": {"output_tokens": 3},
+                    },
+                ],
+            },
+            "latency_ms",
+        ),
+        (
+            # The same claim on a line with no `backoff_ms` anywhere: a W7-1 writer's shape,
+            # where the dispatches alone already outlast the call. Absent waits count as zero
+            # rather than as unknown, so the check still reaches a legacy line -- what it cannot
+            # do is accuse one of a wait it never recorded.
+            {
+                "latency_ms": 7,
+                "attempts": 2,
+                "attempt_log": [
+                    {**_ATTEMPT, "index": 1, "elapsed_ms": 5, "usage": {"input_tokens": 12}},
+                    {**_ATTEMPT, "index": 2, "elapsed_ms": 9, "usage": {"output_tokens": 3}},
+                ],
+            },
+            "latency_ms",
+        ),
+        (
+            # A wait recorded before the dispatch that had nothing before it. The totals fit
+            # inside `latency_ms`, so the timeline claim above has nothing to say about this
+            # line -- it is well-formed in every way except that no runner writes it.
+            {
+                "attempts": 2,
+                "attempt_log": [
+                    {
+                        **_ATTEMPT,
+                        "index": 1,
+                        "elapsed_ms": 5,
+                        "backoff_ms": 3,
+                        "usage": {"input_tokens": 12},
+                    },
+                    {
+                        **_ATTEMPT,
+                        "index": 2,
+                        "elapsed_ms": 3,
+                        "backoff_ms": 0,
+                        "usage": {"output_tokens": 3},
+                    },
+                ],
+            },
+            "first",
+        ),
     ],
-    ids=["indices", "usage"],
+    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The two cross-entry invariants the record refuses, refused on the sweep as well.
+    """The four cross-entry invariants, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
-    another, so `attempts: 2` under indices `[1, 1]`, and entries billing 3 beside a receipt
-    billing 15, are both structurally perfect lines. ``ModelCallReceipt`` refuses exactly these
-    at construction -- but nothing constructs a receipt on the way through ``monoid validate``,
-    which reads the ledger as JSON. A directory the record could not have produced was reported
-    clean, which is the one answer a validator must never give.
+    another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
+    15, dispatches that outlast the call that made them, and a wait booked before the first
+    dispatch are all structurally perfect lines. Nothing constructs a receipt on the way through
+    ``monoid validate``, which reads the ledger as JSON, so a directory the record could not have
+    produced was reported clean -- the one answer a validator must never give.
+
+    Three of the four the record also refuses at construction. The timeline one is this surface's
+    alone, and deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
+    ``_publish`` stamps the measured duration afterwards on every exit (``model_call.py`` builds
+    the log at the failure and answering exits, then times the receipt inside ``_publish``). A
+    constructor check would therefore fire on every retried call, comparing real dispatch
+    durations against a latency of zero. The ledger line is the first place both facts are
+    settled and present, which makes it the first place the claim can be checked at all.
 
     Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
     cross-record claims -- manifest against workspace index, proposal against its hashes,
     settled text against its digests, payloads against their keys. The ledger had none because
-    until this field it made no claim spanning two values; now it makes two.
+    until this field it made no claim spanning two values; now it makes three.
     """
 
     (tmp_path / MODEL_CALLS_FILENAME).write_text(
@@ -534,11 +624,15 @@ def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path
     """
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
+    # Entry 1 predates `backoff_ms` and omits the key; entry 2 records a 30ms wait. Their
+    # dispatches and that wait total 38ms under the record's 42ms, which is the shape the
+    # runner's own clock guarantees -- and an absent wait must not be read as anything but
+    # a wait this line cannot report.
     line = _record(
         attempts=2,
         attempt_log=(
-            ModelCallAttempt(index=1, usage={"input_tokens": 12}),
-            ModelCallAttempt(index=2, usage={"output_tokens": 3}),
+            ModelCallAttempt(index=1, elapsed_ms=5, usage={"input_tokens": 12}),
+            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=30, usage={"output_tokens": 3}),
         ),
     )
     (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")
@@ -612,11 +706,13 @@ _PROJECTION_ALLOWLIST = {
     # W7-3: recorded as issued, not as sent -- the writer docstring fixes the meaning.
     "idempotency_key",
     # the attempt-log block (W7-1): the taxonomy names above are shared with the receipt's
-    # own recorded fields; these three are the entry's alone.
+    # own recorded fields; these four are the entry's alone. `backoff_ms` joined in W7-2,
+    # deliberately -- the wait the kernel imposed before that dispatch.
     "attempt_log",
     "index",
     "elapsed_ms",
     "stream_committed",
+    "backoff_ms",
 }
 
 
@@ -656,6 +752,21 @@ def _assert_the_projection_reflects_over_nothing(source: str) -> None:
 )
 def test_the_recorded_call_projection_is_hand_listed(projection: object) -> None:
     _assert_the_projection_reflects_over_nothing(inspect.getsource(projection))  # type: ignore[arg-type]
+
+
+def test_the_projection_carries_the_wait_only_when_the_entry_knows_it() -> None:
+    """`backoff_ms` on the artifact mirrors the entry's two writer generations: a measured wait
+    is recorded, and an entry parsed from a pre-W7-2 line (None) omits the key. Emitting null
+    would manufacture a value no writer ever wrote -- the exact corrupt shape the null-refusal
+    rule exists to catch -- and emitting 0 would claim a measurement that never happened."""
+
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    measured = _recorded_attempt(ModelCallAttempt(index=1, backoff_ms=7))
+    assert measured["backoff_ms"] == 7
+
+    legacy = _recorded_attempt(ModelCallAttempt(index=1))
+    assert "backoff_ms" not in legacy
 
 
 def test_the_projection_pin_moves_on_the_edits_it_claims_to_catch() -> None:

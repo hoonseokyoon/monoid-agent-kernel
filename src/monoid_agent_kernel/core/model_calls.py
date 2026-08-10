@@ -129,9 +129,13 @@ def _recorded_attempt(entry: ModelCallAttempt) -> dict[str, Any]:
     ``ModelCallAttempt`` must be added HERE by name to reach the artifact, or every field of
     the source type becomes an author of the audit record -- the exact rule the reflection
     census on these projections enforces.
+
+    ``backoff_ms`` is conditional, matching the entry's own wire rule: ``None`` means the entry
+    was parsed from a line that predates the field, and absence is that fact's only honest
+    spelling -- null is a value no writer ever wrote, and 0 is a measurement never taken.
     """
 
-    return {
+    recorded: dict[str, Any] = {
         "index": entry.index,
         "elapsed_ms": entry.elapsed_ms,
         "error_code": entry.error_code,
@@ -143,6 +147,9 @@ def _recorded_attempt(entry: ModelCallAttempt) -> dict[str, Any]:
         "usage": dict(entry.usage),
         "stream_committed": entry.stream_committed,
     }
+    if entry.backoff_ms is not None:
+        recorded["backoff_ms"] = entry.backoff_ms
+    return recorded
 
 
 def model_call_record(
