@@ -889,23 +889,32 @@ def test_a_record_the_corpus_reader_could_not_parse_is_never_written(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    "hostile",
+    ("hostile", "expected_ledger"),
     [
         # A `str` where the split expects `bytes`: `sha256_bytes` raises inside the call.
-        pytest.param({"request_preimage": "not bytes"}, id="preimage"),
+        pytest.param({"request_preimage": "not bytes"}, [0, 1], id="preimage"),
         # An unhashable digest: the seen-set test raises one statement *before* the call, which is
         # why containing the call alone was not enough. Nothing validates this field's type, and
         # the seam is public -- `SettledModelCall` is exported from `contracts`.
-        pytest.param({"request_digest": ["a" * 64]}, id="digest"),
+        pytest.param({"request_digest": ["a" * 64]}, [1], id="digest"),
     ],
 )
 def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
-    tmp_path: Path, hostile: dict[str, Any]
+    tmp_path: Path, hostile: dict[str, Any], expected_ledger: list[int]
 ) -> None:
     """Moving the split out of the lock moved it out of the payload arm's containment too, so a
     raise there skipped both arms and the counter -- no ledger line, no corpus record, and no hole,
     which is the "reads as nothing was lost" shape the index rule exists against. The flag form of
-    corpus failure was pinned; the raise form was not."""
+    corpus failure was pinned; the raise form was not.
+
+    Since W7-4 the two arms part ways on the ledger. A hostile *preimage* is the corpus's
+    problem and the ledger line survives -- the original claim, still pinned by that arm. A
+    hostile value on the *receipt* is refused by the mint: `model_call_record` will not build
+    a line `monoid validate` would convict, whatever the value's type, so that call's ledger
+    line is the cost and the consumed `call_index` is the hole that reports it (the corpus arm
+    advanced the counter). This arm used to pin the opposite -- the ledger wrote the hostile
+    value through and the sweep flagged the line -- which left a certified-artifact writer
+    producing an artifact its own validator rejects, the exact route the mint guard closes."""
     recorder = _standalone_recorder(tmp_path)
     recorder.record_settled_call(
         SettledModelCall(
@@ -929,15 +938,22 @@ def test_a_split_that_raises_costs_the_corpus_and_not_the_ledger(
     ]
     responses = _by_kind(_records(recorder.run_dir), MODEL_RESPONSE_KIND)
 
-    assert [record["call_index"] for record in ledger] == [0, 1]
+    assert [record["call_index"] for record in ledger] == expected_ledger
     assert [record["call_index"] for record in responses] == [0, 1]
     # ... and the corpus line it wrote satisfies the corpus's own schema. A digest that is not a
     # digest joins nothing, so the honest value is the empty one the schema already blesses --
     # writing the hostile value through would put a line in this file that its own validator
-    # rejects, which is the one thing the line encoder's doctrine forbids. (The ledger reports it;
-    # that arm's shape handling predates this artifact.)
+    # rejects, which is the one thing the line encoder's doctrine forbids. (The ledger's side of
+    # the same doctrine is the mint guard: the hostile-receipt line is refused outright, and the
+    # hole is the report.)
     assert not any(
         issue.path.startswith(MODEL_PAYLOADS_FILENAME)
+        for issue in validate_run_dir(recorder.run_dir)
+    )
+    # The ledger too: what the mint guard buys is that neither file carries a line its own
+    # validator rejects -- the loss is named by the hole in `call_index`, not by a flagged line.
+    assert not any(
+        issue.path.startswith(MODEL_CALLS_FILENAME)
         for issue in validate_run_dir(recorder.run_dir)
     )
 
