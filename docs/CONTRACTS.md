@@ -462,6 +462,23 @@ completed from defaults — defaults there turn a corrupt line into a plausible 
 carry no wall-clock instant — the receipt's own rule; the ledger line's `recorded_at` anchors the
 call — and backoff waits fall between entries, so entry times sum to less than `latency_ms`.
 
+`ModelCallReceipt.idempotency_key` is the retry-scope token the call presented (W7-3). The runner
+mints one per call (`idem_` + hex) in the same block that computes the digests — before the first
+dispatch — and it is constant across kernel re-dispatches and adapter-internal retries, because
+both loops reuse the request the token rides on. The runner is the single issuer: a caller-set
+`ModelRequest.idempotency_key` is overwritten, since a respected caller value would let one
+request object hand two calls the same retry scope. The token is deliberately outside the replay
+key — two byte-identical requests share a replay slot precisely because content cannot separate
+them, so the token that separates their provider work is random, never derived — and the recorded
+value means *issued*, not *sent*. Three limits are the contract, not gaps: carriage is
+retry-scoped and **not exactly-once** — the reference gateway logs and echoes the header
+(`Idempotency-Key`, on every response including errors) but does not dedupe on it, and does not
+relay it upstream, because each hop's client issues its own key for its own retry scope; a
+**resumed run reissues** — a call never spans a park, so recovery re-runs the step and the rerun
+is a new call with a new key; and only the **gateway transport presents it** — the OpenAI adapter
+does not read the field, so nothing is sent there. A receipt whose key is empty was never keyed:
+the call was refused before the keying block, or the record predates the field.
+
 #### Generation parameters, reasoning, output schema, and the applied echoes
 
 `ModelConfig.generation: GenerationConfig` carries per-call sampling controls — `temperature`

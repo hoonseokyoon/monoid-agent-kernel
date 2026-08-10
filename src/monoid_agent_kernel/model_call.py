@@ -19,10 +19,17 @@ which is where `permissions`, `recorder` and `loop_phases` already live.
 runner stamps receipts with (this module cannot be imported from `providers` without a
 cycle). The names are re-imported here for this module's own callers and their tests.
 
-**What it does not do: retry.** Backoff and HTTP classification live inside the adapters
-(`providers/gateway.py`), so the kernel makes exactly one adapter call per turn. That is the
-distinction `ModelCallReceipt.attempts` and `provider_retried` encode, and it is why this module
-inherits classification without inheriting a retry loop.
+**Where retry lives: one owner per call, named by the config.** Backoff and HTTP
+classification live inside the adapters (`providers/gateway.py`), and `ModelRetryConfig.layer`
+names which loop owns a call. Under the default `"adapter"` layer the kernel makes exactly one
+adapter call per turn; under `"kernel"` the attempt loop in this module re-dispatches, with the
+adapter's copy of the config neutralized to a single attempt so the two loops can never
+multiply. That is the distinction `ModelCallReceipt.attempts` (kernel dispatches) and
+`provider_retried` (a loop below the adapter boundary reported) encode — and classification is
+inherited from the adapters either way: this module reads what the escaping exception carries,
+it never invents its own taxonomy. (This paragraph said "the kernel makes exactly one adapter
+call per turn" unconditionally until W7-3; that stopped being true when W7-0 landed the kernel
+layer, and two review cycles read past it.)
 """
 
 from __future__ import annotations

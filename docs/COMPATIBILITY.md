@@ -441,6 +441,20 @@ above, adding a key to it is a schema change like any other. The backward proper
 hold is the reader-side one already stated: the schema declares `attempt_log` without requiring
 it, so a v0.21 validator still accepts lines a pre-`attempt_log` v0.21 build wrote.
 
+W7-3 adds `idempotency_key` to `ModelCallReceipt` and to the same ledger line, under exactly the
+reasoning of the previous paragraph and inside the same unreleased window: a schema change to a
+closed schema, made where there is still no released reader to break, under the unchanged
+`monoid.model-calls.v1` identifier. The schema declares the key without requiring it — the
+`attempt_log` precedent — so `monoid validate` keeps passing directories pre-W7-3 v0.21 builds
+filled, and absence on a line means exactly one thing: a writer that predates the field. On the
+receipt's own JSON, `from_json` reads an absent key as `""` ("never keyed"), which is what every
+record written before the field existed means. The key is deliberately excluded from the replay
+key and from the payloads corpus, so no recorded replay identity moves; it is randomly issued
+per call, so replaying a corpus issues fresh keys without touching the equivalence oracle, which
+reads the payloads corpus and never opens the ledger. The value never reaches `status.json`,
+`metrics.json`, or the event stream — carriage is receipt and ledger only, plus the
+`Idempotency-Key` HTTP header on the gateway transport.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

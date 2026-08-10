@@ -7,6 +7,34 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — one retry scope per call, carried where the call is keyed: `idempotency_key`
+
+- **Every model call is keyed with a retry-scope token.** `ModelCallRunner` mints
+  `idem_` + uuid4-hex in the same block that computes the digests — per call, before the
+  first dispatch — and stamps it onto its own copy of the request. Constant across kernel
+  re-dispatches and adapter-internal retries by construction (both loops reuse the request),
+  reissued on resume (a call never spans a park, so recovery re-runs the step as a new
+  call). The runner is the single issuer: a caller-set `ModelRequest.idempotency_key` is
+  overwritten, because a respected caller value would let one request object hand two calls
+  the same retry scope. Random, never content-derived — two byte-identical requests share a
+  replay slot precisely because content cannot separate them.
+- **The receipt and the `model-calls.v1` line record it as issued, not as sent.**
+  `ModelCallReceipt.idempotency_key` (`""` = never keyed: refused before the keying block,
+  or a record predating the field); the ledger schema declares the key without requiring it,
+  the `attempt_log` precedent, so `monoid validate` keeps passing directories pre-W7-3
+  writers filled. Outside the replay key and the payloads corpus, so no recorded replay
+  identity moves and the equivalence oracle's three-field mask holds. Not projected to
+  `status.json`, `metrics.json`, or the event stream.
+- **The gateway presents it; the reference server logs and echoes it.** Both wire routes
+  (sync one-shot, async stream) send `Idempotency-Key` read off the request being
+  dispatched — headers rebuild per attempt so a credential can refresh, and the key must
+  not move with them, which is why it is not minted where headers are. An unkeyed request
+  keeps its exact pre-W7-3 wire shape (no empty header). The reference `llm_gateway` logs
+  the inbound key on the two turn routes and echoes it on every response those requests
+  produce — JSON, SSE, and error responses alike — and deliberately does **not** dedupe on
+  it (retry-scoped carriage is not exactly-once) nor relay it upstream (each hop issues its
+  own key for its own retry scope). The OpenAI adapter does not read the field.
+
 ### Added — every dispatch on the record, and the record in the totals: `attempt_log`
 
 - **`ModelCallReceipt.attempt_log` itemizes what `attempts` counts.** One entry per kernel
