@@ -3693,9 +3693,20 @@ def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
         pytest.param("-leading-punctuation", id="bad-first-character"),
         pytest.param("key with spaces", id="space"),
         pytest.param("ké", id="non-ascii"),
+        # Not strings at all. Only the empty string spells absence here; every other falsy
+        # value is a caller who supplied *something* and would otherwise have watched it
+        # vanish at the transport, which omits what it cannot validate. A truthiness
+        # pre-filter reads all six as "no key given" -- the absence-vs-value conflation this
+        # field has now produced three times, at three different types.
+        pytest.param(None, id="none"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param([], id="empty-list"),
+        pytest.param({}, id="empty-dict"),
     ],
 )
-def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: str) -> None:
+def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: object) -> None:
     """Refused where this repo refuses a non-finite control or a malformed output_schema.
 
     The runner mints after normalization so a run-driven call never reaches this branch; it

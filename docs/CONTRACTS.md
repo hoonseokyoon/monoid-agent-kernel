@@ -490,7 +490,9 @@ nor `httpx` refuses an obsolete folded value (`"a\r\n b"`). So request ingress *
 non-conforming caller-supplied key, the gateway transport *omits* one (an adapter must not lose a
 paid call over a bookkeeping token), and the reference gateway treats a non-conforming inbound key
 as absent — logging that one was dropped, never its bytes, because that route logs before the
-service authenticates.
+service authenticates. Absence on this field is spelled by the **empty string and nothing else**:
+a caller who supplies `None`, `False` or `0` supplied a value, and ingress refuses it rather than
+reading it as "no key" and letting the transport drop it silently.
 
 #### Generation parameters, reasoning, output schema, and the applied echoes
 

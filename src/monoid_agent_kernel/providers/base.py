@@ -842,7 +842,14 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     # says so. The runner mints its own key AFTER this call, so a run-driven request never
     # reaches this branch; it exists for the direct integrator who builds the request.
     idempotency_key = request.idempotency_key
-    if idempotency_key and not is_valid_idempotency_key(idempotency_key):
+    # ``!= ""`` and not truthiness: the EMPTY STRING is what spells absence on this field, and
+    # it is the only thing that does. A truthiness pre-filter also waved through ``None``,
+    # ``False``, ``0``, ``0.0``, ``[]`` and ``{}`` -- a caller who supplied something, which
+    # then reached a transport that omits what it cannot validate, so the key silently
+    # vanished instead of being refused. Same absence-vs-value conflation this field has now
+    # produced at three types: ``null`` read as a missing key on the wire, a present-empty
+    # container read as a missing log, and now every falsy value read as a missing token.
+    if idempotency_key != "" and not is_valid_idempotency_key(idempotency_key):
         raise ValueError(
             "model request idempotency_key must be 1-128 ASCII characters from "
             "[A-Za-z0-9._+-] starting with a letter or digit"
