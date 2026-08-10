@@ -506,8 +506,17 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             {
                 "latency_ms": 7,
                 "attempts": 2,
+                # Every entry records its wait, so this arm turns on the check existing and
+                # nothing else. The legacy arm below is the one that turns on reading an
+                # absent wait as zero -- kept apart so a mutant cannot satisfy both at once.
                 "attempt_log": [
-                    {**_ATTEMPT, "index": 1, "elapsed_ms": 5, "usage": {"input_tokens": 12}},
+                    {
+                        **_ATTEMPT,
+                        "index": 1,
+                        "elapsed_ms": 5,
+                        "backoff_ms": 0,
+                        "usage": {"input_tokens": 12},
+                    },
                     {
                         **_ATTEMPT,
                         "index": 2,
