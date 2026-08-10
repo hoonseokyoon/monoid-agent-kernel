@@ -485,7 +485,7 @@ the call was refused before the keying block, or the record predates the field.
 A key must be a bounded ASCII token — 1–128 characters from `[A-Za-z0-9._+-]`, starting with a
 letter or digit — and that rule is enforced at every edge the value crosses, not only where it is
 minted. The `model-calls.v1` schema states the same rule as a pattern (empty admitted, the
-`^(|...)$` idiom `prompt_digest` uses), because `monoid validate` certifies imported and
+`^(|...)` idiom `prompt_digest` uses), because `monoid validate` certifies imported and
 third-party run directories and a line whose key the rest of the kernel would refuse must not be
 certified. Both enforcers derive from one body in `core/model_io.py`: `core` cannot import
 `providers`, so a rule owned on the provider side could only have been copied, and a retyped twin
@@ -498,6 +498,16 @@ as absent — logging that one was dropped, never its bytes, because that route 
 service authenticates. Absence on this field is spelled by the **empty string and nothing else**:
 a caller who supplies `None`, `False` or `0` supplied a value, and ingress refuses it rather than
 reading it as "no key" and letting the transport drop it silently.
+
+**Every `pattern` in every artifact schema ends at end of *input*, not at `$`.** JSON Schema calls
+`pattern` an ECMA-262 expression; `jsonschema` runs it through Python's `re`, where `$` also
+matches immediately before a single trailing newline. Under that engine a bare `^…$` certified
+`"<digest>\n"`, `"<timestamp>\n"` and `"<key>\n"` — values every other edge in the kernel refuses —
+so `monoid validate` would have passed a line no writer here could produce. The schemas assert
+`END_OF_INPUT` (`core/_json_schema.py`) instead: `$` followed by "and no character may follow",
+which is load-bearing under `re` and redundant under ECMA-262, so the same value is refused by a
+Python validator and a JavaScript one alike. `\Z` would have been the Python spelling and is an
+identity escape in ECMA-262 — a published schema ending in `\Z` demands a literal `Z`.
 
 #### Generation parameters, reasoning, output schema, and the applied echoes
 

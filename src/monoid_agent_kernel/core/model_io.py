@@ -43,6 +43,7 @@ from typing import (
 from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe
+from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
@@ -471,13 +472,16 @@ folded value.
 IDEMPOTENCY_KEY_PATTERN = re.compile(rf"{_IDEMPOTENCY_KEY_BODY}\Z", re.ASCII)
 """The Python form, for validating a value in hand."""
 
-IDEMPOTENCY_KEY_JSON_PATTERN = rf"^(|{_IDEMPOTENCY_KEY_BODY})$"
+IDEMPOTENCY_KEY_JSON_PATTERN = rf"^(|{_IDEMPOTENCY_KEY_BODY}){END_OF_INPUT}"
 """The ECMA-262 form for JSON Schema, empty-allowed the way ``prompt_digest``'s pattern is.
 
 Empty is a legal recorded value -- a refused call was never keyed -- so the ledger admits it
-explicitly rather than by omitting the constraint, exactly as ``^(|[0-9a-f]{64})$`` does for a
-digest that may not have been issued. ``\\Z`` and ``re.ASCII`` do not exist in ECMA-262, which is
-why this is derived from the body rather than from the compiled pattern's source.
+explicitly rather than by omitting the constraint, exactly as the optional-digest pattern does for
+a digest that may not have been issued. ``\\Z`` and ``re.ASCII`` do not exist in ECMA-262, which is
+why this is derived from the body rather than from the compiled pattern's source -- and why the
+end of input is asserted by :data:`~monoid_agent_kernel.core._json_schema.END_OF_INPUT` rather than
+by a bare ``$``, which under ``jsonschema``'s Python engine would also have matched just before a
+trailing newline.
 """
 
 

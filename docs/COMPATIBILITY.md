@@ -455,6 +455,17 @@ reads the payloads corpus and never opens the ledger. The value never reaches `s
 `metrics.json`, or the event stream — carriage is receipt and ledger only, plus the
 `Idempotency-Key` HTTP header on the gateway transport.
 
+In the same window, every `pattern` across the artifact schemas stops accepting a trailing
+newline. `jsonschema` evaluates `pattern` with Python's `re`, where `$` matches immediately before
+a final newline, so `monoid validate` had been certifying `"<digest>\n"`, `"<timestamp>\n"`,
+`"<event.type>\n"` and `"<key>\n"` on `event.v1`, `manifest.v1`, `model-calls.v1`,
+`model-payloads.v1`, `workspace-*`, `approval` and `apply-result` lines. This is a **validation
+tightening, not a schema-version change**: every identifier is unchanged, no writer in this
+project has ever emitted such a value, and the only directories that stop validating are ones
+carrying a value the rest of the kernel already refused. Third parties validating these schemas
+with an ECMA-262 engine see no change at all — the new spelling is redundant there and
+load-bearing only under Python's `re`.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

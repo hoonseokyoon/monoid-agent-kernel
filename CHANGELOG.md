@@ -39,7 +39,7 @@ out in commit messages and here.
   The OpenAI adapter does not read the field.
 - **A key is a bounded ASCII token, enforced at every edge it crosses — including the
   ledger.** 1–128 characters from `[A-Za-z0-9._+-]` starting with a letter or digit. The
-  `model-calls.v1` schema states it as a pattern (empty admitted, the `^(|...)$` idiom
+  `model-calls.v1` schema states it as a pattern (empty admitted, the `^(|...)` idiom
   `prompt_digest` uses), so `monoid validate` cannot certify an imported or third-party line
   whose key the rest of the kernel would refuse; the rule lives once in `core/model_io.py`
   and both enforcers derive from it, because `core` cannot import `providers` and a retyped
@@ -51,6 +51,27 @@ out in commit messages and here.
   over a bookkeeping token), and the reference gateway reads a non-conforming inbound key as
   absent, logging that one was dropped and never its bytes, because that route logs before
   the service authenticates.
+
+### Fixed — every schema `pattern` now ends at end of input, not at `$`
+
+- **`monoid validate` no longer certifies a value with a trailing newline.** JSON Schema
+  calls `pattern` an ECMA-262 expression; `jsonschema` evaluates it with Python's `re`, where
+  `$` also matches immediately before a single trailing newline. Every pattern in the
+  artifact schemas was spelled with a bare `$`, so a `model-calls.v1`, `event.v1`,
+  `manifest.v1`, `model-payloads.v1`, `approval`, `apply-result` or `workspace-*` line
+  carrying `"<digest>\n"`, `"<timestamp>\n"`, `"<event.type>\n"` or `"<key>\n"` validated
+  clean while every other edge in the kernel refused the same value — 5 distinct patterns
+  across 29 declaration sites, all of them. They now assert `END_OF_INPUT`
+  (`core/_json_schema.py`): `$` plus "and no character may follow", load-bearing under `re`
+  and redundant under ECMA-262, so a Python validator and a JavaScript one refuse the same
+  values. `\Z` was rejected as the fix — ECMA-262 has no `\Z` and would read it as a demand
+  for a literal `Z`. The change only tightens: verified over a 176-candidate lattice that the
+  sole behavioural difference from the old patterns is the single-trailing-newline case, and
+  under V8 that the new spellings behave identically to Python's.
+- **The class is pinned, not the instance.** A conformance census discovers every `pattern`
+  reachable from any module-level schema in the package and drives the real validator against
+  each accepted probe plus each line terminator, failing closed if discovery collapses or if a
+  pattern has no probe to witness it.
 
 ### Added — every dispatch on the record, and the record in the totals: `attempt_log`
 

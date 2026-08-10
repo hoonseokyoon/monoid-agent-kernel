@@ -290,6 +290,13 @@ def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() 
     ``is_valid_idempotency_key`` states it to a request being built. Verified as agreement on
     behaviour and not merely as a shared substring, because two spellings of "the same" regex
     can still disagree at the edges.
+
+    The candidates are a *product*, not a list, and that is the correction this census needed.
+    Its first form checked ten strings chosen by hand, and none of them ended in a newline -- so
+    it certified agreement while the schema's ``$`` was matching just before a trailing newline
+    under ``jsonschema``'s Python engine and the kernel's ``\\Z`` was not. A hand-picked lattice
+    proves agreement on the disagreements its author already imagined; the suffix axis exists so
+    the edge no one pictured is generated anyway.
     """
 
     from monoid_agent_kernel.core.model_io import (
@@ -302,7 +309,7 @@ def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() 
         "pattern": IDEMPOTENCY_KEY_JSON_PATTERN,
     }
 
-    for candidate in (
+    bodies = (
         "",
         "idem_0123456789abcdef",
         "A",
@@ -313,15 +320,20 @@ def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() 
         "k\u00e9",
         "...",
         "ok\r\n folded",
-    ):
-        schema_accepts = not _errors(_record(idempotency_key=candidate))
-        rule_accepts = candidate == "" or is_valid_idempotency_key(candidate)
-        assert schema_accepts is rule_accepts, {
-            "candidate": candidate,
-            "schema_accepts": schema_accepts,
-            "rule_accepts": rule_accepts,
-            "hint": "the ledger and the kernel disagree about what a key may be",
-        }
+    )
+    suffixes = ("", "\n", "\r", "\r\n", "\n\n", "\nX", "\t", " ", "\u2028", "\u0085", "\x00")
+
+    for body in bodies:
+        for suffix in suffixes:
+            candidate = body + suffix
+            schema_accepts = not _errors(_record(idempotency_key=candidate))
+            rule_accepts = candidate == "" or is_valid_idempotency_key(candidate)
+            assert schema_accepts is rule_accepts, {
+                "candidate": candidate,
+                "schema_accepts": schema_accepts,
+                "rule_accepts": rule_accepts,
+                "hint": "the ledger and the kernel disagree about what a key may be",
+            }
 
 
 def test_the_schema_advertises_one_namespace_because_the_ledger_has_only_ever_had_one() -> None:
