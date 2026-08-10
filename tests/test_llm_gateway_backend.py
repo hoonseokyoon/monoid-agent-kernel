@@ -1963,3 +1963,224 @@ def test_a_declaration_free_adapter_still_resolves_to_the_configured_provider() 
 
     assert resolved_provider_name(_Plain(), ModelConfig(provider="openai")) == "openai"
     assert resolved_provider_name(_Plain(), None) is None
+
+
+def test_llm_gateway_echoes_the_idempotency_key_on_both_response_routes(caplog) -> None:
+    """The reference gateway logs and echoes the inbound key -- and does nothing else with it:
+    no dedup (retry-scoped carriage is not exactly-once) and no relay upstream (each hop's
+    client issues its own key for its own retry scope). Both response writers echo -- the JSON
+    route and the SSE route are separate ends of ``do_POST`` -- and error responses echo too,
+    because a retried failure is precisely when correlation matters. Absence stays absence."""
+    import logging
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[
+                ModelTurn(response_id="provider_1", final_text="done", usage={"total_tokens": 9})
+            ]
+        ),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        token = _llm_token(manager)
+
+        def _post(path: str, *, key: str | None, bearer: str | None = token):
+            headers = {"Content-Type": "application/json"}
+            if bearer is not None:
+                headers["Authorization"] = f"Bearer {bearer}"
+            if key is not None:
+                headers["Idempotency-Key"] = key
+            return urlopen(
+                Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(_payload()).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                ),
+                timeout=10,
+            )
+
+        with caplog.at_level(logging.INFO, logger="monoid_agent_kernel.llm_gateway.http"):
+            with _post("/internal/llm/turns", key="idem_echo_me") as response:
+                assert response.headers.get("Idempotency-Key") == "idem_echo_me"
+                assert json.loads(response.read())["final_text"] == "done"
+        assert any("idem_echo_me" in record.getMessage() for record in caplog.records)
+
+        with _post("/internal/llm/turns", key=None) as response:
+            assert response.headers.get("Idempotency-Key") is None
+            json.loads(response.read())
+
+        with _post("/internal/llm/turns/stream", key="idem_echo_stream") as response:
+            assert response.headers.get("Idempotency-Key") == "idem_echo_stream"
+            assert b"turn_complete" in response.read()
+
+        with _post("/internal/llm/turns/stream", key=None) as response:
+            assert response.headers.get("Idempotency-Key") is None
+            response.read()
+
+        with pytest.raises(HTTPError) as exc_info:
+            _post("/internal/llm/turns", key="idem_echo_err", bearer="not-a-token")
+        assert exc_info.value.code == 401
+        assert exc_info.value.headers.get("Idempotency-Key") == "idem_echo_err"
+
+
+@pytest.mark.parametrize(
+    "raw_key",
+    [
+        pytest.param(b"legitimate\r\n forged-log-entry", id="obs-fold"),
+        pytest.param(b"ok\r\n X-Injected: yes", id="header-split"),
+        pytest.param(b"A" * 60000, id="unbounded"),
+    ],
+)
+def test_llm_gateway_refuses_to_log_or_echo_an_unspellable_key(caplog, raw_key: bytes) -> None:
+    """The key is attacker-chosen and both of its sinks are raw text, not JSON.
+
+    ``BaseHTTPRequestHandler`` hands back an obsolete folded value with its CRLF intact --
+    urllib will not send one, so this speaks raw sockets, which is the threat model -- and
+    ``send_header`` writes whatever it is given. The log line fires before the service
+    authenticates, so without validation a client holding no token at all forged log lines
+    and split the response header of its own 401. Malformed reads as absent: the fact is
+    logged, never the bytes.
+    """
+    import logging
+    import socket
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    body = json.dumps(_payload()).encode("utf-8")
+    crlf = b"\r\n"
+
+    def _speak(port: int, path: bytes, *, bearer: bytes | None) -> bytes:
+        request = b"POST " + path + b" HTTP/1.1" + crlf + b"Host: 127.0.0.1" + crlf
+        request += b"Content-Type: application/json" + crlf
+        if bearer is not None:
+            request += b"Authorization: Bearer " + bearer + crlf
+        request += b"Idempotency-Key: " + raw_key + crlf
+        request += b"Content-Length: " + str(len(body)).encode() + crlf + crlf + body
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(request)
+            chunks: list[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                if sum(len(chunk) for chunk in chunks) > 400000:
+                    break
+        return b"".join(chunks)
+
+    with serving(server) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        token = _llm_token(manager).encode()
+        with caplog.at_level(logging.INFO, logger="monoid_agent_kernel.llm_gateway.http"):
+            unauthenticated = _speak(port, b"/internal/llm/turns", bearer=None)
+            authenticated = _speak(port, b"/internal/llm/turns", bearer=token)
+            streamed = _speak(port, b"/internal/llm/turns/stream", bearer=token)
+
+    for response in (unauthenticated, authenticated, streamed):
+        head = response.split(crlf + crlf, 1)[0]
+        assert b"Idempotency-Key" not in head
+        assert b"X-Injected" not in head
+    assert b"401" in unauthenticated.split(crlf, 1)[0]
+    assert b"200" in authenticated.split(crlf, 1)[0]
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dropped a malformed idempotency-key" in message for message in messages)
+    assert not any(
+        "forged-log-entry" in message or "X-Injected" in message for message in messages
+    )
+    # Bounded: no log line this request produced can be sized by the client.
+    assert max(len(message) for message in messages) < 512
+
+
+class _HopKeyRecorder:
+    """An upstream adapter that records the key the gateway keyed ITS call with."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def next_turn(self, request):  # noqa: ANN001, ANN201
+        self.seen.append(request.idempotency_key)
+        return ModelTurn(response_id="provider_1", final_text="done")
+
+    async def astream_turn(self, request):  # noqa: ANN001, ANN201
+        self.seen.append(request.idempotency_key)
+        for chunk in (TextDelta("done"), TurnComplete(response_id="provider_1")):
+            yield chunk
+
+
+@pytest.mark.parametrize("route", ["one-shot", "stream"])
+def test_the_gateway_keys_the_upstream_hop_it_drives(route: str) -> None:
+    """A hop with its own retry loop needs its own scope.
+
+    The service builds the upstream ``ModelRequest`` itself -- it never goes through
+    ``ModelCallRunner``, which is what mints for a kernel-driven call -- so without this the
+    upstream hop of a chained gateway carried no key at all, while this PR's own documentation
+    said each hop issues one. The inbound key is still not relayed: relaying would stitch two
+    retry scopes into one and lie to both, so the two values must differ.
+    """
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+
+    upstream = _HopKeyRecorder()
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    claims_token = _llm_token(manager)
+
+    if route == "one-shot":
+        gateway.handle_turn(claims_token, _payload())
+        gateway.handle_turn(claims_token, _payload())
+    else:
+        for _ in range(2):
+            list(gateway.handle_turn_stream(claims_token, _payload()))
+
+    assert len(upstream.seen) == 2
+    for key in upstream.seen:
+        assert is_valid_idempotency_key(key), key
+    # One scope per inbound turn, not one per process: two turns are two upstream calls.
+    assert upstream.seen[0] != upstream.seen[1]
+
+
+def test_the_upstream_key_is_this_hops_own_and_not_the_callers() -> None:
+    """Echo yes, relay no -- the two are different jobs and only one of them is safe."""
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+
+    upstream = _HopKeyRecorder()
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        response = urlopen(
+            Request(
+                f"{base_url}/internal/llm/turns",
+                data=json.dumps(_payload()).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {_llm_token(manager)}",
+                    "Idempotency-Key": "idem_from_the_caller",
+                },
+                method="POST",
+            ),
+            timeout=10,
+        )
+        with response:
+            assert json.loads(response.read())["final_text"] == "done"
+            assert response.headers.get("Idempotency-Key") == "idem_from_the_caller"
+
+    # Both halves, because "not the caller's" is satisfied by an empty key too -- the mutant
+    # that removed issuance passed this test until it also had to be a real key.
+    assert upstream.seen and is_valid_idempotency_key(upstream.seen[0])
+    assert upstream.seen[0] != "idem_from_the_caller"

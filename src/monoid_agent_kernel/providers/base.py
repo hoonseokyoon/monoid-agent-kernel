@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from copy import copy
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
@@ -15,6 +16,7 @@ from monoid_agent_kernel.core.spec import (
     validate_generation_config,
     validate_reasoning_config,
 )
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -178,6 +180,14 @@ class ModelRequest:
     # without the declaration ignore it, and post-hoc validation remains the guarantee either
     # way (native delivery only reduces repairs). ``None`` = unconstrained.
     output_schema: dict[str, Any] | None = None
+    # The retry-scope token this call presents (W7-3) — a carriage channel, not an input: the
+    # runner issues one per call at its keying block and OVERWRITES whatever a caller set,
+    # because a respected caller value would let one request object hand two calls the same
+    # retry scope. Constant across kernel re-dispatches and adapter-internal retries; only the
+    # gateway transport puts it on the wire (``Idempotency-Key``), other adapters ignore it.
+    # Deliberately outside the replay key: ``_request_identity._request_payload`` enumerates
+    # what the digest covers, and this token is per-issuance, not content.
+    idempotency_key: str = ""
 
 
 def _declared_support(
@@ -616,6 +626,27 @@ def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def new_idempotency_key() -> str:
+    """Mint one retry-scope token, for whoever owns a call's retry scope.
+
+    Public and shared because there is more than one such owner: ``ModelCallRunner`` for a call
+    the kernel drives, and the reference gateway's service for the upstream hop it drives
+    itself -- a hop with its own retry loop, hence its own scope. A second copy of this
+    expression is how the two would come to differ; the same reasoning promoted
+    ``capped_backoff`` out of one module when its second caller appeared.
+
+    Random rather than derived, and that is the contract: two byte-identical requests share a
+    replay slot by design -- content cannot separate them -- so the token that separates their
+    provider work must be content-independent. Prefixed the way the kernel's other minted ids
+    are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
+    Conforms by construction to :data:`~monoid_agent_kernel.core.model_io.IDEMPOTENCY_KEY_PATTERN`
+    -- the rule itself lives beside the receipt field it describes, because its two enforcers sit
+    on opposite sides of a one-way import boundary. Pinned by test rather than trusted.
+    """
+
+    return f"idem_{uuid.uuid4().hex}"
+
+
 def _normalize_optional_text(value: Any, field_name: str) -> str | None:
     normalized = normalize_json_ingress(value)
     if normalized is None:
@@ -785,6 +816,24 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
         # adapters) never got to see it. Left in place, the request is refused as the
         # config-recoverable bad request it is.
         output_schema = normalize_json_ingress(output_schema, substitute_nonfinite=False)
+    # Refused rather than repaired, and refused HERE rather than only at the transport: a
+    # caller who spelled a key that cannot go on a header has a bug, and the ingress that
+    # already refuses a non-finite control or a malformed output_schema is where this repo
+    # says so. The runner mints its own key AFTER this call, so a run-driven request never
+    # reaches this branch; it exists for the direct integrator who builds the request.
+    idempotency_key = request.idempotency_key
+    # ``!= ""`` and not truthiness: the EMPTY STRING is what spells absence on this field, and
+    # it is the only thing that does. A truthiness pre-filter also waved through ``None``,
+    # ``False``, ``0``, ``0.0``, ``[]`` and ``{}`` -- a caller who supplied something, which
+    # then reached a transport that omits what it cannot validate, so the key silently
+    # vanished instead of being refused. Same absence-vs-value conflation this field has now
+    # produced at three types: ``null`` read as a missing key on the wire, a present-empty
+    # container read as a missing log, and now every falsy value read as a missing token.
+    if idempotency_key != "" and not is_valid_idempotency_key(idempotency_key):
+        raise ValueError(
+            "model request idempotency_key must be 1-128 ASCII characters from "
+            "[A-Za-z0-9._+-] starting with a letter or digit"
+        )
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),

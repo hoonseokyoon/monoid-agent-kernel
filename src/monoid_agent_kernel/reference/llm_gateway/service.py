@@ -29,6 +29,7 @@ from monoid_agent_kernel.providers._common import (
 )
 from monoid_agent_kernel.providers.base import (
     generation_support,
+    new_idempotency_key,
     provider_usage_of,
     reasoning_support,
     resolved_provider_name,
@@ -168,6 +169,13 @@ class LlmGatewayBackend:
                         model=config,
                         messages=request.messages,
                         output_schema=request.output_schema,
+                        # This hop's own key, not the caller's. The inbound one is echoed and
+                        # never relayed -- relaying would stitch two retry scopes into one and
+                        # lie to both -- while the upstream call has a retry loop of its own
+                        # (a chained ``GatewayModelAdapter`` retries inside ``next_turn``), so
+                        # it needs a scope to name. Built once per inbound turn and reused by
+                        # that loop, which is what makes it attempt-invariant here too.
+                        idempotency_key=new_idempotency_key(),
                     )
                 )
             )
@@ -227,6 +235,10 @@ class LlmGatewayBackend:
             model=config,
             messages=request.messages,
             output_schema=request.output_schema,
+            # The streaming twin of the one-shot hop above, keyed for the same reason and on
+            # the same terms: this hop's own scope, built once and reused by ``_stream_turn``
+            # for both the ``astream_turn`` path and the one-shot fallback.
+            idempotency_key=new_idempotency_key(),
         )
         # Everything above can raise; only past this point are we committed to a stream body.
         return self._stream_turn(claims, request, adapter, model_request)

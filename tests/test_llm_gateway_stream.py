@@ -289,6 +289,75 @@ def test_gateway_marks_a_retried_stream_that_carries_no_chunks(monkeypatch) -> N
     assert assemble_streamed_turn(_stream(adapter)).provider_retried is False
 
 
+def test_gateway_stream_sends_one_key_across_its_attempts(monkeypatch) -> None:
+    """The async route re-resolves headers per attempt so a credential can refresh mid-call;
+    the idempotency key is read off the same request each time and must not move with them.
+    One retry scope on the wire, however many attempts the loop makes."""
+    httpx = pytest.importorskip("httpx")
+    seen: list[Any] = []
+    attempts = {"n": 0}
+
+    class _Response:
+        status_code = 200
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def aiter_lines(self):
+            for line in [
+                'data: {"type":"text_delta","text":"hi"}',
+                "",
+                'data: {"type":"turn_complete","response_id":"turn_1"}',
+                "",
+            ]:
+                yield line
+
+    class _Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        def stream(self, *_args: Any, **kwargs: Any) -> Any:
+            attempts["n"] += 1
+            headers = kwargs.get("headers") or {}
+            seen.append(headers.get("Idempotency-Key"))
+            if attempts["n"] == 1:
+                raise httpx.HTTPError("connection reset before the stream committed")
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+    request = ModelRequest(
+        instruction="go", system_prompt="s", tools=(), idempotency_key="idem_fixed"
+    )
+    chunks = asyncio.run(_collect(adapter.astream_turn(request)))
+
+    assert seen == ["idem_fixed", "idem_fixed"]
+    assert assemble_streamed_turn(chunks).final_text == "hi"
+
+    # Counterweight: an unkeyed request grows no header -- the pre-W7-3 wire shape is a
+    # contract, and an empty header is not "no header".
+    seen.clear()
+    unkeyed = asyncio.run(_collect(adapter.astream_turn(ModelRequest("go", "s", ()))))
+    assert seen == [None]
+    assert assemble_streamed_turn(unkeyed).final_text == "hi"
+
+
 def test_agentloop_astream_over_gateway_streams_real_tokens(tmp_path: Path) -> None:
     pytest.importorskip("httpx")
     server, manager = _server_for(

@@ -441,6 +441,31 @@ above, adding a key to it is a schema change like any other. The backward proper
 hold is the reader-side one already stated: the schema declares `attempt_log` without requiring
 it, so a v0.21 validator still accepts lines a pre-`attempt_log` v0.21 build wrote.
 
+W7-3 adds `idempotency_key` to `ModelCallReceipt` and to the same ledger line, under exactly the
+reasoning of the previous paragraph and inside the same unreleased window: a schema change to a
+closed schema, made where there is still no released reader to break, under the unchanged
+`monoid.model-calls.v1` identifier. The schema declares the key without requiring it — the
+`attempt_log` precedent — so `monoid validate` keeps passing directories pre-W7-3 v0.21 builds
+filled, and absence on a line means exactly one thing: a writer that predates the field. On the
+receipt's own JSON, `from_json` reads an absent key as `""` ("never keyed"), which is what every
+record written before the field existed means. The key is deliberately excluded from the replay
+key and from the payloads corpus, so no recorded replay identity moves; it is randomly issued
+per call, so replaying a corpus issues fresh keys without touching the equivalence oracle, which
+reads the payloads corpus and never opens the ledger. The value never reaches `status.json`,
+`metrics.json`, or the event stream — carriage is receipt and ledger only, plus the
+`Idempotency-Key` HTTP header on the gateway transport.
+
+In the same window, every `pattern` across the artifact schemas stops accepting a trailing
+newline. `jsonschema` evaluates `pattern` with Python's `re`, where `$` matches immediately before
+a final newline, so `monoid validate` had been certifying `"<digest>\n"`, `"<timestamp>\n"`,
+`"<event.type>\n"` and `"<key>\n"` on `event.v1`, `manifest.v1`, `model-calls.v1`,
+`model-payloads.v1`, `workspace-*`, `approval` and `apply-result` lines. This is a **validation
+tightening, not a schema-version change**: every identifier is unchanged, no writer in this
+project has ever emitted such a value, and the only directories that stop validating are ones
+carrying a value the rest of the kernel already refused. Third parties validating these schemas
+with an ECMA-262 engine see no change at all — the new spelling is redundant there and
+load-bearing only under Python's `re`.
+
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
 `retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and

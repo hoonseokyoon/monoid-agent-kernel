@@ -43,6 +43,7 @@ from typing import (
 from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe
+from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
@@ -451,6 +452,48 @@ deterministically when no URL is configured anywhere, so ``unavailable`` is usua
 whose every call is about to fail. All three used to be the same empty string, and the collapse was
 invisible because each produced a key that looked fine.
 """
+
+
+_IDEMPOTENCY_KEY_BODY = r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
+"""What an idempotency key may be spelled as, once, so its two enforcers cannot drift.
+
+The rule lives in ``core`` rather than beside its first caller because it has two enforcers on
+opposite sides of an import boundary that cannot be crossed the other way: ``core/schemas.py``
+states it to ``monoid validate``, and ``providers/base.py`` states it to a request being built.
+``core`` never imports ``providers``, so a rule owned there could only have been copied -- and a
+hand-copied twin regex is a drift waiting to happen. Both forms below derive from this body.
+
+Bounded at 128 characters and free of control characters because this is the one field on a model
+call that reaches a *transport header* rather than a JSON string: JSON escapes a control
+character, an HTTP header does not, and neither ``http.client`` nor ``httpx`` refuses an obsolete
+folded value.
+"""
+
+IDEMPOTENCY_KEY_PATTERN = re.compile(rf"{_IDEMPOTENCY_KEY_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+IDEMPOTENCY_KEY_JSON_PATTERN = rf"^(|{_IDEMPOTENCY_KEY_BODY}){END_OF_INPUT}"
+"""The ECMA-262 form for JSON Schema, empty-allowed the way ``prompt_digest``'s pattern is.
+
+Empty is a legal recorded value -- a refused call was never keyed -- so the ledger admits it
+explicitly rather than by omitting the constraint, exactly as the optional-digest pattern does for
+a digest that may not have been issued. ``\\Z`` and ``re.ASCII`` do not exist in ECMA-262, which is
+why this is derived from the body rather than from the compiled pattern's source -- and why the
+end of input is asserted by :data:`~monoid_agent_kernel.core._json_schema.END_OF_INPUT` rather than
+by a bare ``$``, which under ``jsonschema``'s Python engine would also have matched just before a
+trailing newline.
+"""
+
+
+def is_valid_idempotency_key(value: Any) -> bool:
+    """Whether ``value`` may be presented as an idempotency key on a header or written to a log.
+
+    Empty is *not* valid here: absence is spelled by not calling this, and each caller says what
+    absence means for it. Bounded so an unauthenticated client cannot choose the length of a log
+    line.
+    """
+
+    return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
 
 
 def destination_digest(value: str) -> str:
@@ -995,6 +1038,17 @@ class ModelCallReceipt:
     # (a breakdown that disagrees with its total leaves a reader nothing to believe). Appended
     # last so positional construction predating this field keeps meaning what it meant.
     attempt_log: tuple[ModelCallAttempt, ...] = ()
+    # The retry-scope token the call was keyed with -- issued by the runner in the same block
+    # that computes the digests, once per call and before the first dispatch, so it is constant
+    # across kernel re-dispatches and adapter-internal retries and reissued on resume. Recorded
+    # as ISSUED, not as sent: only the gateway transport presents it on the wire, so a key on a
+    # fake or replay call's receipt says the call was keyed, nothing more. Deliberately outside
+    # the replay key: two identical requests share a replay slot precisely because content
+    # cannot tell them apart, and a token meant to separate their provider work must therefore
+    # be content-independent. Empty means the call never reached the keying block (refused by
+    # the cancel/deadline check or by ingress normalization) or the record predates the field.
+    # Appended after ``attempt_log`` under the same positional-stability rule it states.
+    idempotency_key: str = ""
 
     def __post_init__(self) -> None:
         # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
@@ -1190,6 +1244,7 @@ class ModelCallReceipt:
             # Always emitted, even one-entry and empty — absence means exactly one thing, a
             # writer that predates the field, rather than doubling as "nothing noteworthy".
             "attempt_log": [entry.to_json() for entry in self.attempt_log],
+            "idempotency_key": self.idempotency_key,
         }
 
     @classmethod
@@ -1267,6 +1322,9 @@ class ModelCallReceipt:
             ),
             destination_digest=parse_str(payload, "destination_digest"),
             attempt_log=attempt_log,
+            # Absent on every receipt written before the field existed, which is legal and reads
+            # as "never keyed"; present-but-mistyped is refused, like every other string here.
+            idempotency_key=parse_str(payload, "idempotency_key"),
         )
 
 

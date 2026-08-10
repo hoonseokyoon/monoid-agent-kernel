@@ -7329,3 +7329,144 @@ def test_every_abandonable_call_site_routes_its_discards() -> None:
         "passes on another; the callee cannot tell the exits apart, so a replay slot stays "
         "spent and the next caller receives the following recording",
     }
+
+
+# --------------------------------------------------------------------------------------
+# Every ``pattern`` in every schema, against the dialect its validator actually speaks
+# --------------------------------------------------------------------------------------
+
+# JSON Schema calls ``pattern`` an ECMA-262 regex, ``jsonschema`` runs it through Python's ``re``,
+# and the two disagree at one position: ``$`` matches immediately before a single trailing newline
+# under ``re`` and only at end of input under ECMA-262. Every pattern in this repository was
+# spelled with a bare ``$``, so ``monoid validate`` certified ``"<digest>\n"``, ``"<timestamp>\n"``
+# and ``"<key>\n"`` -- values every other edge in the kernel refuses.
+#
+# Discovered, never listed. The hand-listed candidate lattice of the census this replaces is
+# exactly why the hole survived being reviewed: it proved agreement on the ten strings its author
+# thought of, and a trailing newline was not one of them.
+
+_PATTERN_PROBES: tuple[str, ...] = (
+    "",
+    "x",
+    "Z",
+    "2026-01-01T00:00:00Z",
+    "run.started",
+    "idem_0123456789abcdef",
+    "0123456789abcdef" * 4,
+)
+"""One string per pattern family, at minimum. A pattern no probe satisfies fails the census."""
+
+_LINE_TERMINATORS: tuple[str, ...] = ("\n", "\r", "\r\n", "\n\n", "\u2028", "\u0085")
+
+
+def _schema_patterns() -> dict[str, set[str]]:
+    """Every ``pattern`` reachable from a module-level schema, and where it was found.
+
+    Over ``sys.modules`` rather than over ``core.schemas``, because a schema is a plain dict that
+    any module may define and this census must not be scoped to the one file that happened to
+    hold them all when it was written.
+    """
+
+    import importlib
+    import pkgutil
+    import sys
+
+    import monoid_agent_kernel
+
+    for found in pkgutil.walk_packages(monoid_agent_kernel.__path__, "monoid_agent_kernel."):
+        try:
+            importlib.import_module(found.name)
+        except Exception:  # noqa: BLE001 - an optional-extra module is not this census's business
+            continue
+
+    patterns: dict[str, set[str]] = {}
+
+    def walk(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            found = node.get("pattern")
+            if isinstance(found, str):
+                patterns.setdefault(found, set()).add(where)
+            for key, value in node.items():
+                walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{where}[{index}]")
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("monoid_agent_kernel"):
+            continue
+        for attribute in dir(module):
+            if not attribute.isupper():
+                continue
+            try:
+                value = getattr(module, attribute)
+            except Exception:  # noqa: BLE001 - a lazy attribute is not a schema
+                continue
+            if isinstance(value, dict):
+                walk(value, f"{name}.{attribute}")
+
+    return patterns
+
+
+def test_the_pattern_census_found_the_schemas_it_is_supposed_to_police() -> None:
+    """Fail closed: a discovery that finds nothing would let every test below pass vacuously."""
+
+    patterns = _schema_patterns()
+    assert len(patterns) >= 5, {
+        "found": sorted(patterns),
+        "hint": "schema discovery collapsed; the patterns below are no longer being checked",
+    }
+
+
+def test_every_schema_pattern_has_a_probe_that_satisfies_it() -> None:
+    """The witness requirement, without which the terminator census proves nothing.
+
+    A pattern no probe matches cannot be tested for the hole -- there is no accepted value to
+    append a newline to -- and a census that skips what it cannot test is the failure mode this
+    file was rewritten to remove. So a new pattern with no probe fails here, loudly, rather than
+    passing the test below by never being exercised.
+    """
+
+    from jsonschema import Draft202012Validator
+
+    unwitnessed = {
+        pattern: sorted(sites)
+        for pattern, sites in _schema_patterns().items()
+        if not any(
+            Draft202012Validator({"type": "string", "pattern": pattern}).is_valid(probe)
+            for probe in _PATTERN_PROBES
+        )
+    }
+    assert not unwitnessed, {
+        "patterns": unwitnessed,
+        "hint": "add a string this pattern accepts to _PATTERN_PROBES, or the terminator census "
+        "silently stops covering it",
+    }
+
+
+def test_no_schema_pattern_accepts_a_value_with_a_line_terminator_appended() -> None:
+    """The class of defect, stated once over every member of the class.
+
+    Behavioural rather than textual: a census that grepped for a trailing ``$`` would pass a
+    pattern spelled ``[^\\n]*$`` and fail one whose ``$`` is inside a group, so this drives the
+    real ``Draft202012Validator`` and asks what it certifies.
+    """
+
+    from jsonschema import Draft202012Validator
+
+    leaks: dict[str, list[str]] = {}
+    for pattern, sites in _schema_patterns().items():
+        validator = Draft202012Validator({"type": "string", "pattern": pattern})
+        for probe in _PATTERN_PROBES:
+            if not validator.is_valid(probe):
+                continue
+            for terminator in _LINE_TERMINATORS:
+                if validator.is_valid(probe + terminator):
+                    leaks.setdefault(pattern, []).append(
+                        f"{probe + terminator!r} at {sorted(sites)[0]}"
+                    )
+    assert not leaks, {
+        "patterns": leaks,
+        "hint": "this pattern's end anchor stops before a line terminator; use END_OF_INPUT so "
+        "the same value is refused under Python's re and under ECMA-262 alike",
+    }

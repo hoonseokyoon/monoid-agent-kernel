@@ -271,6 +271,7 @@ def test_json_round_trip_preserves_every_field() -> None:
                 stream_committed=True,
             ),
         ),
+        idempotency_key="idem_e33075f0f24b4e58a15fc5261576ab60",
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt

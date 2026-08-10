@@ -10,6 +10,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
+from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_calls import (
@@ -36,10 +37,24 @@ from monoid_agent_kernel.core._verified_file import read_verified_bytes
 from monoid_agent_kernel.core.model_io import (
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
+    IDEMPOTENCY_KEY_JSON_PATTERN,
     MAX_MODEL_PAYLOAD_BYTES,
 )
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
+
+
+TIMESTAMP_PATTERN = rf"Z{END_OF_INPUT}"
+"""Ends with the UTC designator -- unanchored at the front on purpose, the way it always was."""
+
+EVENT_TYPE_PATTERN = rf"^[a-z]+(\.[a-z_]+)+{END_OF_INPUT}"
+"""A dotted lowercase event name, whole and nothing after it."""
+
+SHA256_PATTERN = rf"^[0-9a-f]{{64}}{END_OF_INPUT}"
+"""A digest that must be present."""
+
+OPTIONAL_SHA256_PATTERN = rf"^(|[0-9a-f]{{64}}){END_OF_INPUT}"
+"""A digest that may not have been issued, where empty is the recorded spelling of absence."""
 
 
 EVENT_SCHEMA: dict[str, Any] = {
@@ -61,8 +76,8 @@ EVENT_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "turn_id": {"type": ["string", "null"]},
         "parent_id": {"type": ["string", "null"]},
-        "timestamp": {"type": "string", "pattern": "Z$"},
-        "type": {"type": "string", "pattern": "^[a-z]+(\\.[a-z_]+)+$"},
+        "timestamp": {"type": "string", "pattern": TIMESTAMP_PATTERN},
+        "type": {"type": "string", "pattern": EVENT_TYPE_PATTERN},
         "level": {"enum": ["debug", "info", "warning", "error"]},
         "data": {"type": "object"},
     },
@@ -598,7 +613,7 @@ MANIFEST_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("manifest.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "created_at": {"type": "string", "pattern": "Z$"},
+        "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "mode": {"enum": ["read-only", "propose", "apply"]},
         "workspace_backend": {"enum": ["overlay", "staging"]},
         "workspace_root": {"type": "string"},
@@ -631,7 +646,7 @@ WORKSPACE_BASE_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("workspace-base.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "created_at": {"type": "string", "pattern": "Z$"},
+        "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "workspace_root": {"type": "string"},
         "workspace_backend": {"enum": ["overlay", "staging"]},
         "entries": {
@@ -643,7 +658,7 @@ WORKSPACE_BASE_SCHEMA: dict[str, Any] = {
                     "path": {"type": "string"},
                     "kind": {"enum": ["file", "dir", "other"]},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": ["string", "null"], "pattern": SHA256_PATTERN},
                 },
                 "additionalProperties": False,
             },
@@ -680,7 +695,7 @@ WORKSPACE_INDEX_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("workspace-index.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "generated_at": {"type": "string", "pattern": "Z$"},
+        "generated_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "workspace_root": {"type": "string"},
         "max_entries": {"type": "integer", "minimum": 1},
         "max_hash_bytes": {"type": "integer", "minimum": 0},
@@ -694,7 +709,7 @@ WORKSPACE_INDEX_SCHEMA: dict[str, Any] = {
                     "path": {"type": "string"},
                     "kind": {"enum": ["file", "dir", "other"]},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": ["string", "null"], "pattern": SHA256_PATTERN},
                     "hash_status": {"enum": ["hashed", "too_large", "not_file", "error"]},
                 },
                 "additionalProperties": False,
@@ -868,7 +883,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "step": {"type": "integer", "minimum": 1},
                 "provider": {"type": ["string", "null"]},
                 "model": {"type": ["string", "null"]},
-                "started_at": {"type": "string", "pattern": "Z$"},
+                "started_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -894,7 +909,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "channel": {"enum": ["output", "reasoning"]},
                 "text": {"type": "string"},
                 "text_len": {"type": "integer", "minimum": 0},
-                "emitted_at": {"type": "string", "pattern": "Z$"},
+                "emitted_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -928,7 +943,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 # the writer because ``additionalProperties`` is False here — a record key with
                 # no schema slot is a validation failure, not a forward-compatible extra.
                 "config_recoverable": {"type": "boolean"},
-                "finished_at": {"type": "string", "pattern": "Z$"},
+                "finished_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -948,9 +963,9 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "kind": {"const": "settled_text"},
                 "run_id": {"type": "string", "minLength": 1},
                 "final_text": {"type": "string"},
-                "final_text_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "final_text_digest": {"type": "string", "pattern": SHA256_PATTERN},
                 "final_text_len": {"type": "integer", "minimum": 0},
-                "recorded_at": {"type": "string", "pattern": "Z$"},
+                "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -1028,7 +1043,7 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "root_run_id": {"type": "string", "minLength": 1},
         "call_index": {"type": "integer", "minimum": 0},
-        "recorded_at": {"type": "string", "pattern": "Z$"},
+        "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "context": {
             "type": "object",
             "required": [
@@ -1066,10 +1081,22 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "provider_name": {"type": "string"},
         # Empty is a valid answer and ``digest_status`` says which reason it is, so the
         # pattern admits both the key and its absence rather than requiring one.
-        "prompt_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
-        "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+        "prompt_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
+        "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
         "digest_generation": {"type": "string"},
         "digest_status": {"enum": list(DIGEST_STATUSES)},
+        # Declared and not required, the ``attempt_log`` rule: the writer always emits it, so
+        # absence on a line means exactly one thing -- a writer that predates the field -- and
+        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled.
+        #
+        # Format-constrained like the two digests beside it rather than left an open string:
+        # this key is a token the kernel MINTS to a closed shape, not an open vocabulary a
+        # provider may extend (which is why ``stop_reason`` and ``provider_error_code`` carry
+        # no pattern and this does). The pattern is DERIVED from the same body
+        # ``is_valid_idempotency_key`` compiles, so an imported or third-party line cannot be
+        # certified against a rule the rest of the kernel does not hold. Empty is admitted
+        # explicitly, the ``^(|...)$`` idiom the digests use: a refused call was never keyed.
+        "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_KEY_JSON_PATTERN},
         "destination_status": {"enum": list(DESTINATION_STATUSES)},
         "stop_reason": {"type": "string"},
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
@@ -1131,7 +1158,7 @@ def _payloads_envelope(kind: str) -> dict[str, Any]:
         "kind": {"const": kind},
         "run_id": {"type": "string", "minLength": 1},
         "root_run_id": {"type": "string", "minLength": 1},
-        "recorded_at": {"type": "string", "pattern": "Z$"},
+        "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
     }
 
 
@@ -1148,7 +1175,7 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
             "required": [*_PAYLOADS_ENVELOPE_KEYS, "sha256", "text"],
             "properties": {
                 **_payloads_envelope(PAYLOAD_CHUNK_KIND),
-                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "sha256": {"type": "string", "pattern": SHA256_PATTERN},
                 "text": {"type": "string"},
             },
             "additionalProperties": False,
@@ -1166,7 +1193,7 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
                 **_payloads_envelope(MODEL_REQUEST_KIND),
                 # Never empty: a keyless call has nothing to file a preimage under, so the
                 # record simply does not exist (unlike the response branch below).
-                "request_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "request_digest": {"type": "string", "pattern": SHA256_PATTERN},
                 "digest_generation": {"type": "string", "minLength": 1},
                 "refs": {"type": "boolean"},
                 # Deliberately untyped. The recipe arm always produces an object, but the
@@ -1193,7 +1220,7 @@ MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
                 "call_index": {"type": "integer", "minimum": 0},
                 # Empty is legal here: the ledger line this index joins says why there was no
                 # key (its ``digest_status``), and this record still names the answer.
-                "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
+                "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
                 "unrecorded_reason": {"enum": list(UNRECORDED_REASONS)},
                 # The inline body, a chunk reference to an offloaded one, or null with
                 # ``unrecorded_reason`` saying why. Body keys are content, not contract, so the
@@ -1224,10 +1251,10 @@ PROPOSAL_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "updated_at": {"type": "number"},
         "mode": {"enum": ["read-only", "propose", "apply"]},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "diff_path": {"type": "string"},
         "diff_bytes": {"type": "integer", "minimum": 0},
-        "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_sha256": {"type": "string", "pattern": SHA256_PATTERN},
         "changed_paths": {"type": "array", "items": {"type": "string"}},
         "files": {
             "type": "array",
@@ -1464,9 +1491,9 @@ PACKAGE_SCHEMA: dict[str, Any] = {
         "schema_version": schema_version_property("proposal-package.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "created_at": {"type": "string"},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
+        "diff_sha256": {"type": "string", "pattern": SHA256_PATTERN},
+        "package_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "files": {
             "type": "array",
             "items": {
@@ -1477,7 +1504,7 @@ PACKAGE_SCHEMA: dict[str, Any] = {
                     "role": {"type": "string"},
                     "workspace_path": {"type": "string"},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": "string", "pattern": SHA256_PATTERN},
                 },
                 "additionalProperties": False,
             },
@@ -1505,14 +1532,14 @@ APPROVAL_SCHEMA: dict[str, Any] = {
         "schema_version": schema_version_property("approval.v1"),
         "approval_id": {"type": "string"},
         "decision": {"enum": ["approved", "rejected"]},
-        "package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "package_hash": {"type": "string", "pattern": SHA256_PATTERN},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "approved_paths": {"type": "array", "items": {"type": "string"}},
         "rejected_paths": {"type": "array", "items": {"type": "string"}},
         "approver_id": {"type": "string"},
         "approved_at": {"type": "string"},
         "note": {"type": "string"},
-        "approval_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_hash": {"type": "string", "pattern": SHA256_PATTERN},
     },
     "additionalProperties": False,
 }
@@ -1537,7 +1564,7 @@ APPLY_RESULT_SCHEMA: dict[str, Any] = {
         "conflicts": {"type": "array", "items": {"type": "object"}},
         "approval_hash": {"type": "string"},
         "package_hash": {"type": "string"},
-        "apply_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "apply_hash": {"type": "string", "pattern": SHA256_PATTERN},
     },
     "additionalProperties": False,
 }

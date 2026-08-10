@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
     normalize_unicode_scalars,
 )
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -289,7 +290,7 @@ class GatewayModelAdapter:
                 http_request = Request(
                     url,
                     data=body,
-                    headers=self._headers(),
+                    headers=self._headers(idempotency_key=request.idempotency_key),
                     method="POST",
                 )
                 try:
@@ -502,8 +503,9 @@ class GatewayModelAdapter:
                     # minutes old. A stale header then failed attempt 2 with a 401, which is
                     # ``gateway_auth_error`` and *not* retryable, so a run the sync path recovered
                     # ended terminally here. The URL and the body are hoisted because neither can
-                    # change between attempts; a credential can.
-                    headers = self._headers()
+                    # change between attempts; a credential can. The idempotency key rides the
+                    # refresh without moving: it is read off the same request every attempt.
+                    headers = self._headers(idempotency_key=request.idempotency_key)
                     try:
                         async with client.stream(
                             "POST", url, headers=headers, content=body
@@ -708,12 +710,27 @@ class GatewayModelAdapter:
             )
         return url
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, idempotency_key: str = "") -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": user_agent(),
         }
+        # Presented only when the call was keyed: an unkeyed request keeps its exact pre-W7-3
+        # wire shape rather than growing an empty header. The value is CALL-scoped while this
+        # method is ATTEMPT-scoped (both routes rebuild headers per attempt so a credential can
+        # refresh mid-call), which is why the key arrives as an argument read off the request
+        # being dispatched instead of being minted here -- minted here, every attempt would
+        # open its own retry scope, the exact opposite of what the token is for.
+        #
+        # Validated at the edge as well as at ingress, because this is the LAST point before a
+        # header exists and the two HTTP stacks under it do not defend it: probed, neither
+        # ``http.client`` nor ``httpx`` refuses an obsolete folded value, so an unvalidated key
+        # on a directly-built request (the runner's own key always conforms) would split the
+        # outbound request header. Omitted rather than raised -- an adapter must not lose a paid
+        # call over a bookkeeping token, the rule ``_resolved_destination`` already follows.
+        if is_valid_idempotency_key(idempotency_key):
+            headers["Idempotency-Key"] = idempotency_key
         token = self._resolve_gateway_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"

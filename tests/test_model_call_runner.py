@@ -3606,6 +3606,153 @@ def test_the_default_layer_still_makes_exactly_one_attempt() -> None:
     assert adapter.calls == 1
 
 
+# --- the idempotency key: issued at keying, constant across dispatches --------------------------
+
+
+class _KeyCapturingAdapter:
+    """Fails ``failures`` times, capturing the request's idempotency key at every dispatch."""
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.seen: list[str] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.seen.append(request.idempotency_key)
+        if len(self.seen) <= self.failures:
+            raise ModelAdapterError("transient", retryable=True)
+        return ModelTurn(final_text="answer")
+
+
+def test_the_runner_issues_one_key_per_call_and_every_dispatch_carries_it() -> None:
+    """Issued in the keying block -- per call, before the first dispatch -- and constant across
+    kernel re-dispatches: the loop reuses the request rather than rebuilding it, so the key the
+    receipt records is the key every attempt presented."""
+
+    adapter = _KeyCapturingAdapter(failures=2)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    receipt = _acall(adapter, request).captures[0].receipt
+
+    assert receipt.attempts == 3
+    assert receipt.idempotency_key.startswith("idem_")
+    assert adapter.seen == [receipt.idempotency_key] * 3
+
+
+def test_every_call_gets_its_own_key_even_over_the_same_request_object() -> None:
+    """Two calls are two retry scopes even when their content is byte-identical. Identical
+    requests share a replay slot by design -- content cannot separate them -- which is exactly
+    why the token that separates their provider work is issued per call, not derived. Issuance
+    is uniform: this adapter never opens a socket and its calls are keyed all the same."""
+
+    adapter = _KeyCapturingAdapter()
+    first = _acall(adapter, REQUEST).captures[0].receipt
+    second = _acall(adapter, REQUEST).captures[0].receipt
+
+    assert first.idempotency_key.startswith("idem_")
+    assert second.idempotency_key.startswith("idem_")
+    assert first.idempotency_key != second.idempotency_key
+
+
+def test_the_runner_is_the_single_issuer_and_overwrites_a_caller_value() -> None:
+    """A respected caller value would let one request object hand two calls the same scope --
+    the collision the per-call issuer exists to prevent -- so the field is a carriage channel,
+    not an input."""
+
+    adapter = _KeyCapturingAdapter()
+    request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), idempotency_key="caller-chosen"
+    )
+    receipt = _acall(adapter, request).captures[0].receipt
+
+    assert receipt.idempotency_key != "caller-chosen"
+    assert receipt.idempotency_key.startswith("idem_")
+    assert adapter.seen == [receipt.idempotency_key]
+
+
+def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
+    """The mint and the validator must not drift: every edge omits or refuses a key outside
+    the token shape, so a mint that ever left it would silently stop being carried.
+
+    Read off ``providers.base``, where the minter lives because the runner is not its only
+    caller -- the reference gateway keys the upstream hop it drives with the same function.
+    Two copies of the expression is how the two issuers would come to differ.
+    """
+
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+    from monoid_agent_kernel.providers.base import new_idempotency_key
+
+    for _ in range(64):
+        assert is_valid_idempotency_key(new_idempotency_key())
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\r\nX-Injected: yes", id="bare-crlf"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="too-long"),
+        pytest.param("-leading-punctuation", id="bad-first-character"),
+        pytest.param("key with spaces", id="space"),
+        pytest.param("ké", id="non-ascii"),
+        # Not strings at all. Only the empty string spells absence here; every other falsy
+        # value is a caller who supplied *something* and would otherwise have watched it
+        # vanish at the transport, which omits what it cannot validate. A truthiness
+        # pre-filter reads all six as "no key given" -- the absence-vs-value conflation this
+        # field has now produced three times, at three different types.
+        pytest.param(None, id="none"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param([], id="empty-list"),
+        pytest.param({}, id="empty-dict"),
+    ],
+)
+def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: object) -> None:
+    """Refused where this repo refuses a non-finite control or a malformed output_schema.
+
+    The runner mints after normalization so a run-driven call never reaches this branch; it
+    exists for the direct integrator, whose bad key would otherwise reach a transport that --
+    probed -- neither `http.client` nor `httpx` defends against when it is obs-folded.
+    """
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        normalize_model_request(
+            ModelRequest(instruction="hi", system_prompt="sys", tools=(), idempotency_key=hostile)
+        )
+
+    # Counterweight: the shape the runner mints survives ingress untouched.
+    kept = normalize_model_request(
+        ModelRequest(
+            instruction="hi", system_prompt="sys", tools=(), idempotency_key="idem_abc123"
+        )
+    )
+    assert kept.idempotency_key == "idem_abc123"
+
+
+def test_a_call_refused_before_keying_records_no_key() -> None:
+    """The keying block sits past the cancel/deadline check, so a refused call was never keyed:
+    ``""`` beside ``attempts == 0``, the receipt's own two-armed audit shape."""
+
+    adapter = _KeyCapturingAdapter()
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST, deadline=time.time() - 1.0)
+
+    with pytest.raises(RunTimeout):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 0
+    assert receipt.idempotency_key == ""
+    assert adapter.seen == []
+
+
 @pytest.mark.parametrize(
     "error_factory",
     [

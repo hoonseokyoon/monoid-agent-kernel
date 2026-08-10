@@ -17,6 +17,7 @@ from monoid_agent_kernel.reference._shared.http_util import (
     read_json_limited,
     redact_internal_error,
 )
+from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.providers.base import provider_usage_of
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.providers.gateway import (
@@ -59,6 +60,18 @@ def make_llm_gateway_handler(
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
+                if parsed.path in ("/internal/llm/turns", "/internal/llm/turns/stream"):
+                    # Logged and echoed (see the response writers), and nothing else: the
+                    # reference gateway does not dedupe on the key -- retry-scoped carriage
+                    # is not exactly-once -- and does not relay it upstream, because each
+                    # hop's client issues its own key for its own retry scope.
+                    key = self._idempotency_key()
+                    if key:
+                        _LOGGER.info("idempotency-key %s on %s", key, parsed.path)
+                    elif self.headers.get("Idempotency-Key"):
+                        # The fact, never the value: an inbound key that cannot be spelled
+                        # safely is exactly the one whose bytes must not reach a log line.
+                        _LOGGER.warning("dropped a malformed idempotency-key on %s", parsed.path)
                 if parsed.path == "/internal/llm/turns":
                     self._write_json(gateway.handle_turn(self._bearer_token(), self._read_json()))
                     return
@@ -202,6 +215,27 @@ def make_llm_gateway_handler(
                 status=status,
             )
 
+        def _idempotency_key(self) -> str:
+            # The ONE read of this header, so the log and the echo can never disagree about
+            # what the client sent. Validated because the value is attacker-chosen and both
+            # of its sinks are raw-text: ``BaseHTTPRequestHandler`` hands back an obsolete
+            # folded value with its CRLF intact (probed), ``send_header`` writes what it is
+            # given, and this route logs before the service authenticates -- so an unvalidated
+            # key forges log lines and splits response headers for a client that never
+            # presented a token. A key that is not a bounded ASCII token reads as absent.
+            key = self.headers.get("Idempotency-Key")
+            return key if is_valid_idempotency_key(key) else ""
+
+        def _echo_idempotency_key(self) -> None:
+            # The echo half of log-and-echo. On EVERY response this request produces -- the
+            # JSON writer serves successes and errors alike (``_write_error`` lands here),
+            # and the SSE writer is the other end of ``do_POST`` -- because a retried
+            # failure is precisely when a client wants the correlation. Absent stays
+            # absent: no key, no header. Malformed reads as absent, above.
+            key = self._idempotency_key()
+            if key:
+                self.send_header("Idempotency-Key", key)
+
         def _write_json(
             self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
         ) -> None:
@@ -209,6 +243,7 @@ def make_llm_gateway_handler(
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self._echo_idempotency_key()
             self.end_headers()
             self.wfile.write(body)
 
@@ -222,6 +257,7 @@ def make_llm_gateway_handler(
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
+            self._echo_idempotency_key()
             self.end_headers()
             try:
                 for frame in frames:

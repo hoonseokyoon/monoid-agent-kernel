@@ -19,10 +19,17 @@ which is where `permissions`, `recorder` and `loop_phases` already live.
 runner stamps receipts with (this module cannot be imported from `providers` without a
 cycle). The names are re-imported here for this module's own callers and their tests.
 
-**What it does not do: retry.** Backoff and HTTP classification live inside the adapters
-(`providers/gateway.py`), so the kernel makes exactly one adapter call per turn. That is the
-distinction `ModelCallReceipt.attempts` and `provider_retried` encode, and it is why this module
-inherits classification without inheriting a retry loop.
+**Where retry lives: one owner per call, named by the config.** Backoff and HTTP
+classification live inside the adapters (`providers/gateway.py`), and `ModelRetryConfig.layer`
+names which loop owns a call. Under the default `"adapter"` layer the kernel makes exactly one
+adapter call per turn; under `"kernel"` the attempt loop in this module re-dispatches, with the
+adapter's copy of the config neutralized to a single attempt so the two loops can never
+multiply. That is the distinction `ModelCallReceipt.attempts` (kernel dispatches) and
+`provider_retried` (a loop below the adapter boundary reported) encode — and classification is
+inherited from the adapters either way: this module reads what the escaping exception carries,
+it never invents its own taxonomy. (This paragraph said "the kernel makes exactly one adapter
+call per turn" unconditionally until W7-3; that stopped being true when W7-0 landed the kernel
+layer, and two review cycles read past it.)
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ from monoid_agent_kernel.providers.base import (
     collect_retry_reports,
     mark_provider_retried,
     mark_provider_usage,
+    new_idempotency_key,
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
@@ -239,6 +247,11 @@ def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
     for name, replacement in changes.items():
         object.__setattr__(cloned, name, replacement)
     return cloned
+
+
+# The minter itself lives in ``providers.base`` beside the rule it satisfies, because the
+# runner is not its only caller: the reference gateway's service keys the upstream hop it
+# drives, which has a retry loop of its own. One expression, both issuers.
 
 
 def _normalize_invocation_context(context: InvocationContext) -> InvocationContext:
@@ -636,8 +649,20 @@ class ModelCallRunner:
                         dispatch_model if dispatch_model is not None else model,
                         retry=_copy_with_fields(model.retry, max_attempts=1),
                     )
+                # One copy for both call-scoped rewrites below. ``normalize_model_request``
+                # already returned a fresh instance, but the explicit copy keeps the rule
+                # visible: nothing past this line writes onto a value the caller holds.
+                request = copy(request)
+                # The call is KEYED here, in the same breath as its digests below: one fresh
+                # token per call, before the first dispatch, so every kernel re-dispatch (the
+                # loop reuses this request) and every adapter-internal retry (the gateway
+                # rebuilds only headers) presents the same value. The runner is the single
+                # issuer -- a caller-supplied value is overwritten, because respecting it
+                # would let one request object hand two calls the same retry scope, the
+                # collision per-call issuance exists to prevent. Issuance is uniform across
+                # adapters; presenting the token on a wire is the gateway transport's alone.
+                object.__setattr__(request, "idempotency_key", new_idempotency_key())
                 if dispatch_model is not None:
-                    request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
                 where, destination_status = self._resolved_destination(model, adapter)
                 digest_result = _encoded_digest(
@@ -677,6 +702,7 @@ class ModelCallRunner:
                     digest_status=digest_result.status,
                     destination_status=destination_status,
                     destination_digest=destination_digest(where),
+                    idempotency_key=request.idempotency_key,
                 )
                 consumer = delta_consumer
                 delivered = False

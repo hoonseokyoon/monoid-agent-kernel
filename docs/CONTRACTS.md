@@ -462,6 +462,53 @@ completed from defaults — defaults there turn a corrupt line into a plausible 
 carry no wall-clock instant — the receipt's own rule; the ledger line's `recorded_at` anchors the
 call — and backoff waits fall between entries, so entry times sum to less than `latency_ms`.
 
+`ModelCallReceipt.idempotency_key` is the retry-scope token the call presented (W7-3). The runner
+mints one per call (`idem_` + hex) in the same block that computes the digests — before the first
+dispatch — and it is constant across kernel re-dispatches and adapter-internal retries, because
+both loops reuse the request the token rides on. The runner is the single issuer: a caller-set
+`ModelRequest.idempotency_key` is overwritten, since a respected caller value would let one
+request object hand two calls the same retry scope. The token is deliberately outside the replay
+key — two byte-identical requests share a replay slot precisely because content cannot separate
+them, so the token that separates their provider work is random, never derived — and the recorded
+value means *issued*, not *sent*. Three limits are the contract, not gaps: carriage is
+retry-scoped and **not exactly-once** — the reference gateway logs and echoes the header
+(`Idempotency-Key`, on every response including errors) but does not dedupe on it, and does not
+relay it upstream: instead it *issues its own* for the upstream hop it drives, because that hop
+has a retry loop of its own and relaying would stitch two retry scopes into one and misdescribe
+both. `ModelCallRunner` is not the only issuer for that reason, and both read the same
+`new_idempotency_key`; a
+**resumed run reissues** — a call never spans a park, so recovery re-runs the step and the rerun
+is a new call with a new key; and only the **gateway transport presents it** — the OpenAI adapter
+does not read the field, so nothing is sent there. A receipt whose key is empty was never keyed:
+the call was refused before the keying block, or the record predates the field.
+
+A key must be a bounded ASCII token — 1–128 characters from `[A-Za-z0-9._+-]`, starting with a
+letter or digit — and that rule is enforced at every edge the value crosses, not only where it is
+minted. The `model-calls.v1` schema states the same rule as a pattern (empty admitted, the
+`^(|...)` idiom `prompt_digest` uses), because `monoid validate` certifies imported and
+third-party run directories and a line whose key the rest of the kernel would refuse must not be
+certified. Both enforcers derive from one body in `core/model_io.py`: `core` cannot import
+`providers`, so a rule owned on the provider side could only have been copied, and a retyped twin
+regex drifts. It is the one field on this record that reaches a **transport header** rather than a JSON
+string: JSON escapes a control character and an HTTP header does not, and neither `http.client`
+nor `httpx` refuses an obsolete folded value (`"a\r\n b"`). So request ingress *refuses* a
+non-conforming caller-supplied key, the gateway transport *omits* one (an adapter must not lose a
+paid call over a bookkeeping token), and the reference gateway treats a non-conforming inbound key
+as absent — logging that one was dropped, never its bytes, because that route logs before the
+service authenticates. Absence on this field is spelled by the **empty string and nothing else**:
+a caller who supplies `None`, `False` or `0` supplied a value, and ingress refuses it rather than
+reading it as "no key" and letting the transport drop it silently.
+
+**Every `pattern` in every artifact schema ends at end of *input*, not at `$`.** JSON Schema calls
+`pattern` an ECMA-262 expression; `jsonschema` runs it through Python's `re`, where `$` also
+matches immediately before a single trailing newline. Under that engine a bare `^…$` certified
+`"<digest>\n"`, `"<timestamp>\n"` and `"<key>\n"` — values every other edge in the kernel refuses —
+so `monoid validate` would have passed a line no writer here could produce. The schemas assert
+`END_OF_INPUT` (`core/_json_schema.py`) instead: `$` followed by "and no character may follow",
+which is load-bearing under `re` and redundant under ECMA-262, so the same value is refused by a
+Python validator and a JavaScript one alike. `\Z` would have been the Python spelling and is an
+identity escape in ECMA-262 — a published schema ending in `\Z` demands a literal `Z`.
+
 #### Generation parameters, reasoning, output schema, and the applied echoes
 
 `ModelConfig.generation: GenerationConfig` carries per-call sampling controls — `temperature`
