@@ -519,8 +519,23 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "latency_ms",
         ),
+        (
+            # The same claim on a line with no `backoff_ms` anywhere: a W7-1 writer's shape,
+            # where the dispatches alone already outlast the call. Absent waits count as zero
+            # rather than as unknown, so the check still reaches a legacy line -- what it cannot
+            # do is accuse one of a wait it never recorded.
+            {
+                "latency_ms": 7,
+                "attempts": 2,
+                "attempt_log": [
+                    {**_ATTEMPT, "index": 1, "elapsed_ms": 5, "usage": {"input_tokens": 12}},
+                    {**_ATTEMPT, "index": 2, "elapsed_ms": 9, "usage": {"output_tokens": 3}},
+                ],
+            },
+            "latency_ms",
+        ),
     ],
-    ids=["indices", "usage", "timeline"],
+    ids=["indices", "usage", "timeline", "timeline_legacy"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
