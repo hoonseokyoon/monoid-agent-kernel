@@ -6591,6 +6591,12 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # even when it is marked retryable -- re-sending cannot help a call whose config
             # must change first.
             "model_call.py",
+            # Joined in W7-2: the synthesized per-attempt child span carries the entry's whole
+            # failure taxonomy (`monoid.model.attempt.config_recoverable`) -- the parent chat
+            # span already carried retryable/http_status, and an attempt child naming only
+            # half the taxonomy would tell a trace reader "waiting may help" without "a config
+            # change will".
+            "observability/otel.py",
             "providers/gateway.py",
             "providers/openai.py",
             # Joined in W6-4b: a replay miss is the client-side park shape by construction --
