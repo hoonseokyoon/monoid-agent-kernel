@@ -639,7 +639,9 @@ def new_idempotency_key() -> str:
     replay slot by design -- content cannot separate them -- so the token that separates their
     provider work must be content-independent. Prefixed the way the kernel's other minted ids
     are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
-    Conforms to :data:`IDEMPOTENCY_KEY_PATTERN` by construction, which is pinned by test.
+    Conforms by construction to :data:`~monoid_agent_kernel.core.model_io.IDEMPOTENCY_KEY_PATTERN`
+    -- the rule itself lives beside the receipt field it describes, because its two enforcers sit
+    on opposite sides of a one-way import boundary. Pinned by test rather than trusted.
     """
 
     return f"idem_{uuid.uuid4().hex}"
