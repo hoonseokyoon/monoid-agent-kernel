@@ -467,7 +467,14 @@ schema alike, because no writer omits by writing null. Entries carry no wall-clo
 receipt's own rule; the ledger line's `recorded_at` anchors the call. Every entry duration is
 the floor of the same monotonic clock, and floors sum to at most the floor of the sum, so
 `sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` holds exactly; the remainder is the keying and
-settle overhead that falls outside the dispatch loop.
+settle overhead that falls outside the dispatch loop. `monoid validate` enforces that inequality
+on the ledger line, where breaking it means a record no runner wrote. The constructor cannot: the
+runner attaches the log while `latency_ms` is still the field's default and `_publish` stamps the
+measured duration afterwards, so the line is the first place both values are settled together —
+a receipt check would fire on every retried call, weighing real durations against a latency of
+zero. A consumer that lays the entries on a timeline bounds its own arithmetic by the same
+inequality rather than assuming it: the OTel preset's per-attempt children never begin before the
+call they belong to, whatever a hand-built or corrupted receipt claims.
 
 `ModelCallReceipt.idempotency_key` is the retry-scope token the call presented (W7-3). The runner
 mints one per call (`idem_` + hex) in the same block that computes the digests — before the first

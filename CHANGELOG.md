@@ -22,6 +22,13 @@ out in commit messages and here.
   GenAI-aware backend aggregating usage or operations over spans would double-count the
   parent; no capture content, whatever the policy — the attempt log is metadata by
   construction. SpanKind INTERNAL, so service maps keep counting one egress per call.
+- **The timeline is bounded at both ends of its own claim.** `monoid validate` now reports a
+  ledger line whose dispatches and recorded waits outlast the `latency_ms` of the call that
+  made them — the third cross-entry claim on that line, after the indices and the usage sum,
+  and the first surface where both values are settled together (the runner attaches the log
+  before `_publish` stamps the duration, so the receipt constructor cannot ask). The OTel
+  children bound their own walk by the same inequality instead of trusting it, so a hand-built
+  or corrupted receipt can no longer place a child before the call that dispatched it.
 - **Placement is the recorded timeline, walked backward from settle**: each child spans its
   measured `elapsed_ms` preceded by its `backoff_ms` gap (that field lands in the entry one
   section below); entries parsed from lines that predate the field pack edge to edge —

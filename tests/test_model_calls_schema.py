@@ -502,25 +502,50 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "sum",
         ),
+        (
+            {
+                "latency_ms": 7,
+                "attempts": 2,
+                "attempt_log": [
+                    {**_ATTEMPT, "index": 1, "elapsed_ms": 5, "usage": {"input_tokens": 12}},
+                    {
+                        **_ATTEMPT,
+                        "index": 2,
+                        "elapsed_ms": 3,
+                        "backoff_ms": 40,
+                        "usage": {"output_tokens": 3},
+                    },
+                ],
+            },
+            "latency_ms",
+        ),
     ],
-    ids=["indices", "usage"],
+    ids=["indices", "usage", "timeline"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The two cross-entry invariants the record refuses, refused on the sweep as well.
+    """The three cross-entry invariants, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
-    another, so `attempts: 2` under indices `[1, 1]`, and entries billing 3 beside a receipt
-    billing 15, are both structurally perfect lines. ``ModelCallReceipt`` refuses exactly these
-    at construction -- but nothing constructs a receipt on the way through ``monoid validate``,
-    which reads the ledger as JSON. A directory the record could not have produced was reported
-    clean, which is the one answer a validator must never give.
+    another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
+    15, and dispatches that outlast the call that made them are all structurally perfect lines.
+    Nothing constructs a receipt on the way through ``monoid validate``, which reads the ledger
+    as JSON, so a directory the record could not have produced was reported clean -- the one
+    answer a validator must never give.
+
+    The first two the record also refuses at construction. The third is this surface's alone, and
+    deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
+    ``_publish`` stamps the measured duration afterwards on every exit (``model_call.py`` builds
+    the log at the failure and answering exits, then times the receipt inside ``_publish``). A
+    constructor check would therefore fire on every retried call, comparing real dispatch
+    durations against a latency of zero. The ledger line is the first place both facts are
+    settled and present, which makes it the first place the claim can be checked at all.
 
     Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
     cross-record claims -- manifest against workspace index, proposal against its hashes,
     settled text against its digests, payloads against their keys. The ledger had none because
-    until this field it made no claim spanning two values; now it makes two.
+    until this field it made no claim spanning two values; now it makes three.
     """
 
     (tmp_path / MODEL_CALLS_FILENAME).write_text(
@@ -547,11 +572,15 @@ def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path
     """
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
+    # Entry 1 predates `backoff_ms` and omits the key; entry 2 records a 30ms wait. Their
+    # dispatches and that wait total 38ms under the record's 42ms, which is the shape the
+    # runner's own clock guarantees -- and an absent wait must not be read as anything but
+    # a wait this line cannot report.
     line = _record(
         attempts=2,
         attempt_log=(
-            ModelCallAttempt(index=1, usage={"input_tokens": 12}),
-            ModelCallAttempt(index=2, usage={"output_tokens": 3}),
+            ModelCallAttempt(index=1, elapsed_ms=5, usage={"input_tokens": 12}),
+            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=30, usage={"output_tokens": 3}),
         ),
     )
     (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")

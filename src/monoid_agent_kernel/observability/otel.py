@@ -465,20 +465,31 @@ class OtelEventSink:
         instant the standalone span pins as its end — so each entry spans its ``elapsed_ms``
         preceded by its recorded ``backoff_ms`` gap. An entry parsed from a line that predates
         the field (``backoff_ms is None``) packs edge to edge instead: durations and order stay
-        exact, the unknown gaps collapse. Wall-clock skew against the monotonic durations is
-        the standalone span's stated limitation, unchanged here. The failed-dispatch error rule
-        is the parent's, held per entry: ``model_call_aborted`` is an interruption, not an
-        error.
+        exact, the unknown gaps collapse. The walk is bounded below by the call's own start, so
+        a child never precedes the call that dispatched it. Wall-clock skew against the
+        monotonic durations is the standalone span's stated limitation, unchanged here. The
+        failed-dispatch error rule is the parent's, held per entry: ``model_call_aborted`` is an
+        interruption, not an error.
         """
 
         log = getattr(receipt, "attempt_log", ()) or ()
         if len(log) < 2 or not parent_span.is_recording():
             return
+        # The floor the walk may not cross: where the call itself began. On the kernel's clock
+        # the entries always fit inside it -- every dispatch and every wait is a disjoint
+        # sub-interval of the same window ``latency_ms`` measures -- but this sink renders
+        # receipts it did not build, and one that was hand-made or read back from a corrupted
+        # ledger would otherwise chain children back past the start of the call. In the
+        # standalone mode that is past the start of their own parent, since the parent begins
+        # at exactly this instant. Clamped rather than refused: the entries' taxonomy and
+        # billing still read, and ``monoid validate`` is the surface that calls such a record
+        # corrupt rather than quietly drawing it.
+        floor_ns = max(0, anchor_ns - getattr(receipt, "latency_ms", 0) * 1_000_000)
         context = self._trace.set_span_in_context(parent_span)
         cursor = anchor_ns
         for entry in reversed(log):
             end_time = cursor
-            start_time = max(0, end_time - entry.elapsed_ms * 1_000_000)
+            start_time = max(floor_ns, end_time - entry.elapsed_ms * 1_000_000)
             attrs: dict[str, Any] = {
                 "monoid.model.attempt.index": entry.index,
                 "monoid.model.attempt.elapsed_ms": entry.elapsed_ms,
@@ -506,7 +517,7 @@ class OtelEventSink:
                 span.set_attribute("error.type", entry.provider_error_code or entry.error_code)
                 span.set_status(self._Status(self._StatusCode.ERROR))
             self._end_span(span, end_time=end_time)
-            cursor = max(0, start_time - (entry.backoff_ms or 0) * 1_000_000)
+            cursor = max(floor_ns, start_time - (entry.backoff_ms or 0) * 1_000_000)
 
     def _end_model_span(
         self, event_id: str, *, error: bool = False, error_type: str = "error"

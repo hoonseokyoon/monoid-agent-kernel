@@ -971,6 +971,56 @@ def test_otel_legacy_backoff_packs_children_edge_to_edge() -> None:
     assert "monoid.model.attempt.backoff_ms" not in second.attributes
 
 
+@pytest.mark.parametrize("span_mode", ["agent", "model_call"])
+def test_otel_attempt_children_never_start_before_the_call_did(span_mode: str) -> None:
+    """A receipt the kernel could not have produced still has to render as a well-formed tree.
+
+    On the kernel's clock the entries always fit: every dispatch and every wait is a disjoint
+    sub-interval of the same window `latency_ms` measures, so their floors sum to at most its
+    floor. But the sink renders receipts it did not build -- hand-built ones, and lines read
+    back from a corrupted ledger -- and for those the backward walk would place the earliest
+    children before the call began. In `model_call` mode that is literally before the parent
+    span starts, because that parent starts at exactly this floor. Clamped rather than refused:
+    the entries' taxonomy and billing are still worth reading, and `monoid validate` is the
+    surface that calls such a record corrupt.
+    """
+
+    receipt = ModelCallReceipt(
+        context=InvocationContext(run_id="run-attempts", step_id="turn_0001"),
+        model=ModelConfig(model="retry-model"),
+        stop_reason="stop",
+        usage={"output_tokens": 7},
+        # The call claims 4ms while its entries claim 8ms of dispatch and 70ms of waiting.
+        latency_ms=4,
+        attempts=2,
+        attempt_log=(
+            ModelCallAttempt(
+                index=1, elapsed_ms=5, backoff_ms=30, error_code="model_error", retryable=True
+            ),
+            ModelCallAttempt(index=2, elapsed_ms=3, backoff_ms=40, usage={"output_tokens": 7}),
+        ),
+    )
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset(span_mode, provider)
+    _deliver(preset, receipt, span_mode)
+    preset.close()
+
+    spans = exporter.get_finished_spans()
+    chat = next(span for span in spans if span.name.startswith("chat"))
+    children = _attempt_children(spans)
+    assert [child.name for child in children] == ["model.attempt 1", "model.attempt 2"]
+    # The rule, in both wirings: the children occupy no more than the call the receipt describes.
+    # Unclamped, this walk reaches 78ms back from the anchor for a call that claims 4.
+    assert children[-1].end_time - children[0].start_time <= receipt.latency_ms * 1_000_000
+    assert all(child.end_time <= chat.end_time for child in children)
+    if span_mode == "model_call":
+        # The corollary, and only where the parent is receipt-derived too: that parent begins at
+        # exactly this floor, so the rule becomes containment. An `agent`-mode chat span starts
+        # from `model.turn.started` instead -- an instant this sink cannot read back off the
+        # span, and one a real run opens before the call it is about.
+        assert all(child.start_time >= chat.start_time for child in children)
+
+
 def test_otel_full_capture_children_stay_content_free() -> None:
     """Content is the parent's opt-in; the children are metadata by construction, whatever the
     policy says."""
