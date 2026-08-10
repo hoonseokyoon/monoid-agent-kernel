@@ -2653,7 +2653,9 @@ retried as a connection error. The model adapter's retry is policy-driven by
 ### The retry layer (`ModelRetryConfig.layer`)
 
 `layer` names the single owner of the retry loop for a model call, so two loops cannot
-multiply attempts. The default, `"adapter"`, is the behavior above: the adapter's own loop
+multiply attempts — a guarantee whose reach the compliance paragraph below states: one
+process, and an adapter that honors either the neutralized config or the layer value itself.
+The default, `"adapter"`, is the behavior above: the adapter's own loop
 retries and the kernel makes exactly one adapter call. Under `"kernel"` the
 `ModelCallRunner` owns the loop: it re-dispatches the already-keyed request on a retryable,
 non-config-recoverable `ModelAdapterError` — the taxonomy, not `retry_on`, which stays the

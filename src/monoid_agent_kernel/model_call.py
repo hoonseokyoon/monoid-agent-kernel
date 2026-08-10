@@ -23,8 +23,10 @@ cycle). The names are re-imported here for this module's own callers and their t
 classification live inside the adapters (`providers/gateway.py`), and `ModelRetryConfig.layer`
 names which loop owns a call. Under the default `"adapter"` layer the kernel makes exactly one
 adapter call per turn; under `"kernel"` the attempt loop in this module re-dispatches, with the
-adapter's copy of the config neutralized to a single attempt so the two loops can never
-multiply. That is the distinction `ModelCallReceipt.attempts` (kernel dispatches) and
+adapter's copy of the config neutralized to a single attempt so a config-honoring loop cannot
+multiply against it. (A loop that reads neither the config nor the layer is out of the kernel's
+reach — its retries surface as `provider_retried` evidence, never as attempts; CONTRACTS states
+both sides of that compliance.) That is the distinction `ModelCallReceipt.attempts` (kernel dispatches) and
 `provider_retried` (a loop below the adapter boundary reported) encode — and classification is
 inherited from the adapters either way: this module reads what the escaping exception carries,
 it never invents its own taxonomy. (This paragraph said "the kernel makes exactly one adapter
