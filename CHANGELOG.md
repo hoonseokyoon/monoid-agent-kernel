@@ -7,6 +7,27 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
+
+- **`OtelEventSink` synthesizes one `model.attempt {index}` child span per kernel dispatch**
+  under the call's `chat` span, at settle, from `receipt.attempt_log` — in both `span_mode`s,
+  through the model-I/O facet. No public event changes: the event stream still carries no
+  attempt data, so the children appear only where the subscription facet is registered. Only
+  when the kernel dispatched more than once — a single-attempt call's chat span IS that
+  attempt, and a child would restate it at double the span volume of every subscribed call.
+- **Children are `monoid.model.attempt.*` and never `gen_ai.*`.** Index, `elapsed_ms`,
+  `backoff_ms`, the failure taxonomy, per-attempt usage (JSON string), `provider_retried`,
+  `stream_committed`; a failed dispatch gets `error.type` + ERROR status under the parent's
+  rule (`model_call_aborted` stays an interruption). No GenAI attributes, because a
+  GenAI-aware backend aggregating usage or operations over spans would double-count the
+  parent; no capture content, whatever the policy — the attempt log is metadata by
+  construction. SpanKind INTERNAL, so service maps keep counting one egress per call.
+- **Placement is the recorded timeline, walked backward from settle**: each child spans its
+  measured `elapsed_ms` preceded by its `backoff_ms` gap (that field lands in the entry one
+  section below); entries parsed from lines that predate the field pack edge to edge —
+  durations and order exact, unknown gaps collapsed. Duplicate `on_model_call` deliveries do
+  not duplicate children; a receipt with no matching open chat span synthesizes no orphans.
+
 ### Added — the wait between dispatches, on the record: `attempt_log[].backoff_ms`
 
 - **Each attempt entry records the measured backoff that preceded its dispatch.**
