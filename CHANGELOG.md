@@ -7,6 +7,27 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the wait between dispatches, on the record: `attempt_log[].backoff_ms`
+
+- **Each attempt entry records the measured backoff that preceded its dispatch.**
+  `ModelCallAttempt.backoff_ms` — 0 on the first entry, the floored monotonic measurement of
+  the sleep that actually ran otherwise, `None` on entries parsed from lines written before
+  the field existed. Measured around the wait rather than copied from the schedule, so a
+  capped sleep records what happened. The entry's timeline algebra closes with it: every
+  duration is the floor of the same monotonic clock, and floors sum to at most the floor of
+  the sum, so `sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` holds exactly — the remainder
+  is keying and settle overhead. Landed ahead of the per-attempt OTel spans (W7-2) so they
+  can sit on the real timeline instead of being packed edge to edge.
+- **The first key added to the entry after the entry shipped, and the wire rule now names
+  that boundary.** The entry stays read-whole-or-refused for the keys it was born with;
+  `backoff_ms` follows the record-level absence rule instead (`_ATTEMPT_OPTIONAL_WIRE_KEYS`,
+  a named policy with its reason beside it): absent = a W7-1 writer's line, still valid to
+  `monoid validate`; null = refused by reader and schema alike, since no writer omits by
+  writing null; `to_json` and the `model-calls.v1` projection omit the key when the value is
+  unknown, so a legacy line round-trips unchanged instead of refusing itself on the next
+  read. Same unreleased-window reasoning as `attempt_log` and `idempotency_key` — no released
+  reader, `monoid.model-calls.v1` identifier unchanged (COMPATIBILITY.md).
+
 ### Added — one retry scope per call, carried where the call is keyed: `idempotency_key`
 
 - **Every model call is keyed with a retry-scope token.** `ModelCallRunner` mints

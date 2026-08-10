@@ -456,11 +456,18 @@ they itemize leaves a reader with two numbers and no way to tell which to believ
 refused at construction, which is also why the runner builds the log and the merged total in a
 single `replace` — and refused again by `monoid validate`, which reads the ledger as JSON and
 constructs no receipt, so a JSON Schema that can only judge one entry at a time would have
-reported such a line clean. The log is optional; an *entry* is not: it has no writer predating
-it, so all ten of its keys are required on the wire and a partial one is refused rather than
-completed from defaults — defaults there turn a corrupt line into a plausible dispatch. Entries
-carry no wall-clock instant — the receipt's own rule; the ledger line's `recorded_at` anchors the
-call — and backoff waits fall between entries, so entry times sum to less than `latency_ms`.
+reported such a line clean. The log is optional; an *entry*'s original keys are not: they have
+no writer predating them, so every key the entry shipped with is required on the wire and a
+partial one is refused rather than completed from defaults — defaults there turn a corrupt line
+into a plausible dispatch. A key added after the entry shipped follows the record-level absence
+rule instead, named per key: `backoff_ms` (W7-2) is the measured wait the kernel imposed before
+that dispatch — 0 on the first entry, absent on lines a W7-1 writer filled, where absence means
+exactly what the whole log's absence means one level up, and refused when null, by reader and
+schema alike, because no writer omits by writing null. Entries carry no wall-clock instant — the
+receipt's own rule; the ledger line's `recorded_at` anchors the call. Every entry duration is
+the floor of the same monotonic clock, and floors sum to at most the floor of the sum, so
+`sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` holds exactly; the remainder is the keying and
+settle overhead that falls outside the dispatch loop.
 
 `ModelCallReceipt.idempotency_key` is the retry-scope token the call presented (W7-3). The runner
 mints one per call (`idem_` + hex) in the same block that computes the digests — before the first

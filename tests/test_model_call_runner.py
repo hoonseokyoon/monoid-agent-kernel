@@ -4080,6 +4080,111 @@ def test_the_attempt_log_names_every_dispatch_and_sums_to_the_receipt() -> None:
     assert summed == dict(receipt.usage)
 
 
+def test_the_backoff_wait_lands_on_the_entry_it_delayed(monkeypatch: Any) -> None:
+    """`backoff_ms` is the wait BEFORE that entry's dispatch: 0 on the first entry, and the
+    sleep an absorbed failure earned lands on the entry it delayed, not the one that caused it.
+
+    Measured around the wait rather than copied from the schedule, so a capped or interrupted
+    sleep records what happened rather than what was asked for. The lower bound is generous on
+    purpose -- the pin is "a real wait was recorded on the right entry", not a timer-precision
+    claim.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    observer = _acall(_FlakyAdapter(failures=1), request)
+
+    receipt = observer.captures[0].receipt
+    first, second = receipt.attempt_log
+    assert first.backoff_ms == 0
+    assert second.backoff_ms is not None
+    assert second.backoff_ms >= 25
+
+
+def test_a_zero_schedule_records_a_zero_wait_not_an_absent_one() -> None:
+    """0 and None are different answers on this field: the runner always knows the wait it
+    imposed, so a zero-schedule run records 0 -- absence stays reserved for entries parsed
+    from lines written before the field existed."""
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    observer = _acall(_FlakyAdapter(failures=1), request)
+
+    receipt = observer.captures[0].receipt
+    assert [entry.backoff_ms for entry in receipt.attempt_log] == [0, 0]
+
+
+def test_an_exhausted_calls_waits_are_logged_and_fit_inside_its_latency(monkeypatch: Any) -> None:
+    """The failure exit threads the wait too, and the timeline algebra closes: dispatch times
+    plus recorded waits never exceed the whole call's `latency_ms` -- the remainder is keying
+    and settle overhead. Every duration is floored from the same monotonic clock, and floors
+    sum to at most the floor of the sum, so the inequality is exact rather than statistical.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=_FlakyAdapter(failures=99),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    waits = [entry.backoff_ms for entry in receipt.attempt_log]
+    assert waits[0] == 0
+    assert all(wait is not None and wait >= 25 for wait in waits[1:])
+    assert (
+        sum(entry.elapsed_ms for entry in receipt.attempt_log)
+        + sum(wait or 0 for wait in waits)
+        <= receipt.latency_ms
+    )
+
+
+def test_a_refused_turns_entry_carries_the_wait_that_preceded_it(monkeypatch: Any) -> None:
+    """The third construction site holds the rule the other two hold: the terminal entry for a
+    turn the normalizer refuses is built outside the dispatch loop, and it still names the
+    backoff that delayed its dispatch."""
+
+    class _FailsThenRefuses:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls = getattr(self, "calls", 0) + 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=_FailsThenRefuses(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    first, second = receipt.attempt_log
+    assert first.backoff_ms == 0
+    assert second.backoff_ms is not None
+    assert second.backoff_ms >= 25
+
+
 def test_a_single_dispatch_call_logs_one_entry_and_a_refused_call_logs_none() -> None:
     """The log is not a kernel-layer exclusive: every settled call names its dispatches.
 

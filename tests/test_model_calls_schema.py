@@ -365,7 +365,12 @@ def test_a_malformed_record_is_refused_by_the_schema(mutation: dict[str, object]
 def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     """The record carries the receipt's per-dispatch log; a line written before the field
     existed carries no key and stays valid -- the sweep validator reads directories that
-    v0.20 writers filled, and a required key there would fail every one of them."""
+    v0.20 writers filled, and a required key there would fail every one of them.
+
+    The same rule holds one level down since W7-2: an entry written before ``backoff_ms``
+    existed carries ten keys and stays valid, because requiring the eleventh would fail every
+    ledger the W7-1 writer filled -- while a writer that knows its wait records it and the
+    schema admits it (``additionalProperties: false`` would refuse an undeclared key)."""
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
     entry = ModelCallAttempt(
@@ -373,11 +378,16 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
         elapsed_ms=42,
         usage={"input_tokens": 12, "output_tokens": 3},
         stream_committed=True,
+        backoff_ms=7,
     )
     record = _record(attempt_log=(entry,))
 
     assert record["attempt_log"] == [entry.to_json()]
+    assert record["attempt_log"][0]["backoff_ms"] == 7
     assert _errors(record) == []
+
+    ten_key_entry = {name: value for name, value in entry.to_json().items() if name != "backoff_ms"}
+    assert _errors({**_record(), "attempts": 1, "attempt_log": [ten_key_entry]}) == []
 
     legacy = _record()
     del legacy["attempt_log"]
@@ -432,6 +442,9 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
                 "unexpected": True,
             }
         ],
+        [{**_ATTEMPT, "backoff_ms": -1}],
+        [{**_ATTEMPT, "backoff_ms": None}],
+        [{**_ATTEMPT, "backoff_ms": "3"}],
     ],
 )
 def test_a_malformed_attempt_log_is_refused_by_the_schema(attempt_log: object) -> None:
@@ -612,11 +625,13 @@ _PROJECTION_ALLOWLIST = {
     # W7-3: recorded as issued, not as sent -- the writer docstring fixes the meaning.
     "idempotency_key",
     # the attempt-log block (W7-1): the taxonomy names above are shared with the receipt's
-    # own recorded fields; these three are the entry's alone.
+    # own recorded fields; these four are the entry's alone. `backoff_ms` joined in W7-2,
+    # deliberately -- the wait the kernel imposed before that dispatch.
     "attempt_log",
     "index",
     "elapsed_ms",
     "stream_committed",
+    "backoff_ms",
 }
 
 
@@ -656,6 +671,21 @@ def _assert_the_projection_reflects_over_nothing(source: str) -> None:
 )
 def test_the_recorded_call_projection_is_hand_listed(projection: object) -> None:
     _assert_the_projection_reflects_over_nothing(inspect.getsource(projection))  # type: ignore[arg-type]
+
+
+def test_the_projection_carries_the_wait_only_when_the_entry_knows_it() -> None:
+    """`backoff_ms` on the artifact mirrors the entry's two writer generations: a measured wait
+    is recorded, and an entry parsed from a pre-W7-2 line (None) omits the key. Emitting null
+    would manufacture a value no writer ever wrote -- the exact corrupt shape the null-refusal
+    rule exists to catch -- and emitting 0 would claim a measurement that never happened."""
+
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    measured = _recorded_attempt(ModelCallAttempt(index=1, backoff_ms=7))
+    assert measured["backoff_ms"] == 7
+
+    legacy = _recorded_attempt(ModelCallAttempt(index=1))
+    assert "backoff_ms" not in legacy
 
 
 def test_the_projection_pin_moves_on_the_edits_it_claims_to_catch() -> None:

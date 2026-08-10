@@ -1136,6 +1136,11 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
                         "additionalProperties": {"type": "integer", "minimum": 0},
                     },
                     "stream_committed": {"type": "boolean"},
+                    # W7-2: declared and not required -- an entry a W7-1 writer filled carries
+                    # ten keys and stays valid, absence meaning the line predates the field.
+                    # Integer only, never null: no writer omits by writing null, and the reader
+                    # (``ModelCallAttempt.from_json``) refuses it under the same rule.
+                    "backoff_ms": {"type": "integer", "minimum": 0},
                 },
                 "additionalProperties": False,
             },

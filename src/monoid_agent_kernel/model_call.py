@@ -606,6 +606,10 @@ class ModelCallRunner:
             # reads both for calls refused before the loop was ever entered.
             attempt_log: list[ModelCallAttempt] = []
             last_attempt_entry: ModelCallAttempt | None = None
+            # The measured wait that preceded the NEXT dispatch: 0 until a backoff actually
+            # runs, then re-measured after each one. Threaded into every entry-construction
+            # site so the wait lands on the entry it delayed, not the one that caused it.
+            pending_backoff_ms = 0
             try:
                 # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
                 # already been crossed, but by then the adapter has been invoked and the provider has
@@ -753,6 +757,7 @@ class ModelCallRunner:
                             or progress.count > reports_before,
                             usage=probe.usage,
                             stream_committed=delivered,
+                            backoff_ms=pending_backoff_ms,
                         )
                         if (
                             retry_plan is None
@@ -788,7 +793,15 @@ class ModelCallRunner:
                         # interrupted.
                         spent_usage = _merged_usage(spent_usage, probe.usage)
                         attempt_log.append(last_attempt_entry)
+                        # Measured, not copied from the schedule -- a capped sleep must record
+                        # what happened. Only when a wait was actually requested: for a zero
+                        # schedule the boundary check is not a backoff, and timing it would
+                        # stamp scheduler noise onto a wait that never ran.
+                        backoff_started = time.monotonic()
                         await self._abackoff(delay, deadline)
+                        pending_backoff_ms = (
+                            self._ms_since(backoff_started) if delay > 0 else 0
+                        )
                 turn = normalize_model_turn(turn)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
@@ -840,6 +853,7 @@ class ModelCallRunner:
                                 provider_retried=progress.count > reports_before,
                                 usage=failed.usage,
                                 stream_committed=delivered,
+                                backoff_ms=pending_backoff_ms,
                             )
                         )
                 # One ``replace`` for the same reason the answering path takes one: the entries
@@ -888,6 +902,7 @@ class ModelCallRunner:
                 provider_retried=progress.count > reports_before or _turn_reported_retry(turn),
                 usage=completed.usage,
                 stream_committed=delivered,
+                backoff_ms=pending_backoff_ms,
             )
             # One ``replace``, not two. The log and the merged bill are the same fact stated two
             # ways, and the receipt refuses a log whose entries do not sum to its usage -- so a
