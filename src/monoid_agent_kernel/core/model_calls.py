@@ -182,6 +182,12 @@ def model_call_record(
     The derived properties (``succeeded``, ``trace_id``, ``span_id``) are absent too: they are
     computed from ``error_code`` and ``traceparent``, both of which are here, and a recorded
     derivation is a value that can come to disagree with its source.
+
+    ``idempotency_key`` IS here, and its meaning is fixed the same way ``redaction_digest``'s
+    absence is: the recorded key says the call was *keyed* -- the runner issues one for every
+    call that reaches the keying block -- not that any transport presented it. Only the gateway
+    adapter puts it on the wire, so a key on a fake or replay call's line is a fact about
+    issuance, never evidence a request was sent.
     """
 
     return {
@@ -198,6 +204,7 @@ def model_call_record(
         "request_digest": receipt.request_digest,
         "digest_generation": receipt.digest_generation,
         "digest_status": receipt.digest_status,
+        "idempotency_key": receipt.idempotency_key,
         "destination_status": receipt.destination_status,
         "stop_reason": receipt.stop_reason,
         "usage": dict(receipt.usage),

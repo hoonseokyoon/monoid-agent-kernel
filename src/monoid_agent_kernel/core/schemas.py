@@ -1070,6 +1070,11 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "request_digest": {"type": "string", "pattern": "^(|[0-9a-f]{64})$"},
         "digest_generation": {"type": "string"},
         "digest_status": {"enum": list(DIGEST_STATUSES)},
+        # Declared and not required, the ``attempt_log`` rule: the writer always emits it, so
+        # absence on a line means exactly one thing -- a writer that predates the field -- and
+        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled. Empty is a
+        # valid value: a refused call was never keyed.
+        "idempotency_key": {"type": "string"},
         "destination_status": {"enum": list(DESTINATION_STATUSES)},
         "stop_reason": {"type": "string"},
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},

@@ -995,6 +995,17 @@ class ModelCallReceipt:
     # (a breakdown that disagrees with its total leaves a reader nothing to believe). Appended
     # last so positional construction predating this field keeps meaning what it meant.
     attempt_log: tuple[ModelCallAttempt, ...] = ()
+    # The retry-scope token the call was keyed with -- issued by the runner in the same block
+    # that computes the digests, once per call and before the first dispatch, so it is constant
+    # across kernel re-dispatches and adapter-internal retries and reissued on resume. Recorded
+    # as ISSUED, not as sent: only the gateway transport presents it on the wire, so a key on a
+    # fake or replay call's receipt says the call was keyed, nothing more. Deliberately outside
+    # the replay key: two identical requests share a replay slot precisely because content
+    # cannot tell them apart, and a token meant to separate their provider work must therefore
+    # be content-independent. Empty means the call never reached the keying block (refused by
+    # the cancel/deadline check or by ingress normalization) or the record predates the field.
+    # Appended after ``attempt_log`` under the same positional-stability rule it states.
+    idempotency_key: str = ""
 
     def __post_init__(self) -> None:
         # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
@@ -1190,6 +1201,7 @@ class ModelCallReceipt:
             # Always emitted, even one-entry and empty — absence means exactly one thing, a
             # writer that predates the field, rather than doubling as "nothing noteworthy".
             "attempt_log": [entry.to_json() for entry in self.attempt_log],
+            "idempotency_key": self.idempotency_key,
         }
 
     @classmethod
@@ -1267,6 +1279,9 @@ class ModelCallReceipt:
             ),
             destination_digest=parse_str(payload, "destination_digest"),
             attempt_log=attempt_log,
+            # Absent on every receipt written before the field existed, which is legal and reads
+            # as "never keyed"; present-but-mistyped is refused, like every other string here.
+            idempotency_key=parse_str(payload, "idempotency_key"),
         )
 
 

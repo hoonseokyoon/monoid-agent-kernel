@@ -226,19 +226,20 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
     Checked both ways. A schema key the writer never emits is a required field that fails every
     real record; a writer key the schema does not declare fails every record too, just later.
 
-    ``required`` is one explicit key short of ``properties``: ``validate_run_dir`` sweeps run
-    directories that v0.20 writers filled, and requiring ``attempt_log`` would fail every ledger
-    written before the field existed. The writer still always emits it -- the ``set(record)``
+    ``required`` is two explicit keys short of ``properties``: ``validate_run_dir`` sweeps run
+    directories that earlier writers filled, and requiring ``attempt_log`` would fail every ledger
+    written before that field existed, just as requiring ``idempotency_key`` would fail every
+    line a pre-W7-3 v0.21 build wrote. The writer still always emits both -- the ``set(record)``
     equality above is the writer-side pin -- so absence keeps meaning exactly one thing, a
-    pre-W7-1 writer. The optional set is pinned exactly: a future key cannot slip into it
-    without arguing with this test.
+    writer that predates the field. The optional set is pinned exactly: a future key cannot
+    slip into it without arguing with this test.
     """
     record = _record()
 
     assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
     assert set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - set(
         MODEL_CALLS_RECORD_SCHEMA["required"]
-    ) == {"attempt_log"}
+    ) == {"attempt_log", "idempotency_key"}
     assert _errors(record) == []
     assert record["schema_version"] == MODEL_CALLS_SCHEMA_VERSION
     assert record["kind"] == MODEL_CALL_KIND
@@ -262,6 +263,7 @@ def test_the_schema_advertises_one_namespace_because_the_ledger_has_only_ever_ha
         {"attempts": -1},
         {"recorded_at": "2026-08-06T00:00:00"},
         {"usage": {"input_tokens": -1}},
+        {"idempotency_key": None},
         {"unexpected": True},
     ],
 )
@@ -516,6 +518,8 @@ _PROJECTION_ALLOWLIST = {
     "config_recoverable",
     "http_status",
     "capture_downgrades",
+    # W7-3: recorded as issued, not as sent -- the writer docstring fixes the meaning.
+    "idempotency_key",
     # the attempt-log block (W7-1): the taxonomy names above are shared with the receipt's
     # own recorded fields; these three are the entry's alone.
     "attempt_log",
