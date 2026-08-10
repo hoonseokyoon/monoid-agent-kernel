@@ -32,6 +32,7 @@ import contextlib
 import inspect
 import logging
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, replace
@@ -239,6 +240,18 @@ def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
     for name, replacement in changes.items():
         object.__setattr__(cloned, name, replacement)
     return cloned
+
+
+def _new_idempotency_key() -> str:
+    """One retry-scope token, minted per call at the keying block.
+
+    Random rather than derived, and that is the contract: two byte-identical requests share a
+    replay slot by design -- content cannot separate them -- so the token that separates their
+    provider work must be content-independent. Prefixed the way the kernel's other minted ids
+    are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
+    """
+
+    return f"idem_{uuid.uuid4().hex}"
 
 
 def _normalize_invocation_context(context: InvocationContext) -> InvocationContext:
@@ -636,8 +649,20 @@ class ModelCallRunner:
                         dispatch_model if dispatch_model is not None else model,
                         retry=_copy_with_fields(model.retry, max_attempts=1),
                     )
+                # One copy for both call-scoped rewrites below. ``normalize_model_request``
+                # already returned a fresh instance, but the explicit copy keeps the rule
+                # visible: nothing past this line writes onto a value the caller holds.
+                request = copy(request)
+                # The call is KEYED here, in the same breath as its digests below: one fresh
+                # token per call, before the first dispatch, so every kernel re-dispatch (the
+                # loop reuses this request) and every adapter-internal retry (the gateway
+                # rebuilds only headers) presents the same value. The runner is the single
+                # issuer -- a caller-supplied value is overwritten, because respecting it
+                # would let one request object hand two calls the same retry scope, the
+                # collision per-call issuance exists to prevent. Issuance is uniform across
+                # adapters; presenting the token on a wire is the gateway transport's alone.
+                object.__setattr__(request, "idempotency_key", _new_idempotency_key())
                 if dispatch_model is not None:
-                    request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
                 where, destination_status = self._resolved_destination(model, adapter)
                 digest_result = _encoded_digest(
@@ -677,6 +702,7 @@ class ModelCallRunner:
                     digest_status=digest_result.status,
                     destination_status=destination_status,
                     destination_digest=destination_digest(where),
+                    idempotency_key=request.idempotency_key,
                 )
                 consumer = delta_consumer
                 delivered = False

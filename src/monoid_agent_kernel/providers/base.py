@@ -178,6 +178,14 @@ class ModelRequest:
     # without the declaration ignore it, and post-hoc validation remains the guarantee either
     # way (native delivery only reduces repairs). ``None`` = unconstrained.
     output_schema: dict[str, Any] | None = None
+    # The retry-scope token this call presents (W7-3) — a carriage channel, not an input: the
+    # runner issues one per call at its keying block and OVERWRITES whatever a caller set,
+    # because a respected caller value would let one request object hand two calls the same
+    # retry scope. Constant across kernel re-dispatches and adapter-internal retries; only the
+    # gateway transport puts it on the wire (``Idempotency-Key``), other adapters ignore it.
+    # Deliberately outside the replay key: ``_request_identity._request_payload`` enumerates
+    # what the digest covers, and this token is per-issuance, not content.
+    idempotency_key: str = ""
 
 
 def _declared_support(
