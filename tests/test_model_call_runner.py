@@ -3668,6 +3668,51 @@ def test_the_runner_is_the_single_issuer_and_overwrites_a_caller_value() -> None
     assert adapter.seen == [receipt.idempotency_key]
 
 
+def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
+    """The mint and the validator must not drift: every edge omits or refuses a key outside
+    the token shape, so a mint that ever left it would silently stop being carried."""
+
+    from monoid_agent_kernel.model_call import _new_idempotency_key
+    from monoid_agent_kernel.providers.base import is_valid_idempotency_key
+
+    for _ in range(64):
+        assert is_valid_idempotency_key(_new_idempotency_key())
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\r\nX-Injected: yes", id="bare-crlf"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="too-long"),
+        pytest.param("-leading-punctuation", id="bad-first-character"),
+        pytest.param("key with spaces", id="space"),
+        pytest.param("ké", id="non-ascii"),
+    ],
+)
+def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: str) -> None:
+    """Refused where this repo refuses a non-finite control or a malformed output_schema.
+
+    The runner mints after normalization so a run-driven call never reaches this branch; it
+    exists for the direct integrator, whose bad key would otherwise reach a transport that --
+    probed -- neither `http.client` nor `httpx` defends against when it is obs-folded.
+    """
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        normalize_model_request(
+            ModelRequest(instruction="hi", system_prompt="sys", tools=(), idempotency_key=hostile)
+        )
+
+    # Counterweight: the shape the runner mints survives ingress untouched.
+    kept = normalize_model_request(
+        ModelRequest(
+            instruction="hi", system_prompt="sys", tools=(), idempotency_key="idem_abc123"
+        )
+    )
+    assert kept.idempotency_key == "idem_abc123"
+
+
 def test_a_call_refused_before_keying_records_no_key() -> None:
     """The keying block sits past the cancel/deadline check, so a refused call was never keyed:
     ``""`` beside ``attempts == 0``, the receipt's own two-armed audit shape."""

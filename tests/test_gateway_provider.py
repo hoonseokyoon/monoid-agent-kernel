@@ -714,6 +714,33 @@ def test_gateway_sends_no_key_header_for_an_unkeyed_request(monkeypatch) -> None
     assert "Idempotency-Key" not in adapter._headers()
 
 
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="too-long"),
+    ],
+)
+def test_gateway_omits_a_key_that_would_split_the_outbound_header(hostile: str) -> None:
+    """The last point before a header exists, and the stacks below it do not defend it.
+
+    Probed: `http.client._is_illegal_header_value` refuses a bare CRLF but NOT an obsolete
+    folded one, and `httpx.Headers` accepts the folded value too -- so an unvalidated key on a
+    directly-built request (the runner's own always conforms) reaches the wire and splits the
+    request header. Omitted rather than raised: an adapter must not lose a paid call over a
+    bookkeeping token.
+    """
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"), token="run-token"
+    )
+
+    assert "Idempotency-Key" not in adapter._headers(idempotency_key=hostile)
+    # Counterweight: the conforming shape is still presented, so this is a filter and not a
+    # switch that turned the feature off.
+    assert adapter._headers(idempotency_key="idem_abc123")["Idempotency-Key"] == "idem_abc123"
+
+
 def test_gateway_retries_transient_connection_error_then_succeeds(monkeypatch) -> None:
     # A bare connection-level error (here ConnectionResetError, an OSError that is neither
     # URLError nor TimeoutError) is transient and must be retried, not surfaced as a failed run.

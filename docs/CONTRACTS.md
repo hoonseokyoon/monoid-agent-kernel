@@ -479,6 +479,16 @@ is a new call with a new key; and only the **gateway transport presents it** —
 does not read the field, so nothing is sent there. A receipt whose key is empty was never keyed:
 the call was refused before the keying block, or the record predates the field.
 
+A key must be a bounded ASCII token — 1–128 characters from `[A-Za-z0-9._+-]`, starting with a
+letter or digit — and that rule is enforced at every edge the value crosses, not only where it is
+minted. It is the one field on this record that reaches a **transport header** rather than a JSON
+string: JSON escapes a control character and an HTTP header does not, and neither `http.client`
+nor `httpx` refuses an obsolete folded value (`"a\r\n b"`). So request ingress *refuses* a
+non-conforming caller-supplied key, the gateway transport *omits* one (an adapter must not lose a
+paid call over a bookkeeping token), and the reference gateway treats a non-conforming inbound key
+as absent — logging that one was dropped, never its bytes, because that route logs before the
+service authenticates.
+
 #### Generation parameters, reasoning, output schema, and the applied echoes
 
 `ModelConfig.generation: GenerationConfig` carries per-call sampling controls — `temperature`

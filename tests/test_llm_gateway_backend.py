@@ -2024,3 +2024,78 @@ def test_llm_gateway_echoes_the_idempotency_key_on_both_response_routes(caplog) 
             _post("/internal/llm/turns", key="idem_echo_err", bearer="not-a-token")
         assert exc_info.value.code == 401
         assert exc_info.value.headers.get("Idempotency-Key") == "idem_echo_err"
+
+
+@pytest.mark.parametrize(
+    "raw_key",
+    [
+        pytest.param(b"legitimate\r\n forged-log-entry", id="obs-fold"),
+        pytest.param(b"ok\r\n X-Injected: yes", id="header-split"),
+        pytest.param(b"A" * 60000, id="unbounded"),
+    ],
+)
+def test_llm_gateway_refuses_to_log_or_echo_an_unspellable_key(caplog, raw_key: bytes) -> None:
+    """The key is attacker-chosen and both of its sinks are raw text, not JSON.
+
+    ``BaseHTTPRequestHandler`` hands back an obsolete folded value with its CRLF intact --
+    urllib will not send one, so this speaks raw sockets, which is the threat model -- and
+    ``send_header`` writes whatever it is given. The log line fires before the service
+    authenticates, so without validation a client holding no token at all forged log lines
+    and split the response header of its own 401. Malformed reads as absent: the fact is
+    logged, never the bytes.
+    """
+    import logging
+    import socket
+
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: FakeModelAdapter(
+            turns=[ModelTurn(response_id="provider_1", final_text="done")]
+        ),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    body = json.dumps(_payload()).encode("utf-8")
+    crlf = b"\r\n"
+
+    def _speak(port: int, path: bytes, *, bearer: bytes | None) -> bytes:
+        request = b"POST " + path + b" HTTP/1.1" + crlf + b"Host: 127.0.0.1" + crlf
+        request += b"Content-Type: application/json" + crlf
+        if bearer is not None:
+            request += b"Authorization: Bearer " + bearer + crlf
+        request += b"Idempotency-Key: " + raw_key + crlf
+        request += b"Content-Length: " + str(len(body)).encode() + crlf + crlf + body
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(request)
+            chunks: list[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                if sum(len(chunk) for chunk in chunks) > 400000:
+                    break
+        return b"".join(chunks)
+
+    with serving(server) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        token = _llm_token(manager).encode()
+        with caplog.at_level(logging.INFO, logger="monoid_agent_kernel.llm_gateway.http"):
+            unauthenticated = _speak(port, b"/internal/llm/turns", bearer=None)
+            authenticated = _speak(port, b"/internal/llm/turns", bearer=token)
+            streamed = _speak(port, b"/internal/llm/turns/stream", bearer=token)
+
+    for response in (unauthenticated, authenticated, streamed):
+        head = response.split(crlf + crlf, 1)[0]
+        assert b"Idempotency-Key" not in head
+        assert b"X-Injected" not in head
+    assert b"401" in unauthenticated.split(crlf, 1)[0]
+    assert b"200" in authenticated.split(crlf, 1)[0]
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dropped a malformed idempotency-key" in message for message in messages)
+    assert not any(
+        "forged-log-entry" in message or "X-Injected" in message for message in messages
+    )
+    # Bounded: no log line this request produced can be sized by the client.
+    assert max(len(message) for message in messages) < 512

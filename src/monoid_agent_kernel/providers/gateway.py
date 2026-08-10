@@ -45,6 +45,7 @@ from monoid_agent_kernel.providers.base import (
     ToolCall,
     ToolCallDelta,
     TurnComplete,
+    is_valid_idempotency_key,
     mark_provider_retried,
     mark_provider_usage,
     report_provider_retried,
@@ -721,7 +722,14 @@ class GatewayModelAdapter:
         # refresh mid-call), which is why the key arrives as an argument read off the request
         # being dispatched instead of being minted here -- minted here, every attempt would
         # open its own retry scope, the exact opposite of what the token is for.
-        if idempotency_key:
+        #
+        # Validated at the edge as well as at ingress, because this is the LAST point before a
+        # header exists and the two HTTP stacks under it do not defend it: probed, neither
+        # ``http.client`` nor ``httpx`` refuses an obsolete folded value, so an unvalidated key
+        # on a directly-built request (the runner's own key always conforms) would split the
+        # outbound request header. Omitted rather than raised -- an adapter must not lose a paid
+        # call over a bookkeeping token, the rule ``_resolved_destination`` already follows.
+        if is_valid_idempotency_key(idempotency_key):
             headers["Idempotency-Key"] = idempotency_key
         token = self._resolve_gateway_token()
         if token:

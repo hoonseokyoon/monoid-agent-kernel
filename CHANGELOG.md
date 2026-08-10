@@ -34,6 +34,15 @@ out in commit messages and here.
   produce — JSON, SSE, and error responses alike — and deliberately does **not** dedupe on
   it (retry-scoped carriage is not exactly-once) nor relay it upstream (each hop issues its
   own key for its own retry scope). The OpenAI adapter does not read the field.
+- **A key is a bounded ASCII token, enforced at every edge it crosses.** 1–128 characters
+  from `[A-Za-z0-9._+-]` starting with a letter or digit. This is the only field on the
+  receipt that reaches a transport header rather than a JSON string — JSON escapes a control
+  character, an HTTP header does not, and neither `http.client` nor `httpx` refuses an
+  obsolete folded value — so request ingress refuses a non-conforming caller-supplied key,
+  the gateway transport omits one rather than raising (an adapter must not lose a paid call
+  over a bookkeeping token), and the reference gateway reads a non-conforming inbound key as
+  absent, logging that one was dropped and never its bytes, because that route logs before
+  the service authenticates.
 
 ### Added — every dispatch on the record, and the record in the totals: `attempt_log`
 

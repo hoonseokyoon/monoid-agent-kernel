@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from copy import copy
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
@@ -624,6 +625,28 @@ def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+# The one rule for what may be spelled as an idempotency key, in the shape this repo already
+# uses for a bounded ASCII token (``conformance/provenance.py:_SAFE_TOKEN_RE``). It exists
+# because this field is the only one that reaches a TRANSPORT HEADER rather than a JSON string:
+# JSON escapes a control character, an HTTP header does not, and neither ``http.client`` nor
+# ``httpx`` refuses an obsolete folded value (``"a\r\n b"``) -- both were probed, both let it
+# through. So a key that is not this shape can split a request header on the way out and a
+# response header or a log line on the way back, and the rule has to live at every edge the
+# value crosses rather than at the one that was noticed.
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
+
+
+def is_valid_idempotency_key(value: Any) -> bool:
+    """Whether ``value`` may be presented as an idempotency key on a header or written to a log.
+
+    Empty is *not* valid here: absence is spelled by not calling this, and the callers each say
+    what absence means for them. Bounded at 128 characters so an unauthenticated client cannot
+    choose the length of a log line.
+    """
+
+    return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+
+
 def _normalize_optional_text(value: Any, field_name: str) -> str | None:
     normalized = normalize_json_ingress(value)
     if normalized is None:
@@ -793,6 +816,17 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
         # adapters) never got to see it. Left in place, the request is refused as the
         # config-recoverable bad request it is.
         output_schema = normalize_json_ingress(output_schema, substitute_nonfinite=False)
+    # Refused rather than repaired, and refused HERE rather than only at the transport: a
+    # caller who spelled a key that cannot go on a header has a bug, and the ingress that
+    # already refuses a non-finite control or a malformed output_schema is where this repo
+    # says so. The runner mints its own key AFTER this call, so a run-driven request never
+    # reaches this branch; it exists for the direct integrator who builds the request.
+    idempotency_key = request.idempotency_key
+    if idempotency_key and not is_valid_idempotency_key(idempotency_key):
+        raise ValueError(
+            "model request idempotency_key must be 1-128 ASCII characters from "
+            "[A-Za-z0-9._+-] starting with a letter or digit"
+        )
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),
