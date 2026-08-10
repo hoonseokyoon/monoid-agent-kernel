@@ -39,6 +39,7 @@ from monoid_agent_kernel.core.model_io import (
     DIGEST_STATUSES,
     IDEMPOTENCY_KEY_JSON_PATTERN,
     MAX_MODEL_PAYLOAD_BYTES,
+    RECORDED_DIGEST_BODY,
 )
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -50,11 +51,15 @@ TIMESTAMP_PATTERN = rf"Z{END_OF_INPUT}"
 EVENT_TYPE_PATTERN = rf"^[a-z]+(\.[a-z_]+)+{END_OF_INPUT}"
 """A dotted lowercase event name, whole and nothing after it."""
 
-SHA256_PATTERN = rf"^[0-9a-f]{{64}}{END_OF_INPUT}"
+SHA256_PATTERN = rf"^{RECORDED_DIGEST_BODY}{END_OF_INPUT}"
 """A digest that must be present."""
 
-OPTIONAL_SHA256_PATTERN = rf"^(|[0-9a-f]{{64}}){END_OF_INPUT}"
-"""A digest that may not have been issued, where empty is the recorded spelling of absence."""
+OPTIONAL_SHA256_PATTERN = rf"^(|{RECORDED_DIGEST_BODY}){END_OF_INPUT}"
+"""A digest that may not have been issued, where empty is the recorded spelling of absence.
+
+Both forms compose the one body ``core/model_io.py`` owns (W7-4), the way the idempotency-key
+forms do: these schema patterns and the ledger's mint guard are enforcers of one rule, and a
+retyped twin regex is how enforcers drift."""
 
 
 EVENT_SCHEMA: dict[str, Any] = {

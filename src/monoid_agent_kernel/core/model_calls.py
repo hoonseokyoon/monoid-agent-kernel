@@ -34,7 +34,12 @@ from __future__ import annotations
 from typing import Any
 
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.model_io import ModelCallAttempt, ModelCallReceipt
+from monoid_agent_kernel.core.model_io import (
+    ModelCallAttempt,
+    ModelCallReceipt,
+    is_recorded_digest,
+    is_valid_idempotency_key,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -196,6 +201,28 @@ def model_call_record(
     adapter puts it on the wire, so a key on a fake or replay call's line is a fact about
     issuance, never evidence a request was sent.
     """
+
+    # The mint guard (W7-4): this is the single place a receipt becomes an artifact line, and
+    # these three are the format-constrained fields ``from_json`` deliberately transports
+    # without judging -- reader-lenient so a damaged receipt can be loaded and inspected,
+    # schema-strict so a damaged LINE cannot be certified. The guard closes the route between
+    # the two: a foreign receipt that parsed fine must not mint a line ``monoid validate``
+    # then refuses. Empty stays admissible on all three -- a refused call was never keyed and
+    # never digested, and a status field explains each -- so this cannot fire on a receipt
+    # the runner built, which is valid by construction on every settle path. For the
+    # recorder, a raise here costs the one line, not the run (its hostile-context
+    # containment); the offending value stays out of the message, the same transport rule
+    # the key's logging sinks follow.
+    for field_name, value, is_valid in (
+        ("idempotency_key", receipt.idempotency_key, is_valid_idempotency_key),
+        ("prompt_digest", receipt.prompt_digest, is_recorded_digest),
+        ("request_digest", receipt.request_digest, is_recorded_digest),
+    ):
+        if value != "" and not is_valid(value):
+            raise ValueError(
+                f"model call record {field_name} must be empty or the shape "
+                "the ledger schema certifies"
+            )
 
     record: dict[str, Any] = {
         "schema_version": MODEL_CALLS_SCHEMA_VERSION,

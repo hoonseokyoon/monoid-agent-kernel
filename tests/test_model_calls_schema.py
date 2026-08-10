@@ -23,7 +23,7 @@ import ast
 import inspect
 import json
 import textwrap
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -290,9 +290,14 @@ def test_the_ledger_accepts_a_key_the_kernel_could_have_issued(key: str) -> None
 def test_the_ledger_refuses_a_key_no_issuer_could_have_minted(key: str) -> None:
     """``monoid validate`` certifies imported and third-party directories, so a line whose key
     the rest of the kernel would refuse must not be certified here either. Before this pattern
-    the field was an open string and every one of these validated clean."""
+    the field was an open string and every one of these validated clean.
 
-    assert _errors(_record(idempotency_key=key))
+    The line is forged onto the record dict rather than driven through ``_record``, because
+    since W7-4 the mint refuses to build it (its own pin below) -- and the schema's refusal
+    must hold for lines that never met our mint at all, which is exactly the third-party case
+    this test exists for."""
+
+    assert _errors({**_record(), "idempotency_key": key})
 
 
 def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() -> None:
@@ -339,7 +344,9 @@ def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() 
     for body in bodies:
         for suffix in suffixes:
             candidate = body + suffix
-            schema_accepts = not _errors(_record(idempotency_key=candidate))
+            # Forged onto the dict, not through ``_record``: the mint refuses the invalid half
+            # of this lattice since W7-4, and the schema's own verdict is what this compares.
+            schema_accepts = not _errors({**_record(), "idempotency_key": candidate})
             rule_accepts = candidate == "" or is_valid_idempotency_key(candidate)
             assert schema_accepts is rule_accepts, {
                 "candidate": candidate,
@@ -478,6 +485,95 @@ def test_an_empty_digest_is_a_valid_record_because_a_status_explains_it() -> Non
     keyless = _record(prompt_digest="", request_digest="", digest_status="absent")
 
     assert _errors(keyless) == []
+
+
+# --- the reader transports, the mint certifies ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad"),
+    [
+        ("idempotency_key", "bad\nkey"),
+        ("prompt_digest", "not-a-digest"),
+        ("request_digest", "B" * 64),
+    ],
+    ids=["key-with-control", "digest-wrong-shape", "digest-wrong-case"],
+)
+def test_the_mint_refuses_a_receipt_the_sweep_would_convict(field_name: str, bad: str) -> None:
+    """``from_json`` deliberately transports these values -- reader-lenient, so a damaged
+    receipt can still be loaded and inspected (W7-3 round 4's decision, kept) -- which left a
+    route from a foreign receipt to a ledger line ``monoid validate`` refuses. The mint is
+    where that route closes: ``model_call_record`` is the single place a receipt becomes an
+    artifact line, so it refuses to build one the sweep would then convict. The receipt
+    itself constructs fine; only certification is denied."""
+
+    receipt = _receipt(**{field_name: bad})
+
+    with pytest.raises(ValueError, match=field_name):
+        model_call_record(
+            receipt,
+            run_id="run-1",
+            root_run_id="run-1",
+            call_index=0,
+            recorded_at="2026-08-11T00:00:00.000Z",
+        )
+
+
+def test_the_mint_admits_every_empty_spelling_a_refused_call_writes() -> None:
+    """Empty-or-valid, and the empty half matters as much: a call refused before the keying
+    block was never keyed and never digested, its status fields say why, and a guard firing
+    there would be the mint refusing the runner's own output -- the self-regression the
+    empty-or-valid split exists to prevent."""
+
+    refused = _receipt(
+        idempotency_key="",
+        prompt_digest="",
+        request_digest="",
+        digest_status="absent",
+        destination_status="not_declared",
+        destination_digest="",
+    )
+
+    record = model_call_record(
+        refused,
+        run_id="run-1",
+        root_run_id="run-1",
+        call_index=0,
+        recorded_at="2026-08-11T00:00:00.000Z",
+    )
+
+    assert _errors(record) == []
+
+
+def test_the_lenient_class_is_derived_from_the_schema_and_is_exactly_three() -> None:
+    """The format-constrained receipt fields, derived rather than hand-listed: every
+    ``properties`` key carrying a ``pattern`` that is also a ``ModelCallReceipt`` field. For
+    each member the division must hold on both sides -- ``from_json`` accepts a malformed
+    value (the reader transports), and the mint refuses to certify it. A fourth patterned
+    receipt field joins the rule or fails here; a reader that quietly starts judging one of
+    the three fails here too."""
+
+    receipt_fields = {field_.name for field_ in fields(ModelCallReceipt)}
+    constrained = {
+        key
+        for key, spec in MODEL_CALLS_RECORD_SCHEMA["properties"].items()
+        if isinstance(spec, dict) and "pattern" in spec and key in receipt_fields
+    }
+    assert constrained == {"idempotency_key", "prompt_digest", "request_digest"}
+
+    for field_name in sorted(constrained):
+        payload = _receipt().to_json()
+        payload[field_name] = "not what the pattern admits\n"
+        loaded = ModelCallReceipt.from_json(payload)
+        assert getattr(loaded, field_name) == "not what the pattern admits\n"
+        with pytest.raises(ValueError, match=field_name):
+            model_call_record(
+                loaded,
+                run_id="run-1",
+                root_run_id="run-1",
+                call_index=0,
+                recorded_at="2026-08-11T00:00:00.000Z",
+            )
 
 
 def test_validate_run_dir_treats_model_calls_as_optional(tmp_path: Path) -> None:

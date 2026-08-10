@@ -496,6 +496,37 @@ def is_valid_idempotency_key(value: Any) -> bool:
     return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
 
 
+RECORDED_DIGEST_BODY = r"[0-9a-f]{64}"
+"""What a recorded content digest may be spelled as, once, so its enforcers cannot drift.
+
+Same argument as ``_IDEMPOTENCY_KEY_BODY`` above, one field family over: ``core/schemas.py``
+states this rule to ``monoid validate`` (both of its digest pattern forms compose this body),
+and ``model_call_record`` states it to a receipt being minted into a ledger line (W7-4). The
+producers already hold the shape by construction -- every digest here is hex SHA-256 output --
+so the spelling exists for values a producer did not mint: a receipt loaded from foreign JSON,
+whose reader deliberately transports what it was given. (``model_payloads.is_chunk_sha256``
+states its own 64-hex rule on purpose and is not a projection of this one: a chunk reference
+becomes a *filename*, so that check is a path-safety boundary every reader re-establishes,
+with its own reasons written beside it.)
+"""
+
+RECORDED_DIGEST_PATTERN = re.compile(rf"{RECORDED_DIGEST_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+
+def is_recorded_digest(value: Any) -> bool:
+    """Whether ``value`` is a digest in hand: exactly 64 lowercase hex characters.
+
+    Empty is *not* valid here, the same line ``is_valid_idempotency_key`` draws: absence is
+    the in-band empty string on every optional-digest field, a status field says why, and
+    each caller states what absence means where it stands -- the ledger's mint guard admits
+    it (a refused call's line is empty and explained), a caller comparing two digests in
+    hand does not.
+    """
+
+    return isinstance(value, str) and RECORDED_DIGEST_PATTERN.fullmatch(value) is not None
+
+
 def destination_digest(value: str) -> str:
     """An id for a call's destination, for a receipt to record *where* without recording *what*.
 

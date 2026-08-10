@@ -525,6 +525,18 @@ service authenticates. Absence on this field is spelled by the **empty string an
 a caller who supplies `None`, `False` or `0` supplied a value, and ingress refuses it rather than
 reading it as "no key" and letting the transport drop it silently.
 
+The key shares one more rule with the two digests beside it (W7-4). These are the three
+format-constrained fields whose values `ModelCallReceipt.from_json` deliberately does **not**
+judge: the reader transports what it was given, so a receipt with a damaged digest can still be
+loaded, inspected and repaired — and a parsed receipt is therefore not a certified one.
+Certification has two enforcers, each deriving from one body in `core/model_io.py`: the schema
+patterns `monoid validate` runs, and `model_call_record`, which refuses to *mint* a ledger line
+the sweep would then convict — checking all three under the same empty-or-valid rule the schema
+states, so it can never fire on a runner-built receipt (a refused call's line is empty and
+explained by its status fields). The class is exactly these three, and the census derives it
+from the schema rather than naming it: a fourth patterned receipt field joins the rule or fails
+the suite, and a reader that quietly starts judging one of the three fails it too.
+
 **Every `pattern` in every artifact schema ends at end of *input*, not at `$`.** JSON Schema calls
 `pattern` an ECMA-262 expression; `jsonschema` runs it through Python's `re`, where `$` also
 matches immediately before a single trailing newline. Under that engine a bare `^…$` certified

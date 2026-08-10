@@ -7,6 +7,24 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the reader transports, the mint certifies: ledger format guard (W7-4)
+
+- **`model_call_record` refuses to mint a line `monoid validate` would then convict.**
+  Carry-over from PR #106 round 6, resolved for the whole class rather than the named field:
+  the three format-constrained, receipt-parsed strings (`idempotency_key`, `prompt_digest`,
+  `request_digest` — the census derives the set from the schema, so it cannot silently grow
+  or shrink) stay reader-lenient on `ModelCallReceipt.from_json`, deliberately: the reader
+  transports, so a receipt with a damaged digest can still be loaded and inspected, and a
+  parsed receipt is not a certified one. Certification now has two enforcers deriving from
+  one body each in `core/model_io.py`: the schema patterns (`RECORDED_DIGEST_BODY` joins
+  `_IDEMPOTENCY_KEY_BODY`, and both of `schemas.py`'s digest forms compose it) and the mint
+  guard, which checks empty-or-valid on all three before building the record. Empty stays
+  admissible because a refused call was never keyed and never digested — the guard cannot
+  fire on a runner-built receipt — and for the recorder a refused mint costs the one line,
+  not the run. (`model_payloads.is_chunk_sha256` keeps its own 64-hex predicate on purpose:
+  a chunk reference becomes a filename, and that path-safety boundary carries its own
+  reader-side obligations.)
+
 ### Changed — one spelling for an unitemized call: `attempt_log` presence rules (W7-4)
 
 - **The writers omit an empty `attempt_log`, and a present-but-empty log beside a positive
