@@ -6,6 +6,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from monoid_agent_kernel.core.json_ingress import exact_text
 from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     PUBLIC_JOB_SCHEMA,
@@ -91,6 +92,10 @@ def public_identifier(value: str) -> str:
 
 
 def public_error_message(error: str) -> str:
+    # This function asks the value exactly one question, and it is the whole function: a `str`
+    # subclass whose `upper()` answers "NOTHING TO SEE HERE" publishes the key body verbatim, and
+    # one that raises takes the run with it from twelve emit sites. See `json_ingress.exact_text`.
+    error = exact_text(error)
     if not error:
         return ""
     if "PRIVATE KEY" in error.upper():
@@ -132,15 +137,15 @@ def public_capability_result(result: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(lease.get("scope"), Mapping):
             public["scope"] = dict(lease["scope"])
         if result.get("reason"):
-            public["reason"] = str(result.get("reason"))
+            public["reason"] = exact_text(result.get("reason"))
         return public
 
-    public = {"status": "denied", "reason": str(result.get("reason") or "denied")}
+    public = {"status": "denied", "reason": exact_text(result.get("reason") or "denied")}
     capability = result.get("capability")
     if capability is None and lease is not None:
         capability = lease.get("capability")
     if capability:
-        public["capability"] = str(capability)
+        public["capability"] = exact_text(capability)
     return public
 
 
@@ -153,13 +158,13 @@ def public_proposal_payload(payload: dict[str, Any], policy: PermissionPolicy) -
         "diff_path": payload.get("diff_path"),
         "diff_bytes": payload.get("diff_bytes"),
         "diff_sha256": payload.get("diff_sha256"),
-        "changed_paths": [public_path(str(path), policy) for path in payload.get("changed_paths", [])],
+        "changed_paths": [public_path(exact_text(path), policy) for path in payload.get("changed_paths", [])],
         "files": [public_proposal_file(file, policy) for file in files],
     }
 
 
 def public_proposal_file(file: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
-    path = str(file.get("path", ""))
+    path = exact_text(file.get("path", ""))
     # The guarded predicate, for the same reason `public_path` uses it — and because after that
     # change this function was calling both: line 101 failed closed while this line still raised on
     # the identical string. Proposal paths come from the workspace diff rather than from a model
@@ -263,17 +268,17 @@ def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dic
     }
     public.update({key: artifact[key] for key in _JOB_COPIED_KEYS if key in artifact})
     if "kind" in artifact:
-        public["kind"] = public_identifier(str(artifact["kind"]))
+        public["kind"] = public_identifier(exact_text(artifact["kind"]))
     public["command_preview"] = truncate_inline_text(
-        str(artifact["command_preview"]), threshold=PREVIEW_BYTE_THRESHOLD, budget=200
+        exact_text(artifact["command_preview"]), threshold=PREVIEW_BYTE_THRESHOLD, budget=200
     )
     public["cwd"] = preview_value("cwd", artifact["cwd"], policy)
     for key in ("stdout_path", "stderr_path"):
-        public[key] = public_inline_path(str(artifact[key]), policy)
+        public[key] = public_inline_path(exact_text(artifact[key]), policy)
     if "changed_paths" in artifact:
         public["changed_paths"] = [public_path(path, policy) for path in artifact["changed_paths"]]
     if "error" in artifact:
-        error = str(artifact["error"])
+        error = exact_text(artifact["error"])
         public["error"] = (
             _REDACTED_JOB_ERROR
             if error and policy.redact_patterns
@@ -370,7 +375,7 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
     payload_budget.charge(2)  # the braces, as `public_mapping` charges its own
     return {
         "command_preview": _budgeted_field(
-            "command_preview", str(arguments.get("command") or ""), policy, payload_budget
+            "command_preview", exact_text(arguments.get("command") or ""), policy, payload_budget
         ),
         "cwd": _budgeted_field("cwd", arguments.get("cwd", "."), policy, payload_budget),
         # Previewed, not copied, even though all three are declared `["integer", "null"]`. The
@@ -399,7 +404,7 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
         # capped. This branch withholds env *values* on purpose, so letting the keys carry arbitrary
         # text made it a way to publish exactly what it was withholding.
         "env_keys": _budgeted_field(
-            "env_keys", sorted(str(key) for key in env), policy, payload_budget
+            "env_keys", sorted(exact_text(key) for key in env), policy, payload_budget
         ),
     }
 
@@ -420,7 +425,7 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
     payload_budget.charge(2)  # the braces, as `public_mapping` charges its own
     if "query" in arguments:
         preview["query_preview"] = _budgeted_field(
-            "query_preview", public_query_preview(str(arguments.get("query") or "")), policy, payload_budget
+            "query_preview", public_query_preview(exact_text(arguments.get("query") or "")), policy, payload_budget
         )
     if "url" in arguments:
         # The descriptor is a digest everywhere except its ``scheme`` and ``domain``, which are
@@ -430,7 +435,7 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
         # events carry the identical fragment through ``public_event_payload``, which bounds it,
         # so the two surfaces of one call disagreed by four megabytes until this route matched.
         preview["url_preview"] = _budgeted_field(
-            "url_preview", public_url_preview(str(arguments.get("url") or "")), policy, payload_budget
+            "url_preview", public_url_preview(exact_text(arguments.get("url") or "")), policy, payload_budget
         )
     for key in (
         "max_results",
@@ -716,9 +721,13 @@ def truncate_to_bytes(value: str, max_bytes: int) -> str:
     Shared with ``shell.preview_command`` rather than reimplemented there. The two truncators had
     already drifted to different constants (240/160 here, 240/200 there) while carrying the same
     defect, so a fix applied to one would have left the other publishing whole commands.
+
+    Measures the *base* string: a ``str`` subclass can override ``encode``, and this cap decides
+    by asking the value how big it is. See ``exact_text``.
     """
     if max_bytes <= 0:
         return ""
+    value = exact_text(value)
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
         return value
@@ -744,6 +753,7 @@ def truncate_inline_text(value: str, *, threshold: int, budget: int) -> str:
     plan steps; the marker is deliberately outside the budget rather than eating into it, so the
     readable prefix is the same length whether or not anything was cut.
     """
+    value = exact_text(value)  # the threshold is a question about the base string; see `exact_text`
     if len(value.encode("utf-8")) <= threshold:
         return value
     return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
@@ -869,13 +879,17 @@ def public_mapping(
     payload_budget.charge(2)  # the braces
     stopped = False
     for key, value in values.items():
+        # `exact_text`, not `str`: a key is model-authored text too, and the callbacks judge it by
+        # `key.lower()` (content redaction, secret masking, the prose branch). `str(key)` looks
+        # like it already normalizes, and does -- through `type(key).__str__`, which a subclass
+        # overrides.
         name = _bounded_key(
-            str(key), threshold=threshold, budget=budget, taken=published, _collisions=collisions
+            exact_text(key), threshold=threshold, budget=budget, taken=published, _collisions=collisions
         )
         if not payload_budget.charge(_fragment_cost(name) + 4):
             stopped = True
             break
-        fragment = preview(str(key), value)
+        fragment = preview(exact_text(key), value)
         if fragment is _DROPPED:
             stopped = True
             break
@@ -1001,7 +1015,14 @@ def _preview_value(
     append it. Charged-at-least-cost per appended byte is what makes the serialized payload
     provably no larger than the budget; a refused fragment comes back as ``_DROPPED`` and the
     enclosing container stops there and says how much it dropped.
+
+    The key is taken as base text before anything reads it, because ``lowered`` below is what
+    decides whether this value is a file body or a path, and a ``str`` subclass answers ``lower()``
+    for itself — a key that spells ``content`` and reports something else escapes the redaction
+    while still being published under its real name. Here rather than only at the container
+    boundaries, so a direct call gets the same rule.
     """
+    key = exact_text(key)
     if mask is not None:
         replacement = mask(key, value)
         if replacement is not UNMASKED:
@@ -1058,8 +1079,16 @@ def _preview_value(
             # the key has no name left to incriminate it). ``env_keys`` was routed through here for
             # exactly this reason one commit earlier -- but that bound keys arriving as list
             # *items*, and left the twin where they arrive as keys.
+            # Converted once and reused, rather than twice at two call sites: the published name
+            # and the key the child is judged by have to be the same string, and two conversions
+            # are two chances for them to stop being.
+            child_name = exact_text(child_key)
             name = _bounded_key(
-                str(child_key), threshold=threshold, budget=budget, taken=preview, _collisions=collisions
+                child_name,
+                threshold=threshold,
+                budget=budget,
+                taken=preview,
+                _collisions=collisions,
             )
             # The quoted key and its separators are appended bytes like any others; refusing them
             # here is what stops a thousand cap-obeying entries from summing past the ceiling.
@@ -1069,7 +1098,7 @@ def _preview_value(
             # Rules still match on the *whole* key: a 5 KB key ending in ``_path`` is a path, and
             # judging it by its truncated form would let length defeat the redaction.
             child = _preview_value(
-                str(child_key),
+                child_name,
                 child_value,
                 policy,
                 mask=mask,
@@ -1135,6 +1164,9 @@ def _preview_value(
             items.append(marker)
         return items
     if isinstance(value, str):
+        # The base string, before anything measures or slices it -- a subclass's `encode` decides
+        # this branch otherwise, and it is the branch that keeps model text off the stream.
+        value = exact_text(value)
         encoded_len = len(value.encode("utf-8"))
         if encoded_len > threshold:
             if lowered in _INLINE_TEXT_KEYS:
@@ -1198,7 +1230,14 @@ def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
     path is precisely the kind that should not be published verbatim.
     """
     try:
-        return policy.is_path_redacted(value)
+        # The base string, like every other guard here. ``normalize_workspace_path`` asks
+        # ``raw == ""`` before it resolves anything, so a value whose ``__eq__`` claims to be empty
+        # answers this predicate for itself: measured, an operator-redacted path *and* the private
+        # key body beside it came out verbatim on the approval card, because a `False` here also
+        # clears ``touches_redacted_path`` and turns the content withholding off with it. The
+        # raising arm is the hazard the comment below already fails closed against, and this is the
+        # one decision in this traversal that had not been converted.
+        return policy.is_path_redacted(exact_text(value))
     except WorkspaceError:
         # Fail closed, for every path-naming field. Scoping this to ``path``/``root``/``cwd`` --
         # to stop a task result's absolute ``report_path`` being blanked by an unrelated pattern --
@@ -1213,7 +1252,10 @@ def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
 
 def redacted_value(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
-        return {"redacted": True, "type": "str", "bytes": len(value.encode("utf-8"))}
+        # The count is the one thing this marker still tells an operator, so it is measured on the
+        # base string: an overriding `encode` reported `"bytes": 1` for a 5,000-character secret,
+        # which reads as "something small was withheld".
+        return {"redacted": True, "type": "str", "bytes": len(exact_text(value).encode("utf-8"))}
     if isinstance(value, bytes):
         return {"redacted": True, "type": "bytes", "bytes": len(value)}
     return {"redacted": True, "type": type(value).__name__}
@@ -1292,7 +1334,9 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
                 return False
             seen.add((id(value), key))
         if isinstance(value, Mapping):
-            return any(walk(item, str(child), depth + 1) for child, item in value.items())
+            # `exact_text` for the same reason the traversal uses it: `lowered` below decides
+            # whether this key names a path, and a `str` subclass answers `lower()` for itself.
+            return any(walk(item, exact_text(child), depth + 1) for child, item in value.items())
         if isinstance(value, list):
             # The parent key carries down: list items have no key of their own, which is the same
             # reason ``preview_value`` reuses it.
@@ -1304,7 +1348,7 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
             and _is_path_redacted(value, policy)
         )
 
-    return any(walk(value, str(key), 0) for key, value in values.items())
+    return any(walk(value, exact_text(key), 0) for key, value in values.items())
 
 
 def _is_path_field(lowered_key: str) -> bool:

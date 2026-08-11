@@ -28,10 +28,19 @@ from typing import Any
 
 import pytest
 
-from support.hostile_scalars import ExplodingComparisons, UnderstatedInteger
+from support.hostile_scalars import (
+    EmptyClaimingPath,
+    ExplodingComparisons,
+    ExplodingText,
+    MisreportingKey,
+    MisreportingText,
+    ShoutingText,
+    UnderstatedInteger,
+    UnderstatedText,
+)
 
 import monoid_agent_kernel
-from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
+from monoid_agent_kernel.core.tool_approval import _jsonish, redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_BUDGET,
@@ -56,8 +65,11 @@ from monoid_agent_kernel.public_view import (
     public_result_content,
     public_path,
     public_proposal_file,
+    public_error_message,
     redacted_value,
     shell_args_preview,
+    touches_redacted_path,
+    truncate_inline_text,
     truncate_to_bytes,
     web_args_preview,
 )
@@ -1272,6 +1284,234 @@ def test_the_integer_threshold_reads_the_value_not_the_object() -> None:
     assert published["truncated"] is True
     assert published["preview"].startswith("0x")
     assert json.dumps(published), "the payload still cannot be spelled by a writer"
+
+
+def test_a_strings_own_encode_cannot_widen_the_preview_cap() -> None:
+    """The cap asks the value how big it is, so the value must not be the one answering.
+
+    Model text arrives at a tool boundary as a Python object, and a ``str`` subclass may override
+    ``encode``. Reporting one byte, 5,000 characters cleared a 240-byte threshold and were
+    published whole through the cap whose entire purpose is that they are not -- 31x the bound, on
+    a run that completes normally and reports nothing unusual.
+    """
+    body = UnderstatedText("s" * 5_000)
+    assert len(str.encode(body, "utf-8")) == 5_000, "the fixture must really be long"
+
+    published = preview_value("note", body, PermissionPolicy())
+
+    assert published["truncated"] is True
+    assert published["bytes"] == 5_000, "the envelope repeated the value's own answer"
+    # `str.encode`, not `.encode`: asking the published prefix how long it is asks the same liar,
+    # and this assertion passed against the unfixed code for exactly that reason until a mutant
+    # said so.
+    assert len(str.encode(published["preview"], "utf-8")) <= PREVIEW_BYTE_BUDGET
+
+
+def test_a_string_that_refuses_to_be_measured_does_not_end_the_run() -> None:
+    """The other direction, on the side where it costs the most.
+
+    This traversal runs *inside event construction*, so an ``encode`` that raises here is not a
+    failed tool call -- it is the emit path, and the run dies as ``internal_error``. The same
+    hazard ``_is_path_redacted`` fails closed against a few lines below.
+    """
+    published = preview_value("note", ExplodingText("s" * 5_000), PermissionPolicy())
+
+    assert published["truncated"] is True
+    assert published["bytes"] == 5_000
+
+
+def test_the_redaction_marker_reports_the_bytes_it_actually_withheld() -> None:
+    """The count is the only thing this marker still tells an operator.
+
+    Taken from the value, it read ``"bytes": 1`` for a 5,000-character secret -- which reads as
+    "something small was withheld" and is the opposite of what happened.
+    """
+    assert redacted_value(UnderstatedText("s" * 5_000)) == {
+        "redacted": True,
+        "type": "str",
+        "bytes": 5_000,
+    }
+
+
+def test_a_key_that_misreports_its_own_name_is_still_judged_by_it() -> None:
+    """``lowered`` decides whether a value is a file body, and the key answers ``lower()``.
+
+    A key spelling ``content`` while reporting something else escaped the content redaction and
+    was then published under its real name -- the rule and the reader disagreeing about the same
+    string.
+    """
+    published = preview_value(MisreportingKey("content"), "SECRET BODY", PermissionPolicy())
+
+    assert published == {"redacted": True, "type": "str", "bytes": len("SECRET BODY")}
+
+
+def test_the_shell_and_web_previews_measure_the_base_string_too() -> None:
+    """The same rule at the three measuring sites outside this module.
+
+    ``preview_command`` splits *and* measures; the web descriptors publish a byte count and a
+    digest as the whole of what they say about a value they withhold, so a lying ``encode`` makes
+    them describe something other than what ran.
+
+    The shell arm is driven by ``split`` rather than by ``encode``, and the difference is the
+    point: ``" ".join(...)`` already returns an exact ``str``, so an understating ``encode`` never
+    reaches that measurement and an arm built on it would be green for a reason that has nothing
+    to do with the guard. ``split`` is the operator this site actually hands to the value.
+    """
+    previewed = preview_command(ExplodingText("echo " + "y" * 5_000))
+    assert len(str.encode(previewed, "utf-8")) <= COMMAND_PREVIEW_BYTE_BUDGET + len("...")
+
+    assert public_query_preview(UnderstatedText("q" * 5_000))["bytes"] == 5_000
+    assert public_url_preview(UnderstatedText("https://e.example/" + "u" * 5_000))["bytes"] == 5_018
+
+def test_the_shared_truncators_measure_the_base_string_when_called_directly() -> None:
+    """The two truncators are called from outside this module, so they are pinned from outside it.
+
+    ``shell.preview_command`` imports ``truncate_to_bytes``, and ``truncate_inline_text`` is what
+    keeps a plan ``step`` a string for a renderer that prints it. The traversal now normalizes
+    ahead of both, which would leave these two green for a reason that has nothing to do with
+    their own code -- so they are measured where a caller actually reaches them.
+    """
+    body = UnderstatedText("s" * 5_000)
+
+    # Measured through the base slot throughout. `truncate_to_bytes` returns its *input* when the
+    # input fits, so a lying value comes back as itself and `result.encode()` asks the liar a
+    # second time -- which is how the first draft of this pin passed against the unfixed code.
+    kept = truncate_to_bytes(body, PREVIEW_BYTE_BUDGET)
+    assert len(str.encode(kept, "utf-8")) <= PREVIEW_BYTE_BUDGET
+
+    inline = truncate_inline_text(
+        body, threshold=PREVIEW_BYTE_THRESHOLD, budget=PREVIEW_BYTE_BUDGET
+    )
+    assert str.endswith(inline, TRUNCATION_SUFFIX), "a cut value published without saying so"
+    assert len(str.encode(inline, "utf-8")) <= PREVIEW_BYTE_BUDGET + len(
+        TRUNCATION_SUFFIX.encode()
+    )
+
+
+_REDACTING_POLICY = PermissionPolicy(redact_patterns=("secrets/**",))
+
+
+def test_a_container_key_is_taken_as_base_text_before_it_names_anything() -> None:
+    """The published name and the rule that judges the value must be the same string.
+
+    A key is model-authored text, and ``str(key)`` looks like it already normalizes -- it does,
+    through ``type(key).__str__``, which a subclass overrides. Both depths, because the outer
+    mapping is built by the builders and the inner one by the traversal, and this repository's
+    house defect is a rule bound at one of a pair.
+    """
+    policy = PermissionPolicy()
+    redacted = {"redacted": True, "type": "str", "bytes": len("SECRET BODY")}
+
+    top = args_preview({MisreportingText("content"): "SECRET BODY"}, policy)
+    assert top == {"content": redacted}, "the key was published under the name it claimed"
+
+    nested = preview_value(
+        "payload", {"outer": {MisreportingText("content"): "SECRET BODY"}}, policy
+    )
+    assert nested["outer"] == {"content": redacted}
+
+
+def test_a_callback_that_reads_the_key_gets_the_base_text_too() -> None:
+    """``public_mapping`` hands the key to a callback, and two of them judge it themselves.
+
+    ``finish_args_preview`` matches ``key.lower()``, so a key spelling ``summary`` and answering
+    something else published the model's final prose where the redaction marker belongs. The
+    traversal normalizes its own key at entry, which is why this needs the *callback* arm to say
+    anything at all.
+    """
+    withheld = {"summary": {"redacted": True, "type": "str", "bytes": len("FINAL ANSWER")}}
+
+    # Both spellings of the lie, because the site read `str(key)` and the fix reads the base text:
+    # a subclass overriding `__str__` is what defeated the code that shipped, and one overriding
+    # `lower()` is what would defeat the bare `key` a later edit could leave here instead.
+    for hostile in (MisreportingText("summary"), MisreportingKey("summary")):
+        published = finish_args_preview({hostile: "FINAL ANSWER"}, PermissionPolicy())
+        assert published == withheld, f"{type(hostile).__name__} was believed"
+
+
+def test_a_path_that_claims_to_be_empty_is_still_matched_by_the_operators_pattern() -> None:
+    """``normalize_workspace_path`` asks ``raw == ""`` before it resolves anything.
+
+    So a value whose ``__eq__`` answers that question for itself walks past ``redact_patterns``.
+    Both consequences are measured: the path publishes verbatim, and -- because the same predicate
+    backs ``touches_redacted_path`` -- the approval card drops its content withholding along with
+    it and prints the file body the operator asked to have hidden.
+    """
+    hostile = EmptyClaimingPath("secrets/creds.txt")
+
+    assert preview_value("path", hostile, _REDACTING_POLICY) == {
+        "redacted": True,
+        "type": "str",
+        "bytes": len("secrets/creds.txt"),
+    }
+    assert public_path(hostile, _REDACTING_POLICY) == REDACTED_PATH
+    assert touches_redacted_path({"path": hostile}, _REDACTING_POLICY)
+
+
+def test_a_key_that_hides_its_own_name_cannot_switch_the_approval_card_to_open() -> None:
+    """``touches_redacted_path`` walks keys at every depth, and ``lowered`` decides.
+
+    A key spelling ``path`` while hiding that name made the walk answer "this call touches nothing
+    redacted", which turns ``decision_surface`` on -- publishing both the path and the file body it
+    was hiding. Both depths, for the same reason as the pin above, and both ways of hiding.
+    """
+    for hostile in (MisreportingText("path"), MisreportingKey("path")):
+        at_top = {hostile: "secrets/creds.txt"}
+        nested = {"outer": {hostile: "secrets/creds.txt"}}
+        named = type(hostile).__name__
+
+        assert touches_redacted_path(at_top, _REDACTING_POLICY), named
+        assert touches_redacted_path(nested, _REDACTING_POLICY), named
+
+        card = redact_tool_arguments(dict(at_top, content="BODY"), policy=_REDACTING_POLICY)
+        assert card["content"] == {"redacted": True, "type": "str", "bytes": len("BODY")}, named
+
+
+def test_an_error_message_cannot_talk_its_way_past_the_key_redaction() -> None:
+    """``public_error_message`` asks the value one question, and that question is the function."""
+    shouted = ShoutingText("-----BEGIN RSA PRIVATE KEY----- MIIEpAIBAAKC")
+
+    assert public_error_message(shouted) == "[redacted-sensitive-error]"
+
+
+def test_an_approval_argument_key_is_masked_by_the_name_it_really_spells() -> None:
+    """``_jsonish`` is what stores the approval request's ``arguments`` and feeds the
+    ``approval_key`` preimage, and it converted keys with ``str(key)``. A key spelling ``api_key``
+    and answering ``harmless`` was published unmasked, in the record a human reads to decide."""
+    stored = _jsonish({MisreportingText("api_key"): "sk-live-XXXX"})
+
+    assert list(stored) == ["api_key"]
+    assert redact_tool_arguments(stored, policy=PermissionPolicy())["api_key"] != "sk-live-XXXX"
+
+def test_the_hand_assembled_builders_read_the_argument_they_were_given() -> None:
+    """The two builders that convert their arguments themselves, at the four model-facing fields.
+
+    ``shell_args_preview`` and ``web_args_preview`` take their values through ``str(...)``, which
+    is ``type(value).__str__`` -- so a command spelling ``rm -rf /`` and answering ``harmless``
+    published the harmless one to the operator while the real one ran, and the web descriptors
+    computed their digest over it. The env *key* is the same question one container down.
+    """
+    policy = PermissionPolicy()
+
+    shell = shell_args_preview(
+        {
+            "command": MisreportingText("rm -rf / --no-preserve-root"),
+            "env": {MisreportingText("AWS_SECRET_ACCESS_KEY"): "v"},
+        },
+        policy,
+    )
+    assert shell["command_preview"] == "rm -rf / --no-preserve-root"
+    assert shell["env_keys"] == ["AWS_SECRET_ACCESS_KEY"]
+
+    web = web_args_preview(
+        {
+            "query": MisreportingText("q" * 40),
+            "url": MisreportingText("https://e.example/" + "u" * 40),
+        },
+        policy,
+    )
+    assert web["query_preview"]["bytes"] == 40
+    assert web["url_preview"]["bytes"] == len("https://e.example/") + 40
 
 
 def test_previewing_a_huge_integer_does_not_materialize_its_whole_spelling() -> None:

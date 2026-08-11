@@ -97,6 +97,31 @@ def _refuse_unportable_scalar(value: Any) -> None:
     raise UnportableScalarError(f"value of type {type(value).__name__} is not portable JSON")
 
 
+def exact_text(value: Any) -> str:
+    """The base ``str``'s own value, so a subclass cannot answer questions about itself.
+
+    A Python-object ingress carries whatever a tool handler built, and a ``str`` subclass may
+    override ``encode``, ``split``, ``lower`` or ``__str__``. Every cap in this codebase decides by
+    *asking the value* — ``len(value.encode("utf-8"))`` — so the object gets to state its own size,
+    and the writer that publishes it does not: ``json.dumps`` spells the base value. Measured: an
+    ``encode`` returning one byte published 5,000 characters through a 160-byte cap, and made
+    ``redacted_value`` report ``"bytes": 1`` for it; an ``encode`` that raises ends the run from
+    inside event construction. Same rule as ``int.__index__`` on the integer guards, and the same
+    idiom ``_exact_json_text`` already applies to JSON document text.
+
+    Free for the ordinary case: ``str.__str__`` on an exact ``str`` returns the object itself, and
+    the type check below skips even that call. Non-strings get ``str()``, so this is a drop-in for
+    the ``str(key)`` conversions that used to do the same job by accident — by accident, because
+    they route through ``type(value).__str__`` and an override defeats them.
+    """
+
+    if type(value) is str:
+        return value
+    if isinstance(value, str):
+        return str.__str__(value)
+    return str(value)
+
+
 def normalize_unicode_scalars(value: str) -> str:
     """Return ``value`` with surrogate pairs combined and lone surrogates replaced.
 
@@ -104,21 +129,39 @@ def normalize_unicode_scalars(value: str) -> str:
     Python normally stores the corresponding scalar as one character.  Combining the pair
     preserves its meaning; replacing an unmatched code unit with U+FFFD keeps later UTF-8
     encoding total and deterministic.
+
+    The *scan* reads the base text, so a ``str`` subclass with a hostile ``__iter__`` cannot raise
+    from inside the four refusing boundaries — this runs on the ingress path, where an
+    unclassified exception is the run-killing crash those boundaries exist to prevent.
+
+    A value that needs no repair comes back **as it arrived**, subclass and all. Normalizing to an
+    exact ``str`` here looked like the tidier half of the rule — one pass at the boundary instead
+    of a rule each guard remembers — and it is wrong: this kernel carries ``str`` subclasses
+    through here on purpose. ``permissions._LegacyPathPattern`` marks a retained pre-v0.20 pattern
+    that needs the historical matcher, and stripping it made a replayed pre-v0.20 tool scope fail
+    validation as *"escaped leading ! is a configuration spelling"*. A normalizer that silently
+    destroys a marker is a worse defect than the one it was closing, and the one it was closing
+    belongs at the guards anyway: ``exact_text`` at the site that measures or decides, where the
+    question is actually asked.
     """
 
-    if not any(0xD800 <= ord(char) <= 0xDFFF for char in value):
-        return value
+    scanned = exact_text(value)
+    if not any(0xD800 <= ord(char) <= 0xDFFF for char in scanned):
+        return value  # unrepaired: the caller's own object, marker and all
+    # Past here the string is rebuilt, so the exact text is what gets indexed and what comes back.
+    # A repaired value is a new string either way, and `__len__`/`__getitem__` are two more
+    # questions this scan has no reason to ask the value.
     normalized: list[str] = []
     index = 0
-    while index < len(value):
-        codepoint = ord(value[index])
-        if 0xD800 <= codepoint <= 0xDBFF and index + 1 < len(value):
-            low = ord(value[index + 1])
+    while index < len(scanned):
+        codepoint = ord(scanned[index])
+        if 0xD800 <= codepoint <= 0xDBFF and index + 1 < len(scanned):
+            low = ord(scanned[index + 1])
             if 0xDC00 <= low <= 0xDFFF:
                 normalized.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)))
                 index += 2
                 continue
-        normalized.append("\ufffd" if 0xD800 <= codepoint <= 0xDFFF else value[index])
+        normalized.append("\ufffd" if 0xD800 <= codepoint <= 0xDFFF else scanned[index])
         index += 1
     return "".join(normalized)
 
@@ -316,7 +359,7 @@ def _exact_json_text(text: Any) -> str:
 
     if not isinstance(text, str):
         raise TypeError("JSON document must be a string")
-    return text if type(text) is str else str.__str__(text)
+    return exact_text(text)
 
 
 def loads_json_ingress(text: str) -> Any:

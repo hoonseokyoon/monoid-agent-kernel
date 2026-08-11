@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from support.hostile_scalars import ExplodingComparisons, UnderstatedInteger
+from support.hostile_scalars import (
+    ExplodingComparisons,
+    MisreportingKey,
+    UnderstatedInteger,
+    UnderstatedText,
+    UniterableText,
+)
 
 import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
@@ -22,6 +28,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
     normalize_unicode_scalars,
 )
+from monoid_agent_kernel.permissions import _LegacyPathPattern
 from monoid_agent_kernel.tools.base import (
     ToolResult,
     ToolSpec,
@@ -302,6 +309,35 @@ def test_an_integer_subclass_is_judged_by_the_value_a_writer_would_spell() -> No
             {"n": UnderstatedInteger(10**5000)}, refuse_unportable_scalars=True
         )
 
+
+def test_the_ingress_scans_the_base_text_without_rewriting_the_callers_value() -> None:
+    """Two halves of one contract, and the second is a guard against my own first attempt at it.
+
+    The *scan* reads base text: this runs on the ingress path, where a hostile ``__iter__`` is an
+    unclassified exception at exactly the boundary that exists to keep runs alive.
+
+    What it must **not** do is hand back an exact ``str``. That was the tidier-looking rule -- one
+    pass at the boundary instead of a rule each guard remembers -- and this kernel carries ``str``
+    subclasses through here on purpose: ``permissions._LegacyPathPattern`` marks a retained
+    pre-v0.20 pattern, and normalizing it away made a replayed pre-v0.20 tool scope fail
+    validation as "escaped leading ! is a configuration spelling". The subclass rule belongs at
+    the guards, where the question is actually asked.
+    """
+    unrepaired = UnderstatedText("abc")
+    normalized = normalize_json_ingress({MisreportingKey("content"): unrepaired})
+    key, value = next(iter(normalized.items()))
+
+    assert value is unrepaired, "the normalizer rewrote a value it had nothing to repair"
+    assert key == "content" and value == "abc", "normalizing changed the text"
+
+    # A marker subclass survives the round trip it is carried through in production.
+    marker = _LegacyPathPattern("internal/**")
+    assert normalize_unicode_scalars(marker) is marker
+
+    # Repaired text is rebuilt, so it comes back exact -- and the scan never asks the value.
+    assert normalize_unicode_scalars(UniterableText("plain")) == "plain"
+    repaired = normalize_json_ingress({"k": UniterableText("a\ud800b")})["k"]
+    assert type(repaired) is str and repaired == "a\ufffdb"
 
 # --------------------------------------------------------------------------------------
 # The refusing boundaries, read off the source rather than remembered
