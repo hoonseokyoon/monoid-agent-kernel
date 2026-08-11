@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import json
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -981,6 +982,72 @@ def test_the_payload_budget_holds_in_the_widest_spelling_a_sink_uses(
     )
     assert "truncated_keys" in published, "the fixture must actually reach the budget"
     assert len(published) > 1, "the budget cut so hard the payload says nothing"
+
+
+def _reference_hex_preview(value: int) -> str:
+    """The spelling this envelope shipped with: materialize it all, then keep the prefix.
+
+    Kept as a reference implementation rather than deleted, because the replacement is a
+    derivation (bit-shift to the retained digits) and "it did not raise" is blind to a
+    derivation that is merely *different*. Every assertion below compares against this.
+    """
+    return truncate_to_bytes(format(int.__index__(value), "#x"), PREVIEW_BYTE_BUDGET)
+
+
+@pytest.mark.parametrize("sign", [1, -1], ids=["positive", "negative"])
+@pytest.mark.parametrize(
+    "bits",
+    [1, 8, 600, 636, 640, 644, 1024, 65_536],
+    ids=lambda bits: f"{bits}-bit",
+)
+def test_the_integer_preview_is_the_prefix_the_full_spelling_would_have_given(
+    sign: int, bits: int
+) -> None:
+    """A grid across the retention boundary, both signs, against the old expression.
+
+    ``PREVIEW_BYTE_BUDGET`` of 160 holds ``0x`` plus 158 hex digits, so 632 bits is where
+    truncation starts and the sign steals one more digit — the rows straddle both. Sizes small
+    enough that the reference implementation is cheap to run, which is the point: correctness is
+    checked where materializing is free, and the allocation pin below covers where it is not.
+    """
+    value = sign * ((1 << (bits - 1)) | 0x9E3779B97F4A7C15)
+
+    published = preview_value("n", value, PermissionPolicy())
+    spelled = published["preview"] if isinstance(published, dict) else None
+
+    if spelled is None:  # under the threshold the integer keeps its type, unchanged
+        assert published == value
+    else:
+        assert spelled == _reference_hex_preview(value)
+
+
+def test_previewing_a_huge_integer_does_not_materialize_its_whole_spelling() -> None:
+    """The envelope must cost the preview, not the number.
+
+    ``format(v, "#x")`` is linear in the bit length, so a sparse big integer — cheap to build,
+    and reachable through ``update_plan``, which normalizes without the refusing boundaries —
+    allocated a full hexadecimal string inside event construction to keep 158 characters of it.
+    Measured on a 20 Mbit value: 10.0 MB peak through this call, against 0.4 KB for the shifted
+    derivation. Pinned with an order of magnitude of headroom rather than tightly, because this
+    is a resource bound and the exact figure moves with allocator behaviour; what must not
+    survive is *proportional to the input*.
+    """
+    huge = 1 << 20_000_000  # built outside the traced region: only the preview is measured
+    items = [{"step": "compute", "status": "pending", "n": huge}]
+
+    tracemalloc.start()
+    try:
+        published = preview_value("items", items, PermissionPolicy(), list_marker=False)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1_000_000, f"the preview allocated {peak / 1e6:.1f} MB to publish 158 characters"
+    assert published[0]["n"] == {
+        "type": "int",
+        "preview": _reference_hex_preview(huge),
+        "truncated": True,
+    }
 
 
 def test_a_url_descriptor_is_bounded_on_started_exactly_as_on_the_events_beside_it() -> None:

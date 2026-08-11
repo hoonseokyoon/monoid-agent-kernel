@@ -606,6 +606,36 @@ def _int_spelling_exceeds(value: int, threshold: int) -> bool:
     return magnitude >= 10**digit_budget
 
 
+def _int_hex_preview(value: int, budget: int) -> str:
+    """The leading hex digits of ``value``, derived without ever spelling the whole number.
+
+    ``format(v, "#x")`` allocates a string linear in the bit length, and then all but ``budget``
+    bytes of it are thrown away. That is a preview whose cost is the size of the *input* rather
+    than of the output, inside event construction, on a route the refusing ingress boundaries do
+    not cover — ``update_plan`` normalizes without them, so a custom tool can nest a sparse big
+    integer in a plan item at almost no cost to itself. Measured on a 20 Mbit value: 10.0 MB peak
+    through ``preview_value`` against 0.4 KB for this derivation, and the ratio grows with the
+    input.
+
+    Shifting away the digits that would be discarded leaves exactly the retained ones, because a
+    right shift by ``4 * dropped`` removes ``dropped`` hex digits and CPython allocates only the
+    result. ``int.__index__`` first, so the arithmetic runs on a true ``int`` and a subclass's
+    ``__format__`` or ``bit_length`` is never consulted. The one allocation still proportional to
+    the input is negating a *negative* magnitude, which copies the integer but not the far larger
+    spelling; the value is already in memory, so this adds no order of growth.
+    """
+    numeric = int.__index__(value)
+    sign = "-" if numeric < 0 else ""
+    magnitude = -numeric if numeric < 0 else numeric
+    keep = budget - len(sign) - 2  # the budget also pays for the sign and the "0x"
+    if keep <= 0:
+        return truncate_to_bytes(f"{sign}0x", budget)
+    hex_digits = (magnitude.bit_length() + 3) // 4
+    if hex_digits > keep:
+        magnitude >>= 4 * (hex_digits - keep)
+    return f"{sign}0x{format(magnitude, 'x')[:keep]}"
+
+
 def _budgeted_field(key: str, value: Any, policy: PermissionPolicy, budget: PayloadBudget) -> Any:
     """One fixed-key builder field, with the refusal translated where the key must survive.
 
@@ -1040,7 +1070,7 @@ def _preview_value(
                 _payload_budget,
                 {
                     "type": "int",
-                    "preview": truncate_to_bytes(format(int.__index__(value), "#x"), budget),
+                    "preview": _int_hex_preview(value, budget),
                     "truncated": True,
                 },
             )
