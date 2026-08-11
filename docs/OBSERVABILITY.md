@@ -4,9 +4,10 @@ Every run emits a structured event stream and durable artifacts, and can mirror
 that stream to OpenTelemetry. This is the reference for the run-directory artifact
 set, custom event sinks, OTel tracing, live streaming, and metrics.
 
-The event stream carries metadata and bounded previews rather than content — with a
-short list of deliberate exceptions, stated under [What `events.jsonl` does and does
-not carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
+The event stream carries metadata and bounded previews rather than content — bounded
+per piece by the preview caps and per payload by one byte budget — with a short list
+of deliberate exceptions, stated under [What `events.jsonl` does and does not
+carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
 claim that the shipped defaults contradict.
 
 ## Outputs

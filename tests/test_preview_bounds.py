@@ -17,12 +17,15 @@ its twin.
 
 from __future__ import annotations
 
+import ast
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+import monoid_agent_kernel
 from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -919,3 +922,142 @@ def test_the_approval_surface_is_payload_bounded_too_just_far_higher() -> None:
 
     assert _payload_bytes(approval) <= APPROVAL_PAYLOAD_BYTE_BUDGET
     assert "truncated_keys" in approval
+
+
+# --------------------------------------------------------------------------------------
+# The budget's roots, read off the source rather than remembered
+# --------------------------------------------------------------------------------------
+
+_KERNEL_PACKAGE = Path(monoid_agent_kernel.__file__).resolve().parent
+
+_TRAVERSAL_ENTRIES = frozenset({"preview_value", "public_mapping"})
+"""The two entry points into the bounded traversal. ``_preview_value`` is the traversal's own
+recursion, reached only through them, so a call to either one is where a ``PayloadBudget`` is
+born or must be threaded."""
+
+_KNOWN_TRAVERSAL_ENTRY_OWNERS = frozenset(
+    {
+        ("core/tool_approval.py", "redact_tool_arguments"),
+        ("loop.py", "AgentToolContext.emit_artifact"),
+        ("loop.py", "AgentToolContext.update_plan"),
+        ("public_view.py", "_budgeted_field"),
+        ("public_view.py", "args_preview"),
+        ("public_view.py", "finish_args_preview"),
+        ("public_view.py", "public_event_payload"),
+        ("public_view.py", "public_job_artifact"),
+        ("public_view.py", "public_result_content"),
+    }
+)
+"""Every function in the kernel that enters the traversal, by file and outermost function.
+
+``shell_args_preview`` and ``web_args_preview`` are absent on purpose: they enter through
+``_budgeted_field``, whose signature makes the budget an argument the caller must produce.
+"""
+
+
+def _traversal_entry_sites() -> list[tuple[str, str, ast.Call]]:
+    """Every call to a traversal entry point in the kernel, with its owning function.
+
+    Matches ``ast.Attribute`` as well as ``ast.Name`` so a refactor to module-qualified calls
+    cannot leave this census silently green. Nested functions and lambdas attribute to their
+    outermost enclosing function, because that is the frame that owns the payload: the
+    ``public_result_content`` callback spending its builder's budget is one root, not two.
+    """
+
+    sites: list[tuple[str, str, ast.Call]] = []
+    for path in sorted(_KERNEL_PACKAGE.rglob("*.py")):
+        relative = path.relative_to(_KERNEL_PACKAGE).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                callee = func.id
+            elif isinstance(func, ast.Attribute):
+                callee = func.attr
+            else:
+                continue
+            if callee not in _TRAVERSAL_ENTRIES:
+                continue
+            chain: list[ast.AST] = []
+            cursor = parents.get(node)
+            while cursor is not None:
+                if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    chain.append(cursor)
+                cursor = parents.get(cursor)
+            chain.reverse()
+            named: list[str] = []
+            for scope in chain:
+                named.append(scope.name)
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+            sites.append((relative, ".".join(named) or "<module>", node))
+    return sites
+
+
+def test_every_traversal_entry_in_the_kernel_is_a_known_root() -> None:
+    """A new payload root must be classified by its author, not discovered by a review round.
+
+    A hand-kept root list is an enumeration of what its author remembered, and every hand-kept
+    census in this repository has fallen one generation behind the code. This one is read off the
+    source: adding a call to ``preview_value`` or ``public_mapping`` anywhere in the kernel adds
+    its owner here, and the ``==`` fails in both directions — a new root that nobody budgeted,
+    and a table entry whose root no longer exists, so the pins above it test nothing.
+
+    If this set grows: the new call site is a payload root or a builder's field. Decide which
+    surface it publishes to (trace or approval), thread or self-own a ``PayloadBudget``
+    accordingly, and only then extend the table.
+    """
+
+    found = {(relative, owner) for relative, owner, _call in _traversal_entry_sites()}
+
+    assert found == _KNOWN_TRAVERSAL_ENTRY_OWNERS
+
+
+def test_a_function_entering_the_traversal_twice_threads_one_budget() -> None:
+    """The reverted bound's first failure shape, pinned as a relation rather than a list.
+
+    ``PREVIEW_MAX_NODES`` was born per-top-level-key: each callback invocation started a fresh
+    allowance, and 400 keys times a bounded value was 42 MB of bounded values. The budget is
+    per payload precisely because it is created once and *threaded* — so a function that enters
+    the traversal more than once is assembling one payload, and every one of its entries must
+    name the budget it spends. A second entry without the keyword is a fresh wrapper-owned
+    budget: per-key accounting, reborn.
+
+    Single-entry functions may omit the keyword. There the wrapper self-owns a fresh budget,
+    which for a single-root payload *is* per-payload accounting.
+    """
+
+    by_owner: dict[tuple[str, str], list[ast.Call]] = {}
+    for relative, owner, call in _traversal_entry_sites():
+        by_owner.setdefault((relative, owner), []).append(call)
+
+    assert any(len(calls) > 1 for calls in by_owner.values()), (
+        "census self-check: no multi-entry function found, so the relation below matched nothing"
+    )
+
+    offenders = {
+        owner: [
+            call.lineno
+            for call in calls
+            if not any(
+                keyword.arg in ("_payload_budget", "payload_budget")
+                for keyword in call.keywords
+            )
+        ]
+        for owner, calls in by_owner.items()
+        if len(calls) > 1
+    }
+    offenders = {owner: lines for owner, lines in offenders.items() if lines}
+
+    assert not offenders, {
+        "sites": offenders,
+        "hint": "this function enters the traversal more than once but lets some entries "
+        "self-own a budget; each unthreaded entry restarts the allowance, which is the "
+        "per-key accounting the payload budget exists to end",
+    }

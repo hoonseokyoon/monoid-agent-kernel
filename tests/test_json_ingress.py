@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import json
 import math
+from pathlib import Path
 
 import pytest
 
+import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
     loads_json_ingress,
@@ -203,3 +206,103 @@ def test_tool_normalizers_preserve_custom_init_extension_types() -> None:
     assert spec.id == "custom.�"
     assert spec.description == "description�"
     assert spec.input_schema == {"example": "�"}
+
+
+# --------------------------------------------------------------------------------------
+# The refusing boundaries, read off the source rather than remembered
+# --------------------------------------------------------------------------------------
+
+_KERNEL_PACKAGE = Path(monoid_agent_kernel.__file__).resolve().parent
+
+_REFUSING_INGRESS_BOUNDARIES = frozenset(
+    {
+        ("loop.py", "AgentToolContext.emit_artifact"),
+        ("tasks.py", "TaskManager.start_task"),
+        ("tasks.py", "TaskManager.report_result"),
+        ("tools/base.py", "normalize_tool_result"),
+    }
+)
+"""The four Python-object ingress boundaries: the places a value reaches the normalizer without
+ever having crossed a JSON parse, so ``bytes`` and past-the-bound integers arrive alive."""
+
+
+def _normalize_json_ingress_call_sites() -> list[tuple[str, str, ast.Call]]:
+    """Every call to ``normalize_json_ingress`` in the kernel, with its owning function.
+
+    Matches ``ast.Attribute`` as well as ``ast.Name`` so a refactor to module-qualified calls
+    cannot leave this census silently green. Nested functions and lambdas attribute to their
+    outermost enclosing function.
+    """
+
+    sites: list[tuple[str, str, ast.Call]] = []
+    for path in sorted(_KERNEL_PACKAGE.rglob("*.py")):
+        relative = path.relative_to(_KERNEL_PACKAGE).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                callee = func.id
+            elif isinstance(func, ast.Attribute):
+                callee = func.attr
+            else:
+                continue
+            if callee != "normalize_json_ingress":
+                continue
+            chain: list[ast.AST] = []
+            cursor = parents.get(node)
+            while cursor is not None:
+                if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    chain.append(cursor)
+                cursor = parents.get(cursor)
+            chain.reverse()
+            named: list[str] = []
+            for scope in chain:
+                named.append(scope.name)
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+            sites.append((relative, ".".join(named) or "<module>", node))
+    return sites
+
+
+def test_the_refusing_ingress_boundaries_are_exactly_the_python_object_routes() -> None:
+    """``refuse_unportable_scalars=True`` appears at the four boundaries and nowhere else.
+
+    Every other caller keeps the default, because every other caller hands the normalizer values
+    that came off a bounded JSON parse — the decoders already refused what these boundaries
+    refuse, and widening the refusal there would convict values that cannot occur. The ``==``
+    fails in both directions. A new ``True`` site means a new Python-object ingress was opened:
+    it belongs in this table only together with the classified-error conversion the other four
+    carry, so the refusal stays a call failure and never a crash. A missing entry means a
+    boundary stopped refusing, and the run-death this closed — ``json.dumps`` raising at the
+    transcript write, ``run.failed`` with no observation — comes back.
+
+    Only a literal ``True`` counts as refusing: a site that grows a variable there drops out of
+    this set and must be re-classified by whoever made the flag conditional.
+    """
+
+    sites = _normalize_json_ingress_call_sites()
+    owners = {(relative, owner) for relative, owner, _call in sites}
+
+    assert ("core/json_ingress.py", "loads_json_ingress") in owners, (
+        "census self-check: the normalizer's own module no longer shows its known caller, "
+        "so this walk is not seeing what it claims to see"
+    )
+
+    refusing = {
+        (relative, owner)
+        for relative, owner, call in sites
+        if any(
+            keyword.arg == "refuse_unportable_scalars"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+    }
+
+    assert refusing == _REFUSING_INGRESS_BOUNDARIES
