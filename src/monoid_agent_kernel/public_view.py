@@ -530,7 +530,19 @@ def _fragment_cost(fragment: Any) -> int:
     inside 256 KiB arrive at 503,579 bytes out of the real frame writer, and near three times the
     ceiling for two-byte scripts and non-BMP codepoints: the same defect this module was
     corrected for once already, one level up — a bound measured in a representation the wire does
-    not use. Studio's spelling *is* this one, so no supported sink can exceed it.
+    not use.
+
+    What this dominates, exactly: every writer that spells a payload onto a stream or a log line
+    — ``events.jsonl``, both SSE frame writers, the HTTP JSON bodies — because Studio's
+    ``_sse_send`` *is* this spelling and the rest undercut it on one axis or the other. It does
+    not dominate ``write_json_atomic``, which pretty-prints ``status.json`` and the approval
+    package files with ``indent=2``: per-element indentation is a third axis, measured at 2.65x
+    the charge for a payload of many tiny elements. That is left as a stated reach rather than a
+    charged axis for two reasons — the indent cost depends on how deeply the payload is nested
+    inside its file, which is the writer's business and not knowable here, and indentation is a
+    bounded multiple of a bounded payload rather than the unbounded growth this budget exists to
+    stop. The claim is a ceiling on what a subscriber receives, not on what a pretty-printer
+    writes to the operator's disk.
 
     Escaped output is ASCII, so its character count is its byte count. The scalar tail envelopes
     everything portable JSON cannot spell before it gets here, so the ``-1`` escape survives only

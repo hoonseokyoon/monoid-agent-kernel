@@ -18,13 +18,19 @@ out in commit messages and here.
   is no aggregate budget, so the caps can be walked around by chunking" closes because the
   cap-obeying pieces still pass and their sum no longer does. The budget is charged on
   serialized output — quoted keys, preview envelopes and truncation markers included — in the
-  widest spelling any sink uses: default separators and `ensure_ascii=True`, because the SSE
+  widest spelling any *stream* writer uses: default separators and `ensure_ascii=True`, because the SSE
   writers escape non-ASCII on purpose (U+2028/U+2029/U+0085 split a frame mid-string otherwise)
   and an escaped BMP character costs six bytes however few it takes in UTF-8. Charging UTF-8
   would bound a representation no live subscriber receives — measured, a payload charged just
   inside the ceiling reached 503,579 bytes out of the real frame writer, and close to three
   times the ceiling for two-byte scripts and non-BMP codepoints. That is the same defect this
-  module was corrected for once before, one level up. It is charged this way because
+  module was corrected for once before, one level up. The ceiling is therefore a statement about
+  what a subscriber receives: `events.jsonl`, both SSE writers and the HTTP bodies are all
+  dominated by this charge, while `write_json_atomic`'s pretty-printed `status.json` and approval
+  files add per-element indentation on top — 2.65× the charge for a payload of many tiny
+  elements, a bounded multiple of a bounded payload rather than a growth axis, and not charged
+  here because the indent cost depends on how deeply each writer nests the payload in its file.
+  It is charged this way because
   the reverted `PREVIEW_MAX_NODES` proved both halves the hard way: it counted visited nodes
   instead of bytes (912 KB of markers lived outside the count), and it was born once per
   top-level key, so 400 keys still cost 42 MB. One `PayloadBudget` per payload: 256 KiB on the

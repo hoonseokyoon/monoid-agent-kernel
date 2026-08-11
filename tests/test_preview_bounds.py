@@ -727,11 +727,13 @@ def _payload_bytes(published: Any) -> int:
 
 
 def _widest_payload_bytes(published: Any) -> int:
-    """The payload as the widest sink spells it: non-ASCII escaped, default separators.
+    """The payload as the widest *stream* writer spells it: non-ASCII escaped, default separators.
 
-    ``reference.studio``'s ``_sse_send`` serializes exactly this way, and
-    ``EventSubscriptionFrame.to_sse`` differs only by compact separators, so no supported sink
-    can spell a payload larger than this.
+    ``reference.studio``'s ``_sse_send`` serializes exactly this way and
+    ``EventSubscriptionFrame.to_sse`` differs only by compact separators, so no writer that puts
+    a payload on a stream or a log line can spell it larger. ``write_json_atomic``'s
+    pretty-printed ``status.json`` and approval files are outside this measure by design — see
+    ``_fragment_cost``, which states that reach.
     """
     return len(json.dumps(published).encode("utf-8"))
 
