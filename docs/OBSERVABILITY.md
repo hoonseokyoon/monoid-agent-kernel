@@ -119,7 +119,8 @@ Not carried:
   answer) are listed under "Carried, deliberately" below — read that list rather than counting
   exceptions here.
 - **A value the previews cannot spell is named by its type, and that name is bounded too** — 64
-  characters, in the `{"truncated": true, "type": …}` and `{"redacted": true, "type": …}` markers
+  bytes in the escaped spelling the budget is charged in, so the bound does not depend on the script
+  the name is written in, in the `{"truncated": true, "type": …}` and `{"redacted": true, "type": …}` markers
   and in the `type` field of `run.failed` and `failure.json`. A class name is legal at any length,
   and two of these markers are published where the budget cannot refuse them, so the name was the
   one unbounded term in a bounded payload. The name is read off the type's own slot rather than

@@ -128,7 +128,18 @@ def exact_text(value: Any) -> str:
 
 
 _BASE_TYPE_NAME = type.__dict__["__name__"].__get__
-TYPE_NAME_MAX_CHARS = 64
+TYPE_NAME_MAX_ESCAPED_BYTES = 64
+
+
+def _escaped_cost(text: str) -> int:
+    """The bytes ``text`` costs where it is charged: escaped, without the quotes.
+
+    The payload accountant prices a fragment the way the *widest* sink spells it, non-ASCII
+    escaped, so this is the unit a bound on published text has to be written in. Escaping is
+    per-character with no context, so a per-character cost sums to the whole string's.
+    """
+
+    return len(json.dumps(text, ensure_ascii=True).encode("utf-8")) - 2
 
 
 def portable_class_name(cls: type) -> str:
@@ -146,11 +157,16 @@ def portable_class_name(cls: type) -> str:
       (``type_set_name`` checks ``PyUnicode_Check``, which admits subclasses, and stores the object
       it was given). Without it the base slot only moves the question from the metaclass to the name
       object: measured, a name whose ``__str__`` raises still took down the f-string that used it.
-    * The character cap, because a class name is legal at any length. Measured: a 1,000,000-character
+    * The cap, because a class name is legal at any length. Measured: a 1,000,000-character
       name published a 1,000,038-byte payload against a 262,144-byte ceiling — 3.8× — through the
       two fallbacks that publish it uncharged, and it made an unbounded ``error_code`` and a
-      1,000,077-character ``tool.call.failed.error``. 64 characters is over four times the longest
-      name this repository defines, and bounds the field at 256 bytes.
+      1,000,077-character ``tool.call.failed.error``. The cap is in **escaped bytes**, the unit the
+      accountant charges in, and not in characters: written in characters it was no bound at all on
+      the surface that pays for it, because a 64-character Hangul name costs 415 bytes where the
+      same length of ASCII costs 95 — measured, 4.4×, and multiplied by every sibling fallback a
+      fixed-field builder emits after exhaustion, which spend through `charge_marker` and so are
+      deducted unconditionally. 64 bytes leaves every ASCII name this repository defines untouched
+      (the longest is under a quarter of it) and prices every script the same.
 
     No ``try``/``except`` and no non-``str`` arm: with ``cls`` coming from ``type(value)`` there is
     nothing here that can raise. 5,759 distinct type objects were swept — every stdlib and kernel
@@ -161,7 +177,18 @@ def portable_class_name(cls: type) -> str:
     person and is never exercised.
     """
 
-    return exact_text(_BASE_TYPE_NAME(cls))[:TYPE_NAME_MAX_CHARS]
+    name = exact_text(_BASE_TYPE_NAME(cls))
+    if _escaped_cost(name) <= TYPE_NAME_MAX_ESCAPED_BYTES:
+        return name
+    kept: list[str] = []
+    spent = 0
+    for character in name:
+        cost = _escaped_cost(character)
+        if spent + cost > TYPE_NAME_MAX_ESCAPED_BYTES:
+            break
+        kept.append(character)
+        spent += cost
+    return "".join(kept)
 
 
 def portable_type_name(value: Any) -> str:

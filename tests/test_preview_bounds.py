@@ -64,6 +64,8 @@ from monoid_agent_kernel.public_view import (
     REDACTED_PATH,
     TRACE_PAYLOAD_BYTE_BUDGET,
     PayloadBudget,
+    _budgeted_field,
+    _fragment_cost,
     TRUNCATION_SUFFIX,
     args_preview,
     finish_args_preview,
@@ -1949,3 +1951,35 @@ def test_a_container_that_answers_for_its_own_type_name_is_capped_anyway() -> No
         isinstance(item, dict) and item.get("circular") is True and type(item["type"]) is str
         for item in inner
     ), inner
+
+
+def test_a_type_name_costs_the_same_bound_in_every_script() -> None:
+    """The cap was written in characters and the budget is charged in bytes.
+
+    `_fragment_cost` measures the way the widest sink spells a fragment -- default separators,
+    non-ASCII escaped -- so a 64-character Hangul name costs 415 bytes where the same length of
+    ASCII costs 95. Capping by characters is not a bound on the surface that pays for it; this is
+    the third time this repository has published a byte ceiling measured in the wrong unit.
+
+    The cumulative arm matters because these fallback markers spend through `charge_marker`, which
+    deducts unconditionally the way a marker must: whatever a fixed-field builder emits after
+    exhaustion, one script must not buy more of it than another.
+    """
+    ceiling = _fragment_cost({"truncated": True, "type": "z" * 64})
+    policy = PermissionPolicy()
+
+    for script in ("\ud55c", "\u6f22", "\U0001f600"):  # Hangul, CJK, astral (a surrogate pair)
+        hostile = type(script * 64, (), {})()
+        published = preview_value("n", hostile, policy)
+        assert _fragment_cost(published) <= ceiling, (script, _fragment_cost(published))
+        assert _fragment_cost(redacted_value(hostile)) <= ceiling, script
+
+    def terminal_spend(script: str) -> int:
+        """What a builder's fixed fields spend once the regular budget is gone."""
+        budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+        budget.remaining = 0
+        for index in range(13):
+            _budgeted_field(f"f{index}", type(script * 64, (), {})(), policy, budget)
+        return -budget.remaining
+
+    assert terminal_spend("\ud55c") <= terminal_spend("z"), "a non-ASCII name buys more marker"
