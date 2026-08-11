@@ -23,7 +23,7 @@ from __future__ import annotations
 import copy
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
@@ -494,6 +494,59 @@ def is_valid_idempotency_key(value: Any) -> bool:
     """
 
     return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+
+
+RECORDED_DIGEST_BODY = r"[0-9a-f]{64}"
+"""What a recorded content digest may be spelled as, once, so its enforcers cannot drift.
+
+Same argument as ``_IDEMPOTENCY_KEY_BODY`` above, one field family over: ``core/schemas.py``
+states this rule to ``monoid validate`` (both of its digest pattern forms compose this body),
+and ``model_call_record`` states it to a receipt being minted into a ledger line (W7-4). The
+producers already hold the shape by construction -- every digest here is hex SHA-256 output --
+so the spelling exists for values a producer did not mint: a receipt loaded from foreign JSON,
+whose reader deliberately transports what it was given. (``model_payloads.is_chunk_sha256``
+states its own 64-hex rule on purpose and is not a projection of this one: a chunk reference
+becomes a *filename*, so that check is a path-safety boundary every reader re-establishes,
+with its own reasons written beside it.)
+"""
+
+RECORDED_DIGEST_PATTERN = re.compile(rf"{RECORDED_DIGEST_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+
+def is_recorded_digest(value: Any) -> bool:
+    """Whether ``value`` is a digest in hand: exactly 64 lowercase hex characters.
+
+    Empty is *not* valid here, the same line ``is_valid_idempotency_key`` draws: absence is
+    the in-band empty string on every optional-digest field, a status field says why, and
+    each caller states what absence means where it stands -- the ledger's mint guard admits
+    it (a refused call's line is empty and explained), a caller comparing two digests in
+    hand does not.
+    """
+
+    return isinstance(value, str) and RECORDED_DIGEST_PATTERN.fullmatch(value) is not None
+
+
+def is_absent_or_valid(value: Any, is_valid: Callable[[Any], bool]) -> bool:
+    """Whether ``value`` is this repo's in-band absence -- the empty string -- or something
+    ``is_valid`` certifies. Judged without consulting the object's own opinion of itself.
+
+    Type before value, the rule ``_validate_counts`` states one field family over: a
+    comparison asks the *value*, and a value may answer. A guard spelling the absence arm as
+    ``value != ""`` is False for a ``str`` subclass whose ``__ne__`` returns False, so the
+    pattern check behind it never runs -- while ``json.dumps`` and an HTTP header both go on
+    reading the underlying string, which is exactly the value the guard existed to refuse.
+    Requiring the exact ``str`` type first makes the emptiness comparison and the pattern the
+    string's own answers, and refuses every non-string in the same breath.
+
+    Both boundaries that admit an empty spelling ask through here -- the ledger mint in
+    ``core/model_calls.py`` and request ingress in ``providers/base.py`` -- so the rule cannot
+    hold at one and drift at the other. The positive-gate callers (``providers/gateway.py``,
+    the reference gateway's header reader) need nothing: asking ``is_valid`` directly never
+    consults equality, and they omit what they cannot certify rather than raising.
+    """
+
+    return type(value) is str and (value == "" or is_valid(value))
 
 
 def destination_digest(value: str) -> str:
@@ -1073,8 +1126,10 @@ class ModelCallReceipt:
     destination_status: str = "not_reached"
     destination_digest: str = ""
     # One entry per kernel dispatch, in order. Empty on receipts written before the field
-    # existed and on refused calls (``attempts == 0``); otherwise one entry per attempt, so the
-    # log is either absent or complete. Both halves of "complete" are enforced below rather
+    # existed, on refused calls (``attempts == 0``), and on any receipt a caller builds
+    # without one -- the empty arm is not reserved for zero dispatches, which is why neither
+    # wire reader may treat an empty log beside a positive ``attempts`` as impossible.
+    # Otherwise one entry per attempt, so the log is either absent or complete. Both halves of "complete" are enforced below rather
     # than left to the writer: the indices are ``1..attempts`` in order (a log naming some
     # attempts twice and others not at all could not answer the question it exists for, and
     # counting alone cannot tell the two apart), and the entries' usage sums to this receipt's
@@ -1109,7 +1164,11 @@ class ModelCallReceipt:
         # "Exactly once" is the claim, so the indices carry it rather than the count. A length
         # check accepts a log of the right size naming one dispatch twice and another not at
         # all -- well-formed in every other field, and unanswerable for the question the log
-        # exists for, with nothing in the record to say so.
+        # exists for, with nothing in the record to say so. The empty half of the rule has a
+        # wire side this constructor cannot see -- absence and ``[]`` parse to the same tuple
+        # -- and neither reader tries to: both spellings mean an unitemized call, the second
+        # because every build before W7-4 wrote it for exactly that. Only the writers
+        # converged; see ``to_json``.
         if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
             range(1, self.attempts + 1)
         ):
@@ -1276,7 +1335,7 @@ class ModelCallReceipt:
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "context": self.context.to_json(),
             "model": self.model.to_json(),
             "provider_name": self.provider_name,
@@ -1298,11 +1357,21 @@ class ModelCallReceipt:
             "digest_status": self.digest_status,
             "destination_status": self.destination_status,
             "destination_digest": self.destination_digest,
-            # Always emitted, even one-entry and empty — absence means exactly one thing, a
-            # writer that predates the field, rather than doubling as "nothing noteworthy".
-            "attempt_log": [entry.to_json() for entry in self.attempt_log],
             "idempotency_key": self.idempotency_key,
         }
+        # Emitted only when there is something to itemize. Presence IS the claim -- one entry
+        # per dispatch, indices ``1..attempts`` -- so this writer gives an empty log no
+        # spelling of its own: absence covers a record that predates the field, a call with
+        # zero dispatches, and a receipt built without a log, which coincide in every readable
+        # fact. Emitting ``[]`` unconditionally gave that one value a second spelling and made
+        # a parsed pre-field receipt come back wearing it. The readers still accept both --
+        # every build before this one wrote ``[]`` for an empty log, at whatever ``attempts``
+        # the receipt carried, and those lines are honest records of unitemized calls.
+        # ``idempotency_key`` above keeps the opposite rule on purpose: its absence spelling
+        # is the in-band empty string, so the key itself always travels.
+        if self.attempt_log:
+            payload["attempt_log"] = [entry.to_json() for entry in self.attempt_log]
+        return payload
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
@@ -1316,7 +1385,16 @@ class ModelCallReceipt:
         # Absent on every receipt written before this field existed, which is legal and reads
         # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,
         # like every other field here. A present log of the wrong length is refused by
-        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb.
+        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb. A
+        # present-but-EMPTY log is read, not refused, at every ``attempts`` count: it is the
+        # spelling every build before W7-4 gave an unitemized call, because ``to_json``
+        # emitted the key unconditionally and an empty log is a legal receipt at any count
+        # (empty *or* complete — the empty arm was never reserved for refused calls). The
+        # runner never wrote that pair, but the runner is not the only writer: a receipt
+        # handed straight to ``AgentRecorder.record_settled_call`` carries whatever log it
+        # was built with, and the default is none. Refusing it here would convict the lines
+        # the previous build wrote through its own public API. The convergence W7-4 makes is
+        # the writer's alone (see ``to_json``): one spelling produced, both still read.
         raw_attempt_log = payload.get("attempt_log")
         if raw_attempt_log is None:
             attempt_log: tuple[ModelCallAttempt, ...] = ()

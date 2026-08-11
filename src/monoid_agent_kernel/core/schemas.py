@@ -39,6 +39,7 @@ from monoid_agent_kernel.core.model_io import (
     DIGEST_STATUSES,
     IDEMPOTENCY_KEY_JSON_PATTERN,
     MAX_MODEL_PAYLOAD_BYTES,
+    RECORDED_DIGEST_BODY,
 )
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -50,11 +51,15 @@ TIMESTAMP_PATTERN = rf"Z{END_OF_INPUT}"
 EVENT_TYPE_PATTERN = rf"^[a-z]+(\.[a-z_]+)+{END_OF_INPUT}"
 """A dotted lowercase event name, whole and nothing after it."""
 
-SHA256_PATTERN = rf"^[0-9a-f]{{64}}{END_OF_INPUT}"
+SHA256_PATTERN = rf"^{RECORDED_DIGEST_BODY}{END_OF_INPUT}"
 """A digest that must be present."""
 
-OPTIONAL_SHA256_PATTERN = rf"^(|[0-9a-f]{{64}}){END_OF_INPUT}"
-"""A digest that may not have been issued, where empty is the recorded spelling of absence."""
+OPTIONAL_SHA256_PATTERN = rf"^(|{RECORDED_DIGEST_BODY}){END_OF_INPUT}"
+"""A digest that may not have been issued, where empty is the recorded spelling of absence.
+
+Both forms compose the one body ``core/model_io.py`` owns (W7-4), the way the idempotency-key
+forms do: these schema patterns and the ledger's mint guard are enforcers of one rule, and a
+retyped twin regex is how enforcers drift."""
 
 
 EVENT_SCHEMA: dict[str, Any] = {
@@ -1085,9 +1090,11 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
         "digest_generation": {"type": "string"},
         "digest_status": {"enum": list(DIGEST_STATUSES)},
-        # Declared and not required, the ``attempt_log`` rule: the writer always emits it, so
-        # absence on a line means exactly one thing -- a writer that predates the field -- and
-        # ``validate_run_dir`` keeps passing directories pre-W7-3 writers filled.
+        # Declared and not required: the writer always emits it -- the in-band empty string
+        # is its absence spelling -- so absence on a line means exactly one thing, a writer
+        # that predates the field, and ``validate_run_dir`` keeps passing directories
+        # pre-W7-3 builds filled. (``attempt_log`` below spells absence by omitting the key
+        # instead; the asymmetry is each field's own rule.)
         #
         # Format-constrained like the two digests beside it rather than left an open string:
         # this key is a token the kernel MINTS to a closed shape, not an open vocabulary a
@@ -1102,10 +1109,14 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "latency_ms": {"type": "integer", "minimum": 0},
         "attempts": {"type": "integer", "minimum": 0},
-        # Declared but not required: the sweep validator reads ledgers v0.20 writers filled,
-        # and absence means exactly one thing -- a writer that predates the field. A present
-        # entry is written whole or refused: the closed shape is the record's own rule, one
-        # level down.
+        # Declared but not required: the sweep validator reads ledgers earlier v0.21 builds
+        # filled, and absence means nothing was itemized -- a writer that predates the field,
+        # a refused call that never dispatched, or a receipt built without a log (this writer
+        # omits an empty log; the ones before it spelled the same value ``[]``, which stays
+        # legal and is why no ``minItems`` appears here). What a JSON Schema cannot state is
+        # how a *non-empty* log stands to the line around it, which is
+        # ``_validate_model_call_attempt_logs``'s job. A present entry is written whole or
+        # refused: the closed shape is the record's own rule, one level down.
         "attempt_log": {
             "type": "array",
             "items": {
@@ -1704,7 +1715,7 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
 
 
 def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
-    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, and to
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes and to
     the one rule its entries owe each other.
 
     A JSON Schema validates every entry against its own shape and can say nothing about how one
@@ -1730,8 +1741,12 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
 
     The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
     (manifest against workspace index, proposal against its hashes, settled text against its
-    digests, payload records against their keys). Absence is still legal: a line with no
-    ``attempt_log`` is a v0.20 writer's, which makes no claim there is anything to check.
+    digests, payload records against their keys). An unitemized log makes no claim to check,
+    in either of its two spellings: absence, which is what this build writes and what every
+    record predating the field carries, and a present ``[]``, which is what builds between
+    W7-1 and W7-4 wrote for the same value at whatever ``attempts`` the receipt held. Both
+    are read as "nothing itemized" and neither is reported -- the claims below are about the
+    entries a log actually names.
     """
     try:
         raw = path.read_bytes()
@@ -1751,13 +1766,22 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
         if not isinstance(record, dict):
             continue
         entries = record.get("attempt_log")
-        if not isinstance(entries, list) or not entries:
+        if not isinstance(entries, list):
             continue  # absent, or shape the schema already refused
-        if not all(isinstance(entry, dict) for entry in entries):
-            continue  # shape is the schema's job
         label = f"{path.name}:{index}"
         attempts = record.get("attempts")
-        if isinstance(attempts, int) and not isinstance(attempts, bool):
+        counted = isinstance(attempts, int) and not isinstance(attempts, bool)
+        if not entries:
+            # Nothing to relate, at any count. ``[]`` is what every build before W7-4 wrote
+            # for an empty log -- the projection emitted the key unconditionally, and a
+            # receipt without entries is legal at any ``attempts`` -- so the count beside it
+            # says nothing about the writer. Reporting the positive-count arm would convict
+            # directories the previous build filled while certifying the zero arm written by
+            # the same line of code.
+            continue
+        if not all(isinstance(entry, dict) for entry in entries):
+            continue  # shape is the schema's job
+        if counted:
             named = [entry.get("index") for entry in entries]
             if named != list(range(1, attempts + 1)):
                 issues.append(

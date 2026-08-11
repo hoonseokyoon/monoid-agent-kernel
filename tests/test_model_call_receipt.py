@@ -283,12 +283,20 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
 
     `test_json_round_trip_preserves_every_field` builds a receipt by construction, so a field
     added without touching it round-trips at its default and the test passes without covering it.
-    This reads the dataclass instead: every declared field must appear in the wire shape, and the
-    round trip above must set each one to something other than its default.
+    This reads the dataclass instead: every declared field must appear in the wire shape -- on
+    a receipt that has something to say in every field -- and the round trip above must set
+    each one to something other than its default. Two arms since W7-4, the entry's own
+    two-generation rule one level up: a receipt that itemized its dispatches names every
+    declared field, and one with nothing to itemize omits exactly ``attempt_log`` -- absence
+    is the one spelling this writer gives an unitemized call, and the ``[]`` its predecessor
+    wrote for the same value is now only read, never produced. ``idempotency_key`` stays in
+    both arms: its absence spelling is the in-band empty string, not a missing key.
     """
 
     declared = {field_.name for field_ in fields(ModelCallReceipt)}
-    assert set(ModelCallReceipt().to_json()) == declared
+    itemized = ModelCallReceipt(attempts=1, attempt_log=(ModelCallAttempt(index=1),))
+    assert set(itemized.to_json()) == declared
+    assert set(ModelCallReceipt().to_json()) == declared - {"attempt_log"}
 
     source = inspect.getsource(test_json_round_trip_preserves_every_field)
     missing = sorted(name for name in declared if f"{name}=" not in source)
@@ -296,6 +304,64 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
         "never_exercised_by_the_round_trip": missing,
         "hint": "a field the enumeration does not name is a field it does not cover",
     }
+
+
+def test_a_pre_field_receipt_re_serializes_as_what_it_is() -> None:
+    """A parsed legacy receipt must not come back wearing the new writer's spelling.
+
+    ``to_json`` used to emit ``attempt_log`` unconditionally, so a pre-field receipt -- absent
+    key beside ``attempts: 3`` -- re-serialized as ``[]``: a second spelling of a value that
+    already had one, which is precisely the distinction W7-1 claimed absence carried and no
+    reader could use. The round trip has to keep "written before the field existed"
+    expressible, the same rule ``backoff_ms`` states one level down."""
+
+    legacy = {
+        key: value
+        for key, value in ModelCallReceipt(attempts=3).to_json().items()
+        if key != "attempt_log"
+    }
+
+    restored = ModelCallReceipt.from_json(legacy)
+
+    assert restored.attempts == 3
+    assert restored.attempt_log == ()
+    assert "attempt_log" not in restored.to_json()
+    assert ModelCallReceipt.from_json(restored.to_json()) == restored
+
+
+def test_the_previous_writers_empty_log_reads_as_the_call_it_always_spelled() -> None:
+    """``[]`` is a spelling an earlier build produced, not a forgery to refuse.
+
+    Until W7-4 ``to_json`` emitted ``attempt_log`` unconditionally, and ``attempts`` defaults
+    to 1 -- so every receipt built without a log carried ``[]`` beside a positive count, and
+    the public seam writes exactly that:
+    ``AgentRecorder.record_settled_call(SettledModelCall(receipt=ModelCallReceipt()))``, no
+    runner involved. The runner is why the pair once read as unproducible -- it fills one
+    entry per dispatch on every terminal path -- but the runner is not the only writer, and
+    an unitemized log beside a positive count is a legal *receipt*: ``attempt_log`` is empty
+    or complete, and its empty arm was never reserved for refused calls. Refusing the pair
+    here would convict the lines the previous build wrote through its own public API.
+
+    So the reader keeps reading both spellings as the one value they always meant, and the
+    convergence is the writer's alone: whatever spelling comes in, what goes back out is
+    absence."""
+
+    for payload, attempts in (
+        # What the previous build wrote for a default receipt -- the Codex R1 line.
+        ({"attempts": 1, "attempt_log": []}, 1),
+        # An absent ``attempts`` reads as 1, which is what older records mean.
+        ({"attempt_log": []}, 1),
+        ({"attempts": 2, "attempt_log": []}, 2),
+        # The refused call, whose zero dispatches the same writer also spelled ``[]``.
+        ({"attempts": 0, "attempt_log": []}, 0),
+        # And absence, the spelling this build produces for every one of them.
+        ({"attempts": 2}, 2),
+    ):
+        restored = ModelCallReceipt.from_json(payload)
+
+        assert restored.attempts == attempts
+        assert restored.attempt_log == ()
+        assert "attempt_log" not in restored.to_json()
 
 
 def test_an_attempt_entry_round_trips_and_refuses_impossible_counts() -> None:
@@ -451,10 +517,11 @@ def test_the_first_dispatch_records_no_wait_before_it() -> None:
 def test_a_legacy_receipt_without_an_attempt_log_still_reads() -> None:
     """Absent on every receipt written before the field existed, which is legal and reads as
     an empty log beside an intact `attempts` count; present-but-mistyped is refused, like
-    every other field here."""
+    every other field here. Since W7-4 the writer itself spells an unitemized call this way,
+    so the keyless payload below is the legacy shape and the current one at once."""
 
     payload = ModelCallReceipt(attempts=3).to_json()
-    del payload["attempt_log"]
+    assert "attempt_log" not in payload
 
     restored = ModelCallReceipt.from_json(payload)
 

@@ -16,7 +16,7 @@ from monoid_agent_kernel.core.spec import (
     validate_generation_config,
     validate_reasoning_config,
 )
-from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+from monoid_agent_kernel.core.model_io import is_absent_or_valid, is_valid_idempotency_key
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -822,14 +822,20 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     # says so. The runner mints its own key AFTER this call, so a run-driven request never
     # reaches this branch; it exists for the direct integrator who builds the request.
     idempotency_key = request.idempotency_key
-    # ``!= ""`` and not truthiness: the EMPTY STRING is what spells absence on this field, and
-    # it is the only thing that does. A truthiness pre-filter also waved through ``None``,
-    # ``False``, ``0``, ``0.0``, ``[]`` and ``{}`` -- a caller who supplied something, which
-    # then reached a transport that omits what it cannot validate, so the key silently
-    # vanished instead of being refused. Same absence-vs-value conflation this field has now
-    # produced at three types: ``null`` read as a missing key on the wire, a present-empty
-    # container read as a missing log, and now every falsy value read as a missing token.
-    if idempotency_key != "" and not is_valid_idempotency_key(idempotency_key):
+    # The EMPTY STRING is what spells absence on this field, and it is the only thing that
+    # does. A truthiness pre-filter also waved through ``None``, ``False``, ``0``, ``0.0``,
+    # ``[]`` and ``{}`` -- a caller who supplied something, which then reached a transport
+    # that omits what it cannot validate, so the key silently vanished instead of being
+    # refused. Same absence-vs-value conflation this field has now produced at three types:
+    # ``null`` read as a missing key on the wire, a present-empty container read as a missing
+    # log, and every falsy value read as a missing token. Asked through
+    # ``is_absent_or_valid`` rather than spelled as ``!= ""`` here, because that comparison is
+    # a question the value may answer: a ``str`` subclass whose ``__ne__`` returns False
+    # walked past this branch, and its underlying string went on to the transport this branch
+    # exists to keep it away from -- the fourth type, and the first one that was a string.
+    # The ledger mint had the same shape and the same hole; the rule lives in one body now,
+    # so neither boundary can drift from the other.
+    if not is_absent_or_valid(idempotency_key, is_valid_idempotency_key):
         raise ValueError(
             "model request idempotency_key must be 1-128 ASCII characters from "
             "[A-Za-z0-9._+-] starting with a letter or digit"

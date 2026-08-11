@@ -832,6 +832,72 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
     assert [client.closed for client in built] == [True]
 
 
+def test_the_kernel_key_is_never_presented_to_the_openai_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CONTRACTS: only the gateway transport presents `Idempotency-Key`; "the OpenAI adapter
+    does not read the field, so nothing is sent there." Stated since W7-3 and checked by
+    nothing until now -- the documented-rule-nobody-enforces shape three W7-2 review rounds
+    kept finding. Scoped to the KERNEL's token: the SDK may run idempotency machinery of its
+    own and this pin says nothing about it, only that the value the runner minted reaches no
+    argument the adapter hands the SDK. Three pins close the claim together: this capture
+    (the dispatch kwargs), the exact `with_options` equality below (`{"max_retries": 0}` and
+    nothing else), and the AST census that every SDK call sits on `_call_client`."""
+    pytest.importorskip("openai")  # the dispatch path imports the SDK; skip on a minimal install
+
+    sentinel = "idem_" + "cafe" * 8
+    seen: list[dict[str, Any]] = []
+
+    class _RefusalAfterCapture(Exception):
+        # The 400 shape the classifier already maps (its own test above): the pin needs the
+        # dispatch kwargs, not a parseable success body, so the cheapest settled outcome ends
+        # the call right after the capture.
+        def __init__(self) -> None:
+            super().__init__("refused after capture")
+            self.status_code = 400
+            self.body = {"code": "unsupported_value"}
+
+    class _CapturingRawCalls:
+        def create(self, **kwargs):  # noqa: ANN003, ANN202
+            seen.append(kwargs)
+            raise _RefusalAfterCapture()
+
+    class _CapturingResponses:
+        with_raw_response = _CapturingRawCalls()
+
+    _stub_openai(monkeypatch, "OpenAI", _CapturingResponses())
+    adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(
+        instruction="hi", system_prompt="", tools=(), idempotency_key=sentinel
+    )
+
+    with pytest.raises(ModelAdapterError):
+        adapter.next_turn(request)
+
+    assert request.idempotency_key == sentinel  # the field was there to leak
+    assert seen, "the dispatch never reached the SDK stub"
+    assert sentinel not in repr(seen), "the kernel's key reached an SDK argument"
+
+
+def test_the_openai_adapter_never_reads_the_idempotency_field() -> None:
+    """The mechanism behind the pin above, checkable without the SDK installed: "the OpenAI
+    adapter does not read the field" (CONTRACTS). An adapter that never names the field
+    cannot present it -- the payload is hand-listed, not serialized off the request -- so
+    this source census is the half of the claim that runs on a minimal install, where the
+    capture pin above skips. A future edit that starts reading the field fails here first
+    and has to argue with the contract sentence it contradicts."""
+
+    import inspect
+
+    import monoid_agent_kernel.providers.openai as openai_module
+
+    source = inspect.getsource(openai_module)
+    assert "idempotency" not in source.lower(), (
+        "the OpenAI adapter names the idempotency field; CONTRACTS says only the gateway "
+        "transport presents it"
+    )
+
+
 # --- Client ownership: the adapter must not leak its HTTP connection pool --------------
 #
 # Driven against a local stand-in with the real SDK over a real socket, because the property is

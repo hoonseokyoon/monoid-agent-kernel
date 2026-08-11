@@ -23,7 +23,7 @@ import ast
 import inspect
 import json
 import textwrap
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -227,19 +227,32 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
     real record; a writer key the schema does not declare fails every record too, just later.
 
     ``required`` is two explicit keys short of ``properties``: ``validate_run_dir`` sweeps run
-    directories that earlier writers filled, and requiring ``attempt_log`` would fail every ledger
-    written before that field existed, just as requiring ``idempotency_key`` would fail every
-    line a pre-W7-3 v0.21 build wrote. The writer still always emits both -- the ``set(record)``
-    equality above is the writer-side pin -- so absence keeps meaning exactly one thing, a
-    writer that predates the field. The optional set is pinned exactly: a future key cannot
-    slip into it without arguing with this test.
+    directories that earlier v0.21 builds filled, and requiring ``attempt_log`` would fail every
+    ledger written before that field existed, just as requiring ``idempotency_key`` would fail
+    every line a pre-W7-3 build wrote. The two optional keys spell absence differently, and the
+    asymmetry is deliberate: ``idempotency_key`` is always emitted, with the in-band empty
+    string for "never keyed", while ``attempt_log`` is emitted only when there is something to
+    itemize -- an empty log's one wire spelling is absence. So the maximal record here carries
+    an itemized log and names every declared key, and the zero-dispatch record omits exactly
+    that one. The optional set is pinned exactly: a future key cannot slip into it without
+    arguing with this test.
     """
+    from monoid_agent_kernel.core.model_io import ModelCallAttempt
+
+    itemized = _record(
+        attempts=1,
+        attempt_log=(
+            ModelCallAttempt(index=1, usage={"input_tokens": 12, "output_tokens": 3}),
+        ),
+    )
     record = _record()
 
-    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
+    assert set(itemized) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
+    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - {"attempt_log"}
     assert set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - set(
         MODEL_CALLS_RECORD_SCHEMA["required"]
     ) == {"attempt_log", "idempotency_key"}
+    assert _errors(itemized) == []
     assert _errors(record) == []
     assert record["schema_version"] == MODEL_CALLS_SCHEMA_VERSION
     assert record["kind"] == MODEL_CALL_KIND
@@ -277,9 +290,14 @@ def test_the_ledger_accepts_a_key_the_kernel_could_have_issued(key: str) -> None
 def test_the_ledger_refuses_a_key_no_issuer_could_have_minted(key: str) -> None:
     """``monoid validate`` certifies imported and third-party directories, so a line whose key
     the rest of the kernel would refuse must not be certified here either. Before this pattern
-    the field was an open string and every one of these validated clean."""
+    the field was an open string and every one of these validated clean.
 
-    assert _errors(_record(idempotency_key=key))
+    The line is forged onto the record dict rather than driven through ``_record``, because
+    since W7-4 the mint refuses to build it (its own pin below) -- and the schema's refusal
+    must hold for lines that never met our mint at all, which is exactly the third-party case
+    this test exists for."""
+
+    assert _errors({**_record(), "idempotency_key": key})
 
 
 def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() -> None:
@@ -326,7 +344,9 @@ def test_the_ledgers_key_pattern_is_derived_from_the_rule_the_kernel_enforces() 
     for body in bodies:
         for suffix in suffixes:
             candidate = body + suffix
-            schema_accepts = not _errors(_record(idempotency_key=candidate))
+            # Forged onto the dict, not through ``_record``: the mint refuses the invalid half
+            # of this lattice since W7-4, and the schema's own verdict is what this compares.
+            schema_accepts = not _errors({**_record(), "idempotency_key": candidate})
             rule_accepts = candidate == "" or is_valid_idempotency_key(candidate)
             assert schema_accepts is rule_accepts, {
                 "candidate": candidate,
@@ -365,7 +385,7 @@ def test_a_malformed_record_is_refused_by_the_schema(mutation: dict[str, object]
 def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     """The record carries the receipt's per-dispatch log; a line written before the field
     existed carries no key and stays valid -- the sweep validator reads directories that
-    v0.20 writers filled, and a required key there would fail every one of them.
+    earlier v0.21 builds filled, and a required key there would fail every one of them.
 
     The same rule holds one level down since W7-2: an entry written before ``backoff_ms``
     existed carries ten keys and stays valid, because requiring the eleventh would fail every
@@ -392,8 +412,7 @@ def test_the_attempt_log_rides_the_record_and_legacy_lines_stay_valid() -> None:
     ten_key_entry = {name: value for name, value in entry.to_json().items() if name != "backoff_ms"}
     assert _errors({**_record(), "attempts": 1, "attempt_log": [ten_key_entry]}) == []
 
-    legacy = _record()
-    del legacy["attempt_log"]
+    legacy = {key: value for key, value in _record().items() if key != "attempt_log"}
     assert _errors(legacy) == []
 
 
@@ -466,6 +485,151 @@ def test_an_empty_digest_is_a_valid_record_because_a_status_explains_it() -> Non
     keyless = _record(prompt_digest="", request_digest="", digest_status="absent")
 
     assert _errors(keyless) == []
+
+
+# --- the reader transports, the mint certifies ----------------------------------------------
+
+
+class _NeverUnequal(str):
+    """A ``str`` that answers *for* its value instead of about it.
+
+    Nothing exotic: a subclass whose ``__ne__`` returns False. Any guard that spells "is this
+    the in-band absence?" as ``value != ""`` asks this object a question it answers falsely,
+    and skips the check behind it -- while ``json.dumps`` and an HTTP header both go on
+    reading the underlying string.
+    """
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad"),
+    [
+        ("idempotency_key", "bad\nkey"),
+        ("prompt_digest", "not-a-digest"),
+        ("request_digest", "B" * 64),
+    ],
+    ids=["key-with-control", "digest-wrong-shape", "digest-wrong-case"],
+)
+def test_the_mint_refuses_a_receipt_the_sweep_would_convict(field_name: str, bad: str) -> None:
+    """``from_json`` deliberately transports these values -- reader-lenient, so a damaged
+    receipt can still be loaded and inspected (W7-3 round 4's decision, kept) -- which left a
+    route from a foreign receipt to a ledger line ``monoid validate`` refuses. The mint is
+    where that route closes: ``model_call_record`` is the single place a receipt becomes an
+    artifact line, so it refuses to build one the sweep would then convict. The receipt
+    itself constructs fine; only certification is denied."""
+
+    receipt = _receipt(**{field_name: bad})
+
+    with pytest.raises(ValueError, match=field_name):
+        model_call_record(
+            receipt,
+            run_id="run-1",
+            root_run_id="run-1",
+            call_index=0,
+            recorded_at="2026-08-11T00:00:00.000Z",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad"),
+    [
+        ("idempotency_key", "bad\nkey"),
+        ("prompt_digest", "not-a-digest"),
+        ("request_digest", "B" * 64),
+    ],
+    ids=["key-with-control", "digest-wrong-shape", "digest-wrong-case"],
+)
+def test_the_mint_judges_the_value_and_not_the_objects_opinion_of_it(
+    field_name: str, bad: str
+) -> None:
+    """The guard asked ``value != ""`` first, which is a question the value may answer.
+
+    A ``str`` subclass whose ``__ne__`` returns False makes that comparison False, so the
+    pattern check behind it never ran and the record carried the object through --
+    ``json.dumps`` writes the underlying string, and the line the guard exists to prevent
+    reaches the ledger anyway. Reproduced end to end before the fix: a receipt keyed with
+    ``_NeverUnequal("bad\nkey")`` through ``record_settled_call`` wrote a
+    ``model_calls.jsonl`` line ``monoid validate`` then convicted.
+
+    Type before value, the rule ``_validate_counts`` states one field family over: once the
+    exact ``str`` type is established, the emptiness comparison and the pattern are the
+    string's own answers. All three fields, because the overload hides any of them equally --
+    a fix proven on the key alone would leave the two digests behind it."""
+
+    receipt = _receipt(**{field_name: _NeverUnequal(bad)})
+
+    with pytest.raises(ValueError, match=field_name):
+        model_call_record(
+            receipt,
+            run_id="run-1",
+            root_run_id="run-1",
+            call_index=0,
+            recorded_at="2026-08-11T00:00:00.000Z",
+        )
+
+
+def test_the_mint_admits_every_empty_spelling_a_refused_call_writes() -> None:
+    """Empty-or-valid, and the empty half matters as much: a call refused before the keying
+    block was never keyed and never digested, its status fields say why, and a guard firing
+    there would be the mint refusing the runner's own output -- the self-regression the
+    empty-or-valid split exists to prevent."""
+
+    refused = _receipt(
+        idempotency_key="",
+        prompt_digest="",
+        request_digest="",
+        digest_status="absent",
+        destination_status="not_declared",
+        destination_digest="",
+    )
+
+    record = model_call_record(
+        refused,
+        run_id="run-1",
+        root_run_id="run-1",
+        call_index=0,
+        recorded_at="2026-08-11T00:00:00.000Z",
+    )
+
+    assert _errors(record) == []
+
+
+def test_the_lenient_class_is_derived_from_the_schema_and_is_exactly_three() -> None:
+    """The format-constrained receipt fields, derived rather than hand-listed: every
+    ``properties`` key carrying a ``pattern`` that is also a ``ModelCallReceipt`` field. For
+    each member the division must hold on both sides -- ``from_json`` accepts a malformed
+    value (the reader transports), and the mint refuses to certify it. A fourth patterned
+    receipt field joins the rule or fails here; a reader that quietly starts judging one of
+    the three fails here too."""
+
+    receipt_fields = {field_.name for field_ in fields(ModelCallReceipt)}
+    constrained = {
+        key
+        for key, spec in MODEL_CALLS_RECORD_SCHEMA["properties"].items()
+        if isinstance(spec, dict) and "pattern" in spec and key in receipt_fields
+    }
+    assert constrained == {"idempotency_key", "prompt_digest", "request_digest"}
+
+    for field_name in sorted(constrained):
+        payload = _receipt().to_json()
+        payload[field_name] = "not what the pattern admits\n"
+        loaded = ModelCallReceipt.from_json(payload)
+        assert getattr(loaded, field_name) == "not what the pattern admits\n"
+        with pytest.raises(ValueError, match=field_name):
+            model_call_record(
+                loaded,
+                run_id="run-1",
+                root_run_id="run-1",
+                call_index=0,
+                recorded_at="2026-08-11T00:00:00.000Z",
+            )
 
 
 def test_validate_run_dir_treats_model_calls_as_optional(tmp_path: Path) -> None:
@@ -577,7 +741,7 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The four cross-entry invariants, refused on the sweep as well.
+    """The four relational claims, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
     another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
@@ -594,10 +758,14 @@ def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     durations against a latency of zero. The ledger line is the first place both facts are
     settled and present, which makes it the first place the claim can be checked at all.
 
+    An *empty* log states none of the four: it is what an earlier build wrote for every
+    receipt without entries, so the sweep has nothing to relate and says nothing. The pin for
+    that line is its own test below, because "reported clean" is the claim that matters there.
+
     Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
     cross-record claims -- manifest against workspace index, proposal against its hashes,
     settled text against its digests, payloads against their keys. The ledger had none because
-    until this field it made no claim spanning two values; now it makes three.
+    until this field it made no claim spanning two values; now it makes four.
     """
 
     (tmp_path / MODEL_CALLS_FILENAME).write_text(
@@ -642,13 +810,36 @@ def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path
     assert not [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)]
 
     # And a line written before the field existed still sweeps clean: no key, no claim to check.
-    legacy = _record()
-    del legacy["attempt_log"]
+    legacy = {key: value for key, value in _record().items() if key != "attempt_log"}
     (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(legacy) + "\n", encoding="utf-8")
 
     assert not [
         issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)
     ]
+
+
+@pytest.mark.parametrize("attempts", [0, 1, 2], ids=["refused", "default", "retried"])
+def test_validate_run_dir_accepts_the_empty_log_an_earlier_build_wrote(
+    tmp_path: Path, attempts: int
+) -> None:
+    """Every count, because the previous writer emitted ``[]`` for every empty log.
+
+    W7-1..W7-3 builds projected ``attempt_log`` unconditionally, so the spelling is not a
+    property of the *count* beside it: a refused call wrote ``[]`` beside ``attempts: 0``, a
+    default receipt handed to the public ``record_settled_call`` seam wrote ``[]`` beside the
+    field's default of 1, and a hand-built receipt with no log wrote ``[]`` beside whatever
+    count it carried. Reporting the positive-count arm would convict directories the previous
+    build filled through its own API while certifying the zero arm from the same line of code
+    -- one writer behaviour, split by a number that had nothing to do with it. The sweep
+    therefore relates a *present, non-empty* log to its line and stays silent on an empty
+    one."""
+
+    line = {**_record(), "attempts": attempts, "attempt_log": []}
+    (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    issues = validate_run_dir(tmp_path)
+
+    assert not [issue for issue in issues if issue.path.startswith(MODEL_CALLS_FILENAME)]
 
 
 # --- the projection reflects over nothing ---------------------------------------------------

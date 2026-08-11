@@ -456,7 +456,18 @@ they itemize leaves a reader with two numbers and no way to tell which to believ
 refused at construction, which is also why the runner builds the log and the merged total in a
 single `replace` — and refused again by `monoid validate`, which reads the ledger as JSON and
 constructs no receipt, so a JSON Schema that can only judge one entry at a time would have
-reported such a line clean. The log is optional; an *entry*'s original keys are not: they have
+reported such a line clean. On the wire an unitemized call has one spelling produced and two
+read (W7-4): the writers omit an empty log, so absence covers a record that predates the field,
+a call with zero dispatches, and a receipt built without one alike — and a present `[]`, which
+every build between W7-1 and W7-4 wrote for all three because the projection emitted the key
+unconditionally, reads as the same value and passes `monoid validate` beside any `attempts`.
+Neither reader refuses that pair. The runner never writes it — it fills one entry per dispatch
+on every terminal path — but the runner is not the only writer: `record_settled_call` is public
+and a receipt handed to it carries whatever log it was built with, the field's own default being
+none, so refusing the pair would convict lines the previous build wrote through its own API.
+`idempotency_key` converges the other way, and the asymmetry is each field's own rule: its
+absence spelling is the in-band empty string, so the key travels on every line, while the log's
+is a missing key, so an empty one is simply not written. The log is optional; an *entry*'s original keys are not: they have
 no writer predating them, so every key the entry shipped with is required on the wire and a
 partial one is refused rather than completed from defaults — defaults there turn a corrupt line
 into a plausible dispatch. A key added after the entry shipped follows the record-level absence
@@ -515,6 +526,18 @@ as absent — logging that one was dropped, never its bytes, because that route 
 service authenticates. Absence on this field is spelled by the **empty string and nothing else**:
 a caller who supplies `None`, `False` or `0` supplied a value, and ingress refuses it rather than
 reading it as "no key" and letting the transport drop it silently.
+
+The key shares one more rule with the two digests beside it (W7-4). These are the three
+format-constrained fields whose values `ModelCallReceipt.from_json` deliberately does **not**
+judge: the reader transports what it was given, so a receipt with a damaged digest can still be
+loaded, inspected and repaired — and a parsed receipt is therefore not a certified one.
+Certification has two enforcers, each deriving from one body in `core/model_io.py`: the schema
+patterns `monoid validate` runs, and `model_call_record`, which refuses to *mint* a ledger line
+the sweep would then convict — checking all three under the same empty-or-valid rule the schema
+states, so it can never fire on a runner-built receipt (a refused call's line is empty and
+explained by its status fields). The class is exactly these three, and the census derives it
+from the schema rather than naming it: a fourth patterned receipt field joins the rule or fails
+the suite, and a reader that quietly starts judging one of the three fails it too.
 
 **Every `pattern` in every artifact schema ends at end of *input*, not at `$`.** JSON Schema calls
 `pattern` an ECMA-262 expression; `jsonschema` runs it through Python's `re`, where `$` also
@@ -2632,7 +2655,9 @@ retried as a connection error. The model adapter's retry is policy-driven by
 ### The retry layer (`ModelRetryConfig.layer`)
 
 `layer` names the single owner of the retry loop for a model call, so two loops cannot
-multiply attempts. The default, `"adapter"`, is the behavior above: the adapter's own loop
+multiply attempts — a guarantee whose reach the compliance paragraph below states: one
+process, and an adapter that honors either the neutralized config or the layer value itself.
+The default, `"adapter"`, is the behavior above: the adapter's own loop
 retries and the kernel makes exactly one adapter call. Under `"kernel"` the
 `ModelCallRunner` owns the loop: it re-dispatches the already-keyed request on a retryable,
 non-config-recoverable `ModelAdapterError` — the taxonomy, not `retry_on`, which stays the

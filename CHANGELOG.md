@@ -7,6 +7,43 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — the reader transports, the mint certifies: ledger format guard (W7-4)
+
+- **`model_call_record` refuses to mint a line `monoid validate` would then convict.**
+  Carry-over from PR #106 round 6, resolved for the whole class rather than the named field:
+  the three format-constrained, receipt-parsed strings (`idempotency_key`, `prompt_digest`,
+  `request_digest` — the census derives the set from the schema, so it cannot silently grow
+  or shrink) stay reader-lenient on `ModelCallReceipt.from_json`, deliberately: the reader
+  transports, so a receipt with a damaged digest can still be loaded and inspected, and a
+  parsed receipt is not a certified one. Certification now has two enforcers deriving from
+  one body each in `core/model_io.py`: the schema patterns (`RECORDED_DIGEST_BODY` joins
+  `_IDEMPOTENCY_KEY_BODY`, and both of `schemas.py`'s digest forms compose it) and the mint
+  guard, which checks empty-or-valid on all three before building the record. Empty stays
+  admissible because a refused call was never keyed and never digested — the guard cannot
+  fire on a runner-built receipt — and for the recorder a refused mint costs the one line,
+  not the run. (`model_payloads.is_chunk_sha256` keeps its own 64-hex predicate on purpose:
+  a chunk reference becomes a filename, and that path-safety boundary carries its own
+  reader-side obligations.)
+
+### Changed — one spelling produced, both still read: `attempt_log` presence rules (W7-4)
+
+- **The writers omit an empty `attempt_log`; the readers keep accepting the `[]` earlier
+  builds wrote for it.** Absence is now the one spelling this build produces for "nothing
+  itemized" — a record that predates the field, a refused call that never dispatched, or a
+  receipt built without a log: `ModelCallReceipt.to_json` and the ledger projection emit the
+  key only when there is an entry to carry. Nothing is refused for the other spelling.
+  `from_json` reads a present `[]` as an empty log beside any `attempts`, and `monoid
+  validate` reports nothing, because that is what every build between W7-1 and W7-4 wrote for
+  the same value: the projection emitted the key unconditionally, and
+  `AgentRecorder.record_settled_call` is public, so a default `ModelCallReceipt()` — whose
+  `attempts` is 1 — already produced `[]` beside a positive count. Every directory those
+  builds filled keeps validating. This supersedes the W7-1 sentence below ("the writer always
+  emits it, so absence means exactly one thing: a writer that predates the field"):
+  unconditional emission gave one value two spellings and made a parsed pre-field receipt
+  re-serialize wearing the second, which is the distinction no reader could use.
+  `idempotency_key` deliberately keeps always-emit: its absence spelling is the in-band empty
+  string, so the key travels on every line rather than being the one that goes missing.
+
 ### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
 
 - **`OtelEventSink` synthesizes one `model.attempt {index}` child span per kernel dispatch**
@@ -141,7 +178,7 @@ out in commit messages and here.
 - **The `model-calls.v1` line carries the log, and old lines stay valid.** A fourth
   hand-listed projection writes it (the reflection census refused `to_json()`, exactly as
   designed); the schema declares the key without requiring it, because `monoid validate`
-  sweeps directories v0.20 writers filled. The writer always emits it, so absence means
+  sweeps directories earlier v0.21 builds filled. The writer always emits it, so absence means
   exactly one thing: a writer that predates the field.
 - **The run's totals now read the receipt the call site used to discard.** On the settled
   path the loop accumulates `receipt.usage` — which folds absorbed attempts' spend the turn

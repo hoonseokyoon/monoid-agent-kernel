@@ -3684,6 +3684,20 @@ def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
         assert is_valid_idempotency_key(new_idempotency_key())
 
 
+class _NeverUnequal(str):
+    """A ``str`` that answers *for* its value instead of about it: ``__ne__`` returns False,
+    so any guard spelling "is this the in-band absence?" as ``value != ""`` skips the check
+    behind it while the transport goes on reading the underlying string."""
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
 @pytest.mark.parametrize(
     "hostile",
     [
@@ -3705,6 +3719,11 @@ def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
         pytest.param(0.0, id="zero-float"),
         pytest.param([], id="empty-list"),
         pytest.param({}, id="empty-dict"),
+        # The seventh, and the only one of them that IS a string: a subclass whose ``__ne__``
+        # returns False answers the ``!= ""`` pre-filter for the value rather than about it,
+        # so the pattern check behind it never runs. The ledger mint carried the same shape
+        # and the same hole; both ask through one predicate now.
+        pytest.param(_NeverUnequal("bad\nkey"), id="equality-overload"),
     ],
 )
 def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: object) -> None:

@@ -34,7 +34,13 @@ from __future__ import annotations
 from typing import Any
 
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.model_io import ModelCallAttempt, ModelCallReceipt
+from monoid_agent_kernel.core.model_io import (
+    ModelCallAttempt,
+    ModelCallReceipt,
+    is_absent_or_valid,
+    is_recorded_digest,
+    is_valid_idempotency_key,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -197,7 +203,32 @@ def model_call_record(
     issuance, never evidence a request was sent.
     """
 
-    return {
+    # The mint guard (W7-4): this is the single place a receipt becomes an artifact line, and
+    # these three are the format-constrained fields ``from_json`` deliberately transports
+    # without judging -- reader-lenient so a damaged receipt can be loaded and inspected,
+    # schema-strict so a damaged LINE cannot be certified. The guard closes the route between
+    # the two: a foreign receipt that parsed fine must not mint a line ``monoid validate``
+    # then refuses. Empty stays admissible on all three -- a refused call was never keyed and
+    # never digested, and a status field explains each -- so this cannot fire on a receipt
+    # the runner built, which is valid by construction on every settle path. That empty arm
+    # is asked through ``is_absent_or_valid`` rather than spelled here: ``value != ""`` is a
+    # question the value answers, and a ``str`` subclass answering it falsely walked past
+    # this guard with its underlying string intact. Request ingress had the same shape and
+    # the same hole; one body serves both now. For the recorder, a raise here costs the one
+    # line, not the run (its hostile-context containment); the offending value stays out of
+    # the message, the same transport rule the key's logging sinks follow.
+    for field_name, value, is_valid in (
+        ("idempotency_key", receipt.idempotency_key, is_valid_idempotency_key),
+        ("prompt_digest", receipt.prompt_digest, is_recorded_digest),
+        ("request_digest", receipt.request_digest, is_recorded_digest),
+    ):
+        if not is_absent_or_valid(value, is_valid):
+            raise ValueError(
+                f"model call record {field_name} must be empty or the shape "
+                "the ledger schema certifies"
+            )
+
+    record: dict[str, Any] = {
         "schema_version": MODEL_CALLS_SCHEMA_VERSION,
         "kind": MODEL_CALL_KIND,
         "run_id": run_id,
@@ -217,11 +248,6 @@ def model_call_record(
         "usage": dict(receipt.usage),
         "latency_ms": receipt.latency_ms,
         "attempts": receipt.attempts,
-        # One object per dispatch, hand-projected below. Always written -- absence on a line
-        # means exactly one thing, a writer that predates the field -- which is why the
-        # schema declares it and does not require it: ``validate_run_dir`` sweeps directories
-        # that v0.20 writers filled.
-        "attempt_log": [_recorded_attempt(entry) for entry in receipt.attempt_log],
         "provider_retried": receipt.provider_retried,
         "error_code": receipt.error_code,
         "provider_error_code": receipt.provider_error_code,
@@ -230,3 +256,14 @@ def model_call_record(
         "http_status": receipt.http_status,
         "capture_downgrades": receipt.capture_downgrades,
     }
+    # One object per dispatch, hand-projected in ``_recorded_attempt`` -- and the key emitted
+    # only when there is a dispatch to itemize, the receipt's own wire rule. Absence on a line
+    # means nothing was itemized: a writer that predates the field, a refused call that never
+    # dispatched, or a receipt built without a log at any count. The schema declares the key
+    # and does not require it for those reasons, and the sweep relates only a NON-EMPTY log to
+    # the line around it: a present ``[]`` is what every build before this one wrote for the
+    # same value -- this projection emitted the key unconditionally -- so ``validate_run_dir``
+    # keeps certifying the directories they filled.
+    if receipt.attempt_log:
+        record["attempt_log"] = [_recorded_attempt(entry) for entry in receipt.attempt_log]
+    return record
