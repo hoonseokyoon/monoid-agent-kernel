@@ -25,23 +25,24 @@ out in commit messages and here.
   a chunk reference becomes a filename, and that path-safety boundary carries its own
   reader-side obligations.)
 
-### Changed — one spelling for an unitemized call: `attempt_log` presence rules (W7-4)
+### Changed — one spelling produced, both still read: `attempt_log` presence rules (W7-4)
 
-- **The writers omit an empty `attempt_log`, and a present-but-empty log beside a positive
-  `attempts` is refused.** Absence on a line now means exactly "nothing itemized" — a record
-  that predates the field, or a refused call that never dispatched — and it is the only
-  spelling of that fact: `ModelCallReceipt.to_json` and the ledger projection emit the key
-  only when there is an entry to carry, `from_json` refuses `[]` beside `attempts > 0`, and
-  `monoid validate` reports the same pair on a ledger line (the fifth relational claim
-  there). Beside `attempts: 0` an explicit `[]` stays accepted — the spelling earlier v0.21
-  builds wrote for a refused call — so every directory they filled keeps validating. This
-  supersedes the W7-1 sentence below ("the writer always emits it, so absence means exactly
-  one thing: a writer that predates the field"): unconditional emission made a parsed
-  pre-field receipt re-serialize as `[]` beside a positive count — an itemization of nothing,
-  a line no writer produces — and no reader could use the distinction it claimed to preserve.
+- **The writers omit an empty `attempt_log`; the readers keep accepting the `[]` earlier
+  builds wrote for it.** Absence is now the one spelling this build produces for "nothing
+  itemized" — a record that predates the field, a refused call that never dispatched, or a
+  receipt built without a log: `ModelCallReceipt.to_json` and the ledger projection emit the
+  key only when there is an entry to carry. Nothing is refused for the other spelling.
+  `from_json` reads a present `[]` as an empty log beside any `attempts`, and `monoid
+  validate` reports nothing, because that is what every build between W7-1 and W7-4 wrote for
+  the same value: the projection emitted the key unconditionally, and
+  `AgentRecorder.record_settled_call` is public, so a default `ModelCallReceipt()` — whose
+  `attempts` is 1 — already produced `[]` beside a positive count. Every directory those
+  builds filled keeps validating. This supersedes the W7-1 sentence below ("the writer always
+  emits it, so absence means exactly one thing: a writer that predates the field"):
+  unconditional emission gave one value two spellings and made a parsed pre-field receipt
+  re-serialize wearing the second, which is the distinction no reader could use.
   `idempotency_key` deliberately keeps always-emit: its absence spelling is the in-band empty
-  string, which a pre-key line and a never-keyed call share, so the log's refusal has no
-  analogue there — a non-empty log witnesses its own generation, an empty string cannot.
+  string, so the key travels on every line rather than being the one that goes missing.
 
 ### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
 

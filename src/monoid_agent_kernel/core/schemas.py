@@ -1111,11 +1111,12 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "attempts": {"type": "integer", "minimum": 0},
         # Declared but not required: the sweep validator reads ledgers earlier v0.21 builds
         # filled, and absence means nothing was itemized -- a writer that predates the field,
-        # or a refused call that never dispatched (the current writer omits an empty log).
-        # ``_validate_model_call_attempt_logs`` refuses the pair no writer produces, an empty
-        # log beside a positive ``attempts`` -- a relational claim a JSON Schema cannot state.
-        # A present entry is written whole or refused: the closed shape is the record's own
-        # rule, one level down.
+        # a refused call that never dispatched, or a receipt built without a log (this writer
+        # omits an empty log; the ones before it spelled the same value ``[]``, which stays
+        # legal and is why no ``minItems`` appears here). What a JSON Schema cannot state is
+        # how a *non-empty* log stands to the line around it, which is
+        # ``_validate_model_call_attempt_logs``'s job. A present entry is written whole or
+        # refused: the closed shape is the record's own rule, one level down.
         "attempt_log": {
             "type": "array",
             "items": {
@@ -1740,12 +1741,12 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
 
     The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
     (manifest against workspace index, proposal against its hashes, settled text against its
-    digests, payload records against their keys). Absence is still legal: a line with no
-    ``attempt_log`` is an earlier v0.21 build's -- or the current writer's spelling of a call
-    with nothing to itemize -- and makes no claim there is anything to check. A *present*
-    empty log is different: beside ``attempts: 0`` it is what pre-W7-4 builds wrote for a
-    refused call and stays accepted, and beside a positive count it is an itemization of
-    nothing -- a pair no writer has ever produced -- which the sweep now reports.
+    digests, payload records against their keys). An unitemized log makes no claim to check,
+    in either of its two spellings: absence, which is what this build writes and what every
+    record predating the field carries, and a present ``[]``, which is what builds between
+    W7-1 and W7-4 wrote for the same value at whatever ``attempts`` the receipt held. Both
+    are read as "nothing itemized" and neither is reported -- the claims below are about the
+    entries a log actually names.
     """
     try:
         raw = path.read_bytes()
@@ -1771,18 +1772,12 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
         attempts = record.get("attempts")
         counted = isinstance(attempts, int) and not isinstance(attempts, bool)
         if not entries:
-            # An empty log is the old spelling of a refused call (``attempts: 0``) and
-            # nothing else: the current writer omits the key, its predecessors filled one
-            # entry per dispatch, so an empty itemization beside a positive count is a line
-            # no writer produces. Beside zero attempts there is nothing left to relate.
-            if counted and attempts > 0:
-                issues.append(
-                    ValidationIssue(
-                        label,
-                        "attempt_log must not be empty beside a positive attempts: "
-                        "absence is the one spelling of an unitemized call",
-                    )
-                )
+            # Nothing to relate, at any count. ``[]`` is what every build before W7-4 wrote
+            # for an empty log -- the projection emitted the key unconditionally, and a
+            # receipt without entries is legal at any ``attempts`` -- so the count beside it
+            # says nothing about the writer. Reporting the positive-count arm would convict
+            # directories the previous build filled while certifying the zero arm written by
+            # the same line of code.
             continue
         if not all(isinstance(entry, dict) for entry in entries):
             continue  # shape is the schema's job

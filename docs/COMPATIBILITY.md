@@ -420,11 +420,17 @@ written before the field existed means; the ledger schema declares the key witho
 requiring it, so `monoid validate` still passes directories older writers filled; and a
 present log that does not name every attempt exactly once is refused — that shape is a
 writer bug, not a legacy to absorb, and `monoid validate` now says so too rather than only
-the constructor. W7-4 closes the empty corner of the same rule: the writers omit an empty
-log — absence is the one wire spelling of "nothing itemized" — a present `[]` beside a
-positive `attempts` is refused by reader and sweep alike as a line no writer produces, and
-beside `attempts: 0` it stays accepted, the spelling earlier v0.21 builds used for a refused
-call, so every directory they filled keeps validating. Leniency stops at the key for the fields an entry shipped with: those have
+the constructor. W7-4 converges the empty corner on the writer's side only: the writers omit
+an empty log, so absence is the one spelling this build produces for "nothing itemized", while
+a present `[]` — what every build between W7-1 and W7-4 wrote for that same value, at whatever
+`attempts` the receipt carried — is still read as an empty log by `from_json` and still passes
+`monoid validate`. The readers stay put on purpose. An empty log is legal on a receipt at any
+count (the log is empty *or* complete, and its empty arm was never reserved for refused calls),
+the projection emitted the key unconditionally, and `AgentRecorder.record_settled_call` is
+public — so the previous build wrote `[]` beside a positive count for every receipt handed to
+it without entries, a default `ModelCallReceipt()` and its `attempts: 1` first among them.
+Refusing that pair would have convicted the directories those builds filled; every one of them
+keeps validating. Leniency stops at the key for the fields an entry shipped with: those have
 no writer predating them, so every one is required and a partial entry is refused instead of
 completed from defaults. (W7-2 later adds `backoff_ms` to the entry; that key has
 predecessors and follows the record-level absence rule — its own paragraph below.) Run totals (`metrics.json`, `state.total_usage`, the token budget, the child

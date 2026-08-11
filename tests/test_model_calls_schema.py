@@ -679,23 +679,13 @@ def test_validate_run_dir_reports_a_malformed_ledger_line(tmp_path: Path) -> Non
             },
             "first",
         ),
-        (
-            # An empty log beside a positive count. Neither writer generation produces it --
-            # the current one omits an empty log, its predecessors filled one entry per
-            # dispatch -- so the only line it describes is a forgery: a pre-field line
-            # re-serialized by a pre-W7-4 build, or a hand-made one. Beside ``attempts: 0``
-            # the same pair stays accepted below, as the spelling earlier v0.21 builds used
-            # for a refused call.
-            {"attempts": 2, "attempt_log": []},
-            "empty",
-        ),
     ],
-    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff", "present_empty"],
+    ids=["indices", "usage", "timeline", "timeline_legacy", "first_backoff"],
 )
 def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     tmp_path: Path, mutation: dict[str, object], message: str
 ) -> None:
-    """The five relational claims, refused on the sweep as well.
+    """The four relational claims, refused on the sweep as well.
 
     A JSON Schema validates each entry against its own shape and cannot relate one entry to
     another, so `attempts: 2` under indices `[1, 1]`, entries billing 3 beside a receipt billing
@@ -704,21 +694,22 @@ def test_validate_run_dir_reports_an_attempt_log_that_contradicts_its_own_line(
     ``monoid validate``, which reads the ledger as JSON, so a directory the record could not have
     produced was reported clean -- the one answer a validator must never give.
 
-    Three of the five the record also refuses at construction. The timeline one is this surface's
+    Three of the four the record also refuses at construction. The timeline one is this surface's
     alone, and deliberately: ``attempt_log`` is attached while ``latency_ms`` is still its default, because
     ``_publish`` stamps the measured duration afterwards on every exit (``model_call.py`` builds
     the log at the failure and answering exits, then times the receipt inside ``_publish``). A
     constructor check would therefore fire on every retried call, comparing real dispatch
     durations against a latency of zero. The ledger line is the first place both facts are
-    settled and present, which makes it the first place the claim can be checked at all. The
-    empty-log claim is sweep-only for a different reason: the constructor cannot see whether
-    the key was present -- after parsing, an empty log is the legal value absence and ``[]``
-    share -- so only the wire's readers (``from_json`` and this sweep) can refuse the pair.
+    settled and present, which makes it the first place the claim can be checked at all.
+
+    An *empty* log states none of the four: it is what an earlier build wrote for every
+    receipt without entries, so the sweep has nothing to relate and says nothing. The pin for
+    that line is its own test below, because "reported clean" is the claim that matters there.
 
     Semantic passes are what ``validate_run_dir`` already does for the surfaces that have
     cross-record claims -- manifest against workspace index, proposal against its hashes,
     settled text against its digests, payloads against their keys. The ledger had none because
-    until this field it made no claim spanning two values; now it makes five.
+    until this field it made no claim spanning two values; now it makes four.
     """
 
     (tmp_path / MODEL_CALLS_FILENAME).write_text(
@@ -771,13 +762,23 @@ def test_validate_run_dir_accepts_a_ledger_line_whose_log_adds_up(tmp_path: Path
     ]
 
 
-def test_validate_run_dir_accepts_the_empty_log_an_earlier_build_wrote(tmp_path: Path) -> None:
-    """``attempts: 0, attempt_log: []`` is what W7-1..W7-3 builds wrote for a refused call --
-    the current writer omits the key -- and the sweep keeps certifying the directories they
-    filled: the refusal above is about a positive count beside an empty log, never about
-    emptiness itself."""
+@pytest.mark.parametrize("attempts", [0, 1, 2], ids=["refused", "default", "retried"])
+def test_validate_run_dir_accepts_the_empty_log_an_earlier_build_wrote(
+    tmp_path: Path, attempts: int
+) -> None:
+    """Every count, because the previous writer emitted ``[]`` for every empty log.
 
-    line = {**_record(), "attempts": 0, "attempt_log": []}
+    W7-1..W7-3 builds projected ``attempt_log`` unconditionally, so the spelling is not a
+    property of the *count* beside it: a refused call wrote ``[]`` beside ``attempts: 0``, a
+    default receipt handed to the public ``record_settled_call`` seam wrote ``[]`` beside the
+    field's default of 1, and a hand-built receipt with no log wrote ``[]`` beside whatever
+    count it carried. Reporting the positive-count arm would convict directories the previous
+    build filled through its own API while certifying the zero arm from the same line of code
+    -- one writer behaviour, split by a number that had nothing to do with it. The sweep
+    therefore relates a *present, non-empty* log to its line and stays silent on an empty
+    one."""
+
+    line = {**_record(), "attempts": attempts, "attempt_log": []}
     (tmp_path / MODEL_CALLS_FILENAME).write_text(json.dumps(line) + "\n", encoding="utf-8")
 
     issues = validate_run_dir(tmp_path)
