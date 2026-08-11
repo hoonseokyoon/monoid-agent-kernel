@@ -15,17 +15,44 @@ from __future__ import annotations
 
 import json
 import math
+import sys
+from functools import lru_cache
 from typing import Any
 
 
 _MAX_JSON_NESTING = 512
 _MAX_JSON_INTEGER_DIGITS = 4300
-# The magnitude form of the digit bound: |n| < 10**4300 iff n has at most 4300 decimal digits,
-# which is exactly `parse_bounded_json_int`'s rule on the way in. Held as an int and compared as
-# an int because the *decimal spelling* is the operation that must never run here — `str()` on a
-# value past the interpreter's digit limit raises, and this predicate exists to keep such values
-# away from every writer that would spell them.
-_MAX_PORTABLE_JSON_INT = 10**_MAX_JSON_INTEGER_DIGITS
+# Below this, an integer is small enough that no configured limit can refuse its spelling, so the
+# common case answers without consulting the interpreter at all.
+_UNCONDITIONALLY_SPELLABLE_INT = 10**17
+
+
+@lru_cache(maxsize=8)
+def _digit_bound_magnitude(digits: int) -> int:
+    """``10**digits``: |n| < this iff n has at most ``digits`` decimal digits.
+
+    Cached because the bound is now read per call rather than fixed at import — the interpreter's
+    limit is settable at runtime — and the distinct values it takes are few.
+    """
+    return 10**digits
+
+
+def _spellable_integer_digits() -> int:
+    """The digit budget an integer must fit for *this* process to publish it portably.
+
+    Two bounds, and the answer is the smaller. The portable one is 4300, exactly
+    ``parse_bounded_json_int``'s rule on the way in, so what one side admits the other can read.
+    The local one is ``sys.get_int_max_str_digits()``: a host that sets ``PYTHONINTMAXSTRDIGITS``
+    or calls ``sys.set_int_max_str_digits`` below 4300 — a documented hardening knob — makes its
+    own ``json.dumps`` raise on integers this predicate would otherwise admit, which put the
+    ``ValueError`` back at the transcript write that the refusing boundaries exist to prevent.
+    Zero disables the interpreter's limit and leaves only the portable ceiling: a process that can
+    spell a 4301-digit integer still must not hand one to a reader that cannot.
+    """
+    configured = sys.get_int_max_str_digits()
+    if configured <= 0:
+        return _MAX_JSON_INTEGER_DIGITS
+    return min(_MAX_JSON_INTEGER_DIGITS, configured)
 
 
 class UnportableScalarError(ValueError):
@@ -50,11 +77,13 @@ def _refuse_unportable_scalar(value: Any) -> None:
     if value is None or isinstance(value, (str, bool, float)):
         return
     if isinstance(value, int):
-        if -_MAX_PORTABLE_JSON_INT < value < _MAX_PORTABLE_JSON_INT:
+        if -_UNCONDITIONALLY_SPELLABLE_INT < value < _UNCONDITIONALLY_SPELLABLE_INT:
             return
-        raise UnportableScalarError(
-            f"integer exceeds the portable JSON bound of {_MAX_JSON_INTEGER_DIGITS} digits"
-        )
+        digits = _spellable_integer_digits()
+        bound = _digit_bound_magnitude(digits)
+        if -bound < value < bound:
+            return
+        raise UnportableScalarError(f"integer exceeds the JSON bound of {digits} digits")
     raise UnportableScalarError(f"value of type {type(value).__name__} is not portable JSON")
 
 

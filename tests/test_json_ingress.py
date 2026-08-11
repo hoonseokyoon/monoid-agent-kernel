@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import math
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
+    UnportableScalarError,
     is_finite_json_number,
     loads_json_ingress,
     loads_model_envelope_json_ingress,
@@ -206,6 +210,73 @@ def test_tool_normalizers_preserve_custom_init_extension_types() -> None:
     assert spec.id == "custom.�"
     assert spec.description == "description�"
     assert spec.input_schema == {"example": "�"}
+
+
+@contextlib.contextmanager
+def _interpreter_int_digit_limit(limit: int) -> Iterator[None]:
+    """Run under a different ``sys.set_int_max_str_digits``, restoring it afterwards.
+
+    The setting is process-global and this suite runs in one process, so the restore is not
+    tidiness: leaking a lowered limit would redden unrelated tests in whatever order they run.
+    """
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(limit)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def test_the_integer_bound_narrows_to_what_this_interpreter_can_actually_spell() -> None:
+    """A host may lower the digit limit; the refusal has to follow it down.
+
+    ``PYTHONINTMAXSTRDIGITS`` and ``sys.set_int_max_str_digits`` are deployment hardening knobs,
+    and below 4300 they make the *process* unable to spell integers this predicate was still
+    admitting -- so a 1500-digit value passed the refusing boundary and then raised ``ValueError``
+    inside ``json.dumps`` at the transcript write, which is the exact run-death the boundary was
+    added to end. The bound is therefore the smaller of the portable ceiling and what this
+    interpreter can spell, read at call time because the limit is settable at runtime.
+
+    The acceptance side is pinned against the writer rather than against arithmetic: whatever
+    ingress admits, ``json.dumps`` must be able to spell.
+    """
+    with _interpreter_int_digit_limit(1000):
+        with pytest.raises(UnportableScalarError):
+            normalize_json_ingress({"n": 10**1500}, refuse_unportable_scalars=True)
+
+        # 1000 digits: the largest this process can spell, and it must survive ingress *and* a dump
+        admitted = normalize_json_ingress({"n": 10**999}, refuse_unportable_scalars=True)
+        assert json.dumps(admitted)
+
+        # 1001 digits: one past what the process can spell
+        with pytest.raises(UnportableScalarError):
+            normalize_json_ingress({"n": 10**1000}, refuse_unportable_scalars=True)
+
+
+def test_a_permissive_interpreter_does_not_widen_the_portable_bound() -> None:
+    """The other direction: 0 disables the interpreter's limit, and 4300 still stands.
+
+    Portability is a claim about every reader, not about this process. A host that turns its own
+    limit off can spell a 4301-digit integer, and the bounded decoders on the other side of the
+    wire still refuse to read one, so admitting it would move the failure to someone else.
+    """
+    with _interpreter_int_digit_limit(0):
+        assert json.dumps(10**4300), "this process can spell it"
+        with pytest.raises(UnportableScalarError):
+            normalize_json_ingress({"n": 10**4300}, refuse_unportable_scalars=True)
+
+
+def test_a_json_integer_past_the_interpreters_limit_is_a_decode_error() -> None:
+    """The parallel half, pinned because it is the one that was already right.
+
+    ``parse_bounded_json_int`` converts inside a ``try``, so a literal this process cannot spell
+    comes back as a classified ``JSONDecodeError`` rather than a bare ``ValueError``. Pinned so a
+    later tightening of the digit check cannot quietly move the decode route into the crash class
+    the Python-object route just left.
+    """
+    with _interpreter_int_digit_limit(1000):
+        with pytest.raises(json.JSONDecodeError):
+            loads_json_ingress('{"n": ' + "9" * 1500 + "}")
 
 
 # --------------------------------------------------------------------------------------
