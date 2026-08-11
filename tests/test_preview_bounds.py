@@ -726,6 +726,16 @@ def _payload_bytes(published: Any) -> int:
     return len(json.dumps(published, ensure_ascii=False).encode("utf-8"))
 
 
+def _widest_payload_bytes(published: Any) -> int:
+    """The payload as the widest sink spells it: non-ASCII escaped, default separators.
+
+    ``reference.studio``'s ``_sse_send`` serializes exactly this way, and
+    ``EventSubscriptionFrame.to_sse`` differs only by compact separators, so no supported sink
+    can spell a payload larger than this.
+    """
+    return len(json.dumps(published).encode("utf-8"))
+
+
 def test_a_value_shared_along_many_paths_costs_at_most_one_payload_budget() -> None:
     """Gap 7: re-expansion is legal per path, so only a total can bound it.
 
@@ -922,6 +932,49 @@ def test_the_approval_surface_is_payload_bounded_too_just_far_higher() -> None:
 
     assert _payload_bytes(approval) <= APPROVAL_PAYLOAD_BYTE_BUDGET
     assert "truncated_keys" in approval
+
+
+@pytest.mark.parametrize(
+    ("label", "char", "utf8_width"),
+    [
+        ("hangul-3-byte", "가", 3),
+        ("cyrillic-2-byte", "б", 2),
+        ("emoji-surrogate-pair", "😀", 4),
+    ],
+)
+def test_the_payload_budget_holds_in_the_widest_spelling_a_sink_uses(
+    label: str, char: str, utf8_width: int
+) -> None:
+    """The same defect this file was written about, one level up: bytes measured in the wrong
+    representation are not a bound.
+
+    The per-value caps were once counted in characters and applied to UTF-8 bytes, which made
+    them no cap at all for non-ASCII text. The payload budget arrived counting UTF-8 bytes while
+    two live sinks -- ``EventSubscriptionFrame.to_sse`` and Studio's ``_sse_send`` -- serialize
+    with ``ensure_ascii=True`` on purpose, because U+2028/U+2029/U+0085 survive an unescaped dump
+    and split an SSE frame mid-string. Escaped, one BMP character costs six bytes however few it
+    takes in UTF-8: 2x for Hangul, 2.87x for two-byte scripts, and the same for a non-BMP
+    codepoint spelled as a surrogate pair. A payload charged just inside 256 KiB reached 503,579
+    bytes out of the real frame writer.
+
+    So the charge is the widest spelling any sink uses, and the arms here are the scripts whose
+    ratios differ -- a Hangul-only pin would leave the worse two-byte case unmeasured, which is
+    the "clean twin" shape this repository keeps re-earning.
+    """
+    policy = PermissionPolicy()
+    # Each value sits at the per-value byte threshold, so nothing is cut per piece and the
+    # payload total is the only thing that can bound this.
+    value = char * (PREVIEW_BYTE_THRESHOLD // utf8_width)
+    assert len(value.encode()) <= PREVIEW_BYTE_THRESHOLD
+    arguments = {f"arg{index:05d}": value for index in range(4000)}
+
+    published = args_preview(arguments, policy)
+
+    assert _widest_payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET, (
+        f"{label}: the payload fits only when the escaping sinks are not counted"
+    )
+    assert "truncated_keys" in published, "the fixture must actually reach the budget"
+    assert len(published) > 1, "the budget cut so hard the payload says nothing"
 
 
 # --------------------------------------------------------------------------------------

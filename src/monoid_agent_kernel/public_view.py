@@ -519,17 +519,27 @@ _DROPPED = _Dropped()
 
 
 def _fragment_cost(fragment: Any) -> int:
-    """Serialized size of one finished fragment, measured the way the sinks will spell it.
+    """Serialized size of one finished fragment, measured the way the *widest* sink spells it.
 
-    ``json.dumps`` with default separators, which are the *widest* spelling any sink uses — the
-    event log writes them and the ledger writes compact — so charging this keeps the bound
-    conservative. The scalar tail envelopes everything portable JSON cannot spell before it gets
-    here, so the ``-1`` escape survives only for what a caller-supplied ``mask`` returns: that
-    contract is the caller's, and an unencodable replacement keeps today's behaviour (through,
-    uncharged) rather than acquiring a spelling this module invented for it.
+    Two axes, and both must be the widest or the budget bounds a representation no reader
+    receives. Separators: default, which the event log writes and the compact sinks undercut.
+    Escaping: ``ensure_ascii=True``, because ``EventSubscriptionFrame.to_sse`` and Studio's
+    ``_sse_send`` escape on purpose — U+2028, U+2029 and U+0085 survive an unescaped dump and
+    split an SSE frame mid-string for ``str.splitlines`` readers — and an escaped BMP character
+    costs six bytes however few it takes in UTF-8. Counting UTF-8 here let a payload charged just
+    inside 256 KiB arrive at 503,579 bytes out of the real frame writer, and near three times the
+    ceiling for two-byte scripts and non-BMP codepoints: the same defect this module was
+    corrected for once already, one level up — a bound measured in a representation the wire does
+    not use. Studio's spelling *is* this one, so no supported sink can exceed it.
+
+    Escaped output is ASCII, so its character count is its byte count. The scalar tail envelopes
+    everything portable JSON cannot spell before it gets here, so the ``-1`` escape survives only
+    for what a caller-supplied ``mask`` returns: that contract is the caller's, and an
+    unencodable replacement keeps today's behaviour (through, uncharged) rather than acquiring a
+    spelling this module invented for it.
     """
     try:
-        return len(json.dumps(fragment, ensure_ascii=False).encode("utf-8"))
+        return len(json.dumps(fragment))
     except (TypeError, ValueError):
         return -1
 

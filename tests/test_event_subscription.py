@@ -7,7 +7,14 @@ import pytest
 from monoid_agent_kernel.core.event_subscription import (
     EventSequenceGap,
     EventSubscription,
+    EventSubscriptionFrame,
     SequenceCursor,
+)
+from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.public_view import (
+    PREVIEW_BYTE_THRESHOLD,
+    TRACE_PAYLOAD_BYTE_BUDGET,
+    args_preview,
 )
 
 
@@ -121,3 +128,41 @@ def test_empty_terminal_stream_with_zero_watermark_ends_cleanly() -> None:
     )
 
     assert [frame.kind for frame in frames] == ["end"]
+
+
+def test_a_budgeted_payload_stays_budgeted_through_this_frames_escaping() -> None:
+    """The payload budget is charged in ``public_view``; this is the surface that spells it widest.
+
+    ``to_sse`` escapes non-ASCII deliberately -- U+2028, U+2029 and U+0085 survive an unescaped
+    dump and split a frame mid-string for ``str.splitlines`` readers -- so a budget counted in
+    UTF-8 bytes would let a Korean payload arrive here at roughly twice its charge, and a
+    two-byte script at nearly three times. Pinned from this side as well as from the builder's,
+    because the two files can be edited apart: a future frame writer that stops escaping is fine,
+    but a payload charge that stops covering escaping is not, and only this test fails then.
+
+    The frame's own overhead -- ``id:``/``data:`` framing and the event envelope -- is measured
+    rather than guessed, by spelling the same frame with an empty payload.
+    """
+    policy = PermissionPolicy()
+    value = "가" * (PREVIEW_BYTE_THRESHOLD // 3)
+    published = args_preview({f"arg{index:05d}": value for index in range(4000)}, policy)
+
+    def frame_for(preview: dict[str, object]) -> EventSubscriptionFrame:
+        return EventSubscriptionFrame(
+            kind="event",
+            cursor=2,
+            event={
+                "schema_version": "1.0",
+                "seq": 1,
+                "type": "tool.call.started",
+                "ts": "2026-08-11T00:00:00Z",
+                "run_id": "0" * 32,
+                "data": {"args_preview": preview},
+            },
+        )
+
+    overhead = len(frame_for({}).to_sse())
+    payload_bytes_on_the_wire = len(frame_for(published).to_sse()) - overhead
+
+    assert payload_bytes_on_the_wire <= TRACE_PAYLOAD_BYTE_BUDGET
+    assert "truncated_keys" in published, "the fixture must actually reach the budget"

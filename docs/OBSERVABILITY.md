@@ -108,7 +108,9 @@ Not carried:
   reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
   the script the text is written in. The *payload* is bounded too: each traversal-built preview
   spends one 256 KiB budget across everything it appends — keys, values and truncation markers
-  alike — so neither re-expanding a structure shared along many paths nor chunking a payload into
+  alike, counted in the widest spelling any sink uses (default separators, non-ASCII escaped, so
+  the ceiling holds on the SSE surfaces that escape deliberately) — so neither re-expanding a
+  structure shared along many paths nor chunking a payload into
   cap-obeying pieces grows an event without bound, and the cut reports itself through the same
   `truncated_keys`/`truncated_items` vocabulary the per-container caps already use. The budget
   covers what the preview builders build, not the stream: routes that bypass the builders
