@@ -1117,27 +1117,43 @@ class TaskManager:
         neither clobbers the recorded result nor re-publishes to the reentry queue (which would make
         the agent observe the result twice). The dedup signal is the already-persisted+rehydrated
         ``ready_for_reentry``/``finished_at`` job state, so it holds across a restart with no extra
-        bookkeeping. Mirrors the inbox's dedup-by-id (effectively-once result ingestion)."""
+        bookkeeping. Mirrors the inbox's dedup-by-id (effectively-once result ingestion).
+
+        The portability refusal below runs only for the report that can actually be persisted; the
+        no-op answers first. See the comment on that branch for why the order is load-bearing."""
         task_id = normalize_unicode_scalars(task_id)
         status = normalize_unicode_scalars(status)
-        try:
-            # Census twin ④, and deliberately *before* any state moves: a refused report leaves
-            # the task running and unclobbered, so the reporter can retry with a portable payload
-            # and idempotency bookkeeping never records a result no writer could spell.
-            result = normalize_json_ingress(result, refuse_unportable_scalars=True)
-        except UnportableScalarError as exc:
-            raise ToolExecutionError(
-                f"task result is not portable JSON: {exc}",
-                error_code="task_result_unportable",
-            ) from exc
         task = self.get_job(task_id)
         if task.ready_for_reentry or task.finished_at is not None:
+            # Answered before the payload is judged, deliberately. A refusal exists to keep a value
+            # no writer can spell away from a writer, and this branch reaches none: it stores
+            # nothing and publishes nothing, so judging the payload here rejects a call that was
+            # always going to be a no-op. The note this replaces claimed the opposite ("deliberately
+            # *before* any state moves ... so the reporter can retry"), which is the reasoning for
+            # the path that *does* move state, bound to both.
+            #
+            # A terminal task is not only a retry, either: ``cancel`` sets ``finished_at`` and a
+            # cancelled result, so for a late reporter this is the first and only report it ever
+            # sends -- and the answer it gets back, ``status: "cancelled"``, is what tells it to
+            # stop. Raised instead, a retry loop keyed on "did this raise" never ends.
             return {
                 "task_id": task_id,
                 "status": task.status,
                 "delivered": False,
                 "duplicate": True,
             }
+        try:
+            # Census twin ④: a task result from an in-process reporter never crossed a JSON parse,
+            # and ``task.json``'s writer cannot spell what the normalizer deliberately leaves alone.
+            # Before any state moves on the path that moves state -- a refused report leaves the
+            # task running and unclobbered, so the reporter can retry with a portable payload and
+            # the idempotency bookkeeping never records a result no writer could spell.
+            result = normalize_json_ingress(result, refuse_unportable_scalars=True)
+        except UnportableScalarError as exc:
+            raise ToolExecutionError(
+                f"task result is not portable JSON: {exc}",
+                error_code="task_result_unportable",
+            ) from exc
         task.status = status  # type: ignore[assignment]
         task.finished_at = time.time()
         task.result = result  # type: ignore[attr-defined]
