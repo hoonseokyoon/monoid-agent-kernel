@@ -105,10 +105,15 @@ Not carried:
   the opposite, and the preamble calls this list the contract.
 - **Whole values of any length**, for every model-authored *value* and every mapping *key* that
   reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
-  the script the text is written in. Several routes bypass the builders entirely and are listed
-  under "Carried, deliberately" below — read that list rather than counting exceptions here. An
-  Legacy raw delta events and the other explicit routes appear under "Carried, deliberately"
-  below.
+  the script the text is written in. The *payload* is bounded too: each traversal-built preview
+  spends one 256 KiB budget across everything it appends — keys, values and truncation markers
+  alike — so neither re-expanding a structure shared along many paths nor chunking a payload into
+  cap-obeying pieces grows an event without bound, and the cut reports itself through the same
+  `truncated_keys`/`truncated_items` vocabulary the per-container caps already use. The budget
+  covers what the preview builders build, not the stream: routes that bypass the builders
+  (hosted-task prompts and choices, `call_id`, validator feedback, error messages, a subagent's
+  answer) are listed under "Carried, deliberately" below — read that list rather than counting
+  exceptions here.
 
 Carried, deliberately:
 
@@ -151,7 +156,10 @@ Carried, deliberately:
   a command cut mid-string hides the part that matters (with the model choosing where that part
   sits), and a card rendering `{"redacted": true}` where a file body should be asks someone to
   authorize a write they cannot inspect. So an `ask`-gated call publishes more on `task.started`
-  than the same call would on `tool.call.started` — bounded, but readable. If that is not acceptable
+  than the same call would on `tool.call.started` — bounded, but readable. The card's payload
+  total has its own, far higher ceiling (1 MiB, against the trace's 256 KiB): a pathological
+  argument map cannot put megabytes on `task.started`, and an ordinary card never meets the
+  accountant. If that is not acceptable
   for a deployment, do not bind the tool to `authorization="ask"`, or attach a redacting
   `EventSink`.
 - **Error messages and paths**, which can name workspace structure.

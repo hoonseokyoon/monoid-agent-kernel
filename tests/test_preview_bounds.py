@@ -28,12 +28,14 @@ from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_BUDGET,
     APPROVAL_BYTE_THRESHOLD,
+    APPROVAL_PAYLOAD_BYTE_BUDGET,
     PREVIEW_BYTE_BUDGET,
     PREVIEW_BYTE_THRESHOLD,
     PREVIEW_MAX_DEPTH,
     PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
     REDACTED_PATH,
+    TRACE_PAYLOAD_BYTE_BUDGET,
     TRUNCATION_SUFFIX,
     args_preview,
     finish_args_preview,
@@ -704,3 +706,152 @@ def test_the_web_event_payload_is_bounded_on_the_events_either_side_of_the_call(
     assert big_locale not in json.dumps(published, ensure_ascii=False)
     assert published["locale"]["truncated"] is True
     assert published["blocked_domains"] == ["evil.test"], "ordinary descriptors pass through"
+
+
+# --- The payload budget: the per-value caps bound each piece, this bounds their sum ------------
+#
+# Depth, key, item and byte caps bound a preview's *shape*; none of them bounds the payload. Two
+# measured consequences at the commit before this one: a mapping shared five ways across nine
+# levels -- 46 objects, an input that fits on a line -- previewed to 25.78 MB in 1.02 s (sharing is
+# not a cycle, so the ancestor guard never fires), and a payload chunked into cap-obeying pieces
+# published all of them (20 items x 20 keys x 234 B ~= 95 KB per event, with nothing bounding the
+# piece count). The budget is charged on what is *appended* -- keys, values and truncation markers
+# alike -- so the serialized payload can never exceed it.
+
+
+def _payload_bytes(published: Any) -> int:
+    return len(json.dumps(published, ensure_ascii=False).encode("utf-8"))
+
+
+def test_a_value_shared_along_many_paths_costs_at_most_one_payload_budget() -> None:
+    """Gap 7: re-expansion is legal per path, so only a total can bound it.
+
+    The cycle guard tracks ancestors on the current path -- deliberately, because the same small
+    mapping appearing twice is ordinary and both copies must render. That leaves fanout: nine
+    levels shared five ways costs 5**8 depth markers at the floor. No per-value cap sees that
+    coming, because every individual value here is tiny. Only reachable from a Python-object
+    caller (a custom or MCP tool's ``ToolResult.content``); JSON cannot express sharing.
+    """
+    policy = PermissionPolicy()
+    leaf: dict[str, Any] = {"deep": "x"}
+    for _ in range(9):
+        leaf = {f"k{index}": leaf for index in range(5)}
+
+    start = time.monotonic()
+    published = public_result_content({"payload": leaf}, policy)
+    elapsed = time.monotonic() - start
+
+    assert _payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET, "the DAG re-expanded unbounded"
+    assert elapsed < 1.0, f"the traversal is still walking the whole DAG: {elapsed:.2f}s"
+
+
+def test_chunking_under_every_per_value_cap_cannot_exceed_the_payload_budget() -> None:
+    """Gap 8: every cap is per-value or per-container, and the piece count was unbounded.
+
+    Each piece here obeys every rule -- 234 bytes is under the threshold, so each value crosses
+    whole -- and the top-level key count is deliberately uncapped (narration reads specific
+    argument names). The budget is what makes "the stream is a bounded channel" true per payload
+    rather than per piece; the cut announces itself through the key the width cap already uses.
+    """
+    policy = PermissionPolicy()
+    word = "A" * 234
+    arguments = {f"arg{index:04d}": word for index in range(2000)}  # ~= 490 KB of obedient pieces
+
+    published = args_preview(arguments, policy)
+
+    assert _payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET
+    assert published["truncated_keys"] > 0, "a cap that does not say it capped"
+
+
+def test_the_budget_is_spent_per_payload_and_not_per_top_level_key() -> None:
+    """The reverted ``PREVIEW_MAX_NODES`` was born once per top-level ``preview_value`` call, so
+    400 keys each got a fresh allowance and the payload still reached 42 MB. One budget object per
+    payload, threaded through the whole traversal, is the difference being pinned: this shape has
+    every subtree comfortably inside a per-key allowance and the *sum* far outside one.
+    """
+    policy = PermissionPolicy()
+    word = "B" * 234
+    arguments = {
+        f"arg{index:03d}": {f"k{n}": word for n in range(20)} for index in range(400)
+    }  # each value ~= 5 KB; the sum ~= 2 MB
+
+    published = args_preview(arguments, policy)
+
+    assert _payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET
+
+
+def test_the_gap_8_exemplar_payload_is_published_byte_identical() -> None:
+    """The budget sits far above anything the caps admit in ordinary shapes.
+
+    This is the *maximum* cap-obeying flat payload from the gap-8 triage (20 items x 20 keys x
+    234 B ~= 95 KB), and it crosses byte-identical: the budget exists for pathological nesting and
+    sharing, not to reshape any payload the existing caps already describe. Green by design before
+    and after the budget landed -- the guard that the constant stays above the ordinary ceiling.
+    """
+    policy = PermissionPolicy()
+    word = "C" * 234
+    items = [
+        {"step": word, "status": "pending", **{f"extra{n}": word for n in range(18)}}
+        for _ in range(20)
+    ]
+
+    published = preview_value("items", items, policy, list_marker=False)
+
+    assert published == items
+
+
+def test_the_fixed_key_builders_share_one_payload_budget_across_their_fields() -> None:
+    """``shell_args_preview`` and ``web_args_preview`` skip ``public_mapping`` on purpose — their
+    outer keys are kernel literals — which is exactly how they would skip the budget: each field
+    previewing under its own fresh allowance is the reverted per-key accounting wearing builder
+    clothes. The field *values* are model-controlled, so any of them can be a nested container,
+    and a container's *structure* is what no per-value cap bounds — the depth and width caps
+    admit ``5**6`` expansion paths from an input that fits on a line.
+    """
+    policy = PermissionPolicy()
+    blob: dict[str, Any] = {"deep": "x"}
+    for _ in range(6):
+        blob = {f"k{index}": blob for index in range(5)}  # ~= 400 KB once re-expanded per path
+
+    shell = shell_args_preview({"command": "echo", "timeout_s": blob, "env": {}}, policy)
+    web = web_args_preview({"locale": blob, "max_results": blob}, policy)
+
+    assert _payload_bytes(shell) <= TRACE_PAYLOAD_BYTE_BUDGET
+    assert _payload_bytes(web) <= TRACE_PAYLOAD_BYTE_BUDGET
+
+
+def test_the_trace_budget_does_not_leak_into_the_approval_surface() -> None:
+    """A person authorizing a call reads the approval card; a log reader reads the trace.
+
+    The two surfaces share one traversal, so a budget added there is inherited by both -- which is
+    how the trace constant could silently become the approval card's ceiling. Same arguments, both
+    surfaces: the trace cuts and says so; the approval card, whose own budget is far higher, shows
+    every argument.
+    """
+    policy = PermissionPolicy()
+    word = "D" * 234
+    arguments = {f"arg{index:04d}": word for index in range(2000)}  # ~= 490 KB
+
+    trace = args_preview(arguments, policy)
+    approval = redact_tool_arguments(arguments, policy=policy)
+
+    assert "truncated_keys" in trace
+    assert "truncated_keys" not in approval, "the approval card lost arguments to the trace constant"
+    assert len(approval) == 2000
+
+
+def test_the_approval_surface_is_payload_bounded_too_just_far_higher() -> None:
+    """Bounded, but readable -- the approval principle extends to the payload total.
+
+    A pathological argument map should not put megabytes on ``task.started`` and ``task.json``
+    just because the surface is a decision surface; it should stay readable up to a ceiling a
+    human could conceivably scroll. Past that, the card cuts and says so, exactly like the trace.
+    """
+    policy = PermissionPolicy()
+    word = "E" * 234
+    arguments = {f"arg{index:04d}": word for index in range(6000)}  # ~= 1.5 MB
+
+    approval = redact_tool_arguments(arguments, policy=policy)
+
+    assert _payload_bytes(approval) <= APPROVAL_PAYLOAD_BYTE_BUDGET
+    assert "truncated_keys" in approval

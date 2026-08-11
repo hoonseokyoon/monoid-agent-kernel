@@ -7,6 +7,37 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — the preview is bounded as a payload, not only per piece: budgeted traversal (Track D)
+
+- **Every traversal-built preview now spends one byte budget across everything it appends.**
+  Two of the four gaps the 0.20.0 notes left open close here. "One preview's total size is
+  bounded only by its input" — the shared-graph re-expansion: nine levels shared five ways,
+  46 objects, previewed to 25.78 MB in 1.02 s, growing ~×5.9 per added branch, with the cycle
+  guard rightly silent because sharing is not a cycle — closes because the walk now stops when
+  the payload reaches its ceiling, while a value shared twice still renders twice. And "there
+  is no aggregate budget, so the caps can be walked around by chunking" closes because the
+  cap-obeying pieces still pass and their sum no longer does. The budget is charged on
+  serialized output — quoted keys, preview envelopes and truncation markers included — because
+  the reverted `PREVIEW_MAX_NODES` proved both halves the hard way: it counted visited nodes
+  instead of bytes (912 KB of markers lived outside the count), and it was born once per
+  top-level key, so 400 keys still cost 42 MB. One `PayloadBudget` per payload: 256 KiB on the
+  trace surface, 1 MiB on the approval card, whose reader is a person and whose ceiling must
+  not quietly become the trace constant. The fixed-key builders (`shell_args_preview`,
+  `web_args_preview`) share one budget across their fields for the same reason, and
+  `public_job_artifact` stays outside the scheme: its field set is a fixed allowlist,
+  individually bounded and schema-validated on both ends.
+- **Exhaustion spends the vocabulary that already exists; nothing is replaced.** The same
+  revert shipped the failure shapes this rules out: budget markers *replacing* plan items kept
+  `len(items) - len(published)` at 0, so `truncated_items` never fired and `status.json`
+  reported a complete-looking plan permanently one step short of done — and a
+  `{"budget_exhausted": true}` dict where `_INLINE_TEXT_KEYS` guarantees a string rendered
+  `[object Object]`. Now a dict that runs out drops its remaining keys and says how many
+  through `truncated_keys`; a list drops its tail and reports through the existing
+  `{"truncated_items": n}` marker — or, at the plan root, through the sibling count the caller
+  already derives from the length difference; strings keep their existing envelopes and inline
+  markers. No new marker shape and no schema value changes, so `validate_run_dir` reads
+  directories written on either side of this change.
+
 ### Added — the reader transports, the mint certifies: ledger format guard (W7-4)
 
 - **`model_call_record` refuses to mint a line `monoid validate` would then convict.**

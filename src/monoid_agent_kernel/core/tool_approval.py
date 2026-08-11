@@ -9,7 +9,9 @@ from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_BUDGET,
     APPROVAL_BYTE_THRESHOLD,
+    APPROVAL_PAYLOAD_BYTE_BUDGET,
     UNMASKED,
+    PayloadBudget,
     preview_value,
     public_mapping,
     touches_redacted_path,
@@ -144,6 +146,11 @@ def redact_tool_arguments(
             return _REDACTED
         return UNMASKED
 
+    # The approval surface gets its *own* payload ceiling, for the same reason it gets its own
+    # per-value budget: the traversal is shared, so a budget added there is inherited here, and
+    # letting the trace constant become the approval card's ceiling would cut arguments a person
+    # needs to read. Far higher, still bounded -- a card is read by a human, not paged by one.
+    payload_budget = PayloadBudget(APPROVAL_PAYLOAD_BYTE_BUDGET)
     return public_mapping(
         arguments,
         lambda key, value: preview_value(
@@ -153,6 +160,7 @@ def redact_tool_arguments(
             mask=mask,
             threshold=APPROVAL_BYTE_THRESHOLD,
             budget=APPROVAL_BYTE_BUDGET,
+            _payload_budget=payload_budget,
             # This is the decision surface: `content`/`old`/`new` are blanked on the trace surface
             # and *shown* here, bounded by the budget above. An approval card that renders
             # `{"redacted": true}` where the file body should be asks a human to authorize a write
@@ -165,6 +173,7 @@ def redact_tool_arguments(
         ),
         threshold=APPROVAL_BYTE_THRESHOLD,
         budget=APPROVAL_BYTE_BUDGET,
+        payload_budget=payload_budget,
     )
 
 

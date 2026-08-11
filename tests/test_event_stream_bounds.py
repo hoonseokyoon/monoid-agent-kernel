@@ -37,6 +37,7 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_MAX_ITEMS,
     PREVIEW_MAX_KEYS,
     REDACTED_PATH,
+    TRACE_PAYLOAD_BYTE_BUDGET,
     TRUNCATION_SUFFIX,
     redacted_value,
 )
@@ -279,6 +280,46 @@ def test_a_list_nested_inside_a_plan_item_keeps_its_own_truncation_marker(tmp_pa
     nested = published[0]["evidence"]
     assert len(nested) == PREVIEW_MAX_ITEMS + 1
     assert nested[-1] == {"truncated_items": 30 - PREVIEW_MAX_ITEMS}
+
+
+def test_a_plan_past_the_payload_budget_is_cut_visibly_and_stays_renderable(tmp_path: Path) -> None:
+    """The three regressions the reverted ``PREVIEW_MAX_NODES`` shipped, pinned as one scenario.
+
+    That budget replaced items with ``{"budget_exhausted": true}`` markers, so ``len(items) -
+    len(published)`` stayed 0 and the sibling count never fired -- a complete-looking plan
+    permanently one step short of done -- and it put a dict where ``_INLINE_TEXT_KEYS`` guarantees
+    the renderer a string. This pins the byte budget spending itself the other way: whole trailing
+    items are *dropped*, so the length difference the caller already publishes as
+    ``truncated_items`` measures the cut, every retained element is still a plan item with a string
+    ``step``, and no foreign element enters the typed array. The item count here is under
+    ``PREVIEW_MAX_ITEMS``, so anything the count reports is the budget's doing, not the width cap's.
+    """
+    word = "x" * 234
+    deep = {
+        f"k{a}": {f"m{b}": {f"n{c}": word for c in range(10)} for b in range(10)}
+        for a in range(10)
+    }  # ~= 245 KB per item once expanded; JSON-legal, cap-obeying, nothing exotic
+    items = [{"step": f"step {index}", "status": "pending", "data": deep} for index in range(20)]
+
+    result = _run(_spec(tmp_path), [("run.update_plan", {"items": items})], "run.update_plan")
+
+    assert validate_run_dir(result.run_dir) == []
+    data = _events(result.run_dir, "plan.updated")[-1]["data"]
+    published = data["items"]
+
+    assert (
+        len(json.dumps(published, ensure_ascii=False).encode("utf-8")) <= TRACE_PAYLOAD_BYTE_BUDGET
+    )
+    assert 0 < len(published) < len(items), "the cut dropped whole items rather than replacing them"
+    assert data["truncated_items"] == len(items) - len(published)
+    assert all(isinstance(item, dict) for item in published)
+    assert all("step" in item for item in published), "a foreign element entered the typed array"
+    assert all(isinstance(item["step"], str) for item in published)
+
+    # `status.json` copies this event wholesale, so the visible cut travels with it.
+    status = json.loads((result.run_dir / "status.json").read_text(encoding="utf-8"))
+    assert len(status["plan"]) == len(published)
+    assert status["plan_truncated_items"] == data["truncated_items"]
 
 
 def test_a_later_shorter_plan_clears_the_stale_truncation_count(tmp_path: Path) -> None:

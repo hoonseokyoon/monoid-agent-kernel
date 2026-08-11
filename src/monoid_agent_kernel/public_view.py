@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -98,6 +99,8 @@ def public_error_message(error: str) -> str:
 
 
 def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+
     def one(key: str, value: Any) -> Any:
         if key == "content":
             return redacted_value(value)
@@ -105,9 +108,9 @@ def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> 
             # Same bound as `paths` on the event that carries this. Diverting `path` to bare
             # `public_path` published the model's whole argument beside its own truncation.
             return public_inline_path(value, policy)
-        return preview_value(key, value, policy)
+        return preview_value(key, value, policy, _payload_budget=payload_budget)
 
-    return public_mapping(content, one)
+    return public_mapping(content, one, payload_budget=payload_budget)
 
 
 def public_capability_result(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -223,6 +226,11 @@ def public_job_artifact(job: Mapping[str, Any], policy: PermissionPolicy) -> dic
     allowlist and validated against ``PUBLIC_JOB_SCHEMA``. A retained or tampered artifact cannot
     invent a field and have a public reader copy it through.
 
+    Deliberately outside the payload budget: the field set is a fixed allowlist, every previewed
+    field is individually bounded, and both ends are schema-validated -- the total is structurally
+    bounded without an accountant. (``cwd``'s lone ``preview_value`` call self-creates a budget,
+    which for a single scalar is the same thing as none.)
+
     The fields receive these treatments:
 
     - ``command`` is dropped outright. ``command_preview`` is already in the artifact and is built
@@ -297,7 +305,12 @@ def args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[st
     is masked on an ``ask``-gated call and published verbatim on an ``allow`` call. Anyone who wants
     it masked on both adds the example sink, or does not pass credentials as tool arguments.
     """
-    return public_mapping(arguments, lambda key, value: preview_value(key, value, policy))
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+    return public_mapping(
+        arguments,
+        lambda key, value: preview_value(key, value, policy, _payload_budget=payload_budget),
+        payload_budget=payload_budget,
+    )
 
 
 # ``run.finish`` arguments that are the model's own prose rather than metadata about the run.
@@ -329,36 +342,50 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
     a redaction marker on an absent value tells an operator something was withheld when nothing
     was there.
     """
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
     return public_mapping(
         arguments,
         lambda key, value: (
             redacted_value(value)
             if value is not None and key.lower() in _FINISH_CONTENT_KEYS
-            else preview_value(key, value, policy)
+            else preview_value(key, value, policy, _payload_budget=payload_budget)
         ),
+        payload_budget=payload_budget,
     )
 
 
 def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dict[str, Any]:
     env = arguments.get("env") if isinstance(arguments.get("env"), dict) else {}
+    # One budget across all seven fields, even though the outer keys are kernel literals. The
+    # values are model-controlled, and any of them can arrive as a *container* -- so per-field
+    # budgets here would be the reverted per-top-level-key accounting wearing builder clothes.
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
     return {
-        "command_preview": preview_value("command_preview", str(arguments.get("command") or ""), policy),
-        "cwd": preview_value("cwd", arguments.get("cwd", "."), policy),
+        "command_preview": _budgeted_field(
+            "command_preview", str(arguments.get("command") or ""), policy, payload_budget
+        ),
+        "cwd": _budgeted_field("cwd", arguments.get("cwd", "."), policy, payload_budget),
         # Previewed, not copied, even though all three are declared `["integer", "null"]`. The
         # schema does not protect this surface: `tool.call.started` is emitted *before*
         # `validate_args` rejects the call, so a model that sends a 2 KB string in `timeout_s`
         # publishes it and is then told the call was invalid. "It is an int" is the same assumption
         # that left `env_keys` and the tool name unbounded.
-        "timeout_s": preview_value("timeout_s", arguments.get("timeout_s"), policy),
-        "max_output_bytes": preview_value("max_output_bytes", arguments.get("max_output_bytes"), policy),
-        "startup_wait_s": preview_value("startup_wait_s", arguments.get("startup_wait_s"), policy),
+        "timeout_s": _budgeted_field("timeout_s", arguments.get("timeout_s"), policy, payload_budget),
+        "max_output_bytes": _budgeted_field(
+            "max_output_bytes", arguments.get("max_output_bytes"), policy, payload_budget
+        ),
+        "startup_wait_s": _budgeted_field(
+            "startup_wait_s", arguments.get("startup_wait_s"), policy, payload_budget
+        ),
         "background": bool(arguments.get("background", False)),
         "resume_on_exit": bool(arguments.get("resume_on_exit", True)),
         # Previewed, not copied. Env *keys* are model-controlled strings of unbounded length and
         # count: a 20 KB key rode out verbatim here while the same value in a generic argument was
         # capped. This branch withholds env *values* on purpose, so letting the keys carry arbitrary
         # text made it a way to publish exactly what it was withholding.
-        "env_keys": preview_value("env_keys", sorted(str(key) for key in env), policy),
+        "env_keys": _budgeted_field(
+            "env_keys", sorted(str(key) for key in env), policy, payload_budget
+        ),
     }
 
 
@@ -372,6 +399,9 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
     field sounds like an enum.
     """
     preview: dict[str, Any] = {}
+    # Same rule as ``shell_args_preview``: kernel-literal keys, model-controlled values, one
+    # budget across all of them so a container in any field cannot start a fresh allowance.
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
     if "query" in arguments:
         preview["query_preview"] = public_query_preview(str(arguments.get("query") or ""))
     if "url" in arguments:
@@ -388,14 +418,14 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
         "format",
     ):
         if key in arguments:
-            preview[key] = preview_value(key, arguments[key], policy)
+            preview[key] = _budgeted_field(key, arguments[key], policy, payload_budget)
     if "allowed_domains" in arguments:
-        preview["allowed_domains"] = preview_value(
-            "allowed_domains", arguments.get("allowed_domains") or [], policy
+        preview["allowed_domains"] = _budgeted_field(
+            "allowed_domains", arguments.get("allowed_domains") or [], policy, payload_budget
         )
     if "blocked_domains" in arguments:
-        preview["blocked_domains"] = preview_value(
-            "blocked_domains", arguments.get("blocked_domains") or [], policy
+        preview["blocked_domains"] = _budgeted_field(
+            "blocked_domains", arguments.get("blocked_domains") or [], policy, payload_budget
         )
     return preview
 
@@ -427,6 +457,116 @@ PREVIEW_MAX_ITEMS = 20
 # So: big enough for any realistic command or argument, still bounded against a pathological one.
 APPROVAL_BYTE_THRESHOLD = 4096
 APPROVAL_BYTE_BUDGET = 4096
+
+# The *payload* ceiling. Every cap above bounds one piece — a value's bytes, a container's width,
+# the recursion's depth — and none of them bounds the sum, which left two measured routes open: a
+# mapping shared five ways across nine levels (46 objects, an input that fits on a line) previewed
+# to 25.78 MB in 1.02 s, because sharing is not a cycle and re-expansion is once per path; and a
+# payload chunked into cap-obeying pieces published all of them, 95 KB per event with nothing
+# bounding the piece count. The budget is bytes of *output* rather than visited nodes: the reverted
+# ``PREVIEW_MAX_NODES`` proved a node is not a byte (counting only containers left 912 KB of
+# markers outside the count), and it was born once per top-level key, so 400 keys still cost 42 MB.
+# One ``PayloadBudget`` per payload, threaded through the whole traversal, charged on everything
+# appended — keys, values and truncation markers alike.
+#
+# Two constants because the two surfaces read differently: a log reader gets the trace ceiling,
+# far above anything the per-value caps admit in ordinary shapes (the worst cap-obeying flat
+# payload measures ~95 KB), and the approval card — a person deciding whether a call may run —
+# gets a ceiling a human could conceivably scroll. Letting the trace constant reach the decision
+# surface is the same inversion ``decision_surface`` exists to prevent.
+TRACE_PAYLOAD_BYTE_BUDGET = 256 * 1024
+APPROVAL_PAYLOAD_BYTE_BUDGET = 1024 * 1024
+# Headroom the terminal truncation markers spend from, so "the cut announces itself" survives the
+# moment the budget runs out. Bounded by construction: past exhaustion, at most one marker lands
+# per container still open on the recursion stack — the depth cap keeps that under two dozen.
+_PAYLOAD_MARKER_RESERVE = 1024
+
+
+class PayloadBudget:
+    """What one payload may still append, in serialized UTF-8 bytes.
+
+    ``charge`` is the ordinary spend: refuse-without-deducting when the fragment does not fit, so
+    the caller drops that fragment and reports the drop. ``charge_marker`` is for the report
+    itself — a truncation marker must land even at zero, or the cut becomes silent, so it spends
+    into the reserve carved out at construction. The serialized payload can exceed neither half:
+    regular fragments fit inside ``limit - reserve``, and post-exhaustion markers fit inside the
+    reserve because the stack depth bounds how many containers can still announce a cut.
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = max(limit - _PAYLOAD_MARKER_RESERVE, 0)
+
+    def charge(self, cost: int) -> bool:
+        if cost > self.remaining:
+            return False
+        self.remaining -= cost
+        return True
+
+    def charge_marker(self, cost: int) -> None:
+        self.remaining -= cost
+
+
+class _Dropped:
+    """Sentinel: the budget refused this fragment; the enclosing container stops and reports."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "DROPPED"
+
+
+_DROPPED = _Dropped()
+
+
+def _fragment_cost(fragment: Any) -> int:
+    """Serialized size of one finished fragment, measured the way the sinks will spell it.
+
+    ``json.dumps`` with default separators, which are the *widest* spelling any sink uses — the
+    event log writes them and the ledger writes compact — so charging this keeps the bound
+    conservative. Unencodable values (a ``bytes`` in a Python-built tool result, an integer past
+    the interpreter's digit limit) report a cost of ``-1``: the caller passes those through
+    uncharged today, exactly as the traversal always has, because inventing a spelling for them
+    is the separate arbitrary-scalar decision and this commit only bounds what already encodes.
+    """
+    try:
+        return len(json.dumps(fragment, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _charge_fragment(budget: PayloadBudget, fragment: Any) -> Any:
+    cost = _fragment_cost(fragment)
+    if cost < 0:
+        return fragment
+    return fragment if budget.charge(cost) else _DROPPED
+
+
+def _charge_terminal_marker(budget: PayloadBudget, fragment: Any) -> None:
+    """A truncation marker is charged like any fragment while money remains, and to the reserve
+    once it does not — the marker landing is what keeps the cut visible."""
+    cost = _fragment_cost(fragment)
+    if cost < 0:  # pragma: no cover - markers are kernel-built JSON
+        return
+    if not budget.charge(cost):
+        budget.charge_marker(cost)
+
+
+def _budgeted_field(key: str, value: Any, policy: PermissionPolicy, budget: PayloadBudget) -> Any:
+    """One fixed-key builder field, with the refusal translated where the key must survive.
+
+    ``shell_args_preview`` and ``web_args_preview`` assemble their outer mapping by hand, so a
+    ``_DROPPED`` coming back has no container loop to stop — and their keys are kernel literals a
+    reader looks up by name, so dropping the *entry* would blank a field that looks checked. The
+    refused value becomes the terminal marker instead: the key stays, the cut says so, and the
+    marker spends from the reserve like every other announcement of exhaustion.
+    """
+    fragment = preview_value(key, value, policy, _payload_budget=budget)
+    if fragment is _DROPPED:
+        fallback = {"truncated": True, "type": type(value).__name__}
+        _charge_terminal_marker(budget, fallback)
+        return fallback
+    return fragment
+
 
 # Keys whose value a renderer prints inline, so the preview has to stay a *string*. Replacing one
 # with a `{"preview": ...}` dict renders `[object Object]` -- `WorkspaceInspector.svelte` does
@@ -516,6 +656,7 @@ def public_mapping(
     *,
     threshold: int = PREVIEW_BYTE_THRESHOLD,
     budget: int = PREVIEW_BYTE_BUDGET,
+    payload_budget: PayloadBudget | None = None,
 ) -> dict[str, Any]:
     """Build a public mapping from ``values``, bounding the **key** as well as the value.
 
@@ -529,15 +670,40 @@ def public_mapping(
     Deliberately not ``preview_value(key, mapping, policy)``, which would also apply
     ``PREVIEW_MAX_KEYS``. The top-level *count* cap is absent on purpose — ``narration`` and the
     activity feed read specific argument names, and dropping the 21st argument would blank them —
-    and that reasoning is about count, not length.
+    and that reasoning is about count, not length. The *payload budget* does stop this loop, and
+    that is not the same regression: the count cap dropped the 21st argument of every wide call,
+    while the budget stops nothing until a quarter-megabyte has already been appended, and says so
+    through ``truncated_keys`` when it does.
+
+    ``payload_budget`` must be the same object the ``preview`` callback spends from — the builders
+    close one budget over both — or the keys and the values are accounted on different ledgers.
+    Callback returns that bypass ``preview_value`` (``public_result_content``'s ``content`` and
+    ``path`` branches, ``finish_args_preview``'s prose redaction) are appended uncharged; each is
+    a kernel-named key producing a bounded fragment, so the slack is a fixed handful of bytes,
+    not a route.
     """
+    if payload_budget is None:
+        payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
     published: dict[str, Any] = {}
     collisions: dict[str, int] = {}
+    payload_budget.charge(2)  # the braces
+    stopped = False
     for key, value in values.items():
         name = _bounded_key(
             str(key), threshold=threshold, budget=budget, taken=published, _collisions=collisions
         )
-        published[name] = preview(str(key), value)
+        if not payload_budget.charge(_fragment_cost(name) + 4):
+            stopped = True
+            break
+        fragment = preview(str(key), value)
+        if fragment is _DROPPED:
+            stopped = True
+            break
+        published[name] = fragment
+    if stopped:
+        dropped_keys = len(values) - len(published)
+        published["truncated_keys"] = dropped_keys
+        _charge_terminal_marker(payload_budget, {"truncated_keys": dropped_keys})
     return published
 
 
@@ -561,10 +727,18 @@ def preview_value(
     budget: int = PREVIEW_BYTE_BUDGET,
     decision_surface: bool = False,
     list_marker: bool = True,
+    _payload_budget: PayloadBudget | None = None,
     _depth: int = 0,
     _ancestors: frozenset[int] = frozenset(),
 ) -> Any:
     """Bound a value for publication, optionally masking keys the caller names first.
+
+    ``_payload_budget`` is the whole-payload byte ceiling this call spends from. Passing ``None``
+    makes this call its *own* payload — right for the single-root builders (``artifact.emitted``'s
+    ``metadata``, ``plan.updated``'s ``items``, ``public_job_artifact``'s ``cwd``), and exactly
+    wrong for a builder that assembles several fields into one payload: each field would get a
+    fresh allowance, which is the per-key accounting the reverted ``PREVIEW_MAX_NODES`` shipped.
+    Multi-field builders create one ``PayloadBudget`` and thread it through every call.
 
     ``mask`` is consulted at *every* level with that level's key, and returning anything other than
     ``UNMASKED`` replaces the value outright. It exists so that the approval projection can add its
@@ -593,10 +767,62 @@ def preview_value(
     rule to every depth on the reasoning that a rule bound at one site should be bound at its twins.
     Nested lists are not that twin.
     """
+    owns_budget = _payload_budget is None
+    if _payload_budget is None:
+        _payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+    result = _preview_value(
+        key,
+        value,
+        policy,
+        mask=mask,
+        threshold=threshold,
+        budget=budget,
+        decision_surface=decision_surface,
+        list_marker=list_marker,
+        _payload_budget=_payload_budget,
+        _depth=_depth,
+        _ancestors=_ancestors,
+    )
+    if result is _DROPPED:
+        if not owns_budget:
+            # A recursive caller translates the refusal into its container's stop-and-report;
+            # the sentinel must never outlive this module.
+            return _DROPPED
+        # A self-owned budget refusing its very first fragment takes a whole default ceiling,
+        # which no real fragment reaches -- but a structural fallback beats trusting that.
+        fallback = {"truncated": True, "type": type(value).__name__}
+        _charge_terminal_marker(_payload_budget, fallback)
+        return fallback
+    return result
+
+
+def _preview_value(
+    key: str,
+    value: Any,
+    policy: PermissionPolicy,
+    *,
+    mask: Callable[[str, Any], Any] | None,
+    threshold: int,
+    budget: int,
+    decision_surface: bool,
+    list_marker: bool,
+    _payload_budget: PayloadBudget,
+    _depth: int,
+    _ancestors: frozenset[int],
+) -> Any:
+    """The traversal behind ``preview_value``, with the payload budget always in hand.
+
+    Every leaf-shaped return — a plain scalar, a preview envelope, a mask replacement, a
+    redaction, a depth or cycle marker — passes through ``_charge_fragment`` exactly once, and the
+    container branches charge the connective tissue (braces, quoted keys, separators) as they
+    append it. Charged-at-least-cost per appended byte is what makes the serialized payload
+    provably no larger than the budget; a refused fragment comes back as ``_DROPPED`` and the
+    enclosing container stops there and says how much it dropped.
+    """
     if mask is not None:
         replacement = mask(key, value)
         if replacement is not UNMASKED:
-            return replacement
+            return _charge_fragment(_payload_budget, replacement)
     lowered = key.lower()
     if not decision_surface:
         # One branch, both withholdings. They were two independent flags for one commit, and that
@@ -606,15 +832,18 @@ def preview_value(
         # means by ``redact_patterns``, it is not that. A surface either withholds from its reader
         # or it does not; a caller cannot pick one half any more.
         if _is_content_field(lowered):
-            return redacted_value(value)
+            return _charge_fragment(_payload_budget, redacted_value(value))
         if (
             _is_path_field(lowered)
             and isinstance(value, str)
             and _is_path_redacted(value, policy)
         ):
-            return redacted_value(value)
+            return _charge_fragment(_payload_budget, redacted_value(value))
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
-        return {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH}
+        return _charge_fragment(
+            _payload_budget,
+            {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH},
+        )
     if isinstance(value, (dict, list)):
         # The depth cap terminates but does not bound *cost*: a container reachable from itself is
         # re-expanded once per edge per level, so a 21-object input with 20 self-referencing keys
@@ -627,11 +856,17 @@ def preview_value(
         # a payload is ordinary and both copies should render. Only a container containing *itself*
         # is elided, which is the case that has no faithful rendering anyway.
         if id(value) in _ancestors:
-            return {"truncated": True, "type": type(value).__name__, "circular": True}
+            return _charge_fragment(
+                _payload_budget,
+                {"truncated": True, "type": type(value).__name__, "circular": True},
+            )
         _ancestors = _ancestors | {id(value)}
     if isinstance(value, dict):
+        if not _payload_budget.charge(2):  # the braces
+            return _DROPPED
         preview: dict[str, Any] = {}
         collisions: dict[str, int] = {}
+        stopped = False
         for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]:
             # The key is model-authored text too, and it was the one string this function published
             # at any length: the same 30 KB file body arrived ``{"redacted": true}`` in the value
@@ -643,9 +878,14 @@ def preview_value(
             name = _bounded_key(
                 str(child_key), threshold=threshold, budget=budget, taken=preview, _collisions=collisions
             )
+            # The quoted key and its separators are appended bytes like any others; refusing them
+            # here is what stops a thousand cap-obeying entries from summing past the ceiling.
+            if not _payload_budget.charge(_fragment_cost(name) + 4):
+                stopped = True
+                break
             # Rules still match on the *whole* key: a 5 KB key ending in ``_path`` is a path, and
             # judging it by its truncated form would let length defeat the redaction.
-            preview[name] = preview_value(
+            child = _preview_value(
                 str(child_key),
                 child_value,
                 policy,
@@ -653,22 +893,37 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 decision_surface=decision_surface,
+                list_marker=True,
+                _payload_budget=_payload_budget,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
             )
+            if child is _DROPPED:
+                stopped = True
+                break
+            preview[name] = child
         # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
         # preview is lossy by construction, and no consumer reads nested preview dicts by key --
         # ``narration`` and the Studio activity feed both read only top-level ``args_preview`` keys,
         # which the ``*_args_preview`` builders above assemble themselves and never width-cap.
-        if len(value) > PREVIEW_MAX_KEYS:
-            preview["truncated_keys"] = len(value) - PREVIEW_MAX_KEYS
+        # One number for both cuts -- the width cap's excess and the budget's stop -- because the
+        # reader's question is "how many keys am I not seeing", not which rule dropped them.
+        dropped_keys = len(value) - len(preview)
+        if stopped or dropped_keys > 0:
+            preview["truncated_keys"] = dropped_keys
+            _charge_terminal_marker(_payload_budget, {"truncated_keys": dropped_keys})
         return preview
     if isinstance(value, list):
+        if not _payload_budget.charge(2):  # the brackets
+            return _DROPPED
         # The parent key is reused for each item because list items have no key of their own. A
         # secret-named list is already masked whole before reaching here; what this carries is the
         # mask *down* to dicts inside the list, so ``{"headers": [{"api_key": ...}]}`` still masks.
-        items = [
-            preview_value(
+        items: list[Any] = []
+        for item in value[:PREVIEW_MAX_ITEMS]:
+            if not _payload_budget.charge(2):  # the separator
+                break
+            child = _preview_value(
                 key,
                 item,
                 policy,
@@ -676,34 +931,46 @@ def preview_value(
                 threshold=threshold,
                 budget=budget,
                 decision_surface=decision_surface,
+                list_marker=True,
+                _payload_budget=_payload_budget,
                 _depth=_depth + 1,
                 _ancestors=_ancestors,
             )
-            for item in value[:PREVIEW_MAX_ITEMS]
-        ]
+            if child is _DROPPED:
+                break
+            items.append(child)
         # The marker is a *foreign shape* in the array it is appended to. In a JSON blob that is the
         # point -- it is self-describing and the reader sees it. In a typed array it is a defect: the
         # Studio plan renderer reads ``items[].step``, so this element drew a blank row AND inflated
         # the ``n/len(plan)`` progress denominator. ``list_marker`` applies to the list passed in
         # and does *not* propagate -- see the docstring for why nested lists are not that twin.
         # (This comment used to claim the opposite, and outlived the fix that made it false.)
-        if list_marker and len(value) > PREVIEW_MAX_ITEMS:
-            items.append({"truncated_items": len(value) - PREVIEW_MAX_ITEMS})
+        # ``len(value) - len(items)`` covers the width cap's excess and the budget's stop with one
+        # number; the ``list_marker=False`` caller reads the same difference off the root itself.
+        if list_marker and len(value) > len(items):
+            marker = {"truncated_items": len(value) - len(items)}
+            _charge_terminal_marker(_payload_budget, marker)
+            items.append(marker)
         return items
     if isinstance(value, str):
         encoded_len = len(value.encode("utf-8"))
         if encoded_len > threshold:
             if lowered in _INLINE_TEXT_KEYS:
                 # Stays a string: a renderer prints this one directly.
-                return truncate_inline_text(value, threshold=threshold, budget=budget)
-            return {
-                "type": "str",
-                "preview": truncate_to_bytes(value, budget),
-                "bytes": encoded_len,
-                "truncated": True,
-            }
-        return value
-    return value
+                return _charge_fragment(
+                    _payload_budget, truncate_inline_text(value, threshold=threshold, budget=budget)
+                )
+            return _charge_fragment(
+                _payload_budget,
+                {
+                    "type": "str",
+                    "preview": truncate_to_bytes(value, budget),
+                    "bytes": encoded_len,
+                    "truncated": True,
+                },
+            )
+        return _charge_fragment(_payload_budget, value)
+    return _charge_fragment(_payload_budget, value)
 
 
 def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:
@@ -755,7 +1022,12 @@ def public_event_payload(data: Mapping[str, Any], policy: PermissionPolicy) -> d
     argument that kept it out of ``plan.updated.items`` was about a consumer reading
     ``items[].step``, and nothing reads these by element shape.
     """
-    return public_mapping(data, lambda key, value: preview_value(key, value, policy))
+    payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+    return public_mapping(
+        data,
+        lambda key, value: preview_value(key, value, policy, _payload_budget=payload_budget),
+        payload_budget=payload_budget,
+    )
 
 
 def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -> bool:
