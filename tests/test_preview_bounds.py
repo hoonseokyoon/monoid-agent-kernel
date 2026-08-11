@@ -984,6 +984,65 @@ def test_the_payload_budget_holds_in_the_widest_spelling_a_sink_uses(
     assert len(published) > 1, "the budget cut so hard the payload says nothing"
 
 
+def test_an_argument_named_like_the_marker_is_renamed_not_erased() -> None:
+    """The marker must not destroy the argument whose name it happens to share.
+
+    A model names its own arguments, so one may be called ``truncated_keys``. The marker used to
+    be written straight over it: the value vanished with no marker of its own, and the count
+    under-reported by one, because the entry it replaced had already been counted as published.
+    That is a cap that does not say what it capped, arriving through the very key meant to
+    announce the cut -- and the top level is the worst place for it, because narration and the
+    activity feed read these keys by name.
+
+    The marker keeps the plain name and the argument takes the ``#N`` suffix, inverting
+    ``_bounded_key``'s "first one wins" on purpose: the name is a contract a consumer looks up,
+    and one that cannot find it reads a cut payload as a complete one.
+    """
+    policy = PermissionPolicy()
+    # First, so it is published before the budget stops: a key the cut never reached is dropped
+    # rather than overwritten, which is a different (and correctly reported) outcome.
+    arguments = {"truncated_keys": "MODEL AUTHORED VALUE"}
+    arguments.update({f"arg{index:05d}": "D" * 234 for index in range(2000)})
+
+    published = args_preview(arguments, policy)
+
+    assert published["truncated_keys"] == len(arguments) - (len(published) - 1)
+    assert published["truncated_keys#2"] == "MODEL AUTHORED VALUE"
+    assert _widest_payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET
+
+
+def test_a_nested_key_named_like_the_marker_is_renamed_too() -> None:
+    """The same rule one level down, where the width cap has been overwriting since before this
+    branch.
+
+    The note this replaced called the loss acceptable because only nested dicts could cap and no
+    consumer reads those by key. The payload budget made the first half false the moment the top
+    level could cut, and a rule that holds at one depth and not its twin is this repository's
+    house defect -- so the marker is disambiguated wherever it is written.
+    """
+    policy = PermissionPolicy()
+    # First, for the same reason as above: past the width cap it would be dropped, not overwritten.
+    inner: dict[str, Any] = {"truncated_keys": "NESTED MODEL VALUE"}
+    inner.update({f"k{index}": index for index in range(PREVIEW_MAX_KEYS + 5)})
+
+    published = preview_value("payload", {"inner": inner}, policy)["inner"]
+
+    assert published["truncated_keys#2"] == "NESTED MODEL VALUE"
+    assert published["truncated_keys"] == len(inner) - (len(published) - 1)
+
+
+def test_a_mapping_that_was_not_cut_keeps_its_marker_named_key_untouched() -> None:
+    """The guard: disambiguation happens only where a cut is actually announced.
+
+    Reserving the name unconditionally would rename a key in a payload nothing was dropped from,
+    which is the "ordinary payloads pass through unchanged" guarantee this module keeps elsewhere.
+    """
+    policy = PermissionPolicy()
+    arguments = {"truncated_keys": "MODEL AUTHORED VALUE", "other": 1}
+
+    assert args_preview(arguments, policy) == arguments
+
+
 def _reference_hex_preview(value: int) -> str:
     """The spelling this envelope shipped with: materialize it all, then keep the prefix.
 

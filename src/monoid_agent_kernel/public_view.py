@@ -707,6 +707,41 @@ def truncate_inline_text(value: str, *, threshold: int, budget: int) -> str:
     return truncate_to_bytes(value, budget) + TRUNCATION_SUFFIX
 
 
+_TRUNCATED_KEYS = "truncated_keys"
+"""The kernel's word for "this mapping is missing keys", on every surface that cuts one."""
+
+
+def _publish_truncated_keys(published: dict[str, Any], dropped: int) -> dict[str, Any] | None:
+    """Add the ``truncated_keys`` marker without destroying a source key of that name.
+
+    A model may name an argument ``truncated_keys``, and the assignment used to overwrite it: the
+    argument's value vanished with no marker of its own, and the count under-reported by one,
+    because the entry it replaced had already been counted as published. That is a cap that does
+    not say what it capped — the exact failure this release exists to close, arriving through the
+    marker meant to announce it.
+
+    The marker keeps the plain name and the source key takes the ``#N`` suffix, which inverts
+    ``_bounded_key``'s "first one wins" on purpose: the name is a contract that ``status.json``,
+    the narration and the activity feed read by name, and a consumer that cannot find it reads a
+    cut payload as a complete one. The argument is not lost, it is renamed — the same disambiguation
+    two colliding source keys already get, so nothing here is destroyed silently.
+
+    Nothing happens to a mapping that is not cut, so the "unchanged when nothing was dropped"
+    guarantee holds: only an actual collision is disambiguated. Returns the marker fragment its
+    caller must charge, or ``None`` when there is nothing to announce.
+    """
+    if dropped < 0:
+        dropped = 0
+    if _TRUNCATED_KEYS in published:
+        collided = published.pop(_TRUNCATED_KEYS)
+        suffix = 2
+        while f"{_TRUNCATED_KEYS}#{suffix}" in published:
+            suffix += 1
+        published[f"{_TRUNCATED_KEYS}#{suffix}"] = collided
+    published[_TRUNCATED_KEYS] = dropped
+    return {_TRUNCATED_KEYS: dropped}
+
+
 def _bounded_key(
     raw: str, *, threshold: int, budget: int, taken: Mapping[str, Any], _collisions: dict[str, int]
 ) -> str:
@@ -786,9 +821,13 @@ def public_mapping(
             break
         published[name] = fragment
     if stopped:
+        # The top level is where an argument name is the model's to choose, so the marker's
+        # collision handling matters most here: narration and the activity feed read these keys by
+        # name, and overwriting one both destroyed it and under-counted the loss, because the
+        # entry it replaced had already been counted as published.
         dropped_keys = len(values) - len(published)
-        published["truncated_keys"] = dropped_keys
-        _charge_terminal_marker(payload_budget, {"truncated_keys": dropped_keys})
+        marker = _publish_truncated_keys(published, dropped_keys)
+        _charge_terminal_marker(payload_budget, marker)
     return published
 
 
@@ -987,16 +1026,16 @@ def _preview_value(
                 stopped = True
                 break
             preview[name] = child
-        # A source key literally named ``truncated_keys`` loses to the marker. Acceptable: the
-        # preview is lossy by construction, and no consumer reads nested preview dicts by key --
-        # ``narration`` and the Studio activity feed both read only top-level ``args_preview`` keys,
-        # which the ``*_args_preview`` builders above assemble themselves and never width-cap.
         # One number for both cuts -- the width cap's excess and the budget's stop -- because the
-        # reader's question is "how many keys am I not seeing", not which rule dropped them.
+        # reader's question is "how many keys am I not seeing", not which rule dropped them. A
+        # source key of the marker's own name is disambiguated rather than overwritten; the note
+        # this replaced called that loss acceptable because only nested dicts could width-cap and
+        # no consumer reads those by key, which the payload budget made false the moment the top
+        # level could cut too.
         dropped_keys = len(value) - len(preview)
         if stopped or dropped_keys > 0:
-            preview["truncated_keys"] = dropped_keys
-            _charge_terminal_marker(_payload_budget, {"truncated_keys": dropped_keys})
+            marker = _publish_truncated_keys(preview, dropped_keys)
+            _charge_terminal_marker(_payload_budget, marker)
         return preview
     if isinstance(value, list):
         if not _payload_budget.charge(2):  # the brackets
