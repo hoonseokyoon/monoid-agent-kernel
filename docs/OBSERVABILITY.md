@@ -118,6 +118,13 @@ Not carried:
   (hosted-task prompts and choices, `call_id`, validator feedback, error messages, a subagent's
   answer) are listed under "Carried, deliberately" below — read that list rather than counting
   exceptions here.
+- **A value the previews cannot spell is named by its type, and that name is bounded too** — 64
+  characters, in the `{"truncated": true, "type": …}` and `{"redacted": true, "type": …}` markers
+  and in the `type` field of `run.failed` and `failure.json`. A class name is legal at any length,
+  and two of these markers are published where the budget cannot refuse them, so the name was the
+  one unbounded term in a bounded payload. The name is read off the type's own slot rather than
+  asked for, so a class that answers `__name__` for itself neither widens this field nor raises
+  while an event is being built.
 
 Carried, deliberately:
 

@@ -29,7 +29,7 @@ from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_from_checkpoint_payload,
 )
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, portable_type_name
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.reference.backend.ports import (
     DriveOpenSessionPort,
@@ -219,7 +219,7 @@ class RecoveryService:
                     run_dir,
                     error=f"recovery failed after {attempts} attempts: {exc}",
                     error_code="unrecoverable",
-                    exc_type=type(exc).__name__,
+                    exc_type=portable_type_name(exc),
                     overwrite=True,
                 )
                 write_failure_status_artifact(
@@ -227,7 +227,7 @@ class RecoveryService:
                     run_id,
                     error=f"recovery failed after {attempts} attempts: {exc}",
                     error_code="unrecoverable",
-                    exc_type=type(exc).__name__,
+                    exc_type=portable_type_name(exc),
                     marker="given_up_by_recovery",
                 )
                 self._meter_giveup(run_dir, run_id, meta)

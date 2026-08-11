@@ -6,7 +6,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from monoid_agent_kernel.core.json_ingress import exact_text
+from monoid_agent_kernel.core.json_ingress import exact_text, portable_type_name
 from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     PUBLIC_JOB_SCHEMA,
@@ -694,7 +694,14 @@ def _budgeted_field(key: str, value: Any, policy: PermissionPolicy, budget: Payl
     _spend_terminal(budget, _fragment_cost(key) + 4)
     fragment = preview_value(key, value, policy, _payload_budget=budget)
     if fragment is _DROPPED:
-        fallback = {"truncated": True, "type": type(value).__name__}
+        # This fallback and its twin below are the only two sites that publish a type name the
+        # budget does not get to refuse -- `_charge_terminal_marker` deducts unconditionally, the
+        # way a marker has to. That made the class name the one unbounded term in a payload this
+        # module promises to bound: measured, a 1,000,000-character name published 1,000,038 bytes
+        # against a 262,144-byte ceiling, 3.8x, through the fallback that replaces a value the
+        # traversal had just refused for being too big. `portable_type_name` bounds it at 64
+        # characters, which is what closes the hole -- every other term here is a kernel literal.
+        fallback = {"truncated": True, "type": portable_type_name(value)}
         _charge_terminal_marker(budget, fallback)
         return fallback
     return fragment
@@ -987,7 +994,8 @@ def preview_value(
             return _DROPPED
         # A self-owned budget refusing its very first fragment takes a whole default ceiling,
         # which no real fragment reaches -- but a structural fallback beats trusting that.
-        fallback = {"truncated": True, "type": type(value).__name__}
+        # Bounded and read from the base slot, for the reason `_budgeted_field`'s twin states.
+        fallback = {"truncated": True, "type": portable_type_name(value)}
         _charge_terminal_marker(_payload_budget, fallback)
         return fallback
     return result
@@ -1046,7 +1054,11 @@ def _preview_value(
     if isinstance(value, (dict, list)) and _depth >= PREVIEW_MAX_DEPTH:
         return _charge_fragment(
             _payload_budget,
-            {"truncated": True, "type": type(value).__name__, "depth_exceeded": PREVIEW_MAX_DEPTH},
+            {
+                "truncated": True,
+                "type": portable_type_name(value),
+                "depth_exceeded": PREVIEW_MAX_DEPTH,
+            },
         )
     if isinstance(value, (dict, list)):
         # The depth cap terminates but does not bound *cost*: a container reachable from itself is
@@ -1062,7 +1074,7 @@ def _preview_value(
         if id(value) in _ancestors:
             return _charge_fragment(
                 _payload_budget,
-                {"truncated": True, "type": type(value).__name__, "circular": True},
+                {"truncated": True, "type": portable_type_name(value), "circular": True},
             )
         _ancestors = _ancestors | {id(value)}
     if isinstance(value, dict):
@@ -1214,8 +1226,13 @@ def _preview_value(
     # ingress boundaries (tool results, artifact metadata, task payloads) are the primary defence;
     # this is what any traversal-shaped route that skips them still gets, instead of the value
     # riding whole into a writer that cannot spell it.
+    #
+    # "Named by type" was itself a question put to the value until `portable_type_name`: the name
+    # is read off the class, so the *metaclass* answered it, and `update_plan` reaches here with no
+    # refusing boundary in front of it — measured, a raise there ended the run with `internal_error`
+    # and no `plan.updated` at all.
     return _charge_fragment(
-        _payload_budget, {"truncated": True, "type": type(value).__name__}
+        _payload_budget, {"truncated": True, "type": portable_type_name(value)}
     )
 
 
@@ -1258,7 +1275,9 @@ def redacted_value(value: Any) -> dict[str, Any]:
         return {"redacted": True, "type": "str", "bytes": len(exact_text(value).encode("utf-8"))}
     if isinstance(value, bytes):
         return {"redacted": True, "type": "bytes", "bytes": len(value)}
-    return {"redacted": True, "type": type(value).__name__}
+    # The type name is the whole remaining content of this marker, and it was read the one way that
+    # lets the value pick it. Same rule as the `bytes` count two lines up, one level further out.
+    return {"redacted": True, "type": portable_type_name(value)}
 
 
 def public_event_payload(data: Mapping[str, Any], policy: PermissionPolicy) -> dict[str, Any]:

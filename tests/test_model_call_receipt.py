@@ -135,6 +135,33 @@ def test_trace_ids_come_from_the_invocation_context() -> None:
 # --- with_error -----------------------------------------------------------------------------
 
 
+def test_with_error_survives_an_exception_that_answers_for_its_own_class() -> None:
+    """`with_error` reads `type(exc).__name__`, which asks the exception's *metaclass*.
+
+    Both reads were the plain one, and the second sits in an `except` handler -- so the handler
+    that exists to absorb a failure raised its own, out of the one object documented to survive any
+    exception. The name also reaches the wire as `error_code`, where a 1,000,000-character class
+    name was measured; it is bounded now.
+    """
+
+    class RaisingName(type):
+        def __getattribute__(cls, name: str):  # noqa: ANN001, ANN204
+            if name == "__name__":
+                raise RuntimeError("hostile metaclass")
+            return super().__getattribute__(name)
+
+    class HidesItsClass(RuntimeError, metaclass=RaisingName):
+        pass
+
+    receipt = ModelCallReceipt().with_error(HidesItsClass("boom"))
+
+    assert receipt.succeeded is False
+    assert receipt.error_code == "HidesItsClass"
+
+    enormous = type("z" * 5_000, (RuntimeError,), {})
+    assert len(ModelCallReceipt().with_error(enormous("boom")).error_code) <= 64
+
+
 def test_with_error_takes_the_taxonomy_a_model_error_already_classified() -> None:
     """The providers raise a classified error, so the runner must not re-derive any of this."""
     receipt = ModelCallReceipt().with_error(

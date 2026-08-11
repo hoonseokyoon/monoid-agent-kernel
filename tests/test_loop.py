@@ -2068,6 +2068,103 @@ def test_from_tools_normalizes_specs_before_binding_and_surface_hashes(tmp_path:
     assert exposed.annotations["score"] is None
 
 
+def test_a_failure_record_survives_a_tool_exception_that_hides_its_own_class(
+    tmp_path: Path,
+) -> None:
+    """Both failure writers name the exception with `type(exc).__name__`, read off its class.
+
+    A tool handler raises whatever class it likes, and that read dispatches to the class's
+    *metaclass*. Raising there took `run_once` out of the loop entirely -- no `run.failed`, no
+    `failure.json`, no terminal record of any kind, from inside the code whose only job at that
+    point is to write one. Worse than the ingress finding that started this, which at least still
+    emitted a terminal event.
+
+    An adapter exception cannot show this: it is wrapped into `ModelAdapterError` before the
+    writers see it. A tool's is not -- the handler wrapper catches only `(NativeAgentError,
+    ValueError, TypeError)` -- so this is the arm where the model-supplied class arrives intact.
+    """
+    from monoid_agent_kernel.tools.decorator import tool
+
+    class _HidesItsName(type):
+        def __getattribute__(cls, name: str):  # noqa: ANN001, ANN204
+            if name == "__name__":
+                raise RuntimeError("hostile metaclass")
+            return super().__getattribute__(name)
+
+    class _Unnameable(RuntimeError, metaclass=_HidesItsName):
+        pass
+
+    @tool(id="custom.unnameable", side_effect="read")
+    def unnameable() -> dict:
+        """Fail with an exception whose class answers for its own name."""
+
+        raise _Unnameable("boom")
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_unnameable", {}, "c1"),),
+            ),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [unnameable]).run_once("run it")
+
+    assert result.status == "failed"
+    run_dir = spec.run_root / result.run_id
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["type"] == "_Unnameable"
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = [event for event in events if event["type"] == "run.failed"]
+    assert len(failed) == 1, "the run ended without saying so"
+    assert failed[0]["data"]["type"] == "_Unnameable"
+
+
+def test_a_failure_record_bounds_the_class_name_it_publishes(tmp_path: Path) -> None:
+    """The other direction of the same read: a class name is legal at any length, and this one is
+    on the wire twice. Measured before the bound: a 1,000,000-character name gave a 1,000,433-byte
+    `run.failed` and a 1,000,373-byte failure bundle, from a tool that returned nothing at all."""
+    from monoid_agent_kernel.tools.decorator import tool
+
+    enormous = type("z" * 5_000, (RuntimeError,), {})
+
+    @tool(id="custom.enormous", side_effect="read")
+    def enormous_failure() -> dict:
+        """Fail with an exception whose class name is enormous."""
+
+        raise enormous("boom")
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_enormous", {}, "c1"),),
+            ),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [enormous_failure]).run_once("run it")
+
+    run_dir = spec.run_root / result.run_id
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert len(failure["type"]) <= 64
+    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        if line.strip() and json.loads(line)["type"] == "run.failed":
+            assert len(json.loads(line)["data"]["type"]) <= 64
+
+
 def test_custom_tool_result_is_normalized_before_observation_and_persistence(
     tmp_path: Path,
 ) -> None:

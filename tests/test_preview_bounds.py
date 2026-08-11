@@ -29,17 +29,27 @@ from typing import Any
 import pytest
 
 from support.hostile_scalars import (
+    HOSTILE_NAMED_TYPES,
     EmptyClaimingPath,
+    HostileNamedDict,
+    HostileNamedList,
     ExplodingComparisons,
     ExplodingText,
+    ImpersonatingName,
     MisreportingKey,
     MisreportingText,
     ShoutingText,
     UnderstatedInteger,
     UnderstatedText,
+    hugely_named_object,
 )
 
 import monoid_agent_kernel
+from monoid_agent_kernel.core.json_ingress import (
+    UnportableScalarError,
+    normalize_json_ingress,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.tool_approval import _jsonish, redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -1799,3 +1809,143 @@ def test_a_builder_that_budgets_one_field_budgets_all_of_them() -> None:
         "and appends others straight from a helper; an uncharged field is outside the ceiling, "
         "and if its helper copies model-controlled text the ceiling is defeated entirely",
     }
+
+
+def test_a_type_that_answers_for_its_own_name_cannot_escape_the_refusal() -> None:
+    """The refusal message reads `type(value).__name__`, which dispatches to the *metaclass*.
+
+    A metaclass that raises there replaces `UnportableScalarError` with an arbitrary exception, at
+    the boundary whose entire job is to convert arbitrary exceptions into classified tool failures --
+    the failure is inside the error path of the mechanism that exists to prevent unclassified
+    failures. Four ways to answer, because the base slot alone closes only three: a class whose
+    `__name__` is a `str` subclass moves the question from the metaclass onto the name object.
+    """
+    for hostile in HOSTILE_NAMED_TYPES:
+        with pytest.raises(UnportableScalarError):
+            normalize_json_ingress({"a": hostile()}, refuse_unportable_scalars=True)
+
+
+def test_the_preview_names_a_type_without_letting_it_answer() -> None:
+    """The same read, past the refusing boundaries and inside event construction.
+
+    `update_plan` normalizes with the default `refuse_unportable_scalars=False`, so these envelopes
+    are what a Python-object value meets with no boundary in front of it; a raise here ends the run.
+    """
+    policy = PermissionPolicy()
+
+    for hostile in HOSTILE_NAMED_TYPES:
+        published = preview_value("n", hostile(), policy)
+        assert published["truncated"] is True
+        assert type(published["type"]) is str
+
+        marker = redacted_value(hostile())
+        assert marker["redacted"] is True
+        assert type(marker["type"]) is str
+
+    # The lying arm publishes a name; the point is that it is not the name the value chose.
+    assert preview_value("n", ImpersonatingName(), policy)["type"] == "ImpersonatingName"
+    assert redacted_value(ImpersonatingName())["type"] == "ImpersonatingName"
+
+
+def test_a_published_type_name_is_bounded_like_every_other_published_string() -> None:
+    """A class name is legal at any length, and two of these sites publish it uncharged.
+
+    Measured before this bound: a 1,000,000-character class name published a 1,000,038-byte payload
+    against a 262,144-byte ceiling -- 3.8x, from a value the traversal had already refused, through
+    the fallback that replaces it. The name is the only unbounded term at those sites.
+    """
+    policy = PermissionPolicy()
+
+    # Large enough that the envelope carrying it does not fit the ceiling, which is what sends the
+    # traversal down the fallback that publishes the name *uncharged* -- the site the measurement
+    # above came from. `_charge_terminal_marker` deducts unconditionally, so nothing else stops it.
+    huge = hugely_named_object(300_000)
+
+    published = preview_value("n", huge, policy)
+    assert len(published["type"]) <= 64, "the published name is not bounded"
+    assert len(json.dumps({"n": published}).encode("utf-8")) <= TRACE_PAYLOAD_BYTE_BUDGET
+
+    assert len(redacted_value(hugely_named_object(10_000))["type"]) <= 64
+
+    with pytest.raises(UnportableScalarError) as refusal:
+        normalize_json_ingress({"a": huge}, refuse_unportable_scalars=True)
+    assert len(str(refusal.value)) <= 160, "the refusal message carries the name unbounded"
+
+
+def test_every_ordinary_type_keeps_the_name_it_publishes_today() -> None:
+    """The one regression this fix could cause: a different string on the wire.
+
+    These names are published into events, so `portable_type_name` has to agree with
+    `type(value).__name__` for every value that is not answering for itself. An equality oracle
+    rather than "it did not raise" -- the same lesson a refactor on this branch already earned.
+    """
+    import collections
+    import datetime
+    import decimal
+    import enum
+    import fractions
+    import re as _re
+    import uuid
+    from dataclasses import dataclass
+
+    class Colour(enum.Enum):
+        RED = 1
+
+    class Level(enum.IntEnum):
+        LOW = 1
+
+    @dataclass
+    class Boxed:
+        value: int
+
+    class Slotted:
+        __slots__ = ("x",)
+
+    Point = collections.namedtuple("Point", "x y")
+
+    values = [
+        None, True, 1, 1.5, "s", b"b", bytearray(b"b"), (), [], {}, set(), frozenset(),
+        object(), type, int, Ellipsis, NotImplemented, range(3), slice(1), memoryview(b"x"),
+        decimal.Decimal("1"), fractions.Fraction(1, 2), uuid.uuid4(), datetime.date(2020, 1, 1),
+        datetime.datetime(2020, 1, 1), datetime.timedelta(1), datetime.timezone.utc,
+        _re.compile("x"), _re.match("x", "x"), Colour.RED, Level.LOW, Boxed(1), Slotted(),
+        Point(1, 2), collections.OrderedDict(), collections.deque(), collections.Counter(),
+        ValueError("x"), KeyError("x"), Exception(), type("Dynamic", (), {})(),
+        (lambda: None), iter([]), (i for i in []), PermissionPolicy(),
+        MisreportingText("x"), UnderstatedInteger(1), EmptyClaimingPath("p"),
+    ]
+
+    divergent = [
+        (type(value).__name__, portable_type_name(value))
+        for value in values
+        if portable_type_name(value) != type(value).__name__
+    ]
+    assert not divergent, divergent
+
+
+def test_a_container_that_answers_for_its_own_type_name_is_capped_anyway() -> None:
+    """The depth cap and the cycle guard name a *container*, so the hostile shape there is not a
+    scalar. Both markers are built inside event construction, and both read the name off the class.
+    """
+    policy = PermissionPolicy()
+
+    # Exactly `PREVIEW_MAX_DEPTH` wrappers, so the hostile container is the value the cap lands on.
+    # One more and an ordinary dict is capped first, and the marker never reads the hostile name.
+    deep: Any = HostileNamedDict({"leaf": 1})
+    for _ in range(PREVIEW_MAX_DEPTH):
+        deep = {"next": deep}
+    published = preview_value("n", deep, policy)
+    cursor = published
+    while isinstance(cursor, dict) and "next" in cursor:
+        cursor = cursor["next"]
+    assert cursor["truncated"] is True
+    assert cursor["depth_exceeded"] == PREVIEW_MAX_DEPTH
+    assert type(cursor["type"]) is str
+
+    circular = HostileNamedList([1])
+    circular.append(circular)
+    inner = preview_value("n", {"outer": circular}, policy)["outer"]
+    assert any(
+        isinstance(item, dict) and item.get("circular") is True and type(item["type"]) is str
+        for item in inner
+    ), inner

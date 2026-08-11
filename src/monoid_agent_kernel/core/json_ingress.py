@@ -94,7 +94,12 @@ def _refuse_unportable_scalar(value: Any) -> None:
         if -bound < numeric < bound:
             return
         raise UnportableScalarError(f"integer exceeds the JSON bound of {digits} digits")
-    raise UnportableScalarError(f"value of type {type(value).__name__} is not portable JSON")
+    # `portable_type_name`, not `type(value).__name__`: this f-string is the last thing that runs
+    # before the classified refusal exists, and the plain read lets the value's metaclass raise
+    # *here* -- an unclassified exception thrown by the error path of the mechanism that exists to
+    # keep unclassified exceptions off this boundary. Measured through a real run: RuntimeError,
+    # status failed, internal_error, and no `tool.call.failed` at all.
+    raise UnportableScalarError(f"value of type {portable_type_name(value)} is not portable JSON")
 
 
 def exact_text(value: Any) -> str:
@@ -120,6 +125,49 @@ def exact_text(value: Any) -> str:
     if isinstance(value, str):
         return str.__str__(value)
     return str(value)
+
+
+_BASE_TYPE_NAME = type.__dict__["__name__"].__get__
+TYPE_NAME_MAX_CHARS = 64
+
+
+def portable_class_name(cls: type) -> str:
+    """A class's own name, bounded, with nothing on the way that gets to answer for it.
+
+    ``cls.__name__`` is an attribute read on a *class*, so it dispatches to the **metaclass** — the
+    same shape as ``value.encode()`` one level down, and reached the same way: an in-process tool or
+    task hands back an object, and its type is whatever built it. Three separate answers had to be
+    taken away, and each line here takes one:
+
+    * ``type.__dict__["__name__"].__get__`` is the base getset slot, so neither a metaclass
+      ``__getattribute__`` nor a metaclass ``__name__`` property runs. ``type.__getattribute__``
+      is *not* enough — it bypasses the first and still finds the second.
+    * ``exact_text`` on the result, because ``cls.__name__ = <str subclass>`` is accepted
+      (``type_set_name`` checks ``PyUnicode_Check``, which admits subclasses, and stores the object
+      it was given). Without it the base slot only moves the question from the metaclass to the name
+      object: measured, a name whose ``__str__`` raises still took down the f-string that used it.
+    * The character cap, because a class name is legal at any length. Measured: a 1,000,000-character
+      name published a 1,000,038-byte payload against a 262,144-byte ceiling — 3.8× — through the
+      two fallbacks that publish it uncharged, and it made an unbounded ``error_code`` and a
+      1,000,077-character ``tool.call.failed.error``. 64 characters is over four times the longest
+      name this repository defines, and bounds the field at 256 bytes.
+
+    No ``try``/``except`` and no non-``str`` arm: with ``cls`` coming from ``type(value)`` there is
+    nothing here that can raise. 5,759 distinct type objects were swept — every stdlib and kernel
+    module, ctypes and enum metaclasses among them — plus every hostile construction that defeats
+    the plain read; the base slot raised zero times and returned a non-``str`` zero times, and the
+    only arguments that do raise are non-types, which ``type(value)`` cannot produce. An unreachable
+    branch presented as a defence is worse than no branch: it reads as a guarded site to the next
+    person and is never exercised.
+    """
+
+    return exact_text(_BASE_TYPE_NAME(cls))[:TYPE_NAME_MAX_CHARS]
+
+
+def portable_type_name(value: Any) -> str:
+    """The name of ``value``'s type. See ``portable_class_name`` for why it is not asked for."""
+
+    return portable_class_name(type(value))
 
 
 def normalize_unicode_scalars(value: str) -> str:

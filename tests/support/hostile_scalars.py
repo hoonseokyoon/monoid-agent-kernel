@@ -97,3 +97,87 @@ class UniterableText(str):
 
     def __iter__(self) -> Any:
         raise RuntimeError("hostile __iter__")
+
+
+# ---------------------------------------------------------------------------
+# Types that answer for themselves. `type(value).__name__` is an attribute read on the *class*,
+# so it dispatches to the metaclass -- the same shape as `value.encode()` one level up.
+# ---------------------------------------------------------------------------
+
+
+class RaisingNameAccess(type):
+    """Raises from ``__getattribute__`` when anything reads ``__name__``."""
+
+    def __getattribute__(cls, name: str) -> Any:
+        if name == "__name__":
+            raise RuntimeError("hostile metaclass __getattribute__")
+        return super().__getattribute__(name)
+
+
+class RaisingNameProperty(type):
+    """Puts a raising descriptor at ``__name__``. ``type.__getattribute__`` still finds this one,
+    which is why the base slot -- and not the reviewer's first suggestion -- is the answer."""
+
+    @property
+    def __name__(cls) -> str:
+        raise RuntimeError("hostile metaclass __name__ property")
+
+
+class LyingNameProperty(type):
+    """Answers ``__name__`` with a portable type's name, so the marker names the wrong thing."""
+
+    @property
+    def __name__(cls) -> str:
+        return "str"
+
+
+class HiddenName(metaclass=RaisingNameAccess):
+    pass
+
+
+class ExplodingName(metaclass=RaisingNameProperty):
+    pass
+
+
+class ImpersonatingName(metaclass=LyingNameProperty):
+    pass
+
+
+class _ExplodingNameText(str):
+    """A ``str`` subclass for use *as* a class's ``__name__``."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("hostile __str__ on the name itself")
+
+
+class RenamedByAHostileString:
+    """``cls.__name__ = <str subclass>`` is accepted by CPython -- ``type_set_name`` checks
+    ``PyUnicode_Check``, which admits subclasses, and stores the object handed to it. So reading the
+    name through the base slot moves the question from the metaclass to the name object, and only
+    ``exact_text`` on the result closes it."""
+
+
+RenamedByAHostileString.__name__ = _ExplodingNameText("RenamedByAHostileString")
+
+
+HOSTILE_NAMED_TYPES = (
+    HiddenName,
+    ExplodingName,
+    ImpersonatingName,
+    RenamedByAHostileString,
+)
+
+
+def hugely_named_object(characters: int = 10_000) -> Any:
+    """An instance of a class whose name is legal, ordinary to construct, and enormous."""
+
+    return type("z" * characters, (), {})()
+
+
+class HostileNamedList(list, metaclass=RaisingNameAccess):
+    """A container that answers for its own type name. The depth cap and the cycle guard both
+    publish `type(value).__name__` of a *container*, so the hostile shape there is not a scalar."""
+
+
+class HostileNamedDict(dict, metaclass=RaisingNameAccess):
+    """The dict half of the same pair."""
