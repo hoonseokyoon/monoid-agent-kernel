@@ -820,6 +820,70 @@ def test_the_fixed_key_builders_share_one_payload_budget_across_their_fields() -
     assert _payload_bytes(web) <= TRACE_PAYLOAD_BYTE_BUDGET
 
 
+def test_an_integer_past_the_threshold_is_enveloped_like_a_string_of_that_size() -> None:
+    """Gap 3's leak half: ``preview_value`` bounded ``str`` and returned every other scalar whole.
+
+    A 4300-digit integer — model-authored content in base ten, and the largest the decoders admit —
+    measured 4,300 bytes against a 240-byte threshold through ``args_preview``. The envelope is the
+    string envelope's sibling, and its ``preview`` is spelled in hex because a decimal spelling is
+    exactly what the interpreter's digit limit may refuse to build; small scalars keep their type,
+    which is what the ``artifact.emitted.kind`` precedent demands of schema-typed neighbours.
+    """
+    policy = PermissionPolicy()
+    big = int("9" * 4300)
+
+    published = args_preview({"n": big, "small": 7}, policy)
+
+    envelope = published["n"]
+    assert envelope["truncated"] is True
+    assert envelope["type"] == "int"
+    assert envelope["preview"].startswith("0x")
+    assert len(envelope["preview"].encode("utf-8")) <= PREVIEW_BYTE_BUDGET
+    assert published["small"] == 7, "a small scalar must keep its type"
+    assert "9" * 60 not in json.dumps(published), "the decimal value rode out whole"
+
+
+@pytest.mark.parametrize(
+    ("value", "enveloped"),
+    [
+        pytest.param(10**239, False, id="240-digit-positive-at-threshold"),
+        pytest.param(10**240, True, id="241-digit-positive-over"),
+        pytest.param(-(10**238), False, id="negative-240-bytes-at-threshold"),
+        pytest.param(-(10**239), True, id="negative-241-bytes-over"),
+    ],
+)
+def test_the_integer_threshold_boundary_is_exact_in_encoded_bytes(value: int, enveloped: bool) -> None:
+    """Encoded bytes, sign included — mirroring the string threshold's exactness pin.
+
+    The negative rows are the ones a digit-count rule gets wrong: ``-(10**239)`` has 240 digits
+    and 241 encoded bytes, so it crosses the threshold its positive twin sits exactly on.
+    """
+    published = preview_value("n", value, PermissionPolicy())
+
+    assert isinstance(published, dict) is enveloped
+
+
+def test_a_scalar_outside_json_is_named_by_type_and_never_asked_to_speak() -> None:
+    """Gap 3's crash half, as seen by the traversal: ``bytes`` used to pass through whole.
+
+    The envelope names the type and nothing else — no ``repr``, no ``str``, no ``len`` — because
+    the value is the one thing this branch must not consult: a hostile ``__repr__`` runs arbitrary
+    code inside event construction, and a >4300-digit integer's decimal spelling is exactly the
+    call that raises. Ingress refusal at the tool-result boundary is the primary defence; this is
+    what any traversal-shaped route that skips it still gets.
+    """
+    policy = PermissionPolicy()
+
+    class _AngryRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("repr must not be consulted")
+
+    published = args_preview({"blob": b"\x00\x01", "angry": _AngryRepr()}, policy)
+
+    assert published["blob"] == {"truncated": True, "type": "bytes"}
+    assert published["angry"] == {"truncated": True, "type": "_AngryRepr"}
+
+
 def test_the_trace_budget_does_not_leak_into_the_approval_surface() -> None:
     """A person authorizing a call reads the approval card; a log reader reads the trace.
 

@@ -68,6 +68,7 @@ from monoid_agent_kernel.core.media import (
     resolve_wire_messages,
 )
 from monoid_agent_kernel.core.json_ingress import (
+    UnportableScalarError,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -500,7 +501,18 @@ class AgentToolContext(ToolContext):
         path = normalize_unicode_scalars(path)
         kind = normalize_unicode_scalars(kind)
         label = None if label is None else normalize_unicode_scalars(label)
-        metadata = normalize_json_ingress(metadata)
+        try:
+            # The tool-result refusal's census twin: this metadata is handed straight to the
+            # ToolContext seam by a custom handler, so it never crossed a JSON parse and can carry
+            # what no writer downstream — the observation back to the model, the transcript — can
+            # spell. Raised as a classified tool error, the emitting call fails and the run keeps
+            # going, which is what "one hostile value costs its own call" means here.
+            metadata = normalize_json_ingress(metadata, refuse_unportable_scalars=True)
+        except UnportableScalarError as exc:
+            raise ToolExecutionError(
+                f"artifact metadata is not portable JSON: {exc}",
+                error_code="artifact_metadata_unportable",
+            ) from exc
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),

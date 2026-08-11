@@ -523,10 +523,10 @@ def _fragment_cost(fragment: Any) -> int:
 
     ``json.dumps`` with default separators, which are the *widest* spelling any sink uses — the
     event log writes them and the ledger writes compact — so charging this keeps the bound
-    conservative. Unencodable values (a ``bytes`` in a Python-built tool result, an integer past
-    the interpreter's digit limit) report a cost of ``-1``: the caller passes those through
-    uncharged today, exactly as the traversal always has, because inventing a spelling for them
-    is the separate arbitrary-scalar decision and this commit only bounds what already encodes.
+    conservative. The scalar tail envelopes everything portable JSON cannot spell before it gets
+    here, so the ``-1`` escape survives only for what a caller-supplied ``mask`` returns: that
+    contract is the caller's, and an unencodable replacement keeps today's behaviour (through,
+    uncharged) rather than acquiring a spelling this module invented for it.
     """
     try:
         return len(json.dumps(fragment, ensure_ascii=False).encode("utf-8"))
@@ -549,6 +549,22 @@ def _charge_terminal_marker(budget: PayloadBudget, fragment: Any) -> None:
         return
     if not budget.charge(cost):
         budget.charge_marker(cost)
+
+
+def _int_spelling_exceeds(value: int, threshold: int) -> bool:
+    """Whether the integer's JSON spelling (sign included) is longer than ``threshold`` bytes.
+
+    Never spells the value to find out: ``str()`` on an integer past the interpreter's digit
+    limit is exactly the crash this branch exists to keep out of event construction. Magnitude
+    comparison against a power of ten is the same question asked without the conversion —
+    ``digits(|v|) > d  iff  |v| >= 10**d`` — with one budgeted byte fewer for a negative sign.
+    The fast path skips building ``10**threshold`` for the ints real payloads carry.
+    """
+    magnitude = -value if value < 0 else value
+    digit_budget = threshold - 1 if value < 0 else threshold
+    if digit_budget >= 18 and magnitude < 10**17:
+        return False
+    return magnitude >= 10**digit_budget
 
 
 def _budgeted_field(key: str, value: Any, policy: PermissionPolicy, budget: PayloadBudget) -> Any:
@@ -970,7 +986,39 @@ def _preview_value(
                 },
             )
         return _charge_fragment(_payload_budget, value)
-    return _charge_fragment(_payload_budget, value)
+    if isinstance(value, bool) or value is None:
+        return _charge_fragment(_payload_budget, value)
+    if isinstance(value, int):
+        # The one JSON scalar whose spelling is unbounded. Up to the threshold it keeps its type
+        # — the ``artifact.emitted.kind`` precedent: schema-typed neighbours must not change shape
+        # for ordinary values — and past it, the string envelope's sibling. The ``preview`` is
+        # spelled in hex because hex is linear-time and exempt from the interpreter's decimal
+        # digit limit, which a ≥4301-digit value (reachable only through Python-object ingress
+        # ahead of the refusing boundaries) would trip; ``int.__index__`` is the base slot, so a
+        # subclass's ``__format__`` is never consulted.
+        if _int_spelling_exceeds(value, threshold):
+            return _charge_fragment(
+                _payload_budget,
+                {
+                    "type": "int",
+                    "preview": truncate_to_bytes(format(int.__index__(value), "#x"), budget),
+                    "truncated": True,
+                },
+            )
+        return _charge_fragment(_payload_budget, value)
+    if isinstance(value, float):
+        # Bounded by construction: a finite float's JSON spelling is ~24 bytes, and non-finite
+        # floats are substituted at semantic ingress before any payload is built.
+        return _charge_fragment(_payload_budget, value)
+    # Everything else — bytes, Decimal, arbitrary objects — is named by type and never asked to
+    # speak: no ``repr``, no ``str``, no ``len``. A hostile ``__repr__`` would run inside event
+    # construction, and a large integer subclass's decimal spelling would raise. The refusing
+    # ingress boundaries (tool results, artifact metadata, task payloads) are the primary defence;
+    # this is what any traversal-shaped route that skips them still gets, instead of the value
+    # riding whole into a writer that cannot spell it.
+    return _charge_fragment(
+        _payload_budget, {"truncated": True, "type": type(value).__name__}
+    )
 
 
 def _is_path_redacted(value: str, policy: PermissionPolicy) -> bool:

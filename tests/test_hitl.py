@@ -11,9 +11,12 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.errors import ToolExecutionError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -94,6 +97,36 @@ def test_report_result_is_idempotent_first_report_wins(tmp_path: Path) -> None:
     assert second["delivered"] is False and second["duplicate"] is True
     assert task.result == {"answer": "Ada"}  # not clobbered
     assert manager._reentry_queue.count(task.job_id) == 1  # no double reentry
+
+    loop.close()
+
+
+def test_an_unportable_task_request_or_result_is_refused_at_ingress(tmp_path: Path) -> None:
+    """The tool-result refusal's census twins ③ and ④: hosted-task payloads are Python objects too.
+
+    ``start_task`` and ``report_result`` both take dicts that never crossed a JSON parse — an
+    in-process reporter can hand them ``bytes`` or an integer past the portable digit bound, which
+    the normalizer deliberately leaves alone and ``task.json``'s writer then cannot serialize. The
+    refusal fires before any state moves: a refused report leaves the task running, unclobbered,
+    and a correct report afterwards still lands.
+    """
+    loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+
+    with pytest.raises(ToolExecutionError) as refused_request:
+        manager.start_task("hitl", {"prompt": b"\x00"})
+    assert refused_request.value.error_code == "task_request_unportable"
+
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    with pytest.raises(ToolExecutionError) as refused_result:
+        manager.report_result(task.job_id, {"answer": 10**4700})
+    assert refused_result.value.error_code == "task_result_unportable"
+    assert task.result is None, "the refused report half-landed"
+    assert task.status == "running"
+
+    delivered = manager.report_result(task.job_id, {"answer": "Ada"})
+    assert delivered["delivered"] is True
 
     loop.close()
 

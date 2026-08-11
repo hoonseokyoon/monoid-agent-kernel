@@ -302,6 +302,20 @@ that separates — a *malformed* attribution is refused, while a *disagreeing* o
 means the envelope cannot be read, the second means it was read and says something the client did
 not expect, which is a fact about a deployment rather than a broken wire.
 
+The v0.21 preview payload budget is a projection-only change: no event schema value, artifact
+identifier, or wire key moves, exhaustion spends the `truncated_keys` / `truncated_items`
+vocabulary that already existed, and `validate_run_dir` reads directories written on either side
+of the change. The same release makes the four Python-object ingress boundaries — a tool result's
+`content`, `emit_artifact` metadata, and a hosted task's request and result — refuse scalars no
+portable JSON writer can spell (`bytes`, integers past the 4300-digit decoder bound, arbitrary
+objects) as a *classified call failure* (`tool_result_unportable` and its per-boundary siblings)
+where every such value previously crashed `json.dumps` at the transcript write and ended the run
+as `internal_error`. Runs that used to die now complete with a failed call the model can observe
+and correct; no retained artifact is convicted retroactively, because these values could never be
+written to one — the refusal moves the failure earlier and names it, it does not change what any
+reader accepts. Callers whose payloads arrive through a JSON parse are unaffected: the bounded
+decoders never admitted these values in the first place.
+
 One v0.21 change moves an existing wire *answer* rather than adding a key: when the reference
 gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
 now a non-retryable 502 `openai_bad_response` (carrying the billed `usage`), where the shapes

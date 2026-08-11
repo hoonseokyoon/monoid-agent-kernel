@@ -20,6 +20,42 @@ from typing import Any
 
 _MAX_JSON_NESTING = 512
 _MAX_JSON_INTEGER_DIGITS = 4300
+# The magnitude form of the digit bound: |n| < 10**4300 iff n has at most 4300 decimal digits,
+# which is exactly `parse_bounded_json_int`'s rule on the way in. Held as an int and compared as
+# an int because the *decimal spelling* is the operation that must never run here — `str()` on a
+# value past the interpreter's digit limit raises, and this predicate exists to keep such values
+# away from every writer that would spell them.
+_MAX_PORTABLE_JSON_INT = 10**_MAX_JSON_INTEGER_DIGITS
+
+
+class UnportableScalarError(ValueError):
+    """A scalar no portable JSON writer can spell reached a refusing ingress.
+
+    Its own class so the four refusing boundaries can convert exactly this into their classified
+    error and leave the normalizer's *other* ``ValueError`` — colliding keys after normalization —
+    on the classification it already had.
+    """
+
+
+def _refuse_unportable_scalar(value: Any) -> None:
+    """Raise for a scalar no portable JSON writer in this process can spell.
+
+    Portable is the decoder's own vocabulary, two-sided: what `parse_bounded_json_int` and the
+    strict loaders admit on the way in is what this refuses to admit past a Python-object ingress
+    on the way through. ``bool`` before ``int`` because it is one; ``float`` is total here (the
+    non-finite substitution is the caller's separate, documented choice); everything else —
+    ``bytes``, ``Decimal``, arbitrary objects — is named by type only, never asked to repr itself.
+    """
+
+    if value is None or isinstance(value, (str, bool, float)):
+        return
+    if isinstance(value, int):
+        if -_MAX_PORTABLE_JSON_INT < value < _MAX_PORTABLE_JSON_INT:
+            return
+        raise UnportableScalarError(
+            f"integer exceeds the portable JSON bound of {_MAX_JSON_INTEGER_DIGITS} digits"
+        )
+    raise UnportableScalarError(f"value of type {type(value).__name__} is not portable JSON")
 
 
 def normalize_unicode_scalars(value: str) -> str:
@@ -70,7 +106,10 @@ def _normalize_scalar(
     *,
     substitute_nonfinite: bool,
     normalize_strings: bool,
+    refuse_unportable: bool,
 ) -> Any:
+    if refuse_unportable:
+        _refuse_unportable_scalar(value)
     if isinstance(value, str):
         return normalize_unicode_scalars(value) if normalize_strings else value
     if substitute_nonfinite and isinstance(value, float) and not math.isfinite(value):
@@ -83,13 +122,17 @@ def normalize_json_ingress(
     *,
     substitute_nonfinite: bool = True,
     normalize_strings: bool = True,
+    refuse_unportable_scalars: bool = False,
 ) -> Any:
     """Copy and normalize a JSON-domain value without recursive Python calls.
 
     ``dict`` keys are normalized as well as values.  If two keys become equal after
     normalization, the input is rejected rather than silently overwriting one meaning.
-    Tuples become JSON arrays, while non-container values outside the JSON domain are left
-    alone so this fix does not invent coercions for the separate arbitrary-scalar gap.
+    Tuples become JSON arrays. Non-container values outside the JSON domain are left alone by
+    default; the boundaries where such a value can only crash a later writer — the four
+    Python-object ingress points: a tool result's content, ``emit_artifact`` metadata, and a
+    hosted task's request and result — pass ``refuse_unportable_scalars=True`` and turn the
+    ``ValueError`` into their own classified refusal instead of carrying the value to the crash.
     """
 
     root: list[Any] = [None]
@@ -103,6 +146,7 @@ def normalize_json_ingress(
                 source,
                 substitute_nonfinite=substitute_nonfinite,
                 normalize_strings=normalize_strings,
+                refuse_unportable=refuse_unportable_scalars,
             )
             continue
 

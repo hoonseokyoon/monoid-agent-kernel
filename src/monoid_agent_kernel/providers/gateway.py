@@ -97,8 +97,9 @@ GATEWAY_BAD_REQUEST = "gateway_bad_request"
 def _encode_request_body(payload: dict[str, Any]) -> bytes:
     """Serialize one request payload, classifying what cannot be serialized.
 
-    ``normalize_json_ingress`` deliberately leaves arbitrary non-JSON scalars alone (the
-    documented arbitrary-scalar gap), so a Python-direct caller can hand ``output_schema``,
+    ``normalize_json_ingress`` leaves arbitrary non-JSON scalars alone by default (only the four
+    refusing Python-object ingress boundaries opt out), so a Python-direct caller can hand
+    ``output_schema``,
     ``messages``, or an observation a value ``json.dumps`` refuses -- a ``set``, a function, a
     NaN under ``allow_nan=False``. Encoded here, once, for both transports: outside a
     classifier that failure escaped as a raw ``TypeError``/``ValueError`` the loop cannot

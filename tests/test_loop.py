@@ -2164,6 +2164,103 @@ def test_invalid_tool_result_control_fields_become_observable_tool_failures(
     assert observation["error"]["retryable"] is True
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("blob", b"\x00\x01\x02", id="bytes"),
+        pytest.param("count", 10**4700, id="int-past-the-digit-limit"),
+    ],
+)
+def test_an_unportable_tool_result_costs_the_call_and_not_the_run(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """A value portable JSON cannot carry is refused where the wrapper can classify it.
+
+    Before this rule, both of these passed ``normalize_tool_result`` untouched — the normalizer
+    deliberately leaves non-container scalars alone — and crashed ``json.dumps`` at the *transcript*
+    write, which sits before ``tool.call.finished``: measured as ``status='failed'``,
+    ``error_code=internal_error``, thirteen events and no finished/failed record for the call. The
+    transcript stays raw by contract, so the fix is refusal at the boundary: the model gets a
+    failed observation it can correct, and the run keeps going.
+    """
+
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return ToolResult(ok=True, content={field: value})
+
+    spec = ToolSpec(
+        id="custom.unportable",
+        description="Return a value portable JSON cannot carry.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_unportable", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("run unportable tool")
+
+    assert result.status == "completed"
+    assert result.final_text == "recovered"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "tool_result_unportable"
+    events_text = (run_spec.run_root / result.run_id / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines() if line]
+    failed = [event for event in events if event["type"] == "tool.call.failed"]
+    assert failed and failed[0]["data"]["error_code"] == "tool_result_unportable"
+
+
+def test_unportable_artifact_metadata_costs_the_emitting_call(tmp_path: Path) -> None:
+    """The same rule at its census twin: ``ToolContext.emit_artifact`` takes Python objects too.
+
+    A custom handler's ``metadata`` dict never crosses a JSON parse, so it can carry ``bytes`` into
+    the same downstream writes the tool-result route reached — the artifact's metadata rides the
+    observation back to the model and the transcript. One predicate, every Python-object ingress.
+    """
+
+    def handler(context: ToolContext, _arguments: dict) -> ToolResult:
+        context.emit_artifact("art.txt", "report", None, {"raw": b"\x00"})
+        return ToolResult(ok=True, content={"emitted": True})
+
+    spec = ToolSpec(
+        id="custom.emitter",
+        description="Emit an artifact with unportable metadata.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_emitter", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+    (run_spec.workspace_root / "art.txt").write_text("body", encoding="utf-8")
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("emit")
+
+    assert result.status == "completed"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "artifact_metadata_unportable"
+
+
 def test_invalid_success_flag_cannot_emit_success_side_effect_evidence(tmp_path: Path) -> None:
     def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
         return ToolResult(

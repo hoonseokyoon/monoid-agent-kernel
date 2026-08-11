@@ -8,7 +8,11 @@ from typing import Any, Literal, Protocol
 from jsonschema import Draft202012Validator, ValidationError
 
 from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    UnportableScalarError,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import ToolExecutionError
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
@@ -85,7 +89,18 @@ def normalize_tool_result(result: ToolResult) -> ToolResult:
         raise ValueError("tool result content must be an object")
     if not isinstance(result.media, (list, tuple)):
         raise ValueError("tool result media must be an array")
-    content = normalize_json_ingress(result.content)
+    try:
+        # Refusing here is what turns "one hostile value" into a failed *call*. The values this
+        # rejects — bytes, an integer past the portable digit bound, arbitrary objects — used to
+        # pass the normalizer untouched and crash `json.dumps` at the transcript write, which sits
+        # before `tool.call.finished`: the run died as `internal_error` with no observation the
+        # model could correct. The transcript stays raw by contract, so the boundary is the fix.
+        content = normalize_json_ingress(result.content, refuse_unportable_scalars=True)
+    except UnportableScalarError as exc:
+        raise ToolExecutionError(
+            f"tool result content is not portable JSON: {exc}",
+            error_code="tool_result_unportable",
+        ) from exc
     if not isinstance(content, dict):
         raise ValueError("tool result content must be an object")
     return _copy_with_fields(
