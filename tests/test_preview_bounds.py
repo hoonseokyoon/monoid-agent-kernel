@@ -55,6 +55,10 @@ from monoid_agent_kernel.public_view import (
     truncate_to_bytes,
     web_args_preview,
 )
+from monoid_agent_kernel.web import (
+    public_query_preview,
+    public_url_preview,
+)
 from monoid_agent_kernel.shell import COMMAND_PREVIEW_BYTE_BUDGET, preview_command
 
 # One character, three scripts, three encoded widths: 1, 2, 3 and 4 bytes per character. The
@@ -979,6 +983,43 @@ def test_the_payload_budget_holds_in_the_widest_spelling_a_sink_uses(
     assert len(published) > 1, "the budget cut so hard the payload says nothing"
 
 
+def test_a_url_descriptor_is_bounded_on_started_exactly_as_on_the_events_beside_it() -> None:
+    """The same descriptor, for the same call, must not differ by which surface prints it.
+
+    ``public_url_preview`` copies ``scheme`` and ``domain`` out of the URL verbatim, and both are
+    model-controlled strings of unbounded length: a hostname is valid at any length, and so is a
+    scheme. ``web_args_preview`` assembled that fragment by hand and neither previewed nor charged
+    it, so a 4 MB hostname published a 4,000,085-byte ``args_preview`` — 15.3x the ceiling, and
+    growing linearly with the URL, so no ceiling at all.
+
+    The web service's own ``.finished``/``.failed`` events carry the identical fragment through
+    ``public_event_payload``, which does bound it. So the two surfaces of one call disagreed:
+    549 bytes there, 4 MB here. Pinned as that agreement rather than as a byte count, because the
+    disagreement is the defect — a rule proven on one of two parallel halves is this repository's
+    house shape, and the halves here are one function apart.
+    """
+    policy = PermissionPolicy()
+    url = "http://" + ("a" * 1_000_000) + "/p"
+
+    started = web_args_preview({"url": url}, policy)
+    beside = public_event_payload({"url_preview": public_url_preview(url)}, policy)
+
+    assert started["url_preview"] == beside["url_preview"]
+    assert _widest_payload_bytes(started) <= TRACE_PAYLOAD_BYTE_BUDGET
+    assert started["url_preview"]["domain"]["truncated"] is True
+
+
+def test_an_ordinary_url_descriptor_is_published_unchanged() -> None:
+    """The guard on the pin above: bounding the descriptor must not reshape ordinary ones."""
+    policy = PermissionPolicy()
+    url = "https://example.com/docs?q=1"
+
+    assert web_args_preview({"url": url}, policy)["url_preview"] == public_url_preview(url)
+    assert web_args_preview({"query": "hello"}, policy)["query_preview"] == public_query_preview(
+        "hello"
+    )
+
+
 # --------------------------------------------------------------------------------------
 # The budget's roots, read off the source rather than remembered
 # --------------------------------------------------------------------------------------
@@ -1115,4 +1156,86 @@ def test_a_function_entering_the_traversal_twice_threads_one_budget() -> None:
         "hint": "this function enters the traversal more than once but lets some entries "
         "self-own a budget; each unthreaded entry restarts the allowance, which is the "
         "per-key accounting the payload budget exists to end",
+    }
+
+
+def _hand_assembled_builder_fields() -> dict[str, list[tuple[int, bool]]]:
+    """Every field a hand-assembling builder publishes, with whether it went through the budget.
+
+    A published field is a value in a ``dict`` literal that is returned, or the right-hand side of
+    an assignment into a subscript — the two ways these builders put a key on the wire. Known
+    syntactic reach: a builder that assembled its mapping by ``update()`` or a comprehension would
+    not be seen, which is a fact about today's code rather than a guarantee.
+    """
+
+    fields: dict[str, list[tuple[int, bool]]] = {}
+    for path in sorted(_KERNEL_PACKAGE.rglob("*.py")):
+        relative = path.relative_to(_KERNEL_PACKAGE).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for owner in ast.walk(tree):
+            if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            budgeted_calls = [
+                node
+                for node in ast.walk(owner)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_budgeted_field"
+            ]
+            if not budgeted_calls:
+                continue
+            published: list[ast.expr] = []
+            for node in ast.walk(owner):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                    published.extend(value for value in node.value.values if value is not None)
+                elif isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Subscript) for target in node.targets
+                ):
+                    published.append(node.value)
+            fields[f"{relative}:{owner.name}"] = [
+                (
+                    value.lineno,
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id == "_budgeted_field",
+                )
+                for value in published
+            ]
+    return fields
+
+
+def test_a_builder_that_budgets_one_field_budgets_all_of_them() -> None:
+    """The half-threaded builder, stated as consistency so it needs no list of fields.
+
+    ``web_args_preview`` created a budget, spent it on nine descriptors, and appended two more —
+    ``query_preview`` and ``url_preview`` — straight from their helpers. The URL one copies a
+    hostname and a scheme verbatim, so the ceiling this branch introduced was defeated by the very
+    builder that declared it, and the builder's own docstring ("every descriptor below is
+    previewed rather than copied") was false about the field most able to carry text.
+
+    Written as "a function that budgets one field budgets all of them" rather than as a table of
+    builders and their fields: a table is an enumeration of what its author remembered, and a
+    field added next year is exactly what neither the author nor the table will remember. The
+    bounded-by-construction fields go through the helper too — a bool costs five charged bytes and
+    buys an invariant that needs no footnote, where leaving them out makes the ceiling "the budget
+    plus whatever the unrouted fields happen to add", which is not a ceiling anyone can check.
+    """
+
+    inconsistent = {
+        owner: {
+            "budgeted": [line for line, ok in found if ok],
+            "unbudgeted": [line for line, ok in found if not ok],
+        }
+        for owner, found in _hand_assembled_builder_fields().items()
+        if len({ok for _line, ok in found}) > 1
+    }
+
+    assert _hand_assembled_builder_fields(), (
+        "census self-check: no hand-assembling builder found, so this matched nothing"
+    )
+    assert not inconsistent, {
+        "sites": inconsistent,
+        "hint": "this builder charges some of its published fields against the payload budget "
+        "and appends others straight from a helper; an uncharged field is outside the ceiling, "
+        "and if its helper copies model-controlled text the ceiling is defeated entirely",
     }

@@ -377,8 +377,15 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
         "startup_wait_s": _budgeted_field(
             "startup_wait_s", arguments.get("startup_wait_s"), policy, payload_budget
         ),
-        "background": bool(arguments.get("background", False)),
-        "resume_on_exit": bool(arguments.get("resume_on_exit", True)),
+        # Bounded by construction -- ``bool`` returns one of two values -- and charged anyway, so
+        # the invariant reads "every field this builder appends is charged" with no footnote about
+        # which ones were exempt. Five charged bytes buys a rule a census can check.
+        "background": _budgeted_field(
+            "background", bool(arguments.get("background", False)), policy, payload_budget
+        ),
+        "resume_on_exit": _budgeted_field(
+            "resume_on_exit", bool(arguments.get("resume_on_exit", True)), policy, payload_budget
+        ),
         # Previewed, not copied. Env *keys* are model-controlled strings of unbounded length and
         # count: a 20 KB key rode out verbatim here while the same value in a generic argument was
         # capped. This branch withholds env *values* on purpose, so letting the keys carry arbitrary
@@ -403,9 +410,19 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
     # budget across all of them so a container in any field cannot start a fresh allowance.
     payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
     if "query" in arguments:
-        preview["query_preview"] = public_query_preview(str(arguments.get("query") or ""))
+        preview["query_preview"] = _budgeted_field(
+            "query_preview", public_query_preview(str(arguments.get("query") or "")), policy, payload_budget
+        )
     if "url" in arguments:
-        preview["url_preview"] = public_url_preview(str(arguments.get("url") or ""))
+        # The descriptor is a digest everywhere except its ``scheme`` and ``domain``, which are
+        # lifted out of the URL verbatim -- and a hostname is valid at any length, so is a scheme.
+        # Appending this fragment raw let a 4 MB hostname publish a 4 MB ``args_preview`` past a
+        # ceiling this same function declares. The web service's own ``.finished``/``.failed``
+        # events carry the identical fragment through ``public_event_payload``, which bounds it,
+        # so the two surfaces of one call disagreed by four megabytes until this route matched.
+        preview["url_preview"] = _budgeted_field(
+            "url_preview", public_url_preview(str(arguments.get("url") or "")), policy, payload_budget
+        )
     for key in (
         "max_results",
         "max_tokens",
