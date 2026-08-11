@@ -23,7 +23,7 @@ from __future__ import annotations
 import copy
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
@@ -525,6 +525,28 @@ def is_recorded_digest(value: Any) -> bool:
     """
 
     return isinstance(value, str) and RECORDED_DIGEST_PATTERN.fullmatch(value) is not None
+
+
+def is_absent_or_valid(value: Any, is_valid: Callable[[Any], bool]) -> bool:
+    """Whether ``value`` is this repo's in-band absence -- the empty string -- or something
+    ``is_valid`` certifies. Judged without consulting the object's own opinion of itself.
+
+    Type before value, the rule ``_validate_counts`` states one field family over: a
+    comparison asks the *value*, and a value may answer. A guard spelling the absence arm as
+    ``value != ""`` is False for a ``str`` subclass whose ``__ne__`` returns False, so the
+    pattern check behind it never runs -- while ``json.dumps`` and an HTTP header both go on
+    reading the underlying string, which is exactly the value the guard existed to refuse.
+    Requiring the exact ``str`` type first makes the emptiness comparison and the pattern the
+    string's own answers, and refuses every non-string in the same breath.
+
+    Both boundaries that admit an empty spelling ask through here -- the ledger mint in
+    ``core/model_calls.py`` and request ingress in ``providers/base.py`` -- so the rule cannot
+    hold at one and drift at the other. The positive-gate callers (``providers/gateway.py``,
+    the reference gateway's header reader) need nothing: asking ``is_valid`` directly never
+    consults equality, and they omit what they cannot certify rather than raising.
+    """
+
+    return type(value) is str and (value == "" or is_valid(value))
 
 
 def destination_digest(value: str) -> str:
@@ -1104,8 +1126,10 @@ class ModelCallReceipt:
     destination_status: str = "not_reached"
     destination_digest: str = ""
     # One entry per kernel dispatch, in order. Empty on receipts written before the field
-    # existed and on refused calls (``attempts == 0``); otherwise one entry per attempt, so the
-    # log is either absent or complete. Both halves of "complete" are enforced below rather
+    # existed, on refused calls (``attempts == 0``), and on any receipt a caller builds
+    # without one -- the empty arm is not reserved for zero dispatches, which is why neither
+    # wire reader may treat an empty log beside a positive ``attempts`` as impossible.
+    # Otherwise one entry per attempt, so the log is either absent or complete. Both halves of "complete" are enforced below rather
     # than left to the writer: the indices are ``1..attempts`` in order (a log naming some
     # attempts twice and others not at all could not answer the question it exists for, and
     # counting alone cannot tell the two apart), and the entries' usage sums to this receipt's
@@ -1140,11 +1164,11 @@ class ModelCallReceipt:
         # "Exactly once" is the claim, so the indices carry it rather than the count. A length
         # check accepts a log of the right size naming one dispatch twice and another not at
         # all -- well-formed in every other field, and unanswerable for the question the log
-        # exists for, with nothing in the record to say so. The empty half of the rule also
-        # has a wire side this constructor cannot enforce -- absence and ``[]`` parse to the
-        # same tuple -- so ``from_json`` and ``monoid validate`` refuse the pair no writer
-        # produces (an empty log beside a positive count) at the boundaries where the key is
-        # still visible.
+        # exists for, with nothing in the record to say so. The empty half of the rule has a
+        # wire side this constructor cannot see -- absence and ``[]`` parse to the same tuple
+        # -- and neither reader tries to: both spellings mean an unitemized call, the second
+        # because every build before W7-4 wrote it for exactly that. Only the writers
+        # converged; see ``to_json``.
         if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
             range(1, self.attempts + 1)
         ):

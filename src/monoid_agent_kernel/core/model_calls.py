@@ -37,6 +37,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
     ModelCallAttempt,
     ModelCallReceipt,
+    is_absent_or_valid,
     is_recorded_digest,
     is_valid_idempotency_key,
 )
@@ -209,16 +210,19 @@ def model_call_record(
     # the two: a foreign receipt that parsed fine must not mint a line ``monoid validate``
     # then refuses. Empty stays admissible on all three -- a refused call was never keyed and
     # never digested, and a status field explains each -- so this cannot fire on a receipt
-    # the runner built, which is valid by construction on every settle path. For the
-    # recorder, a raise here costs the one line, not the run (its hostile-context
-    # containment); the offending value stays out of the message, the same transport rule
-    # the key's logging sinks follow.
+    # the runner built, which is valid by construction on every settle path. That empty arm
+    # is asked through ``is_absent_or_valid`` rather than spelled here: ``value != ""`` is a
+    # question the value answers, and a ``str`` subclass answering it falsely walked past
+    # this guard with its underlying string intact. Request ingress had the same shape and
+    # the same hole; one body serves both now. For the recorder, a raise here costs the one
+    # line, not the run (its hostile-context containment); the offending value stays out of
+    # the message, the same transport rule the key's logging sinks follow.
     for field_name, value, is_valid in (
         ("idempotency_key", receipt.idempotency_key, is_valid_idempotency_key),
         ("prompt_digest", receipt.prompt_digest, is_recorded_digest),
         ("request_digest", receipt.request_digest, is_recorded_digest),
     ):
-        if value != "" and not is_valid(value):
+        if not is_absent_or_valid(value, is_valid):
             raise ValueError(
                 f"model call record {field_name} must be empty or the shape "
                 "the ledger schema certifies"
@@ -254,11 +258,12 @@ def model_call_record(
     }
     # One object per dispatch, hand-projected in ``_recorded_attempt`` -- and the key emitted
     # only when there is a dispatch to itemize, the receipt's own wire rule. Absence on a line
-    # means nothing was itemized: a writer that predates the field (beside a positive
-    # ``attempts``) or a refused call that never dispatched. The schema declares the key and
-    # does not require it for the first reason -- ``validate_run_dir`` sweeps directories that
-    # earlier v0.21 builds filled -- and the sweep refuses the pair no writer produces, an
-    # empty log beside a positive count.
+    # means nothing was itemized: a writer that predates the field, a refused call that never
+    # dispatched, or a receipt built without a log at any count. The schema declares the key
+    # and does not require it for those reasons, and the sweep relates only a NON-EMPTY log to
+    # the line around it: a present ``[]`` is what every build before this one wrote for the
+    # same value -- this projection emitted the key unconditionally -- so ``validate_run_dir``
+    # keeps certifying the directories they filled.
     if receipt.attempt_log:
         record["attempt_log"] = [_recorded_attempt(entry) for entry in receipt.attempt_log]
     return record

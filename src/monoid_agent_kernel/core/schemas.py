@@ -1715,8 +1715,8 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
 
 
 def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
-    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes, to
-    the one rule its entries owe each other, and to the one spelling an empty log may take.
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes and to
+    the one rule its entries owe each other.
 
     A JSON Schema validates every entry against its own shape and can say nothing about how one
     entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``

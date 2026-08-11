@@ -490,6 +490,24 @@ def test_an_empty_digest_is_a_valid_record_because_a_status_explains_it() -> Non
 # --- the reader transports, the mint certifies ----------------------------------------------
 
 
+class _NeverUnequal(str):
+    """A ``str`` that answers *for* its value instead of about it.
+
+    Nothing exotic: a subclass whose ``__ne__`` returns False. Any guard that spells "is this
+    the in-band absence?" as ``value != ""`` asks this object a question it answers falsely,
+    and skips the check behind it -- while ``json.dumps`` and an HTTP header both go on
+    reading the underlying string.
+    """
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
 @pytest.mark.parametrize(
     ("field_name", "bad"),
     [
@@ -508,6 +526,44 @@ def test_the_mint_refuses_a_receipt_the_sweep_would_convict(field_name: str, bad
     itself constructs fine; only certification is denied."""
 
     receipt = _receipt(**{field_name: bad})
+
+    with pytest.raises(ValueError, match=field_name):
+        model_call_record(
+            receipt,
+            run_id="run-1",
+            root_run_id="run-1",
+            call_index=0,
+            recorded_at="2026-08-11T00:00:00.000Z",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad"),
+    [
+        ("idempotency_key", "bad\nkey"),
+        ("prompt_digest", "not-a-digest"),
+        ("request_digest", "B" * 64),
+    ],
+    ids=["key-with-control", "digest-wrong-shape", "digest-wrong-case"],
+)
+def test_the_mint_judges_the_value_and_not_the_objects_opinion_of_it(
+    field_name: str, bad: str
+) -> None:
+    """The guard asked ``value != ""`` first, which is a question the value may answer.
+
+    A ``str`` subclass whose ``__ne__`` returns False makes that comparison False, so the
+    pattern check behind it never ran and the record carried the object through --
+    ``json.dumps`` writes the underlying string, and the line the guard exists to prevent
+    reaches the ledger anyway. Reproduced end to end before the fix: a receipt keyed with
+    ``_NeverUnequal("bad\nkey")`` through ``record_settled_call`` wrote a
+    ``model_calls.jsonl`` line ``monoid validate`` then convicted.
+
+    Type before value, the rule ``_validate_counts`` states one field family over: once the
+    exact ``str`` type is established, the emptiness comparison and the pattern are the
+    string's own answers. All three fields, because the overload hides any of them equally --
+    a fix proven on the key alone would leave the two digests behind it."""
+
+    receipt = _receipt(**{field_name: _NeverUnequal(bad)})
 
     with pytest.raises(ValueError, match=field_name):
         model_call_record(
