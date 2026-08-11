@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from support.hostile_scalars import ExplodingComparisons, UnderstatedInteger
+
 import monoid_agent_kernel
 from monoid_agent_kernel.core.tool_approval import redact_tool_arguments
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -1245,6 +1247,31 @@ def test_the_integer_preview_is_the_prefix_the_full_spelling_would_have_given(
         assert published == value
     else:
         assert spelled == _reference_hex_preview(value)
+
+
+def test_the_integer_threshold_reads_the_value_not_the_object() -> None:
+    """The twin of the ingress refusal's rule, on the side where a raise costs the whole run.
+
+    ``_int_hex_preview`` takes ``int.__index__`` first and says why; the threshold decision two
+    functions up did not, so ``value < 0`` and unary ``-`` were handed to a model-supplied
+    object. This one is the worse half: it runs inside event construction, and it is reachable
+    past the refusing boundaries, because ``update_plan`` normalizes with the default
+    ``refuse_unportable_scalars=False``.
+
+    Both directions, because a subclass can answer wrongly in two ways. Raising ends the run for
+    a plain ``5``; understating itself publishes an integer no writer can spell -- and it slipped
+    the budget too, since ``_fragment_cost`` reads ``json.dumps``'s refusal as "cannot price
+    this" and lets the fragment through uncharged.
+    """
+    policy = PermissionPolicy()
+
+    assert preview_value("n", ExplodingComparisons(5), policy) == 5
+
+    published = preview_value("n", UnderstatedInteger(1 << 16_609), policy)
+
+    assert published["truncated"] is True
+    assert published["preview"].startswith("0x")
+    assert json.dumps(published), "the payload still cannot be spelled by a writer"
 
 
 def test_previewing_a_huge_integer_does_not_materialize_its_whole_spelling() -> None:

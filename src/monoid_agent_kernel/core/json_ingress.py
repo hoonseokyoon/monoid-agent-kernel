@@ -72,16 +72,26 @@ def _refuse_unportable_scalar(value: Any) -> None:
     on the way through. ``bool`` before ``int`` because it is one; ``float`` is total here (the
     non-finite substitution is the caller's separate, documented choice); everything else —
     ``bytes``, ``Decimal``, arbitrary objects — is named by type only, never asked to repr itself.
+
+    The magnitude is read through ``int.__index__``, the base slot, because the question is what a
+    *writer* will spell and ``json.dumps`` spells an ``int`` subclass by its base value. Asked with
+    ``<`` instead, the subclass answers: one that raises ends the run with an unclassified
+    exception where this boundary promises a classified refusal — measured on a plain ``5``, which
+    every writer here handles — and one that merely understates itself is declared portable and
+    dies at the writer this exists to protect. Inside the ``isinstance``, deliberately:
+    ``int.__index__`` raises ``TypeError`` for anything else, which would trade the classified type
+    refusal below for exactly the bare crash this function is here to stop.
     """
 
     if value is None or isinstance(value, (str, bool, float)):
         return
     if isinstance(value, int):
-        if -_UNCONDITIONALLY_SPELLABLE_INT < value < _UNCONDITIONALLY_SPELLABLE_INT:
+        numeric = int.__index__(value)
+        if -_UNCONDITIONALLY_SPELLABLE_INT < numeric < _UNCONDITIONALLY_SPELLABLE_INT:
             return
         digits = _spellable_integer_digits()
         bound = _digit_bound_magnitude(digits)
-        if -bound < value < bound:
+        if -bound < numeric < bound:
             return
         raise UnportableScalarError(f"integer exceeds the JSON bound of {digits} digits")
     raise UnportableScalarError(f"value of type {type(value).__name__} is not portable JSON")

@@ -623,9 +623,19 @@ def _int_spelling_exceeds(value: int, threshold: int) -> bool:
     comparison against a power of ten is the same question asked without the conversion —
     ``digits(|v|) > d  iff  |v| >= 10**d`` — with one budgeted byte fewer for a negative sign.
     The fast path skips building ``10**threshold`` for the ints real payloads carry.
+
+    Through ``int.__index__`` first, for the reason ``_int_hex_preview`` states two functions
+    down and this one did not: the threshold is about what a writer will spell, and ``json.dumps``
+    spells an ``int`` subclass by its base value, so ``<`` and unary ``-`` must not be handed to
+    the subclass. This site is the worse of the pair — it runs *inside event construction*, where
+    a raise from a model-supplied object ends the run (see ``_is_path_redacted`` below for the
+    same hazard), and it is reachable past the refusing boundaries: ``update_plan`` normalizes
+    with the default ``refuse_unportable_scalars=False``, and a subclass that answers the ingress
+    honestly can still detonate on this negation.
     """
-    magnitude = -value if value < 0 else value
-    digit_budget = threshold - 1 if value < 0 else threshold
+    numeric = int.__index__(value)
+    magnitude = -numeric if numeric < 0 else numeric
+    digit_budget = threshold - 1 if numeric < 0 else threshold
     if digit_budget >= 18 and magnitude < 10**17:
         return False
     return magnitude >= 10**digit_budget

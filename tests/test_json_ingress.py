@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from support.hostile_scalars import ExplodingComparisons, UnderstatedInteger
+
 import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
     UnportableScalarError,
@@ -277,6 +279,28 @@ def test_a_json_integer_past_the_interpreters_limit_is_a_decode_error() -> None:
     with _interpreter_int_digit_limit(1000):
         with pytest.raises(json.JSONDecodeError):
             loads_json_ingress('{"n": ' + "9" * 1500 + "}")
+
+
+def test_an_integer_subclass_is_judged_by_the_value_a_writer_would_spell() -> None:
+    """The bound is a question about the writer, so it must be asked of the base value.
+
+    A Python-object ingress can carry an ``int`` subclass with its own ordering, and ``<`` hands
+    the question to the object. Both answers it can give are wrong here: raising turns the
+    classified refusal this boundary promises into an unclassified exception -- on a value
+    (``5``) every writer in this process spells without complaint -- and understating itself
+    declares a past-the-bound integer portable, which puts the ``ValueError`` back at the writer
+    the boundary exists to keep it away from. ``int.__index__`` asks the base slot instead, which
+    is what ``json.dumps`` will spell.
+    """
+    spellable = ExplodingComparisons(5)
+    assert json.dumps(spellable) == "5", "the fixture must be a value writers handle"
+
+    assert normalize_json_ingress({"n": spellable}, refuse_unportable_scalars=True) == {"n": 5}
+
+    with pytest.raises(UnportableScalarError):
+        normalize_json_ingress(
+            {"n": UnderstatedInteger(10**5000)}, refuse_unportable_scalars=True
+        )
 
 
 # --------------------------------------------------------------------------------------
