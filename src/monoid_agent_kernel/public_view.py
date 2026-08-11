@@ -102,12 +102,14 @@ def public_result_content(content: dict[str, Any], policy: PermissionPolicy) -> 
     payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
 
     def one(key: str, value: Any) -> Any:
+        # Both branches below skip `preview_value`, so they charge themselves; `_charge_fragment`
+        # returns the `_DROPPED` sentinel `public_mapping` already stops on.
         if key == "content":
-            return redacted_value(value)
+            return _charge_fragment(payload_budget, redacted_value(value))
         if key == "path" and isinstance(value, str):
             # Same bound as `paths` on the event that carries this. Diverting `path` to bare
             # `public_path` published the model's whole argument beside its own truncation.
-            return public_inline_path(value, policy)
+            return _charge_fragment(payload_budget, public_inline_path(value, policy))
         return preview_value(key, value, policy, _payload_budget=payload_budget)
 
     return public_mapping(content, one, payload_budget=payload_budget)
@@ -346,7 +348,12 @@ def finish_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> 
     return public_mapping(
         arguments,
         lambda key, value: (
-            redacted_value(value)
+            # Charged, because this branch skips `preview_value` and the match is
+            # *case-insensitive*: a mapping holds every case variant of `summary` and `notes` as a
+            # distinct key, so 160 of them take this path in one payload. Uncharged, that published
+            # 7,664 bytes nobody paid for and put the payload 6,575 past the ceiling -- reachable,
+            # because `tool.call.started` is emitted before `validate_args` rejects the call.
+            _charge_fragment(payload_budget, redacted_value(value))
             if value is not None and key.lower() in _FINISH_CONTENT_KEYS
             else preview_value(key, value, policy, _payload_budget=payload_budget)
         ),
@@ -360,6 +367,7 @@ def shell_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> d
     # values are model-controlled, and any of them can arrive as a *container* -- so per-field
     # budgets here would be the reverted per-top-level-key accounting wearing builder clothes.
     payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+    payload_budget.charge(2)  # the braces, as `public_mapping` charges its own
     return {
         "command_preview": _budgeted_field(
             "command_preview", str(arguments.get("command") or ""), policy, payload_budget
@@ -409,6 +417,7 @@ def web_args_preview(arguments: dict[str, Any], policy: PermissionPolicy) -> dic
     # Same rule as ``shell_args_preview``: kernel-literal keys, model-controlled values, one
     # budget across all of them so a container in any field cannot start a fresh allowance.
     payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
+    payload_budget.charge(2)  # the braces, as `public_mapping` charges its own
     if "query" in arguments:
         preview["query_preview"] = _budgeted_field(
             "query_preview", public_query_preview(str(arguments.get("query") or "")), policy, payload_budget
@@ -506,8 +515,12 @@ class PayloadBudget:
     the caller drops that fragment and reports the drop. ``charge_marker`` is for the report
     itself — a truncation marker must land even at zero, or the cut becomes silent, so it spends
     into the reserve carved out at construction. The serialized payload can exceed neither half:
-    regular fragments fit inside ``limit - reserve``, and post-exhaustion markers fit inside the
-    reserve because the stack depth bounds how many containers can still announce a cut.
+    regular fragments fit inside ``limit - reserve``, and what spends from the reserve after
+    exhaustion is bounded by construction — at most one announcement per container still open on
+    the recursion stack, which the depth cap holds under two dozen, plus one per fixed field of a
+    hand-assembled builder. "The stack depth bounds it" was the wrong reason on its own:
+    ``_budgeted_field`` adds a field-bounded term the stack knows nothing about. Measured at the
+    worst shape either route reaches: 17 announcements, 489 bytes, against a 1024-byte reserve.
     """
 
     __slots__ = ("remaining",)
@@ -580,14 +593,26 @@ def _charge_fragment(budget: PayloadBudget, fragment: Any) -> Any:
     return fragment if budget.charge(cost) else _DROPPED
 
 
+def _spend_terminal(budget: PayloadBudget, cost: int) -> None:
+    """Spend bytes that have to land whatever the budget says: charged like any fragment while
+    money remains, and to the reserve once it does not.
+
+    Three kinds of byte qualify, and they are exactly the ones a caller cannot drop — a truncation
+    marker (the cut has to say it happened), the ``#N`` that keeps a source key alive beside a
+    marker of the same name, and a hand-assembled builder's kernel-literal key, which a reader
+    looks up by name.
+    """
+    if not budget.charge(cost):
+        budget.charge_marker(cost)
+
+
 def _charge_terminal_marker(budget: PayloadBudget, fragment: Any) -> None:
     """A truncation marker is charged like any fragment while money remains, and to the reserve
     once it does not — the marker landing is what keeps the cut visible."""
     cost = _fragment_cost(fragment)
     if cost < 0:  # pragma: no cover - markers are kernel-built JSON
         return
-    if not budget.charge(cost):
-        budget.charge_marker(cost)
+    _spend_terminal(budget, cost)
 
 
 def _int_spelling_exceeds(value: int, threshold: int) -> bool:
@@ -644,7 +669,14 @@ def _budgeted_field(key: str, value: Any, policy: PermissionPolicy, budget: Payl
     reader looks up by name, so dropping the *entry* would blank a field that looks checked. The
     refused value becomes the terminal marker instead: the key stays, the cut says so, and the
     marker spends from the reserve like every other announcement of exhaustion.
+
+    The key is charged here for the same reason ``public_mapping`` charges its own: it is appended,
+    and these two builders have no traversal loop to do it for them. Left out, the two of them
+    published 135 and 211 bytes nobody paid for — a fixed amount that never grew with the input,
+    but enough to make "every appended byte is charged" a claim with an unwritten exception in it.
+    A kernel literal cannot be dropped, so it spends like a marker rather than being refusable.
     """
+    _spend_terminal(budget, _fragment_cost(key) + 4)
     fragment = preview_value(key, value, policy, _payload_budget=budget)
     if fragment is _DROPPED:
         fallback = {"truncated": True, "type": type(value).__name__}
@@ -711,7 +743,9 @@ _TRUNCATED_KEYS = "truncated_keys"
 """The kernel's word for "this mapping is missing keys", on every surface that cuts one."""
 
 
-def _publish_truncated_keys(published: dict[str, Any], dropped: int) -> dict[str, Any] | None:
+def _publish_truncated_keys(
+    published: dict[str, Any], dropped: int, budget: PayloadBudget
+) -> None:
     """Add the ``truncated_keys`` marker without destroying a source key of that name.
 
     A model may name an argument ``truncated_keys``, and the assignment used to overwrite it: the
@@ -727,8 +761,17 @@ def _publish_truncated_keys(published: dict[str, Any], dropped: int) -> dict[str
     two colliding source keys already get, so nothing here is destroyed silently.
 
     Nothing happens to a mapping that is not cut, so the "unchanged when nothing was dropped"
-    guarantee holds: only an actual collision is disambiguated. Returns the marker fragment its
-    caller must charge, or ``None`` when there is nothing to announce.
+    guarantee holds: only an actual collision is disambiguated.
+
+    Charges what it appends, marker and rename alike, which is why it takes the budget rather than
+    handing the fragment back for a caller to charge. The rename widens a key the loop already paid
+    for at its plain spelling, and that shortfall was invisible for a measurable reason: every
+    non-empty container over-charges exactly two bytes, because each key is charged its separators
+    (``", "`` plus ``": "``) while the *first* entry spells no leading comma. ``#2`` costs exactly
+    that cushion and disappeared into it. ``#10`` costs one byte more, and on the approval surface
+    a payload of colliding keys arrived 2,027 bytes past a ceiling this module says it cannot
+    exceed. A proof that holds only while an unstated cushion happens to cover it is not the proof
+    this module claims.
     """
     if dropped < 0:
         dropped = 0
@@ -737,9 +780,11 @@ def _publish_truncated_keys(published: dict[str, Any], dropped: int) -> dict[str
         suffix = 2
         while f"{_TRUNCATED_KEYS}#{suffix}" in published:
             suffix += 1
-        published[f"{_TRUNCATED_KEYS}#{suffix}"] = collided
+        renamed = f"{_TRUNCATED_KEYS}#{suffix}"
+        _spend_terminal(budget, _fragment_cost(renamed) - _fragment_cost(_TRUNCATED_KEYS))
+        published[renamed] = collided
     published[_TRUNCATED_KEYS] = dropped
-    return {_TRUNCATED_KEYS: dropped}
+    _charge_terminal_marker(budget, {_TRUNCATED_KEYS: dropped})
 
 
 def _bounded_key(
@@ -797,10 +842,15 @@ def public_mapping(
 
     ``payload_budget`` must be the same object the ``preview`` callback spends from — the builders
     close one budget over both — or the keys and the values are accounted on different ledgers.
-    Callback returns that bypass ``preview_value`` (``public_result_content``'s ``content`` and
-    ``path`` branches, ``finish_args_preview``'s prose redaction) are appended uncharged; each is
-    a kernel-named key producing a bounded fragment, so the slack is a fixed handful of bytes,
-    not a route.
+    Every callback return is charged, the branches that bypass ``preview_value`` included
+    (``public_result_content``'s ``content`` and ``path``, ``finish_args_preview``'s prose
+    redaction): they charge themselves and hand back the same ``_DROPPED`` sentinel this loop
+    already stops on. They used to be exempt, because "each is a kernel-named key producing a
+    bounded fragment, so the slack is a fixed handful of bytes, not a route". Half of that was
+    true. ``public_result_content`` matches ``content`` and ``path`` *exactly* — two keys, 55
+    bytes. ``finish_args_preview`` matches ``key.lower()``, and a mapping holds every case variant
+    as a distinct key: 160 of them, 7,664 uncharged bytes, 6,575 past the ceiling. A key the
+    *model* names is not a kernel-named key, and a count nobody bounded is a route.
     """
     if payload_budget is None:
         payload_budget = PayloadBudget(TRACE_PAYLOAD_BYTE_BUDGET)
@@ -826,8 +876,7 @@ def public_mapping(
         # name, and overwriting one both destroyed it and under-counted the loss, because the
         # entry it replaced had already been counted as published.
         dropped_keys = len(values) - len(published)
-        marker = _publish_truncated_keys(published, dropped_keys)
-        _charge_terminal_marker(payload_budget, marker)
+        _publish_truncated_keys(published, dropped_keys, payload_budget)
     return published
 
 
@@ -1034,8 +1083,7 @@ def _preview_value(
         # level could cut too.
         dropped_keys = len(value) - len(preview)
         if stopped or dropped_keys > 0:
-            marker = _publish_truncated_keys(preview, dropped_keys)
-            _charge_terminal_marker(_payload_budget, marker)
+            _publish_truncated_keys(preview, dropped_keys, _payload_budget)
         return preview
     if isinstance(value, list):
         if not _payload_budget.charge(2):  # the brackets

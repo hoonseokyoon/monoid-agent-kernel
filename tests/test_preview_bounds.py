@@ -18,9 +18,11 @@ its twin.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import time
 import tracemalloc
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +42,7 @@ from monoid_agent_kernel.public_view import (
     PREVIEW_MAX_KEYS,
     REDACTED_PATH,
     TRACE_PAYLOAD_BYTE_BUDGET,
+    PayloadBudget,
     TRUNCATION_SUFFIX,
     args_preview,
     finish_args_preview,
@@ -1042,6 +1045,170 @@ def test_a_mapping_that_was_not_cut_keeps_its_marker_named_key_untouched() -> No
 
     assert args_preview(arguments, policy) == arguments
 
+@contextlib.contextmanager
+def _charged_bytes() -> Iterator[list[int]]:
+    """Every byte charged, across every ``PayloadBudget`` built while this is open.
+
+    Instrumenting the *ledger* rather than the payload is what turns "the payload is bounded" from
+    a claim about the shapes someone thought to test into one about the accounting itself. A byte
+    that lands uncharged is invisible to every ceiling assertion until some other shape widens the
+    gap past the reserve -- which is exactly how three of them shipped: each container happens to
+    over-charge two bytes (a key is charged its ``", "`` separator, and the first entry spells
+    none), and that unstated cushion covered the holes at every size anyone had measured.
+    """
+    total = [0]
+    real_charge = PayloadBudget.charge
+    real_marker = PayloadBudget.charge_marker
+
+    def charge(self: PayloadBudget, cost: int) -> bool:
+        accepted = real_charge(self, cost)
+        if accepted:
+            total[0] += cost
+        return accepted
+
+    def charge_marker(self: PayloadBudget, cost: int) -> None:
+        real_marker(self, cost)
+        total[0] += cost
+
+    PayloadBudget.charge = charge  # type: ignore[method-assign]
+    PayloadBudget.charge_marker = charge_marker  # type: ignore[method-assign]
+    try:
+        yield total
+    finally:
+        PayloadBudget.charge = real_charge  # type: ignore[method-assign]
+        PayloadBudget.charge_marker = real_marker  # type: ignore[method-assign]
+
+
+def _marker_named_dict() -> dict[str, Any]:
+    """A mapping the width cap must cut, whose first key is the marker's own name and whose ``#2``
+    through ``#9`` are taken, so the rename needs a *two-digit* suffix.
+
+    Three bytes against the two a container's first entry leaves spare. One such dict is covered
+    by the cushion and says nothing; the shapes below carry six.
+    """
+    out: dict[str, Any] = {"truncated_keys": 0}
+    out.update({f"truncated_keys#{suffix}": 0 for suffix in range(2, 10)})
+    out.update({f"k{index}": index for index in range(PREVIEW_MAX_KEYS + 1)})
+    return out
+
+
+def _finish_prose_case_variants() -> dict[str, Any]:
+    """Every case spelling of ``summary`` and ``notes``: 2**7 + 2**5 = 160 distinct keys, all of
+    which ``finish_args_preview`` matches through ``key.lower()`` and redacts on the branch that
+    skips the traversal."""
+    variants: dict[str, Any] = {}
+    for word in ("summary", "notes"):
+        for mask in range(1 << len(word)):
+            spelled = "".join(
+                char.upper() if mask & (1 << index) else char for index, char in enumerate(word)
+            )
+            variants[spelled] = "model prose " * 8
+    return variants
+
+
+_UNCHARGED_BYTE_SHAPES = [
+    pytest.param({"a": [_marker_named_dict() for _ in range(6)]}, id="marker-name-collisions"),
+    pytest.param(_finish_prose_case_variants(), id="finish-prose-case-variants"),
+    pytest.param(
+        {"content": "x" * 4096, "path": "notes/a.md", "plain": 1}, id="callback-branches"
+    ),
+    pytest.param(
+        {"argument": "y" * 4096, "count": 12, "nested": {"a": [1, 2, 3], "b": {"c": "d"}}},
+        id="ordinary",
+    ),
+]
+
+# Every builder that spends a ``PayloadBudget``, including the two that assemble their mapping by
+# hand -- the hostile payload rides in one of their fields, since their outer keys are kernel
+# literals. ``public_job_artifact`` is absent on purpose: it is documented as structurally bounded
+# and takes no budget at all.
+_BUDGETED_BUILDERS = [
+    pytest.param(lambda payload, policy: args_preview(payload, policy), id="args_preview"),
+    pytest.param(
+        lambda payload, policy: finish_args_preview(payload, policy), id="finish_args_preview"
+    ),
+    pytest.param(
+        lambda payload, policy: public_result_content(payload, policy), id="public_result_content"
+    ),
+    pytest.param(
+        lambda payload, policy: public_event_payload(payload, policy), id="public_event_payload"
+    ),
+    pytest.param(
+        lambda payload, policy: redact_tool_arguments(payload, policy=policy),
+        id="redact_tool_arguments",
+    ),
+    pytest.param(
+        lambda payload, policy: shell_args_preview({"cwd": payload}, policy), id="shell_args_preview"
+    ),
+    pytest.param(
+        lambda payload, policy: web_args_preview({"max_results": payload}, policy),
+        id="web_args_preview",
+    ),
+]
+
+
+@pytest.mark.parametrize("build", _BUDGETED_BUILDERS)
+@pytest.mark.parametrize("payload", _UNCHARGED_BYTE_SHAPES)
+def test_no_builder_publishes_a_byte_it_did_not_charge(build, payload: dict[str, Any]) -> None:
+    """The invariant the ceiling rests on, asserted directly instead of sampled through payloads.
+
+    ``_preview_value``'s docstring calls charged-at-least-cost-per-appended-byte the reason the
+    serialized payload is provably no larger than the budget. It was not: the truncation marker's
+    collision rename widened a key already charged at its plain spelling, the two hand-assembled
+    builders never charged their outer keys, and ``finish_args_preview``'s prose redaction skipped
+    the traversal that would have charged it. Each is small per occurrence; each scales with the
+    payload, and the first and third put a published payload past the ceiling.
+
+    Both directions matter, so this asserts the ledger *and* the ceiling. A shape that never
+    reaches the ceiling still reddens here the moment a byte lands unpaid for, which is the point
+    -- the earlier pins all sat below the size where the cushion stops covering.
+    """
+    with _charged_bytes() as charged:
+        published = build(payload, PermissionPolicy())
+
+    assert _widest_payload_bytes(published) <= charged[0], (
+        "the payload spells bytes the budget never charged"
+    )
+    assert _widest_payload_bytes(published) <= APPROVAL_PAYLOAD_BYTE_BUDGET
+
+
+def _collision_tree(leaf_lists: int) -> list[Any]:
+    """Nested lists of marker-named dicts: the cheapest way to buy many cut containers per byte,
+    which is what turns a per-container byte into a payload-sized overshoot."""
+    leaves = [[_marker_named_dict() for _ in range(20)] for _ in range(leaf_lists)]
+    middle = [leaves[index : index + 20] for index in range(0, len(leaves), 20)]
+    return [middle[index : index + 20] for index in range(0, len(middle), 20)]
+
+
+def test_a_payload_of_marker_named_keys_stays_under_the_approval_ceiling() -> None:
+    """The reachable breach, on the surface where it was widest.
+
+    The approval card carries a 1 MiB ceiling against the same 1024-byte reserve, so it holds four
+    times the payload and the same slack -- and an argument mapping full of keys named like the
+    marker arrived 2,027 bytes past it. Nothing in the input is exotic: it round-trips through
+    ``json.dumps``/``json.loads`` unchanged and nests four levels under a cap of eight.
+    """
+    published = redact_tool_arguments({"a": _collision_tree(800)}, policy=PermissionPolicy())
+
+    assert _widest_payload_bytes(published) <= APPROVAL_PAYLOAD_BYTE_BUDGET
+    assert "truncated_keys#10" in json.dumps(published), "the fixture never renamed anything"
+
+
+def test_a_finish_call_of_case_variant_prose_keys_stays_under_the_trace_ceiling() -> None:
+    """The largest of the three, and the one no cushion was ever going to cover.
+
+    160 keys take the uncharged redaction branch in a single payload, and the call publishes
+    ``tool.call.started`` *before* ``validate_args`` rejects it -- the same order
+    ``shell_args_preview`` documents for ``timeout_s`` -- so ``additionalProperties: false`` on
+    ``run.finish`` does not stop it being emitted.
+    """
+    arguments = _finish_prose_case_variants()
+    arguments.update({f"arg{index:05d}": "D" * 234 for index in range(2000)})
+
+    published = finish_args_preview(arguments, PermissionPolicy())
+
+    assert _widest_payload_bytes(published) <= TRACE_PAYLOAD_BYTE_BUDGET
+    assert published["truncated_keys"] > 0, "the fixture must actually reach the budget"
 
 def _reference_hex_preview(value: int) -> str:
     """The spelling this envelope shipped with: materialize it all, then keep the prefix.
