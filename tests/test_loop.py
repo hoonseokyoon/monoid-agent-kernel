@@ -2068,6 +2068,103 @@ def test_from_tools_normalizes_specs_before_binding_and_surface_hashes(tmp_path:
     assert exposed.annotations["score"] is None
 
 
+def test_a_failure_record_survives_a_tool_exception_that_hides_its_own_class(
+    tmp_path: Path,
+) -> None:
+    """Both failure writers name the exception with `type(exc).__name__`, read off its class.
+
+    A tool handler raises whatever class it likes, and that read dispatches to the class's
+    *metaclass*. Raising there took `run_once` out of the loop entirely -- no `run.failed`, no
+    `failure.json`, no terminal record of any kind, from inside the code whose only job at that
+    point is to write one. Worse than the ingress finding that started this, which at least still
+    emitted a terminal event.
+
+    An adapter exception cannot show this: it is wrapped into `ModelAdapterError` before the
+    writers see it. A tool's is not -- the handler wrapper catches only `(NativeAgentError,
+    ValueError, TypeError)` -- so this is the arm where the model-supplied class arrives intact.
+    """
+    from monoid_agent_kernel.tools.decorator import tool
+
+    class _HidesItsName(type):
+        def __getattribute__(cls, name: str):  # noqa: ANN001, ANN204
+            if name == "__name__":
+                raise RuntimeError("hostile metaclass")
+            return super().__getattribute__(name)
+
+    class _Unnameable(RuntimeError, metaclass=_HidesItsName):
+        pass
+
+    @tool(id="custom.unnameable", side_effect="read")
+    def unnameable() -> dict:
+        """Fail with an exception whose class answers for its own name."""
+
+        raise _Unnameable("boom")
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_unnameable", {}, "c1"),),
+            ),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [unnameable]).run_once("run it")
+
+    assert result.status == "failed"
+    run_dir = spec.run_root / result.run_id
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["type"] == "_Unnameable"
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = [event for event in events if event["type"] == "run.failed"]
+    assert len(failed) == 1, "the run ended without saying so"
+    assert failed[0]["data"]["type"] == "_Unnameable"
+
+
+def test_a_failure_record_bounds_the_class_name_it_publishes(tmp_path: Path) -> None:
+    """The other direction of the same read: a class name is legal at any length, and this one is
+    on the wire twice. Measured before the bound: a 1,000,000-character name gave a 1,000,433-byte
+    `run.failed` and a 1,000,373-byte failure bundle, from a tool that returned nothing at all."""
+    from monoid_agent_kernel.tools.decorator import tool
+
+    enormous = type("z" * 5_000, (RuntimeError,), {})
+
+    @tool(id="custom.enormous", side_effect="read")
+    def enormous_failure() -> dict:
+        """Fail with an exception whose class name is enormous."""
+
+        raise enormous("boom")
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_enormous", {}, "c1"),),
+            ),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = AgentRunSpec(workspace_root=workspace, run_root=tmp_path / "runs")
+
+    result = AgentLoop.from_tools(spec, adapter, [enormous_failure]).run_once("run it")
+
+    run_dir = spec.run_root / result.run_id
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert len(failure["type"]) <= 64
+    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        if line.strip() and json.loads(line)["type"] == "run.failed":
+            assert len(json.loads(line)["data"]["type"]) <= 64
+
+
 def test_custom_tool_result_is_normalized_before_observation_and_persistence(
     tmp_path: Path,
 ) -> None:
@@ -2162,6 +2259,103 @@ def test_invalid_tool_result_control_fields_become_observable_tool_failures(
     assert observation["ok"] is False
     assert observation["error"]["code"] == "tool_handler_error"
     assert observation["error"]["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("blob", b"\x00\x01\x02", id="bytes"),
+        pytest.param("count", 10**4700, id="int-past-the-digit-limit"),
+    ],
+)
+def test_an_unportable_tool_result_costs_the_call_and_not_the_run(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """A value portable JSON cannot carry is refused where the wrapper can classify it.
+
+    Before this rule, both of these passed ``normalize_tool_result`` untouched — the normalizer
+    deliberately leaves non-container scalars alone — and crashed ``json.dumps`` at the *transcript*
+    write, which sits before ``tool.call.finished``: measured as ``status='failed'``,
+    ``error_code=internal_error``, thirteen events and no finished/failed record for the call. The
+    transcript stays raw by contract, so the fix is refusal at the boundary: the model gets a
+    failed observation it can correct, and the run keeps going.
+    """
+
+    def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
+        return ToolResult(ok=True, content={field: value})
+
+    spec = ToolSpec(
+        id="custom.unportable",
+        description="Return a value portable JSON cannot carry.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_unportable", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("run unportable tool")
+
+    assert result.status == "completed"
+    assert result.final_text == "recovered"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "tool_result_unportable"
+    events_text = (run_spec.run_root / result.run_id / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines() if line]
+    failed = [event for event in events if event["type"] == "tool.call.failed"]
+    assert failed and failed[0]["data"]["error_code"] == "tool_result_unportable"
+
+
+def test_unportable_artifact_metadata_costs_the_emitting_call(tmp_path: Path) -> None:
+    """The same rule at its census twin: ``ToolContext.emit_artifact`` takes Python objects too.
+
+    A custom handler's ``metadata`` dict never crosses a JSON parse, so it can carry ``bytes`` into
+    the same downstream writes the tool-result route reached — the artifact's metadata rides the
+    observation back to the model and the transcript. One predicate, every Python-object ingress.
+    """
+
+    def handler(context: ToolContext, _arguments: dict) -> ToolResult:
+        context.emit_artifact("art.txt", "report", None, {"raw": b"\x00"})
+        return ToolResult(ok=True, content={"emitted": True})
+
+    spec = ToolSpec(
+        id="custom.emitter",
+        description="Emit an artifact with unportable metadata.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_emitter", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+    (run_spec.workspace_root / "art.txt").write_text("body", encoding="utf-8")
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("emit")
+
+    assert result.status == "completed"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "artifact_metadata_unportable"
 
 
 def test_invalid_success_flag_cannot_emit_success_side_effect_evidence(tmp_path: Path) -> None:

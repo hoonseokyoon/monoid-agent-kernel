@@ -68,9 +68,11 @@ from monoid_agent_kernel.core.media import (
     resolve_wire_messages,
 )
 from monoid_agent_kernel.core.json_ingress import (
+    UnportableScalarError,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
+    portable_type_name,
 )
 from monoid_agent_kernel.core.context import (
     ContextProvider,
@@ -500,7 +502,18 @@ class AgentToolContext(ToolContext):
         path = normalize_unicode_scalars(path)
         kind = normalize_unicode_scalars(kind)
         label = None if label is None else normalize_unicode_scalars(label)
-        metadata = normalize_json_ingress(metadata)
+        try:
+            # The tool-result refusal's census twin: this metadata is handed straight to the
+            # ToolContext seam by a custom handler, so it never crossed a JSON parse and can carry
+            # what no writer downstream — the observation back to the model, the transcript — can
+            # spell. Raised as a classified tool error, the emitting call fails and the run keeps
+            # going, which is what "one hostile value costs its own call" means here.
+            metadata = normalize_json_ingress(metadata, refuse_unportable_scalars=True)
+        except UnportableScalarError as exc:
+            raise ToolExecutionError(
+                f"artifact metadata is not portable JSON: {exc}",
+                error_code="artifact_metadata_unportable",
+            ) from exc
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
@@ -2516,7 +2529,13 @@ class AgentLoop:
             data={
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
-                "type": type(exc).__name__,
+                # `portable_type_name`, not `type(exc).__name__`: a tool handler raises whatever
+                # class it likes, and the name is read off that class, so its metaclass answers.
+                # Raising there took `run_once` out entirely -- no `run.failed`, no `failure.json`,
+                # no terminal record of any kind, from inside the code that exists to write one.
+                # A 1,000,000-character class name is the same site's other direction: measured, a
+                # 1,000,433-byte `run.failed` and a 1,000,373-byte failure bundle.
+                "type": portable_type_name(exc),
                 # Provider failure detail (codes/status, never the raw body) — mirrors turn.failed
                 # so the real cause (e.g. insufficient_quota / HTTP 429) reaches logs and the UI.
                 "provider_error_code": state.provider_error_code,
@@ -2550,7 +2569,10 @@ class AgentLoop:
                 # config" from "this will fail again the same way".
                 "retryable": state.retryable,
                 "config_recoverable": state.config_recoverable,
-                "type": type(exc).__name__,
+                # Read the same way as the event above, and for the sharper reason: this bundle is
+                # the operator's restore aid, so an exception that answers for its own class name
+                # destroyed the only record of the failure being recorded.
+                "type": portable_type_name(exc),
                 "last_good_seq": last_good_seq,
                 "restore_hint": (
                     f"restore checkpoint seq {last_good_seq} for run {self.spec.run_id} "

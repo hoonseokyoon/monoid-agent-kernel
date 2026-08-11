@@ -13,6 +13,7 @@ from monoid_agent_kernel.conformance import runner
 from monoid_agent_kernel.conformance.profiles.minimal_agent import MINIMAL_AGENT_RULE_IDS
 from monoid_agent_kernel.conformance.report import CONFORMANCE_REPORT_VERSION
 from monoid_agent_kernel.conformance.report import read_conformance_report
+from monoid_agent_kernel.conformance.report import safe_exception_summary
 from monoid_agent_kernel.conformance.runner import run_conformance
 from monoid_agent_kernel.conformance.verification import verify_conformance_report
 
@@ -195,3 +196,30 @@ def test_runner_redacts_top_level_exception_from_stderr(
     captured = capsys.readouterr()
     assert secret not in captured.err
     assert "conformance runner error: RuntimeError: details redacted" in captured.err
+
+
+def test_a_safe_summary_stays_safe_when_the_exception_hides_its_own_class() -> None:
+    """`safe_exception_summary` reads `__mro__`, `__module__` and `__name__` -- all three off the
+    class, so a metaclass answers all three. The `builtins` filter reads like it keeps a hostile
+    class away from the name read, and does not: a class carrying `__module__ = "builtins"` in its
+    own dict passes it with no code at all, and the summary written into a CI artifact raised.
+    """
+
+    class RaisingName(type):
+        def __getattribute__(cls, name: str):  # noqa: ANN001, ANN204
+            if name == "__name__":
+                raise RuntimeError("hostile metaclass")
+            return super().__getattribute__(name)
+
+    class PassesTheBuiltinsFilter(RuntimeError, metaclass=RaisingName):
+        __module__ = "builtins"
+
+    # Reading the name off the base slot, the filter is passed and the class is named truthfully.
+    # Before, this call raised: the `except` here is for the other two reads, not this one.
+    summary = safe_exception_summary(PassesTheBuiltinsFilter("boom"))
+    assert summary == "PassesTheBuiltinsFilter: details redacted"
+
+    # The ordinary path is unchanged, and the bound applies to it too.
+    assert safe_exception_summary(ValueError("boom")) == "ValueError: details redacted"
+    enormous = type("z" * 5_000, (RuntimeError,), {"__module__": "builtins"})
+    assert len(safe_exception_summary(enormous("boom"))) <= 64 + len(": details redacted")

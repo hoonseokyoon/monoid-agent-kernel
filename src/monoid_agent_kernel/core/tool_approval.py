@@ -4,12 +4,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core.json_ingress import exact_text
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
     APPROVAL_BYTE_BUDGET,
     APPROVAL_BYTE_THRESHOLD,
+    APPROVAL_PAYLOAD_BYTE_BUDGET,
     UNMASKED,
+    PayloadBudget,
     preview_value,
     public_mapping,
     touches_redacted_path,
@@ -144,6 +147,11 @@ def redact_tool_arguments(
             return _REDACTED
         return UNMASKED
 
+    # The approval surface gets its *own* payload ceiling, for the same reason it gets its own
+    # per-value budget: the traversal is shared, so a budget added there is inherited here, and
+    # letting the trace constant become the approval card's ceiling would cut arguments a person
+    # needs to read. Far higher, still bounded -- a card is read by a human, not paged by one.
+    payload_budget = PayloadBudget(APPROVAL_PAYLOAD_BYTE_BUDGET)
     return public_mapping(
         arguments,
         lambda key, value: preview_value(
@@ -153,6 +161,7 @@ def redact_tool_arguments(
             mask=mask,
             threshold=APPROVAL_BYTE_THRESHOLD,
             budget=APPROVAL_BYTE_BUDGET,
+            _payload_budget=payload_budget,
             # This is the decision surface: `content`/`old`/`new` are blanked on the trace surface
             # and *shown* here, bounded by the budget above. An approval card that renders
             # `{"redacted": true}` where the file body should be asks a human to authorize a write
@@ -165,6 +174,7 @@ def redact_tool_arguments(
         ),
         threshold=APPROVAL_BYTE_THRESHOLD,
         budget=APPROVAL_BYTE_BUDGET,
+        payload_budget=payload_budget,
     )
 
 
@@ -280,7 +290,11 @@ def _jsonish(value: Any, _depth: int = 0) -> Any:
             "flatten the payload or pass it as a workspace file"
         )
     if isinstance(value, Mapping):
-        return {str(key): _jsonish(item, _depth + 1) for key, item in value.items()}
+        # `exact_text`, not `str`: this key is the one `_is_secret_key` masks on and the one
+        # the stored `arguments` and the `approval_key` preimage are keyed by. `str(key)` routes
+        # through `type(key).__str__`, so a key spelling `api_key` and answering `harmless`
+        # published its value unmasked -- measured.
+        return {exact_text(key): _jsonish(item, _depth + 1) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_jsonish(item, _depth + 1) for item in value]
     if value is None or isinstance(value, str | int | float | bool):

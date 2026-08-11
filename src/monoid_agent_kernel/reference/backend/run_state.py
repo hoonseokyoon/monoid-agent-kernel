@@ -10,7 +10,7 @@ from monoid_agent_kernel.core._util import read_text_resilient, utc_timestamp, w
 from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.event_sequencing import RunEventSequencer
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, portable_type_name
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -572,7 +572,7 @@ class RunStateMutationService:
             # down was added to clean. The kernel's own writer (`loop.py`) already filters here.
             error=public_error_message(str(exc)),
             error_code=getattr(exc, "error_code", "internal_error"),
-            exc_type=type(exc).__name__,
+            exc_type=portable_type_name(exc),
             overwrite=False,
             # The same fact the core's bundle carries, off the same exception. Read defensively
             # (this arm answers for every exception type, not only ModelAdapterError) and never
@@ -595,7 +595,7 @@ class RunStateMutationService:
             run_id,
             error=public_error_message(str(exc)),
             error_code=getattr(exc, "error_code", "internal_error"),
-            exc_type=type(exc).__name__,
+            exc_type=portable_type_name(exc),
             marker="recorded_by_run_failure",
             provider_error_code=_error_text(exc, "provider_error_code"),
             http_status=_provider_http_status(exc),

@@ -7,6 +7,75 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Changed — the preview is bounded as a payload, not only per piece: budgeted traversal (Track D)
+
+- **Every traversal-built preview now spends one byte budget across everything it appends.**
+  Two of the four gaps the 0.20.0 notes left open close here. "One preview's total size is
+  bounded only by its input" — the shared-graph re-expansion: nine levels shared five ways,
+  46 objects, previewed to 25.78 MB in 1.02 s, growing ~×5.9 per added branch, with the cycle
+  guard rightly silent because sharing is not a cycle — closes because the walk now stops when
+  the payload reaches its ceiling, while a value shared twice still renders twice. And "there
+  is no aggregate budget, so the caps can be walked around by chunking" closes because the
+  cap-obeying pieces still pass and their sum no longer does. The budget is charged on
+  serialized output — quoted keys, preview envelopes and truncation markers included — in the
+  widest spelling any *stream* writer uses: default separators and `ensure_ascii=True`, because the SSE
+  writers escape non-ASCII on purpose (U+2028/U+2029/U+0085 split a frame mid-string otherwise)
+  and an escaped BMP character costs six bytes however few it takes in UTF-8. Charging UTF-8
+  would bound a representation no live subscriber receives — measured, a payload charged just
+  inside the ceiling reached 503,579 bytes out of the real frame writer, and close to three
+  times the ceiling for two-byte scripts and non-BMP codepoints. That is the same defect this
+  module was corrected for once before, one level up. The ceiling is therefore a statement about
+  what a subscriber receives: `events.jsonl`, both SSE writers and the HTTP bodies are all
+  dominated by this charge, while `write_json_atomic`'s pretty-printed `status.json` and approval
+  files add per-element indentation on top — 2.65× the charge for a payload of many tiny
+  elements, a bounded multiple of a bounded payload rather than a growth axis, and not charged
+  here because the indent cost depends on how deeply each writer nests the payload in its file.
+  It is charged this way because
+  the reverted `PREVIEW_MAX_NODES` proved both halves the hard way: it counted visited nodes
+  instead of bytes (912 KB of markers lived outside the count), and it was born once per
+  top-level key, so 400 keys still cost 42 MB. One `PayloadBudget` per payload: 256 KiB on the
+  trace surface, 1 MiB on the approval card, whose reader is a person and whose ceiling must
+  not quietly become the trace constant. The fixed-key builders (`shell_args_preview`,
+  `web_args_preview`) share one budget across their fields for the same reason, and
+  `public_job_artifact` stays outside the scheme: its field set is a fixed allowlist,
+  individually bounded and schema-validated on both ends.
+- **Exhaustion spends the vocabulary that already exists; nothing is replaced.** The same
+  revert shipped the failure shapes this rules out: budget markers *replacing* plan items kept
+  `len(items) - len(published)` at 0, so `truncated_items` never fired and `status.json`
+  reported a complete-looking plan permanently one step short of done — and a
+  `{"budget_exhausted": true}` dict where `_INLINE_TEXT_KEYS` guarantees a string rendered
+  `[object Object]`. Now a dict that runs out drops its remaining keys and says how many
+  through `truncated_keys`; a list drops its tail and reports through the existing
+  `{"truncated_items": n}` marker — or, at the plan root, through the sibling count the caller
+  already derives from the length difference; strings keep their existing envelopes and inline
+  markers. No new marker shape and no schema value changes, so `validate_run_dir` reads
+  directories written on either side of this change.
+
+### Changed — a scalar the writers cannot spell is refused or enveloped, never carried (Track D)
+
+- **Gap 3 closes in two halves, one per failure it caused.** The leak half: `preview_value`
+  bounded `str` and returned every other scalar whole, so a 4300-digit integer — the largest
+  the bounded decoders admit — rode onto `events.jsonl` at 4,300 bytes against a 240-byte
+  threshold, twenty copies per `artifact.emit`. Integers past the threshold now get the string
+  envelope's sibling, `{"type": "int", "preview": <hex prefix>, "truncated": true}` — hex
+  because a decimal spelling is exactly what the interpreter's digit limit may refuse to
+  build — while small scalars keep their type, which is what the `artifact.emitted.kind`
+  precedent demands of schema-typed fields. The crash half: `bytes`, integers past the
+  4300-digit bound, and arbitrary objects passed the normalizer untouched (by design — the
+  boundary was deferred as the arbitrary-scalar gap) and crashed `json.dumps` at the
+  *transcript* write, which sits before `tool.call.finished`: one hostile value in a
+  custom/MCP tool's Python-built result ended the run as `internal_error` with no observation
+  the model could correct. The transcript stays raw by contract, so the fix is refusal at the
+  four Python-object ingress boundaries — tool result content, `emit_artifact` metadata, task
+  request, task result — each converting the shared predicate's refusal into its own
+  classified error (`tool_result_unportable`, `artifact_metadata_unportable`,
+  `task_request_unportable`, `task_result_unportable`): the call fails, the run continues.
+  The predicate is the decoder's own vocabulary run in reverse (`|n| < 10**4300` mirrors
+  `parse_bounded_json_int`), decided without ever spelling the value, and the preview's
+  non-JSON envelope `{"truncated": true, "type": <name>}` names the type without calling
+  `repr` on it — a hostile `__repr__` must not run inside event construction. JSON-parsed
+  routes are unaffected: the bounded decoders never admitted these values.
+
 ### Added — the reader transports, the mint certifies: ledger format guard (W7-4)
 
 - **`model_call_record` refuses to mint a line `monoid validate` would then convict.**

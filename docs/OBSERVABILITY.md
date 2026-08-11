@@ -4,9 +4,10 @@ Every run emits a structured event stream and durable artifacts, and can mirror
 that stream to OpenTelemetry. This is the reference for the run-directory artifact
 set, custom event sinks, OTel tracing, live streaming, and metrics.
 
-The event stream carries metadata and bounded previews rather than content — with a
-short list of deliberate exceptions, stated under [What `events.jsonl` does and does
-not carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
+The event stream carries metadata and bounded previews rather than content — bounded
+per piece by the preview caps and per payload by one byte budget — with a short list
+of deliberate exceptions, stated under [What `events.jsonl` does and does not
+carry](#what-eventsjsonl-does-and-does-not-carry) rather than left as an absolute
 claim that the shipped defaults contradict.
 
 ## Outputs
@@ -105,10 +106,26 @@ Not carried:
   the opposite, and the preamble calls this list the contract.
 - **Whole values of any length**, for every model-authored *value* and every mapping *key* that
   reaches a preview builder: those are capped by a **byte** budget, so the cap does not depend on
-  the script the text is written in. Several routes bypass the builders entirely and are listed
-  under "Carried, deliberately" below — read that list rather than counting exceptions here. An
-  Legacy raw delta events and the other explicit routes appear under "Carried, deliberately"
-  below.
+  the script the text is written in. The *payload* is bounded too: each traversal-built preview
+  spends one 256 KiB budget across everything it appends — keys, values and truncation markers
+  alike, counted in the widest spelling any *stream* writer uses (default separators, non-ASCII
+  escaped, so the ceiling holds on the SSE surfaces that escape deliberately; the pretty-printed
+  `status.json` and approval files add indentation on top of it) — so neither re-expanding a
+  structure shared along many paths nor chunking a payload into
+  cap-obeying pieces grows an event without bound, and the cut reports itself through the same
+  `truncated_keys`/`truncated_items` vocabulary the per-container caps already use. The budget
+  covers what the preview builders build, not the stream: routes that bypass the builders
+  (hosted-task prompts and choices, `call_id`, validator feedback, error messages, a subagent's
+  answer) are listed under "Carried, deliberately" below — read that list rather than counting
+  exceptions here.
+- **A value the previews cannot spell is named by its type, and that name is bounded too** — 64
+  bytes in the escaped spelling the budget is charged in, so the bound does not depend on the script
+  the name is written in, in the `{"truncated": true, "type": …}` and `{"redacted": true, "type": …}` markers
+  and in the `type` field of `run.failed` and `failure.json`. A class name is legal at any length,
+  and two of these markers are published where the budget cannot refuse them, so the name was the
+  one unbounded term in a bounded payload. The name is read off the type's own slot rather than
+  asked for, so a class that answers `__name__` for itself neither widens this field nor raises
+  while an event is being built.
 
 Carried, deliberately:
 
@@ -151,7 +168,10 @@ Carried, deliberately:
   a command cut mid-string hides the part that matters (with the model choosing where that part
   sits), and a card rendering `{"redacted": true}` where a file body should be asks someone to
   authorize a write they cannot inspect. So an `ask`-gated call publishes more on `task.started`
-  than the same call would on `tool.call.started` — bounded, but readable. If that is not acceptable
+  than the same call would on `tool.call.started` — bounded, but readable. The card's payload
+  total has its own, far higher ceiling (1 MiB, against the trace's 256 KiB): a pathological
+  argument map cannot put megabytes on `task.started`, and an ordinary card never meets the
+  accountant. If that is not acceptable
   for a deployment, do not bind the tool to `authorization="ask"`, or attach a redacting
   `EventSink`.
 - **Error messages and paths**, which can name workspace structure.
