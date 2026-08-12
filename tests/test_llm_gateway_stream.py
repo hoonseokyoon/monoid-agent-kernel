@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import io
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,14 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from support.hostile_scalars import (
+    AgreeableFloat,
+    ExplodingComparisons,
+    ExplodingConversion,
+    ExplodingFloatComparisons,
+    ExplodingIntConversion,
+    MisreportingFloat,
+)
 from support.http import serving
 from support.runtime import runtime_config, runtime_provider
 
@@ -1045,6 +1054,76 @@ def test_the_schedule_answers_what_the_expression_it_replaced_answered() -> None
     assert capped_backoff(4, 0.0, 300.0, inf) == 300.0  # the zero-delay exit answered 0.0 here
     assert capped_backoff(4, 1.0, nan, 2.0) == 8.0  # answered `nan`: no wait at all
     assert capped_backoff(4, 1.0, -inf, 2.0) == 8.0  # answered `-inf`: the same no wait
+
+
+def test_no_ordering_in_the_schedule_is_answered_by_the_value_being_ordered() -> None:
+    """Four controls, seven orderings, and a numeric subclass may answer any of them.
+
+    ``a <= b`` gives the reflected operand priority when its type is a proper subclass, so an
+    override is consulted BEFORE the constant it is compared against. A retry policy field is a
+    plain unvalidated attribute, so a subclass reaches every one of these orderings -- and a raise
+    lands inside a schedule that is already recovering from a send failure. At the outbox it lands
+    between ``sender.send`` and ``record_outbox_result``, which loses the receipt for a side
+    effect that already happened.
+
+    Driven per ARGUMENT and per ATTEMPT rather than on the one cell a report named. Measured
+    before the reduction: nine of these fourteen cells raised, spread across all three controls
+    and both operator pairs, and the raising cell for a given control differed by attempt because
+    a different ordering runs on the first attempt than on later ones. A screen fixed at the one
+    reported site would have left eight.
+    """
+    from monoid_agent_kernel.providers._common import capped_backoff, retry_delay_s
+
+    for hostile in (ExplodingComparisons(10), ExplodingFloatComparisons(10.0)):
+        for attempt in (0, 1, 2, 3, 20, 1100):
+            assert capped_backoff(attempt, 1.0, hostile, 2.0) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, 1.0, 10.0, hostile) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, hostile, 10.0, 2.0) >= 0.0, (hostile, attempt)
+            # ...and as the attempt counter itself, which is an ordering too (`max(0, n - 1)`).
+            assert capped_backoff(ExplodingComparisons(attempt), 1.0, 10.0, 2.0) >= 0.0, attempt
+
+    # `retry_delay_s` reads one control of its own, with an ordering, inside a retry handler.
+    assert retry_delay_s(3, 1.0, 10.0, 2.0, ExplodingFloatComparisons(0.5)) >= 0.0
+    assert retry_delay_s(3, 1.0, 10.0, 2.0, ExplodingComparisons(0)) >= 0.0
+
+    # Reading the BASE SLOT, not converting. `float(value)` and `int(value)` dispatch to
+    # `__float__`/`__int__`, which a subclass may override just as freely as an ordering -- so a
+    # reduction written with the constructors would trade one dispatch for another and every
+    # assertion above would still pass. These are the cells that tell the two apart.
+    for hostile in (ExplodingConversion(10.0), ExplodingIntConversion(10)):
+        for attempt in (1, 3, 1100):
+            assert capped_backoff(attempt, 1.0, hostile, 2.0) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, 1.0, 10.0, hostile) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, hostile, 10.0, 2.0) >= 0.0, (hostile, attempt)
+
+
+def test_a_control_that_lies_about_its_ordering_does_not_choose_the_delay() -> None:
+    """The other half, and the harder half: a subclass that answers True rather than raising.
+
+    Exception-safety is not the property. A screen a value can satisfy by agreeing with it is a
+    screen that did not run, and the schedule then answers a delay its own arithmetic never
+    chose. Measured: with a cap answering ``True`` to every ordering, the schedule answered
+    ``1.0`` where its arithmetic owed ``4.0`` -- the cap-resolution screen fired on a cap that
+    never needed resolving, and every later ordering agreed with whatever it was asked.
+
+    The base value is the record, so the answer is the one the arithmetic chose.
+    """
+    from monoid_agent_kernel.providers._common import capped_backoff
+
+    assert capped_backoff(3, 1.0, AgreeableFloat(10.0), 2.0) == 4.0
+    assert capped_backoff(1, 1.0, AgreeableFloat(10.0), 2.0) == 1.0
+    assert capped_backoff(1100, 1.0, AgreeableFloat(10.0), 2.0) == 10.0
+
+    # Counter-arm: an ordinary float answers exactly the same, so the reduction is invisible to
+    # every caller that was never hostile.
+    assert [capped_backoff(n, 1.0, 10.0, 2.0) for n in (1, 3, 1100)] == [1.0, 4.0, 10.0]
+    # ...and a non-numeric number-like object is NOT reduced and NOT refused -- this narrows what
+    # a builtin subclass may do and adds no rejection of its own.
+    assert capped_backoff(3, 1.0, Decimal(10), 2.0) == 4.0
+
+    # The conversion slot lies rather than raises: `float(value)` would take 999.0 as the cap and
+    # answer a schedule nobody configured, while the base slot answers the 10.0 it stores.
+    assert capped_backoff(1100, 1.0, MisreportingFloat(10.0), 2.0) == 10.0
 
 
 def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:

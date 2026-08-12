@@ -13,6 +13,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monoid_agent_kernel.core.json_ingress import exact_number
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
 # Half of ``log(float_max)``: the per-chunk log budget :func:`capped_backoff` sizes its power
@@ -53,6 +54,10 @@ def retry_delay_s(
     """
 
     delay = capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
+    # ``jitter_s`` is the one control this function reads on its own, and it reads it with an
+    # ordering -- inside the ``except`` of a retry loop, where a raise replaces the failure being
+    # recovered from. Same treatment as the four below; see ``exact_number``.
+    jitter_s = exact_number(jitter_s)
     if jitter_s > 0:
         delay = min(delay + random.uniform(0, jitter_s), sys.float_info.max)
     return delay
@@ -111,6 +116,13 @@ def capped_backoff(
     comparison answers exactly, and which converts nothing. An out-of-range cap then resolves
     where ``+inf`` resolves, and an out-of-range multiplier where an infinite one does.
 
+    Neither screen asks the VALUE what it is. Both are orderings, which a numeric subclass may
+    override and raise from, so all four arguments are reduced to their base ``int``/``float`` at
+    the top by :func:`~monoid_agent_kernel.core.json_ingress.exact_number` and every comparison
+    below is between built-ins. Measured: a cap whose ``__ge__`` raises, on a plain ``10``, took
+    this down at the first attempt; a cap whose ``__lt__`` raises took it down at every attempt
+    both before and after the screens changed -- so the reduction closes a family, not a site.
+
     One raise is left standing, and it is named here rather than left to be discovered: a
     multiplier that is an int outside the float range AND not above ``1.0`` -- a large negative
     one -- reaches ``initial_delay_s * backoff_multiplier ** exponent`` on the no-growth arm.
@@ -138,6 +150,23 @@ def capped_backoff(
     not to overflow and folded into the running delay as it goes. A ceiling on the power alone
     would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
     """
+
+    # Every screen and every ordering below is a question put to one of these four values, and
+    # a numeric SUBCLASS gets to answer it: ``a <= b`` hands priority to the reflected operand
+    # when its type is a proper subclass, so an override is called before the constant it is
+    # being compared against. One that raises does so from inside a schedule that is already
+    # recovering from a send failure -- and at the outbox, from between ``sender.send`` and
+    # ``record_outbox_result``, which loses the receipt for a side effect that already happened.
+    #
+    # Reduced here, once, and not screened at each site: there are seven orderings below and
+    # closing one leaves six. After this line every comparison in this function is between
+    # built-ins. ``attempt`` is included even though the durable boundary already strict-types it
+    # (``_nonnegative_integer`` demands ``type(value) is int``), because this function is public
+    # and that guarantee belongs to one caller rather than to the argument.
+    max_delay_s = exact_number(max_delay_s)
+    initial_delay_s = exact_number(initial_delay_s)
+    backoff_multiplier = exact_number(backoff_multiplier)
+    attempt = exact_number(attempt)
 
     # A cap that is not a number is not a cap, and it is settled FIRST -- ahead even of the
     # multiplier, because every arm below reads ``max_delay_s`` and not one of them screens it.

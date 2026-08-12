@@ -4,8 +4,10 @@ An in-process tool handler, a plan item and a task payload are Python objects, n
 value can be an ``int`` subclass with its own ordering. ``json.dumps`` spells such a subclass by
 its **base** value, so every guard deciding "can a writer spell this" has to ask the base value
 too — asked through ``<`` or unary ``-``, the object answers, and it can answer by raising or by
-lying. Defined once and imported by both pins, because the rule is one rule bound at two sites:
-the refusing ingress boundary and the preview threshold.
+lying. Defined once and imported by every pin, because the rule is one rule bound at THREE sites:
+the refusing ingress boundary, the preview threshold, and the shared retry schedule -- which the
+first two did not know about, and whose orderings are ``<=``/``>=`` on ``float`` rather than
+``<``/``>`` on ``int``.
 """
 
 from __future__ import annotations
@@ -14,7 +16,14 @@ from typing import Any
 
 
 class ExplodingComparisons(int):
-    """Raises from every ordering. A plain ``5`` that no writer has any trouble with."""
+    """Raises from every ordering. A plain ``5`` that no writer has any trouble with.
+
+    "Every" now includes ``__le__`` and ``__ge__``. It did not, and the difference is not
+    cosmetic: ``a <= b`` gives the reflected operand priority when its type is a proper subclass,
+    so a screen written ``-BOUND <= value <= BOUND`` calls ``__ge__`` first and reaches nothing
+    this class used to override. A fixture that names half a family and claims the whole one is
+    a mask, not a probe.
+    """
 
     def __lt__(self, other: Any) -> bool:
         raise RuntimeError("hostile __lt__")
@@ -22,8 +31,35 @@ class ExplodingComparisons(int):
     def __gt__(self, other: Any) -> bool:
         raise RuntimeError("hostile __gt__")
 
+    def __le__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __le__")
+
+    def __ge__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __ge__")
+
     def __neg__(self) -> int:
         raise RuntimeError("hostile __neg__")
+
+
+class ExplodingFloatComparisons(float):
+    """The ``float`` spelling of the same thing, for the guards that deal in delays not sizes.
+
+    The family was all ``int`` because the two sites that imported it decide byte sizes and JSON
+    integer bounds. The retry schedule is the third site and it deals in seconds, so the hostile
+    value has to be a ``float`` subclass to reach the orderings it actually performs.
+    """
+
+    def __lt__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __lt__")
+
+    def __gt__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __gt__")
+
+    def __le__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __le__")
+
+    def __ge__(self, other: Any) -> bool:
+        raise RuntimeError("hostile __ge__")
 
 
 class UnderstatedInteger(int):
@@ -33,6 +69,57 @@ class UnderstatedInteger(int):
         return True
 
     def __gt__(self, other: Any) -> bool:
+        return True
+
+
+class ExplodingConversion(float):
+    """Raises from ``__float__``. The value itself is a perfectly ordinary ``10.0``.
+
+    Separates "read the base slot" from "convert": ``float(value)`` dispatches to this and dies,
+    ``float.__float__(value)`` does not consult it at all. Without this class a guard could be
+    rewritten from the slot to the constructor and every ordering pin would stay green -- which
+    is exactly what happened, and is why it exists.
+    """
+
+    def __float__(self) -> float:
+        raise RuntimeError("hostile __float__")
+
+
+class MisreportingFloat(float):
+    """Answers a different number than it stores. The lying half of the conversion pair."""
+
+    def __float__(self) -> float:
+        return 999.0
+
+
+class ExplodingIntConversion(int):
+    """The ``int`` spelling: both conversion slots raise, and ``int.__index__`` still answers."""
+
+    def __index__(self) -> int:
+        raise RuntimeError("hostile __index__")
+
+    def __int__(self) -> int:
+        raise RuntimeError("hostile __int__")
+
+
+class AgreeableFloat(float):
+    """Answers ``True`` to every ordering. The lying half, where the other class is the raising one.
+
+    Harder to see than a raise and the reason a guard must not merely be exception-safe: a screen
+    this satisfies is a screen that did not run, and the schedule then answers a delay its own
+    arithmetic never chose.
+    """
+
+    def __lt__(self, other: Any) -> bool:
+        return True
+
+    def __gt__(self, other: Any) -> bool:
+        return True
+
+    def __le__(self, other: Any) -> bool:
+        return True
+
+    def __ge__(self, other: Any) -> bool:
         return True
 
 

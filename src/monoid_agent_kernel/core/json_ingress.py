@@ -142,6 +142,38 @@ def exact_text(value: Any) -> str:
     return str(value)
 
 
+def exact_number(value: Any) -> Any:
+    """The base ``int``/``float`` value, so a numeric subclass cannot answer comparisons for it.
+
+    The fourth member of the family, and the one the schedule needed: ``exact_text`` for ``str``,
+    ``exact_items``/``exact_length``/``exact_item`` for containers, ``int.__index__`` inside the
+    portability guard, and this. Same rule each time -- read the base slot, because a subclass
+    asked about itself may lie or may raise, and the second is worse than the first when the
+    question is being asked inside a handler that is already recovering from something else.
+
+    ORDERING is the operation at issue here rather than a writer's spelling. ``a <= b`` gives the
+    reflected operand priority when its type is a proper subclass, so a ``float`` subclass
+    overriding ``__ge__`` is called first and gets to raise out of a comparison against a
+    constant. Measured on a plain ``10``: a retry cap whose ``__ge__`` raises took down a schedule
+    that never needed its value for anything but ``min``. The guard one screen down already knows
+    this -- "asked with ``<`` instead, the subclass answers" -- and said it about ``int`` only.
+
+    Reduced ONCE, at the entry, rather than screened at each comparison: there are seven orderings
+    in ``capped_backoff`` and closing one leaves six. Anything that is not a built-in numeric
+    subclass comes back untouched, so ``Decimal`` and foreign objects behave exactly as before --
+    this narrows what a *subclass* can do, and adds no refusal of its own.
+    """
+
+    if type(value) is float or type(value) is int:
+        return value
+    # ``float`` first: ``bool`` is an ``int`` subclass, and both land on their base slot below.
+    if isinstance(value, float):
+        return float.__float__(value)
+    if isinstance(value, int):
+        return int.__index__(value)
+    return value
+
+
 _BASE_TYPE_NAME = type.__dict__["__name__"].__get__
 TYPE_NAME_MAX_ESCAPED_BYTES = 64
 
