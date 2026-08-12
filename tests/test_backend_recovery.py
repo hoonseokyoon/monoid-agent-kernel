@@ -22,6 +22,7 @@ from support.backend_harness import (
     _token_manager,
     _workspace,
     eventually,
+    wait_for_durable_status,
     fake_tool_call,
     json,
     pytest,
@@ -251,6 +252,7 @@ def test_resume_run_single_run_then_continue_after_restart(tmp_path: Path) -> No
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
     assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
 
     # Process 2: a fresh backend (empty _records). send_message would KeyError; resume_run
     # materializes the record from the checkpoint, then the follow-up threads a second turn.
@@ -330,6 +332,7 @@ def test_resume_run_restores_paused_boundary_after_restart(tmp_path: Path) -> No
     assert backend1.pause_run(run_id, token)["pause_requested"] is True
     release_model.set()
     assert eventually(lambda: backend1._record(run_id).state is SessionState.PAUSED)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "paused")
     stored = backend1.checkpoint_store.latest(run_id)
     assert stored is not None
     assert stored.checkpoint.last_suspension is not None
@@ -388,6 +391,7 @@ def test_resume_run_uses_latest_runtime_config_after_hotswap(tmp_path: Path) -> 
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
     assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
 
     replacement = runtime_config(
         version=2,
@@ -756,6 +760,7 @@ def test_a_given_up_run_reads_terminal_failed_on_every_status_surface(
     submission = _submit_multi_turn(backend1, workspace)
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
     backend1.stop_watchdog()  # "crash": the park checkpoint + park-shaped status.json remain
 
     backend2 = _recoverable_backend(
@@ -887,6 +892,7 @@ def test_a_recovered_run_whose_drive_fails_reads_dead_after_restart(tmp_path: Pa
     submission = _submit_multi_turn(backend1, workspace)
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
     backend1.stop_watchdog()  # "crash": the park checkpoint + park-shaped status.json remain
 
     backend2 = _recoverable_backend(
@@ -1054,6 +1060,7 @@ def test_a_closed_limited_run_is_not_advertised_recoverable(tmp_path: Path) -> N
     )
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1._record(run_id).terminal)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["terminal"])
     stored = backend1.checkpoint_store.latest(run_id)
     assert stored is not None and stored.checkpoint.terminal is False  # the closed-limited shape
     backend1.stop_watchdog()
@@ -1096,6 +1103,7 @@ def test_a_concurrent_resume_loser_answers_the_already_live_shape(tmp_path: Path
     submission = _submit_multi_turn(backend1, workspace)
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1._record(run_id).state is SessionState.AWAITING_INPUT)
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
     backend1.stop_watchdog()
 
     backend2 = _recoverable_backend(
@@ -1440,6 +1448,7 @@ def test_backend_list_runs_and_historical_reads_survive_restart(tmp_path: Path) 
     # JSONL commits before the best-effort status projection. Simulate a kill in that window and
     # require restart listing/status to use the authoritative committed tail.
     run_dir = tmp_path / "runs" / run_id
+    wait_for_durable_status(tmp_path / "runs", run_id, where=lambda s: s["terminal"])
     committed_seq = inspect_event_log_tail(run_dir / "events.jsonl").last_seq
     assert committed_seq >= 2
     status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))

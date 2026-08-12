@@ -18,7 +18,7 @@ from support.http import (
 from support.backend_factory import current_backend_factory
 from support.process import python_command as _python_command
 from support.runtime import runtime_config, tool_binding
-from support.waiting import eventually
+from support.waiting import eventually, wait_for_durable_status
 
 from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
@@ -98,6 +98,7 @@ __all__ = [
     'base64',
     'create_backend_server',
     'eventually',
+    'wait_for_durable_status',
     'fake_tool_call',
     'json',
     'pytest',
