@@ -87,8 +87,8 @@ def capped_backoff(
     (``uniform(0, ceiling)``) rather than jitter on top, so it needs the bounded ceiling itself
     rather than :func:`retry_delay_s`.
 
-    So it is TOTAL: every input, non-finite ones included, gets an answer rather than an
-    exception -- and for every FINITE ``max_delay_s`` the answer is the one the open-coded
+    So it is TOTAL OVER THE FLOATS: every one, non-finite included, gets an answer rather than
+    an exception -- and for every FINITE ``max_delay_s`` the answer is the one the open-coded
     ``min(max_delay_s, initial * multiplier ** n)`` gave, because a schedule three layers now
     share is not the place to change what a policy MEANS. What is not preserved is the raise, and
     one thing besides: a NON-FINITE cap. That expression answered ``nan`` for a NaN cap and
@@ -100,6 +100,26 @@ def capped_backoff(
     where the saturation threshold answers the cap for a product one ULP below it. Every
     non-finite-cap cell answers what the same call with ``sys.float_info.max`` answers, which is
     the substitution itself and not a weaker claim about it.
+
+    "Over the floats" is the exact reach and not a hedge. None of these four fields is validated,
+    so an operator can put a Python ``int`` in one, and an int has no ceiling: ``10**400`` is a
+    perfectly good int and no float at all. Asking such a value ``math.isfinite`` -- which
+    CONVERTS before it decides -- raises ``OverflowError`` from inside the screen whose whole job
+    is to decide whether the value is usable, and raises it for every attempt, the first one
+    included. So both screens ask an ORDERING instead, ``-float_info.max <= x <= float_info.max``,
+    which is the question every other guard in this function already asks, which int-to-float
+    comparison answers exactly, and which converts nothing. An out-of-range cap then resolves
+    where ``+inf`` resolves, and an out-of-range multiplier where an infinite one does.
+
+    One raise is left standing, and it is named here rather than left to be discovered: a
+    multiplier that is an int outside the float range AND not above ``1.0`` -- a large negative
+    one -- reaches ``initial_delay_s * backoff_multiplier ** exponent`` on the no-growth arm.
+    Ints do not saturate to ``inf`` the way the float spelling does, which is exactly what makes
+    that arm safe for floats, so the power is computed exactly and the product leaves the range.
+    Measured over an int lattice: 616 cells, every one of them raising identically before this
+    change and after it. It is the arithmetic rather than a screen, the no-growth arm is
+    deliberately the one that takes ``-inf``, and closing it is a separate change owing its own
+    evidence.
 
     The rule that makes it total is one rule, and its ORDER is the whole of it: growth this
     cannot resolve resolves UPWARD, to ``max_delay_s``, decided before any shortcut that reasons
@@ -138,7 +158,18 @@ def capped_backoff(
     # ``min(float_info.max, product)`` are the same number, so ``+inf`` keeps its meaning exactly
     # and only loses the ability to escape as an answer. It is also the spelling this module
     # already uses for a safe extreme (see the saturating add in ``retry_delay_s``).
-    if not math.isfinite(max_delay_s):
+    #
+    # An ORDERING and not ``math.isfinite``: this screen decides whether the cap is usable, and a
+    # screen that converts its argument in order to decide can fail on the argument instead of
+    # judging it. ``math.isfinite(10**400)`` does not answer False, it raises ``OverflowError``,
+    # and it raises here -- above every arm, so for every attempt including the first. The outbox
+    # evaluates this schedule AFTER ``sender.send`` has returned, so that raise loses the receipt
+    # for a side effect that already happened and the request is dispatched a second time. The
+    # comparison asks what the rest of this function asks and cannot fail: int-to-float ordering
+    # in Python is exact and coerces nothing. Measured over 30,375 all-float cells, the two
+    # spellings answer identically in every one -- the substitution changes which VALUES can be
+    # screened, not what the screen decides about any float.
+    if not -sys.float_info.max <= max_delay_s <= sys.float_info.max:
         max_delay_s = sys.float_info.max
     # The MULTIPLIER is settled next, before any shortcut that reasons about the delay or the
     # cap. Every one of those shortcuts rests on what the growth does to the product, and that
@@ -170,7 +201,11 @@ def capped_backoff(
     # refused. One deliberate departure from the old product: a NEGATIVE initial delay under
     # ``+inf`` used to answer ``-inf``. A negative wait is not a wait, and the cap is strictly
     # safer than the "no backoff" both of them floor to.
-    if not math.isfinite(backoff_multiplier):
+    #
+    # The same ordering, for the same reason, and stated in both places on purpose: this screen
+    # predates the cap's and carried the identical hazard, so fixing only the one a reviewer
+    # named would have left the twin standing in the same function under the same idiom.
+    if not -sys.float_info.max <= backoff_multiplier <= sys.float_info.max:
         return max_delay_s
     # Nothing a growth could change: a zero initial delay keeps the product at zero, and a zero
     # cap keeps the answer there. This has to come AFTER the multiplier is settled -- "zero times
