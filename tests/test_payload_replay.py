@@ -72,7 +72,6 @@ from monoid_agent_kernel.providers._request_identity import (
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
-    ToolCall,
     normalize_model_request,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
