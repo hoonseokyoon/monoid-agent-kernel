@@ -915,9 +915,21 @@ def _normalize_model_turn(turn: Any) -> Any:
                     # checkpoint: these arguments ride the assistant message into
                     # `state.messages` and out through `RunCheckpoint.to_json`, whose
                     # `dataclasses.asdict` has no memo and dies on a shape this copy
-                    # keeps. `normalize_model_turn` below already converts anything
-                    # escaping here into a classified `ModelAdapterError`, so the
-                    # refusal needs no conversion of its own.
+                    # keeps.
+                    #
+                    # Where the refusal LANDS depends on the arm, and it is worth
+                    # being exact because an earlier version of this comment was not.
+                    # With no settled outcome it escapes to `normalize_model_turn`,
+                    # which converts it to a classified `ModelAdapterError`. With one
+                    # -- a `final_text`, or a `refusal`/`length` stop reason -- the
+                    # `except` below drops the call and keeps the paid answer, so the
+                    # refusal is NOT converted and nothing is reported. That is not a
+                    # hole in the protection: a settled answer wins in `AgentLoop`, so
+                    # such a call never executes, and dropping it is what keeps its
+                    # arguments out of the checkpoint this bound exists to protect.
+                    # What it costs is the record -- silently -- and both arms are
+                    # pinned in `tests/test_json_ingress.py` so the asymmetry cannot
+                    # drift into one nobody chose.
                     arguments=normalize_json_ingress(arguments, refuse_unportable=True),
                 )
             )

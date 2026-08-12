@@ -1939,7 +1939,7 @@ def test_a_body_too_deep_to_read_is_refused_the_same_way_either_placement(
                 ModelTurn(
                     response_id="r",
                     final_text=pad,
-                    tool_calls=[ToolCall(id="c1", name="t", arguments={"deep": _nested(520)})],
+                    reasoning=[{"deep": _nested(520)}],
                 )
             ]
         ),
@@ -1982,7 +1982,7 @@ def test_a_deep_body_leaves_no_chunk_behind_when_it_is_refused(tmp_path: Path) -
                 ModelTurn(
                     response_id="r",
                     final_text="x" * (PAYLOAD_OFFLOAD_THRESHOLD_BYTES + 4096),
-                    tool_calls=[ToolCall(id="c1", name="t", arguments={"deep": _nested(520)})],
+                    reasoning=[{"deep": _nested(520)}],
                 )
             ]
         ),
@@ -2144,7 +2144,19 @@ def test_a_hostile_corpus_cannot_write_a_megabyte_of_diagnosis(tmp_path: Path) -
     assert stale and len(stale) < ceiling, f"generation tags unbounded: {len(stale or '')} chars"
 
 
-_BOUNDING_CALLS = {"_short", "_named", "_where", "_term_digest"}
+# ``portable_type_name`` and ``portable_class_name`` belong here for the same reason the
+# four locals do: they bound what they return by construction -- 64 bytes in the escaped
+# spelling -- so an expression that passes through one cannot carry corpus bytes at length.
+# Listing them as REVIEWED instead would have said 'unbounded but judged safe', which is
+# false of a call whose whole job is the bound.
+_BOUNDING_CALLS = {
+    "_short",
+    "_named",
+    "_where",
+    "_term_digest",
+    "portable_class_name",
+    "portable_type_name",
+}
 
 # Every interpolation in the message-building modules, reviewed once and keyed by
 # (enclosing function, source text). Keyed by FUNCTION as well as text because the earlier

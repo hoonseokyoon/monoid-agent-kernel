@@ -287,9 +287,8 @@ def test_a_cyclic_model_turn_is_a_classified_adapter_failure() -> None:
 
     That is the route to the checkpoint -- the arguments ride the assistant message into
     ``state.messages`` and out through ``RunCheckpoint.to_json`` -- and it was the one boundary of
-    the five that did not refuse anything. Driven with a tool-calls-only turn on purpose: a
-    settled outcome beside the calls makes ``_normalize_model_turn`` swallow the failure, so a pin
-    written on that shape would pass for the wrong reason.
+    the five that did not refuse anything. This is the arm with no settled outcome, where the
+    refusal escapes and is converted; the other two arms are the test below.
     """
     cyclic: dict = {}
     cyclic["self"] = cyclic
@@ -300,6 +299,65 @@ def test_a_cyclic_model_turn_is_a_classified_adapter_failure() -> None:
 
     with pytest.raises(ModelAdapterError, match="non-portable"):
         normalize_model_turn(turn)
+
+
+@pytest.mark.parametrize(
+    "settled",
+    [
+        pytest.param({"final_text": "the answer the provider was paid for"}, id="final_text"),
+        pytest.param({"stop_reason": "length"}, id="stop_reason"),
+    ],
+)
+def test_a_refused_call_beside_a_settled_answer_is_dropped_and_not_reported(
+    settled: dict[str, str],
+) -> None:
+    """The other two arms of the same boundary, and they do NOT raise. Pinned, not assumed.
+
+    ``_normalize_model_turn`` wraps each call's normalization in an ``except`` that re-raises only
+    when the turn has no settled outcome. That predates this bound -- it exists so a legacy
+    adapter's odd extra entry beside a paid answer does not fail the turn -- and it catches
+    ``Exception``, so it catches this refusal too and the call is simply not appended.
+
+    Left as it is, deliberately, and this test is the record of that decision. What the bound
+    exists to prevent is unportable arguments reaching ``RunCheckpoint.to_json``; dropping the
+    call prevents exactly that, and a settled answer wins in ``AgentLoop`` so the call was never
+    going to execute. Raising instead would discard an answer the provider has already been paid
+    for in order to stop something that is already stopped. What is genuinely lost is the RECORD
+    that a call was refused, silently -- reporting it needs an observation channel this function
+    does not have, and inventing one here would be a redesign of a pure normalizer.
+
+    The asymmetry was noted in a docstring before it was pinned, which is why it survived a
+    review: a sentence saying "this arm swallows it" reads as a description of the world, and
+    only an assertion makes it a decision.
+    """
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    turn = ModelTurn(
+        response_id="r1",
+        tool_calls=(ToolCall(id="c1", name="custom_tool", arguments=cyclic),),
+        **settled,
+    )
+
+    normalized = normalize_model_turn(turn)
+
+    assert normalized.tool_calls == ()
+    # ...and the answer that was paid for survives, which is the whole reason for the leniency.
+    # Absent fields normalize to ``None`` rather than ``""``, so the expectation reads them off
+    # the same mapping that built the turn instead of spelling a default of its own.
+    assert (normalized.final_text, normalized.stop_reason) == (
+        settled.get("final_text"),
+        settled.get("stop_reason"),
+    )
+    # A portable call on the same shape is kept, so this is a refusal being dropped and not the
+    # settled arm discarding calls wholesale.
+    kept = normalize_model_turn(
+        ModelTurn(
+            response_id="r1",
+            tool_calls=(ToolCall(id="c1", name="custom_tool", arguments={"ok": 1}),),
+            **settled,
+        )
+    )
+    assert len(kept.tool_calls) == 1
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
