@@ -56,7 +56,11 @@ from monoid_agent_kernel.core._sync_bridge import (
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.model_io import (
     ModelCallAttempt,
     ModelCallReceipt,
@@ -237,7 +241,7 @@ def _safe_repr(value: Any) -> str:
     except Exception:
         pass
     try:
-        return f"<unrepresentable {type(value).__name__}>"
+        return f"<unrepresentable {portable_type_name(value)}>"
     except Exception:
         return "<unrepresentable>"
 

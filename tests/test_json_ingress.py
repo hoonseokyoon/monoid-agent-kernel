@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from support.hostile_scalars import (
+    HOSTILE_NAMED_TYPES,
     ExplodingComparisons,
     MisreportingItems,
     MisreportingKey,
@@ -21,6 +22,7 @@ from support.hostile_scalars import (
     UnderstatedList,
     UnderstatedText,
     UniterableText,
+    hugely_named_object,
 )
 
 import monoid_agent_kernel
@@ -34,6 +36,8 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
+    portable_class_name,
+    portable_type_name,
 )
 from monoid_agent_kernel.permissions import _LegacyPathPattern
 from monoid_agent_kernel.providers.base import (
@@ -670,6 +674,228 @@ def _refusing_sites() -> list[tuple[str, str, tuple[str, ...]]]:
             for keyword in call.keywords
         )
     ]
+
+
+def test_a_hostile_type_name_cannot_speak_through_the_sites_that_publish_it() -> None:
+    """The census says the reader is called; this says what calling it is worth.
+
+    Each of these raises a classified error whose message names the type it refused. Reading that
+    name the plain way hands the question to the METACLASS, and then three things can happen, all
+    of them worse than the error being reported: the read raises and REPLACES the classified error
+    with a ``RuntimeError`` from inside the raise statement (``HiddenName``, ``ExplodingName``);
+    it answers a portable type's name and the message describes the wrong thing
+    (``ImpersonatingName``); or the name object itself lies when the f-string formats it
+    (``RenamedByAHostileString``). A fourth is legal and needs no hostility at all -- a class name
+    can be any length, and these messages are published.
+
+    Three sites, chosen because they are three different kinds of caller: a kernel entry point
+    that validates what an integrator handed it, a provider-facing normalizer that refuses a
+    fragment shape, and the typed-output coercion, which is the one site that reads TWO names --
+    the value's and the model's.
+
+    The fragment site is asserted on its ``__cause__`` rather than its type, and the difference
+    is the point. ``normalize_model_stream_chunk`` catches ``Exception``, so the classified
+    ``ModelAdapterError`` came out either way -- what changed is what it is chained to. Reading
+    the name the plain way made the cause ``RuntimeError("hostile metaclass ...")``, so an
+    operator debugging a refused fragment learned about the metaclass and never about the
+    fragment. The refusal has to keep its own explanation.
+
+    A note for whoever sees this fail: pytest's traceback formatter calls ``saferepr`` on every
+    frame argument, and its fallback path is ``type(obj).__name__`` -- the exact read this test is
+    about. A failure inside any call below therefore ends in ``INTERNALERROR`` from
+    ``_pytest/_io/saferepr.py`` rather than an assertion diff. That is not a second bug in this
+    test; it is the same one, one layer out.
+    """
+    from monoid_agent_kernel.core.agents import coerce_runtime_config_provider
+    from monoid_agent_kernel.core.result import _coerce_output
+    from monoid_agent_kernel.providers.base import normalize_model_stream_chunk
+
+    for hostile in HOSTILE_NAMED_TYPES:
+        instance = hostile()
+        expected = portable_type_name(instance)
+
+        with pytest.raises(TypeError) as config_error:
+            coerce_runtime_config_provider(instance)
+        assert expected in str(config_error.value)
+
+        with pytest.raises(ModelAdapterError) as fragment_error:
+            normalize_model_stream_chunk(instance)
+        cause = fragment_error.value.__cause__
+        assert isinstance(cause, ValueError), cause
+        assert expected in str(cause), cause
+
+        with pytest.raises(TypeError) as output_error:
+            _coerce_output(instance, int)
+        assert expected in str(output_error.value)
+
+        # ...and the other half of that site: the MODEL is a class too, and the hostility is on
+        # the type being coerced TO rather than on the value.
+        with pytest.raises(TypeError) as model_error:
+            _coerce_output(123, hostile)
+        assert portable_class_name(hostile) in str(model_error.value)
+
+    # The length arm, which needs no hostility: a legal 10,000-character name is bounded to the
+    # 64 escaped bytes the accountant charges in, so the message cannot outgrow the surface that
+    # pays for it.
+    huge = hugely_named_object(10_000)
+    with pytest.raises(TypeError) as huge_error:
+        coerce_runtime_config_provider(huge)
+    assert len(str(huge_error.value)) < 200, len(str(huge_error.value))
+
+
+_NAME_READERS = ("exact_text", "portable_class_name", "portable_type_name")
+
+# Every site in the kernel that reads a ``__name__`` without one of the readers above around it,
+# as ``{(module, the expression it is asked OF, spelling): how many}``. A COUNT and not a set:
+# two of these share all three keys, so a set would collapse them and a fourth unwrapped read in
+# that module would leave the census green.
+#
+# Three sites, and each is here for a reason that does not generalise:
+#
+#   * ``json_ingress.py`` is the rule's own implementation -- the base getset slot every other
+#     site reaches THROUGH. A reader cannot read itself.
+#   * ``decorator.py`` asks ``fn``, the integrator's own function object, and both reads stay
+#     inside the process that owns it: one names a ``TypeError`` about their own signature, the
+#     other builds a pydantic model class name. Neither is published, and neither crosses a
+#     boundary where an adversarial object could have supplied the callable.
+#
+# That module's THIRD read -- ``tool_id``, which IS published, as ``ToolSpec.id`` -- is not here,
+# because it is wrapped and the walk below does not count a wrapped read. Unwrapping it puts it
+# back in this table and reddens the assertion.
+_TYPE_NAMES_ASKED_DIRECTLY = {
+    ("core/json_ingress.py", "type", "dict-slot"): 1,
+    ("tools/decorator.py", "fn", "attribute"): 2,
+}
+
+
+def _type_name_read_sites(tree: ast.AST) -> list[tuple[str, str]]:
+    """``(owner expression, spelling)`` for every ``__name__`` read in one module.
+
+    Three spellings, because a rule proven on one of them is a rule proven on one of three: the
+    plain attribute, the reflective ``getattr`` that no attribute matcher sees, and the base slot
+    itself. ``if __name__ == "__main__"`` is an ``ast.Name`` and not an ``ast.Attribute``, so it
+    is excluded STRUCTURALLY rather than by a string filter that could also drop a real site.
+
+    A read that is already the first argument of a sanctioned reader does not count -- wrapping
+    is exactly what this census asks for. Counting them instead would force them into the
+    allowlist, and an allowlist entry cannot tell a wrapped read from an unwrapped one.
+
+    The climb to that argument passes through ``or`` and ``if/else`` and NOTHING ELSE, because
+    those two hand back one of their operands unchanged: ``exact_text(id or fn.__name__)`` really
+    does read whichever it picked. An f-string would not qualify even though it looks similar --
+    ``f"{name}"`` calls the name object's own ``__format__`` before the reader ever sees it, so
+    the lying value has already spoken. Widening this climb is how a census stops seeing.
+    """
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def wrapped(node: ast.AST) -> bool:
+        cursor: ast.AST = node
+        while True:
+            parent = parents.get(cursor)
+            if isinstance(parent, ast.BoolOp) and cursor in parent.values:
+                cursor = parent
+                continue
+            if isinstance(parent, ast.IfExp) and cursor in (parent.body, parent.orelse):
+                cursor = parent
+                continue
+            break
+        parent = parents.get(cursor)
+        if not isinstance(parent, ast.Call) or not parent.args or parent.args[0] is not cursor:
+            return False
+        func = parent.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        return name in _NAME_READERS
+
+    found: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "__name__":
+            if not wrapped(node):
+                found.append((ast.unparse(node.value), "attribute"))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "__name__"
+        ):
+            found.append((ast.unparse(node.args[0]), "getattr"))
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "__dict__"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "__name__"
+        ):
+            found.append((ast.unparse(node.value.value), "dict-slot"))
+    return found
+
+
+def test_the_type_name_walk_sees_each_spelling_it_claims_to() -> None:
+    """The matcher first, on a source holding all three -- and on the wrapper that hides one.
+
+    A census whose matcher is broken finds nothing and passes. This one is checked against a
+    module it does not read from disk, so it cannot be satisfied by the repository happening to
+    be clean, and both arms of the wrapper climb are checked: a read reached through ``or``
+    DISAPPEARS, and a read the reader only sees after an f-string already formatted it does not.
+    """
+
+    source = (
+        "raw = type(value).__name__\n"
+        'reflective = getattr(value, "__name__", "")\n'
+        'slot = type.__dict__["__name__"]\n'
+        "wrapped = portable_class_name(type(value).__name__)\n"
+        "through_or = exact_text(given or fn.__name__)\n"
+        'through_fstring = exact_text(f"{spoken.__name__}")\n'
+        "if __name__ == '__main__':\n    pass\n"
+    )
+
+    found = _type_name_read_sites(ast.parse(source))
+
+    assert sorted(found) == [
+        ("spoken", "attribute"),
+        ("type", "dict-slot"),
+        ("type(value)", "attribute"),
+        ("value", "getattr"),
+    ], found
+
+
+def test_a_type_name_is_asked_for_directly_only_where_it_may_be() -> None:
+    """Every published type name goes through the reader, and the exceptions are named.
+
+    ``cls.__name__`` is an attribute read on a *class*, so it dispatches to the METACLASS, and an
+    in-process tool or task hands back objects whose type is whatever built them. The reader takes
+    three answers away -- the metaclass, the name object itself, and the length -- and a site that
+    skips it has none of them. These names reach observers, ``run.failed.error``, ``failure.json``,
+    ``status.json``, the CLI's JSON output and an exit-code predicate, so "it is only an error
+    message" is not a reason to leave one unread.
+
+    The ``==`` fails in both directions and in a third: a new unwrapped read has to be justified
+    here in the same edit that adds it, a site that disappears means a reader was removed and the
+    table now describes code that is gone, and a SECOND read added beside an allowlisted one moves
+    its count.
+    """
+
+    modules = sorted(_KERNEL_PACKAGE.rglob("*.py"))
+    parsed = 0
+    asked: dict[tuple[str, str, str], int] = {}
+    for path in modules:
+        relative = path.relative_to(_KERNEL_PACKAGE).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parsed += 1
+        for expression, spelling in _type_name_read_sites(tree):
+            key = (relative, expression, spelling)
+            asked[key] = asked.get(key, 0) + 1
+
+    # A walk that silently skipped modules would pass by reading less, so the arithmetic is
+    # asserted rather than assumed -- the guard the older censuses in this file do not carry.
+    assert parsed == len(modules) and parsed > 100, (parsed, len(modules))
+
+    assert asked == _TYPE_NAMES_ASKED_DIRECTLY
 
 
 def test_the_refusing_ingress_boundaries_are_exactly_the_python_object_routes() -> None:

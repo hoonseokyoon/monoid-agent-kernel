@@ -79,6 +79,7 @@ from monoid_agent_kernel.core.payload_replay import (
     ReplayedResponse,
 )
 from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, is_async_callable
+from monoid_agent_kernel.core.json_ingress import portable_type_name
 from monoid_agent_kernel.core.media import WIRE_FORWARDABLE_PART_TYPES, WIRE_MEDIA_CARRIERS
 from monoid_agent_kernel.core.model_payloads import RECORDED_TURN_FIELDS
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -235,7 +236,7 @@ class ReplayModelAdapter:
             closer = getattr(inner, "close", None)
             if callable(opener) != callable(closer):
                 raise ValueError(
-                    f"inner adapter {type(inner).__name__} exposes open() or close() "
+                    f"inner adapter {portable_type_name(inner)} exposes open() or close() "
                     "without its pair; nothing would release what open() allocates"
                 )
             # Every callable this wrapper forwards, gated by one predicate over the census

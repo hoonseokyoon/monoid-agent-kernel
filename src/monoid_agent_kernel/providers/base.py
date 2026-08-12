@@ -21,6 +21,7 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
+    portable_type_name,
 )
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
@@ -1095,7 +1096,7 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
                 "turn complete provider_retried",
             ),
         )
-    raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+    raise ValueError(f"unsupported model stream fragment: {portable_type_name(chunk)}")
 
 
 def normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
@@ -1208,7 +1209,7 @@ class ModelStreamIngressNormalizer:
                 )
             ]
         if not isinstance(chunk, TurnComplete):
-            raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+            raise ValueError(f"unsupported model stream fragment: {portable_type_name(chunk)}")
         terminal = normalize_model_stream_chunk(chunk)
         emitted = self.finish()
         emitted.append(terminal)

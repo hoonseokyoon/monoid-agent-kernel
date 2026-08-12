@@ -10,7 +10,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from monoid_agent_kernel.core.json_ingress import loads_model_json_ingress
+from monoid_agent_kernel.core.json_ingress import (
+    loads_model_json_ingress,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.env import getenv
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -1014,7 +1017,7 @@ def _model_error_from_openai(
     connection_code = _connection_error_code(exc)
     if connection_code is not None:
         return ModelAdapterError(
-            f"provider connection failed ({type(exc).__name__})",
+            f"provider connection failed ({portable_type_name(exc)})",
             error_code="model_error",
             provider_error_code=connection_code,
             retryable=True,
@@ -1040,7 +1043,7 @@ def _model_error_from_openai(
             provider_retried=retried,
         )
     return ModelAdapterError(
-        f"provider call failed ({type(exc).__name__})",
+        f"provider call failed ({portable_type_name(exc)})",
         error_code="model_error",
         provider_error_code="unclassified_provider_error",
         # Nothing to classify: no status and no code, so no remedy is claimed either.

@@ -52,6 +52,7 @@ from monoid_agent_kernel.core._verified_file import (
     file_identity,
     write_once_temp_stem,
 )
+from monoid_agent_kernel.core.json_ingress import portable_type_name
 from monoid_agent_kernel.core.model_payloads import (
     MODEL_PAYLOADS_DIRNAME,
     MODEL_PAYLOADS_FILENAME,
@@ -381,7 +382,7 @@ def collect_payload_garbage(
                                 reclaimed = int(current.st_size)
                                 reclaimed_bytes += reclaimed
                 except OSError as exc:
-                    error = f"{type(exc).__name__}: {exc}"
+                    error = f"{portable_type_name(exc)}: {exc}"
         entries.append(
             PayloadGcEntry(
                 name=name,

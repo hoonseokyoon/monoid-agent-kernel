@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from monoid_agent_kernel.core.json_ingress import (
+    portable_class_name,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.wire_validation import (
     optional_list,
     parse_bool,
@@ -30,8 +34,8 @@ def _coerce_output(value: object, model: type[_T]) -> _T:
     if isinstance(value, dict):
         return model(**value)
     raise TypeError(
-        f"final_output is {type(value).__name__}, which is not a {model.__name__} "
-        "and cannot be coerced"
+        f"final_output is {portable_type_name(value)}, which is not a "
+        f"{portable_class_name(model)} and cannot be coerced"
     )
 
 

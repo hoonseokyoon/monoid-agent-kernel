@@ -27,6 +27,7 @@ from typing import Any, get_type_hints
 
 from pydantic import ValidationError, create_model
 
+from monoid_agent_kernel.core.json_ingress import exact_text
 from monoid_agent_kernel.tools.base import (
     ToolContext,
     ToolResult,
@@ -101,7 +102,7 @@ def _spec_from_function(
     model = create_model(f"{fn.__name__.title().replace('_', '')}Args", **fields)
     input_schema = model.model_json_schema()
 
-    tool_id = id or fn.__name__
+    tool_id = exact_text(id or fn.__name__)
     tool_description = description or (inspect.getdoc(fn) or "").split("\n", 1)[0]
 
     def validated_kwargs(args: dict[str, Any]) -> dict[str, Any] | ToolResult:
