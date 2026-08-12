@@ -478,7 +478,10 @@ class RunnerBackend:
     # schedule, under one rule standing ahead of every base/cap shortcut: growth it cannot resolve
     # resolves UPWARD, to the cap -- a NaN factor, an infinite one, and a zero base under either
     # (`0 * inf` is nan, not zero). A zero ceiling is uniform(0, 0), which is not a slower retry
-    # but an unthrottled one. The next-attempt
+    # but an unthrottled one. A CAP it cannot resolve resolves the same direction, to the largest
+    # representable wait: `nan` and `-inf` reach `max(0.0, .)` as that same zero ceiling, and
+    # `+inf` stamps a next-attempt time no drain can ever select and no record can carry. The
+    # next-attempt
     # time is stamped on the request (durable), so the schedule survives a restart; the watchdog
     # redrive tick (below) dispatches a request once its time arrives, decoupling retry timing
     # from run activity.

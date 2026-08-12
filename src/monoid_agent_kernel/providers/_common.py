@@ -40,7 +40,9 @@ def retry_delay_s(
     Every input that arrives as JSON is validated finite (``ModelRetryConfig.from_json`` ->
     ``spec._model_control_number``) and every answer is too -- but that dataclass has no
     ``__post_init__``, so a config built in Python carries whatever it was handed, and that is
-    a door :func:`capped_backoff` answers through rather than raising through.
+    a door :func:`capped_backoff` answers through rather than raising through. That applies to
+    ``max_delay_s`` the same as to ``backoff_multiplier``: an unusable CAP is resolved to
+    ``sys.float_info.max`` there, so what arrives here is already a number this can add to.
 
     Jitter rides ON TOP of the cap -- deliberately, since the moment a herd most needs smearing
     is the moment every member is sitting at ``max_delay_s`` -- but ``max_delay_s`` and
@@ -86,14 +88,18 @@ def capped_backoff(
     rather than :func:`retry_delay_s`.
 
     So it is TOTAL: every input, non-finite ones included, gets an answer rather than an
-    exception -- and the answer is the one the open-coded ``min(max_delay_s, initial *
-    multiplier ** n)`` gave, because a schedule three layers now share is not the place to change
-    what a policy MEANS. A NaN cap still answers ``nan``, a negative-infinite one still answers
-    ``-inf``. What is not preserved is the raise. Measured rather than asserted: over a
-    lattice per argument (both signed zeros, a negative, a subnormal, ``1e308``, and the three
-    non-finite values) the only cells that answer differently are a NEGATIVE ``initial_delay_s``
-    -- not a wait any schedule can mean -- and one cell where the saturation threshold answers
-    the cap for a product one ULP below it.
+    exception -- and for every FINITE ``max_delay_s`` the answer is the one the open-coded
+    ``min(max_delay_s, initial * multiplier ** n)`` gave, because a schedule three layers now
+    share is not the place to change what a policy MEANS. What is not preserved is the raise, and
+    one thing besides: a NON-FINITE cap. That expression answered ``nan`` for a NaN cap and
+    ``-inf`` for a negative-infinite one, and neither is a wait -- both floor to no backoff at
+    every caller -- so preserving them preserves the defect rather than the meaning. Measured
+    rather than asserted: over a lattice per argument (both signed zeros, a negative, a subnormal,
+    ``1e308``, and the three non-finite values), the finite-cap cells that answer differently are
+    exactly a NEGATIVE ``initial_delay_s`` -- not a wait any schedule can mean -- and one cell
+    where the saturation threshold answers the cap for a product one ULP below it. Every
+    non-finite-cap cell answers what the same call with ``sys.float_info.max`` answers, which is
+    the substitution itself and not a weaker claim about it.
 
     The rule that makes it total is one rule, and its ORDER is the whole of it: growth this
     cannot resolve resolves UPWARD, to ``max_delay_s``, decided before any shortcut that reasons
@@ -113,7 +119,28 @@ def capped_backoff(
     would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
     """
 
-    # The MULTIPLIER is settled first, before any shortcut that reasons about the delay or the
+    # A cap that is not a number is not a cap, and it is settled FIRST -- ahead even of the
+    # multiplier, because every arm below reads ``max_delay_s`` and not one of them screens it.
+    # The first-attempt exit returns ``min(max_delay_s, initial_delay_s)``, so it reads the cap
+    # on its own; a resolution placed below it would leak through that one. Both ends this
+    # otherwise lands on are wrong. ``nan`` and ``-inf`` leave every ``min(max_delay_s, .)``
+    # answering something not above zero, which every waiter reads as NO BACKOFF: ``if delay > 0``
+    # never sleeps, and the outbox's ``uniform(0, max(0.0, ceiling))`` is ``uniform(0, 0)`` -- an
+    # unthrottled resend against the endpoint that just refused, which is the state the multiplier
+    # arm below was fixed to prevent, reached through the other argument. ``+inf`` is the opposite
+    # end and no better: it rides ordinary products until one leaves the float range and then
+    # answers ``inf``, which is not a long wait but a timer that never fires, and a
+    # ``next_attempt_at`` no durable record will carry -- ``parse_float`` refuses it in the export
+    # that runs AFTER ``sender.send`` already returned.
+    #
+    # ``float_info.max`` and not zero, and not a policy default: an unlimited cap should stay
+    # unlimited. For every product this can represent, ``min(inf, product)`` and
+    # ``min(float_info.max, product)`` are the same number, so ``+inf`` keeps its meaning exactly
+    # and only loses the ability to escape as an answer. It is also the spelling this module
+    # already uses for a safe extreme (see the saturating add in ``retry_delay_s``).
+    if not math.isfinite(max_delay_s):
+        max_delay_s = sys.float_info.max
+    # The MULTIPLIER is settled next, before any shortcut that reasons about the delay or the
     # cap. Every one of those shortcuts rests on what the growth does to the product, and that
     # premise holds only for a growth that is a number -- see the zero-delay exit at the bottom,
     # which is the one that got this wrong by standing above it.
@@ -134,7 +161,8 @@ def capped_backoff(
     # AFTER ``sender.send`` has returned: a raise there loses the receipt for a side effect that
     # already happened, and the request is dispatched a second time.
     #
-    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD.
+    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD
+    # -- which is an ANSWER only because the cap itself was resolved first, at the top.
     # That is what ``min(max_delay_s, initial * multiplier ** n)`` answered for every one of
     # these (``initial * inf`` is ``inf``, ``initial * nan`` is ``nan``, and ``min`` keeps the cap
     # against either), and it is the only safe direction independently of that -- the opposite

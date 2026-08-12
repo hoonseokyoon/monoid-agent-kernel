@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -520,6 +521,112 @@ def test_backoff_delay_keeps_the_cap_when_a_zero_base_meets_growth_it_cannot_res
     # A zero base under ORDINARY growth is untouched: zero really does stay zero there.
     backend.outbox_retry_base_s, backend.outbox_retry_factor = 0.0, 2.0
     assert [backend._outbox_backoff_delay(n) for n in (0, 1, 3, 1100)] == [0.0] * 4
+
+
+def test_backoff_delay_answers_a_reachable_ceiling_for_a_cap_with_no_ordering(
+    backend_factory: Any,
+) -> None:
+    """The ceiling arm of the same rule, at the door whose four knobs carry no validation at all.
+
+    ``max(0.0, nan)`` is ``0.0`` and ``max(0.0, -inf)`` is ``0.0``, so ``nan`` and ``-inf`` both
+    make the ceiling ``uniform(0, 0)`` on EVERY attempt: no backoff, every failure due again
+    immediately, a resend loop against the endpoint that just refused -- verbatim the state the
+    test below exists to prevent, reached through ``cap_s`` rather than through ``factor``.
+    ``+inf`` is the other end, and it is the one that does not show at small attempt counts,
+    which is why the sweep runs out to where the product leaves the float range.
+
+    An unusable cap resolves to ``sys.float_info.max``, i.e. to an unlimited cap, so the first
+    three columns are the plain growth product and only the fourth meets a ceiling.
+    """
+    sender = RecordingOutboxSender()
+    backend, _ws = _outbox_backend(backend_factory, [_DONE], sender=sender)
+    backend.outbox_retry_base_s, backend.outbox_retry_factor = 1.0, 2.0
+    # The ceiling itself, not a jittered draw from it -- the same reader the factor arm uses.
+    backend._outbox_rng = SimpleNamespace(uniform=lambda _low, high: high)
+    for cap in (float("nan"), float("-inf"), float("inf")):
+        backend.outbox_retry_cap_s = cap
+        assert [backend._outbox_backoff_delay(n) for n in (0, 1, 3, 1100)] == [
+            1.0,
+            2.0,
+            8.0,
+            sys.float_info.max,
+        ], cap
+    # An ordinary cap is untouched, cell for cell.
+    backend.outbox_retry_cap_s = 10.0
+    assert [backend._outbox_backoff_delay(n) for n in (0, 1, 3, 1100)] == [1.0, 2.0, 8.0, 10.0]
+
+
+def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -> None:
+    """The ``+inf`` sibling of the NaN-factor test below, in the same after-the-send window.
+
+    ``cap_s = inf`` reads as "no ceiling", which is a policy the service accepts and one an
+    operator can reasonably mean. But the schedule is evaluated AFTER ``sender.send`` returned,
+    and what it produces is stamped on a durable record: ``OutboxRequest.to_json`` normalizes
+    before it builds (``normalize_outbox_request`` -> ``parse_float``), and a non-finite
+    ``next_attempt_at`` is refused there -- inside the checkpoint export at the end of
+    ``drain_outbox``, after a dispatch that already reached the endpoint. The receipt is lost and
+    the request is sent again. A second harm rides on the same value even where nothing raises:
+    ``due_outbox`` selects on ``next_attempt_at <= now``, which ``inf`` never satisfies, so the
+    request is neither retried nor dead-lettered.
+
+    An unlimited cap stays unlimited -- ``float_info.max`` seconds is not a wait anyone returns
+    from -- but it is REPRESENTABLE, which is the whole difference between a slow retry and a
+    lost receipt.
+    """
+    sent: list[str] = []
+    recorded: list[tuple[str, bool, float]] = []
+    # Past the point where the product leaves the float range: below it, ``+inf`` and a finite
+    # ceiling answer identically and this would pass on unfixed code.
+    request = OutboxRequest(destination="email", id="o1", attempts=1024)
+
+    class _Sender:
+        def send(self, req: OutboxRequest) -> OutboxReceipt:
+            sent.append(req.id)
+            return OutboxReceipt(ok=True, reference="ref-1")
+
+    class _Loop:
+        def due_outbox(self, now: float) -> list[OutboxRequest]:
+            return [request]
+
+        def record_outbox_result(
+            self,
+            request_id: str,
+            receipt: OutboxReceipt,
+            *,
+            max_attempts: int = 5,
+            next_attempt_at: float = 0.0,
+        ) -> str:
+            recorded.append((request_id, receipt.ok, next_attempt_at))
+            return "dispatched"
+
+        def snapshot(self) -> None:
+            return None
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    service = OutboxDispatchService(
+        OutboxDispatchContext(
+            retry_policy_provider=lambda: OutboxRetryPolicy(
+                max_attempts=5, base_s=1.0, factor=2.0, cap_s=float("inf")
+            ),
+            max_message_queue_depth_provider=lambda: 100,
+            checkpoint_store_provider=lambda: None,
+            rng_provider=lambda: random.Random(7),
+            live_outbox_runs=lambda: [],
+            call_soon=lambda *_a, **_k: None,
+            record_terminal=lambda _record: False,
+        )
+    )
+    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+
+    assert sent == ["o1"]
+    [(request_id, ok, next_attempt_at)] = recorded
+    assert (request_id, ok) == ("o1", True)
+    # The durable half, executed rather than asserted: the value the drain stamped has to survive
+    # the writer the drain hands it to.
+    carried = OutboxRequest(destination="email", id="o1", next_attempt_at=next_attempt_at)
+    assert OutboxRequest.from_json(carried.to_json()).next_attempt_at == next_attempt_at
 
 
 def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_happened() -> None:

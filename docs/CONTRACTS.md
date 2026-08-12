@@ -1851,7 +1851,14 @@ send.
   about the base or the cap: **growth the schedule cannot resolve resolves upward, to the cap** — a
   `NaN` factor (which raises rather than orders), an infinite one, and a zero base under either
   (`0 * inf` is `nan`, not zero). The other end of that range is a zero ceiling, `uniform(0, 0)`,
-  an unthrottled resend against the endpoint that just refused. The drain only
+  an unthrottled resend against the endpoint that just refused. A **cap** the schedule cannot
+  resolve goes the same direction, to the largest representable wait (`sys.float_info.max`), and it
+  is settled ahead of every other arm because each of them reads `cap_s`: `NaN` and `-inf` land on
+  exactly that zero ceiling, while `+inf` stamps a `next_attempt_at` that `due_outbox` never
+  selects (`next_attempt_at <= now` is False for `inf`) and that `OutboxRequest.to_json` refuses
+  (`parse_float` — finite only), in the checkpoint export that runs *after* the send. An unlimited
+  cap stays unlimited: for every product the schedule can represent, `min(inf, product)` and
+  `min(float_info.max, product)` are the same number. The drain only
   dispatches **due** requests (`loop.due_outbox(now)`; a freshly staged one has `next_attempt_at=0.0`
   → due immediately, so the happy path is unchanged), and because the schedule is on the checkpoint
   it survives a restart. The backend's **watchdog tick** also runs `_redrive_outbox()`: for each live

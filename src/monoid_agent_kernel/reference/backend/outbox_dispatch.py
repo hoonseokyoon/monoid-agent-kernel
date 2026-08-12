@@ -69,6 +69,12 @@ class OutboxDispatchService:
         service accepts reaches it: ``1e308`` on the third attempt, the default ``2.0`` on the
         1024th. Full jitter (``uniform(0, ceiling)``) is why this takes the bounded ceiling
         rather than ``retry_delay_s``, which rides its jitter on top of the cap.
+
+        ``cap_s`` is one of those unvalidated fields, and an unusable one is resolved in the
+        schedule rather than here: ``nan`` and ``-inf`` both reach ``max(0.0, .)`` as ``0.0``,
+        making the ceiling ``uniform(0, 0)`` -- no backoff at all -- and ``+inf`` stamps a
+        ``next_attempt_at`` that ``due_outbox`` can never select and the durable record cannot
+        carry.
         """
         policy = self._context.retry_policy_provider()
         # ``capped_backoff`` grows by ``attempt - 1``; the outbox schedules off ``attempts``.

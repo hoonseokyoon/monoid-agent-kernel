@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,74 @@ def test_turn_retry_backoff_answers_the_cap_for_a_multiplier_with_no_ordering(
         )
     # The first attempt has no growth for a NaN to confuse; the rest answer the cap.
     assert slept == [0.5, 4.0, 4.0]
+
+
+def test_turn_retry_backoff_waits_a_reachable_time_for_a_cap_with_no_ordering(
+    monkeypatch: Any,
+) -> None:
+    """The rule the MULTIPLIER got, on the argument that carries the ceiling itself.
+
+    "Growth this cannot resolve resolves upward, to ``max_delay_s``" is vacuous when
+    ``max_delay_s`` is what cannot be resolved, and both ends it lands on are wrong. ``nan`` and
+    ``-inf`` leave every ``min(max_delay_s, .)`` answering something not above zero, so
+    ``delay > 0`` is False and the turn is retried with NO WAIT AT ALL -- the unthrottled resend
+    against the endpoint that just refused, reached through the cap rather than the multiplier.
+    ``+inf`` is the other end: it answers ordinary products until one leaves the float range, and
+    then ``asyncio.sleep(inf)`` is a timer that never fires, so the driver stops being a driver.
+    Hence the third attempt count; the first two would let ``+inf`` ride along on arms the other
+    two caps redden.
+
+    ``ModelRetryConfig`` has no ``__post_init__`` and this door builds its config in Python, the
+    same reachability the multiplier arm was fixed under. An unusable cap resolves to
+    ``sys.float_info.max``, which is an UNLIMITED cap -- so these wait the ordinary growth
+    product, not the ceiling, until the product reaches it. The collector is the assertion:
+    "did not wait" is a MISSING element, not a smaller one.
+    """
+    slept: list[float] = []
+
+    async def _capture(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(session_drive.asyncio, "sleep", _capture)
+    for cap in (float("nan"), float("-inf"), float("inf")):
+        for attempt in (2, 5, 1101):
+            asyncio.run(
+                session_drive._async_sleep_before_retry(
+                    attempt,
+                    ModelRetryConfig(
+                        initial_delay_s=0.5,
+                        max_delay_s=cap,
+                        backoff_multiplier=2.0,
+                        jitter_s=0.0,
+                    ),
+                )
+            )
+    assert slept == [1.0, 8.0, sys.float_info.max] * 3, slept
+    # The first attempt applies no growth at all, so an unusable cap leaves the initial delay --
+    # and this is the arm that fails if the resolution is moved BELOW the no-growth exit, which
+    # returns ``min(max_delay_s, initial_delay_s)`` and so reads the cap on its own.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            1,
+            ModelRetryConfig(
+                initial_delay_s=0.5,
+                max_delay_s=float("nan"),
+                backoff_multiplier=2.0,
+                jitter_s=0.0,
+            ),
+        )
+    )
+    assert slept[-1] == 0.5, slept[-1]
+    # An ordinary finite cap is untouched, and still binds where it always did.
+    asyncio.run(
+        session_drive._async_sleep_before_retry(
+            5,
+            ModelRetryConfig(
+                initial_delay_s=0.5, max_delay_s=4.0, backoff_multiplier=2.0, jitter_s=0.0
+            ),
+        )
+    )
+    assert slept[-1] == 4.0
 
 
 def test_turn_retry_backoff_keeps_the_cap_when_a_zero_delay_meets_unresolvable_growth(
