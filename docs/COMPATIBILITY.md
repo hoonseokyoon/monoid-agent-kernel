@@ -305,12 +305,12 @@ not expect, which is a fact about a deployment rather than a broken wire.
 The v0.21 preview payload budget is a projection-only change: no event schema value, artifact
 identifier, or wire key moves, exhaustion spends the `truncated_keys` / `truncated_items`
 vocabulary that already existed, and `validate_run_dir` reads directories written on either side
-of the change. The same release makes the four Python-object ingress boundaries — a tool result's
-`content`, `emit_artifact` metadata, and a hosted task's request and result — refuse scalars no
-portable JSON writer can spell (`bytes`, integers past the 4300-digit decoder bound, arbitrary
+of the change. The same release makes five Python-object ingress boundaries — a tool result's `content`,
+`emit_artifact` metadata, a hosted task's request and result, and a model turn's tool-call
+`arguments` — refuse values no portable JSON writer can spell. Four of them refuse scalars (`bytes`, integers past the 4300-digit decoder bound, arbitrary
 objects) as a *classified call failure* (`tool_result_unportable` and its per-boundary siblings)
 where such a value previously reached a writer that could not spell it and ended the run as
-`internal_error`. Which writer depends on the boundary, and naming one for all four was wrong: a
+`internal_error`. Which writer depends on the boundary, and naming one for all of them was wrong: a
 tool result and artifact metadata die at the transcript write, a hosted task's result at
 `task.json`. The refusal fires only where that writer is actually reached — a duplicate report, or
 a first report arriving after the task was cancelled, is answered as the no-op it already was,
@@ -319,6 +319,30 @@ used to die now complete with a failed call the model can observe and correct; n
 written to one — the refusal moves the failure earlier and names it, it does not change what any
 reader accepts. Callers whose payloads arrive through a JSON parse are unaffected: the bounded
 decoders never admitted these values in the first place.
+
+Later in the same release those boundaries stop admitting unportable *containers* as well as
+unportable scalars, under the same flag and the same per-boundary classification. A container that
+is reachable from itself is refused — the normalizer preserved the cycle rather than failing on it,
+so the copy reached `json.dumps` as `ValueError: Circular reference detected` and
+`dataclasses.asdict` as `RecursionError` — and so is one taller than
+`MAX_PORTABLE_CONTAINER_DEPTH` (64), measured as a height over the finished copy rather than as a
+path depth, because the walk memoises and a shared subtree is charged at whichever reference it
+reaches first. The bound is 64 and not the decoder's 512 for a measured reason: on CPython 3.11
+`dataclasses.asdict` dies at 492 containers while the model-JSON decoder admits 512, so every depth
+in [492, 512] cleared each gate it met and then killed the run at the checkpoint writer.
+
+The fifth boundary is the one that reaches the checkpoint — a model turn's tool-call arguments ride
+the assistant message into `state.messages` and out through `RunCheckpoint.to_json` — and it
+classifies differently from the other four. It has no `*_unportable` code of its own; the refusal
+escapes to `normalize_model_turn`, which answers `ModelAdapterError("model adapter returned a
+non-portable response")`. That is a terminal classification, not a config-recoverable one: the loop
+does not re-prompt on it, so what is bought is a named failure instead of a `_CheckpointPersistError`
+from the persistence layer. One asymmetry is deliberate and is recorded here because it is
+observable: when the same turn also carries a settled outcome — a `final_text`, or a `refusal` /
+`length` stop reason — the surrounding leniency drops the offending call and keeps the paid answer
+instead of raising. That leniency predates the bound. The call could not have run anyway (a settled
+answer wins in `AgentLoop`) and dropping it keeps exactly the value the bound exists to keep out of
+the checkpoint, but nothing reports the drop.
 
 One v0.21 change moves an existing wire *answer* rather than adding a key: when the reference
 gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
@@ -506,6 +530,16 @@ project has ever emitted such a value, and the only directories that stop valida
 carrying a value the rest of the kernel already refused. Third parties validating these schemas
 with an ECMA-262 engine see no change at all — the new spelling is redundant there and
 load-bearing only under Python's `re`.
+
+**That window closes at v0.21.0.** Every argument above rests on the same premise — the artifact,
+its writer, its schema and its identifier all arrived inside one unreleased line, so there was no
+population of older readers to be compatible *with*, and a closed schema (`additionalProperties:
+false`) could take a new key without the identifier moving. v0.21.0 is the release that creates
+that population. From it onward `monoid.model-calls.v1` has a released reader, and so do the
+schemas whose `pattern` spelling this section tightened; the next key added to any of them is an
+ordinary compatibility event, decided by the rules at the top of this document rather than by the
+absence of anyone to break. The reasoning above is kept as written because it was true when those
+changes were made — this paragraph dates it, it does not retract it.
 
 `status.json` and `metrics.json` grow the failure-classification keys their readers already had
 event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —

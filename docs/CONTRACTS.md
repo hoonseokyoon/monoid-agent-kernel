@@ -2648,6 +2648,17 @@ web-gateway HTTP layers:
 - **Backend:** `max_message_bytes` (reject over-large follow-up message),
   `max_message_queue_depth` (cap pending-message queue), `max_concurrent_runs` (a bounded
   semaphore; excess submissions stay `queued`, `0` = unbounded).
+- **Container depth** (`MAX_PORTABLE_CONTAINER_DEPTH`, 64): a Python-object ingress refuses a
+  container taller than this, and refuses one that is reachable from itself, at the five
+  refusing boundaries — a tool result's `content`, `emit_artifact` metadata, a hosted task's
+  request and result, and a model turn's tool-call `arguments`. The same number is the approval
+  request's `MAX_ARGUMENT_DEPTH` and the preview walk's `MAX_JSONISH_DEPTH`, so an `ask`-gated
+  and an `allow`-gated call are bounded alike; note the two behave differently at the bound by
+  design — approval and ingress **raise**, the preview **elides**. It is deliberately below the
+  bounded decoder's 512 nesting limit: `dataclasses.asdict` (the checkpoint writer) dies at 492
+  containers on CPython 3.11, so a value in [492, 512] would clear every gate and then fail the
+  run at persistence. Payloads that arrive through a JSON parse are unaffected — the decoder's
+  own limit is stricter than anything it will hand on.
 
 ### Client connection retry
 
