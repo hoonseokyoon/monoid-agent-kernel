@@ -362,6 +362,25 @@ def _normalize_scalar(
     return value
 
 
+MAX_PORTABLE_CONTAINER_DEPTH = 64
+"""How deep a container may nest before no writer downstream can be trusted with it.
+
+One number for the three sites that bound container nesting, because they judge the *same*
+model-authored argument on its way to three different writers and a bound proven at one of them is
+this repository's recurring defect. They do not take the same ACTION, and each says which it takes
+where it stands: this one and ``core.tool_approval`` RAISE, ``core.model_io._jsonish`` returns a
+marker. That difference is load-bearing rather than an inconsistency to tidy away -- a marker lets
+sibling branches keep expanding on a cyclic input, which is how a fast ``RecursionError`` there
+once became a hang, and it is why the shape refusal here raises.
+
+64 rather than the parsers' 512: the writer that fails first is ``dataclasses.asdict`` at
+``RunCheckpoint.to_json``, measured dead at 492 containers under the default recursion limit, so a
+value in [492, 512] cleared every gate it met and killed the run at the checkpoint. 64 leaves an
+enormous margin over anything real -- the deepest structure this repository defines anywhere is 10,
+and ``PREVIEW_MAX_DEPTH`` is 8 -- while sitting far below the first writer that dies.
+"""
+
+
 def _refuse_unportable_shape(root: Any) -> None:
     """Refuse a copy whose shape a portable JSON writer cannot carry.
 
@@ -385,9 +404,26 @@ def _refuse_unportable_shape(root: Any) -> None:
     reference detected`` and ``dataclasses.asdict`` raises ``RecursionError``, neither at the
     boundary that accepted it. Refusing here is the same trade the scalar refusal made: a
     classified failure of one call instead of an unclassified death of the run.
+
+    Depth rides the same pass, as a HEIGHT computed on the way out. A height is the right number
+    because it is what a recursive writer walks: ``dataclasses.asdict`` has no memo, so a subtree
+    referenced twice is descended twice and its full height counts from each reference. Computed
+    bottom-up over the DAG it costs one visit per node, which is the property the reverted
+    ``PREVIEW_MAX_NODES`` budget lacked; refusing on the first node that exceeds is equivalent to
+    refusing on the root's height, since the root's is the largest, and it exits earlier.
     """
 
-    settled: set[int] = set()
+    # A height counts the root container as 1, so the bound is the container count directly. That
+    # is the same admission set the ask path has, but not for the reason it looks like: that side
+    # counts the root container as depth 0, which would leave it one more permissive -- except it
+    # descends into the leaf SCALAR too and charges it a level of its own, so both sides admit at
+    # most `MAX_PORTABLE_CONTAINER_DEPTH` containers on any path. Written down because the first
+    # attempt here was `+ 1`, derived from the depth-vs-height difference alone, and the pin that
+    # compares the two paths' verdict *lists* is what caught it -- an off-by-one is a differing
+    # element there, where two separately stated bounds would both have looked right.
+    tallest_allowed = MAX_PORTABLE_CONTAINER_DEPTH
+
+    settled: dict[int, int] = {}
     on_path: set[int] = set()
     stack: list[tuple[Any, bool]] = [(root, False)]
 
@@ -398,7 +434,17 @@ def _refuse_unportable_shape(root: Any) -> None:
         key = id(node)
         if leaving:
             on_path.discard(key)
-            settled.add(key)
+            children = node.values() if isinstance(node, dict) else node
+            tallest_child = max(
+                (settled[id(child)] for child in children if isinstance(child, (dict, list))),
+                default=0,
+            )
+            settled[key] = tallest_child + 1
+            if settled[key] > tallest_allowed:
+                raise UnportableContainerError(
+                    f"container nests deeper than {MAX_PORTABLE_CONTAINER_DEPTH} levels; "
+                    "flatten the payload or pass it as a workspace file"
+                )
             continue
         if key in on_path:
             raise UnportableContainerError(

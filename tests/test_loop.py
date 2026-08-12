@@ -2402,6 +2402,47 @@ def test_cyclic_artifact_metadata_costs_the_emitting_call(tmp_path: Path) -> Non
     assert observation["error"]["code"] == "artifact_metadata_unportable"
 
 
+def test_a_deeply_nested_tool_argument_fails_the_run_with_a_record_of_why(tmp_path: Path) -> None:
+    """The `allow` path's half of the depth gap, end to end.
+
+    The approval builder has bounded argument depth for releases, but only on `ask`. On `allow` the
+    arguments went into the message history and out through `RunCheckpoint.to_json`, whose
+    `dataclasses.asdict` recurses in pure Python and dies at 492 containers -- while the model-JSON
+    decoder that admitted them stops at 512 -- so a depth in that window cleared every gate it met
+    and surfaced as `_CheckpointPersistError` out of `run_once`: the run lost, with no classified
+    record of what killed it.
+
+    Refused at the turn copy now, so the failure is the adapter's and it says so. This is a
+    terminal failure, not a correctable one -- a bare `ModelAdapterError` is not recoverable and
+    the loop does not re-prompt on it -- and the gain is exactly that an operator can read what
+    happened instead of an arithmetic error from the persistence layer.
+    """
+    deep: object = {"leaf": 1}
+    for _ in range(500):
+        deep = {"next": deep}
+    assert isinstance(deep, dict)
+
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("noop", deep, "c1"),),
+            )
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+
+    result = AgentLoop.from_tools(run_spec, adapter, []).run_once("go deep")
+
+    assert result.status == "failed"
+    events_text = (run_spec.run_root / result.run_id / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in events_text.splitlines() if line]
+    failed = [event for event in events if event["type"] == "run.failed"]
+    assert failed, "the run died without a terminal record"
+    assert failed[0]["data"]["error_code"] == "model_error", failed[0]["data"]
+
+
 def test_invalid_success_flag_cannot_emit_success_side_effect_evidence(tmp_path: Path) -> None:
     def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
         return ToolResult(

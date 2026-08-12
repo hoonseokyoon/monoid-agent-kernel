@@ -47,6 +47,7 @@ from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
+    MAX_PORTABLE_CONTAINER_DEPTH,
     exact_elements,
     exact_items,
     exact_text,
@@ -764,7 +765,12 @@ def content_length(value: Any) -> int | None:
 # otherwise turn a bad payload into a failed call. `core.tool_approval` has the same-named function
 # with the same shape; bounding one and not the other is precisely the twin-miss this release keeps
 # finding, and this side fires *earlier* -- during the model-call publish, before tool dispatch.
-MAX_JSONISH_DEPTH = 64
+# Imported rather than spelled again -- three sites bound the same model-authored
+# argument, and the shared constant is what keeps them from drifting apart. This site
+# ELIDES where the other two raise, which is deliberate and explained below: a marker is
+# what a digest wants, and it is also what makes a depth cap dangerous on a cyclic input,
+# so the cycle guard below is not optional here the way it is where the bound raises.
+MAX_JSONISH_DEPTH = MAX_PORTABLE_CONTAINER_DEPTH
 
 # What replaces a subtree past the bound. A marker rather than a raise: this runs inside digest and
 # observer publication, where the caller wants an identifier for the payload, not an exception.

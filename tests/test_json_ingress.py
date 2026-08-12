@@ -25,6 +25,7 @@ from support.hostile_scalars import (
 
 import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
+    MAX_PORTABLE_CONTAINER_DEPTH,
     UnportableContainerError,
     UnportableScalarError,
     is_finite_json_number,
@@ -200,6 +201,81 @@ def test_a_value_shared_twice_is_not_a_cycle() -> None:
     # with recursion would answer differently depending on key order.
     deeper = normalize_json_ingress({"a": shared, "b": {"c": shared}}, refuse_unportable=True)
     assert deeper["a"] is deeper["b"]["c"]
+
+
+def _nested_arguments(containers: int) -> dict:
+    """A chain of exactly ``containers`` containers, the innermost holding a scalar."""
+
+    inner: object = {"leaf": 1}
+    for _ in range(containers - 1):
+        inner = {"next": inner}
+    assert isinstance(inner, dict)
+    return inner
+
+
+def _ask_path_refuses(arguments: dict) -> bool:
+    from monoid_agent_kernel.core.tool_approval import build_tool_approval_task_request
+
+    spec = ToolSpec(
+        id="custom.deep",
+        description="d",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=lambda _context, _arguments: ToolResult(ok=True),
+    )
+    try:
+        build_tool_approval_task_request(
+            spec=spec,
+            binding_id="b",
+            model_name="m",
+            call_name="custom_deep",
+            call_id="c1",
+            arguments=arguments,
+            reason="r",
+            turn_id="t1",
+            tool_event_id=None,
+        )
+    except ValueError:
+        return True
+    return False
+
+
+def _allow_path_refuses(arguments: dict) -> bool:
+    turn = ModelTurn(
+        response_id="r1",
+        tool_calls=(ToolCall(id="c1", name="custom_deep", arguments=arguments),),
+    )
+    try:
+        normalize_model_turn(turn)
+    except ModelAdapterError:
+        return True
+    return False
+
+
+def test_the_two_approval_paths_answer_the_same_structure_the_same_way() -> None:
+    """One structure, both gates, one verdict list -- asserted as a list so the shape is the claim.
+
+    The bound has always existed on the ``ask`` path, through the approval-request builder, and
+    never on ``allow``: those arguments went into the message history and out through
+    ``RunCheckpoint.to_json``, whose ``dataclasses.asdict`` recurses in pure Python and dies at
+    492 containers while the model-JSON decoder admits 512 -- so a depth in that window was
+    accepted by every gate it met and killed the run at the checkpoint writer, with
+    ``_CheckpointPersistError`` out of ``run_once`` and no classified record of why.
+
+    Comparing the two *lists* rather than the two bounds is deliberate: an off-by-one on either
+    side shows up as a differing element, and a rule bound to one of two parallel halves is
+    exactly this repository's recurring defect. The sweep straddles the bound so neither list can
+    be constant, and that is asserted too -- two lists agreeing on "never refuse" would pass.
+    """
+    depths = range(MAX_PORTABLE_CONTAINER_DEPTH - 2, MAX_PORTABLE_CONTAINER_DEPTH + 4)
+    structures = {depth: _nested_arguments(depth) for depth in depths}
+
+    ask = [_ask_path_refuses(structures[depth]) for depth in depths]
+    allow = [_allow_path_refuses(structures[depth]) for depth in depths]
+
+    assert ask == allow, f"ask={ask} allow={allow} over depths {list(depths)}"
+    assert True in ask and False in ask, f"the sweep never crossed the bound: {ask}"
 
 
 def test_a_cyclic_model_turn_is_a_classified_adapter_failure() -> None:

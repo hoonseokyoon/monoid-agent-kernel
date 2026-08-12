@@ -4,7 +4,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
-from monoid_agent_kernel.core.json_ingress import exact_elements, exact_items, exact_text
+from monoid_agent_kernel.core.json_ingress import (
+    MAX_PORTABLE_CONTAINER_DEPTH,
+    exact_elements,
+    exact_items,
+    exact_text,
+)
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -264,17 +269,17 @@ def _parse_approval_bool(value: Any) -> bool | None:
 # model-controlled and is stored raw -- it is the replay copy and what ``approval_key`` is taken
 # over, so it cannot be truncated the way the preview is. Rejecting is the only honest answer: a call
 # whose arguments cannot be recorded faithfully cannot be faithfully approved.
-MAX_ARGUMENT_DEPTH = 64
-# Known gap, deliberately not closed in this release. This bound is reached only through
-# `build_tool_approval_task_request`, i.e. the `ask` path. On `allow`, the arguments still enter
-# the message history and reach `RunCheckpoint.to_json`, whose `dataclasses.asdict` recurses in
-# pure Python and raises `RecursionError` around depth 500 -- while `json.loads`/`json.dumps`
-# handle 900 -- surfacing as `_CheckpointPersistError` out of `run_once`: the run lost, from one
-# model-authored argument. Guarding tool *dispatch* does not close it (the turn is already in
-# history by then); the fixes are either rejecting the turn at ingestion or dropping `asdict`,
-# and the latter also drops its deep copy, so a checkpoint would start sharing mutable state
-# with the live loop. Both are decisions for the durability surface, not for a content-egress
-# release, and neither file is in its diff.
+# The same number as the shape refusal at the Python-object boundaries, and imported rather than
+# spelled again: this gate and that one judge the same model-authored argument on its way to two
+# different writers, and a bound proven at one of them is the twin-miss this release keeps finding.
+# This site RAISES, which is the action the constant's own note asks each site to state.
+MAX_ARGUMENT_DEPTH = MAX_PORTABLE_CONTAINER_DEPTH
+# The `allow` half of this gap is closed, in `json_ingress._refuse_unportable_shape`: the arguments
+# that skip this builder are refused where the turn is copied, so they never enter the message
+# history and `RunCheckpoint.to_json` never sees them. What remains open, deliberately, is the
+# other half of the original triage -- dropping `asdict` itself, which also drops its deep copy and
+# would let a checkpoint share mutable state with the live loop. That is a durability-surface
+# decision and stays on the durability track.
 
 
 def _jsonish(value: Any, _depth: int = 0) -> Any:
