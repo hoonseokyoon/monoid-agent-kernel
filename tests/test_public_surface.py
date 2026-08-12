@@ -16,6 +16,7 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelConfig",
     "ModelRetryConfig",
     "ReasoningConfig",
+    "GenerationConfig",
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
@@ -95,6 +96,16 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    # Writing a typed ``settled_sink`` needs the argument type, and every other type
+    # ``ModelCallRunner``'s public fields name is exported beside it.
+    "SettledModelCall",
+    "ValidatedCallRunner",
+    "ValidatedCallResult",
+    "AttemptDeltaConsumer",
+    "AttemptStarted",
+    "structured_output_support",
+    "generation_support",
+    "reasoning_support",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",
@@ -228,6 +239,23 @@ def test_contracts_public_surface_is_intentional() -> None:
     assert contracts.__all__ == EXPECTED_CONTRACTS_ALL
 
 
+def test_providers_package_exports_are_intentional() -> None:
+    """Concrete adapters live in ``monoid_agent_kernel.providers``, never in ``contracts``
+    (the removed-names census below bans them there). This is that surface's own census:
+    the shipped adapters, plus the replay adapter with its typed miss beside it -- an
+    error a caller must catch belongs where the class that raises it is found."""
+
+    import monoid_agent_kernel.providers as providers
+
+    assert providers.__all__ == [
+        "FakeModelAdapter",
+        "GatewayModelAdapter",
+        "OpenAIModelAdapter",
+        "ReplayMiss",
+        "ReplayModelAdapter",
+    ]
+
+
 _OPTIONAL_ADAPTER_CAPABILITIES = ("supports_multimodal", "wire_image_encoding", "provider_name")
 
 
@@ -275,6 +303,29 @@ def test_optional_capability_protocols_accept_classvar_implementations() -> None
             assert member.fset is None, f"{protocol.__name__}.{name} must be read-only"
 
 
+def test_the_provider_name_protocol_admits_the_none_its_shipped_adapter_declares() -> None:
+    """The declared type must accept the value the shipped adapter is *documented* to hold.
+
+    ``ProviderNamedModelAdapter.provider_name`` declared ``str`` while its own docstring said
+    omitting it means "do not tag" and ``GatewayModelAdapter.provider_name`` is ``str | None`` --
+    the value a deployment sets when its gateway fronts an upstream with no reasoning artifacts.
+    A protocol that rejects the adapter it was written for checks nothing.
+    """
+    import typing
+
+    from monoid_agent_kernel.core.spec import ModelConfig
+    from monoid_agent_kernel.providers.base import ProviderNamedModelAdapter
+    from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+
+    member = ProviderNamedModelAdapter.__dict__["provider_name"]
+    declared = typing.get_type_hints(member.fget)["return"]
+    assert type(None) in typing.get_args(declared), (
+        f"provider_name is declared {declared!r}, which cannot hold the documented "
+        '"do not tag" value'
+    )
+    assert GatewayModelAdapter(config=ModelConfig(), provider_name=None).provider_name is None
+
+
 def test_a_capability_that_takes_an_argument_is_declared_as_a_method() -> None:
     """``AddressedModelAdapter`` is the one member of the family that is not a property.
 
@@ -308,7 +359,9 @@ def test_optional_capability_protocols_are_satisfied_by_shipped_adapters() -> No
 
     expected = {
         MultimodalModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
-        ProviderNamedModelAdapter: (OpenAIModelAdapter,),
+        # The gateway joined in X-3: it declares the UPSTREAM provider whose opaque reasoning
+        # artifacts it relays, so the loop can tag them and replay them back through the hop.
+        ProviderNamedModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
         ConfiguredModelAdapter: (OpenAIModelAdapter, GatewayModelAdapter),
         AddressedModelAdapter: (GatewayModelAdapter,),
     }
@@ -561,3 +614,120 @@ if blocked:
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_the_relayed_provider_fields_are_keyword_only() -> None:
+    """A field added to a shipped constructor must not rebind its positional arguments.
+
+    ``llm_gateway_provider`` (and the loop-factory context's provider accessor) landed
+    mid-dataclass, before fields embedders already pass positionally -- so an existing fifth
+    positional ``model_adapter_factory`` would be stored as the relayed-provider string and the
+    factory left unset, discovered only when ``resolve_relayed_provider`` calls ``.strip()`` on a
+    callable. Keyword-only keeps the new knob beside the URL it describes without moving any
+    argument that predates it.
+    """
+    import dataclasses
+
+    from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+
+    for cls, name in (
+        (RunnerBackend, "llm_gateway_provider"),
+        (BackendLoopFactoryContext, "llm_gateway_provider_provider"),
+        (StudioConfig, "llm_gateway_provider"),
+        # The recording switches followed the same insertion, for the same reason: each sits
+        # beside the sidecar sibling whose semantics it shares rather than at the tail a
+        # positional append would force. Listed by name because the tuple pins below catch a
+        # dropped ``kw_only`` only as a confusing mid-tuple diff, and this says which rule broke.
+        (RunnerBackend, "model_calls_file"),
+        (RunnerBackend, "model_payload_file"),
+        (BackendLoopFactoryContext, "model_calls_file_provider"),
+        (BackendLoopFactoryContext, "model_payload_file_provider"),
+    ):
+        (fld,) = [f for f in dataclasses.fields(cls) if f.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must be keyword-only to preserve positional order"
+
+
+def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
+    """The behavioral half: the old positional shapes still mean what they meant.
+
+    ``RunnerBackend``'s fifth positional was ``model_adapter_factory`` and ``StudioConfig``'s
+    eleventh was ``stream_output_deltas``; both must still be.
+    """
+    from pathlib import Path as _Path
+
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+    from monoid_agent_kernel.reference._shared.tokens import TokenManager
+
+    def factory(*args: object, **kwargs: object) -> object:  # a stand-in adapter factory
+        raise AssertionError("never called")
+
+    backend = RunnerBackend(
+        _Path("runs"), TokenManager(secret=b"s" * 32), (_Path("."),), "http://gateway", factory
+    )
+    assert backend.model_adapter_factory is factory
+    assert backend.llm_gateway_provider == "openai"
+
+    studio = StudioConfig(
+        _Path("."), "127.0.0.1", 8799, "offline", _Path("runs"), None, False, True, None, None, False
+    )
+    assert studio.stream_output_deltas is False
+    assert studio.llm_gateway_provider is None
+
+
+def test_stable_constructor_positional_order_is_append_only() -> None:
+    """The positional signature of the shipped constructors is a compatibility surface.
+
+    A field inserted mid-dataclass silently rebinds every positional argument after it -- no
+    error, wrong object -- so growth must be appended or keyword-only. These literal pins make a
+    mid-insert fail here; a legitimate append changes only the tail, which is a conscious,
+    reviewable pin move. ``GatewayModelAdapter.provider_name`` is the one documented append.
+    """
+    import dataclasses
+
+    from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+    from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+    from monoid_agent_kernel.reference.studio.server import StudioConfig
+
+    def positional(cls: type) -> tuple[str, ...]:
+        return tuple(f.name for f in dataclasses.fields(cls) if f.init and not f.kw_only)
+
+    assert positional(GatewayModelAdapter) == (
+        "config", "gateway_url", "token", "token_env", "token_file", "token_provider",
+        "provider_name",
+    )
+    assert positional(StudioConfig) == (
+        "workspace", "host", "port", "provider", "run_root", "skills_directory", "mcp",
+        "memory", "memory_directory", "env_file", "stream_output_deltas",
+    )
+    assert positional(BackendLoopFactoryContext) == (
+        "run_root_provider", "llm_gateway_url_provider", "web_gateway_url_provider",
+        "model_adapter_factory_provider", "token_manager_provider",
+        "llm_gateway_token_ttl_s_provider", "checkpoint_store_provider",
+        "emit_output_deltas_provider", "stream_model_calls_provider",
+        "model_content_file_provider", "model_stream_observer_factories_provider",
+        "extra_event_sink_factories_provider", "model_io_subscription_factories_provider",
+        "subagent_definitions_provider", "tool_providers_provider",
+        "context_providers_provider", "output_validators_provider",
+        "capability_broker_factory_provider", "outbox_sender_factory_provider",
+        "current_runtime_config", "record", "record_event", "persist_checkpoint_payload",
+    )
+    assert positional(RunnerBackend) == (
+        "run_root", "token_manager", "allowed_workspace_roots", "llm_gateway_url",
+        "model_adapter_factory", "web_gateway_url", "allowed_apply_roots", "run_token_ttl_s",
+        "llm_gateway_token_ttl_s", "web_gateway_token_ttl_s", "task_callback_token_ttl_s",
+        "idle_timeout_s", "max_session_lifetime_s", "max_turns", "task_wait_poll_s",
+        "max_consecutive_turn_failures", "turn_retry", "emit_output_deltas",
+        "stream_model_calls", "model_content_file", "model_stream_broker",
+        "subagent_definitions", "extra_event_sink_factories",
+        "model_io_subscription_factories", "tool_providers", "context_providers",
+        "output_validators", "capability_broker_factory", "outbox_sender_factory",
+        "outbox_max_attempts", "outbox_retry_base_s", "outbox_retry_factor",
+        "outbox_retry_cap_s", "max_recover_attempts", "lease_ttl_s", "watchdog_interval_s",
+        "max_message_bytes", "max_message_queue_depth", "max_concurrent_runs",
+        "checkpoint_store", "lease_store", "command_store", "command_queue_limit",
+        "command_claim_ttl_s",
+    )

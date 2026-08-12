@@ -6,7 +6,10 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, Union
 
 from monoid_agent_kernel.core._util import canonical_sha256
-from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_unicode_scalars,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.runtime_controls import (
     validate_shell_runtime,
     validate_web_runtime,
@@ -793,7 +796,7 @@ def coerce_runtime_config_provider(source: RuntimeConfigSource) -> RuntimeConfig
         return _CallableRuntimeConfigProvider(source)
     raise TypeError(
         "runtime_config_provider must be a RuntimeConfigProvider, an AgentRuntimeConfig, "
-        f"or a callable(run_id) -> AgentRuntimeConfig; got {type(source).__name__}"
+        f"or a callable(run_id) -> AgentRuntimeConfig; got {portable_type_name(source)}"
     )
 
 

@@ -413,11 +413,66 @@ def test_from_tools_enables_validator_one_liner(tmp_path: Path) -> None:
 
 
 def test_output_retries_survives_checkpoint_round_trip(tmp_path: Path) -> None:
-    cp = RunCheckpoint(run_id="run_1", output_retries=2)
+    history = [{"attempt": 1, "failures": [{"validator_id": "require.foo", "feedback": "no FOO"}]}]
+    cp = RunCheckpoint(run_id="run_1", output_retries=2, output_failure_history=history)
     write_checkpoint(tmp_path, cp)
     restored = read_checkpoint(tmp_path)
     assert restored is not None
     assert restored.output_retries == 2  # else a mid-repair restart double-grants the budget
+    # ...and the evidence rides beside the budget. The counter alone survived, so a restored
+    # run renumbered its attempts from 1 (the number is ``len(history) + 1``) and dropped
+    # failures_by_validator out of metrics.json.
+    assert restored.output_failure_history == history
+
+
+def test_a_restored_mid_repair_run_continues_its_attempt_numbering(tmp_path: Path) -> None:
+    """The behavioural half: the retry BUDGET used to survive and its evidence did not.
+
+    The checkpoint below is a run that already burned one repair attempt against
+    ``require.foo``. Restored into a fresh loop whose budget is exhausted, the next rejection
+    must be attempt **2** and the roll-up must name BOTH epochs' validators — a restored run
+    that renumbers from 1 reports a first failure that never happened and loses the evidence
+    that the budget was spent.
+    """
+    sink = MemoryEventSink()
+    before = {
+        "attempt": 1,
+        "failures": [{"validator_id": "require.foo", "feedback": "must contain FOO"}],
+    }
+    loop = AgentLoop(
+        spec=_spec(tmp_path, limits=RunLimits(max_output_retries=1)),
+        model_adapter=FakeModelAdapter(turns=[_text_turn("FOO here")]),
+        runtime_config_provider=_provider("forbid.foo"),
+        output_validators=(ForbidFoo(),),
+        event_sinks=(sink,),
+    )
+    loop.restore(
+        RunCheckpoint(
+            run_id=loop.spec.run_id,
+            seq=1,
+            output_retries=1,
+            output_failure_history=[dict(before)],
+        )
+    )
+
+    # Re-pumped with ``None`` — the same turn-sequence continued, which is what a mid-repair
+    # restore is. (A NEW user input deliberately resets the budget: the repair budget belongs
+    # to one turn-sequence, so restoring it only matters on this path.)
+    suspension = loop.run_until_suspended(None)
+    result = loop.close()
+
+    assert suspension.status == "limited"
+    assert result.error_code == "output_validator_unsatisfied"
+    exhausted = [event for event in sink.events if event.type == "output.validator.exhausted"]
+    assert exhausted
+    assert [entry["attempt"] for entry in exhausted[-1].data["history"]] == [1, 2]
+    # Both epochs' validators in one roll-up, in the event and in metrics.json alike.
+    assert set(exhausted[-1].data["failures_by_validator"]) == {"require.foo", "forbid.foo"}
+    assert set(result.metrics["output_validation"]["failures_by_validator"]) == {
+        "require.foo",
+        "forbid.foo",
+    }
+    assert result.metrics["output_validation"]["retries"] == 1
 
 
 # --- item A: stop_reason promotion across adapters -----------------------------------------
@@ -1066,3 +1121,94 @@ def test_decide_settle_is_pure(tmp_path: Path) -> None:
         assert len(sink.events) == before_events  # decide emits nothing
     finally:
         loop.close()
+
+
+# --- the per-validator copy must not recurse ----------------------------------------------
+
+
+def test_a_legal_deeply_nested_answer_is_still_validated() -> None:
+    """The per-validator copy of ``parsed`` used ``deepcopy``, which recurses.
+
+    The kernel's strict ingress accepts JSON nested up to 512 levels, which is deep enough to
+    exhaust the interpreter's default 1000-frame stack — so an answer the parser *accepted*
+    blew up in the copy, outside any classification, before a single validator ran, and the
+    standalone validated call leaked the raw ``RecursionError`` out of ``acall``. (The
+    AgentLoop settle path leaves ``parsed`` unset today, so only the standalone surface could
+    reach it; the routine is shared, so the fix binds both.) The copy is now iterative
+    (``normalize_json_ingress``, which exists to walk JSON without recursing), so a legal
+    answer stays validatable rather than becoming a validator defect.
+
+    The limit is pinned to the interpreter default on purpose: pytest raises it to 3000, which
+    is exactly deep enough to hide this defect from a test that does not say what stack it is
+    testing against. Production runs at 1000.
+    """
+
+    import sys
+
+    from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+    from monoid_agent_kernel.core.output_validator import run_output_validators
+
+    depth = 500
+    text = "[" * depth + "]" * depth
+    parsed = loads_json_ingress(text)  # the parser accepts it; the copy must too
+
+    class _Records:
+        def __init__(self, vid: str) -> None:
+            self.id = vid
+            self.schema = None
+            self.seen: object = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            self.seen = view.parsed
+            return ValidationOutcome(ok=True, value=self.id)
+
+    first, second = _Records("a"), _Records("b")
+    view = FinalOutputView(final_text=text, parsed=parsed, parsed_ok=True)
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        failures, ok_values, defect = run_output_validators((first, second), view)
+    finally:
+        sys.setrecursionlimit(previous_limit)
+
+    assert defect is None
+    assert failures == []
+    assert [vid for vid, _ in ok_values] == ["a", "b"]
+    # Still a copy each, and still equal to what was parsed — the isolation contract holds.
+    assert first.seen is not second.seen
+    assert first.seen is not view.parsed
+    assert first.seen == second.seen == parsed
+
+
+def test_the_per_validator_copy_is_still_isolation_not_transformation() -> None:
+    """The iterative copier can normalize and substitute; both are off here, so the value a
+    validator judges is byte-for-byte what was parsed — including a lone-surrogate string that
+    survived strict ingress inside a JSON string escape."""
+
+    from monoid_agent_kernel.core.output_validator import run_output_validators
+
+    parsed = {"note": "a\ud800b", "n": [1, 2, {"deep": True}]}
+
+    class _Mutates:
+        id = "mutates"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            view.parsed["n"].append("scribble")
+            return ValidationOutcome(ok=True, value=view.parsed["note"])
+
+    class _Reads:
+        id = "reads"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            return ValidationOutcome(ok=True, value=list(view.parsed["n"]))
+
+    view = FinalOutputView(final_text="{}", parsed=parsed, parsed_ok=True)
+    _failures, ok_values, defect = run_output_validators((_Mutates(), _Reads()), view)
+
+    assert defect is None
+    values = dict(ok_values)
+    assert values["mutates"] == "a\ud800b"  # not repaired to U+FFFD
+    assert "scribble" not in values["reads"]  # the mutation did not reach the next validator
+    assert parsed["n"] == [1, 2, {"deep": True}]  # nor the caller's own object

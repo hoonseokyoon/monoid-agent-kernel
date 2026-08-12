@@ -52,7 +52,7 @@ from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
     validate_external_agent_envelope,
 )
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, normalize_json_ingress
 from monoid_agent_kernel.core.model_content import (
     MODEL_CONTENT_FILENAME,
     ModelContentReadResult,
@@ -85,6 +85,10 @@ from monoid_agent_kernel.reference.backend.model_stream import (
 )
 from monoid_agent_kernel.reference.outbox import InboxRoutingOutboxSender, OutboxToolProvider
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
+from monoid_agent_kernel.providers.gateway import (
+    DEFAULT_RELAYED_PROVIDER,
+    resolve_relayed_provider,
+)
 from monoid_agent_kernel.reference.llm_gateway.providers import offline_provider_factory
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.reference.web_gateway.http import create_web_gateway_server
@@ -492,18 +496,40 @@ def _runtime_config_for(
             tools.extend(bindings)
     return AgentRuntimeConfig(
         definition_id="studio-agent",
-        model=ModelConfig(model=model, reasoning=ReasoningConfig(effort=effort, summary=summary)),
+        model=ModelConfig(
+            model=model,
+            # Studio's effort/summary are DISPLAY preferences, not a correctness contract, and
+            # its default upstream is the offline echo provider — which honestly declares no
+            # reasoning_support, so under the default "fail" the reasoning_applied echo check
+            # would refuse every offline turn. "omit" states what this app actually wants:
+            # best-effort transport. Against a proving upstream (the real OpenAI adapter behind
+            # the gateway) the server still EMITS the echo and this client still SHAPE-VALIDATES
+            # it -- a malformed reasoning_applied is refused either way. What "omit" gives up is
+            # exactly the enforcement: a missing or mismatched echo is tolerated here.
+            reasoning=ReasoningConfig(effort=effort, summary=summary, on_unsupported="omit"),
+        ),
         prompt=PromptSpec(system_prompt_base=system_prompt),
         tools=tuple(tools),
     )
 
 
 def _gateway_tool_schema(tool: ToolSpec) -> dict[str, Any]:
+    """One tool entry of the profile preview -- a *record* of the request, not the request.
+
+    The record half of the schema rule keeps the substitution, exactly as the transcript's
+    ``core/tool_surface.py:_tool_spec_payload`` and the run manifest do. The request half does
+    not: ``normalize_tool_spec`` preserves a schema's non-finite values so the provider boundary
+    refuses the call as a classified, config-recoverable bad request. Embedding the preserved
+    value in this HTTP egress instead killed the endpoint at ``_write_json``'s ``allow_nan=False``
+    -- an anonymous serialization failure describing a request the operator was only trying to
+    look at, one boundary before the classified refusal and for a portability reason.
+    """
+
     return {
         "id": tool.id,
         "name": tool.exported_name,
         "description": tool.description,
-        "input_schema": tool.input_schema,
+        "input_schema": normalize_json_ingress(tool.input_schema),
         "capability": tool.capability,
         "side_effect": tool.side_effect,
     }
@@ -533,6 +559,16 @@ class StudioConfig:
     memory_directory: Path | None = None
     # Optional env file loaded at server start without overriding process env.
     env_file: Path | None = None
+    # Whose reasoning artifacts the bundled gateway relays, when the deployment knows and Studio
+    # cannot derive it. ``None`` means "derive" (see ``start``); a string wins and is read through
+    # the same ``resolve_relayed_provider`` every other string-typed surface uses, so ``"none"``
+    # spells the protocol's "do not tag" here exactly as it does on the CLI flag. This exists for
+    # the embedder seam: a ``provider_factory`` replaces the gateway's whole upstream, so the
+    # derivation can only answer "do not tag" for it -- correct as a guess, and no way to be told
+    # otherwise, which left an OpenAI-backed factory's reasoning round-trip silently dead.
+    # Keyword-only so the pre-existing positional order is preserved: ``stream_output_deltas``
+    # was the eleventh positional and must stay so.
+    llm_gateway_provider: str | None = field(default=None, kw_only=True)
     # Permit model-authored content to leave the run through Studio's private sidecar and passive
     # live stream. ``MONOID_OUTPUT_DELTAS`` is the deployment-wide permission gate on top. The
     # durable operation log stays compact either way, and provider streaming remains selected so
@@ -1137,6 +1173,22 @@ class StudioServer:
         provider_factory = self._provider_factory_override or (
             offline_provider_factory if self.offline else None
         )
+        # Whose reasoning artifacts this gateway relays, decided at the same site that decides
+        # its upstream. Only the no-factory case actually fronts OpenAI (the gateway falls back
+        # to OpenAIModelAdapter); the offline echo model and any injected factory front something
+        # else entirely, and the adapter's "openai" default would have those runs' receipts and
+        # OTel spans name a provider this process never called. ``None`` is the protocol's
+        # documented "do not tag" and the honest answer for both.
+        #
+        # That derivation is a *guess*, and a correct one only while nobody knows better. An
+        # embedder does: it supplied the factory. So the config's explicit setting wins, read
+        # through the shared resolver so "none" spells "do not tag" here as on every other
+        # string-typed surface. Unset (``None``) still means derive, which is why the override
+        # is tested for presence rather than for truth.
+        if self.config.llm_gateway_provider is not None:
+            relayed_provider = resolve_relayed_provider(self.config.llm_gateway_provider)
+        else:
+            relayed_provider = DEFAULT_RELAYED_PROVIDER if provider_factory is None else None
         gateway = LlmGatewayBackend(
             token_manager=self._token_manager,
             provider_adapter_factory=provider_factory,
@@ -1210,6 +1262,7 @@ class StudioServer:
             # Allow applying an approved proposal back into the workspace (R2).
             allowed_apply_roots=(self.workspace,),
             llm_gateway_url=f"http://127.0.0.1:{gateway_port}/internal/llm/turns",
+            llm_gateway_provider=relayed_provider,
             web_gateway_url=f"http://127.0.0.1:{web_port}",
             # Provider streaming and content egress are separate. Stop stays token-responsive even
             # when live/private content is denied; entitled Studio runs use the passive broker and
@@ -2872,8 +2925,15 @@ def _make_handler(studio: StudioServer) -> type[BaseHTTPRequestHandler]:
             if summary:
                 event = {**event, "studio_activity": summary}
             prefix = f"id: {event_id}\n" if event_id else ""
+            # ``ensure_ascii`` is left at its default of True, and stated rather than defaulted
+            # into: a line is the whole framing here. U+2028, U+2029 and U+0085 survive an
+            # ``ensure_ascii=False`` dump as themselves and split a frame mid-string for any
+            # ``str.splitlines`` reader (httpx's ``aiter_lines``) -- browsers' EventSource breaks
+            # on CR/LF only, so this route's own UI would not be the one to notice.
             self.wfile.write(
-                f"{prefix}data: {json.dumps(event, allow_nan=False)}\n\n".encode("utf-8")
+                f"{prefix}data: {json.dumps(event, ensure_ascii=True, allow_nan=False)}\n\n".encode(
+                    "utf-8"
+                )
             )
             self.wfile.flush()
 

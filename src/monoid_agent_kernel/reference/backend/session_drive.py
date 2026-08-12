@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -10,9 +9,10 @@ from typing import Any
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.content import ContentPart, content_part_from_json
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
-from monoid_agent_kernel.core.lifecycle import state_from_suspension
+from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspension
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
+from monoid_agent_kernel.providers._common import retry_delay_s
 from monoid_agent_kernel.reference.backend.ports import (
     LoopPort,
     MutableRunRecordPort,
@@ -72,10 +72,28 @@ def _studio_retry_resume_event(message: Any) -> tuple[dict[str, Any], str | None
 
 
 async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> None:
-    """Awaitable, cancellable exponential backoff with jitter for turn-level retries."""
-    delay = min(retry.max_delay_s, retry.initial_delay_s * (retry.backoff_multiplier ** max(0, attempt - 1)))
-    if retry.jitter_s > 0:
-        delay += random.uniform(0, retry.jitter_s)
+    """Awaitable, cancellable exponential backoff with jitter for turn-level retries.
+
+    The schedule is :func:`~monoid_agent_kernel.providers._common.retry_delay_s` -- the same one
+    the model-retry loops wait on -- because this loop reads the same ``ModelRetryConfig`` fields
+    and a backoff that differed between them would be a difference nobody chose. It also bounds
+    the exponent rather than only the product: the open-coded ``min(max_delay_s, initial *
+    multiplier ** (attempt - 1))`` this replaces raised ``OverflowError`` for a multiplier the
+    spec accepts (``1e308`` on the third attempt, the default ``2.0`` on the 1025th), and raised
+    HERE it would replace the turn failure being retried with an unclassified arithmetic error.
+
+    It also settles both non-finite doors rather than one. A cap this loop cannot resolve --
+    ``nan`` or ``-inf`` -- used to leave ``delay > 0`` False, retrying the turn with no wait at
+    all, and ``+inf`` used to reach ``asyncio.sleep(inf)``, a timer that never fires. Both are
+    resolved in the schedule, so this loop's ``delay`` is a number it can always wait on.
+    """
+    delay = retry_delay_s(
+        attempt,
+        retry.initial_delay_s,
+        retry.max_delay_s,
+        retry.backoff_multiplier,
+        retry.jitter_s,
+    )
     if delay > 0:
         await asyncio.sleep(delay)
 
@@ -105,6 +123,24 @@ class SessionDriveService:
                 state_from_suspension(suspension),
                 terminal=suspension.reason in {"terminal", "limited"},
             )
+            # The classification the park carries — ALL five, one vocabulary — promoted onto
+            # the record so status()/result() can say it: ``config_recoverable`` alone cannot
+            # separate an ``insufficient_quota`` (fix config) from a ``rate_limit`` (wait).
+            # Deliberately NOT a control-flow input: the branch below still decides
+            # retry-vs-give-up on ``retryable`` alone, because a config-fixable failure is not
+            # fixable by this driver — it is fixable by whoever reads the surface this feeds.
+            # Assigned on every park (not or-ed) so a later clean turn clears a stale flag —
+            # and that rule now covers the error text too: a clean settle park used to keep
+            # the previous failure's error/error_code on the record forever.
+            record.config_recoverable = bool(suspension.config_recoverable)
+            record.retryable = bool(suspension.retryable)
+            record.http_status = (
+                suspension.http_status if type(suspension.http_status) is int else None
+            )
+            record.provider_error_code = str(suspension.provider_error_code or "")
+            record.provider_retried = bool(suspension.provider_retried)
+            record.error = str(suspension.error or "")
+            record.error_code = str(suspension.error_code or "")
             if suspension.turn is not None:
                 record.last_final_output = suspension.turn.final_output
             if suspension.reason in {"terminal", "limited"}:
@@ -129,6 +165,12 @@ class SessionDriveService:
                     break
                 if signal is not self._context.resume_signal:
                     record.message_queue.put_nowait(signal)
+                # The record leaves the park with the pump: without this the resumed turn
+                # served state="paused" over HTTP until its NEXT park, because nothing between
+                # the resume signal and that park writes the record's state.
+                # (``record_event`` flips it too when the turn's ``model.turn.started``
+                # arrives; this covers the gap before it, and drivers without a sink.)
+                _set_record_state(record, SessionState.RUNNING, terminal=False)
                 suspension = await loop.arun_until_suspended(None)
                 continue
             if suspension.reason == "turn_failed":

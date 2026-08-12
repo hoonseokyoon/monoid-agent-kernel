@@ -65,6 +65,10 @@ class ModelStreamOutcome:
     ``retryable`` records the provider's transient-failure signal used by a lifecycle owner to
     decide whether the call is eligible for automatic retry. An explicit user reissue can still
     replace a non-retryable call after configuration changes.
+
+    ``config_recoverable`` is the other half of that sentence, and the reason it is a separate
+    fact: it says the reissue *will* succeed once the configuration is fixed. The live stream lane
+    used to classify a park with half the vocabulary the park itself carries.
     """
 
     status: ModelStreamStatus
@@ -72,6 +76,7 @@ class ModelStreamOutcome:
     usage: Mapping[str, Any] | None = field(default=None)
     error_code: str | None = None
     retryable: bool = False
+    config_recoverable: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in _STATUSES:
@@ -83,6 +88,8 @@ class ModelStreamOutcome:
             object.__setattr__(self, "usage", dict(self.usage))
         if type(self.retryable) is not bool:
             raise ValueError("model stream retryable must be a boolean")
+        if type(self.config_recoverable) is not bool:
+            raise ValueError("model stream config_recoverable must be a boolean")
 
 
 @runtime_checkable

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel._proc import file_size, spawn_process, terminate_process
-from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import exact_text, normalize_unicode_scalars
 from monoid_agent_kernel.errors import PermissionDenied, ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -1008,7 +1008,9 @@ def preview_command(command: str) -> str:
     first 200 characters -- all 150 of them -- and then had ``...`` appended, publishing the entire
     command plus a claim that it had been cut.
     """
-    single_line = " ".join(command.split())
+    # The base string first: this splits *and* measures, and a `str` subclass answers both for
+    # itself -- see `exact_text`. `truncate_to_bytes`, whose bound this shares, does the same.
+    single_line = " ".join(exact_text(command).split())
     if len(single_line.encode("utf-8")) <= PREVIEW_BYTE_THRESHOLD:
         return single_line
     return truncate_to_bytes(single_line, COMMAND_PREVIEW_BYTE_BUDGET) + "..."

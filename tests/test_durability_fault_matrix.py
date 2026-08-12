@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
-from support.runtime import runtime_config
+from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.capability import (
     CapabilityLease,
@@ -27,6 +27,10 @@ from monoid_agent_kernel.core.durable_metadata import (
     DurableMetadataCommitter,
 )
 from monoid_agent_kernel.core.outbox import Outbox, OutboxRequest
+from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.loop import AgentLoop
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter
 from monoid_agent_kernel.reference.stores.lease import LeaseStore, LocalFsLeaseStore
 from monoid_agent_kernel.reference.stores.sqlite import SqliteCheckpointStore, SqliteLeaseStore
 
@@ -246,6 +250,24 @@ def test_restart_lease_and_cancellation_race_has_one_recovery_owner(
     assert lease.owner("run_cancel") == winners[0]
     restored = checkpoint.latest("run_cancel")
     assert restored is not None and restored.checkpoint.cancellation_requested
+    # The flag surviving the store is only half of it: the winning recovery owner rebuilds an
+    # AgentLoop, and a fresh loop has no cancellation token. The restore used to apply the flag
+    # only when one was already installed, so the run that raced its way to a single owner was
+    # then silently un-cancelled by that owner. Assert the restore HONORS it.
+    workspace = tmp_path / f"ws-{kind}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    loop = AgentLoop(
+        spec=AgentRunSpec(
+            run_id="run_cancel",
+            workspace_root=workspace,
+            run_root=tmp_path / "recovered",
+        ),
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="done")]),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+    assert loop.cancellation_token is None
+    loop.restore(restored.checkpoint)
+    assert loop.cancellation_token is not None and loop.cancellation_token.requested is True
 
 
 def test_side_effect_staging_ack_and_restart_state_are_idempotent() -> None:

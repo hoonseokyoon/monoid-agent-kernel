@@ -307,7 +307,11 @@ def test_runtime_config_ingress_normalizes_identity_content_and_model_before_use
     assert request.model is not None and request.model.model == "model-\ufffd"
     assert request.tools[0].id == "binding.\ufffd"
     assert request.tools[0].provider_name == "call_\ufffd"
-    assert request.tools[0].input_schema["default"] is None
+    # Guidance and annotations are model-visible content and keep the substitution; the tool's
+    # ``input_schema`` is a control document, delivered exactly as its author wrote it and
+    # refused at the provider's serializer rather than rewritten (see
+    # tests/test_tool_schema_delivery.py).
+    assert math.isnan(request.tools[0].input_schema["default"])
     assert request.tools[0].annotations["value"] is None
 
 

@@ -7,19 +7,343 @@ common pieces here so the two adapters cannot drift.
 
 from __future__ import annotations
 
+import math
+import random
+import sys
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from monoid_agent_kernel.core.spec import ReasoningConfig
+from monoid_agent_kernel.core.json_ingress import exact_number
+from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
+
+# Half of ``log(float_max)``: the per-chunk log budget :func:`capped_backoff` sizes its power
+# by. Half, not all of it, so the chunk stays safe through the rounding of the division that
+# sizes it -- the power lands at or under ``sqrt(float_max)`` -- at the cost of at most doubling
+# a loop that runs four times in the worst case anyone can configure.
+_CHUNK_LOG_BUDGET = math.log(sys.float_info.max) / 2.0
+
+
+def retry_delay_s(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+    jitter_s: float,
+) -> float:
+    """How long to wait after ``attempt`` failed, before the next one.
+
+    The schedule itself, separated from waiting on it: the gateway's two loops and the
+    kernel runner's loop all wait differently, and a backoff policy that differed between
+    them would be a difference nobody chose. Moved here from ``gateway`` when the kernel
+    layer became the third caller; ``gateway._retry_delay`` remains as an import alias
+    because that module's tests pin and monkeypatch the schedule through the old name.
+
+    Every input that arrives as JSON is validated finite (``ModelRetryConfig.from_json`` ->
+    ``spec._model_control_number``) and every answer is too -- but that dataclass has no
+    ``__post_init__``, so a config built in Python carries whatever it was handed, and that is
+    a door :func:`capped_backoff` answers through rather than raising through. That applies to
+    ``max_delay_s`` the same as to ``backoff_multiplier``: an unusable CAP is resolved to
+    ``sys.float_info.max`` there, so what arrives here is already a number this can add to.
+
+    Jitter rides ON TOP of the cap -- deliberately, since the moment a herd most needs smearing
+    is the moment every member is sitting at ``max_delay_s`` -- but ``max_delay_s`` and
+    ``jitter_s`` are each bounded below and not above, and float addition returns ``inf`` rather
+    than raising when their sum leaves the range. A non-finite wait is not a long wait:
+    ``asyncio.sleep(inf)`` is a timer that never fires, so the loop stops being a loop. Hence
+    the saturating add.
+    """
+
+    delay = capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
+    # ``jitter_s`` is the one control this function reads on its own, and it reads it with an
+    # ordering -- inside the ``except`` of a retry loop, where a raise replaces the failure being
+    # recovered from. Same treatment as the four below; see ``exact_number``.
+    jitter_s = exact_number(jitter_s)
+    if jitter_s > 0:
+        delay = min(delay + random.uniform(0, jitter_s), sys.float_info.max)
+    return delay
+
+
+def capped_backoff(
+    attempt: int,
+    initial_delay_s: float,
+    max_delay_s: float,
+    backoff_multiplier: float,
+) -> float:
+    """``initial_delay_s * backoff_multiplier ** (attempt - 1)``, never above ``max_delay_s``.
+
+    ``max_delay_s`` caps the arithmetic, not only its result. Capping only the result --
+    ``min(max_delay_s, initial * multiplier ** (attempt - 1))`` -- lets the power leave the float
+    range before the cap is ever consulted, and ``float ** int`` raises ``OverflowError`` there
+    rather than saturating at infinity. A policy the spec ACCEPTS reaches that: ``max_attempts``
+    is validated as an integer above zero and ``backoff_multiplier`` as any positive finite
+    number, neither with an upper bound, so ``1e308`` overflows on the third attempt and the
+    default ``2.0`` on the 1025th -- while the configured cap still says four seconds. The
+    reference backend's outbox knobs (``outbox_max_attempts``, ``outbox_retry_factor``) are
+    plain operator-settable fields with no validation at all, so they reach it more cheaply.
+
+    Every caller evaluates the schedule inside a failure handler -- the three model-retry loops
+    around a retryable ``ModelAdapterError``, the reference backend's turn-retry handler, and its
+    outbox dispatcher scheduling around a failed send. An arithmetic error raised there does not
+    merely add noise: it REPLACES the failure being reported, so the layer above gets an
+    unclassified ``OverflowError`` instead of the taxonomy (``retryable``, ``code``,
+    ``http_status``) it retries, reports and stamps receipts on. So the exponent is bounded
+    before the power -- which is also why this is one function and not a shape each loop
+    re-derives. It is public for exactly that reason: the outbox applies FULL jitter
+    (``uniform(0, ceiling)``) rather than jitter on top, so it needs the bounded ceiling itself
+    rather than :func:`retry_delay_s`.
+
+    So it is TOTAL OVER THE FLOATS: every one, non-finite included, gets an answer rather than
+    an exception -- and for every FINITE ``max_delay_s`` the answer is the one the open-coded
+    ``min(max_delay_s, initial * multiplier ** n)`` gave, because a schedule three layers now
+    share is not the place to change what a policy MEANS. What is not preserved is the raise, and
+    one thing besides: a NON-FINITE cap. That expression answered ``nan`` for a NaN cap and
+    ``-inf`` for a negative-infinite one, and neither is a wait -- both floor to no backoff at
+    every caller -- so preserving them preserves the defect rather than the meaning. Measured
+    rather than asserted: over a lattice per argument (both signed zeros, a negative, a subnormal,
+    ``1e308``, and the three non-finite values), the finite-cap cells that answer differently are
+    exactly a NEGATIVE ``initial_delay_s`` -- not a wait any schedule can mean -- and one cell
+    where the saturation threshold answers the cap for a product one ULP below it. Every
+    non-finite-cap cell answers what the same call with ``sys.float_info.max`` answers, which is
+    the substitution itself and not a weaker claim about it.
+
+    "Over the floats" is the exact reach and not a hedge. None of these four fields is validated,
+    so an operator can put a Python ``int`` in one, and an int has no ceiling: ``10**400`` is a
+    perfectly good int and no float at all. Asking such a value ``math.isfinite`` -- which
+    CONVERTS before it decides -- raises ``OverflowError`` from inside the screen whose whole job
+    is to decide whether the value is usable, and raises it for every attempt, the first one
+    included. So both screens ask an ORDERING instead, ``-float_info.max <= x <= float_info.max``,
+    which is the question every other guard in this function already asks, which int-to-float
+    comparison answers exactly, and which converts nothing. An out-of-range cap then resolves
+    where ``+inf`` resolves, and an out-of-range multiplier where an infinite one does.
+
+    Neither screen asks the VALUE what it is. Both are orderings, which a numeric subclass may
+    override and raise from, so all four arguments are reduced to their base ``int``/``float`` at
+    the top by :func:`~monoid_agent_kernel.core.json_ingress.exact_number` and every comparison
+    below is between built-ins. Measured: a cap whose ``__ge__`` raises, on a plain ``10``, took
+    this down at the first attempt; a cap whose ``__lt__`` raises took it down at every attempt
+    both before and after the screens changed -- so the reduction closes a family, not a site.
+
+    One raise is left standing, and it is named here rather than left to be discovered: a
+    multiplier that is an int outside the float range AND not above ``1.0`` -- a large negative
+    one -- reaches ``initial_delay_s * backoff_multiplier ** exponent`` on the no-growth arm.
+    Ints do not saturate to ``inf`` the way the float spelling does, which is exactly what makes
+    that arm safe for floats, so the power is computed exactly and the product leaves the range.
+    Measured over an int lattice: 616 cells, every one of them raising identically before this
+    change and after it. It is the arithmetic rather than a screen, the no-growth arm is
+    deliberately the one that takes ``-inf``, and closing it is a separate change owing its own
+    evidence.
+
+    The rule that makes it total is one rule, and its ORDER is the whole of it: growth this
+    cannot resolve resolves UPWARD, to ``max_delay_s``, decided before any shortcut that reasons
+    about the delay or the cap. Every such shortcut is a claim about what the growth does to the
+    product, and none of them holds when the growth is not a number -- ``0 * inf`` is ``nan``,
+    not zero, so the zero-delay exit standing FIRST answered ``0.0`` where the schedule was the
+    cap: at the outbox a ``uniform(0, 0)`` ceiling, which is not a slower retry but an
+    unthrottled one. Validating the policy at one caller's boundary instead would leave the
+    other callers' boundaries to be found later; the arithmetic has to be total regardless of
+    what validation any of them later grows.
+
+    One bound decides, and it is the exact one: at ``saturating`` the product has already reached
+    the cap, so the answer IS the cap and no larger exponent can change it. Below that point the
+    product is representable even where the power on its own is not -- a subnormal
+    ``initial_delay_s`` under a large multiplier -- so the power is taken in chunks small enough
+    not to overflow and folded into the running delay as it goes. A ceiling on the power alone
+    would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
+    """
+
+    # Every screen and every ordering below is a question put to one of these four values, and
+    # a numeric SUBCLASS gets to answer it: ``a <= b`` hands priority to the reflected operand
+    # when its type is a proper subclass, so an override is called before the constant it is
+    # being compared against. One that raises does so from inside a schedule that is already
+    # recovering from a send failure -- and at the outbox, from between ``sender.send`` and
+    # ``record_outbox_result``, which loses the receipt for a side effect that already happened.
+    #
+    # Reduced here, once, and not screened at each site: there are seven orderings below and
+    # closing one leaves six. After this line every comparison in this function is between
+    # built-ins. ``attempt`` is included even though the durable boundary already strict-types it
+    # (``_nonnegative_integer`` demands ``type(value) is int``), because this function is public
+    # and that guarantee belongs to one caller rather than to the argument.
+    max_delay_s = exact_number(max_delay_s)
+    initial_delay_s = exact_number(initial_delay_s)
+    backoff_multiplier = exact_number(backoff_multiplier)
+    attempt = exact_number(attempt)
+
+    # A cap that is not a number is not a cap, and it is settled FIRST -- ahead even of the
+    # multiplier, because every arm below reads ``max_delay_s`` and not one of them screens it.
+    # The first-attempt exit returns ``min(max_delay_s, initial_delay_s)``, so it reads the cap
+    # on its own; a resolution placed below it would leak through that one. Both ends this
+    # otherwise lands on are wrong. ``nan`` and ``-inf`` leave every ``min(max_delay_s, .)``
+    # answering something not above zero, which every waiter reads as NO BACKOFF: ``if delay > 0``
+    # never sleeps, and the outbox's ``uniform(0, max(0.0, ceiling))`` is ``uniform(0, 0)`` -- an
+    # unthrottled resend against the endpoint that just refused, which is the state the multiplier
+    # arm below was fixed to prevent, reached through the other argument. ``+inf`` is the opposite
+    # end and no better: it rides ordinary products until one leaves the float range and then
+    # answers ``inf``, which is not a long wait but a timer that never fires, and a
+    # ``next_attempt_at`` no durable record will carry -- ``parse_float`` refuses it in the export
+    # that runs AFTER ``sender.send`` already returned.
+    #
+    # ``float_info.max`` and not zero, and not a policy default: an unlimited cap should stay
+    # unlimited. For every product this can represent, ``min(inf, product)`` and
+    # ``min(float_info.max, product)`` are the same number, so ``+inf`` keeps its meaning exactly
+    # and only loses the ability to escape as an answer. It is also the spelling this module
+    # already uses for a safe extreme (see the saturating add in ``retry_delay_s``).
+    #
+    # An ORDERING and not ``math.isfinite``: this screen decides whether the cap is usable, and a
+    # screen that converts its argument in order to decide can fail on the argument instead of
+    # judging it. ``math.isfinite(10**400)`` does not answer False, it raises ``OverflowError``,
+    # and it raises here -- above every arm, so for every attempt including the first. The outbox
+    # evaluates this schedule AFTER ``sender.send`` has returned, so that raise loses the receipt
+    # for a side effect that already happened and the request is dispatched a second time. The
+    # comparison asks what the rest of this function asks and cannot fail: int-to-float ordering
+    # in Python is exact and coerces nothing. Measured over 30,375 all-float cells, the two
+    # spellings answer identically in every one -- the substitution changes which VALUES can be
+    # screened, not what the screen decides about any float.
+    if not -sys.float_info.max <= max_delay_s <= sys.float_info.max:
+        max_delay_s = sys.float_info.max
+    # The MULTIPLIER is settled next, before any shortcut that reasons about the delay or the
+    # cap. Every one of those shortcuts rests on what the growth does to the product, and that
+    # premise holds only for a growth that is a number -- see the zero-delay exit at the bottom,
+    # which is the one that got this wrong by standing above it.
+    exponent = max(0, attempt - 1)
+    # Nothing to grow: the first attempt applies no power at all, and ``multiplier ** 0`` is
+    # ``1.0`` for every multiplier, non-finite ones included, so which one it is cannot matter.
+    if exponent == 0:
+        return min(max_delay_s, initial_delay_s)
+    # A multiplier that does not grow drives the power toward zero, never out of range. ``<=``
+    # is an ordering, so this also takes ``-inf``, whose power is already infinite and so cannot
+    # overflow INTO one; the product here is the open-coded answer exactly.
+    if backoff_multiplier <= 1.0:
+        return min(max_delay_s, initial_delay_s * backoff_multiplier**exponent)
+    # What is left is growth this cannot size: NaN, or ``+inf``. No ordering screens a NaN, so it
+    # fell THROUGH every guard into ``int(_CHUNK_LOG_BUDGET / math.log(nan))``, where ``int(nan)``
+    # raises ``ValueError`` -- the same shape as the ``OverflowError`` the exponent bound exists
+    # to remove, in the same handlers, and worse at the outbox, which evaluates its schedule
+    # AFTER ``sender.send`` has returned: a raise there loses the receipt for a side effect that
+    # already happened, and the request is dispatched a second time.
+    #
+    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD
+    # -- which is an ANSWER only because the cap itself was resolved first, at the top.
+    # That is what ``min(max_delay_s, initial * multiplier ** n)`` answered for every one of
+    # these (``initial * inf`` is ``inf``, ``initial * nan`` is ``nan``, and ``min`` keeps the cap
+    # against either), and it is the only safe direction independently of that -- the opposite
+    # end of the range is a zero wait, an unthrottled resend against the endpoint that just
+    # refused. One deliberate departure from the old product: a NEGATIVE initial delay under
+    # ``+inf`` used to answer ``-inf``. A negative wait is not a wait, and the cap is strictly
+    # safer than the "no backoff" both of them floor to.
+    #
+    # The same ordering, for the same reason, and stated in both places on purpose: this screen
+    # predates the cap's and carried the identical hazard, so fixing only the one a reviewer
+    # named would have left the twin standing in the same function under the same idiom.
+    if not -sys.float_info.max <= backoff_multiplier <= sys.float_info.max:
+        return max_delay_s
+    # Nothing a growth could change: a zero initial delay keeps the product at zero, and a zero
+    # cap keeps the answer there. This has to come AFTER the multiplier is settled -- "zero times
+    # the growth is zero" is a claim about a growth that is a number, and ``0 * inf`` and
+    # ``0 * nan`` are both ``nan``, which ``min(cap, .)`` resolves to the CAP. Standing above the
+    # multiplier, this exit answered ``0.0`` for a policy whose schedule was the cap, i.e. no
+    # backoff where the cap was owed. Settled here, the logarithms below never see zero or a
+    # negative; ``<= 0.0`` is an ordering, so ``-inf`` rides out on it too, and a NaN delay or cap
+    # reaches ``math.log``, which answers ``nan`` rather than raising and leaves every comparison
+    # that answer feeds False.
+    if initial_delay_s <= 0.0 or max_delay_s <= 0.0:
+        return min(max_delay_s, initial_delay_s)
+    growth_per_step = math.log(backoff_multiplier)
+    # ``int >= float`` compares exactly in Python, so ``attempt`` is never itself converted --
+    # the guard against an oversized exponent cannot be defeated by the exponent's own size.
+    if exponent >= (math.log(max_delay_s) - math.log(initial_delay_s)) / growth_per_step:
+        return max_delay_s
+    # One chunk covers every schedule a real policy writes, and then this is the arithmetic it
+    # always was. Growth is monotone, so an intermediate that reaches the cap settles the answer
+    # for every step still owed -- which is also what keeps a chunk product that saturates to
+    # infinity (multiplication, so no ``OverflowError``) from escaping as one.
+    chunk = max(1, int(_CHUNK_LOG_BUDGET / growth_per_step))
+    delay = initial_delay_s
+    remaining = exponent
+    while remaining > 0:
+        taken = min(remaining, chunk)
+        delay *= backoff_multiplier**taken
+        if delay >= max_delay_s:
+            return max_delay_s
+        remaining -= taken
+    return min(max_delay_s, delay)
 
 
 def build_reasoning_payload(reasoning: ReasoningConfig) -> dict[str, Any]:
-    """Reasoning block for a model request: ``{}`` when default/off, else effort/summary."""
+    """Reasoning block for a model request: ``{}`` when default/off, else effort/summary.
+
+    Like its generation sibling below, this projection is also the gateway server's
+    ``reasoning_applied`` echo and the client checker's expected value, so the two sides of
+    that wire agree on the *shape* of "applied" by construction. Note the default config is
+    NOT the empty block here (``ReasoningConfig()`` projects ``{"effort": "medium"}``), which
+    is why "did the request use the feature" is answered by ``ReasoningConfig.is_default``
+    rather than by this payload's truthiness.
+    """
     payload: dict[str, Any] = {}
     if reasoning.effort != "default":
         payload["effort"] = reasoning.effort
     if reasoning.summary != "off":
         payload["summary"] = reasoning.summary
     return payload
+
+
+def build_generation_payload(generation: GenerationConfig) -> dict[str, Any]:
+    """Sampling block for a model request: ``{}`` when nothing is set, else only the set keys.
+
+    ``on_unsupported`` never rides here -- it is the caller's policy, not a provider knob. The
+    gateway server's ``generation_applied`` echo is this same block, so the two sides of that
+    wire agree on the *shape* of "applied" by construction. Whether to emit it at all is a
+    separate question the server answers from its upstream adapter's ``generation_support``
+    declaration -- this builder cannot know what an adapter does with the config it is handed.
+    """
+    payload: dict[str, Any] = {}
+    if generation.temperature is not None:
+        payload["temperature"] = generation.temperature
+    if generation.top_p is not None:
+        payload["top_p"] = generation.top_p
+    if generation.max_output_tokens is not None:
+        payload["max_output_tokens"] = generation.max_output_tokens
+    return payload
+
+
+def reasoning_replay_window_start(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Index of the first message in the ACTIVE REPLAY WINDOW: one past the last ``user`` entry.
+
+    Captured provider reasoning can only be replayed while it sits inside this window — the
+    in-flight tool loop. Once a new user message lands, every earlier block is outside the
+    window, and it stays outside forever because the window only ever moves forward.
+
+    Two halves depend on that one fact and they must not drift: the OpenAI adapter decides what
+    to REPLAY out of the window (``_reasoning_replay_flags``), and the kernel decides what is
+    still worth SENDING into it (:func:`prune_dead_reasoning`). A log with no user message at
+    all is entirely window (start ``0``), which is what the replay rule always did.
+    """
+    start = 0
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            start = index + 1
+    return start
+
+
+def prune_dead_reasoning(messages: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Drop the ``reasoning`` key from every message BEFORE the active replay window.
+
+    Outside the window the block is unreachable: the adapter reconstructs those turns from
+    ``content``/``tool_calls`` and never reads it. Sending it anyway is pure cost, and cost that
+    grows with the conversation — one dead block per user turn, re-sent on every later request,
+    counted against the wire-byte cap and the receiving server's body limit.
+
+    This builds the ephemeral wire copy; the caller's messages are never mutated and the durable
+    log keeps every block verbatim (see ``docs/CONTRACTS.md``). Messages that keep their block
+    are passed through by identity, so the copy is cheap on the common short conversation.
+    """
+    start = reasoning_replay_window_start(messages)
+    pruned: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index < start and "reasoning" in message:
+            pruned.append({key: value for key, value in message.items() if key != "reasoning"})
+        else:
+            pruned.append(message)
+    return tuple(pruned)
 
 
 def text_from_message_content(content: Any) -> str:
@@ -54,6 +378,63 @@ def project_message_to_text(message: dict[str, Any]) -> dict[str, Any]:
     if isinstance(content, list):
         return {**message, "content": text_from_message_content(content)}
     return message
+
+
+# Every key :func:`normalize_usage` below can emit, and therefore the whole vocabulary of a
+# normalized usage mapping. Declared here, beside the function that is its authority, so a
+# consumer that must FILTER a wider mapping down to usage (the subagent roll-up folds a child's
+# whole metrics dict into the parent's totals, where a stray ``duration_s`` would corrupt them)
+# names the domain rather than hand-copying a subset of it. Kept in step with the function by
+# ``tests/test_carriage_conformance.py``, which reads the keys the live callable can assign.
+NORMALIZED_USAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "reasoning_tokens",
+        "audio_tokens",
+    }
+)
+
+
+def usage_reported_by(payload: Any) -> dict[str, int]:
+    """Tokens a call that ends in a REFUSAL reported spending, read leniently.
+
+    The stamp's source on every refusal path an adapter has. A payload the reader rejects for a
+    malformed key was generated and BILLED before the reader ever looked at it, so the refusal is
+    the only carrier left for its cost -- and without this the receipt, the run's token budget
+    and (across a hop) the tenant ledger all record zero for a turn the provider charged for.
+
+    Lenient on purpose, and that is the whole reason it is not :func:`normalize_usage`. This runs
+    on a failure path, so a second malformation must not replace the failure being reported with
+    a different one: anything unreadable simply reads as "not reported", including a ``usage``
+    that is itself the malformed key. Values are judged, names are not -- an unknown counter a
+    newer gateway reports rides through rather than being silently dropped.
+
+    One function for both adapters. It began as the gateway client's ``_reported_error_usage``
+    and the OpenAI adapter had no equivalent at all, which is exactly how the *source* reader --
+    the one that sees the provider's own billed body first -- came to refuse it for free. Two
+    copies of "what counts as a reported cost" is two copies that can disagree, and the census
+    holds this one to the same verdict as the four other readers of the same stamp.
+    """
+
+    # The outer guard is the one the shared version needed: the gateway client only ever handed
+    # this a decoded JSON object, while the OpenAI adapter hands it whatever the SDK returned, and
+    # an ``AttributeError`` raised *inside* an except-handler would replace the failure being
+    # reported -- the exact thing this function exists to avoid. The ``usage`` test stays ``dict``,
+    # byte-identical to the verdict the gateway wire has always given.
+    if not isinstance(payload, Mapping):
+        return {}
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if type(value) is int and value >= 0
+    }
 
 
 def _usage_object(value: Any, field_name: str) -> dict[str, Any]:

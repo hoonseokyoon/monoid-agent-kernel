@@ -17,6 +17,7 @@ from __future__ import annotations
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.core.spec import (
     AgentRunSpec,
+    GenerationConfig,
     ModelConfig,
     ModelRetryConfig,
     ReasoningConfig,
@@ -136,7 +137,24 @@ from monoid_agent_kernel.core.model_stream import (
 
 # Model call execution (adapter dispatch + cancel/deadline race + capture). Above ``core`` because
 # it names the provider vocabulary it drives; see the module docstring.
-from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_call import ModelCallRunner, SettledModelCall
+
+# One validated model call: dispatch + validate + bounded explicit repair, outside any loop.
+from monoid_agent_kernel.validated_call import (
+    AttemptDeltaConsumer,
+    AttemptStarted,
+    ValidatedCallResult,
+    ValidatedCallRunner,
+)
+
+# The fail-closed capability probes: what a transport in front of an adapter may base an
+# applied-parameters proof on. Documented as the contract for third-party gateways, so they
+# are importable from here rather than from a provider module.
+from monoid_agent_kernel.providers.base import (
+    generation_support,
+    reasoning_support,
+    structured_output_support,
+)
 
 # Output validation (post-response conformance; checked at the settle points)
 from monoid_agent_kernel.core.output_validator import (
@@ -277,6 +295,7 @@ __all__ = [
     "ModelConfig",
     "ModelRetryConfig",
     "ReasoningConfig",
+    "GenerationConfig",
     "RunLimits",
     "AgentArtifact",
     "AgentRunResult",
@@ -363,6 +382,14 @@ __all__ = [
     "ModelStreamObserverFactory",
     "safe_open_model_stream",
     "ModelCallRunner",
+    "SettledModelCall",
+    "ValidatedCallRunner",
+    "ValidatedCallResult",
+    "AttemptDeltaConsumer",
+    "AttemptStarted",
+    "structured_output_support",
+    "generation_support",
+    "reasoning_support",
     "OutputValidator",
     "OutputValidatorBinding",
     "ValidationOutcome",

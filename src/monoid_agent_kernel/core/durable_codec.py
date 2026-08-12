@@ -7,6 +7,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar
 
+from monoid_agent_kernel.core.json_ingress import portable_type_name
+
 T = TypeVar("T")
 U = TypeVar("U")
 
@@ -171,7 +173,7 @@ class DurableCodec(Generic[T]):
             except Exception as exc:
                 return self.corrupt(
                     f"{self.family} migration v{current_version}->v{current_version + 1} "
-                    f"failed ({type(exc).__name__})",
+                    f"failed ({portable_type_name(exc)})",
                     observed_schema=version.raw,
                 )
             if not isinstance(migrated_payload, dict):
@@ -189,7 +191,7 @@ class DurableCodec(Generic[T]):
             value = loader(copy.deepcopy(working))
         except Exception as exc:
             return self.corrupt(
-                f"{self.family} payload validation failed ({type(exc).__name__})",
+                f"{self.family} payload validation failed ({portable_type_name(exc)})",
                 observed_schema=version.raw,
             )
         return DurableLoadResult(

@@ -18,6 +18,7 @@ from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.reference._shared.http_util import (
     HardenedThreadingHTTPServer,
     HttpRequestTooLarge,
+    drain_request_body,
     log_http_request,
     read_json_limited,
     redact_internal_error,
@@ -158,6 +159,9 @@ def make_mcp_handler(
         def _write_error(
             self, status: HTTPStatus, message: str, *, error_code: str = "mcp_gateway_error"
         ) -> None:
+            # Before the status, not after: the bytes have to leave the receive buffer before the
+            # close, and the close follows this write immediately.
+            drain_request_body(self)
             self._write_json(
                 {"error": message, "error_code": error_code, "http_status": int(status)},
                 status=status,

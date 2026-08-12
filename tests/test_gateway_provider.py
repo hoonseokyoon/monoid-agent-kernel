@@ -448,6 +448,7 @@ def test_gateway_one_shot_maps_non_utf8_json_to_bad_response(monkeypatch: Any) -
     [
         {"type": "text_delta", "text": "hi", "provider_retried": "false"},
         {"type": "error", "error": "busy", "retryable": "false"},
+        {"type": "error", "error": "busy", "config_recoverable": "false"},
     ],
 )
 def test_gateway_sse_rejects_truthy_non_boolean_controls(frame: dict[str, Any]) -> None:
@@ -506,7 +507,7 @@ def test_gateway_rejects_coercible_wire_http_status(payload: dict[str, Any]) -> 
     assert "http_status" in str(caught.value)
 
 
-@pytest.mark.parametrize("field_name", ["retryable", "provider_retried"])
+@pytest.mark.parametrize("field_name", ["retryable", "provider_retried", "config_recoverable"])
 def test_gateway_non_200_rejects_truthy_non_boolean_controls(field_name: str) -> None:
     from monoid_agent_kernel.providers.gateway import _error_from_status_body
 
@@ -547,6 +548,10 @@ def test_gateway_non_200_validation_preserves_upstream_retry_evidence(
         ({"error": 42}, True),
         ({"error": "busy", "retryable": "false"}, True),
         ({"error": "busy", "provider_retried": "false"}, False),
+        # The third boolean control on this wire goes through the same exact-boolean reader, so
+        # a coerced ``"false"`` must refuse on all three readers rather than authorize a config
+        # fix nobody stated.
+        ({"error": "busy", "config_recoverable": "false"}, True),
     ],
 )
 def test_gateway_error_validation_preserves_valid_status_and_retry_evidence(
@@ -624,6 +629,116 @@ def test_gateway_retries_retryable_http_error_then_succeeds(monkeypatch) -> None
 
     assert calls == 2
     assert turn.final_text == "done"
+
+
+def test_gateway_sends_the_request_key_on_every_attempt(monkeypatch) -> None:
+    """The sync route rebuilds headers per attempt so a credential can refresh mid-call; the
+    idempotency key is read off the same request each time and must not move with them. One
+    retry scope on the wire, however many attempts the adapter's loop makes. (urllib stores
+    header names capitalized, so the capture reads ``Idempotency-key``.)"""
+    seen: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        seen.append(request.get_header("Idempotency-key"))
+        if len(seen) == 1:
+            raise HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                {},
+                io.BytesIO(
+                    b'{"error":"rate limited","error_code":"gateway_rate_limited","retryable":true}'
+                ),
+            )
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.time.sleep", lambda _delay: None)
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=2, initial_delay_s=0, jitter_s=0),
+        ),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(
+        ModelRequest("finish", "sys", (), None, idempotency_key="idem_fixed")
+    )
+
+    assert turn.final_text == "done"
+    assert seen == ["idem_fixed", "idem_fixed"]
+
+
+def test_gateway_sends_no_key_header_for_an_unkeyed_request(monkeypatch) -> None:
+    """A request that carries no key produces no header, not an empty one: the pre-W7-3 wire
+    shape is a contract, and ``_headers()`` with no argument keeps its exact old answer."""
+    seen: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"turn_handle":"turn_ok","final_text":"done","usage":{"total_tokens":1}}'
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        seen.append(request.get_header("Idempotency-key"))
+        return Response()
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", fake_urlopen)
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"),
+        token="run-token",
+    )
+
+    turn = adapter.next_turn(ModelRequest("finish", "sys", (), None))
+
+    assert turn.final_text == "done"
+    assert seen == [None]
+    assert "Idempotency-Key" not in adapter._headers()
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="too-long"),
+    ],
+)
+def test_gateway_omits_a_key_that_would_split_the_outbound_header(hostile: str) -> None:
+    """The last point before a header exists, and the stacks below it do not defend it.
+
+    Probed: `http.client._is_illegal_header_value` refuses a bare CRLF but NOT an obsolete
+    folded one, and `httpx.Headers` accepts the folded value too -- so an unvalidated key on a
+    directly-built request (the runner's own always conforms) reaches the wire and splits the
+    request header. Omitted rather than raised: an adapter must not lose a paid call over a
+    bookkeeping token.
+    """
+    adapter = GatewayModelAdapter(
+        ModelConfig(gateway_url="http://gateway.local/internal/llm/turns"), token="run-token"
+    )
+
+    assert "Idempotency-Key" not in adapter._headers(idempotency_key=hostile)
+    # Counterweight: the conforming shape is still presented, so this is a filter and not a
+    # switch that turned the feature off.
+    assert adapter._headers(idempotency_key="idem_abc123")["Idempotency-Key"] == "idem_abc123"
 
 
 def test_gateway_retries_transient_connection_error_then_succeeds(monkeypatch) -> None:
@@ -1035,6 +1150,167 @@ def test_a_non_200_body_carries_the_backend_retry_end_to_end() -> None:
     assert _error_from_status_body(400, json.dumps(plain)).provider_retried is False
 
 
+def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises() -> None:
+    """Four of the six validators could not name the status their caller already knew.
+
+    ``_exact_gateway_bool`` and ``_gateway_string`` forward it and the other four did not, so the
+    *same* malformed error envelope produced a classified failure carrying HTTP 400 or one
+    carrying nothing at all, decided by which field of it was malformed. Each is driven directly:
+    accepting the parameter and dropping it on the floor would satisfy a signature census and
+    fix nothing.
+
+    Ten now, not six. Every validator that joined the wire afterwards inherited the same
+    obligation -- ``_gateway_reasoning_items`` with X-3's reasoning hop, the two echo
+    validators the value-validator census turned up unregistered, and B1's
+    ``_validated_reasoning_echo``, which joined the censused way. The list the conformance
+    suite pins against is derived from "does it raise", so an eleventh arrives here as a
+    failing census rather than as a quiet omission.
+    """
+    from monoid_agent_kernel.providers.gateway import (
+        _exact_gateway_bool,
+        _exact_gateway_int,
+        _gateway_fragment_string,
+        _gateway_reasoning_items,
+        _gateway_string,
+        _gateway_usage,
+        _portable_gateway_payload,
+        _validated_generation_echo,
+        _validated_reasoning_echo,
+        _validated_schema_echo,
+    )
+
+    raisers = {
+        "_exact_gateway_bool": lambda: _exact_gateway_bool(
+            {"retryable": "false"}, "retryable", default=False, context="c", http_status=400
+        ),
+        "_gateway_string": lambda: _gateway_string(
+            {"error": 42}, "error", context="c", http_status=400
+        ),
+        "_exact_gateway_int": lambda: _exact_gateway_int(
+            {"index": "1"}, "index", default=0, context="c", minimum=0, http_status=400
+        ),
+        "_gateway_fragment_string": lambda: _gateway_fragment_string(
+            {"text": 42},
+            "text",
+            context="c",
+            http_status=400,
+            known_provider_retried=False,
+        ),
+        "_gateway_usage": lambda: _gateway_usage(
+            {"input_tokens": "many"}, context="c", http_status=400
+        ),
+        # A non-string object key is what portable JSON cannot carry at all (a non-finite number
+        # is substituted, not refused).
+        "_portable_gateway_payload": lambda: _portable_gateway_payload(
+            {1: "one"}, context="c", http_status=400
+        ),
+        # An array of objects is the only shape the replay path can hand back to a provider.
+        "_gateway_reasoning_items": lambda: _gateway_reasoning_items(
+            ["not an object"], context="c", http_status=400
+        ),
+        "_validated_generation_echo": lambda: _validated_generation_echo(
+            "not an object", http_status=400
+        ),
+        "_validated_schema_echo": lambda: _validated_schema_echo("not a bool", http_status=400),
+        "_validated_reasoning_echo": lambda: _validated_reasoning_echo(
+            "not an object", http_status=400
+        ),
+    }
+
+    for name, raiser in raisers.items():
+        with pytest.raises(ModelAdapterError) as caught:
+            raiser()
+        assert caught.value.http_status == 400, name
+        assert caught.value.provider_error_code == "gateway_bad_response", name
+
+    # And an unstated status stays unstated rather than being invented from the failure class.
+    with pytest.raises(ModelAdapterError) as unstated:
+        _gateway_usage({"input_tokens": "many"}, context="c")
+    assert unstated.value.http_status is None
+
+
+def test_every_error_constructor_reads_the_config_recoverability() -> None:
+    """The `provider_retried` twin above, for the classification that had no wire slot at all.
+
+    `config_recoverable` says "the remedy is configuration, not another attempt", and it used to
+    die at the hop: no server writer emitted it and all three client readers rebuilt `False`, so
+    a config-fixable refusal arrived one hop out as an ordinary terminal failure and only the 4xx
+    `_model_error_status` picks hinted at it. Every reader is driven, because a fact bound on one
+    of them and not its siblings is the shape this wire keeps producing.
+    """
+    from monoid_agent_kernel.providers.gateway import (
+        _chunk_from_event,
+        _error_from_http_error,
+        _error_from_status_body,
+    )
+
+    body = {
+        "error": "upstream refused an unproven turn",
+        "error_code": "gateway_generation_not_applied",
+        "retryable": False,
+        "http_status": 422,
+        "config_recoverable": True,
+    }
+
+    with pytest.raises(ModelAdapterError) as sync_read:
+        _parse_gateway_response(dict(body))
+    assert sync_read.value.config_recoverable is True
+
+    with pytest.raises(ModelAdapterError) as stream_read:
+        _chunk_from_event({"type": "error", **body})
+    assert stream_read.value.config_recoverable is True
+
+    assert _error_from_status_body(422, json.dumps(body)).config_recoverable is True
+    assert _error_from_http_error(_http_error(422, json.dumps(body))).config_recoverable is True
+
+    # An older gateway that never mentions the key still reads as "not config-fixable" — the
+    # compatibility contract of the added field, stated on every reader.
+    silent = {key: value for key, value in body.items() if key != "config_recoverable"}
+    with pytest.raises(ModelAdapterError) as silent_sync:
+        _parse_gateway_response(dict(silent))
+    assert silent_sync.value.config_recoverable is False
+    with pytest.raises(ModelAdapterError) as silent_stream:
+        _chunk_from_event({"type": "error", **silent})
+    assert silent_stream.value.config_recoverable is False
+    assert _error_from_status_body(422, json.dumps(silent)).config_recoverable is False
+
+
+def test_both_server_writers_put_the_config_recoverability_on_the_wire() -> None:
+    """The writer half: one body definition, two writers, and the same key on both.
+
+    The non-200 body and the SSE terminal frame are separate call sites around `_error_body`,
+    which is exactly where a field goes missing — `provider_retried` reached both only because
+    they were reviewed together.
+    """
+    from monoid_agent_kernel.providers.gateway import _error_from_status_body
+    from monoid_agent_kernel.reference.llm_gateway.http import _error_body, _stream_error_frame
+
+    refused = ModelAdapterError(
+        "upstream refused an unproven turn",
+        provider_error_code="gateway_generation_not_applied",
+        retryable=False,
+        config_recoverable=True,
+    )
+    body = _error_body(
+        422,
+        str(refused),
+        error_code=refused.provider_error_code,
+        retryable=refused.retryable,
+        config_recoverable=refused.config_recoverable,
+    )
+    assert body["config_recoverable"] is True
+    assert _error_from_status_body(422, json.dumps(body)).config_recoverable is True
+
+    frame = _stream_error_frame(None, refused)
+    assert frame["config_recoverable"] is True
+    assert {key: value for key, value in frame.items() if key != "type"} == body
+
+    # The default direction: a failure the gateway raised on its own is not config-fixable, and
+    # the key is written rather than omitted, so a reader never has to guess which it was.
+    plain = _stream_error_frame(None, ModelAdapterError("refused"))
+    assert plain["config_recoverable"] is False
+
+
 def test_a_first_attempt_failure_does_not_claim_a_retry() -> None:
     """The false-positive direction. Every other test asks whether a real retry is recorded; this
     asks whether an imaginary one is, which a boundary slip on `_stamp_retry` would produce for
@@ -1126,3 +1402,47 @@ def test_the_retry_is_reported_before_the_wait_not_after_it(monkeypatch: Any) ->
         adapter.next_turn(ModelRequest(system_prompt="s", instruction="hi", tools=()))
 
     assert order == ["report", "wait", "report", "wait"]
+
+
+def test_the_kernel_layer_turns_the_adapters_own_loop_off(monkeypatch: Any) -> None:
+    """Exactly one layer may multiply attempts, and `layer` names it.
+
+    Under `layer="kernel"` the runner owns the retry loop, so this adapter must make exactly
+    one HTTP attempt no matter what `max_attempts` says -- the schedule fields govern
+    whichever layer loops, not this one. The default-layer half is the control: the same
+    refused call IS loop-eligible (retryable, its code in `retry_on`), so the kernel half
+    passing cannot mean the error was never retryable to begin with.
+    """
+
+    calls: list[int] = []
+
+    def _refused(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append(1)
+        raise URLError("unreachable")
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", _refused)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
+
+    kernel = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3, layer="kernel"),
+        ),
+        token="run-token",
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        kernel.next_turn(ModelRequest("go", "sys", (), None))
+    assert caught.value.retryable is True
+    assert len(calls) == 1
+
+    calls.clear()
+    adapter_layer = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(max_attempts=3),
+        ),
+        token="run-token",
+    )
+    with pytest.raises(ModelAdapterError):
+        adapter_layer.next_turn(ModelRequest("go", "sys", (), None))
+    assert len(calls) == 3

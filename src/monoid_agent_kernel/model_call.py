@@ -14,24 +14,36 @@ imports `core.content`, so it would close a `core` <-> `tools` cycle. A runner t
 genuinely depends on provider vocabulary, so it belongs in the layer above both, next to `loop` --
 which is where `permissions`, `recorder` and `loop_phases` already live.
 
-**What it does not do: retry.** Backoff and HTTP classification live inside the adapters
-(`providers/gateway.py`), so the kernel makes exactly one adapter call per turn. That is the
-distinction `ModelCallReceipt.attempts` and `provider_retried` encode, and it is why this module
-inherits classification without inheriting a retry loop.
+**Where the replay key's arithmetic lives.** One layer down, in
+`providers/_request_identity.py`, so the replay adapter shares the exact functions this
+runner stamps receipts with (this module cannot be imported from `providers` without a
+cycle). The names are re-imported here for this module's own callers and their tests.
+
+**Where retry lives: one owner per call, named by the config.** Backoff and HTTP
+classification live inside the adapters (`providers/gateway.py`), and `ModelRetryConfig.layer`
+names which loop owns a call. Under the default `"adapter"` layer the kernel makes exactly one
+adapter call per turn; under `"kernel"` the attempt loop in this module re-dispatches, with the
+adapter's copy of the config neutralized to a single attempt so a config-honoring loop cannot
+multiply against it. (A loop that reads neither the config nor the layer is out of the kernel's
+reach — its retries surface as `provider_retried` evidence, never as attempts; CONTRACTS states
+both sides of that compliance.) That is the distinction `ModelCallReceipt.attempts` (kernel dispatches) and
+`provider_retried` (a loop below the adapter boundary reported) encode — and classification is
+inherited from the adapters either way: this module reads what the escaping exception carries,
+it never invents its own taxonomy. (This paragraph said "the kernel makes exactly one adapter
+call per turn" unconditionally until W7-3; that stopped being true when W7-0 landed the kernel
+layer, and two review cycles read past it.)
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import inspect
-import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
@@ -44,10 +56,16 @@ from monoid_agent_kernel.core._sync_bridge import (
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.model_io import (
+    ModelCallAttempt,
     ModelCallReceipt,
     ModelIOSubscription,
+    destination_digest,
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
@@ -65,11 +83,29 @@ from monoid_agent_kernel.providers.base import (
     assemble_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
+    mark_provider_usage,
+    new_idempotency_key,
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
+    resolved_provider_name,
 )
-from monoid_agent_kernel.tools.base import ToolSpec
+from monoid_agent_kernel.providers._common import retry_delay_s
+from monoid_agent_kernel.providers._request_identity import (
+    _REQUEST_DIGEST_GENERATION,
+    _digest,
+    _encoded_digest,
+    _prompt_payload,
+    _request_payload,
+    effective_model_for,
+)
+from monoid_agent_kernel.providers._request_identity import (  # noqa: F401 - re-exported
+    _PROMPT_DIGEST_GENERATION,
+    _DigestResult,
+    _model_identity,
+    _prompt_terms,
+    _tool_payload,
+)
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.model_call")
 
@@ -87,139 +123,26 @@ ShouldAbort = Callable[[], bool]
 """Polled once per streamed chunk, after it has been delivered. See `ModelCallRunner.acall`."""
 
 
-def _prompt_payload(request: ModelRequest) -> dict[str, Any]:
-    """The assembled prompt, as the thing `prompt_digest` identifies.
+@dataclass(frozen=True)
+class SettledModelCall:
+    """One settled call, as `ModelCallRunner.settled_sink` receives it.
 
-    Tool definitions and generation settings are deliberately absent: the question this digest
-    answers is "did the model see the same conversation twice", which must stay true when a tool is
-    added to the surface or the temperature changes around it.
+    ``receipt`` is always present -- success or failure, this is the audit fact. ``turn`` is the
+    normalized provider turn on success and ``None`` on failure, because a failed call has no
+    answer to record. ``request_preimage`` is the exact byte sequence ``request_digest`` was
+    hashed over, present only when the runner was asked to capture it
+    (`capture_request_preimage`) *and* a key was issued -- a refusal has no preimage because a
+    preimage for an unissued key would be an identity for a call that does not exist.
 
-    Everything that *constitutes* the conversation is present, including the by-reference shape.
-    A request may carry its history as `messages`, or as a `previous_turn_handle` naming history the
-    provider holds plus the `observations` produced since -- and in that second shape those two
-    fields **are** the prompt. Hashing only `messages` made every by-reference continuation collide
-    with every other, which is the ordinary case for a gateway client, not an edge one.
-
-    `messages` keeps `None` apart from `()`, because the wire does. Both shipped adapters select the
-    request shape with `messages is not None` -- an empty tuple sends an empty conversation and
-    drops the instruction, `None` sends the instruction or the handle. `or ()` read the field for
-    emptiness when the field's own meaning is presence, so two requests the provider answers
-    differently were handed one replay key.
+    The preimage travels as the bytes the hasher consumed, never re-derived at the sink: the
+    key's ``provider`` term comes from a resolution the runner performed against the adapter at
+    call time, and re-resolving at the sink is the double-read that once let a receipt say
+    ``openai`` while its key was taken under ``gateway``.
     """
 
-    return {
-        "system_prompt": request.system_prompt,
-        "instruction": request.instruction,
-        "messages": None if request.messages is None else list(request.messages),
-        "previous_turn_handle": request.previous_turn_handle,
-        "observations": [observation.to_json() for observation in request.observations],
-    }
-
-
-# Bounds the encoder's output, not the input's shape. Comfortably above a resolved multimodal
-# request (base64 image parts ride in ``messages``) and far below the point where a deliberately
-# shared payload could expand without end.
-_MAX_DIGEST_BYTES = 4 * 1024 * 1024
-
-# The settings ``core._util.canonical_sha256`` serializes with, and the same object does the
-# encoding and the hashing here. A guard that checks one encoding while another does the hashing
-# is exactly how a payload once passed validation and then raised mid-hash.
-_CANONICAL_ENCODER = json.JSONEncoder(
-    ensure_ascii=False,
-    allow_nan=False,
-    sort_keys=True,
-    separators=(",", ":"),
-    check_circular=True,
-)
-
-
-def _digest(payload: dict[str, Any]) -> str:
-    """The canonical-JSON digest of `payload`, or `""` when canonical JSON cannot carry it.
-
-    Streamed through the standard encoder rather than normalized first. Four rounds of review went
-    into a hand-written normalizer that reshaped anything into something hashable -- stringified
-    mapping keys, `<cycle:n>` markers, `repr` for values JSON had no form for -- and each fix
-    revealed another way for two different requests to land on one digest: a `repr` shared by
-    unrelated objects, a marker a caller could type as ordinary text, a lone surrogate that passed
-    the type check and then failed at encode.
-
-    The premise was wrong. A `ModelRequest` carries what will be sent to a provider over HTTP, so a
-    payload canonical JSON cannot carry was never going to reach a model either. Reshaping it into
-    something hashable invented an identity for a request that does not exist, and inventing
-    identities is the one thing a replay key must not do.
-
-    So: hash what encodes, and issue no key for what does not. Refusing is safe -- the call still
-    happens, it simply is not replayable -- while a fabricated key returns the wrong call. An empty
-    digest means *no key*; two unreplayable calls both carry `""` and are not thereby the same call.
-
-    Every encoder failure means the same thing here -- no key -- so the clause catches `Exception`
-    rather than a list of types. Naming them was itself a bug found four times over: circular
-    references, unencodable primitives, unserializable objects, then a `dict` subclass whose
-    `items()` raises. The question is never which exception the encoder chose, only whether it
-    finished. `BaseException` is deliberately not caught: a cancellation or an interrupt is not a
-    statement about the payload.
-
-    Output is capped so a payload built from shared references cannot expand without bound; passing
-    the cap also means no key, since a prefix would stand for the whole.
-    """
-
-    hasher = hashlib.sha256()
-    encoded = 0
-    try:
-        for chunk in _CANONICAL_ENCODER.iterencode(payload):
-            raw = chunk.encode("utf-8")
-            encoded += len(raw)
-            if encoded > _MAX_DIGEST_BYTES:
-                return ""
-            hasher.update(raw)
-    except Exception:
-        return ""
-    return hasher.hexdigest()
-
-
-def _tool_payload(spec: ToolSpec) -> dict[str, Any]:
-    """A tool definition as the replay key sees it: every field except the ones JSON cannot carry.
-
-    Read off the dataclass rather than listing fields by hand, so a field added to `ToolSpec` joins
-    the digest automatically instead of quietly falling out of it. Reducing a tool to its `id` --
-    which this did first -- made two requests offering the same id with different descriptions or
-    input schemas produce the same replay key, though the provider was sent different tool
-    definitions.
-
-    Erring toward *more* than the wire carries is deliberate and asymmetric: an over-sensitive
-    replay key costs a miss and a re-run, an under-sensitive one hands back the wrong call.
-    """
-
-    return {
-        field_.name: getattr(spec, field_.name)
-        for field_ in fields(spec)
-        if not callable(getattr(spec, field_.name))
-    }
-
-
-def _request_payload(
-    request: ModelRequest, model: ModelConfig, *, provider: str, destination: str
-) -> dict[str, Any]:
-    """The whole request, as the thing `request_digest` identifies -- the replay key.
-
-    `model` is the *effective* config, resolved by the caller, not `request.model`. The request's is
-    optional and the shipped adapters fall back to their own, so hashing `request.model or
-    ModelConfig()` gave two calls on differently-configured adapters the same replay key.
-
-    `provider` and `destination` are here because the same request answered by a different service
-    is a different call. A config alone does not identify the service: an adapter may route by a
-    per-instance override or an environment variable, so two adapters holding identical configs can
-    address different hosts. `destination` is hashed and never recorded, so an internal hostname
-    stays internal, and it is empty for an adapter that does not expose one -- see
-    `AddressedModelAdapter`.
-    """
-
-    payload = _prompt_payload(request)
-    payload["tools"] = [_tool_payload(spec) for spec in request.tools]
-    payload["model"] = model.to_json()
-    payload["provider"] = provider
-    payload["destination"] = destination
-    return payload
+    receipt: ModelCallReceipt
+    request_preimage: bytes | None = None
+    turn: Any | None = None
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
@@ -233,6 +156,15 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
 
     `bool` is excluded because it is an `int` subclass and a boolean token count is a bug, not a
     count of one -- the same rule the receipt applies.
+
+    `type(value) is int` rather than `isinstance`, which is what its three siblings
+    (`providers/base.py:provider_usage_of`, `providers/_common.py:usage_reported_by`,
+    `core/model_io.py:ModelCallReceipt.with_error`) already spell. An `isinstance` here accepted
+    every `int` subclass -- an `IntEnum` a provider SDK hands back as a token count is the real
+    shape -- so one stamp read as a recordable usage on this path and as no usage at all on the
+    three that consume it, and the receipt this function feeds would then reject what it accepted.
+    Excluding `bool` is now implied, and kept spelled out because it is the case a reader checks
+    for first.
     """
 
     return {
@@ -240,9 +172,55 @@ def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
         for key, value in usage.items()
         if isinstance(key, str)
         and not isinstance(value, bool)
-        and isinstance(value, int)
+        and type(value) is int
         and value >= 0
     }
+
+
+def _kernel_retryable(exc: BaseException) -> bool:
+    """Whether the kernel's own loop may pay for another attempt at this failure.
+
+    Judged by the taxonomy, not by `retry_on`: that list is the adapter loop's
+    provider-specific code selector (its defaults are gateway codes), while `retryable` is
+    the cross-provider signal CONTRACTS names "automatic retry eligibility". Run boundaries
+    (`RunCancelled`, `RunTimeout`, `ModelCallAborted`) are not `ModelAdapterError` and fall
+    out structurally -- a run that stopped is not a failure to retry -- and
+    `config_recoverable` refuses even when marked retryable, because re-sending cannot help
+    a call whose config must change first.
+    """
+
+    if not isinstance(exc, ModelAdapterError):
+        return False
+    return bool(exc.retryable) and not bool(exc.config_recoverable)
+
+
+def _turn_reported_retry(turn: ModelTurn) -> bool:
+    """What the outcome object itself declared, probed rather than read as an attribute.
+
+    A third-party adapter may return any turn-shaped object, and a missing flag means "did not
+    retry", which is true of every adapter with no retry loop. One probe for its two readers --
+    the receipt's whole-call fold in `_completed` and the answering attempt's log entry -- so
+    the two cannot drift.
+    """
+
+    try:
+        return bool(getattr(turn, "provider_retried", False))
+    except Exception:
+        return False
+
+
+def _merged_usage(spent: Mapping[str, int], usage: Mapping[str, int]) -> dict[str, int]:
+    """Key-wise sum of two already-normalized usage mappings.
+
+    Both inputs arrive clean -- `provider_usage_of` and `_recordable_usage` apply the same
+    exact-int rule -- so this is arithmetic, not validation. One helper for both settle
+    exits, so success and failure cannot disagree about what a retried call cost.
+    """
+
+    merged = dict(usage)
+    for key, value in spent.items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
 
 
 def _safe_repr(value: Any) -> str:
@@ -263,7 +241,7 @@ def _safe_repr(value: Any) -> str:
     except Exception:
         pass
     try:
-        return f"<unrepresentable {type(value).__name__}>"
+        return f"<unrepresentable {portable_type_name(value)}>"
     except Exception:
         return "<unrepresentable>"
 
@@ -275,6 +253,11 @@ def _copy_with_fields(value: Any, /, **changes: Any) -> Any:
     for name, replacement in changes.items():
         object.__setattr__(cloned, name, replacement)
     return cloned
+
+
+# The minter itself lives in ``providers.base`` beside the rule it satisfies, because the
+# runner is not its only caller: the reference gateway's service keys the upstream hop it
+# drives, which has a retry loop of its own. One expression, both issuers.
 
 
 def _normalize_invocation_context(context: InvocationContext) -> InvocationContext:
@@ -353,6 +336,30 @@ def _call_content(request: ModelRequest, turn: ModelTurn | None) -> dict[str, An
         return {}
 
 
+def _discard_hook(adapter: Any, request: Any) -> Any:
+    """The adapter's chance to take back an answer the run threw away, or None.
+
+    A run boundary that wins over a COMPLETED call discards a real result. For a
+    stateless adapter that is nothing; for one holding shared state it is a silent
+    corruption. The replay adapter advances a per-key cursor when it hands an answer
+    over, so a discarded call permanently consumes a recorded answer and every later
+    consumer of that corpus is shifted by one -- a structurally valid turn belonging to
+    a different call, which is the substitution the replay work exists to prevent.
+
+    Optional and duck-typed, so no adapter is obliged to care: absent means the old
+    behaviour exactly.
+    """
+
+    hook = getattr(adapter, "discard_turn", None)
+    if not callable(hook) or request is None:
+        return None
+
+    def discarded(turn: Any) -> None:
+        hook(request, turn)
+
+    return discarded
+
+
 @dataclass
 class ModelCallRunner:
     """Runs one model call against an adapter, whatever shape that adapter is.
@@ -412,62 +419,86 @@ class ModelCallRunner:
     Identifying the call is not: `prompt_digest` and `request_digest` are computed on every call,
     before anything looks at this field, because they describe the call whether or not anyone is
     watching. That costs two canonical-JSON encodes and two SHA-256 passes over the serialized
-    prompt per call, which is why `_MAX_DIGEST_BYTES` bounds it. An `AgentLoop` with no model-I/O
+    prompt per call, which is why `MAX_MODEL_PAYLOAD_BYTES` bounds it. An `AgentLoop` with no model-I/O
     subscriptions still pays that; anyone trimming the cost should start there and not expect this
     field to gate it."""
+
+    settled_sink: Callable[[SettledModelCall], None] | None = None
+    """Where a settled call is recorded, as opposed to *delivered*.
+
+    Separate from `subscriptions` rather than a subscription of its own, for three reasons. A
+    subscription is governed by a `CapturePolicy`, and the narrowing a `none`-mode policy applies
+    would strip the very digests a durable record exists to carry. Registering one would also defeat
+    the `if self.subscriptions` gate below, so every call would assemble `_call_content` and hash
+    every field of it to satisfy a consumer that reads none of that. And a kernel-owned recorder
+    inserting itself into the host's own observer list is a thing the host can see and close.
+
+    The reason a caller cannot do this from `acall`'s return value: a failed call publishes its
+    receipt and re-raises without stamping it on the exception, so the return value carries receipts
+    for successful calls only. A ledger built on it would record everything except the failures --
+    which are exactly what an audit trail is for.
+
+    ONE sink receiving the whole settled call -- receipt, optional preimage, optional turn --
+    rather than a receipt sink beside a payload sink. Two sinks would put the receipt ledger and
+    the payload corpus for one call in two deliveries, and the recorder behind them could only
+    keep their line indices agreeing by cooperation across two lock acquisitions -- the exact
+    index race W6-1 fixed *inside* the recorder, reopened one seam higher. A superset delivery
+    makes the agreement structural: one call, one delivery, one reservation. (This superseded the
+    unreleased `receipt_sink`, whose guarantees the tests re-prove on this seam.)
+
+    Read once per call, like `subscriptions`, and expected not to raise; one that does is contained
+    the same way an observer is."""
+
+    capture_request_preimage: bool = False
+    """Whether the sink's `SettledModelCall.request_preimage` is populated.
+
+    Off by default because the preimage is the encoded request -- up to `MAX_MODEL_PAYLOAD_BYTES`
+    held in memory per in-flight call -- and a sink that only files receipts (the ledger without
+    the payload corpus) should not pay for bytes it never reads. The wiring that enables the
+    payload recorder sets this; the digests themselves are computed either way."""
 
     def _effective_model(
         self,
         request: ModelRequest,
         adapter: Any,
     ) -> tuple[ModelConfig, ModelConfig | None]:
-        """The config recorded for the call and an explicit dispatch override when one exists.
+        """Delegates to :func:`providers._request_identity.effective_model_for`.
 
-        `ModelRequest.model` is optional and every shipped adapter falls back to its own
-        `self.config`, so a receipt built from the request alone reports the *default* model no
-        matter which one served the call -- a fabricated audit field, not merely a missing one.
-        Probed via `getattr` and type-checked: see `ConfiguredModelAdapter`.
+        A wrapper and nothing more, pinned as such: the receipt's resolution and a replay
+        lookup's must be one implementation, and a body regrown here would be the twin the
+        move to `_request_identity` closed.
         """
 
-        if request.model is not None:
-            normalized = normalize_model_config(request.model) or ModelConfig()
-            return normalized, normalized
-        # Tolerant of a raising probe for the reason `_destination` gives: a replay key is
-        # bookkeeping, and an adapter that cannot answer must not thereby lose its call. Plain
-        # `getattr(..., None)` swallowed only `AttributeError`, so a `config` property that raised
-        # anything else took the whole call down.
-        #
-        # A raising probe and an absent one both land on the default here, because the return type
-        # admits nothing else -- the receipt cannot say "unknown". That is a known limit of this
-        # field, not a distinction being drawn.
-        try:
-            configured = getattr(adapter, "config", None)
-        except Exception:
-            configured = None
-        if isinstance(configured, ModelConfig):
-            normalized = normalize_model_config(configured) or ModelConfig()
-            return normalized, normalized
-        return ModelConfig(), None
+        return effective_model_for(request, adapter)
 
-    def _destination(self, model: ModelConfig, adapter: Any) -> str:
-        """Where this adapter would send a call under `model`, or `""` if it does not say.
+    def _resolved_destination(self, model: ModelConfig, adapter: Any) -> tuple[str, str]:
+        """Where this adapter would send a call under `model`, and WHICH outcome that was.
 
-        Probed and tolerant of failure for the same reason every other probe here is: a replay key
-        is bookkeeping, and an adapter that cannot answer must not thereby lose its call.
+        Probed and tolerant of failure for the same reason every other probe here is: bookkeeping,
+        and an adapter that cannot answer must not thereby lose its call.
 
         The `getattr` is inside the `try`, not before it. Tolerating only the *call* left the
         *lookup* undefended, so an adapter exposing `resolve_destination` as a property that raised
         still lost its call -- the one shape the rule above exists to rule out, surviving in the
         probe the other two were written to imitate.
+
+        Returning a status alongside the value is the fix for what tolerance used to cost. Three
+        outcomes answered `""`: an adapter with no destination concept, one that answered with
+        nothing, and one whose probe raised. The third is not a shrug -- the shipped gateway
+        resolver raises *deterministically* when no URL is configured anywhere, so it usually means
+        a deployment whose every call is about to fail. All three produced a valid-looking key that
+        could not be told from the others, which is exactly the shape `_digest`'s own docstring
+        rules out for itself: refusing is safe, but a fabricated answer returns the wrong call.
         """
 
         try:
             resolve = getattr(adapter, "resolve_destination", None)
             if not callable(resolve):
-                return ""
-            return normalize_unicode_scalars(str(resolve(model) or ""))
+                return "", "not_declared"
+            value = normalize_unicode_scalars(str(resolve(model) or ""))
         except Exception:
-            return ""
+            return "", "unavailable"
+        return (value, "resolved") if value else ("", "declined")
 
     def _token(self) -> CancellationToken | None:
         return (
@@ -561,12 +592,30 @@ class ModelCallRunner:
             model=provisional_model,
             provider_name=provider,
         )
+        # Assigned once the request key is taken; a failure before that point hands the sink
+        # `None`, which is truthful -- there is no preimage for a call that never got a key.
+        request_preimage: bytes | None = None
         with collect_retry_reports() as progress:
-            # Whether the kernel got as far as reaching into the adapter, which is what `attempts`
-            # counts. A run already cancelled or past its deadline is refused below without the
-            # adapter being touched, and the receipt for that used to carry the default `attempts=1`
-            # -- telling a consumer summing the field that provider work happened when none did.
-            reached_adapter = False
+            # How many times the kernel reached into the adapter, which is what `attempts`
+            # counts. A run already cancelled or past its deadline is refused below without
+            # the adapter being touched and reports 0 -- the receipt used to carry the
+            # default `attempts=1` there, telling a consumer summing the field that provider
+            # work happened when none did. Under the kernel retry layer each re-dispatch
+            # counts one more.
+            attempts_made = 0
+            # Usage the loop's swallowed attempts already paid for; merged into whichever
+            # receipt settles this call, success or failure, by the same helper.
+            spent_usage: dict[str, int] = {}
+            # One entry per dispatch, appended at the same commit points the counters use:
+            # absorbed attempts at the absorb line below, the terminal one at whichever exit
+            # settles the call. Initialized beside `spent_usage` because the failure exit
+            # reads both for calls refused before the loop was ever entered.
+            attempt_log: list[ModelCallAttempt] = []
+            last_attempt_entry: ModelCallAttempt | None = None
+            # The measured wait that preceded the NEXT dispatch: 0 until a backoff actually
+            # runs, then re-measured after each one. Threaded into every entry-construction
+            # site so the wait lands on the entry it delayed, not the one that caused it.
+            pending_backoff_ms = 0
             try:
                 # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
                 # already been crossed, but by then the adapter has been invoked and the provider has
@@ -587,25 +636,178 @@ class ModelCallRunner:
                     context if context is not None else InvocationContext()
                 )
                 model, dispatch_model = self._effective_model(request, adapter)
+                # The kernel loops only when the effective config assigns it the loop.
+                retry_plan = model.retry if model.retry.layer == "kernel" else None
+                if retry_plan is not None:
+                    # The dispatch copy is neutralized -- `max_attempts=1` -- so any
+                    # config-honoring adapter cannot loop under this layer even if it never
+                    # learned `layer` exists; the layer value itself still travels so an
+                    # adapter whose loop lives outside the config (the OpenAI SDK) can
+                    # comply on its own. The receipt is keyed from `model`, not this copy,
+                    # so it describes the call as configured -- and the replay key excludes
+                    # the retry block entirely, so neither the layer nor the neutralization
+                    # can move it.
+                    #
+                    # Copied field-wise rather than through `dataclasses.replace`, for the
+                    # reason `_copy_with_fields` exists: a public extension config with a
+                    # narrower convenience constructor is supported everywhere else -- ingress
+                    # normalization rewrites it this same way -- and `replace` would dispatch
+                    # back through that constructor with every inherited field, raising
+                    # `TypeError` before the adapter is reached. Only this layer rewrites a
+                    # config after ingress, so only this layer could refuse one.
+                    dispatch_model = _copy_with_fields(
+                        dispatch_model if dispatch_model is not None else model,
+                        retry=_copy_with_fields(model.retry, max_attempts=1),
+                    )
+                # One copy for both call-scoped rewrites below. ``normalize_model_request``
+                # already returned a fresh instance, but the explicit copy keeps the rule
+                # visible: nothing past this line writes onto a value the caller holds.
+                request = copy(request)
+                # The call is KEYED here, in the same breath as its digests below: one fresh
+                # token per call, before the first dispatch, so every kernel re-dispatch (the
+                # loop reuses this request) and every adapter-internal retry (the gateway
+                # rebuilds only headers) presents the same value. The runner is the single
+                # issuer -- a caller-supplied value is overwritten, because respecting it
+                # would let one request object hand two calls the same retry scope, the
+                # collision per-call issuance exists to prevent. Issuance is uniform across
+                # adapters; presenting the token on a wire is the gateway transport's alone.
+                object.__setattr__(request, "idempotency_key", new_idempotency_key())
                 if dispatch_model is not None:
-                    request = copy(request)
                     object.__setattr__(request, "model", dispatch_model)
+                where, destination_status = self._resolved_destination(model, adapter)
+                digest_result = _encoded_digest(
+                    payload=_request_payload(
+                        request,
+                        model,
+                        # The RESOLVED provider, not the raw declaration `provider_name` records
+                        # above: the key must say who actually served the call. Declaration-only
+                        # collided a fake adapter with a gateway built without one -- both declare
+                        # nothing -- and `ModelConfig.provider` alone separated a direct call from
+                        # a gateway relaying the same upstream, which is the one pair a corpus
+                        # wants sharing a key. It also normalizes, which matters here because
+                        # `provider` is the only `ModelConfig` field with no ingress validation.
+                        #
+                        # Resolved from the declaration THIS CALL ALREADY READ, handed in rather
+                        # than probed again. The adapter is read once per call for this reason
+                        # already; the declaration on it was still read twice, and a `provider_name`
+                        # that answers once and then raises made the two disagree -- the receipt
+                        # saying `openai` while the key had been taken under the config's `gateway`.
+                        # A key whose preimage the record contradicts is the exact defect that took
+                        # the destination out of this payload.
+                        provider=resolved_provider_name(adapter, model, declared=provider) or "",
+                    ),
+                    want_preimage=self.capture_request_preimage,
+                )
+                request_preimage = digest_result.preimage
                 receipt = replace(
                     receipt,
                     context=normalized_context,
                     model=model,
                     prompt_digest=_digest(_prompt_payload(request)),
-                    request_digest=_digest(
-                        _request_payload(
-                            request,
-                            model,
-                            provider=provider,
-                            destination=self._destination(model, adapter),
-                        )
-                    ),
+                    request_digest=digest_result.digest,
+                    digest_generation=_REQUEST_DIGEST_GENERATION,
+                    # Key and status arrive as one result object: the two fields describing one
+                    # encoder decision cannot be computed twice and disagree, and the encoder is
+                    # the only party that can tell `absent` from `too_large`.
+                    digest_status=digest_result.status,
+                    destination_status=destination_status,
+                    destination_digest=destination_digest(where),
+                    idempotency_key=request.idempotency_key,
                 )
-                reached_adapter = True
-                turn = await self._adrive(request, deadline, should_abort, delta_consumer, adapter)
+                consumer = delta_consumer
+                delivered = False
+                # Installed for any consumer, not only under the kernel's loop. The flag is
+                # *used* where a retry window exists -- delivery closes it -- but it is
+                # *recorded* on every call, and `layer` defaults to `"adapter"`: gating the
+                # wrapper on the loop that reads the flag wrote `stream_committed: false`
+                # onto every shipped streaming call's ledger line while the consumer was
+                # holding its chunks. The key is present either way, so a reader cannot tell
+                # a definite "nothing was delivered" from "this arm never answered".
+                if delta_consumer is not None:
+                    inner_consumer = delta_consumer
+
+                    def _marking_consumer(chunk: ModelStreamChunk) -> None:
+                        # Delivery is what closes the retry window (see the loop below),
+                        # and delivery means the consumer received it -- the same line the
+                        # `acall` docstring draws for `should_abort`.
+                        nonlocal delivered
+                        delivered = True
+                        inner_consumer(chunk)
+
+                    consumer = _marking_consumer
+                while True:
+                    attempts_made += 1
+                    reports_before = progress.count
+                    attempt_started = time.monotonic()
+                    try:
+                        turn = await self._adrive(
+                            request, deadline, should_abort, consumer, adapter
+                        )
+                        break
+                    except BaseException as exc:
+                        # Every fact the entry needs, read through `with_error` on a throwaway
+                        # receipt -- the one census-pinned reader of what an exception carries,
+                        # so the log cannot drift from the receipt built beside it. Probed HERE,
+                        # before the outer handler's whole-call `mark_provider_retried` can
+                        # colour the exception: what this reads is attempt-scoped.
+                        probe = ModelCallReceipt().with_error(exc)
+                        last_attempt_entry = ModelCallAttempt(
+                            index=attempts_made,
+                            elapsed_ms=self._ms_since(attempt_started),
+                            error_code=probe.error_code,
+                            provider_error_code=probe.provider_error_code,
+                            retryable=probe.retryable,
+                            config_recoverable=probe.config_recoverable,
+                            http_status=probe.http_status,
+                            provider_retried=probe.provider_retried
+                            or progress.count > reports_before,
+                            usage=probe.usage,
+                            stream_committed=delivered,
+                            backoff_ms=pending_backoff_ms,
+                        )
+                        if (
+                            retry_plan is None
+                            or attempts_made >= retry_plan.max_attempts
+                            or delivered
+                            or not _kernel_retryable(exc)
+                        ):
+                            raise
+                        delay = retry_delay_s(
+                            attempts_made,
+                            retry_plan.initial_delay_s,
+                            retry_plan.max_delay_s,
+                            retry_plan.backoff_multiplier,
+                            retry_plan.jitter_s,
+                        )
+                        # Sleeping into a boundary would waste wall clock the run has
+                        # already spent and then mask the provider failure with a
+                        # `RunTimeout` that names nothing; the transient error itself is
+                        # the better answer.
+                        if deadline is not None and time.time() + delay >= deadline:
+                            raise
+                        # What the absorbed attempt already cost, recorded only once the loop
+                        # has committed to absorbing it -- which is here, past every `raise`
+                        # that would make THIS error the call's outcome. Recorded any earlier,
+                        # the error the deadline check re-raises is both the swallowed attempt
+                        # and the terminal one, and `receipt.with_error` reads its stamp again:
+                        # a single billed call landing on the receipt twice. The log entry
+                        # commits at this same line for the same reason: appended earlier, the
+                        # attempt the deadline check re-raises would be logged as absorbed AND
+                        # as terminal, and the log would name one dispatch twice. Past this
+                        # line the receipt is the only carrier left -- a boundary raised by
+                        # the wait below reports itself, not the provider failure it
+                        # interrupted.
+                        spent_usage = _merged_usage(spent_usage, probe.usage)
+                        attempt_log.append(last_attempt_entry)
+                        # Measured, not copied from the schedule -- a capped sleep must record
+                        # what happened. Only when a wait was actually requested: for a zero
+                        # schedule the boundary check is not a backoff, and timing it would
+                        # stamp scheduler noise onto a wait that never ran.
+                        backoff_started = time.monotonic()
+                        await self._abackoff(delay, deadline)
+                        pending_backoff_ms = (
+                            self._ms_since(backoff_started) if delay > 0 else 0
+                        )
                 turn = normalize_model_turn(turn)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
@@ -620,21 +822,112 @@ class ModelCallRunner:
                 # whatever the observer threw. Turning capture on must not change how a provider
                 # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
                 # arriving during delivery should still stop everything.
-                failed = receipt.with_error(exc)
-                if not reached_adapter:
-                    failed = replace(failed, attempts=0)
+                failed = replace(receipt.with_error(exc), attempts=attempts_made)
+                # The terminal entry: the attempt whose outcome this exception is -- unless it
+                # interrupted the WAIT between attempts (a backoff boundary), in which case
+                # every dispatched attempt is already logged and the receipt alone carries the
+                # boundary's taxonomy. A refused call never dispatched, so its log stays empty
+                # beside `attempts == 0`.
+                if attempts_made > len(attempt_log):
+                    if (
+                        last_attempt_entry is not None
+                        and last_attempt_entry.index == attempts_made
+                    ):
+                        attempt_log.append(last_attempt_entry)
+                    else:
+                        # The failure happened between the dispatch's return and the settle
+                        # (the normalizer refused the turn), so no attempt-scoped probe exists;
+                        # the entry mirrors the receipt, which extracted the same facts from
+                        # the same exception -- every fact except one. ``provider_retried`` on
+                        # that receipt is the whole CALL's fold: the handler above stamps
+                        # ``progress.retried`` onto the escaping error before ``with_error``
+                        # reads it, so mirroring it here would credit this dispatch with a
+                        # report an earlier absorbed one made. Counted on this attempt's own
+                        # channel instead, the way both sibling construction sites count it.
+                        # The refused turn's own declaration is not consulted: the normalizer
+                        # rejected that turn, and a fact read off a value the call refused is
+                        # not a fact the call may report.
+                        attempt_log.append(
+                            ModelCallAttempt(
+                                index=attempts_made,
+                                elapsed_ms=self._ms_since(attempt_started),
+                                error_code=failed.error_code,
+                                provider_error_code=failed.provider_error_code,
+                                retryable=failed.retryable,
+                                config_recoverable=failed.config_recoverable,
+                                http_status=failed.http_status,
+                                provider_retried=progress.count > reports_before,
+                                usage=failed.usage,
+                                stream_committed=delivered,
+                                backoff_ms=pending_backoff_ms,
+                            )
+                        )
+                # One ``replace`` for the same reason the answering path takes one: the entries
+                # must sum to the usage they are entries for, and a two-step build holds a
+                # receipt that does not -- which ``__post_init__`` now refuses.
+                failed = replace(
+                    failed,
+                    attempt_log=tuple(attempt_log),
+                    usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
+                )
                 with contextlib.suppress(Exception):
-                    self._publish(request, None, failed, elapsed_ms=self._ms_since(started))
+                    self._publish(
+                        request,
+                        None,
+                        failed,
+                        elapsed_ms=self._ms_since(started),
+                        request_preimage=request_preimage,
+                    )
+                # The terminal error leaves carrying what the whole logical call cost: the
+                # loop's failure accounting reads this stamp (`_billed_usage`), and a stamp
+                # naming only the last attempt under-counts every absorbed one. Stamped AFTER
+                # the receipt above is built -- `with_error` reads this same stamp, and a
+                # cumulative stamp read back there would land the absorbed spend on the
+                # receipt twice (the exact double-count the absorb commit point exists to
+                # prevent).
+                if spent_usage:
+                    mark_provider_usage(exc, failed.usage)
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
             # silently stops working for adapters that retry and then succeed -- which is most of
             # the time a retry loop runs.
+            completed = replace(
+                self._completed(receipt, turn, retried=progress.retried),
+                attempts=attempts_made,
+            )
+            # The answering attempt's entry, built from the settled receipt so its usage is the
+            # same normalized reading `_completed` just made -- and BEFORE the absorbed spend is
+            # merged below, so the entry keeps this attempt's own bill and the entries sum to
+            # the receipt. Its retry flag is attempt-scoped on both channels: what the adapter
+            # reported during THIS dispatch, plus what this turn itself declared -- not the
+            # whole-call `progress.retried` fold the receipt carries.
+            answering_entry = ModelCallAttempt(
+                index=attempts_made,
+                elapsed_ms=self._ms_since(attempt_started),
+                provider_retried=progress.count > reports_before or _turn_reported_retry(turn),
+                usage=completed.usage,
+                stream_committed=delivered,
+                backoff_ms=pending_backoff_ms,
+            )
+            # One ``replace``, not two. The log and the merged bill are the same fact stated two
+            # ways, and the receipt refuses a log whose entries do not sum to its usage -- so a
+            # receipt carrying the log beside the not-yet-merged usage is a state this record is
+            # not allowed to hold, however briefly. ``replace`` re-runs ``__post_init__``, which
+            # is what makes "briefly" indistinguishable from "at all".
+            completed = replace(
+                completed,
+                attempt_log=(*attempt_log, answering_entry),
+                usage=(
+                    _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
+                ),
+            )
             settled = self._publish(
                 request,
                 turn,
-                self._completed(receipt, turn, retried=progress.retried),
+                completed,
                 elapsed_ms=self._ms_since(started),
+                request_preimage=request_preimage,
             )
         return turn, settled
 
@@ -664,10 +957,7 @@ class ModelCallRunner:
             stop_reason = normalize_unicode_scalars(str(getattr(turn, "stop_reason", "") or ""))
         except Exception:
             stop_reason = ""
-        try:
-            turn_retried = bool(getattr(turn, "provider_retried", False))
-        except Exception:
-            turn_retried = False
+        turn_retried = _turn_reported_retry(turn)
         return replace(
             receipt,
             stop_reason=stop_reason,
@@ -687,15 +977,62 @@ class ModelCallRunner:
         receipt: ModelCallReceipt,
         *,
         elapsed_ms: int,
+        request_preimage: bytes | None = None,
     ) -> ModelCallReceipt:
+        """Deliver the settled receipt to observers, then record it, on every exit.
+
+        Recording is in a `finally` because the two callers fail in opposite directions when
+        delivery raises. The failure path publishes inside `contextlib.suppress(Exception)`, so a
+        record placed after `dispatch_model_call` disappears with no trace; the success path
+        publishes unguarded, so the same placement fails a call the provider has already been paid
+        for. `dispatch_model_call` contains its own observers, so this is a defence against the
+        pipeline itself, not against a broken exporter.
+
+        The cost, stated rather than fixed: when delivery raises, the recorded receipt is the
+        pre-delivery one and `capture_downgrades` stays at the floor it was resolved to. Moving the
+        record earlier to make that deterministic would make it *always* zero, which is a worse
+        record -- a field that never reports a withheld capture reads as "nothing was withheld".
+        """
+
         timed = replace(receipt, latency_ms=elapsed_ms)
-        if not self.subscriptions:
-            return timed
-        return dispatch_model_call(
-            receipt=timed,
-            content=_call_content(request, turn),
-            subscriptions=self.subscriptions,
-        )
+        settled = timed
+        try:
+            if self.subscriptions:
+                settled = dispatch_model_call(
+                    receipt=timed,
+                    content=_call_content(request, turn),
+                    subscriptions=self.subscriptions,
+                )
+        finally:
+            self._record(settled, request_preimage, turn)
+        return settled
+
+    def _record(
+        self, receipt: ModelCallReceipt, request_preimage: bytes | None, turn: Any | None
+    ) -> None:
+        """Hand the settled call to `settled_sink`, absorbing whatever it does.
+
+        The same containment `dispatch_model_call` gives an observer, and for a sharper version of
+        the same reason: a sink is typically a durable writer, so "the disk is full" must not
+        become "the answer is discarded" -- nor "this provider failure is now a RuntimeError",
+        which is what an unguarded call on the failure path would do to the taxonomy an escaping
+        `ModelAdapterError` carries.
+
+        The `SettledModelCall` is assembled inside the containment: its constructor is trivial
+        today, and the guard is what keeps that an implementation detail rather than a promise.
+        """
+
+        sink = self.settled_sink
+        if sink is None:
+            return
+        try:
+            sink(
+                SettledModelCall(
+                    receipt=receipt, request_preimage=request_preimage, turn=turn
+                )
+            )
+        except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
+            _LOGGER.debug("model call settled sink failed", exc_info=True)
 
     async def _adrive(
         self,
@@ -716,13 +1053,19 @@ class ModelCallRunner:
             )
         anext_turn = getattr(adapter, "anext_turn", None)
         if anext_turn is not None:
-            return await self._aawait(anext_turn(request), deadline)
+            return await self._aawait(
+                anext_turn(request), deadline, adapter=adapter, request=request
+            )
         next_turn = adapter.next_turn
         if is_async_callable(next_turn):
-            return await self._aawait(next_turn(request), deadline)
+            return await self._aawait(
+                next_turn(request), deadline, adapter=adapter, request=request
+            )
         turn = await self._aawait(
             start_abandonable_sync_call(lambda: next_turn(request), thread_name=self.thread_name),
             deadline,
+            adapter=adapter,
+            request=request,
         )
         # Second line of defence, the same one the tool half keeps: an adapter can be synchronous
         # and still hand back something awaitable -- it delegates to an async client, or its
@@ -731,7 +1074,7 @@ class ModelCallRunner:
         # reads are all defensive, so it recorded a *successful* call for a provider that was never
         # invoked, and the caller got an object whose every turn field was missing.
         if inspect.isawaitable(turn):
-            return await self._aawait(turn, deadline)
+            return await self._aawait(turn, deadline, adapter=adapter, request=request)
         return turn
 
     async def _astream(
@@ -905,7 +1248,34 @@ class ModelCallRunner:
             else:
                 closing.add_done_callback(consume_task_outcome)
 
-    async def _aawait(self, pending: Any, deadline: float | None) -> ModelTurn:
+    async def _abackoff(self, delay_s: float, deadline: float | None) -> None:
+        """Wait between kernel attempts under the same race the attempts run under.
+
+        The sleep is `pending` to the shared bridge: a cancellation wakes it through the
+        token callback, the deadline bounds it through the wait timeout, and the boundary
+        check re-raises the same `RunCancelled`/`RunTimeout` an in-flight attempt reports.
+        A backoff cannot outlive a run that stopped wanting the answer.
+        """
+
+        if delay_s <= 0:
+            self._check_cancel_or_deadline(deadline)
+            return
+        await await_abandonable_call(
+            asyncio.sleep(delay_s),
+            deadline=deadline,
+            token=self._token(),
+            grace_s=0.0,
+            check_boundary=self._check_cancel_or_deadline,
+        )
+
+    async def _aawait(
+        self,
+        pending: Any,
+        deadline: float | None,
+        *,
+        adapter: Any = None,
+        request: ModelRequest | None = None,
+    ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
 
         Only terminal run boundaries apply while a model call is in flight. Interrupt and pause are
@@ -931,11 +1301,22 @@ class ModelCallRunner:
         #
         # The static field is what the detach is given, not `_grace_s()`: that is the accessor which
         # may have just raised.
+        #
+        # The discard hook is the same one the wait below is given, and this exit went without it
+        # for a round. The callee cannot tell which exit its caller took: a replay adapter that
+        # answers after `_grace_s()` raised has already advanced its cursor, so dropping the turn
+        # here leaves the slot spent and hands the following recording to the next caller. Both
+        # exits of this function carry it, and
+        # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
         try:
             token = self._token()
             grace_s = self._grace_s()
         except BaseException:
-            await abandon_unwaited_call(pending, grace_s=self.cancel_grace_s)
+            await abandon_unwaited_call(
+                pending,
+                grace_s=self.cancel_grace_s,
+                on_discarded=_discard_hook(adapter, request),
+            )
             raise
         try:
             return await await_abandonable_call(
@@ -944,6 +1325,7 @@ class ModelCallRunner:
                 token=token,
                 grace_s=grace_s,
                 check_boundary=self._check_cancel_or_deadline,
+                on_discarded=_discard_hook(adapter, request),
             )
         except CalleeCancelled as exc:
             raise ModelAdapterError(

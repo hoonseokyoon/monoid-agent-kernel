@@ -21,7 +21,10 @@ from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, RunLimits
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import AsyncModelAdapter, ModelAdapter
-from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+from monoid_agent_kernel.providers.gateway import (
+    GatewayModelAdapter,
+    resolve_relayed_provider,
+)
 from monoid_agent_kernel.reference._shared.tokens import TokenKind, TokenManager
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, RunRequestPort
 from monoid_agent_kernel.reference.backend.run_state import BackendRunStateSink
@@ -46,6 +49,12 @@ class BackendLoopBuild:
 class BackendLoopFactoryContext:
     run_root_provider: Callable[[], Path]
     llm_gateway_url_provider: Callable[[], str]
+    # The upstream the gateway at that URL relays. Doubled word because the convention here is
+    # ``<service field>_provider`` and the service field is ``llm_gateway_provider`` -- it is the
+    # accessor for a *provider name*, not a provider of providers.
+    # Keyword-only for the same reason as the service field it accesses: inserted beside its
+    # URL sibling without rebinding the positional arguments that predate it.
+    llm_gateway_provider_provider: Callable[[], str | None] = field(kw_only=True)
     web_gateway_url_provider: Callable[[], str | None]
     model_adapter_factory_provider: Callable[[], ModelAdapterFactory | None]
     token_manager_provider: Callable[[], TokenManager]
@@ -54,6 +63,11 @@ class BackendLoopFactoryContext:
     emit_output_deltas_provider: Callable[[], bool]
     stream_model_calls_provider: Callable[[], bool]
     model_content_file_provider: Callable[[], bool]
+    # The ledger and replay-corpus switches, keyword-only for the same reason as
+    # ``llm_gateway_provider_provider`` above: inserted beside their sidecar sibling without
+    # rebinding the positional arguments that predate them.
+    model_calls_file_provider: Callable[[], bool] = field(kw_only=True)
+    model_payload_file_provider: Callable[[], bool] = field(kw_only=True)
     model_stream_observer_factories_provider: Callable[
         [str], tuple[ModelStreamObserverFactory, ...]
     ]
@@ -184,6 +198,8 @@ class BackendLoopFactory:
                 emit_output_deltas=self._context.emit_output_deltas_provider(),
                 stream_model_calls=self._context.stream_model_calls_provider(),
                 model_content_file=self._context.model_content_file_provider(),
+                model_calls_file=self._context.model_calls_file_provider(),
+                model_payload_file=self._context.model_payload_file_provider(),
                 model_stream_observer_factories=(
                     self._context.model_stream_observer_factories_provider(run_id)
                 ),
@@ -285,6 +301,13 @@ class BackendLoopFactory:
             gateway_url=self._context.llm_gateway_url_provider(),
             token=llm_gateway_token,
             token_provider=token_provider,
+            # Placed on the construction, not on one caller: every activation this backend
+            # builds -- the submitted run AND the one recovery rebuilds after a restart --
+            # arrives here, so a per-deployment upstream survives a restore instead of silently
+            # reverting to the reference default one process later.
+            provider_name=resolve_relayed_provider(
+                self._context.llm_gateway_provider_provider()
+            ),
         )
 
     def web_gateway_client(self, token: str) -> WebGatewayClient | None:

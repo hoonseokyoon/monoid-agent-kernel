@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from support.http import serving
 from support.runtime import runtime_config, tool_binding
 
 from monoid_agent_kernel.cli import main
-from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -28,7 +29,16 @@ from monoid_agent_kernel.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
 )
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.providers._common import (
+    prune_dead_reasoning,
+    reasoning_replay_window_start,
+)
+from monoid_agent_kernel.providers.fake import (
+    FakeModelAdapter,
+    FakeStreamingModelAdapter,
+    fake_tool_call,
+)
+import monoid_agent_kernel.providers.openai as openai_module
 from monoid_agent_kernel.providers.openai import (
     OpenAIModelAdapter,
     _capture_reasoning_items,
@@ -291,6 +301,109 @@ def test_openai_payload_sets_zdr_store_and_include() -> None:
     assert payload["store"] is False
     assert payload["include"] == ["reasoning.encrypted_content"]
     assert "previous_response_id" not in payload
+
+
+def test_openai_refuses_the_by_reference_shape_under_zdr() -> None:
+    """``store=False`` above and ``previous_response_id`` are contradictory in one adapter: no
+    response is ever persisted, so a handle naming one can never resolve. The shape was emitted
+    anyway and failed as an opaque provider 404 at call time -- on the *original* call, not
+    merely on a validation repair. It is refused at the adapter boundary instead, classified
+    the same way every other config-shaped refusal here is, and the message names the supported
+    route."""
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    request = ModelRequest(
+        instruction=None,
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_1",
+    )
+
+    with pytest.raises(ModelAdapterError) as refused:
+        adapter._payload(request)
+
+    assert refused.value.provider_error_code == "unsupported_request_shape"
+    assert refused.value.retryable is False
+    assert refused.value.config_recoverable is True
+    assert "messages" in str(refused.value)
+
+
+def test_the_by_reference_refusal_fires_on_both_openai_entry_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``next_turn`` and ``astream_turn`` are the adapter's only two entry points and both
+    build their body through ``_classified_payload`` -> ``_payload``; the refusal must reach
+    the caller unchanged through each (``ModelAdapterError`` is outside the
+    ``TypeError``/``ValueError``/``RecursionError`` family that classifier converts)."""
+
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"), allow_direct_provider_api=True)
+    request = ModelRequest(
+        instruction="follow up",
+        system_prompt="sys",
+        tools=(),
+        previous_turn_handle="resp_1",
+    )
+
+    with pytest.raises(ModelAdapterError) as blocking:
+        adapter.next_turn(request)
+    assert blocking.value.provider_error_code == "unsupported_request_shape"
+    assert blocking.value.config_recoverable is True
+
+    async def _drive() -> None:
+        async for _chunk in adapter.astream_turn(request):
+            pass
+
+    with pytest.raises(ModelAdapterError) as streamed:
+        asyncio.run(_drive())
+    assert streamed.value.provider_error_code == "unsupported_request_shape"
+    assert streamed.value.config_recoverable is True
+
+
+def test_a_stale_handle_beside_by_value_messages_is_not_refused() -> None:
+    """The refusal is bound to the *shape*, not to the field: ``messages`` overrides the handle
+    path (documented, and both adapters select on ``messages is not None``), and the loop does
+    hand a by-value request a leftover handle. Refusing on the field alone would have killed
+    the ordinary production path."""
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    payload = adapter._payload(
+        ModelRequest(
+            instruction=None,
+            system_prompt="sys",
+            tools=(),
+            previous_turn_handle="stale-handle",
+            messages=({"role": "user", "content": "hi"},),
+        )
+    )
+
+    assert payload["input"] == [{"role": "user", "content": "hi"}]
+    assert "previous_response_id" not in payload
+
+
+def test_the_gateway_maps_the_by_reference_refusal_to_a_bad_request() -> None:
+    """Blast radius: the reference gateway's own by-reference continuation maps its opaque
+    turn_handle to a stored provider response id and passes it upstream, so with the default
+    OpenAI upstream that continuation now inherits this refusal. That is the coherent outcome
+    -- a classified 422 the outer client survives, instead of the opaque provider 404 it used
+    to become. Gateway by-reference support itself is untouched: an upstream that *does* keep
+    responses still continues by handle."""
+
+    from monoid_agent_kernel.reference.llm_gateway.http import _model_error_status
+
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    with pytest.raises(ModelAdapterError) as refused:
+        adapter._payload(
+            ModelRequest(
+                instruction=None,
+                system_prompt="sys",
+                tools=(),
+                previous_turn_handle="provider_response_1",
+            )
+        )
+
+    assert _model_error_status(refused.value) == HTTPStatus.UNPROCESSABLE_ENTITY
 
 
 def test_openai_parse_captures_reasoning_subsequence_verbatim() -> None:
@@ -565,6 +678,113 @@ def test_openai_reasoning_all_or_nothing_on_mixed_active_window() -> None:
     assert _reasoning_replay_flags(messages, "gpt-5.5") == [False, False, False, False, False]
 
 
+# --- the active window as ONE rule, and the prune the kernel builds on it ---------------------
+
+
+@pytest.mark.parametrize(
+    ("roles", "expected_start"),
+    (
+        ((), 0),
+        # No user message at all: the whole log is the window (what the flag rule always said).
+        (("assistant", "tool"), 0),
+        (("user", "assistant", "tool"), 1),
+        (("user", "assistant", "tool", "user", "assistant", "tool"), 4),
+        # A trailing user message opens an empty window -- nothing after it yet.
+        (("user", "assistant", "user"), 3),
+    ),
+)
+def test_the_replay_window_start_is_the_rule_the_flags_are_built_from(
+    roles: tuple[str, ...], expected_start: int
+) -> None:
+    """One definition of "active window", read by both halves that depend on it.
+
+    The adapter decides what to REPLAY from it and the kernel decides what to SEND into it; two
+    copies of the same index arithmetic is exactly the twin-drift this repo keeps paying for, so
+    the rule lives in one function and this pins the flags to it rather than to a hand-copy.
+    """
+
+    messages = tuple({"role": role, "content": ""} for role in roles)
+    assert reasoning_replay_window_start(messages) == expected_start
+    assert _reasoning_replay_flags(messages, "gpt-5.5") == [
+        index >= expected_start for index in range(len(messages))
+    ]
+
+
+def _two_window_conversation(historical_model: str = "gpt-5.5") -> tuple[dict, ...]:
+    """Two user turns: an assistant block outside the window, and one inside it."""
+    return (
+        {"role": "user", "content": "u1"},
+        _assistant_with_reasoning(
+            historical_model, [_RS_A, _FC_A], [{"id": "c_a", "name": "fs_read", "arguments": {}}]
+        ),
+        {"role": "tool", "call_id": "c_a", "content": {"ok": True}},
+        {"role": "user", "content": "u2"},
+        _assistant_with_reasoning(
+            "gpt-5.5", [_RS_B, _FC_B], [{"id": "c_b", "name": "text_search", "arguments": {}}]
+        ),
+        {"role": "tool", "call_id": "c_b", "content": {"ok": True}},
+    )
+
+
+def test_pruning_a_dead_reasoning_block_drops_it_only_outside_the_window() -> None:
+    messages = _two_window_conversation()
+    pruned = prune_dead_reasoning(messages)
+
+    assert "reasoning" not in pruned[1], "the historical block is unreachable — drop it"
+    assert pruned[4]["reasoning"] == messages[4]["reasoning"], "the live one must survive"
+    # Nothing else about the log may change: only that one key leaves.
+    assert pruned[1] == {k: v for k, v in messages[1].items() if k != "reasoning"}
+    assert [pruned[i] for i in (0, 2, 3, 5)] == [messages[i] for i in (0, 2, 3, 5)]
+    # The caller's log is untouched — the prune builds the wire copy, it does not mutate.
+    assert messages[1]["reasoning"]["items"] == [_RS_A, _FC_A]
+
+
+def test_the_openai_input_is_byte_identical_once_a_block_leaves_the_window() -> None:
+    """The safety proof for the prune: what the provider SEES does not change.
+
+    Outside the window ``_message_to_input_items`` takes the reconstruction branch whether or
+    not the key is there (the replay flag is False, and the flag is all it reads), so removing
+    it can only remove bytes from the request — never items from the input.
+    """
+
+    messages = _two_window_conversation()
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+
+    def payload_for(log: tuple[dict, ...]) -> dict:
+        return adapter._payload(
+            ModelRequest(instruction=None, system_prompt="", tools=(), messages=log)
+        )
+
+    assert payload_for(prune_dead_reasoning(messages)) == payload_for(messages)
+    # And the prune really did remove something the un-pruned request was still paying for.
+    assert "enc_a" in json.dumps(messages)
+    assert "enc_a" not in json.dumps(prune_dead_reasoning(messages))
+    assert "enc_b" in json.dumps(prune_dead_reasoning(messages))
+
+
+def test_a_dead_block_cannot_poison_the_window_before_or_after_the_prune() -> None:
+    """The one way this could have gone wrong: the all-or-nothing rule reads only the window.
+
+    A historical block tagged with a *different* model is already ignored, so pruning it must
+    not flip the live window's decision either way. If the model-identity scan ever widened to
+    the whole log, the prune would silently start changing what is replayed — this fails first.
+    """
+
+    messages = _two_window_conversation(historical_model="gpt-4o")
+    pruned = prune_dead_reasoning(messages)
+
+    assert _reasoning_replay_flags(pruned, "gpt-5.5") == _reasoning_replay_flags(messages, "gpt-5.5")
+    adapter = OpenAIModelAdapter(ModelConfig(model="gpt-5.5"))
+    replayed = [
+        item
+        for item in adapter._payload(
+            ModelRequest(instruction=None, system_prompt="", tools=(), messages=pruned)
+        )["input"]
+        if item.get("type") == "reasoning"
+    ]
+    assert replayed == [_RS_B]
+
+
 @pytest.mark.skipif(
     not os.environ.get("OPENAI_API_KEY") or not _openai_responses_available(),
     reason="OPENAI_API_KEY or OpenAI Responses SDK support not available",
@@ -589,9 +809,14 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
             self.status_code = 400
             self.body = {"code": "unsupported_value"}
 
-    class _FakeResponses:
+    class _FakeRawCalls:
         def create(self, **kwargs):  # noqa: ANN003
             raise _FakeBadRequest()
+
+    class _FakeResponses:
+        # The surface ``next_turn`` drives: the raw-response wrapper (it keeps the final request
+        # the success-path retry probe reads), which raises exactly as the plain call would.
+        with_raw_response = _FakeRawCalls()
 
     built = _stub_openai(monkeypatch, "OpenAI", _FakeResponses())
     adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
@@ -605,6 +830,72 @@ def test_openai_adapter_maps_provider_400_to_model_adapter_error(monkeypatch: py
     assert "secret prompt" not in str(err)  # no prompt/body leak
     # A rejected call still owns its client: the throwing path releases the pool too.
     assert [client.closed for client in built] == [True]
+
+
+def test_the_kernel_key_is_never_presented_to_the_openai_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CONTRACTS: only the gateway transport presents `Idempotency-Key`; "the OpenAI adapter
+    does not read the field, so nothing is sent there." Stated since W7-3 and checked by
+    nothing until now -- the documented-rule-nobody-enforces shape three W7-2 review rounds
+    kept finding. Scoped to the KERNEL's token: the SDK may run idempotency machinery of its
+    own and this pin says nothing about it, only that the value the runner minted reaches no
+    argument the adapter hands the SDK. Three pins close the claim together: this capture
+    (the dispatch kwargs), the exact `with_options` equality below (`{"max_retries": 0}` and
+    nothing else), and the AST census that every SDK call sits on `_call_client`."""
+    pytest.importorskip("openai")  # the dispatch path imports the SDK; skip on a minimal install
+
+    sentinel = "idem_" + "cafe" * 8
+    seen: list[dict[str, Any]] = []
+
+    class _RefusalAfterCapture(Exception):
+        # The 400 shape the classifier already maps (its own test above): the pin needs the
+        # dispatch kwargs, not a parseable success body, so the cheapest settled outcome ends
+        # the call right after the capture.
+        def __init__(self) -> None:
+            super().__init__("refused after capture")
+            self.status_code = 400
+            self.body = {"code": "unsupported_value"}
+
+    class _CapturingRawCalls:
+        def create(self, **kwargs):  # noqa: ANN003, ANN202
+            seen.append(kwargs)
+            raise _RefusalAfterCapture()
+
+    class _CapturingResponses:
+        with_raw_response = _CapturingRawCalls()
+
+    _stub_openai(monkeypatch, "OpenAI", _CapturingResponses())
+    adapter = OpenAIModelAdapter(ModelConfig(), api_key="test", allow_direct_provider_api=True)
+    request = ModelRequest(
+        instruction="hi", system_prompt="", tools=(), idempotency_key=sentinel
+    )
+
+    with pytest.raises(ModelAdapterError):
+        adapter.next_turn(request)
+
+    assert request.idempotency_key == sentinel  # the field was there to leak
+    assert seen, "the dispatch never reached the SDK stub"
+    assert sentinel not in repr(seen), "the kernel's key reached an SDK argument"
+
+
+def test_the_openai_adapter_never_reads_the_idempotency_field() -> None:
+    """The mechanism behind the pin above, checkable without the SDK installed: "the OpenAI
+    adapter does not read the field" (CONTRACTS). An adapter that never names the field
+    cannot present it -- the payload is hand-listed, not serialized off the request -- so
+    this source census is the half of the claim that runs on a minimal install, where the
+    capture pin above skips. A future edit that starts reading the field fails here first
+    and has to argue with the contract sentence it contradicts."""
+
+    import inspect
+
+    import monoid_agent_kernel.providers.openai as openai_module
+
+    source = inspect.getsource(openai_module)
+    assert "idempotency" not in source.lower(), (
+        "the OpenAI adapter names the idempotency field; CONTRACTS says only the gateway "
+        "transport presents it"
+    )
 
 
 # --- Client ownership: the adapter must not leak its HTTP connection pool --------------
@@ -685,17 +976,34 @@ class _ResponsesStandIn(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        if self.server.status != 200:
+        if self.server.take_failure():
+            # A transient 500 the SDK's own retry loop absorbs. ``retry-after-ms`` keeps the
+            # SDK's backoff out of the test clock (its schedule honours the header).
+            self._respond(
+                500,
+                _STANDIN_ERROR,
+                "application/json",
+                extra_headers={"retry-after-ms": "1"},
+            )
+        elif self.server.status != 200:
             self._respond(self.server.status, _STANDIN_ERROR, "application/json")
         elif json.loads(body).get("stream"):
             self._respond(200, _STANDIN_SSE, "text/event-stream")
         else:
             self._respond(200, json.dumps(_STANDIN_RESPONSE).encode("utf-8"), "application/json")
 
-    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+    def _respond(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -710,9 +1018,10 @@ class _StandInServer(ThreadingHTTPServer):
     sockets actually went away, observed from outside the code under test.
     """
 
-    def __init__(self, status: int = 200) -> None:
+    def __init__(self, status: int = 200, fail_first: int = 0) -> None:
         super().__init__(("127.0.0.1", 0), _ResponsesStandIn)
         self.status = status
+        self.fail_first = fail_first
         self.live = 0
         self._live_lock = threading.Lock()
 
@@ -720,11 +1029,21 @@ class _StandInServer(ThreadingHTTPServer):
         with self._live_lock:
             self.live += delta
 
+    def take_failure(self) -> bool:
+        """Consume one budgeted transient failure, if any remain."""
+        with self._live_lock:
+            if self.fail_first <= 0:
+                return False
+            self.fail_first -= 1
+            return True
+
 
 @contextlib.contextmanager
-def _responses_stand_in(monkeypatch: pytest.MonkeyPatch, *, status: int = 200) -> Iterator[_StandInServer]:
+def _responses_stand_in(
+    monkeypatch: pytest.MonkeyPatch, *, status: int = 200, fail_first: int = 0
+) -> Iterator[_StandInServer]:
     """Serve the stand-in and point the SDK at it via ``OPENAI_BASE_URL``."""
-    server = _StandInServer(status)
+    server = _StandInServer(status, fail_first)
     with serving(server) as base_url:
         monkeypatch.setenv("OPENAI_BASE_URL", f"{base_url}/v1")
         yield server
@@ -907,6 +1226,51 @@ def test_openai_next_turn_closes_its_client(monkeypatch: pytest.MonkeyPatch) -> 
     assert still_open == 0, f"{still_open} connection(s) still open server-side"
 
 
+def test_openai_next_turn_reports_the_sdk_retry_behind_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empirical, against the real SDK: a 500 its retry loop absorbs still marks the success.
+
+    The stand-in refuses the first POST and answers the second, which is invisible to the
+    adapter's own control flow -- the SDK hands back a parsed model either way. The evidence
+    is the ``x-stainless-retry-count`` header the SDK stamps on its final request, read off the
+    raw-response wrapper; without it this call was written to the transcript, the receipt and
+    the gateway wire as a clean first attempt. The follow-up call on the now-healthy server
+    proves the flag is per-call evidence, not adapter state.
+    """
+    pytest.importorskip("openai")
+    with _responses_stand_in(monkeypatch, fail_first=1):
+        retried = _standin_adapter().next_turn(_standin_request())
+        clean = _standin_adapter().next_turn(_standin_request())
+
+    assert retried.final_text == "Hi"
+    assert retried.provider_retried is True
+    assert clean.final_text == "Hi"
+    assert clean.provider_retried is False
+
+
+def test_openai_astream_reports_the_sdk_retry_on_every_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming twin, and on every chunk: an abandoned stream never yields the terminal
+    one, so evidence riding only ``TurnComplete`` is evidence a cancelled call cannot report."""
+    pytest.importorskip("openai")
+    with _responses_stand_in(monkeypatch, fail_first=1):
+        adapter, request = _standin_adapter(), _standin_request()
+
+        async def drain_twice() -> tuple[list[Any], list[Any]]:
+            first = [chunk async for chunk in adapter.astream_turn(request)]
+            second = [chunk async for chunk in adapter.astream_turn(request)]
+            return first, second
+
+        retried, clean = asyncio.run(drain_twice())
+
+    assert [type(chunk) for chunk in retried] == [TextDelta, TurnComplete]
+    assert [chunk.provider_retried for chunk in retried] == [True, True]
+    assert [type(chunk) for chunk in clean] == [TextDelta, TurnComplete]
+    assert [chunk.provider_retried for chunk in clean] == [False, False]
+
+
 def test_openai_astream_classifies_a_failure_from_the_clients_own_teardown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -947,9 +1311,18 @@ def test_openai_next_turn_classifies_a_failure_from_the_clients_own_teardown(
     """The sync twin: ``__exit__`` sits inside the classified region too."""
     pytest.importorskip("openai")
 
-    class _Responses:
-        def create(self, **_kwargs: Any) -> Any:
+    class _RawTurn:
+        # The ``LegacyAPIResponse`` shape: ``parse()`` yields the model, and no ``request``
+        # attribute at all -- which the retry probe must read as "no retry", not crash on.
+        def parse(self) -> Any:
             return _StreamResp()
+
+    class _RawCalls:
+        def create(self, **_kwargs: Any) -> Any:
+            return _RawTurn()
+
+    class _Responses:
+        with_raw_response = _RawCalls()
 
     built = _stub_openai(
         monkeypatch, "OpenAI", _Responses(), close_error=RuntimeError("pool teardown failed")
@@ -1563,3 +1936,293 @@ def test_cli_run_refuses_an_adapter_offering_open_without_close(
     assert not isinstance(result.exception, AttributeError), (
         "the failure must be a reported CLI error, not a raw attribute lookup escaping the handler"
     )
+
+
+def test_cli_run_recording_flags_produce_the_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--model-calls-file`` / ``--model-payload-file`` are the CLI's halves of the switches
+    the backend carries as fields. Without them this CLI shipped ``monoid gc`` and ``monoid
+    validate`` -- consumer verbs -- while no ``monoid run`` invocation could produce the
+    artifacts they consume. The witness is the digest join, as in the backend twin: the
+    ledger line's 64-hex key must name the corpus request record beside it. And the flags
+    stay opt-in: the corpus is content-classified, so the second run pins that omitting them
+    writes neither file."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeModelAdapter(turns=[ModelTurn(final_text="done")]),
+    )
+    config_file = _write_config(tmp_path / "runtime.json", "run.finish")
+    run_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-recording",
+            "--model-calls-file", "--model-payload-file",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_dir = run_root / "cli-recording"
+    ledger_lines = [
+        json.loads(line)
+        for line in (run_dir / "model_calls.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert ledger_lines, "the ledger flag reached the run"
+    digest = ledger_lines[0]["request_digest"]
+    assert len(digest) == 64
+    request_records = [
+        record
+        for record in (
+            json.loads(line)
+            for line in (run_dir / "model_payloads.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        if record.get("kind") == "model_request"
+    ]
+    assert [record["request_digest"] for record in request_records] == [digest]
+
+    quiet = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-quiet",
+        ],
+    )
+
+    assert quiet.exit_code == 0, quiet.output
+    assert not (run_root / "cli-quiet" / "model_calls.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model_payloads.jsonl").exists()
+    assert not (run_root / "cli-quiet" / "model-content.jsonl").exists()
+
+    # The third sidecar, whose flag landed with these two so that `monoid validate`'s
+    # model-content arm stops being a consumer with no producer. Driven by a *streaming* adapter,
+    # because this flag is the one with a side effect: it selects the streaming dispatch, and the
+    # non-streaming fake above produces a file with `stream_opened`/`stream_closed` and not one
+    # `stream_segment` -- so an existence check on that adapter pins the wiring and none of the
+    # behaviour the flag's own help advertises.
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli._model_adapter",
+        lambda *_a, **_k: FakeStreamingModelAdapter(
+            chunk_turns=[[TextDelta("streamed "), TextDelta("answer"), TurnComplete()]]
+        ),
+    )
+    content = CliRunner().invoke(
+        main,
+        [
+            "run", "--workspace", str(workspace), "--instruction", "Finish.",
+            "--run-root", str(run_root), "--runtime-config-file", str(config_file),
+            "--run-id", "cli-content", "--model-content-file",
+        ],
+    )
+
+    assert content.exit_code == 0, content.output
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (run_root / "cli-content" / "model-content.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert "stream_segment" in kinds, kinds
+
+
+@pytest.mark.parametrize("requested", [True, False], ids=["asked", "omitted"])
+def test_backend_serve_carries_the_recording_flags_to_the_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requested: bool
+) -> None:
+    """A deployment is served, not run one-shot, so the deployment shape needs the flags too.
+
+    `monoid run` and the `RunnerBackend` field are two of the three surfaces the precedent this
+    wiring follows shipped together -- `--llm-gateway-provider` landed on `monoid run`, on
+    `monoid backend serve`, and as the field, because a switch reachable from two of three leaves
+    the served deployment with `monoid gc` and `monoid validate` and no way to produce what they
+    consume. Both parities are pinned: absent flags must leave the deployment recording nothing.
+    """
+    built: list[Any] = []
+
+    def capture(runner_backend, **_kwargs):
+        built.append(runner_backend)
+        raise KeyboardInterrupt  # stop before the socket; serve_forever is not under test
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.create_backend_server", capture)
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    argv = [
+        "backend", "serve",
+        "--run-root", str(tmp_path / "runs"),
+        "--workspace-root", str(workspace),
+        "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        "--ephemeral-token-secret",
+    ]
+    if requested:
+        argv += ["--model-calls-file", "--model-payload-file", "--model-content-file"]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert built, result.output
+    backend = built[0]
+    try:
+        # All three private sidecars, because a deployment reachable for two of them is the
+        # asymmetry this branch exists to close, and `monoid validate` re-checks all three.
+        assert backend.model_calls_file is requested
+        assert backend.model_payload_file is requested
+        assert backend.model_content_file is requested
+    finally:
+        backend.shutdown()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["backend", "serve"], ["llm-gateway", "serve"], ["web-gateway", "serve"]],
+    ids=["backend", "llm-gateway", "web-gateway"],
+)
+def test_every_serve_command_reports_a_bind_failure_as_a_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: list[str]
+) -> None:
+    """Three commands, one rule. The first version of this fix was bound on `backend serve` alone
+    while its two siblings, eighty and two hundred lines below in the same file, kept the bare
+    traceback the commit message said had been removed -- and that message's own words were "the
+    CLI error *every other* startup failure gets".
+
+    Port 99999 rather than a genuinely bound socket, because that is the shape that escaped:
+    `click`'s `int` accepts it and the socket layer answers with `OverflowError`, not `OSError`,
+    so an `except OSError` catches nothing at all here.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in (
+        "MONOID_BACKEND_ADMIN_TOKEN",
+        "MONOID_LLM_GATEWAY_ADMIN_TOKEN",
+        "MONOID_WEB_GATEWAY_ADMIN_TOKEN",
+    ):
+        monkeypatch.setenv(name, "admin-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    argv = [*command, "--port", "99999", "--ephemeral-token-secret"]
+    if command[0] == "backend":
+        argv += [
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+        ]
+
+    result = CliRunner().invoke(main, argv)
+
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, (OSError, OverflowError)), (
+        f"the bind failure escaped as a traceback: {result.exception!r}"
+    )
+    assert "could not listen on" in result.output, result.output
+
+
+def test_backend_serve_releases_the_backend_when_the_socket_cannot_be_taken(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bound port is the everyday failure of this command, and it happens after the backend is
+    built. With the release keyed to `serve_forever`, that path returned a constructed backend to
+    nobody and reported a bare `OSError` traceback instead of the CLI error every other startup
+    failure gets."""
+    from monoid_agent_kernel.reference.backend.service import RunnerBackend
+
+    released: list[str] = []
+
+    class _Tracking(RunnerBackend):  # type: ignore[misc]
+        def shutdown(self, *args: object, **kwargs: object) -> object:
+            released.append("shutdown")
+            return super().shutdown(*args, **kwargs)
+
+    monkeypatch.setattr("monoid_agent_kernel.cli.RunnerBackend", _Tracking)
+    monkeypatch.setattr(
+        "monoid_agent_kernel.cli.create_backend_server",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError(48, "address already in use")),
+    )
+    monkeypatch.setenv("MONOID_BACKEND_ADMIN_TOKEN", "admin-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "backend", "serve",
+            "--run-root", str(tmp_path / "runs"),
+            "--workspace-root", str(workspace),
+            "--llm-gateway-url", "http://llm-gateway.internal/v1/turns",
+            "--ephemeral-token-secret",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert released == ["shutdown"], "the constructed backend was never released"
+    assert not isinstance(result.exception, OSError), (
+        "the bind failure must be a reported CLI error, not a traceback"
+    )
+    assert "could not listen on" in result.output, result.output
+
+
+def test_the_kernel_layer_reaches_every_sdk_call_through_one_helper() -> None:
+    """The census: every `.responses` access in the adapter sits on a `_call_client(...)` result.
+
+    The OpenAI SDK's own retry loop is not governed by `ModelRetryConfig` -- the adapter only
+    reads its evidence -- so the layer contract can only reach it through client options, and
+    `_call_client` is the single place that happens. Derived from the source rather than
+    listed, so a new SDK call site joins the census by existing instead of by being
+    remembered.
+    """
+
+    import ast as ast_module
+
+    source = Path(openai_module.__file__).read_text(encoding="utf-8")
+    accesses = [
+        node
+        for node in ast_module.walk(ast_module.parse(source))
+        if isinstance(node, ast_module.Attribute) and node.attr == "responses"
+    ]
+    assert accesses, "the census matched no SDK call route; the adapter moved -- re-derive it"
+    bypassing = [
+        node.lineno
+        for node in accesses
+        if not (
+            isinstance(node.value, ast_module.Call)
+            and isinstance(node.value.func, ast_module.Name)
+            and node.value.func.id == "_call_client"
+        )
+    ]
+    assert not bypassing, f"SDK call routes bypassing _call_client at lines {bypassing}"
+
+
+def test_the_kernel_layer_disables_the_sdks_own_retries() -> None:
+    """`layer="kernel"` reaches the SDK as `max_retries=0`; the default leaves it untouched.
+
+    Identity for the default layer matters as much as the option for the kernel one: the
+    client may be scope-cached, and an options copy taken on every call under the default
+    would be a behavior change nobody asked for.
+    """
+
+    class _Recording:
+        def __init__(self) -> None:
+            self.options: dict[str, Any] | None = None
+
+        def with_options(self, **kwargs: Any) -> _Recording:
+            self.options = dict(kwargs)
+            return self
+
+    kernel_client = _Recording()
+    kernel_config = ModelConfig(retry=ModelRetryConfig(layer="kernel"))
+    assert openai_module._call_client(kernel_client, kernel_config) is kernel_client
+    assert kernel_client.options == {"max_retries": 0}
+
+    default_client = _Recording()
+    assert openai_module._call_client(default_client, ModelConfig()) is default_client
+    assert default_client.options is None

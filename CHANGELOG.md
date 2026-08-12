@@ -7,6 +7,2705 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-12
+
+### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path
+
+- **Gap 6 closes at ingestion, which was one of the two fixes its own entry named.**
+  `MAX_ARGUMENT_DEPTH` was reached only through the approval-request builder, so an `ask`-gated
+  call rejected a deep argument and an `allow`-gated one carried it into the message history and
+  on to `RunCheckpoint.to_json`. Measured on this interpreter rather than estimated:
+  `dataclasses.asdict` dies at **492** containers while the model-JSON decoder that admitted them
+  stops at **512**, so every depth in [492, 512] cleared every gate it met and then killed the run
+  at the checkpoint writer — `_CheckpointPersistError` out of `run_once`, with no classified
+  record of what happened. The Python-object arm had no bound at all: 5,000 levels accepted. A
+  fifth refusing boundary at `_normalize_model_turn` now carries the bound on the route a model's
+  own tool-call arguments take, and the failure is a classified `ModelAdapterError` an operator
+  can read. Honestly scoped: that is **terminal**, not correctable — a bare `ModelAdapterError`
+  is not recoverable and the loop does not re-prompt on it, so the model does not get a chance to
+  flatten its arguments. The entry's other fix — dropping `asdict`, which also drops its deep copy
+  and would let a checkpoint share mutable state with the live loop — stays on the durability
+  surface for 0.22, and the "known gap, deliberately not closed" comment is retired naming that
+  half specifically. **With this, all four gaps the 0.20.0 notes left open are addressed in
+  0.21**: gap 3 and gaps 7–8 in the Track D entries below, gap 6 here.
+- **A container no longer decides what the copy of it contains.** `normalize_json_ingress` asked
+  `source.items()`, `len(source)` and `source[i]`, so a `dict` or `list` subclass wrote the record
+  every later reader sees — the checkpoint, the transcript, the preview, the operator's redact
+  patterns. The scalar generations' argument does not transfer and was not reused: measured,
+  `json.dumps` reads a `list` subclass's real storage but takes a `dict` subclass's overridden
+  `items()`, so "what will a writer spell" answers opposite ways on the two halves and settles
+  neither. The argument that does hold is that **the copy is the record**. Reading length and
+  elements from the same base slot pair also removes the `IndexError` route structurally: two
+  questions that cannot disagree.
+- **A container reachable from itself is refused before the writer that cannot spell it.** The
+  walk memoises a container before descending, so the second visit short-circuits and a
+  self-referential input produced a self-referential *copy* at path depth 2 — accepted, then
+  fatal at `json.dumps` (`Circular reference detected`) or `asdict` (`RecursionError`), neither at
+  the boundary that took it. No depth bound would ever have caught it. The refusal is a
+  three-colour walk over the finished copy: an ancestor hit is a cycle, a memo hit is legitimate
+  sharing and stays shared. The depth bound rides the same pass as a **height** computed on the
+  way out, not a counter carried in — measured, a carried counter peaked at 252 on a copy that
+  was 501 containers tall and killed `asdict`, because the memo charges a shared subtree at
+  whichever reference the walk reaches first while `asdict` has no memo. One constant, 64, now
+  serves the three sites that bound container nesting, each documenting whether it raises or
+  elides, because those two behaviours must not be unified even though the number should be.
+- All of this is **opt-in per boundary**. Four existing pins forbid a default-on refusal, and
+  that is checked by mutant rather than asserted: making the flag default to `True` reddens three
+  of them.
+
+### Fixed — a cap that is not a number is not a cap
+
+- **`capped_backoff` resolves an unusable `max_delay_s` before any arm reads it.** The schedule
+  was made total under one rule — growth it cannot resolve resolves upward, to the cap — and the
+  rule is vacuous when the cap is what cannot be resolved. `nan` and `-inf` left every
+  `min(max_delay_s, .)` answering something not above zero, which every caller floors to **no
+  backoff at all**: the retry loops through `if delay > 0`, the outbox through
+  `uniform(0, max(0.0, ceiling))` = `uniform(0, 0)` — an unthrottled resend against the endpoint
+  that just refused, which is the state the multiplier arm was fixed to prevent, reached through
+  the other argument. `+inf` is the far end: it answers ordinary products until one leaves the
+  float range, then `asyncio.sleep(inf)` is a timer that never fires, and at the outbox it stamps
+  a `next_attempt_at` that `due_outbox` never selects and `OutboxRequest.to_json` refuses
+  (`parse_float` — finite only), in the checkpoint export that runs *after* the send: the receipt
+  for a dispatch that reached the endpoint is lost and the request goes again. An unusable cap
+  resolves to `sys.float_info.max`, above the multiplier arm because the first-attempt exit
+  returns `min(max_delay_s, initial_delay_s)` and reads the cap on its own. An unlimited cap stays
+  unlimited: for every product the schedule can represent, `min(inf, product)` and
+  `min(float_info.max, product)` are the same number. The doors stay unvalidated — the same
+  decision the multiplier arm was settled under, restated rather than revisited.
+
+### Fixed — the last reads that let a type name itself, and a relation that keeps them closed
+
+- **Fourteen expressions still asked a class for its own name.** Enumerated by AST across 193
+  modules, not from memory. The published ones reach observers, `run.failed.error`,
+  `failure.json`, `status.json` and the CLI's JSON output (where an exit-code predicate reads
+  one); the rest raise, and raising is not lesser exposure — `type(x).__name__` inside a `raise`
+  is evaluated *before* the exception exists, so a hostile metaclass replaces the classified
+  error with its own. Measured: a `TypeError` explaining what an integrator passed became a
+  `RuntimeError` from inside a hostile `__getattribute__`. The census that keeps this closed
+  counts three spellings (attribute, `getattr`, base slot), does not count a read already wrapped
+  in a reader, and tracks a **count** per site rather than a set — two of the three surviving
+  reads share a module, an owner and a spelling, and a set would collapse them.
+- **A restart test now waits on the durable fact it is about to read.** Nine tests waited for an
+  in-memory record and then built a second backend over the same run root, racing the status
+  writer; three said so in a comment while doing it. The rule is a relation over the source
+  rather than a list of the nine, and it is checked in both directions and in order — a durable
+  wait standing *before* the in-memory one, which is what three of them actually had, is still a
+  violation. Test-only: this makes the race legible, it does not make the writer reliable. If the
+  artifact is never written, these now fail deterministically at the wait instead of
+  intermittently three constructions later.
+
+### Changed — the preview is bounded as a payload, not only per piece: budgeted traversal (Track D)
+
+- **Every traversal-built preview now spends one byte budget across everything it appends.**
+  Two of the four gaps the 0.20.0 notes left open close here. "One preview's total size is
+  bounded only by its input" — the shared-graph re-expansion: nine levels shared five ways,
+  46 objects, previewed to 25.78 MB in 1.02 s, growing ~×5.9 per added branch, with the cycle
+  guard rightly silent because sharing is not a cycle — closes because the walk now stops when
+  the payload reaches its ceiling, while a value shared twice still renders twice. And "there
+  is no aggregate budget, so the caps can be walked around by chunking" closes because the
+  cap-obeying pieces still pass and their sum no longer does. The budget is charged on
+  serialized output — quoted keys, preview envelopes and truncation markers included — in the
+  widest spelling any *stream* writer uses: default separators and `ensure_ascii=True`, because the SSE
+  writers escape non-ASCII on purpose (U+2028/U+2029/U+0085 split a frame mid-string otherwise)
+  and an escaped BMP character costs six bytes however few it takes in UTF-8. Charging UTF-8
+  would bound a representation no live subscriber receives — measured, a payload charged just
+  inside the ceiling reached 503,579 bytes out of the real frame writer, and close to three
+  times the ceiling for two-byte scripts and non-BMP codepoints. That is the same defect this
+  module was corrected for once before, one level up. The ceiling is therefore a statement about
+  what a subscriber receives: `events.jsonl`, both SSE writers and the HTTP bodies are all
+  dominated by this charge, while `write_json_atomic`'s pretty-printed `status.json` and approval
+  files add per-element indentation on top — 2.65× the charge for a payload of many tiny
+  elements, a bounded multiple of a bounded payload rather than a growth axis, and not charged
+  here because the indent cost depends on how deeply each writer nests the payload in its file.
+  It is charged this way because
+  the reverted `PREVIEW_MAX_NODES` proved both halves the hard way: it counted visited nodes
+  instead of bytes (912 KB of markers lived outside the count), and it was born once per
+  top-level key, so 400 keys still cost 42 MB. One `PayloadBudget` per payload: 256 KiB on the
+  trace surface, 1 MiB on the approval card, whose reader is a person and whose ceiling must
+  not quietly become the trace constant. The fixed-key builders (`shell_args_preview`,
+  `web_args_preview`) share one budget across their fields for the same reason, and
+  `public_job_artifact` stays outside the scheme: its field set is a fixed allowlist,
+  individually bounded and schema-validated on both ends.
+- **Exhaustion spends the vocabulary that already exists; nothing is replaced.** The same
+  revert shipped the failure shapes this rules out: budget markers *replacing* plan items kept
+  `len(items) - len(published)` at 0, so `truncated_items` never fired and `status.json`
+  reported a complete-looking plan permanently one step short of done — and a
+  `{"budget_exhausted": true}` dict where `_INLINE_TEXT_KEYS` guarantees a string rendered
+  `[object Object]`. Now a dict that runs out drops its remaining keys and says how many
+  through `truncated_keys`; a list drops its tail and reports through the existing
+  `{"truncated_items": n}` marker — or, at the plan root, through the sibling count the caller
+  already derives from the length difference; strings keep their existing envelopes and inline
+  markers. No new marker shape and no schema value changes, so `validate_run_dir` reads
+  directories written on either side of this change.
+
+### Changed — a scalar the writers cannot spell is refused or enveloped, never carried (Track D)
+
+- **Gap 3 closes in two halves, one per failure it caused.** The leak half: `preview_value`
+  bounded `str` and returned every other scalar whole, so a 4300-digit integer — the largest
+  the bounded decoders admit — rode onto `events.jsonl` at 4,300 bytes against a 240-byte
+  threshold, twenty copies per `artifact.emit`. Integers past the threshold now get the string
+  envelope's sibling, `{"type": "int", "preview": <hex prefix>, "truncated": true}` — hex
+  because a decimal spelling is exactly what the interpreter's digit limit may refuse to
+  build — while small scalars keep their type, which is what the `artifact.emitted.kind`
+  precedent demands of schema-typed fields. The crash half: `bytes`, integers past the
+  4300-digit bound, and arbitrary objects passed the normalizer untouched (by design — the
+  boundary was deferred as the arbitrary-scalar gap) and crashed `json.dumps` at the
+  *transcript* write, which sits before `tool.call.finished`: one hostile value in a
+  custom/MCP tool's Python-built result ended the run as `internal_error` with no observation
+  the model could correct. The transcript stays raw by contract, so the fix is refusal at the
+  four Python-object ingress boundaries — tool result content, `emit_artifact` metadata, task
+  request, task result — each converting the shared predicate's refusal into its own
+  classified error (`tool_result_unportable`, `artifact_metadata_unportable`,
+  `task_request_unportable`, `task_result_unportable`): the call fails, the run continues.
+  The predicate is the decoder's own vocabulary run in reverse (`|n| < 10**4300` mirrors
+  `parse_bounded_json_int`), decided without ever spelling the value, and the preview's
+  non-JSON envelope `{"truncated": true, "type": <name>}` names the type without calling
+  `repr` on it — a hostile `__repr__` must not run inside event construction. JSON-parsed
+  routes are unaffected: the bounded decoders never admitted these values.
+
+### Added — the reader transports, the mint certifies: ledger format guard (W7-4)
+
+- **`model_call_record` refuses to mint a line `monoid validate` would then convict.**
+  Carry-over from PR #106 round 6, resolved for the whole class rather than the named field:
+  the three format-constrained, receipt-parsed strings (`idempotency_key`, `prompt_digest`,
+  `request_digest` — the census derives the set from the schema, so it cannot silently grow
+  or shrink) stay reader-lenient on `ModelCallReceipt.from_json`, deliberately: the reader
+  transports, so a receipt with a damaged digest can still be loaded and inspected, and a
+  parsed receipt is not a certified one. Certification now has two enforcers deriving from
+  one body each in `core/model_io.py`: the schema patterns (`RECORDED_DIGEST_BODY` joins
+  `_IDEMPOTENCY_KEY_BODY`, and both of `schemas.py`'s digest forms compose it) and the mint
+  guard, which checks empty-or-valid on all three before building the record. Empty stays
+  admissible because a refused call was never keyed and never digested — the guard cannot
+  fire on a runner-built receipt — and for the recorder a refused mint costs the one line,
+  not the run. (`model_payloads.is_chunk_sha256` keeps its own 64-hex predicate on purpose:
+  a chunk reference becomes a filename, and that path-safety boundary carries its own
+  reader-side obligations.)
+
+### Changed — one spelling produced, both still read: `attempt_log` presence rules (W7-4)
+
+- **The writers omit an empty `attempt_log`; the readers keep accepting the `[]` earlier
+  builds wrote for it.** Absence is now the one spelling this build produces for "nothing
+  itemized" — a record that predates the field, a refused call that never dispatched, or a
+  receipt built without a log: `ModelCallReceipt.to_json` and the ledger projection emit the
+  key only when there is an entry to carry. Nothing is refused for the other spelling.
+  `from_json` reads a present `[]` as an empty log beside any `attempts`, and `monoid
+  validate` reports nothing, because that is what every build between W7-1 and W7-4 wrote for
+  the same value: the projection emitted the key unconditionally, and
+  `AgentRecorder.record_settled_call` is public, so a default `ModelCallReceipt()` — whose
+  `attempts` is 1 — already produced `[]` beside a positive count. Every directory those
+  builds filled keeps validating. This supersedes the W7-1 sentence below ("the writer always
+  emits it, so absence means exactly one thing: a writer that predates the field"):
+  unconditional emission gave one value two spellings and made a parsed pre-field receipt
+  re-serialize wearing the second, which is the distinction no reader could use.
+  `idempotency_key` deliberately keeps always-emit: its absence spelling is the in-band empty
+  string, so the key travels on every line rather than being the one that goes missing.
+
+### Added — the retried call, visible in the trace: per-attempt OTel spans (W7-2)
+
+- **`OtelEventSink` synthesizes one `model.attempt {index}` child span per kernel dispatch**
+  under the call's `chat` span, at settle, from `receipt.attempt_log` — in both `span_mode`s,
+  through the model-I/O facet. No public event changes: the event stream still carries no
+  attempt data, so the children appear only where the subscription facet is registered. Only
+  when the kernel dispatched more than once — a single-attempt call's chat span IS that
+  attempt, and a child would restate it at double the span volume of every subscribed call.
+- **Children are `monoid.model.attempt.*` and never `gen_ai.*`.** Index, `elapsed_ms`,
+  `backoff_ms`, the failure taxonomy, per-attempt usage (JSON string), `provider_retried`,
+  `stream_committed`; a failed dispatch gets `error.type` + ERROR status under the parent's
+  rule (`model_call_aborted` stays an interruption). No GenAI attributes, because a
+  GenAI-aware backend aggregating usage or operations over spans would double-count the
+  parent; no capture content, whatever the policy — the attempt log is metadata by
+  construction. SpanKind INTERNAL, so service maps keep counting one egress per call.
+- **A wait cannot precede the dispatch it separates from nothing.** `backoff_ms` is the wait
+  *between* two dispatches, so the first entry's is 0 — stated since the field landed, checked
+  now: the receipt refuses any other value there, and `monoid validate` reports a ledger line
+  that books one. Absence stays legal and distinct, meaning a record written before the field.
+- **The timeline is bounded at both ends of its own claim.** `monoid validate` now reports a
+  ledger line whose dispatches and recorded waits outlast the `latency_ms` of the call that
+  made them — the third cross-entry claim on that line, after the indices and the usage sum,
+  and the first surface where both values are settled together (the runner attaches the log
+  before `_publish` stamps the duration, so the receipt constructor cannot ask). The OTel
+  children bound their own walk by the same inequality instead of trusting it, so a hand-built
+  or corrupted receipt can no longer place a child before the call that dispatched it.
+- **Placement is the recorded timeline, walked backward from settle**: each child spans its
+  measured `elapsed_ms` preceded by its `backoff_ms` gap (that field lands in the entry one
+  section below); entries parsed from lines that predate the field pack edge to edge —
+  durations and order exact, unknown gaps collapsed. Duplicate `on_model_call` deliveries do
+  not duplicate children; a receipt with no matching open chat span synthesizes no orphans.
+
+### Added — the wait between dispatches, on the record: `attempt_log[].backoff_ms`
+
+- **Each attempt entry records the measured backoff that preceded its dispatch.**
+  `ModelCallAttempt.backoff_ms` — 0 on the first entry, the floored monotonic measurement of
+  the sleep that actually ran otherwise, `None` on entries parsed from lines written before
+  the field existed. Measured around the wait rather than copied from the schedule, so a
+  capped sleep records what happened. The entry's timeline algebra closes with it: every
+  duration is the floor of the same monotonic clock, and floors sum to at most the floor of
+  the sum, so `sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` holds exactly — the remainder
+  is keying and settle overhead. Landed ahead of the per-attempt OTel spans (W7-2) so they
+  can sit on the real timeline instead of being packed edge to edge.
+- **The first key added to the entry after the entry shipped, and the wire rule now names
+  that boundary.** The entry stays read-whole-or-refused for the keys it was born with;
+  `backoff_ms` follows the record-level absence rule instead (`_ATTEMPT_OPTIONAL_WIRE_KEYS`,
+  a named policy with its reason beside it): absent = a W7-1 writer's line, still valid to
+  `monoid validate`; null = refused by reader and schema alike, since no writer omits by
+  writing null; `to_json` and the `model-calls.v1` projection omit the key when the value is
+  unknown, so a legacy line round-trips unchanged instead of refusing itself on the next
+  read. Same unreleased-window reasoning as `attempt_log` and `idempotency_key` — no released
+  reader, `monoid.model-calls.v1` identifier unchanged (COMPATIBILITY.md).
+
+### Added — one retry scope per call, carried where the call is keyed: `idempotency_key`
+
+- **Every model call is keyed with a retry-scope token.** `ModelCallRunner` mints
+  `idem_` + uuid4-hex in the same block that computes the digests — per call, before the
+  first dispatch — and stamps it onto its own copy of the request. Constant across kernel
+  re-dispatches and adapter-internal retries by construction (both loops reuse the request),
+  reissued on resume (a call never spans a park, so recovery re-runs the step as a new
+  call). The runner is the single issuer: a caller-set `ModelRequest.idempotency_key` is
+  overwritten, because a respected caller value would let one request object hand two calls
+  the same retry scope. Random, never content-derived — two byte-identical requests share a
+  replay slot precisely because content cannot separate them.
+- **The receipt and the `model-calls.v1` line record it as issued, not as sent.**
+  `ModelCallReceipt.idempotency_key` (`""` = never keyed: refused before the keying block,
+  or a record predating the field); the ledger schema declares the key without requiring it,
+  the `attempt_log` precedent, so `monoid validate` keeps passing directories pre-W7-3
+  writers filled. Outside the replay key and the payloads corpus, so no recorded replay
+  identity moves and the equivalence oracle's three-field mask holds. Not projected to
+  `status.json`, `metrics.json`, or the event stream.
+- **The gateway presents it; the reference server logs and echoes it.** Both wire routes
+  (sync one-shot, async stream) send `Idempotency-Key` read off the request being
+  dispatched — headers rebuild per attempt so a credential can refresh, and the key must
+  not move with them, which is why it is not minted where headers are. An unkeyed request
+  keeps its exact pre-W7-3 wire shape (no empty header). The reference `llm_gateway` logs
+  the inbound key on the two turn routes and echoes it on every response those requests
+  produce — JSON, SSE, and error responses alike — and deliberately does **not** dedupe on
+  it (retry-scoped carriage is not exactly-once) nor relay it upstream — it **issues its own**
+  key for the upstream hop it drives, on both the one-shot and streaming paths, because that
+  hop has a retry loop of its own and a relayed key would stitch two scopes into one. So
+  `ModelCallRunner` is not the only issuer, and both read the same `new_idempotency_key`.
+  The OpenAI adapter does not read the field.
+- **A key is a bounded ASCII token, enforced at every edge it crosses — including the
+  ledger.** 1–128 characters from `[A-Za-z0-9._+-]` starting with a letter or digit. The
+  `model-calls.v1` schema states it as a pattern (empty admitted, the `^(|...)` idiom
+  `prompt_digest` uses), so `monoid validate` cannot certify an imported or third-party line
+  whose key the rest of the kernel would refuse; the rule lives once in `core/model_io.py`
+  and both enforcers derive from it, because `core` cannot import `providers` and a retyped
+  twin regex drifts. This is the only field on the
+  receipt that reaches a transport header rather than a JSON string — JSON escapes a control
+  character, an HTTP header does not, and neither `http.client` nor `httpx` refuses an
+  obsolete folded value — so request ingress refuses a non-conforming caller-supplied key,
+  the gateway transport omits one rather than raising (an adapter must not lose a paid call
+  over a bookkeeping token), and the reference gateway reads a non-conforming inbound key as
+  absent, logging that one was dropped and never its bytes, because that route logs before
+  the service authenticates.
+
+### Fixed — every schema `pattern` now ends at end of input, not at `$`
+
+- **`monoid validate` no longer certifies a value with a trailing newline.** JSON Schema
+  calls `pattern` an ECMA-262 expression; `jsonschema` evaluates it with Python's `re`, where
+  `$` also matches immediately before a single trailing newline. Every pattern in the
+  artifact schemas was spelled with a bare `$`, so a `model-calls.v1`, `event.v1`,
+  `manifest.v1`, `model-payloads.v1`, `approval`, `apply-result` or `workspace-*` line
+  carrying `"<digest>\n"`, `"<timestamp>\n"`, `"<event.type>\n"` or `"<key>\n"` validated
+  clean while every other edge in the kernel refused the same value — 5 distinct patterns
+  across 29 declaration sites, all of them. They now assert `END_OF_INPUT`
+  (`core/_json_schema.py`): `$` plus "and no character may follow", load-bearing under `re`
+  and redundant under ECMA-262, so a Python validator and a JavaScript one refuse the same
+  values. `\Z` was rejected as the fix — ECMA-262 has no `\Z` and would read it as a demand
+  for a literal `Z`. The change only tightens: verified over a 176-candidate lattice that the
+  sole behavioural difference from the old patterns is the single-trailing-newline case, and
+  under V8 that the new spellings behave identically to Python's.
+- **The class is pinned, not the instance.** A conformance census discovers every `pattern`
+  reachable from any module-level schema in the package and drives the real validator against
+  each accepted probe plus each line terminator, failing closed if discovery collapses or if a
+  pattern has no probe to witness it.
+
+### Added — every dispatch on the record, and the record in the totals: `attempt_log`
+
+- **`ModelCallReceipt.attempt_log` itemizes what `attempts` counts.** One entry per kernel
+  dispatch: index, elapsed, the failure taxonomy `with_error` reads (probed on the attempt,
+  before the whole-call retry fold can colour it), per-attempt billed usage, per-attempt
+  `provider_retried` (the progress channel — which now counts reports instead of only
+  remembering one — plus what that attempt's own outcome declared), and whether a delivered
+  chunk had closed the retry window when the attempt settled. The log is empty or complete:
+  `len(attempt_log)` is 0 (a refused call, or a record written before the field existed) or
+  exactly `attempts`, and entry usage sums to the receipt's `usage` on either settle exit.
+  No wall-clock instant, the receipt's own rule — the ledger line's `recorded_at` anchors
+  the call, and backoff waits fall between entries.
+- **The `model-calls.v1` line carries the log, and old lines stay valid.** A fourth
+  hand-listed projection writes it (the reflection census refused `to_json()`, exactly as
+  designed); the schema declares the key without requiring it, because `monoid validate`
+  sweeps directories earlier v0.21 builds filled. The writer always emits it, so absence means
+  exactly one thing: a writer that predates the field.
+- **The run's totals now read the receipt the call site used to discard.** On the settled
+  path the loop accumulates `receipt.usage` — which folds absorbed attempts' spend the turn
+  cannot know about — and on the failure path the terminal error is restamped with the
+  merged total before it escapes, so the existing park accounting adds the whole call.
+  `metrics.json`, `state.total_usage`, the cumulative token budget and the child roll-up
+  all see what a kernel-retried call actually cost. This supersedes W7-0's framing below
+  ("the receipt is the audit surface... the budget still meters settled turns"): the receipt
+  remains the per-call authority, and the run's accounting now consumes it. Stated
+  precisely: the token budget is a pre-call gate — checked before a turn begins —
+  and `max_attempts` is the intra-call bound on what one logical call may spend; transcript
+  `model_turn` rows keep the turn's own usage (the model's statement), so totals reconcile
+  as transcript rows plus absorbed spend. Spend absorbed by an adapter's *own* loop stays
+  client-invisible (each hop meters its own wire calls); a deployment that wants absorbed
+  spend in run accounting assigns the loop to the kernel.
+- **Every arm the loop re-raises a model failure through reaches that accounting, not the
+  one that was driven.** The bill is read inside an `except` clause, which binds it to the
+  types that clause catches: `except ModelAdapterError` covered a provider's refusal and
+  nothing else, so a third-party exception (rebuilt from its message, stamps dropped) and
+  every run boundary (`RunCancelled`, `RunTimeout`, and the `ModelCallAborted` translated
+  into a `TurnInterrupted` — all `NativeAgentError`, all one arm further along) carried the
+  absorbed spend out of the loop with no one reading it. One translator now carries what was
+  stamped onto any error it replaces, and one accounting function is reached from both
+  re-raising arms. Visible change: a cancelled, timed-out or interrupted run's
+  `metrics.json` and `total_usage` now include attempts a kernel retry completed and paid
+  for before the boundary; the terminating dispatch's own bill is still not counted, as it
+  never was for a call that did not settle.
+- **…including the stops that are not `Exception`s.** `asyncio.CancelledError` has inherited
+  straight from `BaseException` since 3.8, so a host cancelling the task driving
+  `asubmit`/`arun_once` — and a `KeyboardInterrupt` — reached *no* arm rather than the wrong
+  one, carrying the stamp the runner had just written. Both now account and both are
+  re-raised unchanged, guarded so a raising observer cannot replace the stop; the run
+  outlives them and its totals are still reported. `SystemExit` and `GeneratorExit` reach an
+  explicit arm that deliberately stays silent: teardown is where a recorder's sinks are
+  closing. The handler chain is now total, so a class outside `Exception` is a written
+  decision rather than an omission.
+- **An `attempt_log` entry is read whole or refused, and the sweep checks the two claims
+  that span entries.** The entry reader defaulted all ten fields, so `[{}]` beside
+  `attempts: 1` deserialized into a plausible successful dispatch — an entry has no writer
+  predating it, and the ledger schema had required all ten since the field shipped. And
+  because `monoid validate` reads the ledger as JSON without constructing a receipt, the
+  index and usage-sum invariants `__post_init__` refuses were unenforced there; a
+  relationship pass now applies both, alongside the ones the manifest, proposal, transcript
+  and payload surfaces already had.
+- **`stream_committed` answers on both retry layers, not only the one that reads it.** The
+  delivery marker was installed on the consumer only when the kernel owns the loop — where
+  the flag is *used*, to refuse a retry that would replay a chunk — while the flag is
+  *recorded* on every call and `layer` defaults to `"adapter"`. Every shipped streaming call
+  therefore wrote a definite `stream_committed: false` onto its ledger line with the
+  consumer holding its chunks, and a present `false` cannot be told from "this arm never
+  answered".
+- **`ModelCallReceipt.with_error` cannot fail the call it is reporting.** Every read in that
+  method is guarded so a description of a failure never replaces it; the usage-sum invariant
+  reopened that door, because the method overwrites `usage` from the exception's stamp and
+  leaves `attempt_log` alone — so calling it on a receipt already carrying entries raised
+  `ValueError` out of the reporting path. A receipt that already carries its own breakdown
+  now keeps its total, the rule `provider_retried` already followed.
+- **Promoted from the post-W7-0 reassessment probes, now permanent pins:** delivery is
+  marked before the consumer runs (a consumer raising a retryable-dressed error cannot
+  reopen the stream and replay its own side effect); a consumer exception propagates with
+  its type intact, never retried; the anext-coroutine and awaitable-returning dispatch
+  shapes retry under the kernel layer like their two siblings; and kernel retry rides the
+  replay fallthrough — miss, flaky inner, retry, miss again, inner answers — without
+  spinning the corpus.
+
+### Added — the kernel owns the retry when the config says so: `ModelRetryConfig.layer`
+
+- **`ModelRetryConfig` names who runs the retry loop.** `layer: "adapter" | "kernel"`
+  (default `"adapter"`, serialized only when it departs the default, so a config that never
+  chose keeps its pre-field `config_hash`). Under `"kernel"`, `ModelCallRunner` loops around
+  the one dispatch point all four adapter shapes share: the request is normalized and keyed
+  once, one receipt settles with `attempts=N`, and observers see one capture. The predicate
+  is the taxonomy — a retryable, non-config-recoverable `ModelAdapterError`; run boundaries
+  fall out structurally, and `retry_on` stays the adapter loop's code selector.
+- **Exactly one layer loops.** The dispatch copy is neutralized to `max_attempts=1` with the
+  layer preserved (silencing any config-honoring loop, including third-party adapters that
+  never learned `layer` exists); the gateway client answers one attempt under `"kernel"` on
+  both its loops, and the OpenAI adapter passes the SDK `max_retries=0` through the one
+  helper every `.responses` route is census-bound to. Kernel × adapter stays the kernel's
+  count, not the product — pinned end-to-end through the runner and the gateway wire.
+- **A delivered chunk closes the retry window.** Once the delta consumer holds output, a
+  retry would replay it downstream, so the loop refuses — the same commit line the gateway's
+  `committed` flag and the OpenAI SDK's pre-stream retry window already draw. A stream that
+  dies before delivering anything retries, and the consumer sees only the attempt that
+  answered.
+- **A swallowed attempt still cost tokens.** Usage stamped on errors the kernel loop absorbs
+  (`mark_provider_usage`) is summed into the receipt on either settle exit; the receipt is
+  the audit surface for the whole logical call. The run token budget still meters settled
+  turns and parked failures — per-attempt spend absorbed by any retry layer is a receipt
+  fact, documented as such.
+- **The backoff answers to the run.** The wait shares the gateway's schedule
+  (`retry_delay_s` in `providers/_common`, one function for all three loops) and runs under
+  the same cancel/deadline race as the attempts, so a cancellation wakes it; a backoff that
+  cannot fit the remaining deadline re-raises the transient provider error instead of
+  sleeping into a `RunTimeout` that names nothing. `max_delay_s` now caps the exponent and
+  not only the product: `max_attempts` and `backoff_multiplier` are validated with a lower
+  bound and no upper one, so a policy the spec accepts could overflow
+  `multiplier ** (attempt - 1)` before the cap was consulted — and `float ** int` raises
+  there, inside the handler for the retryable `ModelAdapterError`, replacing the provider's
+  taxonomy with an unclassified `OverflowError`. The jittered sum saturates for the sibling
+  reason: jitter rides on top of the cap, `max_delay_s` and `jitter_s` are both unbounded
+  above, and float addition answers `inf` rather than raising — a wait no timer can fire.
+- **The replay key does not move.** The identity projection already excluded the retry block
+  (W6-4b's `_model_identity` named this exact field addition as its reason); the exclusion
+  matrix now pins `retry.layer` per-field, and a retried run's corpus is shape-identical to
+  an unretried one because recording is settle-driven — failed attempts leave no records.
+
+### Added — the corpus replays: `monoid run --replay-from` and `ReplayModelAdapter`
+
+- **`discard_turn` now takes back the answer it served, not the last one it remembers.** The
+  per-key served-slot note was written on every hit and cleared by nothing, so it outlived its
+  call: a later call on the same key — exhausted by then, so served live through the fallthrough —
+  released the *earlier* call's slot when discarded. Nothing caught it, because an exhausted call
+  never moves the cursor, so the `cursor == slot + 1` guard still held for the delivered slot. A
+  recording already handed to one call was handed to another, at exit 0 with a clean
+  `monoid validate`. Each in-flight answer is now noted separately and matched by identity, which
+  is what makes the documented "a live fallthrough answer is not taken back" true in code. The note
+  is per call rather than per key — nothing serialises `next_turn` against the adapter a sibling
+  family shares, and one note per key let whichever of two concurrent calls served last overwrite
+  the other's turn-to-slot association — and it holds the turn weakly, so the bookkeeping is never
+  why a recorded body (up to the 8 MB payload ceiling) stays in memory. A discard the cursor
+  cannot honour yet stays pending rather than being dropped, and every release retries the highest
+  pending slot, so two concurrent calls give both slots back whichever order their discards
+  arrive in. `ReplayCorpus.release` holds that pending set and reports whether it rewound, because
+  "not now" and "not ever" are different and only the cursor can tell them apart — in the corpus
+  rather than above it, since `ReplayTake`'s own reconstruction-failure release is a second caller
+  and a rule living in the adapter released straight past it. Compaction walks *consecutive* slots
+  only, so a slot whose successor was delivered and kept is still not given back.
+- **A payload record whose envelope is corrupt is damage, not something to coerce.** The reader
+  type-checked the fields it *keys* on and substituted the ones it *reports* with: a missing or
+  wrongly typed `run_id`, `root_run_id` or `recorded_at` became `""` or `str(...)` and the record
+  was indexed anyway. `schemas.py` requires all three, so those are records `monoid validate` calls
+  corrupt while `rejected_records` stayed zero — the preflight then told the operator a damaged
+  corpus was sound, and the adapter served the record as a successful turn with its provenance lost
+  or invented. The check sits above the kind dispatch, so chunks, requests and answers all get it.
+  The coercion had also stopped being merely advisory: `run_id` correlates the impersonation
+  evidence now, so two damaged records in two unrelated runs both collapsed to `""` and intersected.
+  `unrecorded_reason` is checked the same way, by membership in the schema's own enum: coerced, a
+  missing marker or a `false` became `""` — the value meaning "recorded normally" — so a damaged
+  record with a well-formed body beside it replayed as a successful turn.
+- **The reader and `monoid validate` now agree on what a damaged payload record is, because the
+  reader *is* the schema.** Four successive review rounds found the same shape — the reader
+  validating what it *keys* on and indexing what the schema calls corrupt, so `rejected_records`
+  stayed zero and the replay preflight reported a damaged corpus as sound. `_index` no longer
+  restates the schema field by field; it runs `MODEL_PAYLOADS_RECORD_SCHEMA`'s own branch, selected
+  by `kind`, which is equivalent to the top-level `oneOf` because each branch pins `kind` with
+  `const`. That closes the class rather than the reported field: unknown and cross-kind properties
+  are refused (every branch is `additionalProperties: false`), along with the unknown `kind`,
+  absent `payload`, negative `call_index` and non-object `response` earlier rounds each found one
+  at a time. The two checks the schema cannot make are all that stay hand-written — a chunk's
+  bytes re-hashed against its name, and the empty response digest, which is legal and unjoinable
+  rather than damaged.
+
+  The measurement that had ruled this out was of the wrong placement — and the replacement
+  measurement was of the wrong record, which took two more passes to catch. On a record the schema
+  **accepts**, the whole `oneOf` costs ~257µs because it tries all three branches; the branch alone
+  costs ~66µs, or 0.66s for a 10,000-record corpus at construction. That is ~16% of what
+  `ReplayCorpus.load` already spends on the same corpus (~410µs per record to read, verify and
+  parse it), and load is per replay invocation over the sources named, not a global index: a single
+  50-call run is ~100 records, and a 200-run union is ~20,000. The first figures quoted here (232µs
+  and 14.8µs) were timed against a fixture with a misspelled `schema_version`, so `is_valid`
+  short-circuited on the first keyword and measured a rejection rather than the acceptance every
+  healthy record pays.
+  `test_the_reader_and_the_schema_agree_on_what_a_damaged_record_is` is now the equivalence proof
+  for the dispatch and runs in both directions — reader-looser is the defect, reader-stricter has
+  to be enumerated and now *fails* when it is not.
+- **`--replay-fallthrough` no longer applies the corpus's multimodal answer to the live adapter.**
+  `supports_multimodal` is derived from what the recorded preimages hold, which is right for the
+  recorded calls and wrong for the live ones: `AgentLoop` gates `resolve_wire_messages` on this one
+  flag, so a text-only corpus made the loop skip resolution for a *new* image request, which then
+  missed the corpus and reached a paid provider call with its media still by reference — and
+  provider mappers forward media only once it is base64, so the call happened, was charged, and had
+  no image in it. A corpus whose recorded parts are all text now lends the inner adapter its
+  capability, which is sound exactly there because resolution passes text through unchanged and so
+  cannot move a recorded key. Where it cannot be lent — a corpus recording media *by reference*
+  (resolving would rewrite its own preimages), one with unreadable requests, or a text-only inner —
+  a fallthrough carrying unresolved media is refused as `config_recoverable` before the call rather
+  than paid for blind. Rejecting the combination outright was not available: `openai` and `gateway`
+  both declare `supports_multimodal = True` unconditionally.
+- **Every capability the replay wrapper exposes now states whether it is the corpus's answer or
+  the inner's.** Two review rounds found the same question asked of two attributes —
+  `supports_multimodal` and `config` — and neither fix bound the next one. A declaration answers
+  "whose recording is this key from", which only the corpus can say; a capability answers "what can
+  the thing that will actually run do", which under fallthrough is the inner. `wire_image_encoding`
+  travels with the capability it governs, because `AgentLoop` reads it off whichever adapter it
+  asked about `supports_multimodal` — lending one without the other hands the inner bytes in a shape
+  the wrapper chose for it. Latent today (only `base64` is accepted) and bound now, because the
+  coupling was created by the preceding fix. `provider_name` stays the corpus's, as the module
+  docstring and `docs/CONTRACTS.md`'s third ledger delta already record. A new public attribute with
+  no stated origin fails `test_every_exposed_capability_states_where_it_comes_from`, read off the
+  class by AST rather than from a list someone maintains.
+- **The request evidence scan no longer holds the whole expanded corpus.** `request_terms_view()`
+  returned a tuple *and* wrote every expansion into a cache the corpus kept for its lifetime, so
+  constructing `ReplayModelAdapter` reassembled and parsed every offloaded request and retained it —
+  the recipes that name those preimages are a handful of chunk references each, the preimages are up
+  to the 8 MB ceiling and unbounded in number, so the peak tracked the *expanded* corpus before a
+  single call was served. It yields now and retains nothing; the only thing kept is the
+  `unreadable_requests` count, computed once because the derivation asks three times and the CLI
+  preflight twice. Its twin `response_bodies_view` was made a generator one round earlier for the
+  same reason.
+- **A fallthrough wrapper with no config of its own answers with the inner adapter's.** The
+  effective-model probe reads `getattr(adapter, "config", None)` and can only see the wrapper, so a
+  request whose `model` is None resolved to the *default* model: a recording keyed under the
+  original adapter's configuration missed, and the fallthrough then served the call with the inner's
+  own non-default config while the receipt stamped the default — a real answer recorded under a
+  model identity that never produced it. A validated `ModelConfig` on the inner is adopted when no
+  explicit one is given; a raising probe or a non-`ModelConfig` leaves the wrapper silent.
+- **A union whose sources disagree about the recorded provider declaration is refused.** The rule
+  that declines to declare was made run-scoped in an earlier round; the positive half beside it
+  stayed a global flag, so one source carrying an injected reasoning block declared for the whole
+  union — including a source whose own history and reasoning-bearing answers prove its original did
+  not declare. Replay then injected blocks that source's preimages never had, recomputing every key
+  from its second turn on, while the preflight saw one provider and one model across the union and
+  said nothing. Within a run the two co-occur by construction and the positive evidence still wins;
+  across runs it is a contradiction, and the corpus is refused with both run sets named.
+- **A duplicate request record must hash to the key it claims to share.** A request recorded by two
+  runs is credited to both, which is what lets a run holding both halves of the evidence intersect
+  itself — but it credited on digest equality alone. The first record's payload has always been
+  re-hashed before its terms are believed; every duplicate behind it was believed for repeating a
+  name, which is the one claim an edited record can make for free. An altered run could therefore
+  be reported as carrying another run's assistant history. Each contributor now keeps its own
+  payload and is re-hashed against the shared digest before its run is credited.
+- **A discarded outcome is handed back on every path that drops one, not just the first.** A run
+  boundary can throw away a real result in five places: the boundary check finding the call already
+  done, the awaiter's own cleanup finding it done a moment later, an async callee settling after
+  detach, a synchronous worker settling inside the abandonment grace once its waiter is cancelled,
+  and a caller abandoning a call it never got to wait on — `ModelCallRunner` resolves its grace
+  accessor after the call is already live, so an accessor that raises takes an exit that carried no
+  hook. Only the first was wired. The grace one mattered most for replay — the worker had already
+  advanced the cursor, and its answer was dropped where only awaitables are disposed of, so a
+  `ModelTurn` simply vanished and the slot stayed spent. All five now go through one
+  `hand_back_discarded` rule, `AbandonableSyncCall` carries a `set_discard_hook` the awaiter
+  installs, and `abandon_unwaited_call` carries the hook for both of its own halves. The count is
+  no longer taken by reading: a previous round counted four by reading `core/_sync_bridge.py`, and
+  the fifth was a caller's other exit in another module, so
+  `test_every_abandonable_call_site_routes_its_discards` censuses call sites and requires a
+  function that routes discards on one exit to route them on all of them.
+- **Deriving the adapter no longer materializes the response corpus.** `response_bodies_view()`
+  built a tuple of every answer body so the impersonation derivation could ask one boolean per
+  body. Bodies reach the 8 MB payload ceiling and nothing bounds how many there are, so
+  constructing a `ReplayModelAdapter` over a large run directory resolved the whole corpus into
+  memory before serving a single call. It yields now, keeping one body alive at a time.
+- **The multimodal derivation reads both media carriers.** A user turn carries parts in `content`;
+  a tool message carries returned media in a top-level `media` list. Only the first was scanned, so
+  a corpus whose images came back from a tool derived text-only — and since the flag is a preimage
+  term, replay then left the re-executed media by reference while the recorded digest covered its
+  resolved base64 form, missing every lookup after that turn. `core.media.WIRE_MEDIA_CARRIERS` is
+  now one list with two readers rather than two hand-maintained copies.
+- **Reasoning evidence no longer crosses recorded runs.** The rule that declines to declare reads
+  "answers carried reasoning, and a request had a turn behind it in which the block would have
+  appeared" — a claim about a continuation of the conversation the reasoning came from. Both halves
+  were global scans over the whole union, so a family union could combine a single-turn source that
+  recorded reasoning with a multi-turn source that recorded none, and decline where each source
+  alone declares. Under the shipped gateway default that drops the declaration and makes every
+  recomputed key name the transport instead of the relayed provider, so the preflight refused a
+  corpus and a config that were both correct. `request_terms_view()` and `response_bodies_view()`
+  now carry each item's `run_id` and the derivation intersects them, and a request recorded by two
+  runs reports under *both* — first-wins is right for the payload and wrong for provenance, and
+  keeping only the first stopped a run holding both halves from intersecting itself. This narrows
+  the inference rather than proving it: correlating a continuation with the answer it continues
+  from needs message-prefix matching the corpus does not model. Both error directions fail closed.
+- **A malformed recorded scalar or container is refused rather than defaulted.** Bodies are
+  deliberately open-shaped, so a damaged corpus can carry a string where a bool belongs, or `false`
+  where a list does. `bool("false")` is `True`, so a recorded "not retried" replayed as retried; and
+  `or ()` turned a damaged `tool_calls` into an empty one, reconstructing a perfectly successful
+  final-text turn — the corpus's damage answered rather than refused. `provider_retried`,
+  `tool_calls`, `reasoning` and `usage` now all earn the `not_recorded` refusal, checked from one
+  declared table rather than four hand-written guards.
+- **A replay corpus can be narrowed rather than silent, and the two are no longer confused.**
+  A request record that reassembles and hashes correctly can still be past the reader's JSON
+  nesting bound, and it was then simply absent from `request_terms_view()`. The impersonation
+  derivation reads those terms, so a corpus missing exactly the records that argue against
+  declaring looked identical to one that never had them — and took the opposite horn, declaring
+  a provider and making the loop inject reasoning blocks the recorded preimages never had.
+  `ReplayCorpus.unreadable_requests()` counts them, the derivation declines while it is
+  non-zero, `monoid validate` reports each such record instead of certifying the corpus clean,
+  and the preflight says so even when enough records remain to derive an identity. The records
+  are still *written*: a deep tool result stays in the by-value message log, so refusing them
+  would cost the run its request provenance from that call onward.
+- **The replay preflight no longer blames the runtime config for the corpus's silence.** With no
+  readable request record there is nothing for a config to match or to diverge from, so "fix the
+  runtime config" named the one cause that was ruled out. It now points at `monoid validate`.
+- **A discarded model call can now be taken back: `ModelCallRunner` offers adapters an optional
+  `discard_turn(request, turn)`.** A run boundary is checked before a completed call's result is
+  read, so a call can finish and still have its answer thrown away — on every dispatch shape, not
+  just the abandonable-worker one. For `ReplayModelAdapter` that meant a discarded call
+  permanently consumed a recorded answer, and the next consumer of that corpus was served the
+  following one: a structurally valid turn belonging to a different call, at exit 0 with a clean
+  `monoid validate`. The hook releases the slot, keyed by recomputing the request's digest. A
+  fallthrough answer served live is deliberately not taken back; `docs/CONTRACTS.md` states it.
+- **A settle that raises no longer becomes the verdict.** A corpus whose `release` raised inside
+  `ReplayTake.__exit__` replaced the typed `ReplayMiss` with a bare `RuntimeError`, turning a
+  `config_recoverable` park into an unclassified kill; through `served()` it discarded a live
+  answer already paid for. Both call sites now contain it and log, the way disposal already did.
+- **`monoid validate` no longer retains every chunk it reads.** Memoizing resolved bytes beside
+  the inline chunks made its footprint O(total offloaded corpus) with an 8 MB per-chunk ceiling
+  and no bound on the count. A chunk whose verdict is already known is no longer resolved at all,
+  so read-once now holds however the records are ordered, and the bytes stay transient.
+- **Three diagnosis sentences were still unbounded**, and the census meant to prevent that could
+  not see them: it matched attribute names, and all three interpolate plain locals. The census is
+  now an allow-list — every interpolation must be bounded or reviewed by name.
+
+
+- **`ReplayModelAdapter` and `ReplayMiss` (`monoid_agent_kernel.providers`), the corpus reader
+  behind them (`core/payload_replay.py`), and `monoid run --replay-from RUN_DIR_OR_ID`
+  (repeatable) with `--replay-fallthrough`.** A recorded run replays through the engine to the
+  same answer, and the replay run's own ledger recomputes the same request keys line for line —
+  the runner's recomputation is the proof. Answers replay in recorded order, each once; misses
+  are typed (`no_key` / `absent` / `not_recorded` / `identity_mismatch` / `exhausted` /
+  `generation_mismatch`), content-free, and park-shaped (`error_code: "replay_miss"`,
+  `retryable: false`, `config_recoverable: true`), so a session survives a miss and a one-shot
+  run promotes it to `failure.json`. Pure replay builds no live adapter — no gateway URL, no
+  token, no `--allow-direct-provider-api` — and a preflight refuses a run whose config cannot
+  match anything recorded, naming expected and actual. Provider impersonation is derived from
+  corpus evidence (declared originals re-inject reasoning into the record; undeclared ones do
+  not), heterogeneous-provider unions are rejected at construction, tools re-execute for real,
+  and every ledger line of a `monoid run --replay-from` run carries `attributes.replay_from`
+  (a stamp of that command, not of the adapter). A refused record
+  keeps its slot until the caller moves past it, so a parked turn's re-attempt earns the same
+  refusal rather than the next call's answer, whether the corpus refused it or reconstruction
+  did; a source named twice is one source, on volumes that report an inode and on those that do
+  not; a key more than one named source can answer is counted and warned about, because across
+  a union "file order" is the order of the flags; a miss whose diverging term is the model
+  identity says `identity_mismatch` and names both sides in plaintext rather than blaming the
+  conversation; and a body that is not a recorded turn — wrong fields, or a count the loop would
+  refuse — is a typed miss rather than a model error blamed on a model that was never called. Known v1 limits,
+  documented: a spawning run's post-spawn parent turn cannot replay (the spawn observation
+  embeds per-run identifiers), though the children themselves replay from the family union;
+  concurrent callers of one key divide its recordings in scheduler order, because the
+  recording never fixed that order either; the consumption cursor is per-process, so a durably
+  resumed replay counts from the start again; and replay serves whole turns, so a streaming
+  run degrades to one-shot.
+- **Settlement is a property of leaving a take, not a rule each call site re-attaches.**
+  `ReplayCorpus.take(digest, generation=...)` is a context manager: its block declares
+  `served()` when the call happened, and every other exit — a raise, a rejected reconstruction,
+  a refusal with no fallthrough — settles unserved. The two directions are opposite (a standing
+  refusal is spent forward, a record handed over and rejected is given back) and which one is
+  held is not visible from the call site, so the choice moved into the object that owns the
+  cursor. Leaving the block having declared nothing raises rather than defaulting, because a
+  silent default is another way to serve one answer twice. It also closes a route nobody had
+  named: any exception escaping between the take and the settle now gives the slot back, where
+  before it was lost, so a Ctrl-C landing inside reconstruction no longer costs the re-attempt
+  its position. A synchronous wrapper now also
+  refuses an inner that hands back an *awaitable*: such a call returns having done no provider
+  work, so nothing may be settled on its behalf, and no declaration-side check can see the shape
+  (`iscoroutinefunction` is false for a plain `def` returning a coroutine). The same rule is
+  bound over `next_turn`, `open` and `close` as one census rather than three hand-written
+  checks.
+- **An offloaded response body is held to the same ingress rules as an inline one**, and
+  `monoid validate` now parses a resolved chunk rather than only re-hashing it. Re-hashing
+  proves the bytes are the ones the writer named, not that they are a body any reader will
+  accept — so a planted chunk could carry JSON the ingress rules forbid, and, since tools
+  re-execute for real, a non-finite number in recorded tool arguments could reach a live tool
+  invocation as a value that exists in no recording.
+- **The recorder no longer writes an answer the reader will refuse to read.** The record line's
+  depth gate cannot see an offloaded body, whose brackets live in a chunk file rather than in
+  the line, so a body deeper than the reader parses was stored with `unrecorded_reason: ""` —
+  the writer stating it recorded the answer — and then refused at replay as `not_recorded`. It
+  is refused at write time now, as `unencodable`, which is exactly what the inline half has
+  always done with the same body. The bound stays on the writer rather than moving off the
+  reader because without the lexical scan the decoder's own stack limit decides instead, and
+  the same corpus would replay or not depending on how deep the call stack already is.
+- **A miss message is bounded in every channel, not only in its values.** The identity bound
+  covered one quoted value and left the clause *count*, the term *names*, and the identifiers
+  (`run_id`, `unrecorded_reason`, the generation tags, a resolver's error text) unbounded — all
+  of them corpus-supplied, on a corpus this reader's own threat model does not trust, and all
+  landing on `turn.failed`, in `failure.json`, in `status.json` and on stderr where nothing
+  downstream truncates.
+- **The family union is not key-disjoint, and the warning says which remedy applies.** Nothing
+  run-scoped is in a replay key, so two subagents with the same definition and the same prompt
+  record one key in two run directories and the `--replay-from` order decides which child gets
+  which answer. Disjointness is a property of the prompts, not of the family shape. Where the
+  crossing sources are children of one run — sharing a `root_run_id` *and* differing in
+  `run_id` — the preflight asks for them in spawn order, because reversing the flags is not an
+  actionable instruction for a fan-out. The run-id test is what keeps that sentence true: a run
+  named beside an archived copy of itself shares a root as well, and `--replay-from` takes a
+  directory or an id, so naming both is an ordinary slip that would otherwise be reported as a
+  fan-out with a spawn order that does not exist.
+- **The replay key's derivation moved down to `providers/_request_identity.py`** so the adapter
+  shares the exact functions the runner stamps receipts with; `model_call` re-imports every
+  name, so embedder imports and behavior are unchanged, and the identity pins moved with the
+  functions. A checked-in golden corpus now turns any composition change that forgets to bump
+  the digest generation into a failing test instead of a silently rekeyed fleet.
+
+### Changed
+
+- **`monoid validate` answers per chunk what it used to answer per record.** An offloaded body
+  is content-addressed, so whether it reads back is a property of the bytes, and the bytes
+  cannot change between two reads of one run directory — but N response records may name one
+  chunk, and each re-read and re-parsed it. Measured at eight records over one 8 MB chunk, the
+  command took 7.4 s; the read and the parse verdict are now memoized by sha, so the cost tracks
+  a corpus's distinct chunk bytes rather than its record count.
+- **`monoid validate` now reports a malformed response reference as its own integrity issue**
+  ("response reference is not a content-addressed name"). A single-key chunk-marker object
+  carrying a non-sha value is unmistakably writer-shaped corruption; it used to be skipped as
+  data (non-string values) or reported in resolution-failure vocabulary (string values). The
+  validator and the replay reader now interpret references through one shared trichotomy.
+
+### Added — the recording switches are reachable from the shipped shapes
+
+- **`--model-calls-file`, `--model-payload-file` and `--model-content-file` on both `monoid run`
+  and `monoid backend serve`, and the matching keyword-only `RunnerBackend(model_calls_file=...,
+  model_payload_file=...)` fields.** The per-call ledger and the private replay corpus existed
+  only as `AgentLoop` keyword arguments — an embedder could record, no shipped shape could —
+  while the same CLI already shipped `monoid gc`, a consumer verb for an artifact nothing it ran
+  could produce, and `monoid validate`'s corpus arm beside it. Every surface lands together, as
+  `--llm-gateway-provider` did, because a switch reachable from two of three leaves the served
+  deployment with the consumer verbs and no producer — and `model-content.jsonl` is in the set
+  for that same reason, since `monoid validate` re-checks it too. The backend carries the
+  booleans exactly as it carries `model_content_file`: into the submitted run and into the
+  activation recovery rebuilds, pinned by the ledger's own activation-restart signature
+  (`call_index` back at zero, both zeros recorded). Each boolean is read when a host builds an
+  activation, so it describes the host, not the run — a run reclaimed by a node configured
+  differently records differently from there on. All three stay opt-in — two of them are
+  content-classified — and the omission half is pinned too: a run without the flags writes none
+  of them. Studio is deliberately not wired for the two recording switches; its egress toggle
+  grants live delivery and the content sidecar, never the corpus, and all three Studio censuses
+  now enumerate them so that stays true.
+- **Breaking, for direct constructors of an unsupported surface:**
+  `BackendLoopFactoryContext` gains two *required* keyword arguments,
+  `model_calls_file_provider` and `model_payload_file_provider`, following
+  `llm_gateway_provider_provider`. `reference.backend` declares itself outside the supported
+  public surface, and only `RunnerBackend` constructs this class in-tree, so nothing in a
+  supported configuration breaks; an embedder that assembles the context itself must add the two.
+  The `RunnerBackend` fields are keyword-only for the ordinary reason: its positional argument
+  list is pinned by `tests/test_public_surface.py`.
+
+### Fixed — a sidecar somebody asked for and did not get says so
+
+- **Every transition into a sidecar's terminal state now logs one `WARNING` naming the artifact,
+  instead of a `debug` line nobody sees or, for `model-content.jsonl`, nothing at all.** These
+  writers fail closed when the path is not a file this process may append to (a planted link, or
+  the second name a hardlink-deduplicating backup leaves behind), when a chunk cannot be stored,
+  when an append may have torn its line, and — for the content store — when its descriptor stops
+  matching its path mid-run. All of that was silent: the run exited zero, reported `completed`,
+  and `monoid validate` called the directory clean, because each artifact is optional. Worse, the
+  refused file keeps whatever was there, so a reader could find another run's records under this
+  run's name; and the chunk case leaves the corpus file never created at all, which is
+  indistinguishable from never asking for it. `WARNING` because it means a run lost an artifact
+  it was configured to produce, and because Python's last-resort handler delivers exactly that
+  level to stderr for an operator who configured no logging, which is the shape `monoid run` runs
+  in. Once per writer per activation: in each writer the flag and the announcement are one call,
+  the raw assignment appears only inside it, and an AST census derives the flag set from the gates
+  that read it and fails the file if any other site writes one. A failure that costs a single
+  record stays at `debug`, and a third-party stream observer that raises stays `debug` too — that
+  isolation is a different contract. The loggers are `monoid_agent_kernel.recorder` and
+  `monoid_agent_kernel.core.model_content` (renamed from `monoid_agent_kernel.model_content` so
+  that quieting `monoid_agent_kernel.core` reaches it); the message names the artifact only, with
+  `monoid_run_id` and `monoid_artifact` carried as record fields.
+  **For embedders: this is new output.** These lines did not exist below `debug` before, and
+  Python's last-resort handler puts `WARNING` on stderr when no logging is configured.
+- **Every `serve` command reports a bind failure as a CLI error.** `backend serve`,
+  `llm-gateway serve` and `web-gateway serve` all bind after constructing what they serve, so a
+  bound port ended in a bare traceback; `backend serve` additionally left the constructed backend
+  unreleased. `--port 99999` is part of this: click accepts it and the socket layer answers with
+  `OverflowError`, which an `OSError` handler does not catch.
+
+### Added — the chunk directory's crash litter now has a collector
+
+- **`monoid gc RUN_DIR` reports what no record in a run's replay corpus resolves — orphaned
+  chunks from an interrupted write, dead write temporaries from other processes' crashed writers
+  — and `monoid gc RUN_DIR --apply` deletes it.** Report-only is the default because this is the
+  first deletion an operator can ask the kernel for (the recorder already unlinks its own
+  process's temporaries) and a chunk is an unrecoverable original: deletion is nominated by
+  keep-set membership (one whole-record walker, deliberately a superset of every resolver), gated
+  by `--min-age-s` (default one day; a gate that is not a finite, non-negative number of seconds
+  is refused before the directory is read), re-checked immediately before each unlink — same
+  directory the safety gate approved, still a regular file, still past the gate — and held to one
+  invariant, pinned on every fixture whose sweep runs to completion against a real corpus:
+  `monoid validate` reports exactly the same issues after a sweep as before it. Foreign entries (anything the corpus writer
+  demonstrably did not mint) are reported and never touched. Chunk-shaped files beside an absent
+  or unreadable corpus are `unjudged` and never touched, because a mutilated directory and a
+  first-call crash whose very first chunk was directory-sized leave the same state — the chunk
+  file lands before the corpus file's lazy create. Corpus lines no reader parses are named by
+  number in the report, and what only they referenced is collected: those references are
+  invisible to the validator and the replay reader alike. Exit is non-zero for refusals and
+  failed deletions, zero for garbage merely found, and 2 — no report, nothing swept — for an
+  unusable `--min-age-s` or a missing run directory. A refusal includes a corpus the collector
+  could not read, whether or not any chunk-shaped file was there to carry it. `chunk_dir_state`
+  distinguishes `unsafe` (something is wearing the directory's name) from `unreadable` (the
+  platform declined), `unprovable` (a volume with no stable file ids, where no deletion could be
+  re-proved, so none is attempted in either mode) and `swapped` (the approved directory was
+  replaced mid-pass). `reclaimed_bytes` counts a file only when the
+  sweep removed its inode's last name, so an orphan inside a hardlink-deduplicated archive
+  reports as deleted and reclaims nothing; `candidate_bytes` is an upper bound, because a scan
+  cannot see a link count on every platform. `chunk_dir_state` separates `unsafe` (something is
+  wearing the directory's name) from `unreadable` (the platform declined), which call for
+  opposite responses. Never run it beside a live writer of the same
+  run directory; liveness is the operator's knowledge, as with `monoid validate`.
+- **Adoption now leaves a timestamp.** A writer accepting a chunk file that already exists — a
+  resumed run re-deriving what it already holds is the common case — takes the stored file
+  without rewriting a byte and, from this release, refreshes its times, which turns the
+  collector's age gate into a protocol about recent use rather than a guess about fresh writes.
+  Best-effort: a touch the platform refuses is swallowed, because the chunk is stored either way. The conformance evidence store's exists-hit reuse stays pinned
+  mtime-stable on purpose (no collector sweeps the evidence directory), and an incremental
+  archiver may answer the refreshed timestamp with one redundant re-copy.
+
+### Added — a private replay corpus for the calls the ledger indexes
+
+- **`AgentLoop.model_payload_file=True` writes `model_payloads.jsonl`, plus a `model_payloads/`
+  chunk directory once some single value exceeds 256 KiB** — the 43rd public compatibility artifact (`monoid.model-payloads.v1`): the
+  request preimage each `request_digest` was hashed over, and the settled response body
+  (`response_id`, `final_text`, `tool_calls`, `reasoning`, `usage`, `stop_reason`,
+  `provider_retried`). Opt-in, independent of every other switch, inherited by subagents,
+  validated — including full reassembly — by `monoid validate`.
+- **A request record is a verified recipe.** Every value at least as large as the reference that
+  would replace it becomes a content-addressed chunk — per tool definition (so a mid-run surface
+  change re-records one definition, not twenty-eight; the tool block is ~97% of a first-turn
+  default-surface preimage), per message (so a growing by-value conversation re-references what it
+  already recorded instead of storing the whole history again every turn), and per observation. Chunks past 256 KiB move to the
+  chunk directory, and the writer reassembles and compares against the digest *before* writing,
+  falling back to a verbatim, never-walked payload when anything disagrees. Data shaped like a
+  chunk reference cannot reach that fallback: a reference is a fixed size, so a lookalike is
+  always large enough to be lifted into a chunk, where reassembly never re-walks it. `ModelTurn.raw` is deliberately not
+  recorded (a replayed turn answers `raw={}`); `reasoning` deliberately is, encrypted entries
+  included, because the loop re-injects it into the next turn.
+- **`digest_status` gains `too_large`, and one constant now gates the key, the recorded request
+  and the recorded response.** The band between the old 4 MiB digest cap and the 8,000,000-byte
+  message-log bound used to ship calls that transmitted successfully and silently had no replay
+  key. `MAX_MODEL_PAYLOAD_BYTES` closes that band and makes an oversized payload a *named*
+  condition rather than an unexplained `absent` — it does not make the case impossible, because
+  it bounds the whole identity payload while the run limits bound only the message log. Digests
+  under the old cap are unchanged.
+- **`monoid validate` no longer quotes a content-bearing record back at you.** jsonschema builds
+  its message out of the instance, so one line of `model_payloads.jsonl` or `model-content.jsonl`
+  that matches no schema branch used to print a whole conversation — or a whole system prompt, for
+  a chunk record — to the terminal and into `--json` output. Both artifacts pin a literal
+  `schema_version` enum of v1 spellings only, so the first version bump would have done it to
+  every line of every retained run directory. The failing keyword and the path are reported; the value is not.
+- **`SettledModelCall` is exported from `monoid_agent_kernel.contracts`**, beside the
+  `ModelCallRunner` whose `settled_sink` takes it.
+- **Unreleased-seam supersession: `ModelCallRunner.receipt_sink` is replaced by `settled_sink`**,
+  which receives a `SettledModelCall` (receipt + optional request preimage + turn). One delivery
+  per call is what lets the recorder keep the ledger and the corpus index-aligned under a single
+  lock acquisition; `capture_request_preimage` (default off) gates the preimage buffering so a
+  ledger-only run pays nothing. `AgentRecorder.record_model_call` is superseded by
+  `record_settled_call` the same way. Neither seam ever shipped in a release.
+
+### Added — a private ledger of the model calls a run made
+
+- **`AgentLoop.model_calls_file=True` writes `model_calls.jsonl`**, one `monoid.model-calls.v1`
+  record per settled model call. Opt-in, so an existing run directory keeps its shape; optional
+  for readers; validated by `monoid validate` when present. Registered as the 42nd public
+  compatibility artifact.
+- **Failed calls are in it.** The record is fed from a `ModelCallRunner` sink (`settled_sink`, as
+  superseded above) rather
+  than from the loop's return value, because a failed call publishes its receipt and re-raises
+  without stamping it on the exception — a ledger built on the return value would have recorded
+  only the successes, which is the opposite of what an audit trail is for. It is also not a
+  `ModelIOObserver`: a `CapturePolicy` narrowing would strip the very digests the ledger carries,
+  and registering a kernel-owned recorder in the host's observer list would make every call
+  assemble and hash content that nothing reads.
+- **A record is a declared projection, not a serialized receipt.** `ModelCallReceipt.to_json()`
+  emits `model.to_json()`, and `ModelConfig.to_json()` emits `gateway_url` — the field the gateway
+  adapter resolves its destination from. Serializing the receipt would have written the preimage of
+  `destination_digest` in the adjacent field of the same line, and because that digest is keyed
+  under a per-process secret, one such line makes every other digest in the file confirmable. The
+  shipped scaffold configures a `gateway_url`, so this would have been line one of a new agent's
+  first run.
+- **`destination_digest` is not recorded; `destination_status` is.** A per-process key written to a
+  file that outlives the process names one destination two ways across a recovery, which reads as a
+  deployment change that never happened. A durable form needs a deployment-supplied key, and that
+  choice is still open. `redaction_digest` is absent for an independent reason: it is set only by
+  the per-subscription capture narrowing, so on this seam it is always empty, and recording it
+  would state "no redaction rules were applied" on lines where a redacted consumer applied rules.
+- **`call_index` and `root_run_id` are the writer's, not the receipt's.** The receipt carries no
+  wall clock, no ordinal, and no proven run identity — `context.run_id` is a caller's claim. A
+  subagent inherits the switch and records into its own run directory, so `root_run_id` is what
+  makes a run tree joinable.
+
+### Fixed — the replay key names the provider the receipt records
+
+- **The declaration is read once per call, not once per reader.** The adapter itself has been read
+  once per call for a while, precisely so that one call cannot be answered by one adapter and
+  attributed to another. The `provider_name` *on* that adapter was still read twice — once for
+  `ModelCallReceipt.provider_name`, once for the key — and a property that answers and then stops
+  answering made the two disagree: the receipt said `openai` while the key had been taken under the
+  config's `gateway`. A key whose preimage the record contradicts cannot be recomputed and cannot
+  be verified, which is the exact defect that took the destination out of this payload.
+- **`resolved_provider_name` accepts the declaration a caller has already read.** One expression of
+  "declaration else config" still, rather than the rule restated at the call site; the runner now
+  hands in its own probe instead of having an identical one re-derived beside it. A sentinel, not
+  `None`: an adapter that declares `None` is answering "nothing, use the config", and that has to
+  stay distinguishable from "I did not ask".
+
+### Fixed — an absent status no longer contradicts the digest it describes
+
+- **A receipt written before these fields existed keeps the key it recorded.** `from_json` read a
+  missing `digest_status` as `not_reached` — "the call was refused before a key was computed" —
+  over a payload carrying a non-empty `request_digest`, so the record denied its own contents and
+  `to_json` wrote the denial back, making it permanent on the first read/write. A consumer asking
+  the status whether a replay key exists would have discarded a real one. A missing status is now
+  inferred from the digest it explains: non-empty `request_digest` reads `ok`.
+- **The same rule binds the destination pair**, where the same contradiction is manufacturable:
+  a non-empty `destination_digest` reads `resolved`, the only probe outcome that answers with a
+  value. One reader, both pairs — the split rule is how the first one got written.
+- **`digest_generation` is not inferred with it.** A legacy key was taken over a different payload,
+  so naming a generation for it would hand a replay consumer a key it cannot reproduce; empty is
+  the honest answer and is what makes `ok` safe. A status the payload *states* is kept verbatim
+  even where it disagrees with its digest — that pair is a bug in a writer, and repairing it on
+  read would hide the writer that has one.
+- **Silence is a key that is not there.** The reader asked `payload.get(key) is None`, which reads a
+  key *present and holding `null`* as an absent one. That was harmless while both landed on the
+  default and stopped being harmless the moment absence began to infer: a corrupt record would have
+  been admitted, handed a status inferred from its digest that it never carried, and had `to_json`
+  write that back out as a stated one. `null` is now refused, like every other string on the
+  receipt — `http_status` is nullable only because it is declared `int | None`.
+- **A receipt can no longer be born unreadable by its own class.** `from_json` refused a status
+  outside its enum while `to_json` emitted one, so `ModelCallReceipt(digest_status="okay")` wrote
+  an audit record this same class rejects on the way back in — a failure that surfaces in the
+  consumer, long after the writer that caused it is gone. `__post_init__` now refuses both closed
+  enums through the same function the reader uses, so the two cannot drift apart;
+  `ModelCallCapture` has always refused a `mode` outside `CAPTURE_MODES` this way, and these were
+  the pair that did not.
+- Red first: both pairs parametrized over one test, plus the inference's two limits (silence only,
+  never over a statement; no value, no claim), the null refusal at both witness states, and the
+  constructor refusal through `replace` as well as direct construction. One more pin holds each
+  field to its *own* vocabulary, because a single helper serving two enums is exactly the shape
+  where a transposed argument passes every "a bad value is refused" test — `not_reached` is a
+  member of both sets.
+
+### Added — the identity projection cannot go back to reflecting over `ModelConfig`
+
+- **A structural pin over `_model_identity`'s own source asserts it reflects over nothing** — no
+  `to_json`, no `fields`/`asdict`/`vars`/`getattr`, and every attribute it reads is on a declared
+  allowlist. This is the one claim no behavioural test can make: a matrix says which fields move
+  the key, not *how* the projection decided, and a reflective implementation would satisfy every
+  matrix while re-opening the hazard the hand-listing closed.
+- **The pin is itself tested.** A companion mutates the source three ways — reading a transport
+  field, returning `to_json()`, adding a timeout term — and asserts the pin turns red on each,
+  because a structural pin's claim about which edits it catches is a claim that can be wrong.
+- **One more pin states an ordering nothing else would notice:** the replay key is taken after
+  `normalize_model_request`, so normalization is key material. Every other test builds its payload
+  from an already-normalized request and would stay green if that order flipped.
+
+### Changed — the endpoint leaves the replay key and becomes recorded metadata
+
+- **`request_digest` no longer covers where a call was sent.** The destination was hashed into
+  the key on the reasoning that the same request answered by a different service is a different
+  call — true, and the wrong place to say it. The value is deliberately never recorded, so no
+  record could reconstruct the preimage: a key taken over it could not be recomputed, could not be
+  verified, and a miss could not be told apart from a defect. Two calls with identical content
+  now share a key regardless of which host answered.
+- **`ModelCallReceipt` gains four fields that say what the key alone could not.**
+  `destination_status` names which of the probe's outcomes happened — `not_declared` (the adapter
+  routes on config alone), `declined` (it answered with nothing), `resolved`, `unavailable` (the
+  probe raised), or `not_reached` (the call was refused first). `destination_digest` is keyed
+  under the per-process key, for the same reason `RedactionPolicy.digest` is and with the same
+  cost: it identifies a destination within one process, not across restarts. A hostname is drawn
+  from a small enough space that an unkeyed digest of one is a confirm-a-guess oracle, which is
+  the disclosure the never-record rule exists to prevent.
+- **`digest_status` and `digest_generation` end the empty string's four meanings.** An absent
+  `request_digest` used to mean any of: the payload could not be encoded, it exceeded the cap, the
+  call was refused before a key existed, or a `none`-mode policy removed one. A consumer holding a
+  keyless record could not tell a defect from a policy from a boundary.
+- **The probe stopped conflating "no destination" with "cannot resolve one".** Both answered `""`,
+  so an adapter that routes on config alone and a deployment whose resolver raises
+  deterministically — every call about to fail — minted the same valid-looking key. Tolerating the
+  raise is right; recording it as absence was not.
+- Red first: the destination separation now asserted on the receipt with the key held equal, the
+  three probe outcomes told apart, the round trip over the new fields, and the `none`-mode
+  narrowing. The round-trip test gained a companion that reads the dataclass, because enumerating
+  fields by construction leaves a new one covered in name only.
+
+### Changed — the replay key is a declared field list, not a serialized config
+
+- **`request_digest` reads a hand-listed projection of `ModelConfig`, not `to_json()`.** Every
+  consumer of that serializer used to be a co-author of the replay key: a field added to
+  `ModelConfig` for any reason rekeyed the entire corpus, and `ModelRetryConfig` is scheduled to
+  gain one, so this was not hypothetical. The list encodes one rule — what the provider is asked
+  for goes in the key, how the call is carried does not.
+- **`timeout_s`, `retry` and `gateway_url` left the key.** None of them reaches a provider; the
+  gateway wire has always emitted only model/reasoning/generation because each hop owns its own
+  transport policy. Their presence was inherited from `to_json` emitting everything, not chosen,
+  and it meant raising a timeout or widening a retry set silently invalidated every recorded key
+  on a fleet. `ModelConfig.to_json` itself is unchanged, so `config_hash` and durable recovery
+  are unaffected.
+- **The key's `provider` term is now the provider that actually served the call** —
+  `resolved_provider_name`, the adapter's declaration else the config's. A gateway relaying an
+  upstream and a direct call to the same upstream now share a key, which is the pair a replay
+  corpus most wants to share one; reading only the declaration would have collided a fake adapter
+  with a gateway built without one, and reading only the config would have separated the pair.
+  It also normalizes, which matters because `provider` is the only `ModelConfig` field with no
+  ingress validation.
+- **The projection is hand-listed all the way down.** Listing only `ModelConfig`'s own fields and
+  calling `reasoning.to_json()` would have moved the rekey hazard one level deeper rather than
+  closing it.
+- Red first: a parameterized transport-policy matrix (five non-default configs), the projection's
+  shape, and the relayed-equals-direct key. The inclusion matrix and the declare-nothing pair are
+  guards — green before and after — stating what must not have been dropped while the exclusions
+  were made. A literal alone cannot see conditional inclusion, which is why both are matrices.
+- `_GENERATION_1_REQUEST_DIGEST` carries the omit-when-absent job forward under the current
+  generation, and its operating rule replaces "never regenerate": it moves only together with a
+  tag bump.
+
+### Changed — both model-call digests name their own domain
+
+- **Each digest is now taken in a named domain carried as the payload's single wrapper key:
+  `monoid.model-prompt-digest.v1` and `monoid.model-request-digest.v1`.** Every digest value
+  moves once, deliberately; no field joined or left the payload in this change. Two jobs, one
+  tag. The digests stop sharing a key space by *accident* — the request payload starts from the
+  prompt terms and adds keys that happen to be unconditional, so it could not happen to equal a
+  prompt payload, which is a property of today's field lists rather than a rule. And a rules
+  change is now announced: bumping `.v1` to `.v2` disowns a corpus the change invalidated in one
+  edit, instead of letting two incompatible encodings collide in one key space.
+- **The tag is applied in the payload builders, not in the hasher.** Same place
+  `content_digest` applies its shape key. A prefix fed to the hasher would bypass the canonical
+  encoder and break the twin invariant that keeps it byte-identical to `canonical_sha256`.
+- **`_PRE_W5_REQUEST_DIGEST` is disowned rather than regenerated.** Its file forbids
+  regenerating it, and that is right, so the literal stays and its assertion inverts: generation
+  1 must *not* reproduce the pre-W5 encoding. The pre-W5 `config_hash` literals are untouched —
+  `ModelConfig.to_json` did not change, so durable recovery across versions is unaffected.
+- This is the last change at which giving `prompt_digest` a domain is free: nothing persists it
+  today, and a later track records model calls to disk.
+- Census: the digest-generation rule's mechanism clause joins `EXTRA_CARRIERS` for
+  `docs/CONTRACTS.md`, anchored on the phrase rather than the key words — "domain" and
+  "generation change" both predate this change in the very rule the sentence replaces.
+
+### Fixed — the third group's newly-covered members are named, and stale sentences retire
+
+- **`docs/COMPATIBILITY.md`'s "the third group did not move at all" is scoped and corrected.**
+  It was true of the dozen refusals raised *inside* the adapter's two stamped regions, which
+  already carried their `usage` and `provider_retried` before v0.21 — for those the `error_code`
+  changed and nothing else did. It was false of the members v0.21 *added* to that group (the
+  stream's per-frame field validators and the blocking path's `_coerce_response`): those gained
+  `provider_retried` and gained a `usage` object where the body previously had **no `usage` key
+  at all**, since the writer omits it when the failure cost nothing. That is a wire-shape change
+  on those shapes, and it is now stated as one — a client summing `usage` across failures will
+  count tokens on calls it used to count as free, which is the correction. Neither sub-group
+  moved on recoverability. The third-party-adapter paragraph beside it now names the one field
+  those raw refusals gained too.
+- **The gateway meter's comment stops naming the shipped adapter as its reason.** `_meter_failure`
+  still catches `Exception` rather than `ModelAdapterError`, but "every refusal in the OpenAI
+  stream's terminal region is a raw `ValueError`/`AttributeError`" has not been true since that
+  region learned to re-mint its raw refusals classified. The real remaining reason is the one
+  the wide guard was always worth having for: the provider seam is pluggable, and a third-party
+  adapter's refusals are its own to name.
+- **`_model_error_from_openai`'s docstring names the shapes that actually reach it.** Its
+  `known_provider_retried` example was a `raw.parse()` failure, which now leaves the body-read
+  guard classified and carrying that value itself. The upgrade still matters for the two shapes
+  that arrive after the exchange committed — a client teardown that raises, and a mid-stream
+  transport drop whose `httpx` `request` property raises when read — and those are what it names
+  now. Two changelog entries earlier in this section are scoped the same way.
+
+### Fixed — a truncated stream refuses instead of settling, and the body-read phase speaks the one code
+
+- **An OpenAI stream that ends without `response.completed`/`response.incomplete` is refused,
+  not settled.** A body that stopped by clean EOF left `final_data` empty and the terminal chunk
+  built after the drain synthesized `stop_reason="stop"` with zero usage — so half an answer
+  reached the loop as a complete one, settled, and metered as a free call. The one-shot twin
+  already refuses exactly this condition: a truncated 200 fails its body read and is classified.
+  Now both do, as a non-retryable `openai_bad_response` carrying the call's `provider_retried`
+  and no invented cost. Asked as a fact about the *stream* (a terminal response was captured)
+  rather than about the contents of the payload, so an empty terminal body is still a stream
+  that ended properly. A consumer that abandons the stream mid-flight is unaffected — its
+  `GeneratorExit` never reaches the check, and that call has an outcome of its own.
+- **The body-read phase answers `openai_bad_response` like the adapter's other two.** `raw.parse()`
+  plus the model dump/coerce is the third body-read site, and the only one whose raw failures
+  still escaped as `unclassified_provider_error` — while `_parse_response` and `_terminal_chunk`
+  both mint `openai_bad_response` for the same kind of failure, and the `_coerce_response` on
+  the very next line already answered it. Enumerated rather than assumed: `LegacyAPIResponse.parse`
+  reads `response.json()` on a JSON content type (a `json.JSONDecodeError` on an incomplete
+  body), validates the model (`APIResponseValidationError`, whose 200 status the classifier
+  cannot use), and touches `response.text` (`httpx.ResponseNotRead`) — every one of them a
+  statement that the body could not be read. The narrow guard routes the connection family back
+  to the classifier first, because "unreadable" and "unreachable" are different answers with
+  different remedies: a payload defect is terminal, a dropped connection is retryable.
+
+### Fixed — the retry fact rides every lane that learned it
+
+- **The frameless-stream checks read the retry the wire reported.** The gateway server stamps
+  `provider_retried` on *every* frame precisely so the fact survives a stream that never reaches
+  its terminal frame — and the client's frameless branch was the one reader ignoring it, passing
+  `attempt > 1` (its own retry loop, and nothing else) to all three checkers while the
+  terminal-frame site beside it passes `chunk.provider_retried`, which is the wire's fact
+  combined with the client's. So a gateway backend that retried and then sent a body ending
+  before its terminal frame was refused with a receipt claiming a clean single attempt — on the
+  one carrier a refused turn has left. The drain now retains what the frames said (reset per
+  attempt, beside `saw_terminal`) and the branch reads the same conjunction the framed one does.
+  The conformance ledger's by-design entry for this asymmetry retires with it: the premise it
+  rested on — "a stream with no terminal frame carries no server-side retry evidence to read" —
+  was simply not true of the wire the server writes.
+- **Both reference-gateway error writers read the flag off any exception, like the cost beside
+  it.** `_write_exception` reads `provider_usage_of(exc)` once above the branch on the stated
+  rule that the stamp does not belong to a type, then passed `provider_retried` on the
+  `ModelAdapterError` arm alone — though `mark_provider_retried` stamps an arbitrary
+  `BaseException` (the gateway client's own `_stamp_retry` documents exactly that), so an
+  upstream adapter that retried and then refused in a raw `ValueError`/`AttributeError` was
+  carrying a readable flag that nothing read. `_stream_error_frame` had the same shape. Both now
+  read it once above the branch, leniently, and pass it on every arm.
+- **The OpenAI adapter reports its SDK's retries on the channel that survives abandonment.** It
+  learns the fact off the exchange on both paths and stamped it onto outcomes only — the turn,
+  the chunks, the exceptions it mints — so a call the run abandons mid-flight (a deadline
+  landing while the body parses or the stream drains) produced none of them and the receipt,
+  built from the `RunTimeout`/`RunCancelled` the race raised, recorded a clean single attempt.
+  `GatewayModelAdapter` reports at both of its own retry sites for exactly that reason, so the
+  identical race told the truth on one adapter and not the other. One `report_provider_retried`
+  at each learn site, when there is something to report.
+
+### Fixed — the permission-policy adoption gate reads fields, not the class
+
+- **`LoopBootstrapper` adopts the operator's `spec.permission_policy` whichever class carries
+  the loop's own.** The gate asked `loop.permission_policy == PermissionPolicy()`, and a
+  generated dataclass `__eq__` is class-exact — the third unbound site of the exact rule
+  `ReasoningConfig`/`GenerationConfig` were fixed for. A deployment's extension subclass with
+  both pattern tuples empty therefore answered "the caller configured this", so the operator's
+  `deny_patterns`/`redact_patterns` were silently **not** adopted and the loop enforced the
+  empty policy at every `self.permission_policy` site — while the subagent sites read
+  `self.spec.permission_policy` directly, leaving half a run honouring the operator's lists and
+  half not. Such subclasses reach the gate intact by design: the spec validator gates on
+  `isinstance`. `PermissionPolicy` now answers `is_default` off the two fields it declares, and
+  the bootstrap asks that instead. Adoption is still for defaults only: a policy with a kernel
+  field set — on the base class or on a subclass — is a configured policy and is never
+  overwritten.
+- **One rule, one home.** `matches_the_kernel_defaults` moved to `_policy_util` because
+  `core.spec` imports `permissions` and the two cannot import each other; that module imports
+  nothing of the package, so it is the one place all three gates can reach. The rationale is
+  the same on all three, said in the terms each one guards: extension fields are invisible to
+  the projection for the model configs and invisible to enforcement for the policy, so they
+  must be invisible to the gate.
+
+### Fixed — the raw arms pay what the turn already cost
+
+- **A connection that drops *after* the OpenAI stream's terminal response reports what that
+  turn cost.** The rule "a refusal carries the billed cost" was bound to the classified arm of
+  `astream_turn`'s guard and not to the raw arm two lines below it — and the raw arm is exactly
+  where this case lands: a stream can go on emitting frames after `response.completed`, and the
+  SDK translates transport failures into `APIConnectionError` only up to the response headers,
+  so a drop while the *body* streams arrives as a raw `httpx.ReadError`/`ReadTimeout`/
+  `RemoteProtocolError`. The counts were already captured and the error left with `usage: {}`,
+  so the receipt, the run's token budget and (across a hop) the tenant ledger all recorded zero
+  for a turn the provider generated and billed. A drop *before* the terminal frame still carries
+  nothing: mid-stream usage is genuinely unknowable. Retryability is unchanged — a dropped
+  socket is honestly retryable, and only the lost cost was the defect.
+- **The blocking path's twin, on both of its arms.** `next_turn`'s raw arm is reachable with a
+  billed body already parsed — the client's own `close()` runs in an inner `finally` and an
+  exception there *replaces* the call's outcome — and its classified arm was handing the
+  completion seam `None` unconditionally, discarding a readable cost whenever the refusal was
+  `_coerce_response`'s: that reader is `dict`-only while `usage_reported_by` accepts any
+  `Mapping`, so a Mapping-but-not-`dict` response is refused for its container and perfectly
+  readable for its cost. Both arms now read one expression (`_readable_payload`) over the two
+  phases of the body read, pre-initialized so a failure before either phase answers with the
+  provider's failure rather than a `NameError`.
+- **The gateway client stops under-counting a stream the hop already metered.** Both of
+  `astream_turn`'s `httpx.HTTPError` handlers — the per-attempt one and the client-lifecycle one
+  that catches a pool teardown — minted `gateway_network_error` with an empty stamp, so a drop
+  *after* the terminal frame was indistinguishable on the wire from a drop before it. The drain
+  now retains what the stream reported spending (reset per attempt, beside `saw_terminal`) and
+  every mint carries it through the same guarded helper. `retryable` and `error_code` are
+  untouched on both branches.
+
+### Fixed — the pin binds values, the sweep covers the family, four sentences stop over-claiming
+
+- **The fold-guard structural pin had its verdicts inverted.** It compared only the keyword
+  *names* on the refusal it parses, so mutating `retryable=False` to `True` — the exact
+  loosening its own docstring claims to catch — left the name set unchanged and stayed green,
+  while adding a legitimate third keyword changed the set and went red. It now asserts the
+  values (a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact) with the name set tested as a superset, and a companion test mutates the source in
+  memory to show the pin moving on each edit it claims to catch.
+- **The shipped-runtime-config sweep replays the whole proof family.** It drove only
+  `_check_reasoning_applied`, but `generation.on_unsupported` governs two more checkers with the
+  identical shipped-refusal shape. All three are now derived exactly as the three real
+  enforcement sites derive them and replayed against a silent upstream. Born green — neither
+  shipped config sets a sampling control, and a runtime config cannot carry an output schema —
+  which is what an enumeration-breadth pin is for.
+- **Four sentences corrected against the code they describe.** `docs/COMPATIBILITY.md` now
+  attributes the park→terminal move to *both* answers that made it (the 400 lost its
+  recoverable status range; the 500's `retryable: true`, which `AgentLoop` reads *before* the
+  status, became `false`) and states plainly that the ~13 already-502 shapes changed their name
+  and nothing else — same status, same flags, same `usage`, same verdict. Its gateway-author
+  guidance now says three attempts (two retries) per `model.retry.max_attempts`, and derives the
+  bare-502 re-buy from the conjunction that actually causes it: a body omitting **both**
+  `retryable` and `error_code`, since `_should_retry` needs the derived flag *and* a code in
+  `retry_on`. This changelog no longer claims the `stream_bad_tool_args` raises became
+  non-retryable — `ModelAdapterError.retryable` already defaulted to `False`, so that keyword is
+  a no-op made legible. And the sync/streamed code asymmetry (`openai_bad_response` vs
+  `stream_bad_tool_args`) is recorded at the raise sites as the deliberate provider-neutrality
+  it is, so the next twin census reads a decision instead of a silent cell.
+
+### Fixed — `is_default` reads the fields, not the class
+
+- **`ReasoningConfig.is_default` and `GenerationConfig.is_default` now compare the fields the
+  base class declares, not `self == Config()`.** Generated dataclass `__eq__` is class-exact, so
+  a public extension subclass with *every kernel field at its default* was never "default" — and
+  the kernel supports such subclasses deliberately (every validator gates on `isinstance`, and
+  `providers/base._copy_with_fields` exists so normalization need not call an extension's
+  narrower constructor). The consequence was a hop nobody could fix from either end: the client
+  computed `is_default=False` and demanded proof of `{"effort": "medium"}`, while the server —
+  which only ever sees the wire, and `to_json` emits base fields only — rebuilt a plain
+  `ReasoningConfig`, computed `is_default=True`, emitted no `reasoning_applied`, and every turn
+  was refused `gateway_reasoning_not_applied` even against a declaring upstream. Extension fields
+  are invisible to `build_reasoning_payload`, `build_generation_payload` and `to_json`, so they
+  are invisible to the gate: one rule, stated once in `_matches_the_kernel_defaults`.
+- **The generation twin was the same defect with a serialization consumer.**
+  `ModelConfig.to_json` emits the `generation` key only when the block is not default, and that
+  dict feeds the request digest, the runtime-config semantic hash durable recovery compares
+  across restarts, and the gateway wire — so an all-defaults extension silently changed the
+  config hash while changing nothing the hash is about. Nothing is loosened in either direction:
+  a kernel field that *is* set stays non-default on a subclass exactly as it does on the base.
+
+### Fixed — the completion seam covers the whole adapter, not two regions of it
+
+- **Every refusal that leaves the OpenAI adapter's two call paths is completed, not just the
+  ones raised inside its two stamped regions.** The classifying seam was bound to
+  `_parse_response` and `_terminal_chunk`, so the code *between and around* them still refused
+  bare: the stream's per-frame field validators (`_provider_string`,
+  `_first_provider_string` — a `response.output_item.added` with no `call_id`/`id` is the
+  reachable case) and the sync path's `_coerce_response`. Those escaped through
+  `except ModelAdapterError: raise` with an empty `provider_error_code`, so one hop out the
+  reference gateway resolved them to its own `gateway_bad_response` — the wrong-wire-blamed
+  502 the seam exists to stop — while the *same helper* called one function deeper answered
+  `openai_bad_response`. Both arms are completion arms now, running the one
+  `_complete_billed_refusal` implementation. Backfill-only still holds, so the request-shaped
+  refusals inside the same region (`unserializable_request`, `unsupported_request_shape`) keep
+  their own code and their own remedy.
+- **A refusal after the terminal frame carries the cost it was billed.** A stream goes on
+  emitting frames after `response.completed`, so the streamed completion arm stamps from the
+  terminal payload when one has arrived and records nothing when it has not — mid-stream usage
+  is genuinely unknowable, and a lenient read invents none.
+- **The retry the call already spent stops being re-derived from the exception.** Both
+  `except Exception` arms rebuilt the fact with `_provider_retried_by_the_sdk(exc)`, which reads
+  the HTTP exchange — and an exception the SDK never raised carries none, so a `raw.parse()`
+  failure after two SDK retries was recorded as a clean single attempt. `_model_error_from_openai`
+  takes a `known_provider_retried` upgrade (the spelling the gateway validators already use):
+  whichever source can see the retry wins, neither can clear what the other observed. The
+  locals it reads are pre-initialized, so a `create()` that raises cannot answer with a
+  `NameError` instead of the provider's failure. (That `raw.parse()` example is history rather
+  than a description of HEAD: the body-read failures it names now leave their own guard as
+  `openai_bad_response` — see "the body-read phase speaks the one code" — carrying the same
+  value. The upgrade still matters for the two shapes that reach the classifier after the
+  exchange committed: a client teardown that raises, and a mid-stream transport drop whose
+  `request` property raises when read.)
+- **The stream's terminal reader gets the one-shot reader's coerce twin.** It read
+  `if response is not None and hasattr(response, "model_dump")` with no else, where the sync
+  twin reads `model_dump() if hasattr(...) else _coerce_response(response)` — which *accepts* a
+  plain mapping and *refuses* anything else. The stream discarded both: a billed streamed turn
+  whose terminal response is a mapping reported SUCCESS with zero usage (run budget, receipt and
+  tenant ledger all recording a free call, the captured reasoning dropped), and an unreadable one
+  was not refused at all. Unreachable through the shipped SDK, which always returns a model;
+  reachable through every stand-in and wrapper.
+- **The seam's third mutation joins its two siblings.** The code stamp was a bare `setattr`
+  beside two guarded helpers; `providers/base.py` now owns `mark_provider_error_code` next to
+  `mark_provider_retried` and `mark_provider_usage`, one copy of the rule they state — a type
+  that refuses the attribute stays unnamed rather than replacing the provider's failure with an
+  `AttributeError` raised inside the except-handler.
+
+### Fixed — the OpenAI reader refuses in one classified voice, and the refusal still pays
+
+- **Every malformed-payload refusal in the OpenAI adapter's two stamped regions is now a
+  non-retryable `openai_bad_response`.** The body mapping and the stream-terminal construction
+  each refused in more than one type: most shapes were already `ModelAdapterError`, but
+  `normalize_usage` said "malformed usage" with a raw `ValueError` and the stop-reason walk
+  raised a raw `AttributeError` — on the terminal path even after the ingress normalizer moved
+  inside the guard, because Python evaluates the `TurnComplete` arguments first. The classifying
+  arms mint the classified error at the same seam that stamps the billed usage and chain the raw
+  cause; the arm that catches an already-typed refusal *backfills* the same code onto the bare
+  `ModelAdapterError`s the mapping's own field validators raise, and upgrades `provider_retried`
+  from the exchange the raise site cannot see — so the code is the whole class's, not the raw
+  arm's alone (backfill never overwrites a code a refusal already named, and the retry flag only
+  ever goes up). Two real behaviors change, both intended:
+  - **In-process, the billed tokens reach the run budget.** A raw escape hit the loop's blanket
+    wrapper, which re-minted it unstamped — so `total_usage`, the transcript record and
+    `metrics.updated` all said zero for a call the provider billed, and only the getattr-based
+    receipt kept the cost. Classified, the refusal takes the loop's `ModelAdapterError` arm.
+  - **Over the gateway hop, the answer is an honest 502.** The raw `ValueError` shapes answered
+    400 `gateway_bad_request` (claiming the *client's* request was bad, and reading as
+    config-shaped recoverable one hop out); the raw `AttributeError` shapes answered 500 with
+    `retryable: true` — an invitation to re-buy the same tokens for a payload defect. Both now
+    map through the classified arm to 502, non-retryable, still carrying the billed `usage`.
+- **The raw arms stayed type-agnostic.** The tenant meter and both gateway error writers keep
+  reading whatever escapes, on purpose — a third-party adapter behind the gateway can still
+  refuse raw with a stamped cost, and hand-stamped raw probes pin the 400 arm and the meter's
+  read-off-whatever-escaped property. (The writers gained one field later in this same release:
+  see "the retry fact rides every lane that learned it", which reads `provider_retried` off the
+  escaping exception on every arm rather than on the `ModelAdapterError` arm alone.) `assemble_streamed_turn`'s bare `normalize_usage` re-run
+  (provably dead — every folded chunk passes the internal ingress first) is guarded in the
+  ingress's classified voice rather than deleted. It is bound *structurally*: the behavioral
+  test for this shape is intercepted by the ingress and never reaches the guard, so deleting
+  the guard left the suite green;
+  `test_the_folds_usage_renormalization_stays_structurally_guarded` parses the fold and holds
+  the try/handler shape, the refusal's message, and the VALUE each classification keyword
+  binds — a literal `False` for `retryable`, the carried `provider_retried` name for the retry
+  fact — with the keyword set tested as a superset so strengthening the refusal passes and only
+  weakening it fails. A companion test mutates that source in memory and shows the pin moving on
+  each edit it claims to catch.
+- **The fold's own tool-call refusals pay for the turn they were billed for.** Both
+  `stream_bad_tool_args` raises in `assemble_streamed_turn` — a model emitting non-JSON
+  function-call arguments is ordinary — escaped with no usage stamp and no `provider_retried`,
+  though the fold is holding both by then. The one-shot twin of that act pays through the
+  OpenAI reader's stamping seam, so a *streamed* turn the provider generated and billed was
+  metered at zero at the tenant ledger and in the run's token budget while its sync twin was
+  not. `providers/base.py` stays provider-neutral: the refusals keep their own
+  `stream_bad_tool_args` code. What actually changed is the usage stamp and `provider_retried`;
+  `retryable=False` is now written explicitly, but `ModelAdapterError.retryable` already
+  defaults to `False`, so that is a no-op made legible rather than a behavior change.
+
+### Added — the reasoning block comes back as proof (v0.21-track:B1 closed)
+
+- **`reasoning_applied` is the third applied echo on `monoid.llm-turn.v1`.** A fail-closed
+  reasoning request used to be accepted unproven: the config crossed the hop (both request-side
+  seals), but nothing came back to say the upstream applied it, and `ReasoningConfig.
+  on_unsupported="fail"` governed nothing. The gateway server now echoes the exact forwarded
+  reasoning projection (`build_reasoning_payload` — the same one-projection rule as the
+  generation echo) on the response body and the terminal stream frame, derived from the new
+  `reasoning_support` adapter declaration, never from the request; the client validates it
+  beside its two siblings and enforces it at all three sites (sync, terminal frame, frameless
+  drain) as non-retryable, config-recoverable `gateway_reasoning_not_applied`. Fifth additive
+  response-direction key on an unchanged protocol identifier, after `generation_applied`,
+  `schema_applied`, `reasoning` and `provider`.
+- **The gate is `ReasoningConfig.is_default`, not payload truthiness.** The default reasoning
+  config projects a non-empty provider block (`{"effort": "medium"}`), so the generation gate
+  transcribed literally would have stamped an echo onto every default-config call and changed
+  the wire shape of traffic that configured nothing. `effort="default"` projects an *empty*
+  block that is still configured: the echo may legitimately be `{}`, and that empty proof is
+  what catches a hop that rebuilds `"medium"` out of an omitted effort.
+- **One knob per feature family.** The generation/schema pair keeps sharing
+  `generation.on_unsupported`; the reasoning echo, its checker, and the forwarding
+  `GatewayModelAdapter.reasoning_support` claim all read `reasoning.on_unsupported` — the
+  field the request wire already carried. A claim answered off another family's knob would
+  mint proof for a call whose own policy said best-effort. `reasoning_support(adapter,
+  config=None)` joins the exported fail-closed probe family; `OpenAIModelAdapter` declares it
+  unconditionally (it puts the block on the Responses body), the fakes deliberately do not.
+- **All five shipped callers state their real policy instead of inheriting a refusal.**
+  Configuring any reasoning key makes a config non-default, so the client starts demanding
+  proof — and `on_unsupported` inherited `"fail"`, which refuses every turn against an
+  upstream that declares no `reasoning_support` (the shipped `--provider fake` echo adapter,
+  any pre-B1 gateway, most third-party factories). Studio, the messy-workspace scenario, the
+  full-stack scenario, the `monoid builder init` scaffold and `examples/runtime-config.json`
+  — the file README, `docs/CLI.md`, the first-skill tutorial and `docs/OBSERVABILITY.md` all
+  tell a reader to pass — now set `reasoning.on_unsupported="omit"`. Their effort/summary are
+  display-grade preferences, not transport proof. Pinned three ways, because they are three
+  kinds of caller: Studio by a policy test on its config builder, the two scenarios
+  behaviorally by their own offline runs, and the two JSON producers by a sweep that
+  *enumerates* every shipped runtime config (builder scaffold plus every `examples/*.json`
+  that parses as one) and replays the client's own check against a silent upstream — so the
+  next shipped config inherits the pin instead of repeating the defect. Read `"omit"` for
+  exactly what it gives up: a proving upstream still *emits* the echo and the client still
+  *shape-validates* it (a malformed `reasoning_applied` is refused `gateway_bad_response`
+  either way), but a missing or mismatched echo is tolerated — enforcement is the whole of
+  what the knob trades away.
+- Census: the `KNOWN_GAPS` B1 entry is deleted and its `v0.21-track:B1` disposition token
+  retired with it; `reasoning_applied` joins every echo census (`APPLIED_ECHO_KEYS`
+  derivations, the wire key sets, the 7e refusal probes, the value-validator tables — now ten
+  status-forwarding validators — and the three-file `CARRIER_FILES` set that was pinned empty
+  while the gap was open).
+
+### Fixed — the terminal chunk is validated where its stamp is
+
+- **The stream's end-of-turn payload is normalized inside the usage guard.** `TurnComplete`
+  itself validates nothing, so a field the terminal construction copies raw — a non-string `id`
+  is the reachable case — used to leave `_terminal_chunk` successfully and be refused one step
+  later by the ingress normalizer's strict pass, outside the guard: the refusal carried no usage,
+  and the receipt, the run's token budget and the gateway tenant meter recorded zero for a turn
+  the provider already billed. The same normalization now runs inside the guarded region, so
+  every field's *first* validation happens where the stamp is; the downstream pass re-runs it
+  idempotently, and the refusal arrives classified (`ModelAdapterError`) rather than raw.
+
+### Fixed — a new keyword does not move the arguments that predate it
+
+- **`llm_gateway_provider` is keyword-only on every constructor it joined.** It landed
+  mid-dataclass on `RunnerBackend`, `BackendLoopFactoryContext` and `StudioConfig`, beside the
+  URL it describes — which silently rebound every later positional argument: an embedder's
+  fifth positional `model_adapter_factory` was stored as the relayed-provider string and the
+  factory left unset, surfacing only when `resolve_relayed_provider` called `.strip()` on a
+  callable. `kw_only=True` keeps the field beside its sibling without moving anything that
+  predates it. (`GatewayModelAdapter.provider_name` was already appended last and is untouched.)
+  The positional signatures of all four constructors are now pinned append-only in
+  `test_public_surface.py`, so the next mid-insert fails a test instead of an embedder.
+
+### Fixed — an early rejection reaches the client on all four reference servers, not one
+
+- **A response written before the request body was read was being discarded by a TCP reset.** A
+  handler that answers a POST without consuming the body leaves the client's bytes in the kernel
+  receive buffer; closing that socket sends an RST rather than a FIN, and the RST discards whatever
+  the client has not yet pulled out of its own buffer — so a status the server wrote and flushed
+  successfully never arrives. The caller sees `ConnectionAbortedError` instead. Every early
+  rejection has this shape: an unknown path, a missing or bad token, an over-large body.
+- **The cost is a reclassified error, not a lost one.** `gateway_auth_error` carries
+  `retryable: false`; a transport abort reads as transient to every retry policy in this repo, so a
+  credential failure was retried as though it might succeed next time. On the llm-gateway wire the
+  whole classified body goes with it — `retryable`, `config_recoverable`, the provider code, and
+  the billed `usage` a refused-but-generated turn still owes.
+- **The fix already existed on one of the four servers.** `BackendHttpHandler` had it as
+  `_discard_unread_request_body`, with an accurate analysis of the same race, and the other three
+  wrote their rejections into that reset for as long as it existed. Promoted verbatim in behavior
+  to `_shared.http_util.drain_request_body` and called by all four `_write_error` funnels — the
+  same bounds it always had (64 KiB cap, 0.5s drain timeout well under the 30s connection timeout,
+  close-undrained past either, because this runs for a caller already refused). Its per-request
+  marker is now keyed to the request's own headers object, so it invalidates itself on a keep-alive
+  connection instead of needing every handler to reset a boolean.
+- **(tests) The rule is bound on each handler rather than on the one whose test caught it.** The
+  symptom was a ~5-15% flake in `test_mcp_gateway_rejects_bad_token_when_admin_configured`. It is
+  intermittent only because the handler's header read is buffered: a body sharing the segment its
+  headers arrived in gets swallowed incidentally, and `http.client` sends the two separately while
+  a hand-written probe using one `sendall` does not — which is why the obvious reproduction reports
+  "cannot reproduce". `tests/test_http_reject_drains_body.py` splits the send deliberately, making
+  all four reject paths fail 100% before the fix, and censuses every reference `_write_error` so a
+  fifth server cannot skip the drain.
+
+### Added — the gateway names the upstream it relayed, and the client stops trusting its default
+
+- **The LLM-gateway success body and terminal `turn_complete` frame carry `provider`.** The
+  reasoning artifacts a hop relays are only replayable if the tag on them names a provider that
+  can read them back, and that tag was written from `GatewayModelAdapter.provider_name` — the
+  *client's* declaration, defaulting to `"openai"` because that is what the reference gateway
+  fronts. For a deployment whose `provider_adapter_factory` routes elsewhere the default is simply
+  wrong, and nothing on either side of the wire could tell. The server can: it built the upstream
+  adapter. Written from that adapter's own declaration and from nothing else — deliberately *not*
+  through the config fallback, because `_upstream_model_config` hardcodes `provider="openai"` for
+  every call this gateway serves, so the fallback would have named OpenAI for an upstream that is
+  not, minting the same confident lie one layer down. Additive and omit-when-unknown, on the rule
+  `reasoning` already uses.
+- **A client verifies against that name instead of adopting it.** On a mismatch the relayed
+  `reasoning` artifacts are dropped for that turn and nothing else changes — the declaration keeps
+  naming the provider on the reasoning tag, `ModelCallReceipt.provider_name`, the model-stream
+  context and every OTel `gen_ai.provider.name`. Adopting per turn would give *one call's* provider
+  question two answers again, which is the defect `resolved_provider_name` was written to end;
+  dropping is what the replay filter already does with a tag that does not match
+  (`_reasoning_replay_flags`), decided one hop earlier so the run never carries an item it cannot
+  spend. Both sides resolve their declaration through the same tolerant, Unicode-normalizing
+  expression, so two spellings of one name cannot read as a disagreement. Absence gates nothing on
+  either side, which is what makes an older gateway and an undeclared upstream indistinguishable
+  by design.
+- **(tests) The maximal upstream stub declares every capability the writers probe it for.** The
+  `reasoning` gap survived a whole wire census because the maximal builder left that field at its
+  default; a capability the stub never *declares* is invisible the same way, one level out — the
+  writer probes the adapter, reads nothing, omits the key, and no key-set diff can tell that from a
+  writer that never had the key. `provider_name` was exactly that on the day it was added. The
+  probe list is now derived from the two writers rather than hand-kept.
+
+### Fixed — the other half of the gateway helper census is derived, and two validators join it
+
+- **(tests) The wire-value validator list is derived from the module rather than hand-kept.** The
+  gateway helper census closed with `mapping readers | value validators == registered helpers`,
+  and only the left operand was derived: the right one was a hand list, so a new validator written
+  into both hand lists in one edit kept the equality green while no scan had ever looked at the
+  module. Two were already sitting in that hole — `_validated_generation_echo` and
+  `_validated_schema_echo`, this shape since they were written, registered nowhere — and X-3's
+  `_gateway_reasoning_items` was registered only because someone chose to. Discovered now by the
+  mirror of the mapping predicate: called by a registered reader, raises a `ModelAdapterError` of
+  its own, reads no key off any parameter. The two derivations partition the helper list instead
+  of overlapping, so nothing falls in the remainder.
+- **(tests) "Reads the wire" means holding the mapping, not calling any registered helper.**
+  Registering the two echo validators promoted their callers — `_check_generation_applied` and
+  `_check_schema_applied`, policy checks that never touch a mapping — into *error readers*, with
+  none of a reader's pinned key sets or round-trip behavior to answer for. The reader discovery
+  now counts only the mapping-reading helpers, which loses no reader: pulling a value off the wire
+  to hand onward means reading the mapping, directly or through one of those.
+- **The two echo validators can name the status their caller already read.** Every other refusing
+  validator on this wire takes `http_status`; these two could not, so the *same* malformed
+  terminal frame produced a classified failure carrying a status or one carrying nothing, decided
+  by which field of it was bad. Inert at today's call sites (the streamed reader's hint is `None`
+  outside an error frame, exactly as for the four parameterized before them) — the asymmetry is
+  what is fixed. The census population is derived from "does the helper raise" now, because the
+  hand tuple of six had already gone stale: `_gateway_reasoning_items` arrived carrying the
+  parameter and joined nothing.
+
+### Fixed — round four: the escaping rule reaches the other four SSE writers
+
+- **The three remaining SSE frame writers escape the characters their readers call line breaks.**
+  Round three fixed the gateway's writer and stopped there; the same `ensure_ascii=False` was
+  live on every other line-framed route in the repo — the backend run stream
+  (`POST /v1/runs/stream`), the run event stream (`GET /v1/runs/<id>/events`, via
+  `EventSubscriptionFrame.to_sse`) and the live model-content channel
+  (`LiveModelStreamFrame.to_sse`). U+2028, U+2029 and U+0085 reached the wire as themselves and
+  any `str.splitlines` reader — httpx's `aiter_lines`, what a third-party consumer reads these
+  routes with — split the frame mid-JSON. The model-content channel is the one a separator
+  reaches first, because every `delta` on it is raw provider text; on the two `id:`-carrying
+  routes the split also swallows the frame's id, which is the cursor a reconnect resumes from, so
+  a truncated frame costs the reader its place as well. The Studio writer was already correct by
+  accident (it never passed the argument) and now says so. Nothing in the wire *shape* changed —
+  the same JSON, spelled so a line protocol can carry it.
+- **An error response no longer leaves the request body in the socket.** `_require_admin()` is
+  the first statement of both run routes, so the request most likely to be refused is the one
+  whose body is guaranteed unread — and this handler is HTTP/1.0, so it closes after every
+  response. Closing a socket that still holds unread data makes the platform send an RST rather
+  than a FIN, discarding the 401 already written: the caller saw a dropped connection and could
+  not tell a rejected token from a broken network. Error responses now drain the body first,
+  bounded in both directions (64 KiB, 0.5s) because a refused request has not earned the server's
+  read budget; past either bound the connection is closed undrained, as before. Found by a test
+  that started flaking one run in seven once a pooled-connection client was pointed at the
+  neighbouring route.
+- **(tests) Every SSE frame writer is now censused rather than remembered.** The writer set is
+  discovered from the AST — a function that writes a `data:` field *and* the blank line that ends
+  the frame — pinned in full, and each one is required to state `ensure_ascii=True`. A sixth
+  route, or an edit that shrinks one of these encodings the way the length-delimited bodies do,
+  fails there. Round-trip tests on all three routes read with httpx's line splitter, because the
+  suite's existing SSE helpers split on `\n\n` and passed against the bug the whole time.
+
+### Fixed — round three: the stamp is read wherever it lands, and the frame stops splitting
+
+- **A refused call's cost reaches the ledger whatever type the refusal is.** The receipt and the
+  run's budget read the stamp off *any* exception; the reference gateway's tenant meter and both
+  of its error writers inspected only a `ModelAdapterError` — and on that route the refusals
+  that matter are not one. The OpenAI stream never runs the mapping that classifies, so every
+  refusal in its terminal region is a raw `ValueError`/`AttributeError`, and the sync reader has
+  one raw shape too (`normalize_usage` says "malformed usage" with a `ValueError`). An upstream
+  whose final payload was malformed therefore charged the tenant nothing, answered with an
+  envelope saying the call was free, and came back `gateway_server_error` with `retryable: true`
+  — an invitation to buy the same tokens again. The meter now charges off any escaping
+  `Exception` through one writer (meter-then-reraise: nothing swallowed, nothing reclassified,
+  `GeneratorExit` deliberately not caught), and `usage` rides *every* arm of `_write_exception`
+  and `_stream_error_frame` rather than the classified arm alone. Omit-when-empty is unchanged,
+  so a failure raised before a provider keeps its exact wire shape.
+- **The SSE frame writer escapes the three characters its readers call line breaks.** Frames
+  were serialized with `ensure_ascii=False`, so U+2028, U+2029 and U+0085 reached the wire as
+  themselves — and the line-splitting readers clients use (httpx's `aiter_lines`, which this
+  project's own `GatewayModelAdapter` reads a stream with) break on all three. The frame arrived
+  truncated mid-string and the client reported `gateway_bad_response` with no usage for a turn
+  the server had produced, framed and already metered. `final_text` could always carry one; the
+  relayed `reasoning` array made it reachable from plaintext that need never appear in the
+  answer. `ensure_ascii=True` on the SSE writer only — the length-delimited body is framed by
+  `Content-Length`, cannot be split by a character, and keeps its smaller encoding. Same JSON,
+  spelled so a line protocol can carry it.
+- **(tests) The gateway helper-home registry fails loudly for the next shared helper.** A
+  wire-reading helper defined in another module and left unregistered was dropped from discovery
+  as unreachable, so the keys it reads stopped being counted on both sides of every pinned
+  read-set. Homes are derived from the module's own imports now and diffed against the hand map.
+- **`docs/OBSERVABILITY.md` names the fourth surface that sets the relayed provider.** It listed
+  three where `docs/CONTRACTS.md` lists four; `StudioConfig(llm_gateway_provider=...)` is the
+  one a reader of that section is most likely to be holding.
+
+### Fixed — round two: the cost rule reaches the readers it was written for
+
+- **Every per-key refusal off a billed *error* envelope now carries its cost, on all three
+  readers.** Round one guarded the two success-shaped regions and left a comment claiming they
+  were "every other refusal this reader can raise". The error branch between them refutes it:
+  `_parse_gateway_response`'s `"error" in data` branch, its stream-frame twin, and
+  `_error_from_status_body` — the reader *both* transports land in for a non-200 — each read
+  five keys of their own before the stamp that ends the branch, so a malformed `http_status`,
+  `retryable`, `config_recoverable`, `error` or `error_code` on a payload carrying valid billed
+  usage refused for free. That is the shape most likely to report a cost at all: an error
+  envelope exists because a call failed, and a call that failed *after* the upstream generated is
+  what the rule was written for. One semantic on all three — a malformed error envelope stays a
+  non-retryable `gateway_bad_response`, because a broken envelope is a broken gateway whatever
+  failure it was reporting. In `_error_from_status_body` that raise escapes past the caller's
+  `_should_retry`, so a 429 with an unparseable body is refused rather than retried: the body,
+  not the status line, is the authority. No wire or schema change.
+- **The *source* reader stamps the body OpenAI already billed.** Every carrier of a refused
+  call's cost — the receipt, the run's token budget, the gateway's error envelope, the tenant
+  ledger a hop away — can only report what the adapter that first saw the provider's body
+  recorded, and `_parse_response` recorded nothing. A dozen malformed shapes are refused there on
+  bodies carrying a valid `usage` (a model emitting non-JSON function-call arguments is ordinary,
+  not exotic), so the gateway wrote `usage: {}` and metered zero for a turn OpenAI billed. The
+  streamed twin is a separate construction — the stream folds deltas and reads end-of-turn
+  metadata off `response.completed`, never running the one-shot mapping — and now carries the
+  same rule at its own seam. Its refusals are raw `ValueError`/`AttributeError`, which is why
+  that seam catches `Exception`; the consumers one hop out were widened to match in the same
+  release (above), so the stamp is read wherever it lands rather than only where the failure had
+  already been classified. The lenient reader is one function for both adapters
+  (`providers/_common.usage_reported_by`); well-formed paths are unchanged.
+- **`resolved_provider_name` no longer answers nothing on its tolerance path.** It is documented
+  as one expression so the model-stream context, `run.started` and the receipt-derived span
+  cannot disagree about one call — but its guard *returned* `None` instead of falling through, so
+  on exactly the path it exists for (a third-party `provider_name` that raises, or whose `str()`
+  does) the model-stream context reported no provider while every surface beside it reported the
+  configured transport. Tolerance is "keep going", not "answer nothing". The declaration is now
+  normalized the way `ModelCallRunner` normalizes its own read, so the two are byte-identical
+  rather than equal only on well-behaved strings.
+- **The validated call's repair request stops re-sending dead reasoning.** Its by-value branch
+  appended an assistant turn *and* a user-role repair prompt, then forwarded every prior
+  `reasoning` block behind them — 100% unreachable, since the prompt itself moves the active
+  window past them, and paid again on every repair attempt. Pruned through the same function the
+  loop's seam uses. What the provider sees is byte-identical; what changes is size.
+- **`StudioConfig(llm_gateway_provider=...)`.** Studio derives the relayed provider from whether
+  a `provider_factory` was injected, which can only answer "do not tag" for one — right as a
+  guess, and it left an embedder with an OpenAI-backed factory unable to say otherwise, so its
+  reasoning round-trip was silently dead. Unset still derives; set wins, through the same
+  resolver every other string-typed surface uses (`none` = "do not tag").
+
+### Changed — two sentences an operator would otherwise have to guess
+
+- **"Last `user` message" includes kernel-authored ones.** The replay-window rule counts the
+  `OutputValidator`'s repair prompt and background/HITL observation messages as window
+  boundaries, because the adapter's replay filter reads the role and always has. Someone reading
+  "a new user turn" would guess they do not count. No behavior change — the prune this documents
+  produces a byte-identical provider payload.
+- **The four-surface provider agreement is scoped to activations that emit `run.started`.** An
+  event-only sink attached to a *restored* run joins after that event was written and reports no
+  provider or model for the resumed turns. Pre-existing, and absent from the receipt-driven
+  configuration, where every call publishes its own receipt.
+
+### Fixed — a refused gateway turn still reports what it cost
+
+- **Every per-key refusal off a *validated success* envelope now carries the usage the envelope
+  reported.** The contract says it plainly — "A refused turn was still generated and billed, so
+  the refusal carries the usage the provider reported … on both transports" — and the rule was
+  bound to two of the places that raise it: the 200 *error* envelope, and the terminal frame's
+  `generation_applied`/`schema_applied` echo pair. Every other key of the same two envelopes
+  escaped unstamped, so a body or a `turn_complete` frame that reported spending tokens and was
+  then refused for a malformed `stop_reason`, `final_text`, `turn_handle`/`response_id`,
+  `tool_calls`, `retryable`, `provider_retried` — or the newly added `reasoning`, which
+  inherited the miss the day it shipped — left the run's cumulative token budget and its
+  `metrics.updated` at zero for a call the provider charged for. A budget that skips refused
+  calls is not a bound. Bound at the seam rather than per key, so the next wire key added to
+  either reader cannot repeat it; the lenient read is unchanged, so a body whose `usage` is
+  *itself* the malformed key stamps nothing rather than replacing the failure being reported.
+  No wire, schema or protocol change — the stamp already existed and now covers the payloads it
+  was written for.
+
+### Fixed — the upstream a gateway relays is configurable, and attribution agrees with itself
+
+- **`GatewayModelAdapter.provider_name` is reachable from the builders that ship.** It landed
+  configurable only by hand-constructing the adapter: neither `monoid run`'s `_model_adapter` nor
+  the backend's `build_model_adapter` could set it, so every deployment took the reference default
+  and a gateway fronting a different upstream mislabelled its reasoning tag and its spans with no
+  way to say otherwise. Adds `monoid run --llm-gateway-provider`, `monoid backend serve
+  --llm-gateway-provider`, and the `RunnerBackend(llm_gateway_provider=...)` field, all reading one
+  sentinel (`none` = the protocol's "do not tag"). The backend's value is applied inside
+  `build_model_adapter`, so the adapter recovery rebuilds after a restart inherits it instead of
+  reverting to the default. Deliberately not a `ModelConfig` field: it describes the deployment's
+  transport, not the agent, and that dataclass feeds `config_hash`.
+- **Agent Studio no longer attributes offline runs to OpenAI.** The relayed provider is decided at
+  the same site that decides the bundled gateway's upstream, so the offline echo model and any
+  injected provider factory tag nothing, while the `openai` deployment still reports `"openai"`.
+- **`OtelEventSink` stopped giving two answers for one call.** Its receipt-derived span read the
+  answering adapter's `provider_name`; its event-driven chat span read `run.started`'s
+  `model_provider`, filled from the raw `ModelConfig.provider` — so through the gateway the same
+  class reported the upstream in one configuration and the transport in another, and the
+  zero-argument form the docs teach was the disagreeing one. `run.started` now reports the provider
+  that actually serves the run (resolved by `resolved_provider_name(adapter, config)`, shared with
+  the model-stream context). No schema change; the transport stays recorded verbatim on
+  `manifest.json`.
+- **`ProviderNamedModelAdapter.provider_name` is typed `str | None`**, matching the shipped
+  `GatewayModelAdapter` field and the protocol's own documented "do not tag" sense.
+
+### Fixed — the request stops paying for reasoning the provider already discards
+
+- **Historical reasoning blocks are pruned from the wire.** The loop appended a captured
+  reasoning block to every assistant message and pruned none, while the rule that decides
+  whether a block is *replayable* lives in the OpenAI adapter: replay only inside the active
+  window — the messages after the last `user` message. A block outside that window is outside
+  forever, because the window only moves forward. Every user turn therefore added one dead
+  block and every later request re-sent all of them: on a four-user-turn conversation, ~97% of
+  the request's message bytes were payload the upstream provably throws away, growing
+  O(user_turns × payload) and paid twice on the gateway route. Requests are now built from a
+  wire copy with the key dropped from every message before the window start. What the provider
+  sees is unchanged and pinned as such — outside the window the adapter already reconstructed
+  those turns from `content`/`tool_calls`, and the model-identity scan reads only the window, so
+  a pruned log yields a byte-identical payload. `state.messages` and the checkpoint are
+  untouched: the durable record keeps every block verbatim. The window rule now exists once, in
+  `providers/_common.reasoning_replay_window_start`, read by both the adapter that decides what
+  to replay and the kernel that decides what to send. `prompt_digest` identifies the
+  conversation the model actually saw and so is taken over the pruned request.
+
+### Changed — the reasoning artifact array is documented as what it is
+
+- **Not opaque, and the redaction policy has to know.** The `reasoning` array was documented as
+  "already provider-encrypted, never interpreted". That holds for one of the three item types it
+  carries: the capture is the provider's verbatim output subsequence — reasoning items **plus**
+  the `message`/`function_call` items paired with them, because the provider validates that
+  adjacency on replay. A `message` entry is the model's plaintext answer and a `function_call`
+  entry is plaintext arguments, duplicating what `final_text`/`tool_calls` carry on the same
+  envelope. Anything that logs, previews, or truncates this value **must treat it as model
+  content**, or a surface that bounds `final_text` and dumps `reasoning` raw has bounded
+  nothing. It also roughly doubles a small body when populated. Docs and docstrings only.
+- **`reasoning` skew fails open on *absence*, not on malformed values.** A present value must be
+  an array of objects; a malformed one is refused non-retryably as `gateway_bad_response` by
+  both readers. One skew case worth naming: the same protocol uses `reasoning` on the *request*
+  body for the reasoning *config object*, so a third-party gateway echoing request keys back
+  answers an array-valued key with an object and trips that refusal.
+
+### Added — the provider-native reasoning round-trip survives the gateway hop
+
+- **`reasoning` joins the LLM gateway success envelope, on both transports.** The kernel captures
+  a provider's native reasoning artifacts off a turn (`ModelTurn.reasoning`, carrying OpenAI's
+  `encrypted_content`) and replays them verbatim on the next by-value turn — the ZDR reasoning
+  round-trip DX-13a is built on. Through the gateway that loop was dead in the response
+  direction: the server wrote the items to neither the sync body nor the terminal
+  `turn_complete` frame, and neither client reader named the key, so a run routed through the
+  gateway captured nothing and therefore replayed nothing. (The request direction always worked:
+  `messages` ride by value and are forwarded verbatim to the upstream adapter.) The key is a
+  JSON array of the provider's own item objects, relayed untouched — this hop has no business
+  interpreting them, though only the reasoning-type entries are encrypted (see the redaction
+  note above) — written by one shared
+  server helper and read by one shared strict validator, so the two transports cannot come to
+  disagree about the shape or about how strictly they refuse a malformed one. It is
+  omit-when-empty and **response**-conditional: present only when the upstream produced
+  artifacts, so traffic that produces none keeps its exact previous wire shape, and an absent
+  key reads as "no artifacts" on both an older gateway and a non-reasoning upstream. Additive
+  under `llm-turn-result.v1`; no protocol identifier changed.
+- **`GatewayModelAdapter` declares the upstream provider it relays.** The wire alone did not
+  revive the feature: the loop tags captured artifacts only when the adapter names a provider,
+  and the gateway adapter named none — so the block was dropped one line after the reader
+  reconstructed it. The new `provider_name` field defaults to `"openai"` (the reference
+  gateway's own default upstream), takes the deployment's real upstream when a
+  `provider_adapter_factory` routes elsewhere, and accepts `None` for the protocol's documented
+  "do not tag". It names the *upstream* rather than the hop because a tagged block is replayed
+  only to a matching adapter and model.
+- **Observability through the gateway now attributes to the model, not the transport.** That
+  same attribute is what three surfaces probe an adapter for, so naming the upstream changes all
+  three at once, deliberately: OTel's `gen_ai.provider.name` on the `chat` span,
+  `ModelCallReceipt.provider_name` (previously `""` on this route), and the model-stream
+  context's `provider` (previously the config's string) now report the upstream instead of
+  falling back to `"gateway"`. The transport stays legible beside them as
+  `receipt.model.provider`. Using the existing seam is the point — a second attribute would give
+  the reasoning tag and the spans two truths to drift between.
+- **Known limit, by design: a stream that ends without a terminal frame carries no artifacts.**
+  Such a stream has no end-of-turn metadata channel at all — the same reason it carries no
+  `usage` and no turn handle — so the absence is tolerated as `()` rather than refused, and a run
+  continuing over that hop simply re-derives nothing to replay (the loop appends no reasoning
+  block for an empty tuple). Registered as a by-design carriage gap rather than papered over.
+  A fail-closed *proof* that reasoning was applied remains a separate open track.
+
+### Fixed — a success the SDK re-sent stops reading as a clean first attempt
+
+- **`OpenAIModelAdapter` reports the SDK's own retries on its success paths too.** The retry
+  probe added in the burn-down (`_provider_retried_by_the_sdk`) ran only on exceptions, so a
+  call the OpenAI client's internal retry loop re-sent before *succeeding* was written to
+  `transcript.jsonl`, the `ModelCallReceipt` and the gateway success body/frames as
+  `provider_retried: false` — contrary to the field's audit semantics, while the identical
+  call one failure later reported its retries. Both success lanes now read the same stamped
+  `x-stainless-retry-count` header through the same one parser as the failure path: the
+  non-streaming turn goes through `with_raw_response` (the parsed model keeps no reference to
+  the HTTP exchange; the wrapper's `.parse()` yields the same object, and its
+  `.http_response.request` carries the header — verified empirically on openai 2.41.1,
+  including that the wrapper has no `.request` of its own), and the streaming path reads
+  `stream.response.request`, stamping the verdict on EVERY chunk rather than only
+  `TurnComplete`, so a stream abandoned mid-flight still reports it. The probe's guard policy
+  is unchanged on all lanes: anything unreadable means "no retry", never a raise. No wire or
+  schema change — the turn/chunk carriers, transcript success record, receipt and gateway
+  bodies already had the field and now receive the true value.
+
+### Fixed — every failure quarantine speaks, and a resume refusal says why
+
+- **`record_run_failure` — the third `failure.json` writer — makes the terminal statement the
+  give-up sites make.** A run whose driver died (a build failure, a drive exception, a
+  recovered run's re-drive failing) got `failure.json` and a FAILED in-memory record but its
+  `status.json` kept the old park, so after a restart `status()`/`list_runs` reported
+  `awaiting_input, terminal=false` forever while `recover_runs` skipped the dir — byte-for-byte
+  the symptom the give-up sites had just been cured of. All three quarantine lanes now write
+  the artifact through ONE shared writer (`run_state.write_failure_status_artifact`), each with
+  an honest marker (`given_up_by_recovery`; `recorded_by_run_failure`) and its own
+  `error_code` — and the pairing is bound structurally: a writer census in
+  `tests/test_carriage_conformance.py` discovers every `failure.json` writer in src and fails
+  any that neither writes the terminal artifact nor emits `run.failed`. Reader-side backstop
+  for pre-fix dirs: `lifecycle_from_status_artifact` now reads a failure bundle beside a
+  NON-terminal parked artifact as `failed`/terminal (a terminal artifact — a genuine close —
+  still wins, and deleting the bundle restores the park, so the restore-hint flow is intact).
+  The record also gets the FAILED-terminal heal `record_run_result` applies (keep the four
+  classification facts, drop `provider_retried`).
+- **The minted quarantine artifact is schema-valid over a run that never wrote status.json.**
+  The give-up writer over a missing/unreadable `status.json` omitted `STATUS_SCHEMA`'s
+  required watermark keys, so `monoid validate` rejected the very file the fix mints. The
+  shared writer seeds `last_event_seq: 0` / `last_event_type: ""` ("no committed event known
+  to this writer"; the schema's floor moves to 0 — every reader already accepted it and
+  reconciles against the committed log tail), reads the prior payload with the resilient
+  reader so an atomic-replace race cannot drop identity/metrics, and merges over whatever it
+  preserved.
+- **A closed-limited run is no longer advertised `recoverable: true` beside
+  `terminal: true`.** `list_runs` computed `recoverable` from {no failure.json, non-terminal
+  checkpoint} only, and a run that CLOSED limited keeps a non-terminal park checkpoint by
+  design — so the listing advertised a dead run resumable and `resume_run` then 400'd with
+  "inspect failure.json" over a bundle that does not exist. The projection now consults the
+  same close-recording artifact fact recovery's guard consults — one function
+  (`core.projections.status_artifact_records_close`), both callers, read off the payload the
+  row already loads.
+- **Resume refusals are typed.** `attempt_resume` answers `ResumeOutcome`
+  (resumed/closed/already_live/failed) instead of a bare bool, and `resume_run` maps it:
+  closed → `NativeAgentError(error_code="run_terminal")`; a lost register-record claim race
+  (the studio double-click shape) → the already-live success shape (`resumed: false`, like
+  the record-exists branch) instead of a 400 for a resume that in fact succeeded; only a
+  genuine non-resume keeps the inspect-logs/failure.json hint.
+
+### Fixed — the close boundary tells the truth, and a dead run reads dead everywhere
+
+- **The terminal heal reaches the backend record.** Terminals minted at the close boundary
+  (a pending-cancel promotion, the unrecovered turn-failure promotion, the new unsettled-close
+  promotion) never pass the driver's top-of-loop park promotion — so at a CANCELLED terminal
+  reached by cancelling a `turn_failed` park, live `GET /status` served the dead turn's five
+  classification facts beside `error_code="cancelled"` while `status.json` healed them, and the
+  two branches of the same endpoint disagreed across a restart. `record_run_result` — the one
+  seam every terminal result funnels through — now binds the same rule the status sink and the
+  offline projection already bind: a non-failed terminal (completed/limited/cancelled) clears
+  the five facts on the record; a failed terminal keeps the four what-it-died-of facts and drops
+  the per-call `provider_retried`, exactly as `run.failed`'s vocabulary does. All three readers
+  are pinned to one answer per close-boundary terminal kind.
+- **Closing a mid-turn PAUSED (or interrupted) run no longer finalizes a clean success and
+  deletes its only restore point.** A turn frozen at a step boundary (pause) or abandoned before
+  settling (interrupt) read the per-submit reset state at close: `run.finished` said
+  `completed` with an empty answer and the completed-run cleanup deleted the checkpoints holding
+  the frozen turn — backend-reachable via `pause_run` + idle timeout. `close()` now promotes a
+  mid-turn park to `status="limited"` / `error_code="closed_unsettled"` (one new code, both
+  variants, documented in CONTRACTS.md) with an empty classification and its checkpoints kept;
+  the marker rides the checkpoint's `last_suspension`, so a restored park closes the same way.
+  A resumed pause that settles keeps the clean-completion contract.
+- **Cancelling a settled park keeps the settled answer.** `cancel_run` + close (and `drain()`
+  at deploy) replaced the parked turn's settled `final_text` with "Stopped because the run was
+  cancelled." on the result, `run.finished`, and every readable surface — v0.20 returned the
+  answer with the wrong COMPLETED status, and the status fix silently took the answer. The
+  pending-cancel promotion now preserves the park's settled text (the cancel statement lives in
+  `error`/`error_code`); a mid-turn cancel, which has no settled text, keeps the stop notice.
+- **A given-up run reads terminal on every status surface.** The recovery give-up paths
+  (unrecoverable after `max_recover_attempts`; corrupt durable state) wrote `failure.json` and
+  metered — but no terminal status artifact, so `status()`, `list_runs` and the offline
+  projection all answered `state=awaiting_input, terminal=False, error=""` forever while
+  `resume_run` refused the run as unrecoverable. Both sites now write the terminal statement
+  into `status.json` (the sink's `run.failed` shape, plus a `given_up_by_recovery` marker the
+  closed-run recovery guard and the offline projection honor), and `restore_hint` now names the
+  actual operator flow — delete `failure.json` to lift the quarantine, then
+  `recover_runs`/`resume_run` — which previously pointed at a path that skips quarantined dirs.
+- **The cancel-ack checkpoint no longer races the drive.** `cancel_run` read `record.state` on
+  the HTTP thread and persisted later on the shared loop: a park state read just before the
+  drive resumed let a mid-turn snapshot overwrite the committed park checkpoint's content at the
+  same seq, and an idle-timeout close landing between ack and persist made `snapshot()` raise
+  `run_not_open` — a 500 after acknowledging the cancel. The quiescence check + ack checkpoint +
+  wake signal now run as one callable on the drive's own loop, double-gated on the record's park
+  state and the loop's committed-park marker (`AgentLoop.at_quiescent_park()`), and a persist
+  refused with `run_not_open`/`run_terminal` is treated as the successful cancel it is. The
+  remaining mid-turn/mid-close window is documented as honestly non-durable.
+
+### Fixed — the facade wraps what restore produces, and deadness is a recorded fact
+
+- **`LoopSession` can wrap a restored loop, as its docstring always promised.** A fresh
+  `LoopSession(loop)` over a restored parked loop reported `created`; `open()` raised
+  `run_already_open`, and any pump crashed the FSM (`illegal_session_transition`
+  created->running) — the facade's own embedder contract had no restore story (the backend
+  drives loops directly, so only the facade lane was broken). Construction now derives the
+  initial state from the wrapped loop when no explicit `_state` is passed: a terminal session
+  maps through the shared terminal precedence, a parked session maps its rehydrated
+  `last_suspension` through the same checkpoint reader + pump projector (also seeding
+  `inspect()`'s last-park view), and an open-but-unpumped session is `idle`. A fresh un-opened
+  loop still yields `created`, and the backend's explicit `LoopSession(loop, _state=record.state)`
+  seeding is untouched.
+- **`health()` no longer answers dead during the backend's `aopen` window.** Between
+  `attach_loop` (loop findable, `run.started` already recorded RUNNING) and `open()` assigning
+  `loop._session` on its worker thread, an HTTP-thread inspect/health facade read
+  `_session is None` + state != `created` as dead — alive=False/terminal=True for a run
+  milliseconds from its first pump. `AgentLoop` now records a monotonic finalization fact
+  (`_finalized`) at exactly the sites that tear the activation down — `close()`,
+  `release_parked()`, `discard_uncommitted()` (the async facades and every failure path route
+  through these; `restore()` never sets it) — and `_loop_is_dead()` is `session.terminal` OR
+  (no session AND finalized). The window answers alive; every previously closed cell (post-close
+  park facade, close-that-raises, pre-close terminal-limited) still answers dead.
+
+### Fixed — a closed run stays closed, a cancel is a cancel, and every abandoned run reaches the ledger
+
+- **Recovery no longer resurrects a closed LIMITED run.** A run that closed limited (e.g.
+  `max_steps`) was the one terminal outcome with no recovery-visible marker: its park checkpoint
+  is non-terminal (a live-limited park is resumable by design), `close()` keeps checkpoints for
+  every non-completed status, and no failure.json exists — so `recover_runs()` (and the watchdog
+  reclaim) re-drove it on EVERY pass: another terminal `run.finished` appended per restart, and
+  the full cumulative usage re-metered into each fresh tenant ledger, forever. `attempt_resume`
+  now consults the run's durable status artifact (`lifecycle_from_status_artifact`, which also
+  resolves legacy bare `status="limited"` dirs closed before this fix) and recognizes the closed
+  run — a skip, not a quarantine. A run that genuinely crashed at a limited park (non-terminal
+  status artifact) still recovers.
+- **Cancelling a PARKED run records CANCELLED, not a clean COMPLETED.** The cancel was acked,
+  the close signal broke the drive — and `close()` then read the per-submit reset state
+  (`status="completed"`), so `run.finished` said completed, the record overwrote
+  `error_code="cancelled"` with `""`, and the completed-run cleanup deleted the cancelled run's
+  checkpoints. `close()`/`aclose()` now promote a pending cancel through the mid-run
+  `RunCancelled` vocabulary (`status="limited"`, `error_code="cancelled"`, terminal park
+  checkpoint, checkpoints kept), so a park-cancel classifies exactly like a mid-turn cancel.
+- **An acknowledged cancel of a parked run is durable.** The park checkpoint predated the
+  cancel, so a crash before the terminal record restored the run uncancelled despite the ack.
+  `cancel_run` of a quiescent (parked) run now commits a checkpoint carrying
+  `cancellation_requested` before the ack returns; the restore path already honors it. A cancel
+  landing mid-turn keeps its existing path (the pump's own terminal park), with a documented
+  residual crash window.
+- **The recovery give-up paths meter what the run had spent.** The
+  resume-failed-`max_recover_attempts` give-up and the corrupt-durable-state quarantine wrote
+  failure.json and stopped — a run that crashed after N billed turns and could never be resumed
+  was never counted and its checkpointed spend never reached any ledger. Both now route through
+  a record-free metering seam (`meter_abandoned_run`) with the same spend source, high-water
+  semantics, and run count as the failure path.
+- **Failure metering survives a corrupt status.json and reads the fresher source.** One
+  non-count metric (`{"input_tokens": 12.5}`) turned failure-recording into an escaping
+  `ValueError` — after `runs` was incremented, past the failure paths that yield the streaming
+  client's terminal frame. And the all-or-nothing fallback (checkpoint wins if present) dropped
+  everything billed between the last park and a mid-turn death. `_spent_before_failure` now
+  folds BOTH durable sources per key (guarded: non-negative ints only, unreadable keys dropped)
+  and takes the per-key max — strictly closer to "billed once per token", with
+  `record_run_result`'s strictness for kernel-written values untouched.
+- **The DBOS receipt-verifier compat window matches its stated scope.** The pre-v0.21 "failed"
+  spelling was accepted for ANY `status="limited"` suspension — but cancel boundaries and
+  live-limited parks carry that status too, and pre-v0.21 processes already recorded
+  "cancelled"/"limited" there, so a "failed" receipt at those boundaries is corrupt, not
+  compatible. The widening now applies only at a terminal-limited boundary (the one mapping
+  v0.21 actually changed), and both directions are pinned in tests.
+
+### Fixed — every status surface carries the classification, and the pause is visible on all of them
+
+- **The durable status readers carry the FULL failure classification, one rule, all carriers.**
+  `turn.failed` emits seven facts and every consumer copied a different fragment: `status.json`'s
+  sink and the offline projection kept `error`/`error_code`, the backend record the same pair,
+  the park promotion only `config_recoverable` — and `config_recoverable` alone cannot separate
+  an `insufficient_quota` (fix the config) from a `rate_limit` (wait). All three consumers now
+  copy `provider_error_code` / `http_status` / `retryable` / `config_recoverable` /
+  `provider_retried` beside the error pair (`provider_usage` is metering and stays off status
+  surfaces), the session driver promotes all five off every park (assigned, never or-ed, so a
+  clean settle clears stale answers — including the error text, which used to survive a clean
+  settle on the record), `BackendRunRecord` gains the missing fields, and `status()` / `result()`
+  serve them on the live branch **and** on the record-is-None branch, so a post-restart operator
+  gets the same answer from status.json that the live record gave.
+- **Terminal events heal instead of or-falling-back.** The offline projection's terminal
+  branches read `data.get("error_code") or projection["error_code"]`, so
+  `turn.failed -> recovery -> run.finished{completed, error_code:""}` reported the dead turn's
+  `model_error` on a cleanly completed run — and `run.finished` never touched `error` at all.
+  Terminal branches now ASSIGN error/error_code and heal the classification (a failed terminal
+  keeps what `run.failed` carries, minus `provider_retried` — a per-call fact the terminal
+  vocabulary deliberately drops), on the offline projection and the sink twin alike.
+- **A model turn starting clears the dead turn's answer everywhere.** The retry path re-pumps
+  straight from `turn_failed` without passing a parked state, so the parked-state-guarded clears
+  never fired and all three readers showed the previous failure beside `state="running"`. The
+  unpark clear is unconditional on `model.turn.started` now, on both file readers and the record.
+- **The pause is observable on the durable surfaces.** While paused, `status.json` and the
+  offline projection said `state="running"`; after resume, the backend record said `"paused"`
+  through the whole resumed turn. Both file readers project `session.state.changed{state:
+  "paused"}` (the session-lane carrier; `turn.paused` stays a turn-lane cause event), `PAUSED`
+  joins every park-clear set (`_PARKED_STATES`, the sink twin, `record_event`'s), and the
+  driver's paused-resume branch marks the record RUNNING when it re-pumps.
+- **The terminal park carries what its own `run.failed` event says.** The terminal `Suspension`
+  constructions dropped the classification fields the type already declared, so a driver
+  promoting "what the park knew" promoted defaults over the truth its own event log carried —
+  all three terminal constructions (non-recoverable model error, the generic failure arm, and
+  `fail_recoverable`'s persisted park) now populate them from the same state the emit reads.
+- **`metrics.json` states the verdict.** It carried `provider_error_code` /
+  `provider_http_status` and dropped `retryable` / `config_recoverable`; a failed run's metrics
+  now record both, declared in `METRICS_SCHEMA` (and the status.json block in `STATUS_SCHEMA`)
+  under the stream_closed precedent — declare even under `additionalProperties: True`. Absent
+  keys on pre-v0.21 artifacts mean what those runs meant (see COMPATIBILITY.md).
+- The carriage census grows the cells that would have caught this: a per-consumer-branch pin of
+  the classification key-subset each `turn.failed`/`run.failed` branch copies (helper-following,
+  so a read moved into a function stays censused), the pause event on the two file readers'
+  handled-set pins with the record's absence declared, and the new carrier files registered.
+
+### Fixed — the facade answers for the loop it wraps
+
+- **The blocking settle twin shares the pump's terminal precedence.** A `LoopSession.submit()`
+  that spends the session tool-call budget hands back `status="limited"` with the session
+  terminal, and `_derive_after_settle` read only the terminal flag: FAILED, where
+  `run_until_suspended` answered LIMITED for the identical run — and a cancelled submit
+  answered FAILED where the pump said CANCELLED. The divergence then escalated: `close()`
+  computed LIMITED (or CANCELLED) through the shared mapper and crashed the FSM
+  (`illegal_session_transition 'failed' -> 'limited'`) *after* the loop had already finalized,
+  so the embedder lost the `AgentRunResult` it was owed. The precedence — cancelled first,
+  then a terminal `status="limited"` to LIMITED, else FAILED — now lives in one
+  `_terminal_outcome_state` that `state_from_suspension` and `_derive_after_settle` both call,
+  and the census pin that proved three mappers agree seats the fourth mapper it had missed.
+- **`health()` and `inspect()` bind to actual loop liveness.** A closed limited run — facade
+  in LIMITED (a park state), `loop._session` gone — reported `alive=True,
+  can_accept_input=True`, while a live-but-terminal session reported the self-contradictory
+  `alive=False, can_accept_input=True`. One predicate (session terminal, or activation torn
+  down after leaving CREATED) now answers for `alive`, for `can_accept_input`, and for the
+  no-session `inspect().terminal` that hardcoded `False` — so a closed run no longer reads
+  as live. Pre-open (CREATED, no session yet) still reads as alive-but-not-accepting.
+- **A refused pump never moves the facade.** `submit()` / `resume()` /
+  `run_until_suspended()` wrote RUNNING *before* asking the loop, so the loop's `run_not_open`
+  / `run_terminal` refusal left the facade wedged in RUNNING — permanently, post-close, since
+  RUNNING accepts no input and a dead loop can never settle it back out. The pumps check loop
+  openness and terminality first and refuse with the loop's own typed error codes from the
+  truthful state (a never-opened facade now refuses `run_not_open` instead of
+  `illegal_session_transition`). And a `close()` that raises lands the facade on FAILED when
+  the loop is dead — `AgentLoop.close` discards the activation before re-raising — rather
+  than leaving an input-accepting park state over it.
+
+### Fixed — the transport failures one adapter parked, the other terminalized
+
+- **A transient connection failure on the direct OpenAI adapter ends the turn, not the run.**
+  `openai.APIConnectionError` (and the `APITimeoutError` that subclasses it) carries no status
+  and no body, so it fell to the classifier's unclassified tail: retryable=False, terminal for
+  the whole session — while the gateway adapter classifies the identical condition (`URLError`
+  / `TimeoutError` / `OSError`) retryable=True and the loop parks `turn_failed` for the backend
+  to backoff-retry. The classifier now has a connection-family branch — `openai_timeout` /
+  `openai_network_error`, the direct adapter's spelling of the `*_timeout` / `*_network_error`
+  pair every other transport uses — retryable, no claimed status, and still carrying the
+  retries the SDK itself spent on the family it retries most. The family binds both spellings
+  of the drop: the SDK wraps transport failures into `APIConnectionError` only up to the
+  response headers (`_base_client._request`), and its streaming iterator has no translation at
+  all — so the identical drop mid-body raises the *raw* `httpx.ReadError` / `ReadTimeout` /
+  `RemoteProtocolError` into the classifier, where it fell past the new branch to the
+  unclassified tail and terminalized the flagship streaming lane. The raw families now answer
+  with the same pair (`TimeoutException` checked before the `TransportError` it subclasses;
+  `HTTPStatusError` deliberately excluded — a provider that answered a status is not a
+  connection that dropped, and the status branches above already classify it).
+- **A fresh terminal failure classifies the record from its own event.** The record's
+  `run.failed` branch copied the error pair only — justified by the driver's park promotion,
+  which never runs for a terminal that never parked (a non-recoverable failure on the stream
+  lane, or any first-turn failure) — so live `status()`/`result()` served default
+  classification against a status.json that carried the truth. The branch now takes the
+  event's whole classification through the same guarded reads as its `turn.failed` twin.
+- **The live stream broker carries both halves of the failure classification.** The closed
+  frame forwarded only `retryable`, so a live consumer of the reference backend's model
+  stream read a config-fixable failure as merely non-retryable while the model-content
+  sidecar beside the lane recorded both facts. `LiveModelStreamFrame` gains an optional
+  `config_recoverable` (validated, serialized, forwarded by the writer's close), registered
+  as a carrier file in the conformance census.
+- **A driver death answers the same on the live record and the durable artifact.**
+  `record_run_failure` wrote the exception's provider code, HTTP status and recovery flags
+  into status.json but mutated only the error pair on the live record — `status()`/`result()`
+  prefer the active record, so they served the last park's stale classification (or defaults)
+  against the just-written artifact until the record was released. The record now takes the
+  same guarded exception reads the artifact takes.
+- **A 408/409 from the provider is transient, not a configuration defect.** The 4xx branch
+  recognized only 429 as retryable, so a request timeout (408) or conflict (409) came out
+  retryable=False — and the one config predicate then stamped `config_recoverable=True`,
+  parking the turn with a "change your configuration" answer for a condition that clears on
+  backoff. Both statuses are now retryable, and the predicate itself excludes them
+  (`_TRANSIENT_4XX_STATUSES`), so no present or future caller can claim config for a
+  transient 4xx.
+- **The SDK-retry probe classifies a request-less httpx error instead of crashing on it.**
+  `httpx.HTTPError.request` is a *property that raises* `RuntimeError` when unset, and the one
+  probe read outside a `try` swallowed only `AttributeError` — so a mid-stream network drop
+  (`ReadError` while consuming the body, retryable connection family per the bullet above)
+  reached the classifier and came out as a raw `RuntimeError` in place of the classified
+  error, which the gateway route then mapped to an anonymous 500: the verdict was decided by
+  the probe's crash, not by the classification. The whole read now sits in one guard with the
+  probe's own stated policy — anything unreadable means "no retry" — in the fully-covered
+  style of `provider_usage_of`.
+- **The receipt constructor joins the four readers of the countable-int predicate.**
+  `ModelCallReceipt.__post_init__` answered `isinstance(value, int)` where the four readers of
+  one usage stamp (`provider_usage_of`, `_reported_error_usage`, `with_error`,
+  `_recordable_usage`) all answer `type(value) is int`, so the constructor accepted the
+  `IntEnum` every reader beside it refuses — a receipt could carry a count no consumer would
+  count. The five-sibling agreement is pinned in the census (the four-readers pin now seats
+  the fifth), with the deliberate asymmetry stated: failure-path readers filter silently, the
+  success-path constructor refuses loudly.
+
+### Added — a field-carriage conformance suite (repo-internal drift tooling)
+
+- **`tests/test_carriage_conformance.py` machine-diffs each semantic fact against every carrier
+  obliged to repeat it.** The dominant defect shape here is a fact that rides N parallel carriers
+  — dataclass, checkpoint payload, event data, event schema, wire body, SSE frame, client reader,
+  transcript record — with a change binding N−1 of them; review finds those one at a time. The
+  suite takes an authority per fact family (`dataclasses.fields`, the `__init__` signature, the
+  normalizer's emitted-key domain) and set-diffs it against each carrier, so a field added to an
+  authority without a carrier fails by construction. Seven families are covered: `Suspension`,
+  `ModelAdapterError` transport, usage counts, the W5 applied-echo protocol, the tool catalog
+  (one `ToolSpec` projected by five hand-written builders, each omission justified in place),
+  the checkpoint validator's field coverage (six hand-maintained frozensets over a validator
+  that fails open), and the success envelope — the main wire, two server writers against two
+  client parsers.
+- Four properties make the census trustworthy: one hand-written *maximal builder* per authority
+  with a reflection guard (a generic synthesizer would silently skip a new field); *behavioral*
+  reader censuses that diff reconstructed attributes rather than key sets, because a reader that
+  ignores a wire key leaves no trace in any key set; *declared* alias tables for the facts that
+  are renamed at a hop (wire `error_code` carries `provider_error_code`, `RunCheckpoint` spells
+  `http_status` as `provider_http_status`, `awaiting_task_ids` is `task_ids` on one event, the
+  success body's `turn_handle` is read back as `response_id`); and **no hand copies as
+  authorities** — the usage domain is the assignable key set of the live normalizer, the server
+  error body is captured from the shipped `_write_exception` and diffed against its SSE twin,
+  and the gateway's error-reader list is discovered from the module rather than written down.
+  An AST backstop pins the set of files whose *code* names each headline field (substring
+  containment counted a comment as a carrier and so failed open), plus a declared list of
+  non-Python carriers — the shipped Studio bundle, `docs/CONTRACTS.md`, `docs/OBSERVABILITY.md`
+  — so a wire-key rename that breaks the shipped UI fails a test that names the file.
+- **The suite is green, and the currently unbound cells are registered rather than fixed.** Every
+  one is an entry in a `KNOWN_GAPS` registry carrying its carrier as `path:symbol` (checked to
+  exist, so a rename rots the entry loudly) and a disposition — `burn-down` or `by-design`
+  (a third token, `v0.21-track:B1`, existed while that gap was registered and retired with its
+  only entry). The assertions encode today's reality exactly, so closing a gap *breaks* the suite
+  and the fixer must update the expected set and delete the registry entry in the same change.
+  A second registry, `FUTURE_FAMILIES`, declares the families deliberately *not* censused yet —
+  each with the authority a census would take, its carrier count, and a one-line risk note — so
+  the suite's silence about a family is a decision on the record rather than an oversight.
+- **Round-2 hardening: the census mechanisms were attacked, and the ones that failed open are
+  repaired here.** Each repair is a mechanism, not a patched assertion. Every drift below was run
+  against the suite as it stood and passed all 89 tests; each now fails with a diagnostic naming
+  the shape. *Wrapper transparency* — `inspect.getsource`
+  and `inspect.signature` both follow `__wrapped__`, so a `functools.wraps` wrapper adding an
+  eighth usage key passed the whole suite; every live-callable census now refuses a wrapped
+  object rather than reading the function underneath it. *Fail-closed emit reading* — the
+  assignable-domain reader documented itself as fail-closed and looked at one of the four ways to
+  write a key into a dict, so `result.update({...})`, `|=` and augmented assignment were each an
+  emitted key it reported as nonexistent; any method call or augmented assignment on the result
+  is now an unanalyzable shape that fails by name. *Bucket membership and consumption* — moving a
+  field between two checkpoint validation buckets changes the rule it is validated under at the
+  recovery boundary and left the union, the disjointness and the count untouched; membership is
+  pinned per bucket, and every bucket must be read by the validator, so a declared-but-unused one
+  fails. *Minimal-probe twins* — the wire censuses pinned only the maximal request, so a writer
+  that omitted a key whenever it held its default value was invisible; each family-7 census has a
+  minimal twin, and the difference between the two probes is the conditional half of the wire.
+  *Widened discovery* — reader discovery was a predicate on where a function was written (module
+  level) and how it spelled its raise (a literal constructor); it now walks class bodies and
+  resolves one level of delegation. The gateway's wire-reading helper list, the other closed hand
+  list in the family, is derived from the module and diffed against it, and the emit-site census
+  counts every emit for an event type instead of only those with a literal `data={...}`.
+- **Round-3 hardening: each round-2 repair was attacked on its own twin, and five broke there.**
+  Same method as above — every drift below was run against the suite as it stood, passed all 111
+  tests, and now fails with a diagnostic naming the shape (suite: 111 → 120). *The write census
+  was bound on one name.* The assignable-domain reader refused what it could not read about the
+  dict it *returns* and looked at no other name, so `details["tool_tokens"] = ...` written ahead
+  of `for key, value in details.items(): result[key] = value` reached the wire through the copy
+  loop's source — and a source with no dict literal bound to it resolved to the empty set instead
+  of refusing. One mechanism (`_dict_writes`) now answers for every name in a scope: constant
+  contributions (subscript writes, analyzable `update({...})` and `|=` merges) are folded in, and
+  a `**` splat, a computed key, a merge from a name, a rebinding, an unmodelled mutator, or a
+  `return` of anything but the counted name is refused by name. *Its resolver twin had no refusal
+  in it at all.* The `data=<name>` emit-site resolver and the bespoke `metrics.updated` census
+  each read dict literals plus constant-key subscript writes and silently dropped everything
+  else, so a `data.update({...})` put a key on the wire that the schema diff reported as
+  nonexistent; both now resolve through the same mechanism and fail closed. *Family-2 discovery
+  still spelled two predicates.* "Reads the wire" meant *calling a registered helper*, so a
+  reader doing its own `payload.get("error")` was not a reader; "takes a mapping" meant the
+  annotation said so, so a `payload: Any` helper carrying a wire key was invisible to every
+  read-key census. Both are read off the body now, with the registered helpers excluded by name
+  because the sibling census already derives them. *Family 2 had no minimal probe.* Family 7 grew
+  minimal-input twins in round 2 and the error family did not, so an omit-when-falsy filter added
+  on either shipped writer's side of the shared `_error_body` call was invisible to probes that
+  only ever fed a maximal exception; both writers are now driven with a minimal one, pinning that
+  `usage` is the single conditional key. *Two registered-gap pins censused a spelling and an
+  end.* The call-receipt pin collected `getattr(exc, …)` reads only, so the one-line
+  `exc.config_recoverable` that would close the gap left it green; the ready-result pin flipped
+  only for a filter landing inside `projection.py:result`, so it now also pins that the HTTP
+  route writes that dict wholesale. A registry entry's "eleven web counters" is eight. Seven new
+  tests drive synthetic sources through the refusal and folding rules themselves, because
+  today's readable code returns the same key set whether those rules exist or not.
+- **Round-4 hardening: the write census refused what is written *through* a name and missed both
+  ways the dict leaves it** (suite: 120 → 124). `result.mutate()` was refused and `mutate(result)`
+  was not, so a tracked dict handed to a plain call — `_fold_web_counters(metrics_data, ctx)`, the
+  idiom the censused package itself uses in `_accumulate_usage_mapping(state.total_usage, billed)`
+  — was mutated invisibly, and `alias = result; alias["k"] = v` wrote through a second handle the
+  consumer never asks about; an argument position outside a whitelist of provably read-only
+  builtins (plus the emit binding the census exists to read) and an alias are refusals now. The
+  three literal-*argument* extractors — the `kind="model_turn"` transcript records, the
+  `write_failure` bundle, the manifest's `limits=` — were the fourth resolution path onto that
+  rule and still read the weak half of it, dropping a `**` splat silently while their equality
+  pins stayed green; all three resolve through the strict extractor, and the weak one is gone.
+- **Every registry entry now has an assertion behind it.** Five round-1 entries were prose: the
+  driver and the call receipt that were designed for `config_recoverable` and never name it, the
+  closed `stream_closed` schema, the `turn.failed` event that no status projection consumes, and
+  the `turn.interrupted` cause-vs-park vocabulary collision. Ten further gaps found by the round-2
+  black-box pass are registered and pinned — among them the `result()` ready branch serving the
+  raw error its two siblings filter, three checkpoint-carriage cells (`output_failure_history`,
+  the context-owned subagent/skill counters, and a cancellation flag written unconditionally and
+  applied conditionally), the backend tenant meter dropping the same four priced sub-counts the
+  gateway meter does, a failed run metering nothing at all, two run-status projections each blind
+  to the park the other sees, three lifecycle mappers answering one terminal-limited run three
+  ways, and a recovery-path `Suspension` built outside the durable status vocabulary. Two new
+  `FUTURE_FAMILIES` entries (run-state → checkpoint carriage; the settled-text digest family with
+  six hand carriers), and the numeric claims in that registry are pinned so a stale prediction
+  rots loudly.
+- An end-to-end streamed twin of the by-reference 422 (`tests/test_llm_gateway_backend.py`): the
+  refusal is raised after the HTTP layer has committed to a 200 SSE body, so it travels as a
+  terminal `type: "error"` frame rather than a non-200 response — a materially different route
+  whose composition the sync test could not prove.
+- Registered as a `contract` module in `tests/support/test_tiers.py` (the tier policy
+  CONTRIBUTING.md requires updating for any new boundary); it is import-and-call only, so it runs
+  in the parallel shard. No public surface, wire format, or shipped contract changes.
+
+### Added — `config_recoverable` crosses the hop it was minted to describe
+
+- **The gateway error envelope carries `config_recoverable`** on both writers (the non-200 body
+  and the terminal SSE `error` frame, which share one `_error_body` definition) and all three
+  client readers bind it (`_parse_gateway_response`, `_chunk_from_event`,
+  `_error_from_status_body`). It was the one transportable fact on `ModelAdapterError` with no
+  wire key at all: a refusal whose remedy is the caller's configuration arrived one hop out as an
+  ordinary terminal failure, and the only thing a client could read it off was the 422 the
+  server's status mapper picks — a hint rather than a statement, and nothing at all for the
+  refusals that carry no HTTP status of their own. Written unconditionally beside `retryable` and
+  `provider_retried`, so absence means "an older gateway" and reads as `false`; read through the
+  same exact-boolean reader as its siblings, so a coerced `"false"` is refused rather than
+  believed. Additive in both directions and no protocol identifier changes
+  (docs/COMPATIBILITY.md).
+- **`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch declares it**, which the failure-record
+  writer had emitted since the field existed; the record was valid only because that branch sets
+  `additionalProperties: True`. No stored transcript changes.
+- **`OpenAIModelAdapter` classifies both facts on every branch.** `_model_error_from_openai`
+  produces four `ModelAdapterError`s and stated neither flag: the adapter that reads the
+  provider's own classification never said the refusal was config-shaped, and the adapter whose
+  SDK owns a retry loop never reported having run it. Recoverability now comes from one predicate
+  (`_config_shaped_refusal`: a non-retryable 4xx, the same rule `AgentLoop._recoverable_turn_error`
+  already applies) evaluated at all four sites rather than a condition per branch. The retry count
+  is read off the final request's `x-stainless-retry-count` header, which the OpenAI SDK stamps on
+  every attempt and every `APIError` retains — the SDK hands `retries_taken` only to the success
+  path — and any shape that cannot answer reads as "no retry" rather than claiming one.
+- Six `KNOWN_GAPS` entries closed in `tests/test_carriage_conformance.py`; the census constants
+  moved with them (`TRANSPORTABLE_ERROR_UNCARRIED` is now empty, kept as the guard the next such
+  fact meets). Two registered-gap pins that had leaned on that set — the call receipt's read set
+  and the closed `stream_closed` schema — now name the field directly, because a pin over an
+  empty set proves nothing and both entries are still open.
+
+### Fixed — every priced count reaches every ledger
+
+- **Both tenant meters sum the four priced sub-counts.** The gateway's `LlmGatewayUsage` and the
+  reference backend's `TenantUsage` each normalized seven counts and summed three, so a
+  cache-heavy or reasoning-heavy run under-reported on both — and a call priced *only* in
+  sub-counts (an entirely cache-read turn) metered as `total=0`, invisible to the ledger.
+  `total_tokens` is still what the provider reported and is never re-derived; what changed is
+  that the sub-counts are their own columns, so such a call is visible in the ones it was
+  actually expressed in. Fixed on both meters in one change: two meters with one omission is
+  precisely the shape where fixing one leaves the other.
+- **`metrics.updated` publishes all four.** It declared `reasoning_tokens` alone (R10's studio
+  meter) and not its three siblings, so a cache-heavy run's priced detail never reached a live
+  consumer. Each is written only when the adapter reported one, so an absent sub-count means
+  "not reported" rather than zero. **Dashboard step-change:** a consumer summing token columns
+  across events will see cache/audio columns appear for the first time on runs that were already
+  producing them.
+- **A subagent's sub-counts reach its parent.** The roll-up read a hard-coded three-key tuple,
+  so a child's cache and reasoning tokens stopped at the child — an undercount in exactly the
+  aggregate a bound is checked against. It now filters the child's metrics through
+  `providers/_common.py:NORMALIZED_USAGE_KEYS`, the emitted domain of `normalize_usage`, rather
+  than a wider hand copy (and a filter rather than a splat: `result.metrics` carries
+  `tool_calls` / `duration_s` beside the counts). The token budget itself is unchanged — it
+  reads the three headline counts — so this is a reporting step-change, not a behavior change
+  for runs near a bound. The roll-up's own comment claimed it did not touch `total_usage` while
+  the code beneath it did; the comment now matches.
+- **A run that dies of an exception is metered.** `record_run_failure` fed the tenant ledger
+  nothing at all — not even the run count — while `record_run_result` beside it did, so a run
+  that died of a driver exception after N billed turns reported zero for every one of them. It
+  meters what the run had already spent, from the last committed checkpoint (its
+  `total_usage`), falling back to the on-disk status projection, and counts the run either way.
+  Both terminal paths report *cumulative* totals from different sources, so both go through one
+  seam that owns a per-run high-water mark: a run metered on failure, recovered, and then
+  completed is billed once for each token, and counted once as a run.
+- Four more `KNOWN_GAPS` entries closed (plus the two round-2 twin registrations beside them).
+
+### Added — the park records the classification the wire already carried
+
+- **`Suspension` gains `provider_error_code` and `provider_retried`, and both ride the
+  checkpoint.** The park a recovery driver reads carried `retryable` / `http_status` /
+  `config_recoverable` and not the two facts the decision usually turns on: `insufficient_quota`
+  (a human fixes the billing) and `rate_limit_exceeded` (back off and re-issue) are the *same*
+  retryable/status pair and opposite answers, and an exhausted adapter retry budget read as an
+  untried call. Both lived only inside the live exception, so a checkpoint restore handed the
+  driver a park with no reason on it. `suspension_checkpoint_payload` writes them and its reader
+  defaults them when absent, so a pre-v0.21 checkpoint restores unchanged. `TurnNotSettled`
+  re-stamps both onto itself as well — that facade hands a driver an exception and nothing else.
+- **`turn.failed` states the retry and the cost.** The event declared the classification and not
+  `provider_retried` or the usage of a call that failed *after* the provider billed for it, while
+  the transcript record written on the very same failure recorded both. Named `provider_usage`
+  after the kernel fact, not after the gateway wire's compat-frozen `usage` alias — the same rule
+  that makes this event spell `provider_error_code` where the wire says `error_code`.
+- **`run.failed` and `failure.json` keep the classification the promotion used to lose.**
+  `fail_recoverable` (and `close()` on an unrecovered park) turns a classified `turn.failed` into
+  the terminal record, and the terminal record could not say a failure was config-fixable — the
+  one thing an operator reading it needs in order to know whether resending is worth anything.
+  The live `RunState` twins are deliberately not new `RunCheckpoint` fields: the durable park
+  observation already carries them, and `restore()` reads them back from it, so the restore path
+  has one authority instead of two that can disagree. The reference backend's second writer of
+  `monoid.failure.v1` carries the same two, read off the failing exception by name and never
+  coerced; its recovery-path callers hold no provider verdict and leave the honest `false`.
+- **The success transcript record states `provider_retried`.** `ModelTurn` carries it and the
+  call receipt records it, so the private replay artifact of a retried-then-successful call read
+  as a clean single attempt — the case where the retry evidence matters most. Its failure twin
+  records it too, so the two halves of one artifact cannot drift apart again.
+- **A billed refusal now publishes the cost it added to the totals.** The `ModelAdapterError` arm
+  accumulated the usage of a call that failed after billing and emitted no `metrics.updated`,
+  while the success path beside it emitted one per turn — so a run whose only model call failed
+  billed never reported its cost at all. Both paths now call one `_emit_metrics_updated` writer
+  (a second inline emit would be a twin to keep in step); the failure-path emission fires only
+  when something was actually billed.
+- Six more `KNOWN_GAPS` entries closed. The affected census pins state the harmonized behaviour;
+  what `run.failed` still does *not* take from `turn.failed` (`provider_usage`,
+  `provider_retried` — per-call facts, not classifications of the run) is pinned as a set, so a
+  new divergence between the two is a failure rather than a silence.
+
+### Fixed — the status rides every validator and the bundle; records substitute; one predicate
+
+- **`failure.json` carries `http_status`, on both of its writers.** The core's bundle
+  (`loop.py`) emitted the `run.failed` event and the operator's restore aid from the same run
+  state and gave the status to only one of them, so diagnosing a failure from the bundle alone
+  could not tell a 429 from a 400 from a transport error. The reference backend
+  (`recovery.py:write_failure_bundle`) is the second writer of the same `monoid.failure.v1`
+  artifact — the one a worker crash leaves behind, where the bundle is the only record there is —
+  and it carries the field too, read off the failing exception by name and never coerced. Written
+  as `null` when the failure reached no provider, so "no status" and "an older writer" stay
+  distinguishable. A new census pin diffs the two writers' key sets against each other, because
+  one artifact with two hand-written writers is how the field could have landed on one half.
+- **The four gateway validators that could not name a status now can.**
+  `_exact_gateway_int`, `_gateway_fragment_string`, `_gateway_usage` and
+  `_portable_gateway_payload` gained the `http_status` parameter their `_exact_gateway_bool` /
+  `_gateway_string` siblings already forwarded into the `ModelAdapterError` they raise, so one
+  malformed payload no longer classifies two ways depending on which of its fields was malformed.
+  All six are driven directly in a test that reads the status back off the raise — a parameter
+  can be accepted and dropped.
+- **The run manifest's tool projection substitutes a non-portable schema locally.**
+  `core/manifest.py:_tool_spec_payload` embedded `input_schema` raw and was portable only
+  because `RunManifest.to_json` normalizes the whole assembled manifest one frame up — a property
+  of its caller, not of itself, and its transcript twin had already needed the substitution
+  locally. Manifest output is byte-identical (`to_json` normalizes an already-normalized payload
+  to itself); what changes is that a second caller no longer inherits an anonymous
+  `allow_nan=False` durability failure.
+- **One predicate for one stamp.** `model_call.py:_recordable_usage` asked
+  `isinstance(value, int)` where its three siblings (`provider_usage_of`,
+  `_reported_error_usage`, `ModelCallReceipt.with_error`) ask `type(value) is int`, so an
+  `IntEnum` token count — the shape a provider SDK plausibly returns — was a recordable usage on
+  one path and no usage at all on the three that consume it, and the receipt this function feeds
+  would then reject what it had just accepted.
+- Seven more `KNOWN_GAPS` entries closed; the affected census pins now state the harmonized
+  behaviour (all six validators forward, all four readers agree, three record projections
+  substitute) rather than the old divergence.
+
+### Fixed — internal-review pass over the W5 surface (proof chain, ingress symmetry, classification)
+
+- **The Studio profile preview is a record, and now substitutes like one.** Preserving a tool
+  schema's non-finite values through ingress (above) means the value reaches every surface that
+  embeds the schema, and the preview endpoint serializes with `allow_nan=False` — so looking at
+  the tool surface of a profile carrying such a schema failed the request with an anonymous
+  serialization error, one boundary before the classified refusal a real call gets and for a
+  portability reason rather than a config one. `_gateway_tool_schema` normalizes the embedded
+  schema, the same rule the transcript's `_tool_spec_payload` and the run manifest already apply.
+- **A stream that ends without a terminal frame is no longer accepted unproven.** The
+  applied-parameter checks lived only on the `turn_complete` frame — which is exactly the frame
+  an older gateway never sends; its stream ends cleanly, `assemble_streamed_turn` synthesizes
+  `stop_reason="stop"`, and the turn was accepted with every parameter unproven while the sync
+  transport refused the same server. The drain now runs the same shared checks with an absent
+  echo; traffic that configures neither knob keeps the old tolerance for frameless streams.
+- **The capability question is answered per call, not per adapter.** `GatewayModelAdapter`'s
+  `generation_support` / `structured_output_support` declarations are now callables taking the
+  effective per-call config (the probes pass it through; a raising callable still reads
+  `"none"`), and the reference gateway probes them under the same config the upstream call runs
+  under (`_upstream_model_config`, built once for the adapter, the request, and the proof). A
+  shared factory-built adapter could previously mint proof from its standing config for a call
+  it enforced under a wire-supplied `"omit"` — the copied-back-proof defect one config-source
+  hop later.
+- **Direct-Python reasoning configs fail closed.** `validate_reasoning_config` now exists as
+  the one rule source (the codec, `normalize_model_config`, and the runtime-config ingress all
+  consume it; the ingress's hand-copied enum frozensets are deleted). A Python-constructed
+  `ReasoningConfig(effort="turbo")` previously sailed through normalization to die mid-run as a
+  provider 400 while the JSON codec rejected the same value at config time.
+- **`effort="default"` survives the gateway wire.** It is the one reasoning field whose
+  omission sentinel differs from the codec's reconstruction default (`"medium"`), so a client
+  asking for provider-default reasoning silently got medium — only through a gateway. The
+  client payload now carries it explicitly, like the off-default policy beside it; all other
+  values keep their exact wire bytes.
+- **A tool-call answer on the standalone surface is an outcome, not empty text.**
+  `ValidatedCallStatus` gains `"tool_calls"`, short-circuiting before validation like refusal
+  and truncation; previously the validators judged `final_text or ""`, burned a paid repair
+  rewriting an answer the model never gave, and with zero validators the turn read `"ok"` with
+  `final_text=None`.
+- **Receipts survive exceptions.** `OutputValidatorError` (and any exception escaping
+  `ValidatedCallRunner.acall`) now carries the completed calls' receipts as a `receipts`
+  attribute; they were dropped with the raise, contradicting the audit-trail claim.
+- **An unserializable request is a classified error on every path.** The gateway body encode
+  (both transports) now raises non-retryable `gateway_bad_request` instead of leaking a raw
+  `TypeError`, and the OpenAI payload build moved inside its classifier on both paths — one
+  rule covering `output_schema`, `messages`, and observations.
+- **A proof refusal ends the turn, not the run.** `ModelAdapterError` gains
+  `config_recoverable`; `gateway_generation_not_applied` / `gateway_schema_not_applied` set it,
+  `AgentLoop`'s classifier honors it (the error's own remedy is config the user fixes and
+  resends), and the reference gateway's HTTP layer maps such errors to 422 rather than
+  laundering them into a run-killing 502 across a chained hop.
+- **Repair requests carry their conversation exactly one way.** `_repair_request` clears the
+  carriage fields of the shapes it did not choose, so a repair's `request_digest` describes a
+  request an adapter actually sends and a stale `instruction` can never be re-read beside the
+  appended messages.
+- The capability probes (`structured_output_support` / `generation_support`) and
+  `AttemptDeltaConsumer` are exported from `contracts` — all three are documented contract
+  surface a third-party gateway or streaming caller implements against, and previously
+  required importing provider modules. OpenAI 4xx classification now names the provider's
+  `param` (a provider-authored field path, not user content) so a schema-subset rejection is
+  distinguishable from any other bad request.
+- **`submit()` / `asubmit()` / `run_once()` surface a non-settling park honestly instead of
+  crashing.** A turn that parked without settling — a *recoverable* turn failure (any
+  provider 4xx, an exhausted retryable error, W5's proof refusals), an interrupt, or a pause —
+  produces a `Suspension` with `turn=None`; the blocking facades asserted `turn is not None`
+  and crashed with a message-less `AssertionError` (silently returning `None` under
+  `python -O`), including on the fork-subagent path through `arun_once`. `submit`/`asubmit`
+  now raise `TurnNotSettled` (`monoid_agent_kernel.errors`), carrying the suspension and its
+  classification, with the session alive exactly as the `run_until_suspended` / `astream`
+  halves always kept it; `LoopSession.submit` maps the park onto the FSM exactly like its
+  pump half before re-raising. `run_once` is one-shot — its own `finally` closes the run —
+  so it **returns** the promoted failed `AgentRunResult` instead of raising past the close
+  that recorded it (which also restores the fork-subagent `subagent.failed` event and usage
+  roll-up, and a clean CLI exit). The stale "every non-awaiting reason attaches a turn"
+  claim is corrected in the docstrings and `Suspension` docs.
+- **`close()` promotes an unrecovered `turn_failed` park to the terminal failure record.**
+  Closing a run whose last park was a recoverable turn failure previously finalized from the
+  per-turn reset state: `run.finished` claimed `status=completed` with no `failure.json`,
+  and the completed-run cleanup then deleted the very checkpoints the park preserves for an
+  operator-driven restore. `close()` now performs the same promotion `fail_recoverable`
+  offers drivers explicitly (`failure.json` + `run.failed` + checkpoints kept); a park
+  recovered by a later settle still closes `completed`. The `turn.failed` event schema
+  gains `config_recoverable`, so `mak validate` accepts runs containing recoverable turn
+  failures (the third twin of that key, after the Suspension and the checkpoint payload).
+- `Suspension` and the `turn.failed` event carry `config_recoverable`, so a driver can
+  distinguish "park for a config fix" from other non-retryable turn failures without
+  hard-coding provider codes; the durable park payload round-trips it (absent on
+  pre-v0.21 checkpoints reads `False`).
+- The unserializable-request errors on both adapters are `config_recoverable` too — the
+  same mistake reported by a gateway server is an HTTP 400, which was already
+  turn-recoverable; and the OpenAI twin now names the defect (`unserializable_request`)
+  instead of falling through as `unclassified_provider_error`.
+- `run_output_validators` hands each validator its own copy of `parsed`, keeping
+  `FinalOutputView` read-only in fact: one validator's in-place mutation was previously
+  judged — and surfaced as a value — by the next. An exception already stamped with an inner
+  validated call's `receipts` keeps the innermost stamp instead of being overwritten.
+- **A boolean can no longer prove a sampling parameter.** The `generation_applied` echo was
+  compared with `==`, and Python holds `True == 1` and `False == 0.0` — so a gateway
+  answering JSON booleans proved exactly the most ordinary settings this block carries
+  (`max_output_tokens=1`, `top_p=1`, `temperature=0`) under the default fail-closed policy.
+  The comparison is now per key and non-coercive (a number is proven only by a number,
+  through the same `is_finite_json_number` rule the rest of this wire reads with), while
+  still accepting either JSON spelling of one number so a non-Python gateway echoing `1` for
+  `1.0` is not falsely refused.
+- **The OpenAI adapter refuses the by-reference shape instead of sending an unusable one.**
+  `OpenAIModelAdapter` sets `store=False` on every request (zero data retention, paired with
+  `include=["reasoning.encrypted_content"]`) and still emitted `previous_response_id` when a
+  request carried `previous_turn_handle` — a handle naming a response the adapter guaranteed was
+  never persisted. One of `ModelRequest`'s three documented shapes was therefore dead on this
+  adapter, and said so only as an opaque provider 404 at call time, on the original call and not
+  merely on a validation repair. It is now refused at the adapter boundary with a non-retryable,
+  `config_recoverable` `unsupported_request_shape` naming `messages` as the supported route, on
+  `next_turn` and `astream_turn` alike; the unreachable branch (and its observation-item helper)
+  is deleted. The refusal is bound to the *shape*, not to the field: `messages` still overrides a
+  leftover handle, exactly as documented. The reference gateway's own by-reference continuation
+  inherits it when its upstream is this adapter — as a classified `422` the outer client survives
+  rather than an opaque 404 — while gateway by-reference support for upstreams that really do
+  persist responses is untouched. The `422` is the status on both transports but only the
+  non-streamed route *is* a `422` response: `handle_turn_stream` builds the adapter eagerly and
+  raises inside the frame generator, after the SSE `200` is committed, so there the refusal
+  travels as the terminal `error` frame carrying `http_status: 422` — which the client's stream
+  reader reconstructs into the same `ModelAdapterError`.
+- **A tool's `input_schema` is not rewritten by ingress either.** The `output_schema` rule
+  below was bound on one of the two schemas this request carries. `normalize_tool_spec`
+  substituted non-finite floats with `null`, so `{"enum": [NaN]}` became `{"enum": [null]}` —
+  the constraint the registry's `Draft202012Validator` then judged every call against and the
+  definition the provider was then sent, neither being what the tool author wrote. The value
+  now survives ingress (strings and containers are still normalized) and is refused at the
+  serialization boundary as a non-retryable, `config_recoverable` bad request, on both
+  adapters and both transports. The reference gateway's server-side ingress carried the same
+  defect for the `tools` it forwards (under either wire spelling, `input_schema` or
+  `parameters`) and is bound the same way, on `handle_turn` and `handle_turn_stream` alike.
+  A *record* of a schema keeps the substitution — the manifest, the transcript's tool-surface
+  snapshot and the event log cannot carry a non-finite value at all — so such a schema fails
+  the call it rides on, classified, instead of killing the run at a durability writer.
+- **`output_schema` is not rewritten by ingress.** `normalize_model_request` substituted
+  non-finite floats with `null` — right for model content, wrong for a control document
+  promised verbatim: `{"enum": [NaN]}` became `{"enum": [null]}`, a different constraint the
+  provider then enforced, and the strict serializer that exists to refuse the value never saw
+  it. Strings and containers are still normalized; the value now reaches the boundary and is
+  refused there.
+- **The OpenAI adapter preflights the whole request body.** `_payload` embeds `output_schema`
+  without serializing it, so its classifier saw nothing: a set or a cycle inside the schema
+  failed later inside the SDK as an anonymous `unclassified_provider_error` with no
+  `config_recoverable` (terminalizing the run for what the gateway twin reports recoverably),
+  and a `NaN` was serialized to the JSON-invalid literal `NaN` and sent. The assembled payload
+  is now strict-encoded (`allow_nan=False`) inside the classification boundary on both the
+  blocking and the streaming path.
+- **A request too deep to encode is classified, not raw.** `json.dumps` recurses, so a
+  container nested past the interpreter limit raises `RecursionError` — a `RuntimeError`
+  subclass, outside the `TypeError`/`ValueError` family both encoders caught — and nothing
+  upstream refuses it first (`normalize_json_ingress` is iterative by design, and the
+  512-level nesting cap guards the JSON *text* parsers, not a Python-constructed value). It
+  escaped raw from the gateway encoder and reached the OpenAI adapter's outer handler as an
+  anonymous `unclassified_provider_error`, terminalizing the run either way. Both encoders now
+  answer it like any other unsendable request.
+- **The unrecovered-park promotion survives a restart.** `close()` promotes an unrecovered
+  `turn_failed` park from a session field, and `restore()` rebuilt the session without it — so
+  a crash-and-recover of exactly the run the park exists for (a non-retryable configuration
+  failure, recovered, left idle, then closed) finalized `completed`, wrote no `failure.json`,
+  and let the completed-run cleanup delete the checkpoints the park preserves for an operator
+  restore. `restore()` now rehydrates it from the checkpoint's `last_suspension` (only
+  `reason="turn_failed"`; a later settle clears it at pump entry, exactly as in-process).
+- **A conforming deeply-nested answer is still validated.** The per-validator copy of
+  `FinalOutputView.parsed` used `deepcopy`, which recurses: the strict ingress accepts JSON
+  nested to 512 levels — deep enough to exhaust the interpreter's default 1000-frame stack —
+  so an answer the *parser accepted* raised `RecursionError` in the copy, outside any
+  classification, before a single validator ran, and `ValidatedCallRunner.acall` leaked it raw.
+  The copy now goes through the kernel's iterative JSON copier with both substitutions off, so
+  it is isolation and nothing else.
+- **An attempt that streams nothing still announces itself.** `AttemptDeltaConsumer` carried
+  the attempt boundary on chunks alone, so an attempt that produced none delivered nothing at
+  all — a consumer holding a rejected attempt's text was never told to drop it and rendered it
+  beside an `ok` result. Every attempt now opens with an `AttemptStarted(attempt)` event
+  (exported from `contracts`), delivered before that attempt's chunks and whether or not any
+  arrive; the consumer's event type is `AttemptStarted | ModelStreamChunk`.
+- **A refused turn still reports the tokens it burned.** The applied-parameters refusals fire
+  *after* the gateway returned a complete, billed answer with its usage — the client simply
+  refuses to trust that its parameters shaped it. The failed `ModelCallReceipt` reported zero
+  tokens and the loop's accumulation runs only on the returned-turn path, so a paid call
+  vanished from the metrics and from the cumulative token budget, which makes that budget a
+  bound that does not hold. The refusal now carries the reported usage (`mark_provider_usage`,
+  the twin of `mark_provider_retried`) on both transports; `ModelCallReceipt.with_error` reads
+  it back, and `AgentLoop` accumulates it on the failure path. A failure that reports no usage
+  still adds nothing. **The cost survives a gateway hop too**: when a reference gateway's own
+  upstream refuses a billed turn, the error envelope carries `usage` (JSON body and SSE error
+  frame alike, omitted when empty so an error raised before reaching a provider keeps its exact
+  wire shape), all three client error readers stamp it back onto the reconstructed exception,
+  and the gateway meters the call against the tenant before re-raising instead of losing it to
+  the raise.
+- **`run_once` no longer *returns* an interrupted run as a success.** It absorbs a
+  non-settling park because `close()` turns it into the record that *is* the call's result —
+  but `close()` promotes only `turn_failed`. An `interrupted`/`paused` park has no failure to
+  promote, so absorbing it returned a `completed` result for a run with no settled answer.
+  Only the park `close()` can promote is absorbed; the others surface as `TurnNotSettled`
+  after the same close. Note the scope honestly: the typed raise is the *only* signal — the
+  one-shot's closing `finally` still finalizes the run record `completed` (a user stop is not
+  a failure) and the completed-run cleanup still deletes its checkpoints. A caller that wants
+  to resume an interrupted turn uses the multi-turn facades (`open`/`submit`/`close`), where
+  the session stays alive.
+
+### Fixed — pre-merge twin census over the whole PR surface
+
+- A three-dimension twin census (transport/topology, facade/lifecycle carriers,
+  adapter/shape/codec) swept every fact this PR introduced for the branch's dominant defect
+  shape — a rule bound on N−1 of its N parallel sites — and found three unbound cells, all in
+  the newest commits no external round had reviewed:
+  the tenant ledger metered a billed failure on `/turns` but not on `/turns/stream` (both
+  stream sub-branches; the sync twin was test-pinned, the stream twin untested);
+  a malformed applied-echo on a *billed* terminal frame raised `gateway_bad_response` without
+  the frame's own `usage`, while the sync transport stamped it;
+  and the reference server's blanket ingress normalize rewrote non-finite `output_schema`
+  values (`NaN` → `null`) that the client-side rule keeps verbatim precisely so they are
+  refused rather than silently turned into a different constraint (live only for in-process
+  Python callers — HTTP bodies reject the constants at the JSON parser). All three fixed at
+  shared seams (`_stream_turn`'s one failure meter; the frame parser stamps before
+  re-raising; `_normalized_turn_payload` shared by both handlers).
+
+### Added — `GenerationConfig`: per-call sampling controls (kernel types)
+
+- `ModelConfig` gains `generation: GenerationConfig` — `temperature` (0–2), `top_p` ((0, 1]),
+  `max_output_tokens` (≥ 1), and `on_unsupported` (`"fail"` default / `"omit"`). Every value
+  field defaults to `None`, meaning "delegate to the provider". The JSON codec and direct-Python
+  normalization share one fail-closed rule source (`validate_generation_config`), so a range
+  accepted from JSON can never diverge from the range accepted from a constructor. **This
+  release adds the type and its ingress only; provider and gateway threading land next**, so a
+  configured value has no request-body effect yet.
+- **`ModelConfig.to_json` omits the `generation` key entirely when the block was never
+  configured.** That single rule is the compatibility mechanism for three consumers at once: a
+  generation-free config keeps its pre-existing `request_digest` (replay key), its
+  `AgentRuntimeConfig.config_hash` (durable recovery compares this hash across versions), and
+  its wire shape. Setting any generation value changes all three, deliberately — pinned by
+  literal-hash tests captured on v0.20.1.
+- `GenerationConfig` is exported from `monoid_agent_kernel.contracts` (and the package root)
+  alongside its siblings `ModelConfig` / `ModelRetryConfig` / `ReasoningConfig`, so configuring
+  generation does not require reaching into `core.spec`.
+
+### Documentation — the output-validation and model-call contracts are now written down
+
+- `docs/CONTRACTS.md` gains an Output Validation section documenting all six exported types
+  (`OutputValidator`, `ValidationOutcome`, `FinalOutputView`, `OutputRetry`,
+  `OutputValidatorBinding`, `OutputValidatorError`), the exception-classification contract, the
+  loop's settle orchestration, and the standalone `ValidatedCallRunner` contract — these types
+  had shipped in `contracts.py` since their introduction with no per-symbol contract entry.
+- The Model Adapter section documents generation-parameter and output-schema delivery, the
+  applied-echo enforcement, the fail-closed `structured_output_support` probe, the two digest
+  stability rules (additive fields omitted when unset; canonicalization changes are
+  domain-version changes), and the `RunLimits.max_output_tokens` vs
+  `GenerationConfig.max_output_tokens` distinction. The stale `ModelRequest` field list gains
+  the `messages` and `output_schema` fields.
+- The LLM Gateway wire contract shows the `generation` / `output_schema` request keys and the
+  applied-echo response keys; `docs/COMPATIBILITY.md` records the additive-key policy for
+  `monoid.llm-turn.v1`, the fail-closed version-skew behavior, and the mixed-fleet caveat for
+  configured generation blocks in `config_hash`.
+
+### Added — output-schema delivery on the standalone path (ResponseContract)
+
+- `ModelRequest.output_schema` carries a standard, provider-neutral JSON Schema for the final
+  answer. The OpenAI adapter translates it to the Responses API `text.format` json_schema
+  block **verbatim — never adjusted to the provider's strict subset** — so the request digest
+  identifies exactly what the provider was asked to enforce (a schema the provider rejects is
+  its own error through the taxonomy). The envelope is strict mode (`strict: true` — anything
+  less is not *enforced* decoding and would make `schema_applied: true` a false proof), and
+  OpenAI's strict subset has requirements of its own (`additionalProperties: false` on every
+  object, every property required); a schema outside it 400s with the offending `param` named
+  in the classified error. The digest follows the omission rule: schema-free
+  requests keep their pre-existing replay key. `AgentLoop` does not set the field; this is the
+  standalone/LLM-only path only.
+- Adapters opt in with a `structured_output_support = "native"` declaration, read through a
+  fail-closed probe (absence and unknown values mean `"none"`). The `monoid.llm-turn.v1` wire
+  gains `output_schema` (request) and a `schema_applied` boolean echo (response body and
+  terminal stream frame): the reference gateway threads the schema to its upstream adapter and
+  echoes `True` only when that adapter declared native enforcement, so a forwarded-but-ignored
+  schema reads `False`. The client refuses an unproven schema under the same
+  `on_unsupported="fail"` knob that governs the sampling-parameter echo — one policy for "the
+  transport cannot prove application", deliberately not two half-settable ones.
+- `FinalOutputView.parsed` gives validators a best-effort structured view of the answer when a
+  schema was requested, with `parsed_ok` saying whether there was a parse at all — `parsed is
+  None` cannot, because a schema permitting a root `null` yields a valid parsed `None`, and a
+  validator rejecting on `parsed is None` would fail a conforming answer and spend its repair
+  budget on it. The parse goes through the kernel's strict JSON ingress
+  rather than bare `json.loads`, which accepts Python's non-standard `NaN` / `Infinity`
+  constants: a validator reading `parsed` — a schema validator will call `NaN` a number — would
+  otherwise accept an answer that is not JSON at all. `ValidatedCallRunner` populates
+  it; repair calls keep the schema riding while still stripping tools. Post-hoc validation
+  remains the guarantee on every adapter — native delivery only reduces repairs, and adapters
+  without support keep working unchanged.
+
+### Added — `ValidatedCallRunner`: one validated model call, outside any loop
+
+- A caller invoking `ModelCallRunner` directly — an LLM-only skill, a gateway, a batch driver —
+  gets the same validate-and-re-prompt guarantee `AgentLoop` applies at its settle points:
+  dispatch, run the registered `OutputValidator`s, and repair with at most `max_repair_calls`
+  (default 1) explicit follow-up calls. Exhaustion is a result (`status="unsatisfied"`), not an
+  exception; refusal, truncation, and a tool-call answer (`status="tool_calls"` — this surface
+  has no executor, so a turn that stopped to request tools is handed back with its calls
+  rather than having its empty text judged) short-circuit **before** validation, in the same
+  order the loop decides them; a validator defect raises `OutputValidatorError` and never
+  re-prompts. `ValidatedCallResult` carries the receipts of every call made on every settled
+  result, and an exception escaping `acall` carries the completed calls' receipts as its
+  `receipts` attribute — the failing call's own receipt reaches only
+  `ModelCallRunner.subscriptions`, because the adapter raised instead of returning it.
+  A thin sync facade (`call`) covers callers with no event loop and
+  refuses to run inside an active one. The runner is **frozen**, and `max_repair_calls` must be
+  an exact non-negative `int`, like every other budget control in the kernel — the loop bound is
+  `repair_calls >= budget`, which `nan` makes permanently false and `inf` never reaches, so
+  neither a budget arriving from dynamically typed configuration nor one reassigned onto a
+  reusable runner afterwards can authorize unbounded paid model calls.
+- **A repair call never carries tools.** The standalone surface has no tool executor, and a
+  validation failure must not escalate into a tool loop — inside `AgentLoop` a repair turn is
+  deliberately a full agent turn; here it is deliberately not. Repair follows the shape of how
+  the **incoming request** carried its conversation, never what the answer came back with:
+  by-value messages append the answer and the repair prompt, a request that itself arrived on a
+  continuation handle carries the repair as the next instruction on the new handle, and a
+  one-shot instruction is synthesized into the by-value form. A one-shot call is never promoted
+  onto the handle path because the provider returned a response id — `OpenAIModelAdapter` sends
+  `store=False`, so that id was never persisted and the repair would 404, losing the whole call
+  to an exception. A request that arrived **on** a continuation handle whose turn came
+  back **without** a new handle has no repairable shape — the conversation is on the provider's
+  side of that handle — so it settles `unsatisfied` without spending a repair call rather than
+  repairing against a synthesized prompt that drops every prior message.
+- **Streaming is per attempt.** `acall` takes an `AttemptDeltaConsumer`
+  (`(attempt_index, chunk) -> None`) instead of a plain `DeltaConsumer`: a rejected attempt's
+  text is discarded output, and a consumer that renders or accumulates chunks must be told when
+  the previous attempt is retracted. Carrying the index in the signature makes the boundary
+  impossible to miss rather than a convention to remember.
+- The validation routine, exception classification, repair text, and failure rollup moved from
+  the loop's settle module into `core.output_validator`
+  (`run_output_validators` / `build_repair_message` / `failures_by_validator`) and the loop now
+  imports them — one rule source for both execution surfaces, so the repair dialect and the
+  defect boundary cannot drift. No behavior change on the loop path.
+
+### Added — generation parameters reach the providers, and the gateway proves it applied them
+
+- The OpenAI adapter sends `temperature` / `top_p` / `max_output_tokens` on the Responses API
+  body when configured (one shared payload builder covers the one-shot and streamed paths). A
+  direct provider call has no applied-echo, so `on_unsupported` is not enforceable there:
+  `"fail"` and `"omit"` behave identically and an unsupported parameter surfaces as the
+  provider's own error through the existing taxonomy.
+- The `monoid.llm-turn.v1` wire carries a `generation` block (only when configured — the
+  protocol id is unchanged and generation-free traffic keeps its exact previous shape), and the
+  reference gateway parses it **fail-closed with the same codec the kernel uses**, threads it
+  into the upstream adapter's config on both the blocking and streaming paths, and echoes
+  `generation_applied` (response body, and the terminal `turn_complete` frame on the stream).
+- **The echo is derived from what the upstream adapter declares, never from the request.**
+  Adapters opt in with `generation_support = "native"`, read through the same fail-closed probe
+  as `structured_output_support`; the reference gateway omits the echo when its upstream does
+  not declare it. Echoing the requested block back would have matched exactly on the client
+  and let `on_unsupported="fail"` accept sampling controls that an ignoring adapter — the
+  offline echo adapter, any `provider_adapter_factory` backend — never put on a request.
+  A declaration can therefore be conditional: `GatewayModelAdapter` only *forwards*, so it
+  declares `"native"` under `on_unsupported="fail"` (where a returned turn is a proven turn)
+  and `"none"` under `"omit"` (where it deliberately accepts an unproven one). Otherwise a
+  chained gateway would mint a fresh positive echo for a call whose inner hop proved nothing.
+- **The gateway client refuses a turn whose parameters cannot be proven applied.** Under the
+  default `on_unsupported="fail"`, a response without a matching `generation_applied` echo —
+  an older gateway that silently discarded the block, exactly the deployment this exists to
+  catch — fails with non-retryable `gateway_generation_not_applied`; `"omit"` accepts
+  best-effort transport. Both the sync response and the streamed terminal frame enforce it,
+  through one shape rule and one policy rule shared by both: a malformed echo is
+  `gateway_bad_response` on either transport whatever the policy says, and the rejection
+  carries this client's own retry evidence (`provider_retried`) since no turn is returned to
+  carry it.
+- The gateway wire also carries `reasoning.on_unsupported` and `generation.on_unsupported` now
+  (off-default only). The server rebuilds a config object from each block, so a field left off
+  is not "unset" there but the *default*: a client's `"omit"` came back as `"fail"` on the
+  server's copy. That becomes a live failure as soon as a gateway's upstream is another
+  gateway — the next hop enforces the reset policy and rejects a turn the caller asked to
+  accept best-effort — and it hits `output_schema` callers too, since the same knob gates the
+  schema echo. The applied-echo comparison is untouched: it is built from
+  `build_generation_payload`, which carries provider knobs only, never policy.
+- `TurnComplete` gains an optional `generation_applied` field so the streamed echo has a place
+  to ride; absent means the wire never mentioned it.
+
+### Changed — `ReasoningConfig.from_json` is now fail-closed
+
+- `effort`, `summary`, and `on_unsupported` reject values outside their documented enums with a
+  field-named `ValueError`. Previously the codec accepted arbitrary values and the mistake
+  surfaced later (or not at all) depending on which ingress the config travelled through.
+  Payloads that only ever carried documented values are unaffected. The reference gateway's
+  request parser now reuses this codec (and the generation one), so an out-of-enum reasoning
+  value or an out-of-range sampling value answers 400 `gateway_bad_request` at the boundary
+  instead of travelling to the upstream provider. The direct-Python half of the 0.20.1
+  "retained and direct-Python controls fail closed" contract landed with the internal-review
+  pass above (`validate_reasoning_config` consumed by `normalize_model_config`); this entry
+  closed the codec half.
+
 ## [0.20.1] - 2026-08-01
 
 ### Fixed — Studio traces tell the operational story

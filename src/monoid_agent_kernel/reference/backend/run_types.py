@@ -206,6 +206,22 @@ class BackendRunRecord:
     finished_at: float | None = None
     error: str = ""
     error_code: str = ""
+    # The failure classification the last observed park carried — one vocabulary, all five,
+    # because ``config_recoverable`` alone cannot separate an ``insufficient_quota`` (fix the
+    # config) from a ``rate_limit`` (wait). Read off the Suspension by the session driver at
+    # every park (assigned, never or-ed, so a clean settle clears a stale answer) and off the
+    # ``turn.failed`` event by ``record_event`` for stream-driven runs; it does NOT change
+    # control flow — a single-shot run whose turn fails is still terminal — it only lets
+    # status()/result() say what the park already knew, which is the whole reason the
+    # classification exists. Spellings follow the Suspension/event vocabulary (``http_status``,
+    # not the checkpoint's ``provider_http_status`` alias).
+    config_recoverable: bool = False
+    retryable: bool = False
+    http_status: int | None = None
+    provider_error_code: str = ""
+    # Per-call fact (attempts the adapter already made inside one call). Carried while parked;
+    # the terminal vocabulary deliberately drops it, exactly as ``run.failed`` does.
+    provider_retried: bool = False
     result: AgentRunResult | None = None
     # Latest settled turn's validated output (AgentTurnResult.final_output), captured per park so a
     # live multi-turn run can expose it via status() before the run closes (result() carries the

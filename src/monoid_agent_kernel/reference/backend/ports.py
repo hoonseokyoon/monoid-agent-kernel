@@ -58,6 +58,8 @@ class LoopPort(Protocol):
 
     def snapshot(self) -> RunCheckpoint | None: ...
 
+    def at_quiescent_park(self) -> bool: ...
+
     def collect_checkpoint_blobs(self) -> Mapping[str, bytes]: ...
 
     def interrupt_turn(self) -> None: ...
@@ -125,6 +127,12 @@ class RunRecordPort(Protocol):
     last_event_type: str
     error: str
     error_code: str
+    # The full park classification, one vocabulary with the Suspension/event spellings.
+    config_recoverable: bool
+    retryable: bool
+    http_status: int | None
+    provider_error_code: str
+    provider_retried: bool
     result: AgentRunResult | None
     last_final_output: Any
     runtime_config: AgentRuntimeConfig | None

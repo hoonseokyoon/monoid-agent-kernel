@@ -142,6 +142,23 @@ class RunCheckpoint:
     # its own stored observation after newer inputs have advanced the run.
     applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # --- additive v0.21 (kept at the tail for positional compatibility) ---
+    # The evidence behind ``output_retries``. The budget rode this snapshot and the history did
+    # not, so a run restored mid-repair renumbered its attempts from an empty history (the
+    # attempt number is ``len(history) + 1``) and lost ``failures_by_validator`` out of
+    # metrics.json. Each entry: {attempt, failures:[{validator_id, feedback}]} — JSON-native as
+    # written, so no codec of its own.
+    output_failure_history: list[dict[str, Any]] = field(default_factory=list)
+    # The AgentToolContext-owned roll-ups. Their RunState twins (total_usage, total_tool_calls)
+    # were already checkpointed and ``loop_phases.py:build_metrics`` writes all of them into one
+    # metrics.json, so a restored run used to report pre-restart token totals beside
+    # post-restart subagent and skill counts — one artifact mixing two epochs with nothing
+    # saying which is which.
+    subagent_count: int = 0
+    subagent_usage: dict[str, int] = field(default_factory=dict)
+    skill_activation_count: int = 0
+    skills_activated: list[str] = field(default_factory=list)
+
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -169,6 +186,8 @@ _CHECKPOINT_NONNEGATIVE_INT_FIELDS = frozenset(
         "output_retries",
         "session_step",
         "submit_local_step",
+        "subagent_count",
+        "skill_activation_count",
     }
 )
 _CHECKPOINT_BOOL_FIELDS = frozenset({"terminal", "revoked_all", "cancellation_requested"})
@@ -182,6 +201,7 @@ _CHECKPOINT_LIST_OF_DICT_FIELDS = frozenset(
         "pending_capability_replays",
         "pending_tool_approval_replays",
         "outbox_requests",
+        "output_failure_history",
     }
 )
 _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
@@ -193,6 +213,7 @@ _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
         "revoked_capabilities",
         "inbox_seen_ids",
         "applied_input_ids",
+        "skills_activated",
     }
 )
 
@@ -226,6 +247,51 @@ def _validate_counter_mapping(value: object, field_name: str) -> None:
         _require_nonnegative_int(count, f"{field_name}.{key}")
 
 
+# The park payload's own field families, mirroring what
+# ``core/result.py:suspension_from_checkpoint_payload`` expects to read back. Named here so the
+# validator and the reader cannot drift into disagreeing about one payload.
+_SUSPENSION_STRING_FIELDS = ("final_text", "error", "error_code", "provider_error_code")
+_SUSPENSION_BOOL_FIELDS = ("has_external", "retryable", "config_recoverable", "provider_retried")
+
+
+def _validate_suspension_payload(value: object, field_name: str) -> None:
+    """A durable park observation, refused at the boundary instead of at the reader.
+
+    ``last_suspension`` used to be validated as "an object or null" and nothing more, so every
+    field the writer/reader pair agrees on was unpinned on the durable artifact itself: a park
+    payload with a string ``retryable`` or a ``status`` outside the vocabulary reached
+    ``suspension_from_checkpoint_payload``, where it became a ValueError from a different module
+    (or, for the bools, silently did not).
+
+    Absence stays legal for everything but ``reason``/``status``: those two are what the reader
+    requires, and a pre-v0.21 checkpoint simply omits the fields added since.
+    """
+
+    from monoid_agent_kernel.core.result import (
+        SUSPENSION_CHECKPOINT_STATUSES,
+        SUSPENSION_REASONS,
+    )
+
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"checkpoint {field_name} must be an object or null")
+    if value.get("reason") not in SUSPENSION_REASONS:
+        raise ValueError(f"checkpoint {field_name}.reason is outside the park vocabulary")
+    if value.get("status") not in SUSPENSION_CHECKPOINT_STATUSES:
+        raise ValueError(f"checkpoint {field_name}.status is outside the durable vocabulary")
+    for name in _SUSPENSION_STRING_FIELDS:
+        if name in value and not isinstance(value[name], str):
+            raise ValueError(f"checkpoint {field_name}.{name} must be a string")
+    for name in _SUSPENSION_BOOL_FIELDS:
+        if name in value and not isinstance(value[name], bool):
+            raise ValueError(f"checkpoint {field_name}.{name} must be boolean")
+    if "http_status" in value and value["http_status"] is not None:
+        _require_nonnegative_int(value["http_status"], f"{field_name}.http_status")
+    if "awaiting_task_ids" in value:
+        _require_list_of(value["awaiting_task_ids"], str, f"{field_name}.awaiting_task_ids")
+
+
 def _validate_active_input(value: object) -> None:
     if value is None:
         return
@@ -253,9 +319,13 @@ def _validate_receipts(value: object) -> None:
             raise ValueError(
                 f"checkpoint applied_input_receipts.{input_id}.terminal must be boolean"
             )
-        if "suspension" in receipt and not isinstance(receipt["suspension"], dict):
-            raise ValueError(
-                f"checkpoint applied_input_receipts.{input_id}.suspension must be an object"
+        if "suspension" in receipt:
+            # The same payload shape as ``last_suspension`` — written by the same
+            # ``suspension_checkpoint_payload`` and read back by the same reader (the DBOS run
+            # driver does exactly that), so it gets the same schema rather than a second,
+            # weaker one.
+            _validate_suspension_payload(
+                receipt["suspension"], f"applied_input_receipts.{input_id}.suspension"
             )
         for field_name in ("checkpoint_sha256", "state", "error", "error_code"):
             if field_name in receipt and not isinstance(receipt[field_name], str):
@@ -290,14 +360,16 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             _require_list_of(payload[field_name], str, field_name)
     if "pending_user_input" in payload and payload["pending_user_input"] is not None:
         _require_list_of(payload["pending_user_input"], dict, "pending_user_input")
-    for field_name in ("previous_runtime_config", "workspace_base", "last_suspension"):
+    for field_name in ("previous_runtime_config", "workspace_base"):
         if (
             field_name in payload
             and payload[field_name] is not None
             and not isinstance(payload[field_name], dict)
         ):
             raise ValueError(f"checkpoint {field_name} must be an object or null")
-    for field_name in ("tool_call_counts", "total_usage"):
+    if "last_suspension" in payload:
+        _validate_suspension_payload(payload["last_suspension"], "last_suspension")
+    for field_name in ("tool_call_counts", "total_usage", "subagent_usage"):
         if field_name in payload:
             _validate_counter_mapping(payload[field_name], field_name)
     for field_name in ("revoked_before", "remaining_duration_s"):

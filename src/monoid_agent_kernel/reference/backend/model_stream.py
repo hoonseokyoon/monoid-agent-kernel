@@ -102,6 +102,10 @@ class LiveModelStreamFrame:
     usage: Mapping[str, Any] | None = field(default=None)
     error_code: str | None = None
     retryable: bool | None = None
+    # The other half of the failure's classification: ``retryable`` alone told a live consumer
+    # a config-fixable failure was merely non-retryable, while the model-content sidecar beside
+    # this lane carried both facts.
+    config_recoverable: bool | None = None
     partial: bool | None = None
     content_omitted: bool = False
     reason: LiveModelStreamResetReason | None = None
@@ -113,6 +117,8 @@ class LiveModelStreamFrame:
             object.__setattr__(self, "usage", dict(self.usage))
         if self.retryable is not None and type(self.retryable) is not bool:
             raise ValueError("model stream retryable must be a boolean")
+        if self.config_recoverable is not None and type(self.config_recoverable) is not bool:
+            raise ValueError("model stream config_recoverable must be a boolean")
         if self.kind == "delta":
             if self.channel not in {"output", "reasoning"} or not isinstance(self.text, str):
                 raise ValueError("model stream delta requires a channel and text")
@@ -163,6 +169,7 @@ class LiveModelStreamFrame:
             "usage": None if self.usage is None else dict(self.usage),
             "error_code": self.error_code,
             "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
             "partial": self.partial,
             "reason": self.reason,
             "oldest_available_cursor": self.oldest_available_cursor,
@@ -177,13 +184,26 @@ class LiveModelStreamFrame:
         return normalized
 
     def to_sse(self) -> bytes:
-        """Serialize this frame for a passive SSE response."""
+        """Serialize this frame for a passive SSE response.
+
+        ``ensure_ascii=True``, unlike :func:`_frame_size` below and unlike ``to_json``'s other
+        readers. A line is the whole framing on the wire and the two ends disagree about what one
+        is: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE survive an
+        ``ensure_ascii=False`` dump as themselves, and the line-splitting readers clients use --
+        httpx's ``aiter_lines``, whose splitter is ``str.splitlines`` -- break on all three. This
+        channel is model content by definition: every ``delta`` carries raw provider text and a
+        ``closed`` frame carries ``final_text``, so a separator arrives here as soon as a model
+        emits one, splitting the frame mid-string and taking its ``id:`` with it -- which is the
+        cursor a reconnect resumes from. Escaping is the frame writer's job, not the model's.
+        :func:`_frame_size` keeps the smaller encoding on purpose: it bounds what the in-process
+        ring retains, not what any socket is handed.
+        """
 
         if self.kind == "heartbeat":
             return b": keep-alive\n\n"
         payload = json.dumps(
             self.to_json(),
-            ensure_ascii=False,
+            ensure_ascii=True,
             separators=(",", ":"),
             allow_nan=False,
         )
@@ -762,6 +782,7 @@ class _LiveModelStreamWriter(ModelStreamWriter):
                 usage=usage,
                 error_code=outcome.error_code,
                 retryable=outcome.retryable,
+                config_recoverable=outcome.config_recoverable,
                 partial=outcome.status != "completed",
             )
 

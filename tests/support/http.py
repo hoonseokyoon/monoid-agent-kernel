@@ -42,6 +42,66 @@ def serving(server: Any) -> Iterator[str]:
             raise AssertionError("HTTP server thread did not stop")
 
 
+# --- the reader that can see a split frame ------------------------------------------------
+#
+# The characters an SSE writer must not put on the wire raw. JSON escapes every other member of
+# ``str.splitlines``' set (the C0 controls) whatever ``ensure_ascii`` says; these three survive an
+# ``ensure_ascii=False`` dump as themselves, so they are the whole of what a frame writer has to
+# escape for itself.
+LINE_SEPARATORS = "\u2028\u2029\u0085"
+
+
+def sse_data_frames_by_line(
+    url: str,
+    *,
+    token: str | None = None,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_s: float = 15.0,
+    stop_after: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read an SSE route the way a third-party client does: split into LINES, parse ``data:`` ones.
+
+    The suite's other SSE readers split the body on ``\\n\\n`` or read it whole, and neither can
+    fail the way this one can -- which is exactly why a writer that splits its own frames passed
+    them. ``httpx``'s line splitter is ``str.splitlines``, which breaks on U+2028, U+2029 and
+    U+0085 as well as CR/LF; a browser's ``EventSource`` breaks on CR/LF only. So a frame carrying
+    one of :data:`LINE_SEPARATORS` arrives whole in a browser and truncated mid-JSON here, and only
+    a line reader states the difference.
+
+    ``iter_lines`` is the sync twin of the ``aiter_lines`` an async consumer reads with and shares
+    its decoder. Callers must ``pytest.importorskip("httpx")`` first. ``stop_after`` bounds a route
+    that stays open rather than ending its stream.
+    """
+
+    import httpx
+
+    request_headers = dict(headers or {})
+    if token is not None:
+        request_headers["Authorization"] = f"Bearer {token}"
+    method = "POST" if payload is not None else "GET"
+    frames: list[dict[str, Any]] = []
+    with httpx.Client(timeout=timeout_s) as client:
+        with client.stream(
+            method, url, json=payload, headers=request_headers
+        ) as response:
+            assert response.headers.get("content-type", "").startswith("text/event-stream")
+            for line in response.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                raw = line.removeprefix("data: ")
+                try:
+                    frames.append(json.loads(raw))
+                except json.JSONDecodeError as exc:
+                    raise AssertionError(
+                        "an SSE frame did not survive a line-splitting reader -- the writer put a "
+                        f"separator on the wire raw and the frame stops mid-JSON: {raw!r}"
+                    ) from exc
+                if stop_after is not None and len(frames) >= stop_after:
+                    break
+    return frames
+
+
 def http_json(
     url: str,
     payload: dict[str, Any] | None = None,

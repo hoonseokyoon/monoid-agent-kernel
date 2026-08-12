@@ -103,6 +103,10 @@ class OtelEventSink:
         self._spans: dict[str, Any] = {}
         self._model_span_ids: dict[str, str] = {}
         self._authoritative_finish_span_ids: set[str] = set()
+        # Chat spans whose attempt children have been synthesized, keyed like the span map.
+        # ``on_model_call`` is public and may be called twice for one call; the enrich is
+        # idempotent on attributes, and this is what keeps the children from multiplying.
+        self._attempt_synthesized_span_ids: set[str] = set()
         self._pending_span_ends: dict[int, tuple[Any, int | None]] = {}
         self._closed = False
 
@@ -269,6 +273,7 @@ class OtelEventSink:
         self._spans.clear()
         self._model_span_ids.clear()
         self._authoritative_finish_span_ids.clear()
+        self._attempt_synthesized_span_ids.clear()
         if self._run_span is not None:
             self._end_span(self._run_span)
             self._run_span = None
@@ -359,6 +364,12 @@ class OtelEventSink:
         )
         if receipt.stop_reason:
             self._authoritative_finish_span_ids.add(event_id or "")
+        # Marked before emitting rather than after: a processor that raises mid-synthesis is
+        # contained by ``on_model_call``, and a redelivery must not append a second set of
+        # children next to a partial first.
+        if event_id and event_id not in self._attempt_synthesized_span_ids:
+            self._attempt_synthesized_span_ids.add(event_id)
+            self._emit_attempt_spans(span, receipt, time.time_ns())
 
     def _emit_model_call_span(self, capture: ModelCallCapture) -> None:
         receipt = capture.receipt
@@ -387,6 +398,7 @@ class OtelEventSink:
                 capture,
                 mark_error=(capture.receipt.error_code != "model_call_aborted"),
             )
+            self._emit_attempt_spans(span, receipt, end_time)
         finally:
             # Fix the span to the receipt's settled instant. Capture serialization/exporter work is
             # observer overhead, not model latency, and must not stretch this span.
@@ -439,6 +451,74 @@ class OtelEventSink:
         for key, value in _clean(attrs).items():
             span.set_attribute(key, value)
 
+    def _emit_attempt_spans(self, parent_span: Any, receipt: Any, anchor_ns: int) -> None:
+        """Synthesize one INTERNAL child per logged dispatch, placed backward from settle.
+
+        Only when the kernel dispatched more than once: a single-attempt call's chat span IS
+        that attempt, and a child would restate it at double the span volume of every
+        subscribed call. Children carry ``monoid.model.attempt.*`` and never ``gen_ai.*`` —
+        a GenAI-aware backend aggregating usage or operation counts over those spans would
+        double-count the parent otherwise — and never capture content: the log is metadata by
+        construction, the entry's own rule.
+
+        Placement walks backward from the anchor — the capture-processing instant, the same
+        instant the standalone span pins as its end — so each entry spans its ``elapsed_ms``
+        preceded by its recorded ``backoff_ms`` gap. An entry parsed from a line that predates
+        the field (``backoff_ms is None``) packs edge to edge instead: durations and order stay
+        exact, the unknown gaps collapse. The walk is bounded below by the call's own start, so
+        a child never precedes the call that dispatched it. Wall-clock skew against the
+        monotonic durations is the standalone span's stated limitation, unchanged here. The
+        failed-dispatch error rule is the parent's, held per entry: ``model_call_aborted`` is an
+        interruption, not an error.
+        """
+
+        log = getattr(receipt, "attempt_log", ()) or ()
+        if len(log) < 2 or not parent_span.is_recording():
+            return
+        # The floor the walk may not cross: where the call itself began. On the kernel's clock
+        # the entries always fit inside it -- every dispatch and every wait is a disjoint
+        # sub-interval of the same window ``latency_ms`` measures -- but this sink renders
+        # receipts it did not build, and one that was hand-made or read back from a corrupted
+        # ledger would otherwise chain children back past the start of the call. In the
+        # standalone mode that is past the start of their own parent, since the parent begins
+        # at exactly this instant. Clamped rather than refused: the entries' taxonomy and
+        # billing still read, and ``monoid validate`` is the surface that calls such a record
+        # corrupt rather than quietly drawing it.
+        floor_ns = max(0, anchor_ns - getattr(receipt, "latency_ms", 0) * 1_000_000)
+        context = self._trace.set_span_in_context(parent_span)
+        cursor = anchor_ns
+        for entry in reversed(log):
+            end_time = cursor
+            start_time = max(floor_ns, end_time - entry.elapsed_ms * 1_000_000)
+            attrs: dict[str, Any] = {
+                "monoid.model.attempt.index": entry.index,
+                "monoid.model.attempt.elapsed_ms": entry.elapsed_ms,
+                "monoid.model.attempt.backoff_ms": entry.backoff_ms,
+                "monoid.model.attempt.retryable": entry.retryable,
+                "monoid.model.attempt.config_recoverable": entry.config_recoverable,
+                "monoid.model.attempt.http_status": entry.http_status,
+                "monoid.model.attempt.provider_retried": entry.provider_retried,
+                "monoid.model.attempt.stream_committed": entry.stream_committed,
+            }
+            if entry.error_code:
+                attrs["monoid.model.attempt.error_code"] = entry.error_code
+            if entry.provider_error_code:
+                attrs["monoid.model.attempt.provider_error_code"] = entry.provider_error_code
+            if entry.usage:
+                attrs["monoid.model.attempt.usage"] = _json_attribute(dict(entry.usage))
+            span = self._start_span(
+                f"model.attempt {entry.index}",
+                context=context,
+                kind=self._SpanKind.INTERNAL,
+                attributes=_clean(attrs),
+                start_time=start_time,
+            )
+            if entry.error_code not in ("", "model_call_aborted") and span.is_recording():
+                span.set_attribute("error.type", entry.provider_error_code or entry.error_code)
+                span.set_status(self._Status(self._StatusCode.ERROR))
+            self._end_span(span, end_time=end_time)
+            cursor = max(floor_ns, start_time - (entry.backoff_ms or 0) * 1_000_000)
+
     def _end_model_span(
         self, event_id: str, *, error: bool = False, error_type: str = "error"
     ) -> None:
@@ -453,6 +533,7 @@ class OtelEventSink:
             if mapped_event_id == event_id:
                 self._model_span_ids.pop(turn_id, None)
         self._authoritative_finish_span_ids.discard(event_id)
+        self._attempt_synthesized_span_ids.discard(event_id)
 
     def _close_latest_model_span(self, *, error: bool = False, error_type: str = "error") -> None:
         if not self._model_span_ids:
@@ -492,6 +573,7 @@ class OtelEventSink:
         if event.parent_id in self._authoritative_finish_span_ids:
             finish_attrs.pop("gen_ai.response.finish_reasons", None)
         self._authoritative_finish_span_ids.discard(event.parent_id or "")
+        self._attempt_synthesized_span_ids.discard(event.parent_id or "")
         if span.is_recording():
             for key, value in finish_attrs.items():
                 if value is not None:
@@ -516,6 +598,7 @@ class OtelEventSink:
         self._spans.clear()
         self._model_span_ids.clear()
         self._authoritative_finish_span_ids.clear()
+        self._attempt_synthesized_span_ids.clear()
         self._end_span(span)
         self._run_span = None
 

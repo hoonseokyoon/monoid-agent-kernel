@@ -264,6 +264,45 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         ),
     ),
     _monoid_artifact(
+        "model-calls.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=(
+            "core/schemas.py:MODEL_CALLS_RECORD_SCHEMA",
+            "core/model_calls.py:MODEL_CALLS_SCHEMA_VERSION",
+        ),
+        # No legacy namespace: this artifact has never existed under native-agent-runner.*, and
+        # advertising a reader for records that cannot exist is a false compatibility claim.
+        legacy_reader=False,
+        notes=(
+            "Optional private run-dir ledger of settled model calls, one record per call including "
+            "failed ones. Metadata and the replay key only: a record is a declared projection of "
+            "ModelCallReceipt rather than its serialization, so it never carries request or "
+            "response content, the configured endpoint, or the per-process destination digest."
+        ),
+    ),
+    _monoid_artifact(
+        "model-payloads.v1",
+        kind="durable",
+        reader_policy="json-schema",
+        source=(
+            "core/schemas.py:MODEL_PAYLOADS_RECORD_SCHEMA",
+            "core/model_payloads.py:MODEL_PAYLOADS_SCHEMA_VERSION",
+        ),
+        # Same single-namespace rule as the ledger beside it: never existed under the legacy
+        # prefix, so no reader is advertised for records that cannot exist.
+        legacy_reader=False,
+        notes=(
+            "Optional private run-dir replay corpus: request preimages as verified reassembly "
+            "recipes (every value at least as large as the reference replacing it becomes a "
+            "chunk, per tool definition, per message and per observation; offloaded to a "
+            "content-addressed model_payloads/ directory past 256 KiB) plus settled response "
+            "bodies. Content-classified, unlike the ledger it joins: preimages carry the "
+            "conversation and tool definitions, responses carry model output and reasoning. "
+            "validate_run_dir re-verifies every request record against its request_digest."
+        ),
+    ),
+    _monoid_artifact(
         "manifest.v1",
         kind="durable",
         reader_policy="json-schema",

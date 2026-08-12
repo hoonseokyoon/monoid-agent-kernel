@@ -248,7 +248,19 @@ and each run writes `metrics.json` with counters, timing, and token usage.
 text leaves as a digest that entitled readers join back from private run artifacts, and tool
 arguments are truncated to a byte budget. Studio renders tokens through a separate passive live
 channel and records replayable output/reasoning in the private `model-content.jsonl` sidecar. Raw
-provider chunks therefore stay out of the durable operation log and its Trace/export surface.
+provider chunks therefore stay out of the durable operation log and its Trace/export surface. A run
+can also opt into `model_calls.jsonl`, a private ledger of one metadata record per settled model
+call — including the failed ones — carrying timings, token usage, failure taxonomy and the replay
+key, and no content. A third opt-in, `model_payloads.jsonl`, records the content half for replay:
+the exact request bytes each replay key was hashed over (stored as verified reassembly recipes,
+deduplicated per tool definition, per message and per observation) and the settled response
+bodies, reasoning included. Both are requested per run with `monoid run --model-calls-file` and
+`monoid run --model-payload-file`, per deployment with the same two flags on
+`monoid backend serve`, and directly by an embedder through the matching `AgentLoop` and
+`RunnerBackend` fields. `monoid run --replay-from RUN_DIR_OR_ID` closes the loop: it serves a
+recorded corpus back as the model — offline, no provider configuration at all — replaying
+answers in recorded order while tools re-execute for real, and failing misses as a typed,
+content-free `replay_miss` unless `--replay-fallthrough` hands them to the live adapter.
 `MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
 egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
 integrations can still opt into the legacy durable `model.output.delta` and
