@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-12
+
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path
 
 - **Gap 6 closes at ingestion, which was one of the two fixes its own entry named.**
