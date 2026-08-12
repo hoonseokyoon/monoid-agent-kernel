@@ -127,6 +127,37 @@ def test_an_unportable_task_request_or_result_is_refused_at_ingress(tmp_path: Pa
     assert task.result is None, "the refused report half-landed"
     assert task.status == "running"
 
+
+def test_a_cyclic_task_payload_is_refused_at_the_same_two_boundaries(tmp_path: Path) -> None:
+    """The container generation of the pin above: a shape no writer can carry, not a scalar.
+
+    A dict that contains itself clears the normalizer's memo without complaint -- the second visit
+    short-circuits, so the walk finishes -- and then dies at ``task.json``'s writer with
+    ``ValueError: Circular reference detected``, a run-death with no observation. One predicate
+    covers both generations, so the shape costs the call and not the run, under the error codes
+    these boundaries already speak.
+    """
+    loop = _build_loop(
+        tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")])
+    )
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+
+    cyclic_request: dict = {}
+    cyclic_request["self"] = cyclic_request
+    with pytest.raises(ToolExecutionError) as refused_request:
+        manager.start_task("hitl", cyclic_request)
+    assert refused_request.value.error_code == "task_request_unportable"
+
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    cyclic_result: dict = {}
+    cyclic_result["self"] = cyclic_result
+    with pytest.raises(ToolExecutionError) as refused_result:
+        manager.report_result(task.job_id, cyclic_result)
+    assert refused_result.value.error_code == "task_result_unportable"
+    assert task.result is None, "the refused report half-landed"
+    assert task.status == "running"
+
     delivered = manager.report_result(task.job_id, {"answer": "Ada"})
     assert delivered["delivered"] is True
 

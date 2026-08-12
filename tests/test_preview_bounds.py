@@ -1284,7 +1284,7 @@ def test_the_integer_threshold_reads_the_value_not_the_object() -> None:
     functions up did not, so ``value < 0`` and unary ``-`` were handed to a model-supplied
     object. This one is the worse half: it runs inside event construction, and it is reachable
     past the refusing boundaries, because ``update_plan`` normalizes with the default
-    ``refuse_unportable_scalars=False``.
+    ``refuse_unportable=False``.
 
     Both directions, because a subclass can answer wrongly in two ways. Raising ends the run for
     a plain ``5``; understating itself publishes an integer no writer can spell -- and it slipped
@@ -1872,13 +1872,13 @@ def test_a_type_that_answers_for_its_own_name_cannot_escape_the_refusal() -> Non
     """
     for hostile in HOSTILE_NAMED_TYPES:
         with pytest.raises(UnportableScalarError):
-            normalize_json_ingress({"a": hostile()}, refuse_unportable_scalars=True)
+            normalize_json_ingress({"a": hostile()}, refuse_unportable=True)
 
 
 def test_the_preview_names_a_type_without_letting_it_answer() -> None:
     """The same read, past the refusing boundaries and inside event construction.
 
-    `update_plan` normalizes with the default `refuse_unportable_scalars=False`, so these envelopes
+    `update_plan` normalizes with the default `refuse_unportable=False`, so these envelopes
     are what a Python-object value meets with no boundary in front of it; a raise here ends the run.
     """
     policy = PermissionPolicy()
@@ -1918,7 +1918,7 @@ def test_a_published_type_name_is_bounded_like_every_other_published_string() ->
     assert len(redacted_value(hugely_named_object(10_000))["type"]) <= 64
 
     with pytest.raises(UnportableScalarError) as refusal:
-        normalize_json_ingress({"a": huge}, refuse_unportable_scalars=True)
+        normalize_json_ingress({"a": huge}, refuse_unportable=True)
     assert len(str(refusal.value)) <= 160, "the refusal message carries the name unbounded"
 
 

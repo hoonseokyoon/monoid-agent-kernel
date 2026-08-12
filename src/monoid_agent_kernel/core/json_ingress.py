@@ -55,12 +55,27 @@ def _spellable_integer_digits() -> int:
     return min(_MAX_JSON_INTEGER_DIGITS, configured)
 
 
-class UnportableScalarError(ValueError):
-    """A scalar no portable JSON writer can spell reached a refusing ingress.
+class UnportableValueError(ValueError):
+    """A value no portable JSON writer can carry reached a refusing ingress.
 
-    Its own class so the four refusing boundaries can convert exactly this into their classified
-    error and leave the normalizer's *other* ``ValueError`` — colliding keys after normalization —
-    on the classification it already had.
+    Its own class so the refusing boundaries can convert exactly this into their classified error
+    and leave the normalizer's *other* ``ValueError`` — colliding keys after normalization — on the
+    classification it already had. One base and not two independent classes, because a boundary
+    that caught one and not the other would be this repository's own recurring defect: a rule bound
+    to one of two parallel halves.
+    """
+
+
+class UnportableScalarError(UnportableValueError):
+    """A scalar no portable JSON writer in this process can spell."""
+
+
+class UnportableContainerError(UnportableValueError):
+    """A container whose *shape*, not whose scalars, no portable writer can carry.
+
+    Separate from the scalar refusal because the two are found by different machinery and at
+    different times: a scalar is judged where it sits, and a shape is only knowable once the whole
+    copy exists. Both are ``UnportableValueError``, so no boundary has to know that.
     """
 
 
@@ -347,12 +362,63 @@ def _normalize_scalar(
     return value
 
 
+def _refuse_unportable_shape(root: Any) -> None:
+    """Refuse a copy whose shape a portable JSON writer cannot carry.
+
+    Runs over the finished copy rather than during the walk, and that is not a convenience. The
+    walk memoises a container *before* descending into it, so the second reference to a shared
+    subtree short-circuits — which makes a depth counter carried through the walk unsound, not
+    merely imprecise. Measured: a subtree referenced once near the root and once 250 levels down
+    is charged its depth at whichever reference the walk reaches first, so the counter peaked at
+    252 while the copy it cleared was 501 containers tall and killed ``dataclasses.asdict``. Over
+    the finished copy the same sharing is free instead: each node is settled once, and a node
+    referenced again is already settled.
+
+    Three colours. ``on_path`` is the ancestor set — entered and not yet settled — so a hit there
+    is a back edge and therefore a cycle. ``settled`` is everything already finished, so a hit
+    there is a cross or forward edge and therefore ordinary sharing, which is accepted and left
+    shared: the preview renders a value shared twice twice, and refusing every second visit would
+    convict each DAG that ever reaches a tool result.
+
+    Why refuse a cycle at all: the walk returns a self-referential copy, and the writers it is
+    handed to disagree with it later and elsewhere — ``json.dumps`` raises ``ValueError: Circular
+    reference detected`` and ``dataclasses.asdict`` raises ``RecursionError``, neither at the
+    boundary that accepted it. Refusing here is the same trade the scalar refusal made: a
+    classified failure of one call instead of an unclassified death of the run.
+    """
+
+    settled: set[int] = set()
+    on_path: set[int] = set()
+    stack: list[tuple[Any, bool]] = [(root, False)]
+
+    while stack:
+        node, leaving = stack.pop()
+        if not isinstance(node, (dict, list)):
+            continue
+        key = id(node)
+        if leaving:
+            on_path.discard(key)
+            settled.add(key)
+            continue
+        if key in on_path:
+            raise UnportableContainerError(
+                "container is reachable from itself and cannot be written as portable JSON"
+            )
+        if key in settled:
+            continue
+        on_path.add(key)
+        stack.append((node, True))
+        children = node.values() if isinstance(node, dict) else node
+        for child in children:
+            stack.append((child, False))
+
+
 def normalize_json_ingress(
     value: Any,
     *,
     substitute_nonfinite: bool = True,
     normalize_strings: bool = True,
-    refuse_unportable_scalars: bool = False,
+    refuse_unportable: bool = False,
 ) -> Any:
     """Copy and normalize a JSON-domain value without recursive Python calls.
 
@@ -363,9 +429,12 @@ def normalize_json_ingress(
     reader gets and a subclass answering for itself was writing the record.
     Tuples become JSON arrays. Non-container values outside the JSON domain are left alone by
     default; the boundaries where such a value can only crash a later writer — the four
-    Python-object ingress points: a tool result's content, ``emit_artifact`` metadata, and a
-    hosted task's request and result — pass ``refuse_unportable_scalars=True`` and turn the
-    ``ValueError`` into their own classified refusal instead of carrying the value to the crash.
+    Python-object ingress points: a tool result's content, ``emit_artifact`` metadata, a hosted
+    task's request and result, and a model turn's tool-call arguments — pass
+    ``refuse_unportable=True`` and turn the ``UnportableValueError`` into their own classified
+    refusal instead of carrying the value to the crash. The same flag refuses a *shape* no
+    writer can carry (:func:`_refuse_unportable_shape`), because a boundary that refused one
+    and not the other would be a rule bound to one of two halves.
     """
 
     root: list[Any] = [None]
@@ -379,7 +448,7 @@ def normalize_json_ingress(
                 source,
                 substitute_nonfinite=substitute_nonfinite,
                 normalize_strings=normalize_strings,
-                refuse_unportable=refuse_unportable_scalars,
+                refuse_unportable=refuse_unportable,
             )
             continue
 
@@ -418,6 +487,8 @@ def normalize_json_ingress(
         for index in range(size - 1, -1, -1):
             pending.append((exact_item(source, index), copied_list, index))
 
+    if refuse_unportable:
+        _refuse_unportable_shape(root[0])
     return root[0]
 
 

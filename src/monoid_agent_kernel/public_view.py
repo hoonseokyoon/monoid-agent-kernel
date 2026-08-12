@@ -641,7 +641,7 @@ def _int_spelling_exceeds(value: int, threshold: int) -> bool:
     the subclass. This site is the worse of the pair — it runs *inside event construction*, where
     a raise from a model-supplied object ends the run (see ``_is_path_redacted`` below for the
     same hazard), and it is reachable past the refusing boundaries: ``update_plan`` normalizes
-    with the default ``refuse_unportable_scalars=False``, and a subclass that answers the ingress
+    with the default ``refuse_unportable=False``, and a subclass that answers the ingress
     honestly can still detonate on this negation.
     """
     numeric = int.__index__(value)

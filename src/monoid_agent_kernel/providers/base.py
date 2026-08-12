@@ -910,7 +910,14 @@ def _normalize_model_turn(turn: Any) -> Any:
                     call,
                     id=_normalize_required_text(getattr(call, "id"), "model tool call id"),
                     name=_normalize_required_text(getattr(call, "name"), "model tool call name"),
-                    arguments=normalize_json_ingress(arguments),
+                    # The fifth Python-object ingress, and the one that reaches the
+                    # checkpoint: these arguments ride the assistant message into
+                    # `state.messages` and out through `RunCheckpoint.to_json`, whose
+                    # `dataclasses.asdict` has no memo and dies on a shape this copy
+                    # keeps. `normalize_model_turn` below already converts anything
+                    # escaping here into a classified `ModelAdapterError`, so the
+                    # refusal needs no conversion of its own.
+                    arguments=normalize_json_ingress(arguments, refuse_unportable=True),
                 )
             )
         except Exception:

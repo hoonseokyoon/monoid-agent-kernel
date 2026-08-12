@@ -25,6 +25,7 @@ from support.hostile_scalars import (
 
 import monoid_agent_kernel
 from monoid_agent_kernel.core.json_ingress import (
+    UnportableContainerError,
     UnportableScalarError,
     is_finite_json_number,
     loads_json_ingress,
@@ -34,6 +35,12 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_unicode_scalars,
 )
 from monoid_agent_kernel.permissions import _LegacyPathPattern
+from monoid_agent_kernel.providers.base import (
+    ModelAdapterError,
+    ModelTurn,
+    ToolCall,
+    normalize_model_turn,
+)
 from monoid_agent_kernel.tools.base import (
     ToolResult,
     ToolSpec,
@@ -145,6 +152,74 @@ def test_a_container_that_overstates_its_length_cannot_crash_the_boundary() -> N
     result = normalize_tool_result(ToolResult(ok=True, content={"items": OverstatedList([1, 2])}))
 
     assert result.content == {"items": [1, 2]}
+
+
+def test_a_container_reachable_from_itself_is_refused_at_the_python_object_routes() -> None:
+    """The walk's memo makes a cycle look finished, and the writers it hands the copy to disagree.
+
+    ``normalize_json_ingress`` records a container *before* walking its children, so the second
+    visit short-circuits and the walk ends -- for a self-referential list, at path depth 2 -- with
+    a self-referential copy. ``json.dumps`` then raises ``ValueError: Circular reference
+    detected`` and ``dataclasses.asdict`` raises ``RecursionError``, neither of them at the
+    boundary that accepted it. So a cycle needs a refusal of its own: no depth bound will ever see
+    one, because the memo stops the walk before any depth accumulates.
+    """
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(UnportableContainerError, match="reachable from itself"):
+        normalize_json_ingress(cyclic, refuse_unportable=True)
+
+    nested: list = [1]
+    nested.append(nested)
+    with pytest.raises(UnportableContainerError, match="reachable from itself"):
+        normalize_json_ingress({"outer": nested}, refuse_unportable=True)
+
+    # Through a boundary, so the classified refusal an operator reads is pinned too.
+    boundary_cycle: dict = {}
+    boundary_cycle["self"] = boundary_cycle
+    with pytest.raises(Exception) as refused:
+        normalize_tool_result(ToolResult(ok=True, content=boundary_cycle))
+    assert getattr(refused.value, "error_code", "") == "tool_result_unportable"
+
+
+def test_a_value_shared_twice_is_not_a_cycle() -> None:
+    """A memo hit is not the question; an *ancestor* hit is.
+
+    The refusing boundaries carry shared graphs on purpose -- the preview renders a value shared
+    twice twice, and the copy keeps the sharing -- so refusing on any second visit would convict
+    every DAG that ever reaches a tool result.
+    """
+    shared = {"leaf": 1}
+    normalized = normalize_json_ingress({"a": shared, "b": shared}, refuse_unportable=True)
+
+    assert normalized["a"] is normalized["b"]
+    assert normalized["a"] == {"leaf": 1}
+
+    # The second reference reached *below* the first, which is where a walk that confused sharing
+    # with recursion would answer differently depending on key order.
+    deeper = normalize_json_ingress({"a": shared, "b": {"c": shared}}, refuse_unportable=True)
+    assert deeper["a"] is deeper["b"]["c"]
+
+
+def test_a_cyclic_model_turn_is_a_classified_adapter_failure() -> None:
+    """The fifth Python-object route: an adapter's own ``ToolCall.arguments``.
+
+    That is the route to the checkpoint -- the arguments ride the assistant message into
+    ``state.messages`` and out through ``RunCheckpoint.to_json`` -- and it was the one boundary of
+    the five that did not refuse anything. Driven with a tool-calls-only turn on purpose: a
+    settled outcome beside the calls makes ``_normalize_model_turn`` swallow the failure, so a pin
+    written on that shape would pass for the wrong reason.
+    """
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    turn = ModelTurn(
+        response_id="r1",
+        tool_calls=(ToolCall(id="c1", name="custom_tool", arguments=cyclic),),
+    )
+
+    with pytest.raises(ModelAdapterError, match="non-portable"):
+        normalize_model_turn(turn)
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
@@ -294,15 +369,15 @@ def test_the_integer_bound_narrows_to_what_this_interpreter_can_actually_spell()
     """
     with _interpreter_int_digit_limit(1000):
         with pytest.raises(UnportableScalarError):
-            normalize_json_ingress({"n": 10**1500}, refuse_unportable_scalars=True)
+            normalize_json_ingress({"n": 10**1500}, refuse_unportable=True)
 
         # 1000 digits: the largest this process can spell, and it must survive ingress *and* a dump
-        admitted = normalize_json_ingress({"n": 10**999}, refuse_unportable_scalars=True)
+        admitted = normalize_json_ingress({"n": 10**999}, refuse_unportable=True)
         assert json.dumps(admitted)
 
         # 1001 digits: one past what the process can spell
         with pytest.raises(UnportableScalarError):
-            normalize_json_ingress({"n": 10**1000}, refuse_unportable_scalars=True)
+            normalize_json_ingress({"n": 10**1000}, refuse_unportable=True)
 
 
 def test_a_permissive_interpreter_does_not_widen_the_portable_bound() -> None:
@@ -315,7 +390,7 @@ def test_a_permissive_interpreter_does_not_widen_the_portable_bound() -> None:
     with _interpreter_int_digit_limit(0):
         assert json.dumps(10**4300), "this process can spell it"
         with pytest.raises(UnportableScalarError):
-            normalize_json_ingress({"n": 10**4300}, refuse_unportable_scalars=True)
+            normalize_json_ingress({"n": 10**4300}, refuse_unportable=True)
 
 
 def test_a_json_integer_past_the_interpreters_limit_is_a_decode_error() -> None:
@@ -345,11 +420,11 @@ def test_an_integer_subclass_is_judged_by_the_value_a_writer_would_spell() -> No
     spellable = ExplodingComparisons(5)
     assert json.dumps(spellable) == "5", "the fixture must be a value writers handle"
 
-    assert normalize_json_ingress({"n": spellable}, refuse_unportable_scalars=True) == {"n": 5}
+    assert normalize_json_ingress({"n": spellable}, refuse_unportable=True) == {"n": 5}
 
     with pytest.raises(UnportableScalarError):
         normalize_json_ingress(
-            {"n": UnderstatedInteger(10**5000)}, refuse_unportable_scalars=True
+            {"n": UnderstatedInteger(10**5000)}, refuse_unportable=True
         )
 
 
@@ -391,24 +466,81 @@ _KERNEL_PACKAGE = Path(monoid_agent_kernel.__file__).resolve().parent
 _REFUSING_INGRESS_BOUNDARIES = frozenset(
     {
         ("loop.py", "AgentToolContext.emit_artifact"),
+        ("providers/base.py", "_normalize_model_turn"),
         ("tasks.py", "TaskManager.start_task"),
         ("tasks.py", "TaskManager.report_result"),
         ("tools/base.py", "normalize_tool_result"),
     }
 )
-"""The four Python-object ingress boundaries: the places a value reaches the normalizer without
-ever having crossed a JSON parse, so ``bytes`` and past-the-bound integers arrive alive."""
+"""The five Python-object ingress boundaries: the places a value reaches the normalizer without
+ever having crossed a JSON parse, so ``bytes``, past-the-bound integers and shapes no writer can
+carry all arrive alive.
+
+``update_plan`` (``loop.py``) is a sixth such route and is deliberately absent: a plan is not a
+``RunCheckpoint`` field, ``status.json``'s copy is taken from the emitted event rather than from
+``self.plan``, and the preview already publishes a ``circular`` marker for the shape. Nothing there
+reaches a writer a cycle or a depth kills, so refusing would convict a value that costs nothing.
+Recorded here because an ``==`` that does not explain its absences reads as an oversight."""
+
+_REFUSAL_CONVERSIONS = {
+    ("loop.py", "AgentToolContext.emit_artifact"): ("UnportableValueError",),
+    ("tasks.py", "TaskManager.start_task"): ("UnportableValueError",),
+    ("tasks.py", "TaskManager.report_result"): ("UnportableValueError",),
+    ("tools/base.py", "normalize_tool_result"): ("UnportableValueError",),
+    # The fifth converts one frame up, in ``normalize_model_turn``, which turns anything escaping
+    # ``_normalize_model_turn`` into a classified ``ModelAdapterError`` and stamps the usage the
+    # refused turn was already billed for. The handler seen *here* is the settled-outcome arm.
+    ("providers/base.py", "_normalize_model_turn"): ("Exception",),
+}
+"""What each boundary is prepared to catch. The flag alone is only half a boundary: a refusal that
+nothing converts is an unclassified exception with extra steps, which is the crash this whole
+mechanism exists to replace."""
 
 
-def _normalize_json_ingress_call_sites() -> list[tuple[str, str, ast.Call]]:
+def _enclosing_handler_types(
+    call: ast.Call, parents: dict[ast.AST, ast.AST]
+) -> tuple[str, ...]:
+    """The exception types the nearest enclosing ``try`` around ``call`` is prepared to catch.
+
+    Only a ``try`` whose *body* contains the call counts: a call sitting inside an ``except`` arm
+    is not protected by that arm. The search stops at the owning function, because a handler in a
+    caller is a different function's promise and this census is about this one's.
+    """
+
+    child: ast.AST = call
+    cursor = parents.get(call)
+    while cursor is not None:
+        if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return ()
+        if isinstance(cursor, ast.Try) and any(node is child for node in cursor.body):
+            names: list[str] = []
+            for handler in cursor.handlers:
+                caught = handler.type
+                if caught is None:
+                    names.append("BareExcept")
+                    continue
+                targets = caught.elts if isinstance(caught, ast.Tuple) else [caught]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        names.append(target.id)
+                    elif isinstance(target, ast.Attribute):
+                        names.append(target.attr)
+            return tuple(sorted(set(names)))
+        child = cursor
+        cursor = parents.get(cursor)
+    return ()
+
+
+def _normalize_json_ingress_call_sites() -> list[tuple[str, str, ast.Call, tuple[str, ...]]]:
     """Every call to ``normalize_json_ingress`` in the kernel, with its owning function.
 
     Matches ``ast.Attribute`` as well as ``ast.Name`` so a refactor to module-qualified calls
     cannot leave this census silently green. Nested functions and lambdas attribute to their
-    outermost enclosing function.
+    outermost enclosing function. Each site also carries what its nearest enclosing ``try`` is
+    prepared to catch, so the table below can fix the *conversion* and not only the flag.
     """
 
-    sites: list[tuple[str, str, ast.Call]] = []
+    sites: list[tuple[str, str, ast.Call, tuple[str, ...]]] = []
     for path in sorted(_KERNEL_PACKAGE.rglob("*.py")):
         relative = path.relative_to(_KERNEL_PACKAGE).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -440,43 +572,78 @@ def _normalize_json_ingress_call_sites() -> list[tuple[str, str, ast.Call]]:
                 named.append(scope.name)
                 if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     break
-            sites.append((relative, ".".join(named) or "<module>", node))
+            sites.append(
+                (
+                    relative,
+                    ".".join(named) or "<module>",
+                    node,
+                    _enclosing_handler_types(node, parents),
+                )
+            )
     return sites
 
 
+def _refusing_sites() -> list[tuple[str, str, tuple[str, ...]]]:
+    return [
+        (relative, owner, handlers)
+        for relative, owner, call, handlers in _normalize_json_ingress_call_sites()
+        if any(
+            keyword.arg == "refuse_unportable"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+    ]
+
+
 def test_the_refusing_ingress_boundaries_are_exactly_the_python_object_routes() -> None:
-    """``refuse_unportable_scalars=True`` appears at the four boundaries and nowhere else.
+    """``refuse_unportable=True`` appears at the five boundaries and nowhere else.
 
-    Every other caller keeps the default, because every other caller hands the normalizer values
-    that came off a bounded JSON parse — the decoders already refused what these boundaries
-    refuse, and widening the refusal there would convict values that cannot occur. The ``==``
-    fails in both directions. A new ``True`` site means a new Python-object ingress was opened:
-    it belongs in this table only together with the classified-error conversion the other four
-    carry, so the refusal stays a call failure and never a crash. A missing entry means a
-    boundary stopped refusing, and the run-death this closed — ``json.dumps`` raising at the
-    transcript write, ``run.failed`` with no observation — comes back.
+    Every other caller keeps the default. For scalars the reason is that they hand the normalizer
+    values that came off a bounded JSON parse, so the decoders already refused what these
+    boundaries refuse. That reason does **not** extend to shape: the model-JSON decoders admit 512
+    levels of nesting and ``dataclasses.asdict`` dies at 492, so the depth bound had to be carried
+    by these boundaries rather than inherited from the parsers — which is why the route a model's
+    own tool-call arguments take is now one of them.
 
-    Only a literal ``True`` counts as refusing: a site that grows a variable there drops out of
-    this set and must be re-classified by whoever made the flag conditional.
+    The ``==`` fails in both directions. A new ``True`` site means a new Python-object ingress was
+    opened, and it belongs here only together with the conversion the others carry. A missing
+    entry means a boundary stopped refusing, and the run-death this closed — ``json.dumps``
+    raising at the transcript write, ``run.failed`` with no observation — comes back.
+
+    Only a literal ``True`` counts: a site that grows a variable there drops out of this set and
+    must be re-classified by whoever made the flag conditional.
     """
 
     sites = _normalize_json_ingress_call_sites()
-    owners = {(relative, owner) for relative, owner, _call in sites}
+    owners = {(relative, owner) for relative, owner, _call, _handlers in sites}
 
     assert ("core/json_ingress.py", "loads_json_ingress") in owners, (
         "census self-check: the normalizer's own module no longer shows its known caller, "
         "so this walk is not seeing what it claims to see"
     )
 
-    refusing = {
-        (relative, owner)
-        for relative, owner, call in sites
-        if any(
-            keyword.arg == "refuse_unportable_scalars"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in call.keywords
-        )
-    }
+    refusing = {(relative, owner) for relative, owner, _handlers in _refusing_sites()}
 
     assert refusing == _REFUSING_INGRESS_BOUNDARIES
+
+
+def test_every_refusing_boundary_converts_what_it_refuses() -> None:
+    """The flag is half a boundary; the conversion is the other half.
+
+    A refusal nothing catches is an unclassified exception with extra steps — the exact failure
+    the scalar refusal was written to replace, re-earned one level up. So the handler types are
+    read off the source too, and fixed by a table: a boundary that refuses without converting, or
+    that narrows its ``except`` to one of the two ``UnportableValueError`` subclasses, fails here
+    rather than in production.
+    """
+
+    conversions = {
+        (relative, owner): handlers for relative, owner, handlers in _refusing_sites()
+    }
+
+    assert any("UnportableValueError" in handlers for handlers in conversions.values()), (
+        "census self-check: no boundary shows the base exception in its handler, so the handler "
+        "walk is not seeing what it claims to see"
+    )
+    assert conversions == _REFUSAL_CONVERSIONS

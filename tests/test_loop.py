@@ -2358,6 +2358,50 @@ def test_unportable_artifact_metadata_costs_the_emitting_call(tmp_path: Path) ->
     assert observation["error"]["code"] == "artifact_metadata_unportable"
 
 
+def test_cyclic_artifact_metadata_costs_the_emitting_call(tmp_path: Path) -> None:
+    """The same boundary, the container generation: a shape rather than a scalar.
+
+    ``metadata`` that contains itself is copied without complaint -- the walk's memo makes the
+    second visit look finished -- and the copy then meets ``json.dumps`` at the event write, which
+    raises ``ValueError: Circular reference detected`` from inside event construction. The run
+    keeps going and the model gets an observation it can correct, which is the whole trade.
+    """
+
+    def handler(context: ToolContext, _arguments: dict) -> ToolResult:
+        cyclic: dict = {}
+        cyclic["self"] = cyclic
+        context.emit_artifact("art.txt", "report", None, cyclic)
+        return ToolResult(ok=True, content={"emitted": True})
+
+    spec = ToolSpec(
+        id="custom.cyclic_emitter",
+        description="Emit an artifact whose metadata contains itself.",
+        input_schema={"type": "object"},
+        capability="",
+        side_effect="read",
+        handler=handler,
+    )
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("custom_cyclic_emitter", {}, "c1"),),
+            ),
+            ModelTurn(response_id="r2", final_text="recovered"),
+        ]
+    )
+    run_spec = AgentRunSpec(workspace_root=tmp_path / "ws", run_root=tmp_path / "runs")
+    run_spec.workspace_root.mkdir()
+    (run_spec.workspace_root / "art.txt").write_text("body", encoding="utf-8")
+
+    result = AgentLoop.from_tools(run_spec, adapter, [spec]).run_once("emit")
+
+    assert result.status == "completed"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    assert observation["error"]["code"] == "artifact_metadata_unportable"
+
+
 def test_invalid_success_flag_cannot_emit_success_side_effect_evidence(tmp_path: Path) -> None:
     def handler(_context: ToolContext, _arguments: dict) -> ToolResult:
         return ToolResult(

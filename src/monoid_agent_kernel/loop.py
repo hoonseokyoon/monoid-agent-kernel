@@ -68,7 +68,7 @@ from monoid_agent_kernel.core.media import (
     resolve_wire_messages,
 )
 from monoid_agent_kernel.core.json_ingress import (
-    UnportableScalarError,
+    UnportableValueError,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -508,8 +508,8 @@ class AgentToolContext(ToolContext):
             # what no writer downstream — the observation back to the model, the transcript — can
             # spell. Raised as a classified tool error, the emitting call fails and the run keeps
             # going, which is what "one hostile value costs its own call" means here.
-            metadata = normalize_json_ingress(metadata, refuse_unportable_scalars=True)
-        except UnportableScalarError as exc:
+            metadata = normalize_json_ingress(metadata, refuse_unportable=True)
+        except UnportableValueError as exc:
             raise ToolExecutionError(
                 f"artifact metadata is not portable JSON: {exc}",
                 error_code="artifact_metadata_unportable",

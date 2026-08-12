@@ -17,7 +17,7 @@ from typing import Any, Literal, Protocol
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
 from monoid_agent_kernel.core.json_ingress import (
-    UnportableScalarError,
+    UnportableValueError,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -1090,8 +1090,8 @@ class TaskManager:
             # Census twin ③ of the tool-result refusal: a task request from an in-process caller
             # never crossed a JSON parse, and `task.json`'s writer cannot spell what the
             # normalizer deliberately leaves alone.
-            request = normalize_json_ingress(request, refuse_unportable_scalars=True)
-        except UnportableScalarError as exc:
+            request = normalize_json_ingress(request, refuse_unportable=True)
+        except UnportableValueError as exc:
             raise ToolExecutionError(
                 f"task request is not portable JSON: {exc}",
                 error_code="task_request_unportable",
@@ -1148,8 +1148,8 @@ class TaskManager:
             # Before any state moves on the path that moves state -- a refused report leaves the
             # task running and unclobbered, so the reporter can retry with a portable payload and
             # the idempotency bookkeeping never records a result no writer could spell.
-            result = normalize_json_ingress(result, refuse_unportable_scalars=True)
-        except UnportableScalarError as exc:
+            result = normalize_json_ingress(result, refuse_unportable=True)
+        except UnportableValueError as exc:
             raise ToolExecutionError(
                 f"task result is not portable JSON: {exc}",
                 error_code="task_result_unportable",
