@@ -13,6 +13,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from monoid_agent_kernel.core.json_ingress import exact_number
 from monoid_agent_kernel.core.spec import GenerationConfig, ReasoningConfig
 
 # Half of ``log(float_max)``: the per-chunk log budget :func:`capped_backoff` sizes its power
@@ -40,7 +41,9 @@ def retry_delay_s(
     Every input that arrives as JSON is validated finite (``ModelRetryConfig.from_json`` ->
     ``spec._model_control_number``) and every answer is too -- but that dataclass has no
     ``__post_init__``, so a config built in Python carries whatever it was handed, and that is
-    a door :func:`capped_backoff` answers through rather than raising through.
+    a door :func:`capped_backoff` answers through rather than raising through. That applies to
+    ``max_delay_s`` the same as to ``backoff_multiplier``: an unusable CAP is resolved to
+    ``sys.float_info.max`` there, so what arrives here is already a number this can add to.
 
     Jitter rides ON TOP of the cap -- deliberately, since the moment a herd most needs smearing
     is the moment every member is sitting at ``max_delay_s`` -- but ``max_delay_s`` and
@@ -51,6 +54,10 @@ def retry_delay_s(
     """
 
     delay = capped_backoff(attempt, initial_delay_s, max_delay_s, backoff_multiplier)
+    # ``jitter_s`` is the one control this function reads on its own, and it reads it with an
+    # ordering -- inside the ``except`` of a retry loop, where a raise replaces the failure being
+    # recovered from. Same treatment as the four below; see ``exact_number``.
+    jitter_s = exact_number(jitter_s)
     if jitter_s > 0:
         delay = min(delay + random.uniform(0, jitter_s), sys.float_info.max)
     return delay
@@ -85,15 +92,46 @@ def capped_backoff(
     (``uniform(0, ceiling)``) rather than jitter on top, so it needs the bounded ceiling itself
     rather than :func:`retry_delay_s`.
 
-    So it is TOTAL: every input, non-finite ones included, gets an answer rather than an
-    exception -- and the answer is the one the open-coded ``min(max_delay_s, initial *
-    multiplier ** n)`` gave, because a schedule three layers now share is not the place to change
-    what a policy MEANS. A NaN cap still answers ``nan``, a negative-infinite one still answers
-    ``-inf``. What is not preserved is the raise. Measured rather than asserted: over a
-    lattice per argument (both signed zeros, a negative, a subnormal, ``1e308``, and the three
-    non-finite values) the only cells that answer differently are a NEGATIVE ``initial_delay_s``
-    -- not a wait any schedule can mean -- and one cell where the saturation threshold answers
-    the cap for a product one ULP below it.
+    So it is TOTAL OVER THE FLOATS: every one, non-finite included, gets an answer rather than
+    an exception -- and for every FINITE ``max_delay_s`` the answer is the one the open-coded
+    ``min(max_delay_s, initial * multiplier ** n)`` gave, because a schedule three layers now
+    share is not the place to change what a policy MEANS. What is not preserved is the raise, and
+    one thing besides: a NON-FINITE cap. That expression answered ``nan`` for a NaN cap and
+    ``-inf`` for a negative-infinite one, and neither is a wait -- both floor to no backoff at
+    every caller -- so preserving them preserves the defect rather than the meaning. Measured
+    rather than asserted: over a lattice per argument (both signed zeros, a negative, a subnormal,
+    ``1e308``, and the three non-finite values), the finite-cap cells that answer differently are
+    exactly a NEGATIVE ``initial_delay_s`` -- not a wait any schedule can mean -- and one cell
+    where the saturation threshold answers the cap for a product one ULP below it. Every
+    non-finite-cap cell answers what the same call with ``sys.float_info.max`` answers, which is
+    the substitution itself and not a weaker claim about it.
+
+    "Over the floats" is the exact reach and not a hedge. None of these four fields is validated,
+    so an operator can put a Python ``int`` in one, and an int has no ceiling: ``10**400`` is a
+    perfectly good int and no float at all. Asking such a value ``math.isfinite`` -- which
+    CONVERTS before it decides -- raises ``OverflowError`` from inside the screen whose whole job
+    is to decide whether the value is usable, and raises it for every attempt, the first one
+    included. So both screens ask an ORDERING instead, ``-float_info.max <= x <= float_info.max``,
+    which is the question every other guard in this function already asks, which int-to-float
+    comparison answers exactly, and which converts nothing. An out-of-range cap then resolves
+    where ``+inf`` resolves, and an out-of-range multiplier where an infinite one does.
+
+    Neither screen asks the VALUE what it is. Both are orderings, which a numeric subclass may
+    override and raise from, so all four arguments are reduced to their base ``int``/``float`` at
+    the top by :func:`~monoid_agent_kernel.core.json_ingress.exact_number` and every comparison
+    below is between built-ins. Measured: a cap whose ``__ge__`` raises, on a plain ``10``, took
+    this down at the first attempt; a cap whose ``__lt__`` raises took it down at every attempt
+    both before and after the screens changed -- so the reduction closes a family, not a site.
+
+    One raise is left standing, and it is named here rather than left to be discovered: a
+    multiplier that is an int outside the float range AND not above ``1.0`` -- a large negative
+    one -- reaches ``initial_delay_s * backoff_multiplier ** exponent`` on the no-growth arm.
+    Ints do not saturate to ``inf`` the way the float spelling does, which is exactly what makes
+    that arm safe for floats, so the power is computed exactly and the product leaves the range.
+    Measured over an int lattice: 616 cells, every one of them raising identically before this
+    change and after it. It is the arithmetic rather than a screen, the no-growth arm is
+    deliberately the one that takes ``-inf``, and closing it is a separate change owing its own
+    evidence.
 
     The rule that makes it total is one rule, and its ORDER is the whole of it: growth this
     cannot resolve resolves UPWARD, to ``max_delay_s``, decided before any shortcut that reasons
@@ -113,7 +151,56 @@ def capped_backoff(
     would answer ``max_delay_s`` for those, turning a 1.8-second wait into a 1.8e308-second one.
     """
 
-    # The MULTIPLIER is settled first, before any shortcut that reasons about the delay or the
+    # Every screen and every ordering below is a question put to one of these four values, and
+    # a numeric SUBCLASS gets to answer it: ``a <= b`` hands priority to the reflected operand
+    # when its type is a proper subclass, so an override is called before the constant it is
+    # being compared against. One that raises does so from inside a schedule that is already
+    # recovering from a send failure -- and at the outbox, from between ``sender.send`` and
+    # ``record_outbox_result``, which loses the receipt for a side effect that already happened.
+    #
+    # Reduced here, once, and not screened at each site: there are seven orderings below and
+    # closing one leaves six. After this line every comparison in this function is between
+    # built-ins. ``attempt`` is included even though the durable boundary already strict-types it
+    # (``_nonnegative_integer`` demands ``type(value) is int``), because this function is public
+    # and that guarantee belongs to one caller rather than to the argument.
+    max_delay_s = exact_number(max_delay_s)
+    initial_delay_s = exact_number(initial_delay_s)
+    backoff_multiplier = exact_number(backoff_multiplier)
+    attempt = exact_number(attempt)
+
+    # A cap that is not a number is not a cap, and it is settled FIRST -- ahead even of the
+    # multiplier, because every arm below reads ``max_delay_s`` and not one of them screens it.
+    # The first-attempt exit returns ``min(max_delay_s, initial_delay_s)``, so it reads the cap
+    # on its own; a resolution placed below it would leak through that one. Both ends this
+    # otherwise lands on are wrong. ``nan`` and ``-inf`` leave every ``min(max_delay_s, .)``
+    # answering something not above zero, which every waiter reads as NO BACKOFF: ``if delay > 0``
+    # never sleeps, and the outbox's ``uniform(0, max(0.0, ceiling))`` is ``uniform(0, 0)`` -- an
+    # unthrottled resend against the endpoint that just refused, which is the state the multiplier
+    # arm below was fixed to prevent, reached through the other argument. ``+inf`` is the opposite
+    # end and no better: it rides ordinary products until one leaves the float range and then
+    # answers ``inf``, which is not a long wait but a timer that never fires, and a
+    # ``next_attempt_at`` no durable record will carry -- ``parse_float`` refuses it in the export
+    # that runs AFTER ``sender.send`` already returned.
+    #
+    # ``float_info.max`` and not zero, and not a policy default: an unlimited cap should stay
+    # unlimited. For every product this can represent, ``min(inf, product)`` and
+    # ``min(float_info.max, product)`` are the same number, so ``+inf`` keeps its meaning exactly
+    # and only loses the ability to escape as an answer. It is also the spelling this module
+    # already uses for a safe extreme (see the saturating add in ``retry_delay_s``).
+    #
+    # An ORDERING and not ``math.isfinite``: this screen decides whether the cap is usable, and a
+    # screen that converts its argument in order to decide can fail on the argument instead of
+    # judging it. ``math.isfinite(10**400)`` does not answer False, it raises ``OverflowError``,
+    # and it raises here -- above every arm, so for every attempt including the first. The outbox
+    # evaluates this schedule AFTER ``sender.send`` has returned, so that raise loses the receipt
+    # for a side effect that already happened and the request is dispatched a second time. The
+    # comparison asks what the rest of this function asks and cannot fail: int-to-float ordering
+    # in Python is exact and coerces nothing. Measured over 30,375 all-float cells, the two
+    # spellings answer identically in every one -- the substitution changes which VALUES can be
+    # screened, not what the screen decides about any float.
+    if not -sys.float_info.max <= max_delay_s <= sys.float_info.max:
+        max_delay_s = sys.float_info.max
+    # The MULTIPLIER is settled next, before any shortcut that reasons about the delay or the
     # cap. Every one of those shortcuts rests on what the growth does to the product, and that
     # premise holds only for a growth that is a number -- see the zero-delay exit at the bottom,
     # which is the one that got this wrong by standing above it.
@@ -134,7 +221,8 @@ def capped_backoff(
     # AFTER ``sender.send`` has returned: a raise there loses the receipt for a side effect that
     # already happened, and the request is dispatched a second time.
     #
-    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD.
+    # The answer is the cap, and it is one rule: growth that cannot be resolved resolves UPWARD
+    # -- which is an ANSWER only because the cap itself was resolved first, at the top.
     # That is what ``min(max_delay_s, initial * multiplier ** n)`` answered for every one of
     # these (``initial * inf`` is ``inf``, ``initial * nan`` is ``nan``, and ``min`` keeps the cap
     # against either), and it is the only safe direction independently of that -- the opposite
@@ -142,7 +230,11 @@ def capped_backoff(
     # refused. One deliberate departure from the old product: a NEGATIVE initial delay under
     # ``+inf`` used to answer ``-inf``. A negative wait is not a wait, and the cap is strictly
     # safer than the "no backoff" both of them floor to.
-    if not math.isfinite(backoff_multiplier):
+    #
+    # The same ordering, for the same reason, and stated in both places on purpose: this screen
+    # predates the cap's and carried the identical hazard, so fixing only the one a reviewer
+    # named would have left the twin standing in the same function under the same idiom.
+    if not -sys.float_info.max <= backoff_multiplier <= sys.float_info.max:
         return max_delay_s
     # Nothing a growth could change: a zero initial delay keeps the product at zero, and a zero
     # cap keeps the answer there. This has to come AFTER the multiplier is settled -- "zero times

@@ -81,6 +81,11 @@ async def _async_sleep_before_retry(attempt: int, retry: ModelRetryConfig) -> No
     multiplier ** (attempt - 1))`` this replaces raised ``OverflowError`` for a multiplier the
     spec accepts (``1e308`` on the third attempt, the default ``2.0`` on the 1025th), and raised
     HERE it would replace the turn failure being retried with an unclassified arithmetic error.
+
+    It also settles both non-finite doors rather than one. A cap this loop cannot resolve --
+    ``nan`` or ``-inf`` -- used to leave ``delay > 0`` False, retrying the turn with no wait at
+    all, and ``+inf`` used to reach ``asyncio.sleep(inf)``, a timer that never fires. Both are
+    resolved in the schedule, so this loop's ``delay`` is a number it can always wait on.
     """
     delay = retry_delay_s(
         attempt,

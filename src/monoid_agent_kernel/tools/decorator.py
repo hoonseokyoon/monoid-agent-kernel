@@ -27,6 +27,7 @@ from typing import Any, get_type_hints
 
 from pydantic import ValidationError, create_model
 
+from monoid_agent_kernel.core.json_ingress import exact_text, portable_type_name
 from monoid_agent_kernel.tools.base import (
     ToolContext,
     ToolResult,
@@ -101,7 +102,26 @@ def _spec_from_function(
     model = create_model(f"{fn.__name__.title().replace('_', '')}Args", **fields)
     input_schema = model.model_json_schema()
 
-    tool_id = id or fn.__name__
+    # `exact_text` is TOTAL -- it answers a string for anything -- and that is right where it
+    # publishes, wrong here. Placed alone in front of `ToolSpec.id` it also converted values that
+    # `normalize_tool_spec`'s `_required_text` used to REFUSE, so `@tool(id=123)` registered as
+    # `"123"` and `@tool(id=object())` registered as `"<object object at 0x...>"` -- a MEMORY
+    # ADDRESS, different every run, carried into `capability` too by the `capability or tool_id`
+    # below and so into any approval policy keyed on it. A normalizer standing in front of a
+    # validator answers the question the validator was going to ask, and the validator never runs.
+    #
+    # So the type is decided here and only the base value is taken after. Rejecting rather than
+    # deferring to `normalize_tool_spec` because a decoration-time raise names the `@tool` line,
+    # and because the id is used before that check exists -- `capability or tool_id`.
+    #
+    # `exact_text` stays: it is the reason this line was touched at all. `normalize_unicode_scalars`
+    # deliberately returns `str` subclasses AS THEY ARRIVED (it carries `_LegacyPathPattern` on
+    # purpose), so before it, a subclass whose `__str__` lies about the id survived all the way
+    # through `normalize_tool_spec` intact. `isinstance` and not `type(id) is str` for exactly that
+    # reason: a subclass is a string and is accepted, then reduced to its base value.
+    if id is not None and not isinstance(id, str):
+        raise TypeError(f"@tool id must be a string, not {portable_type_name(id)}")
+    tool_id = exact_text(id or fn.__name__)
     tool_description = description or (inspect.getdoc(fn) or "").split("\n", 1)[0]
 
     def validated_kwargs(args: dict[str, Any]) -> dict[str, Any] | ToolResult:

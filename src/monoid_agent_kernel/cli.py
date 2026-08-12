@@ -24,7 +24,7 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     StaticRuntimeConfigProvider,
 )
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import loads_json_ingress, portable_type_name
 from monoid_agent_kernel.reference.backend.http import create_backend_server
 from monoid_agent_kernel.reference.backend.service import RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenManager
@@ -483,7 +483,7 @@ def run(
             closer = getattr(model_adapter, "close", None)
             if not callable(closer):
                 raise click.ClickException(
-                    f"model adapter {type(model_adapter).__name__} exposes open() without a "
+                    f"model adapter {portable_type_name(model_adapter)} exposes open() without a "
                     "callable close(); nothing would release what open() allocates"
                 )
             # Reported the way every other startup failure is. These two calls sit below the

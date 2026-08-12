@@ -47,6 +47,9 @@ from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
+    MAX_PORTABLE_CONTAINER_DEPTH,
+    exact_elements,
+    exact_items,
     exact_text,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -378,17 +381,20 @@ class DefaultRedactor:
         if isinstance(value, str):
             return policy.redact_text(value)
         if isinstance(value, Mapping):
+            # `exact_text` and `exact_items`, not `str(key)` and `value.items()`: the
+            # key answering `lower()` decides whether this field is a secret, and the
+            # mapping answering `items()` decides which fields are judged at all.
             return {
-                str(key): (
+                exact_text(key): (
                     policy.replacement
-                    if policy.names_a_secret(str(key))
+                    if policy.names_a_secret(exact_text(key))
                     else self.redact(item, policy=policy)
                 )
-                for key, item in value.items()
+                for key, item in exact_items(value)
             }
         # `str` is a Sequence, and bytes have no text semantics we may assume, so both are excluded.
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return [self.redact(item, policy=policy) for item in value]
+            return [self.redact(item, policy=policy) for item in exact_elements(value)]
         return value
 
 
@@ -759,7 +765,12 @@ def content_length(value: Any) -> int | None:
 # otherwise turn a bad payload into a failed call. `core.tool_approval` has the same-named function
 # with the same shape; bounding one and not the other is precisely the twin-miss this release keeps
 # finding, and this side fires *earlier* -- during the model-call publish, before tool dispatch.
-MAX_JSONISH_DEPTH = 64
+# Imported rather than spelled again -- three sites bound the same model-authored
+# argument, and the shared constant is what keeps them from drifting apart. This site
+# ELIDES where the other two raise, which is deliberate and explained below: a marker is
+# what a digest wants, and it is also what makes a depth cap dangerous on a cyclic input,
+# so the cycle guard below is not optional here the way it is where the bound raises.
+MAX_JSONISH_DEPTH = MAX_PORTABLE_CONTAINER_DEPTH
 
 # What replaces a subtree past the bound. A marker rather than a raise: this runs inside digest and
 # observer publication, where the caller wants an identifier for the payload, not an exception.
@@ -1576,7 +1587,9 @@ def redacted_fields_or_none(
     if not isinstance(redacted, Mapping):
         return None
     try:
-        normalized = normalize_json_ingress({str(key): value for key, value in redacted.items()})
+        normalized = normalize_json_ingress(
+            {exact_text(key): value for key, value in exact_items(redacted)}
+        )
     except Exception:
         return None
     return normalized if isinstance(normalized, Mapping) else None

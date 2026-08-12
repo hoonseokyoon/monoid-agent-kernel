@@ -36,9 +36,13 @@ from support.hostile_scalars import (
     ExplodingComparisons,
     ExplodingText,
     ImpersonatingName,
+    MisreportingItems,
     MisreportingKey,
     MisreportingText,
     ShoutingText,
+    UnderstatedDict,
+    UnderstatedList,
+    UniterableList,
     UnderstatedInteger,
     UnderstatedText,
     hugely_named_object,
@@ -1280,7 +1284,7 @@ def test_the_integer_threshold_reads_the_value_not_the_object() -> None:
     functions up did not, so ``value < 0`` and unary ``-`` were handed to a model-supplied
     object. This one is the worse half: it runs inside event construction, and it is reachable
     past the refusing boundaries, because ``update_plan`` normalizes with the default
-    ``refuse_unportable_scalars=False``.
+    ``refuse_unportable=False``.
 
     Both directions, because a subclass can answer wrongly in two ways. Raising ends the run for
     a plain ``5``; understating itself publishes an integer no writer can spell -- and it slipped
@@ -1458,6 +1462,50 @@ def test_a_path_that_claims_to_be_empty_is_still_matched_by_the_operators_patter
     }
     assert public_path(hostile, _REDACTING_POLICY) == REDACTED_PATH
     assert touches_redacted_path({"path": hostile}, _REDACTING_POLICY)
+
+
+def test_a_container_publishes_what_the_record_stored() -> None:
+    """One value, two walks: the ingress copy that is stored and the preview that is published.
+
+    A ``list`` subclass under-reporting ``__len__`` made them disagree -- the record kept one
+    element and the card showed three -- because the two walks ask different questions: ingress
+    sizes with ``len`` and reads indices, the preview takes a slice. Neither question is the
+    value's to answer, and a published record that contradicts the durable one is worse than
+    either being wrong alone.
+    """
+    policy = PermissionPolicy()
+
+    hostile_list = UnderstatedList([1, 2, 3])
+    assert normalize_json_ingress(hostile_list) == [1, 2, 3]
+    assert preview_value("items", hostile_list, policy) == [1, 2, 3]
+
+    # Ordinary key names, because `content` is a content field the preview redacts by design and
+    # this pin is about which entries the walk sees, not about which ones the policy hides.
+    hostile_items = MisreportingItems({"alpha": "kept", "safe": 1})
+    assert normalize_json_ingress(hostile_items) == {"alpha": "kept", "safe": 1}
+    assert preview_value("m", hostile_items, policy) == {"alpha": "kept", "safe": 1}
+
+    # A count derived from `len(value) - len(published)` reports a drop that never happened.
+    hostile_len = UnderstatedDict({"alpha": "kept", "safe": 1})
+    assert preview_value("m", hostile_len, policy) == {"alpha": "kept", "safe": 1}
+
+
+def test_a_list_that_hides_its_own_elements_cannot_switch_the_approval_card_to_open() -> None:
+    """``touches_redacted_path`` walks a list with ``__iter__``; the preview walks it with a slice.
+
+    So a list that iterates as empty answers "this call touches nothing redacted" while still
+    holding the path, ``decision_surface`` turns on, and the card publishes both the operator's
+    redacted path and the file body it was hiding. The container twin of the ``EmptyClaimingPath``
+    pin above, reached through the container instead of through the ``str``.
+    """
+    hostile = UniterableList(["secrets/creds.txt"])
+    arguments = {"source_path": hostile, "content": "PRIVATE KEY BODY"}
+
+    assert touches_redacted_path(arguments, _REDACTING_POLICY)
+
+    published = json.dumps(redact_tool_arguments(arguments, policy=_REDACTING_POLICY))
+    assert "secrets/creds.txt" not in published, published
+    assert "PRIVATE KEY BODY" not in published, published
 
 
 def test_a_key_that_hides_its_own_name_cannot_switch_the_approval_card_to_open() -> None:
@@ -1824,13 +1872,13 @@ def test_a_type_that_answers_for_its_own_name_cannot_escape_the_refusal() -> Non
     """
     for hostile in HOSTILE_NAMED_TYPES:
         with pytest.raises(UnportableScalarError):
-            normalize_json_ingress({"a": hostile()}, refuse_unportable_scalars=True)
+            normalize_json_ingress({"a": hostile()}, refuse_unportable=True)
 
 
 def test_the_preview_names_a_type_without_letting_it_answer() -> None:
     """The same read, past the refusing boundaries and inside event construction.
 
-    `update_plan` normalizes with the default `refuse_unportable_scalars=False`, so these envelopes
+    `update_plan` normalizes with the default `refuse_unportable=False`, so these envelopes
     are what a Python-object value meets with no boundary in front of it; a raise here ends the run.
     """
     policy = PermissionPolicy()
@@ -1870,7 +1918,7 @@ def test_a_published_type_name_is_bounded_like_every_other_published_string() ->
     assert len(redacted_value(hugely_named_object(10_000))["type"]) <= 64
 
     with pytest.raises(UnportableScalarError) as refusal:
-        normalize_json_ingress({"a": huge}, refuse_unportable_scalars=True)
+        normalize_json_ingress({"a": huge}, refuse_unportable=True)
     assert len(str(refusal.value)) <= 160, "the refusal message carries the name unbounded"
 
 

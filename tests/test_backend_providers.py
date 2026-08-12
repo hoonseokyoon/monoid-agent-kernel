@@ -15,6 +15,7 @@ from support.backend_harness import (
     _token_manager,
     _workspace,
     eventually,
+    wait_for_durable_status,
     fake_tool_call,
     json,
     pytest,
@@ -266,6 +267,7 @@ def test_backend_resume_carries_providers(tmp_path: Path) -> None:
     run_id, token = submission.run_id, submission.run_token
     assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
     assert eventually(lambda: backend1._record(run_id).state.value == "awaiting_input")
+    wait_for_durable_status(run_root, run_id, where=lambda s: s["state"] == "awaiting_input")
 
     # Fresh backend (empty _records) with its own provider instance resumes the run, then a
     # follow-up triggers a skill call that must resolve against the re-attached provider.

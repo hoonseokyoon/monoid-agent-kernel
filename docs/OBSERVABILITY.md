@@ -125,7 +125,11 @@ Not carried:
   and two of these markers are published where the budget cannot refuse them, so the name was the
   one unbounded term in a bounded payload. The name is read off the type's own slot rather than
   asked for, so a class that answers `__name__` for itself neither widens this field nor raises
-  while an event is being built.
+  while an event is being built. That now holds wherever a type is named and not only in these
+  markers: every remaining site reads the name through the same bounded reader, and an AST census
+  over the package holds it there. Three sites are exempt and each is named in that census — the
+  reader's own implementation, which cannot read itself, and two reads of an integrator's own
+  function object that never leave the process that owns it.
 
 Carried, deliberately:
 

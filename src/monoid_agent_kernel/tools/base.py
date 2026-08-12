@@ -9,7 +9,7 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
 from monoid_agent_kernel.core.json_ingress import (
-    UnportableScalarError,
+    UnportableValueError,
     normalize_json_ingress,
     normalize_unicode_scalars,
 )
@@ -95,8 +95,8 @@ def normalize_tool_result(result: ToolResult) -> ToolResult:
         # pass the normalizer untouched and crash `json.dumps` at the transcript write, which sits
         # before `tool.call.finished`: the run died as `internal_error` with no observation the
         # model could correct. The transcript stays raw by contract, so the boundary is the fix.
-        content = normalize_json_ingress(result.content, refuse_unportable_scalars=True)
-    except UnportableScalarError as exc:
+        content = normalize_json_ingress(result.content, refuse_unportable=True)
+    except UnportableValueError as exc:
         raise ToolExecutionError(
             f"tool result content is not portable JSON: {exc}",
             error_code="tool_result_unportable",

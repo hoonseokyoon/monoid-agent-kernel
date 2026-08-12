@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import io
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,14 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from support.hostile_scalars import (
+    AgreeableFloat,
+    ExplodingComparisons,
+    ExplodingConversion,
+    ExplodingFloatComparisons,
+    ExplodingIntConversion,
+    MisreportingFloat,
+)
 from support.http import serving
 from support.runtime import runtime_config, runtime_provider
 
@@ -975,10 +984,12 @@ def test_the_schedule_answers_what_the_expression_it_replaced_answered() -> None
 
     Three outcomes, each asserted rather than tolerated: the new code must never raise; where
     the old expression raised (`OverflowError`, this helper's whole reason) the new one answers;
-    and where both answer they agree -- except for one named family, which is checked to BE that
-    family rather than waved through.
+    and where both answer they agree -- except for two named families, each checked to BE that
+    family rather than waved through, and partitioned before either rule runs because a cell can
+    belong to both.
     """
     import math
+    import sys
 
     from monoid_agent_kernel.providers._common import capped_backoff
 
@@ -1004,28 +1015,126 @@ def test_the_schedule_answers_what_the_expression_it_replaced_answered() -> None
                         continue
                     divergences.append((attempt, initial, cap, multiplier, answer, open_coded))
 
-    # Every remaining disagreement is ONE family and it is named: a negative initial delay,
-    # which is not a wait any schedule can mean. The new answer is `min(cap, initial)` (or the
-    # cap when the multiplier is `+inf`), the old one was the more-negative product; both are
-    # below zero, so both call sites floor them identically -- the outbox through
-    # `uniform(0, max(0.0, ceiling))` and the retry loops through `if delay > 0`. Asserted as a
-    # property of every divergence, so a divergence of any OTHER shape reddens this test.
-    for attempt, initial, cap, multiplier, answer, open_coded in divergences:
+    # The divergences are two families, and they are PARTITIONED before either is judged --
+    # because they overlap. A negative initial delay under a NaN cap belongs to both, and one
+    # loop carrying both rules would let whichever ran first absolve it.
+    finite_cap = [row for row in divergences if math.isfinite(row[2])]
+    unusable_cap = [row for row in divergences if not math.isfinite(row[2])]
+    # Family one, and the two rules are the ones it always carried, cell for cell: a negative
+    # initial delay, which is not a wait any schedule can mean. The new answer is
+    # `min(cap, initial)` (or the cap when the multiplier is `+inf`), the old one was the
+    # more-negative product; both are below zero, so both call sites floor them identically --
+    # the outbox through `uniform(0, max(0.0, ceiling))` and the retry loops through
+    # `if delay > 0`. That these still hold unchanged is the evidence that the finite half of the
+    # schedule did not move when the cap arm was added.
+    for attempt, initial, cap, multiplier, answer, open_coded in finite_cap:
         assert initial < 0.0, (attempt, initial, cap, multiplier, answer, open_coded)
         assert max(0.0, answer) == max(0.0, open_coded) or answer == cap, (
             attempt, initial, cap, multiplier, answer, open_coded,
         )
+    # Family two is the deliberate departure, and its oracle is the SUBSTITUTION ITSELF rather
+    # than some weaker property that would also admit a different rule: a cap that is not a
+    # number is answered exactly as though the caller had written `sys.float_info.max`. What the
+    # open-coded expression did instead was keep it -- `min(nan, x)` is `nan` and `min(-inf, x)`
+    # is `-inf` -- and neither is a wait; both floor to no backoff at every caller, which is the
+    # unthrottled resend the multiplier arm was fixed to prevent, reached through the cap.
+    for attempt, initial, cap, multiplier, answer, open_coded in unusable_cap:
+        assert same(answer, capped_backoff(attempt, initial, sys.float_info.max, multiplier)), (
+            attempt, initial, cap, multiplier, answer, open_coded,
+        )
+    # Neither family may be empty: a rule quantified over an empty list proves nothing, and this
+    # test's whole job is to be unable to pass by comparing nothing.
+    assert finite_cap and unusable_cap
     # Counts, so a lattice or a schedule that quietly stops exercising a branch cannot pass by
     # comparing nothing. 12**3 * 4 = 6912 cells.
     assert fixed + agreed + len(divergences) == 6912
-    assert (fixed, agreed, len(divergences)) == (576, 6226, 110)
-    # And the two cells behind the two review rounds, named outright rather than left to counts.
+    assert (fixed, agreed, len(finite_cap), len(unusable_cap)) == (576, 5040, 99, 1197)
+    # And the cells behind each review round, named outright rather than left to counts.
     assert capped_backoff(4, 1.0, 300.0, nan) == 300.0  # int(nan) raised here
     assert capped_backoff(4, 0.0, 300.0, inf) == 300.0  # the zero-delay exit answered 0.0 here
+    assert capped_backoff(4, 1.0, nan, 2.0) == 8.0  # answered `nan`: no wait at all
+    assert capped_backoff(4, 1.0, -inf, 2.0) == 8.0  # answered `-inf`: the same no wait
+
+
+def test_no_ordering_in_the_schedule_is_answered_by_the_value_being_ordered() -> None:
+    """Four controls, seven orderings, and a numeric subclass may answer any of them.
+
+    ``a <= b`` gives the reflected operand priority when its type is a proper subclass, so an
+    override is consulted BEFORE the constant it is compared against. A retry policy field is a
+    plain unvalidated attribute, so a subclass reaches every one of these orderings -- and a raise
+    lands inside a schedule that is already recovering from a send failure. At the outbox it lands
+    between ``sender.send`` and ``record_outbox_result``, which loses the receipt for a side
+    effect that already happened.
+
+    Driven per ARGUMENT and per ATTEMPT rather than on the one cell a report named. Measured
+    before the reduction: nine of these fourteen cells raised, spread across all three controls
+    and both operator pairs, and the raising cell for a given control differed by attempt because
+    a different ordering runs on the first attempt than on later ones. A screen fixed at the one
+    reported site would have left eight.
+    """
+    from monoid_agent_kernel.providers._common import capped_backoff, retry_delay_s
+
+    for hostile in (ExplodingComparisons(10), ExplodingFloatComparisons(10.0)):
+        for attempt in (0, 1, 2, 3, 20, 1100):
+            assert capped_backoff(attempt, 1.0, hostile, 2.0) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, 1.0, 10.0, hostile) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, hostile, 10.0, 2.0) >= 0.0, (hostile, attempt)
+            # ...and as the attempt counter itself, which is an ordering too (`max(0, n - 1)`).
+            assert capped_backoff(ExplodingComparisons(attempt), 1.0, 10.0, 2.0) >= 0.0, attempt
+
+    # `retry_delay_s` reads one control of its own, with an ordering, inside a retry handler.
+    assert retry_delay_s(3, 1.0, 10.0, 2.0, ExplodingFloatComparisons(0.5)) >= 0.0
+    assert retry_delay_s(3, 1.0, 10.0, 2.0, ExplodingComparisons(0)) >= 0.0
+
+    # Reading the BASE SLOT, not converting. `float(value)` and `int(value)` dispatch to
+    # `__float__`/`__int__`, which a subclass may override just as freely as an ordering -- so a
+    # reduction written with the constructors would trade one dispatch for another and every
+    # assertion above would still pass. These are the cells that tell the two apart.
+    for hostile in (ExplodingConversion(10.0), ExplodingIntConversion(10)):
+        for attempt in (1, 3, 1100):
+            assert capped_backoff(attempt, 1.0, hostile, 2.0) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, 1.0, 10.0, hostile) >= 0.0, (hostile, attempt)
+            assert capped_backoff(attempt, hostile, 10.0, 2.0) >= 0.0, (hostile, attempt)
+
+
+def test_a_control_that_lies_about_its_ordering_does_not_choose_the_delay() -> None:
+    """The other half, and the harder half: a subclass that answers True rather than raising.
+
+    Exception-safety is not the property. A screen a value can satisfy by agreeing with it is a
+    screen that did not run, and the schedule then answers a delay its own arithmetic never
+    chose. Measured: with a cap answering ``True`` to every ordering, the schedule answered
+    ``1.0`` where its arithmetic owed ``4.0`` -- the cap-resolution screen fired on a cap that
+    never needed resolving, and every later ordering agreed with whatever it was asked.
+
+    The base value is the record, so the answer is the one the arithmetic chose.
+    """
+    from monoid_agent_kernel.providers._common import capped_backoff
+
+    assert capped_backoff(3, 1.0, AgreeableFloat(10.0), 2.0) == 4.0
+    assert capped_backoff(1, 1.0, AgreeableFloat(10.0), 2.0) == 1.0
+    assert capped_backoff(1100, 1.0, AgreeableFloat(10.0), 2.0) == 10.0
+
+    # Counter-arm: an ordinary float answers exactly the same, so the reduction is invisible to
+    # every caller that was never hostile.
+    assert [capped_backoff(n, 1.0, 10.0, 2.0) for n in (1, 3, 1100)] == [1.0, 4.0, 10.0]
+    # ...and a non-numeric number-like object is NOT reduced and NOT refused -- this narrows what
+    # a builtin subclass may do and adds no rejection of its own.
+    assert capped_backoff(3, 1.0, Decimal(10), 2.0) == 4.0
+
+    # The conversion slot lies rather than raises: `float(value)` would take 999.0 as the cap and
+    # answer a schedule nobody configured, while the base slot answers the 10.0 it stores.
+    assert capped_backoff(1100, 1.0, MisreportingFloat(10.0), 2.0) == 10.0
 
 
 def test_jitter_cannot_hand_a_waiter_a_non_finite_delay() -> None:
-    """The schedule answers with a number, and every one of its inputs is validated finite.
+    """The schedule answers with a number, and jitter must not be able to take that away.
+
+    Not because the inputs are screened: everything that ARRIVES AS JSON is validated finite
+    (`_model_control_number`), but `ModelRetryConfig` has no `__post_init__`, so that is not the
+    guard it reads as -- the cap and multiplier arms above are driven with exactly the values
+    validation would have refused, through callers that build their config in Python. What holds
+    unconditionally is downstream of it: `capped_backoff` answers a finite number for every
+    input, and the sum below saturates rather than leaving the range.
 
     Jitter is added ON TOP of the cap -- deliberately, because the moment a herd most needs
     smearing is the moment every member is sitting at `max_delay_s` -- and float addition
