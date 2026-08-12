@@ -197,6 +197,79 @@ def portable_type_name(value: Any) -> str:
     return portable_class_name(type(value))
 
 
+_BASE_DICT_ITEMS = dict.items
+_BASE_DICT_LEN = dict.__len__
+_BASE_LIST_LEN = list.__len__
+_BASE_LIST_ITEM = list.__getitem__
+_BASE_TUPLE_LEN = tuple.__len__
+_BASE_TUPLE_ITEM = tuple.__getitem__
+_BASE_STR_LEN = str.__len__
+_BASE_BYTES_LEN = bytes.__len__
+
+
+def exact_items(mapping: Any) -> Any:
+    """A mapping's own entries, so a subclass does not choose which ones a walk sees.
+
+    The container generation of the rule ``exact_text`` and ``portable_class_name`` already apply
+    one level down, and it needs a different argument than they did. Theirs was "a writer spells
+    the base value, so a guard must read the base value" -- measured, that does not settle this
+    one: ``json.dumps`` reads a ``list`` subclass's real storage and takes a ``dict`` subclass's
+    overridden ``items()``, so the two halves of "what will a writer spell" answer opposite ways.
+
+    What settles it is that the COPY is the record. ``normalize_json_ingress`` is the last place a
+    caller's object is seen; the checkpoint's ``asdict``, the transcript, the preview and the
+    operator's redact patterns all read what the walk produced. A container that answers one way
+    here and another way to the walk that publishes it does not make one of them wrong -- it makes
+    the published record contradict the durable one, which is the failure neither walk can detect.
+
+    Only ``dict`` has a base slot to read. A third-party ``Mapping`` implements ``items`` as its
+    storage rather than as an override of one, so asking it is the only read there is.
+    """
+
+    if isinstance(mapping, dict):
+        return _BASE_DICT_ITEMS(mapping)
+    return mapping.items()
+
+
+def exact_length(container: Any) -> int:
+    """A container's own size. See :func:`exact_items` for why it is not asked for."""
+
+    if isinstance(container, list):
+        return _BASE_LIST_LEN(container)
+    if isinstance(container, tuple):
+        return _BASE_TUPLE_LEN(container)
+    if isinstance(container, dict):
+        return _BASE_DICT_LEN(container)
+    if isinstance(container, str):
+        return _BASE_STR_LEN(container)
+    if isinstance(container, bytes):
+        return _BASE_BYTES_LEN(container)
+    return len(container)
+
+
+def exact_item(sequence: Any, index: int) -> Any:
+    """A sequence's own element at ``index``. See :func:`exact_items`."""
+
+    if isinstance(sequence, list):
+        return _BASE_LIST_ITEM(sequence, index)
+    if isinstance(sequence, tuple):
+        return _BASE_TUPLE_ITEM(sequence, index)
+    return sequence[index]
+
+
+def exact_elements(sequence: Any, stop: int | None = None) -> tuple[Any, ...]:
+    """A sequence's own elements, up to ``stop`` of them.
+
+    ``stop`` exists because a caller with a width cap already looks at only the first few, and
+    reading the base storage should not turn a twenty-element preview into a million-element copy.
+    """
+
+    size = exact_length(sequence)
+    if stop is not None and stop < size:
+        size = stop
+    return tuple(exact_item(sequence, index) for index in range(size))
+
+
 def normalize_unicode_scalars(value: str) -> str:
     """Return ``value`` with surrogate pairs combined and lone surrogates replaced.
 
@@ -285,6 +358,9 @@ def normalize_json_ingress(
 
     ``dict`` keys are normalized as well as values.  If two keys become equal after
     normalization, the input is rejected rather than silently overwriting one meaning.
+    The copy's *shape* is read through the base slots (:func:`exact_items`, :func:`exact_length`,
+    :func:`exact_item`) rather than asked of the container, because this copy is what every later
+    reader gets and a subclass answering for itself was writing the record.
     Tuples become JSON arrays. Non-container values outside the JSON domain are left alone by
     default; the boundaries where such a value can only crash a later writer — the four
     Python-object ingress points: a tool result's content, ``emit_artifact`` metadata, and a
@@ -318,7 +394,7 @@ def normalize_json_ingress(
             destination[slot] = copied
             prepared: list[tuple[Any, Any]] = []
             seen: set[Any] = set()
-            for key, child in source.items():
+            for key, child in exact_items(source):
                 if not isinstance(key, str):
                     raise ValueError("JSON object keys must be strings")
                 normalized_key = normalize_unicode_scalars(key)
@@ -330,11 +406,17 @@ def normalize_json_ingress(
                 pending.append((child, copied, normalized_key))
             continue
 
-        copied_list: list[Any] = [None] * len(source)
+        # One read of the size, and the elements from the same base slots. Asked of the value, the
+        # two questions have no consistent answer: a `__len__` reporting more than it holds sized
+        # the copy past the last real index and the walk raised a raw `IndexError` -- out of a
+        # boundary whose whole job is to hand back a classified refusal, and reachable from any
+        # custom or MCP tool handler.
+        size = exact_length(source)
+        copied_list: list[Any] = [None] * size
         memo[source_id] = copied_list
         destination[slot] = copied_list
-        for index in range(len(source) - 1, -1, -1):
-            pending.append((source[index], copied_list, index))
+        for index in range(size - 1, -1, -1):
+            pending.append((exact_item(source, index), copied_list, index))
 
     return root[0]
 

@@ -12,8 +12,13 @@ import pytest
 
 from support.hostile_scalars import (
     ExplodingComparisons,
+    MisreportingItems,
     MisreportingKey,
+    OverstatedList,
+    SubstitutingList,
+    UnderstatedDict,
     UnderstatedInteger,
+    UnderstatedList,
     UnderstatedText,
     UniterableText,
 )
@@ -102,6 +107,44 @@ def test_json_ingress_is_iterative_and_preserves_graph_topology() -> None:
     assert normalized["left"] is normalized["right"]
     assert normalized["left"] == {"value": None}
     assert normalized["cycle"][0] is normalized["cycle"]
+
+
+def test_a_container_does_not_decide_what_the_walk_copies() -> None:
+    """The copy IS the record, so the container that produced it does not get to describe it.
+
+    Every later reader sees what this walk copied and never the original -- the checkpoint's
+    ``asdict``, the transcript, the preview, the operator's redact patterns -- so a ``dict`` or
+    ``list`` subclass overriding ``items``, ``__len__`` or ``__getitem__`` was writing the record.
+    The scalar generations' argument does not carry here: measured, ``json.dumps`` reads a ``list``
+    subclass's real storage and takes a ``dict`` subclass's overridden ``items()``, so "what will a
+    writer spell" answers opposite ways on the two halves and settles neither.
+    """
+    assert normalize_json_ingress(UnderstatedList([1, 2, 3])) == [1, 2, 3]
+    assert normalize_json_ingress(SubstitutingList([1, 2])) == [1, 2]
+    assert normalize_json_ingress(MisreportingItems({"content": "SECRET", "safe": 1})) == {
+        "content": "SECRET",
+        "safe": 1,
+    }
+    assert normalize_json_ingress(UnderstatedDict({"content": "SECRET", "safe": 1})) == {
+        "content": "SECRET",
+        "safe": 1,
+    }
+    # Nested, because a child is reached through a different arm of the walk than the root is.
+    assert normalize_json_ingress({"outer": UnderstatedList([1, 2, 3])}) == {"outer": [1, 2, 3]}
+    assert normalize_json_ingress([MisreportingItems({"a": 1, "b": 2})]) == [{"a": 1, "b": 2}]
+
+
+def test_a_container_that_overstates_its_length_cannot_crash_the_boundary() -> None:
+    """``len`` sizes the copy and ``__getitem__`` fills it -- two questions with no consistent answer.
+
+    The raw ``IndexError`` came out of ``normalize_tool_result``, which converts
+    ``UnportableScalarError`` and nothing else, so an unclassified exception escaped the boundary
+    whose whole job is to classify. That is the container twin of the crash the scalar refusal
+    closed, and it is reachable from any custom or MCP tool handler.
+    """
+    result = normalize_tool_result(ToolResult(ok=True, content={"items": OverstatedList([1, 2])}))
+
+    assert result.content == {"items": [1, 2]}
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])

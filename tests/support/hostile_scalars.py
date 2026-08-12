@@ -181,3 +181,82 @@ class HostileNamedList(list, metaclass=RaisingNameAccess):
 
 class HostileNamedDict(dict, metaclass=RaisingNameAccess):
     """The dict half of the same pair."""
+
+
+# ---------------------------------------------------------------------------
+# Containers that answer for their own CONTENTS. The scalar generations above are defeated by
+# reading the base value; a container is defeated the same way, but the argument for it is not the
+# same. `json.dumps` spells an `int` subclass by its base value, so "what will a writer spell"
+# settles the scalar case -- and it does NOT settle this one: measured, `json.dumps` of a `list`
+# subclass reads the real storage while `json.dumps` of a `dict` subclass takes the overridden
+# `items()`. The two halves answer opposite ways. What settles it instead is that the COPY is the
+# record: the original never reaches a writer, and every later reader -- the checkpoint, the
+# transcript, the preview, the operator's redact patterns -- sees what the walk copied.
+# ---------------------------------------------------------------------------
+
+
+class UnderstatedList(list):
+    """Reports one element however many it holds.
+
+    The ingress walk sizes the copy with `len` and then reads that many indices, so the copy is a
+    prefix and the rest is dropped in silence -- while the preview slices the real storage and
+    publishes all of it. The stored record and the published one disagree about what happened.
+    """
+
+    def __len__(self) -> int:
+        return 1
+
+
+class OverstatedList(list):
+    """Reports more elements than it holds.
+
+    `len` sizes the copy and `__getitem__` fills it, so the walk's two questions disagree and it
+    raises `IndexError` -- unclassified, out of a boundary whose whole job is to classify.
+    """
+
+    def __len__(self) -> int:
+        return 5
+
+
+class SubstitutingList(list):
+    """Answers every index and every slice with something other than what it stores."""
+
+    def __getitem__(self, index: Any) -> Any:
+        return "CLEAN"
+
+
+class UniterableList(list):
+    """Iterates as empty while holding its elements.
+
+    `touches_redacted_path` walks a list with `__iter__` and the preview walks it with a slice, so
+    this is the shape where the escape hatch and the publication disagree about whether the
+    operator's pattern was touched at all -- the container twin of `EmptyClaimingPath`.
+    """
+
+    def __iter__(self) -> Any:
+        return iter(())
+
+
+class MisreportingItems(dict):
+    """Answers `items()` with a mapping other than the one it stores."""
+
+    def items(self) -> Any:  # type: ignore[override]
+        return [("safe", 1)]
+
+
+class UnderstatedDict(dict):
+    """Answers `len()` with fewer keys than `items()` yields, so a walk deriving a truncation count
+    from the difference reports a drop that never happened."""
+
+    def __len__(self) -> int:
+        return 1
+
+
+HOSTILE_CONTAINERS = (
+    UnderstatedList([1, 2, 3]),
+    OverstatedList([1, 2]),
+    SubstitutingList([1, 2]),
+    UniterableList([1, 2]),
+    MisreportingItems({"content": "SECRET", "safe": 1}),
+    UnderstatedDict({"content": "SECRET", "safe": 1}),
+)

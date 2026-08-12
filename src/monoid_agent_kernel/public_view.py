@@ -6,7 +6,13 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from monoid_agent_kernel.core.json_ingress import exact_text, portable_type_name
+from monoid_agent_kernel.core.json_ingress import (
+    exact_elements,
+    exact_items,
+    exact_length,
+    exact_text,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     PUBLIC_JOB_SCHEMA,
@@ -885,7 +891,7 @@ def public_mapping(
     collisions: dict[str, int] = {}
     payload_budget.charge(2)  # the braces
     stopped = False
-    for key, value in values.items():
+    for key, value in exact_items(values):
         # `exact_text`, not `str`: a key is model-authored text too, and the callbacks judge it by
         # `key.lower()` (content redaction, secret masking, the prose branch). `str(key)` looks
         # like it already normalizes, and does -- through `type(key).__str__`, which a subclass
@@ -906,7 +912,7 @@ def public_mapping(
         # collision handling matters most here: narration and the activity feed read these keys by
         # name, and overwriting one both destroyed it and under-counted the loss, because the
         # entry it replaced had already been counted as published.
-        dropped_keys = len(values) - len(published)
+        dropped_keys = exact_length(values) - len(published)
         _publish_truncated_keys(published, dropped_keys, payload_budget)
     return published
 
@@ -1083,7 +1089,7 @@ def _preview_value(
         preview: dict[str, Any] = {}
         collisions: dict[str, int] = {}
         stopped = False
-        for child_key, child_value in list(value.items())[:PREVIEW_MAX_KEYS]:
+        for child_key, child_value in list(exact_items(value))[:PREVIEW_MAX_KEYS]:
             # The key is model-authored text too, and it was the one string this function published
             # at any length: the same 30 KB file body arrived ``{"redacted": true}`` in the value
             # position and verbatim in the key position, past both the byte cap and
@@ -1132,7 +1138,7 @@ def _preview_value(
         # this replaced called that loss acceptable because only nested dicts could width-cap and
         # no consumer reads those by key, which the payload budget made false the moment the top
         # level could cut too.
-        dropped_keys = len(value) - len(preview)
+        dropped_keys = exact_length(value) - len(preview)
         if stopped or dropped_keys > 0:
             _publish_truncated_keys(preview, dropped_keys, _payload_budget)
         return preview
@@ -1143,7 +1149,7 @@ def _preview_value(
         # secret-named list is already masked whole before reaching here; what this carries is the
         # mask *down* to dicts inside the list, so ``{"headers": [{"api_key": ...}]}`` still masks.
         items: list[Any] = []
-        for item in value[:PREVIEW_MAX_ITEMS]:
+        for item in exact_elements(value, PREVIEW_MAX_ITEMS):
             if not _payload_budget.charge(2):  # the separator
                 break
             child = _preview_value(
@@ -1170,8 +1176,8 @@ def _preview_value(
         # (This comment used to claim the opposite, and outlived the fix that made it false.)
         # ``len(value) - len(items)`` covers the width cap's excess and the budget's stop with one
         # number; the ``list_marker=False`` caller reads the same difference off the root itself.
-        if list_marker and len(value) > len(items):
-            marker = {"truncated_items": len(value) - len(items)}
+        if list_marker and exact_length(value) > len(items):
+            marker = {"truncated_items": exact_length(value) - len(items)}
             _charge_terminal_marker(_payload_budget, marker)
             items.append(marker)
         return items
@@ -1274,7 +1280,9 @@ def redacted_value(value: Any) -> dict[str, Any]:
         # which reads as "something small was withheld".
         return {"redacted": True, "type": "str", "bytes": len(exact_text(value).encode("utf-8"))}
     if isinstance(value, bytes):
-        return {"redacted": True, "type": "bytes", "bytes": len(value)}
+        # The count through the base slot, for the same reason as the `str` arm above:
+        # a `bytes` subclass reporting one byte reads as "something small was withheld".
+        return {"redacted": True, "type": "bytes", "bytes": exact_length(value)}
     # The type name is the whole remaining content of this marker, and it was read the one way that
     # lets the value pick it. Same rule as the `bytes` count two lines up, one level further out.
     return {"redacted": True, "type": portable_type_name(value)}
@@ -1355,11 +1363,19 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
         if isinstance(value, Mapping):
             # `exact_text` for the same reason the traversal uses it: `lowered` below decides
             # whether this key names a path, and a `str` subclass answers `lower()` for itself.
-            return any(walk(item, exact_text(child), depth + 1) for child, item in value.items())
+            return any(
+                walk(item, exact_text(child), depth + 1)
+                for child, item in exact_items(value)
+            )
         if isinstance(value, list):
             # The parent key carries down: list items have no key of their own, which is the same
             # reason ``preview_value`` reuses it.
-            return any(walk(item, key, depth + 1) for item in value)
+            # Through the base slot, and not `for item in value`: this walk and the
+            # one that publishes asked a list two different questions -- `__iter__`
+            # here, a slice there -- so a list iterating as empty while still holding
+            # the path answered "nothing redacted is touched", turned the decision
+            # surface on, and published both the operator's path and the file body.
+            return any(walk(item, key, depth + 1) for item in exact_elements(value))
         lowered = key.lower()
         return (
             _is_path_field(lowered)
@@ -1367,7 +1383,7 @@ def touches_redacted_path(values: Mapping[str, Any], policy: PermissionPolicy) -
             and _is_path_redacted(value, policy)
         )
 
-    return any(walk(value, exact_text(key), 0) for key, value in values.items())
+    return any(walk(value, exact_text(key), 0) for key, value in exact_items(values))
 
 
 def _is_path_field(lowered_key: str) -> bool:

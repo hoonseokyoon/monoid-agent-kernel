@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
-from monoid_agent_kernel.core.json_ingress import exact_text
+from monoid_agent_kernel.core.json_ingress import exact_elements, exact_items, exact_text
 from monoid_agent_kernel.core.model_io import DEFAULT_SECRET_KEY_PARTS, REDACTION_PLACEHOLDER
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -294,9 +294,11 @@ def _jsonish(value: Any, _depth: int = 0) -> Any:
         # the stored `arguments` and the `approval_key` preimage are keyed by. `str(key)` routes
         # through `type(key).__str__`, so a key spelling `api_key` and answering `harmless`
         # published its value unmasked -- measured.
-        return {exact_text(key): _jsonish(item, _depth + 1) for key, item in value.items()}
+        return {
+            exact_text(key): _jsonish(item, _depth + 1) for key, item in exact_items(value)
+        }
     if isinstance(value, list | tuple):
-        return [_jsonish(item, _depth + 1) for item in value]
+        return [_jsonish(item, _depth + 1) for item in exact_elements(value)]
     if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)
