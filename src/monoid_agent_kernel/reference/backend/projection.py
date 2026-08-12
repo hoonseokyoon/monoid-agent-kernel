@@ -27,12 +27,14 @@ from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
 )
+from monoid_agent_kernel.core.projections import status_artifact_records_close
 from monoid_agent_kernel.core.subagent_runtime import (
     subagent_diagnostics_from_events,
     validate_descendant_run_id,
 )
 from monoid_agent_kernel.core.trace_context import trace_id_of
 from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.public_view import public_error_message
 from monoid_agent_kernel.reference.backend.content_hydration import hydrate_settled_text
 from monoid_agent_kernel.reference.backend.ports import RunRecordPort
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
@@ -112,6 +114,37 @@ def _status_last_event_seq(status_payload: Mapping[str, Any] | None) -> int:
     return raw if type(raw) is int and raw >= 0 else 0
 
 
+def _status_payload_classification(status_payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The error + failure classification a durable ``status.json`` carries, guarded.
+
+    The record-is-None branch of ``status()`` serves this so a post-restart operator gets the
+    same answer the live record gave — one vocabulary, both branches. Guarded reads for the
+    same reason ``run_state.py`` guards its event twins: this is disk data, and a truthy
+    string must not become a claim that a failure is retryable.
+    """
+
+    payload = status_payload or {}
+
+    def _text(name: str) -> str:
+        value = payload.get(name)
+        return value if isinstance(value, str) else ""
+
+    def _flag(name: str) -> bool:
+        value = payload.get(name)
+        return value if type(value) is bool else False
+
+    http_status = payload.get("http_status")
+    return {
+        "error": _text("error"),
+        "error_code": _text("error_code"),
+        "retryable": _flag("retryable"),
+        "http_status": http_status if type(http_status) is int else None,
+        "config_recoverable": _flag("config_recoverable"),
+        "provider_error_code": _text("provider_error_code"),
+        "provider_retried": _flag("provider_retried"),
+    }
+
+
 def _committed_event_highwatermark(run_dir: Path, advertised: int) -> int:
     """Reconcile a best-effort status watermark with the authoritative committed JSONL tail."""
 
@@ -162,6 +195,10 @@ class RunProjectionService:
             return {
                 "run_id": run_id,
                 **_status_payload_lifecycle(status_payload, run_dir),
+                # status.json carries the classification a parked failure wrote, so the
+                # operator who restarts the backend gets the same top-level answer the live
+                # record served — not a payload with no error slot at all.
+                **_status_payload_classification(status_payload),
                 "last_event_seq": last_event_seq,
                 "run_dir": str(run_dir),
                 "status_file": status_payload,
@@ -182,6 +219,14 @@ class RunProjectionService:
             "last_event_type": record.last_event_type,
             "error": record.error,
             "error_code": record.error_code,
+            # What the park knew — the whole classification, one vocabulary. The driver
+            # records it and does not act on it, so this surface is the only place it
+            # becomes useful to anyone.
+            "retryable": record.retryable,
+            "http_status": record.http_status,
+            "config_recoverable": record.config_recoverable,
+            "provider_error_code": record.provider_error_code,
+            "provider_retried": record.provider_retried,
             "final_output": _json_safe(
                 record.last_final_output
                 if record.last_final_output is not None
@@ -201,6 +246,11 @@ class RunProjectionService:
                 "ready": False,
                 "error": record.error,
                 "error_code": record.error_code,
+                "retryable": record.retryable,
+                "http_status": record.http_status,
+                "config_recoverable": record.config_recoverable,
+                "provider_error_code": record.provider_error_code,
+                "provider_retried": record.provider_retried,
             }
         result = record.result
         diff_text = (
@@ -215,8 +265,20 @@ class RunProjectionService:
             "ready": True,
             "final_text": result.final_text,
             "final_output": _json_safe(result.final_output),
-            "error": result.error,
+            # ``AgentRunResult.error`` is deliberately raw: the embedding application is inside
+            # the trust boundary. This response is not — the route hands this dict to
+            # ``_write_json`` unchanged — so the filter lands here, on the one error expression
+            # that did not already come pre-filtered from its writer (``record.error`` on the
+            # not-ready branch above, and ``metrics["error"]`` below, both go through
+            # ``public_error_message`` in ``run_state.py``/``loop_phases.py``). The in-process
+            # result object keeps the whole message.
+            "error": public_error_message(result.error),
             "error_code": result.error_code,
+            "retryable": record.retryable,
+            "http_status": record.http_status,
+            "config_recoverable": record.config_recoverable,
+            "provider_error_code": record.provider_error_code,
+            "provider_retried": record.provider_retried,
             "run_dir": str(result.run_dir),
             "manifest_path": str(result.run_dir / "manifest.json"),
             "diff_path": str(result.diff_path),
@@ -359,6 +421,7 @@ class RunProjectionService:
                 continue
             run_id = meta.get("run_id") or run_dir.name
             record = self._context.active_record(run_id)
+            status_payload: dict[str, Any] | None = None
             if record is not None:
                 lifecycle = {
                     **_record_lifecycle_payload(record),
@@ -368,7 +431,6 @@ class RunProjectionService:
                     ),
                 }
             else:
-                status_payload: dict[str, Any] | None = None
                 status_path = run_dir / "status.json"
                 if status_path.exists():
                     try:
@@ -388,6 +450,13 @@ class RunProjectionService:
                 record is None
                 and not (run_dir / "failure.json").exists()
                 and checkpoint_store is not None
+                # The same artifact fact ``attempt_resume``'s closed-run guard consults —
+                # one function, both callers. A run that CLOSED limited keeps a
+                # NON-terminal park checkpoint by design, so without this the row said
+                # ``recoverable: true`` beside ``terminal: true`` and resume_run refused
+                # what the listing advertised. No extra I/O: the payload above is the same
+                # small JSON this row already read.
+                and not status_artifact_records_close(status_payload)
             ):
                 stored = checkpoint_store.latest(run_id)
                 recoverable = stored is not None and not stored.checkpoint.terminal

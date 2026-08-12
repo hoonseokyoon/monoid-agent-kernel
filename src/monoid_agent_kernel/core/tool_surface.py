@@ -719,7 +719,14 @@ def _tool_spec_payload(tool: ToolSpec) -> dict[str, Any]:
         "id": tool.id,
         "exported_name": tool.exported_name,
         "description": tool.description,
-        "input_schema": tool.input_schema,
+        # The transcript is a *record*, and a record substitutes what portable JSON cannot
+        # carry -- exactly as ``RunManifest.to_json`` and the event writer already do. The
+        # request does not: ``normalize_tool_spec`` keeps a schema's non-finite values so the
+        # provider boundary refuses the call as a classified, config-recoverable bad request.
+        # Without the substitution here, the same schema instead killed the run at the
+        # transcript writer's ``allow_nan=False`` with an anonymous ``internal_error``, one
+        # boundary before the classified refusal and for a durability reason.
+        "input_schema": normalize_json_ingress(tool.input_schema),
         "capability": tool.capability,
         "side_effect": tool.side_effect,
         "path_args": list(tool.path_args),

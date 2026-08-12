@@ -1,0 +1,7478 @@
+"""Machine-diff each semantic fact against every carrier obliged to repeat it.
+
+The recurring defect in this repository is not a wrong value, it is a *missing* one: a fact
+(``config_recoverable``, ``provider_retried``, a usage sub-count) rides N parallel carriers —
+dataclass, checkpoint payload, event data, event schema, wire body, SSE frame, client reader,
+transcript record — and a change binds N-1 of them.  Review finds those one at a time.  This
+module finds them by construction: for each fact family it takes an AUTHORITY (the dataclass
+fields, the ``__init__`` signature, the normalizer's emitted-key domain) and set-diffs it
+against each carrier's key set, so a field added to the authority without a carrier fails here.
+
+Three rules make that census trustworthy:
+
+*Maximal builders, not synthesizers.*  Every family has one hand-written builder
+(``_maximal_suspension``, ``_maximal_adapter_error``, ``_MAXIMAL_USAGE``) with every field set
+to a distinguishable non-default value, plus a reflection guard that diffs the builder's
+coverage against the authority.  A generic type-driven synthesizer would silently skip a new
+field; the guard is what turns a new field into a failure.
+
+*Behavioral where a dict diff is blind.*  A reader that ignores a wire key drops it without
+leaving a trace in any key set, so the reader censuses feed a maximal wire body through the
+real function and diff the *reconstructed attributes*.  That is the only way to see a
+dropped read.
+
+*Aliases are declared, not inferred.*  A fact is renamed at three hops (wire ``error_code``
+carries ``provider_error_code``; ``RunCheckpoint`` spells ``http_status`` as
+``provider_http_status``; ``awaiting_task_ids`` is ``task_ids`` on one event), so the alias
+tables below are load-bearing: without them a rename reads as a missing field and the census
+would have to be loosened until it proved nothing.
+
+*And the census does not trust its own hand copies.*  Three of the mechanisms above were
+defeated by drifts they were built to catch, all for one reason: an authority that was really a
+transcription.  A key set copied off the normalizer missed an eighth emit branch; a probe that
+re-implemented a server call missed a field threaded into the real one; a reader list written by
+hand missed a fourth reader.  So each authority is now derived from the thing it describes —
+the assignable key domain of the *live* ``normalize_usage``, the shipped ``_write_exception``
+driven against a capturing host, the reader set discovered from the module.  Where a
+hand-written EXPECTED remains it is pinned in full and diffed against a derived set, never
+spot-checked; and the file-scan backstop reads code occurrences (AST), because substring
+containment counted a comment as a carrier and so failed open.
+
+*Then the derivations were attacked in turn, and they fell too.*  Every "read the live
+callable" census read the wrong object, because ``inspect.getsource`` and ``inspect.signature``
+both follow ``__wrapped__`` — so a ``functools.wraps`` wrapper adding an eighth usage key passed
+untouched (``_live_callable`` now refuses a wrapper).  The assignable-domain reader claimed to
+fail closed and looked at one of the four ways to write a key into a dict, so ``result.update``
+walked past it.  Bucket *membership* was unpinned, so moving a field between two checkpoint
+validation buckets changed the rule it is validated under while the union, the disjointness and
+the count all stayed put — and a bucket nobody loops over validated nothing at all.  The wire
+censuses pinned only the *maximal* request, so a writer that omitted a key whenever it held its
+default value was indistinguishable from one that always writes it; each has a minimal-probe
+twin now, and the difference between the two probes is the conditional half of the wire.  And
+reader discovery was a predicate on where a function was *written* (module level) and how it
+*spelled* its raise (a literal constructor), so a reader in a class body or one delegating to a
+factory was not a reader.
+
+*And each of those fixes was then attacked on its own twin, which is where they broke.*  A rule
+proven on one of two parallel halves is this repository's dominant defect shape, and the census
+was reproducing it five ways.  The write census that refuses what it cannot read was applied to
+the *result* dict and to no other name, so a key written into the dict a copy loop reads
+(``details["tool_tokens"] = ...``) reached the wire through a name nobody watched — and the
+resolver twin beside it, the one that answers ``data=<name>`` at an emit site, had no refusal in
+it at all.  Reader discovery still carried two spelled predicates: "reads the wire" meant
+*calling a registered helper*, and "takes a mapping" meant the annotation said so, so an inline
+``payload.get("error")`` and a ``payload: Any`` each walked past.  Family 7 had a minimal-input
+twin for its two writers and family 2 had none, so an omit-when-falsy filter on either error
+writer was invisible to every probe.  And two registered-gap pins censused one spelling of a read
+(``getattr``, not ``exc.attr``) and one end of a two-ended path (the projection, not the route
+that serves it), either of which would have stayed green through the very fix it exists to catch.
+
+*And the repair that answers for every name still only watched what is written through it.*  A
+dict leaves a name two other ways — handed to a call, and aliased — and neither was a
+contribution the census refused, so ``_fold_web_counters(metrics_data, ctx)`` (the idiom this
+package already uses in ``_accumulate_usage_mapping(state.total_usage, billed)``) and
+``alias = result; alias["k"] = v`` each put a key on the wire that the census reported as
+nonexistent.  An argument position is refused now unless the callee provably cannot reach a
+mapping's mutators.  The same rule had a fourth resolution path that never got it: the extractors
+that pull a *pinned* literal out of an argument dropped a ``**`` splat silently, so a merge into
+the failure bundle or a transcript record widened the artifact while its equality pin stayed green.
+
+*A registry entry with no assertion is prose.*  The registry's contract is "closing a gap breaks
+this suite", which holds only for entries something actually asserts.  Five round-1 entries had
+no pin at all — the drivers and consumers designed for a fact that ignore it, a closed schema,
+an unconsumed event, a vocabulary collision — and the "Registered-gap pins" section below closes
+that, one assertion per entry, each flipping the moment its gap is fixed.  The numeric claims in
+:data:`FUTURE_FAMILIES` are pinned the same way, because a prediction carrying a stale count is
+worse than no prediction.
+
+**The green-with-registered-gaps contract.**  This suite is GREEN today, and today's reality
+is not the ideal: many cells are unbound.  Every one of them is registered in
+:data:`KNOWN_GAPS` with its carrier and disposition, and the assertions below encode reality
+*exactly* — a pinned key set, an asserted loss.  So fixing a gap **breaks this suite**, and
+that is the mechanism working: the fixer must update the EXPECTED constant and delete the
+registry entry in the same change.  Do not loosen an assertion to accommodate a fix.
+
+**And the families it does not cover are declared too.**  :data:`FUTURE_FAMILIES` names each
+fact family deliberately left uncensused, with the authority a census would take and how many
+hand-written carriers of it exist today.  Without that list the suite's silence is ambiguous —
+a family with no failing cell reads exactly like a family nobody looked at — and given the
+defect shape this repository keeps producing, an uncensused family with a carrier count is a
+prediction rather than a footnote.
+
+Seven families are censused: ``Suspension``, ``ModelAdapterError`` transport, usage counts, the
+W5 applied-echo protocol, the tool catalog, the checkpoint validator's field coverage, and the
+success envelope (the main wire).  :data:`KNOWN_GAPS` also carries cells that belong to no
+census — the raw-vs-filtered error asymmetry, the run-status projections, the checkpoint's
+un-carried run state — because a cell found by hand still has to be registered and pinned; those
+pins live in the "Registered-gap pins" section rather than in a family.
+"""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import functools
+import inspect
+import json
+import textwrap
+from dataclasses import dataclass
+from enum import IntEnum
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any, get_args, get_type_hints
+
+import pytest
+
+from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+from monoid_agent_kernel.core.lifecycle import REASON_TO_STATE
+from monoid_agent_kernel.core.manifest import _tool_spec_payload as _manifest_tool_spec_payload
+from monoid_agent_kernel.core.result import (
+    AgentTurnResult,
+    Suspension,
+    _SUSPENSION_REASONS,
+    suspension_checkpoint_payload,
+    suspension_from_checkpoint_payload,
+)
+from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS, TRANSCRIPT_RECORD_SCHEMA
+from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
+from monoid_agent_kernel.core.tool_surface import (
+    _tool_spec_payload as _transcript_tool_spec_payload,
+)
+from monoid_agent_kernel.errors import ModelAdapterError, TurnNotSettled
+from monoid_agent_kernel.model_call import _recordable_usage
+from monoid_agent_kernel.observability.otel import _chat_finish_attrs, _subagent_finish_attrs
+from monoid_agent_kernel.providers import gateway as gateway_client
+from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
+from monoid_agent_kernel.providers.base import (
+    ModelTurn,
+    ToolCall,
+    mark_provider_retried,
+    mark_provider_usage,
+    provider_usage_of,
+)
+from monoid_agent_kernel.providers.openai import _openai_tool_schema
+from monoid_agent_kernel.reference.llm_gateway.http import (
+    _error_body,
+    _model_error_status,
+    _stream_error_frame,
+    make_llm_gateway_handler,
+)
+from monoid_agent_kernel.reference.llm_gateway.service import (
+    LLM_TURN_PROTOCOL_VERSION,
+    _TOOL_SCHEMA_KEYS,
+    LlmGatewayBackend,
+    LlmGatewayTurnRequest,
+    LlmGatewayUsage,
+    _applied_echoes,
+    _parse_tool,
+)
+from monoid_agent_kernel.reference.studio.server import (
+    _gateway_tool_schema as _studio_gateway_tool_schema,
+)
+from monoid_agent_kernel.reference._shared.tokens import TokenManager
+from monoid_agent_kernel.tools.base import ToolSpec
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = ROOT / "src" / "monoid_agent_kernel"
+
+
+# --------------------------------------------------------------------------------------
+# Registry
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CarriageGap:
+    """One fact/carrier cell the census found unbound, and what is meant to happen to it."""
+
+    family: str
+    field: str
+    # "path:symbol", path relative to ``src/monoid_agent_kernel`` — checked to exist below, so a
+    # renamed carrier rots this entry loudly instead of pointing at nothing.
+    carrier: str
+    gap: str
+    disposition: str
+
+
+DISPOSITIONS = frozenset({"burn-down", "by-design"})
+
+KNOWN_GAPS: tuple[CarriageGap, ...] = (
+    CarriageGap(
+        "suspension",
+        "reason",
+        "loop.py:_apump_turn",
+        "BY DESIGN, and split out from the burn-down entry it used to share. turn.interrupted's "
+        "data.reason is a *cause* vocabulary (\"user_stop\") and Suspension.reason is a *park* "
+        "vocabulary (\"interrupted\"): one key name, two domains, deliberately. The event answers "
+        "\"why did this stop\", the park answers \"where is the run now\", the two value sets are "
+        "disjoint, and neither is derivable from the other — so a reader that joins them by name "
+        "is joining two different questions. Registered rather than deleted because the collision "
+        "is real and only a declaration keeps it from being 'fixed' into one vocabulary; "
+        "documented at core/schemas.py:turn.interrupted and in docs/CONTRACTS.md's event-reads "
+        "section. The other half of the old entry — the pause park emitting no turn-lane event at "
+        "all — was a genuine asymmetry and is closed: turn.paused now rides beside "
+        "turn.interrupted with the same cause vocabulary",
+        "by-design",
+    ),
+    # --- the success wire ---------------------------------------------------------------
+    CarriageGap(
+        "success-envelope",
+        "reasoning (frameless stream)",
+        # The carrier is the assembler, not the frame reader: ``_chunk_from_event`` is never
+        # called on this shape at all (there is no frame), so naming it pointed the entry at
+        # code the gap cannot reach. ``assemble_streamed_turn`` is where the tolerance lives --
+        # it reads reasoning off ``TurnComplete`` and nowhere else, so an absent terminal frame
+        # produces ``()`` there and the adapter's frameless drain
+        # (providers/gateway.py:astream_turn) returns without raising.
+        "providers/base.py:assemble_streamed_turn",
+        "BY DESIGN, and the residue of the burn-down entry X-3 closed. The artifacts now ride "
+        "both transports, but a stream that ends without a terminal frame has nowhere to put "
+        "them: assemble_streamed_turn reads reasoning off TurnComplete and nowhere else, the "
+        "deltas are a content channel with no end-of-turn metadata slot "
+        "(reference/llm_gateway/http.py:_write_sse), and the SSE body simply ends on connection "
+        "close. Exactly the wire status usage and turn_handle already have on that shape, and "
+        "tolerated the same way: the assembler reads () and raises nothing. A run continuing "
+        "over a frameless hop re-derives nothing to replay, which is the loop's neutral case -- "
+        "it appends no reasoning block for an empty tuple. The ARTIFACTS stay tolerated; the "
+        "PROOF does not: since B1 the frameless drain runs _check_reasoning_applied beside the "
+        "other two checkers, so a CONFIGURED fail-closed reasoning request now refuses on this "
+        "shape (absent frame = absent echo) while default-reasoning traffic keeps the "
+        "tolerance. Enforcing the artifact array itself as an absence would still be wrong -- "
+        "an upstream that produced no reasoning is indistinguishable from a frame that dropped "
+        "it, and inventing a metadata channel here would be a second protocol for one field. "
+        "Asserted by test_a_frameless_stream_reads_no_reasoning_and_does_not_fail "
+        "(tests/test_llm_gateway_backend.py), which drives a real frameless SSE body through "
+        "GatewayModelAdapter.astream_turn -- filtering the terminal frame out of a complete "
+        "stream and calling the assembler by hand skips the drain that decides what a frameless "
+        "body means, so it proved nothing about this gap",
+        "by-design",
+    ),
+    # --- tool catalog ------------------------------------------------------------------
+    CarriageGap(
+        "tool-spec",
+        "id",
+        "providers/openai.py:_openai_tool_schema",
+        "the Responses API keys a tool by name, so the kernel id has no slot and the mapping "
+        "back is carried entirely by exported_name being stable: by design, and the reason a "
+        "provider_name change is a wire-compatibility change",
+        "by-design",
+    ),
+    # --- checkpoint carriage: what the snapshot leaves behind ---------------------------
+    # Hand-found cells of the family FUTURE_FAMILIES declares as "run-state -> checkpoint
+    # carriage": there is no census diffing ``snapshot()``'s written key set against the live
+    # RunState + tool context, so these were found one at a time and are pinned one at a time.
+    CarriageGap(
+        "checkpoint",
+        "shell_calls/web_search_calls/total_shell_duration_s (tool-service counters)",
+        "loop.py:snapshot",
+        "NARROWED from the context-counter entry the burn-down closed. The AgentToolContext's "
+        "own roll-ups (subagent_count/subagent_usage/skill_activation_count/skills_activated) "
+        "are checkpointed and restored now, but loop_phases.py:build_metrics also splats three "
+        "SERVICE metric blocks into the same metrics.json — ShellService.metrics(), "
+        "WebService.metrics() and JobsService.background_metrics() — and the first two have no "
+        "durable slot at all, so those columns still restart at zero while the token totals "
+        "beside them are cumulative. Not fixed rather than fake-fixed: the services are rebuilt "
+        "per activation and their counters are ~12 heterogeneous fields (ints, a duration float, "
+        "a per-binding dict), so an honest fix is a service-owned checkpoint payload with its "
+        "own validation bucket, not five more scalars on RunCheckpoint. The jobs block is the "
+        "exception and the reason this is narrow rather than absent: it is DERIVED from "
+        "job_manager.list_jobs(), whose hosted tasks the checkpoint already carries — only the "
+        "shell BackgroundJobs it also counts are unrestorable, and tasks.py documents why (a "
+        "subprocess cannot cross a process boundary)",
+        "burn-down",
+    ),
+    # --- checkpoint validation ---------------------------------------------------------
+    CarriageGap(
+        "checkpoint",
+        "schema_version",
+        "core/checkpoint.py:_validate_checkpoint_payload",
+        "the one RunCheckpoint field no branch of the validator inspects; the codec owns the "
+        "version envelope, so this is the documented exclusion rather than a hole -- pinned so "
+        "a SECOND unvalidated field cannot join it quietly",
+        "by-design",
+    ),
+    # --- by-design: asserted and explained, never "fixed" ------------------------------
+    CarriageGap(
+        "suspension",
+        "turn",
+        "core/result.py:suspension_checkpoint_payload",
+        "excluded by design: the AgentTurnResult is a projection artifact of local paths and "
+        "metrics, and a recovery driver needs only the boundary facts to return the same park",
+        "by-design",
+    ),
+    CarriageGap(
+        "applied-echo",
+        "generation",
+        "core/spec.py:ModelConfig",
+        "to_json omits a default generation block by design: this dict feeds the runtime-config "
+        "semantic hash, so a never-configured block must serialize byte-identically to a config "
+        "predating the field. The replay key holds the same omission but no longer through this "
+        "serializer -- W6-0 gave it a hand-listed projection (providers._request_identity._model_identity)",
+        "by-design",
+    ),
+    CarriageGap(
+        "transportable-error",
+        "usage",
+        "reference/llm_gateway/http.py:_error_body",
+        "omitted-when-empty by design: an error raised before a provider was reached keeps its "
+        "exact pre-usage wire shape",
+        "by-design",
+    ),
+    CarriageGap(
+        "applied-echo",
+        "generation_applied/schema_applied/reasoning_applied",
+        "reference/llm_gateway/http.py:_stream_error_frame",
+        "error frames carry no applied-echoes by design: there is no turn to prove anything "
+        "about, and a fail-closed client refuses on absence anyway",
+        "by-design",
+    ),
+    CarriageGap(
+        "usage",
+        "provider_usage",
+        "providers/_common.py:usage_reported_by",
+        "lenient by design: arbitrary keys pass, because a malformed usage on an error path "
+        "must not replace the failure being reported with a validation error",
+        "by-design",
+    ),
+    CarriageGap(
+        "usage",
+        "cache_read_tokens/cache_creation_tokens/reasoning_tokens/audio_tokens",
+        "observability/otel.py:_chat_finish_attrs",
+        "only input/output token attributes are emitted (here and at its _subagent_finish_attrs "
+        "/ _apply_capture twins), by design: GenAI semantic conventions define those two and a "
+        "non-standard attribute is not portable across collectors",
+        "by-design",
+    ),
+    CarriageGap(
+        "transportable-error",
+        "error_code",
+        "reference/llm_gateway/http.py:_error_body",
+        "compat-frozen alias: the wire key error_code carries provider_error_code, and the "
+        "kernel-level error_code has no wire slot at all — readers reconstruct the class "
+        "default. Renaming the key would break every deployed gateway client",
+        "by-design",
+    ),
+    CarriageGap(
+        "suspension",
+        "http_status",
+        "core/checkpoint.py:RunCheckpoint",
+        "compat-frozen alias: the checkpoint spells this provider_http_status while the event, "
+        "wire and Suspension all spell it http_status",
+        "by-design",
+    ),
+    CarriageGap(
+        "suspension",
+        "awaiting_task_ids",
+        "core/schemas.py:EVENT_DATA_SCHEMAS",
+        "three spellings of one fact, alias-registered: Suspension.awaiting_task_ids, task_ids "
+        "on run.awaiting_input, awaiting_task_ids again on the backend frame "
+        "(reference/backend/run_execution.py)",
+        "by-design",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class FutureFamily:
+    """A fact family this census does NOT cover yet, declared so the omission is a decision.
+
+    ``KNOWN_GAPS`` says "this cell is unbound"; this says "this whole family is uncensused".
+    Without it the suite's silence is ambiguous — a family with no failing cell reads exactly
+    like a family nobody looked at — and the shape this repository keeps producing is a fact
+    riding N hand-written carriers, so an uncensused family with a carrier count is a
+    prediction, not a note.
+    """
+
+    family: str
+    # "path:symbol" — the thing a census of this family would take as its authority.
+    authority: str
+    # How many independent hand-written carriers of that authority exist today.
+    carrier_count: int
+    risk: str
+    disposition: str
+
+
+FUTURE_FAMILIES: tuple[FutureFamily, ...] = (
+    FutureFamily(
+        "model-config wire block",
+        "core/spec.py:ModelConfig",
+        4,
+        "the client writes the block (providers/gateway.py:_payload) and the server rebuilds it "
+        "(reference/llm_gateway/service.py:_parse_turn_request), with two special carriages that "
+        "exist because a missing key is the *default* on the rebuild, not 'unset': off-default "
+        "on_unsupported, and effort='default' whose omission sentinel differs from the codec's "
+        "reconstruction default. A third such field would be a silent policy override",
+        "burn-down",
+    ),
+    FutureFamily(
+        "model-config transport policy",
+        "reference/llm_gateway/service.py:_upstream_model_config",
+        1,
+        "the rebuilt upstream config takes default timeout_s/retry rather than the caller's. "
+        "By design: the wire block never carries them (providers/gateway.py:_payload emits only "
+        "model/reasoning/generation), so each hop owns its own transport policy — the client's "
+        "timeout bounds the call to the gateway, the server's bounds the call to the provider. "
+        "The test that separates 'must ride' from 'per-hop' is whether a default silently "
+        "*overrides a caller's stated intent*, which is exactly why on_unsupported was added. "
+        "W6-0 made the replay key agree with the wire on this: providers._request_identity._model_identity omits "
+        "timeout_s/retry/gateway_url, so an ops change to per-hop policy no longer rekeys a corpus",
+        "by-design",
+    ),
+    FutureFamily(
+        "run limits",
+        "core/spec.py:RunLimits",
+        1,
+        "core/manifest.py:build_run_manifest carries 4 of 15 limits into the run manifest, so "
+        "the durable record of what a run was allowed to do omits every token budget, every "
+        "subagent bound and the message-log caps",
+        "burn-down",
+    ),
+    FutureFamily(
+        "stream frames",
+        "providers/base.py:ModelStreamChunk",
+        2,
+        "reference/llm_gateway/service.py:_chunk_to_frame is a second hand-built frame writer "
+        "beside the four to_json codecs, read back by providers/gateway.py:_chunk_from_event; "
+        "a field added to a chunk type reaches neither unless both are edited",
+        "burn-down",
+    ),
+    FutureFamily(
+        "stream-outcome usage lane",
+        "core/model_stream.py:ModelStreamOutcome",
+        3,
+        "outcome -> the stream_closed record (core/schemas.py, additionalProperties False) -> "
+        "the live frame the studio reads; the record carries retryable but not "
+        "config_recoverable, and a closed cap means a new fact is a schema change",
+        "burn-down",
+    ),
+    FutureFamily(
+        "outbox request codec",
+        "core/outbox.py:OutboxRequest",
+        3,
+        "codec + event subsets + the backend's redrive read; a field added to the request that "
+        "the event subset omits is invisible to an operator watching a stuck outbox",
+        "burn-down",
+    ),
+    FutureFamily(
+        "capability lease",
+        "core/capability.py:CapabilityLease",
+        3,
+        "lease dataclass, checkpoint payload and the control envelope that grants it",
+        "burn-down",
+    ),
+    FutureFamily(
+        "hosted tasks",
+        "tasks.py:HostedTask",
+        3,
+        "task record, checkpoint payload and the run.awaiting_input/backend frames that name "
+        "its ids (already one registered alias: task_ids vs awaiting_task_ids)",
+        "burn-down",
+    ),
+    FutureFamily(
+        "control envelope",
+        "core/control.py:ControlCommand",
+        2,
+        "the control-command.v1 wire shape and its dispatch table; an unknown command field is "
+        "dropped silently at the boundary",
+        "burn-down",
+    ),
+    FutureFamily(
+        "content-part vocabulary",
+        "core/content.py:ContentPart",
+        3,
+        "five part types spelled in the union, the to_json/from_json codec pair and the "
+        "provider-side mappers; a sixth type reaching only the codec drops at the adapters",
+        "burn-down",
+    ),
+    FutureFamily(
+        "status.json projection",
+        "recorder.py:StatusJsonSink",
+        2,
+        "the sink writes a metrics key STATUS_SCHEMA does not declare, so the operator-facing "
+        "status file is already wider than its own schema",
+        "burn-down",
+    ),
+    FutureFamily(
+        "run-state -> checkpoint carriage",
+        "loop.py:snapshot",
+        2,
+        "the authority is the key set snapshot() writes, and the carriers are the two live "
+        "states it must cover: RunState and the AgentToolContext. Nothing diffs them, so the "
+        "three registered cells (output_failure_history, the context-owned "
+        "subagent/skill counters, and cancellation_requested's asymmetric restore) were each "
+        "found by hand — which is the definition of an uncensused family, not of three "
+        "unrelated bugs",
+        "burn-down",
+    ),
+    FutureFamily(
+        "settled-text digest",
+        "loop_phases.py:_settled_text_fields",
+        6,
+        "one settle payload is EITHER final_text OR final_text_digest+final_text_len, and the "
+        "choice is re-implemented at every hop: the writer here, two schema branches "
+        "(core/schemas.py), the hydration reader "
+        "(reference/backend/content_hydration.py:DIGEST_FIELD), a second hand reader in "
+        "reference/studio/cli.py, a third path in reference/studio/chat_projection.py, and the "
+        "sidecar join key in core/model_content.py. Renaming the fact, or adding a third "
+        "encoding, has to land on all of them at once and nothing says so",
+        "burn-down",
+    ),
+)
+
+
+def test_registry_entries_are_well_formed() -> None:
+    assert KNOWN_GAPS
+    for gap in KNOWN_GAPS:
+        assert gap.disposition in DISPOSITIONS, gap
+        assert ":" in gap.carrier, gap
+        assert gap.gap.strip(), gap
+    assert FUTURE_FAMILIES
+    for family in FUTURE_FAMILIES:
+        assert family.disposition in DISPOSITIONS, family
+        assert ":" in family.authority, family
+        assert family.carrier_count >= 1, family
+        assert family.risk.strip(), family
+    # A declared future family must not silently overlap a family the census already covers.
+    assert len({family.family for family in FUTURE_FAMILIES}) == len(FUTURE_FAMILIES)
+
+
+def test_registry_carrier_locations_exist() -> None:
+    """A renamed carrier must rot its registry entry rather than point at nothing."""
+
+    missing: list[str] = []
+    for location in [gap.carrier for gap in KNOWN_GAPS] + [
+        family.authority for family in FUTURE_FAMILIES
+    ]:
+        relative_path, symbol = location.split(":", 1)
+        path = PACKAGE / relative_path
+        if not path.is_file():
+            missing.append(f"{location} (no such file)")
+            continue
+        if symbol not in path.read_text(encoding="utf-8"):
+            missing.append(f"{location} (symbol absent)")
+    assert missing == [], {"stale_registry_entries": missing}
+
+
+# --------------------------------------------------------------------------------------
+# Live-callable guard — the census must read the object it just called
+# --------------------------------------------------------------------------------------
+
+
+def _unwrap_chain(function: Any) -> list[Any]:
+    """``function`` followed by everything its ``__wrapped__`` chain points at."""
+
+    chain = [function]
+    seen = {id(function)}
+    current = function
+    while True:
+        current = getattr(current, "__wrapped__", None)
+        if current is None or id(current) in seen:
+            return chain
+        seen.add(id(current))
+        chain.append(current)
+
+
+def _live_callable(function: Any) -> Any:
+    """``function``, refused if it is a ``functools.wraps`` wrapper over something else.
+
+    ``inspect.getsource`` and ``inspect.signature`` both FOLLOW ``__wrapped__``. That defeated the
+    "census the live callable, not the file" rule at the one place it was supposed to hold: a
+    ``@functools.wraps`` wrapper around ``normalize_usage`` emitting an eighth key was invisible
+    to every assertion here, because ``getsource`` handed back the *wrapped* function's body and
+    the wrapper's own branch was never read. The signature censuses have the same hole.
+
+    Refused rather than merged. A wrapper is usually not analyzable at all (``*args, **kwargs``
+    and a call), so merging its key domain would mean teaching each census a second shape; and a
+    wrapper installed over a censused carrier is a carriage change, which is exactly the kind of
+    thing this suite exists to make someone declare.
+    """
+
+    chain = _unwrap_chain(function)
+    assert len(chain) == 1, {
+        "censused_callable": getattr(function, "__qualname__", repr(function)),
+        "wraps": [getattr(item, "__qualname__", repr(item)) for item in chain[1:]],
+        "hint": "inspect.getsource/signature follow __wrapped__, so this census would have read "
+        "the wrapped function and missed every branch the wrapper adds",
+    }
+    return function
+
+
+def _live_signature(function: Any) -> inspect.Signature:
+    return inspect.signature(_live_callable(function))
+
+
+def _live_source(function: Any) -> str:
+    return inspect.getsource(_live_callable(function))
+
+
+# --------------------------------------------------------------------------------------
+# Maximal builders + their reflection guards
+# --------------------------------------------------------------------------------------
+
+
+def _maximal_turn() -> AgentTurnResult:
+    return AgentTurnResult(
+        status="failed",
+        final_text="settled text",
+        proposal_path=Path("proposal.json"),
+        proposal_hash="deadbeef",
+    )
+
+
+def _maximal_suspension() -> Suspension:
+    """Every Suspension field at a distinguishable non-default value.
+
+    ``reason`` must be one of the declared Literal values; ``turn_failed`` is chosen because it
+    is the reason that actually populates the classification trio the census cares about.
+    """
+
+    return Suspension(
+        reason="turn_failed",
+        status="failed",
+        final_text="settled text",
+        error="upstream refused",
+        error_code="model_error",
+        awaiting_task_ids=("task-1", "task-2"),
+        has_external=True,
+        turn=_maximal_turn(),
+        retryable=True,
+        http_status=429,
+        config_recoverable=True,
+        provider_error_code="insufficient_quota",
+        provider_retried=True,
+    )
+
+
+def test_maximal_suspension_covers_every_authority_field() -> None:
+    """The guard that turns a newly added Suspension field into a failure of this suite."""
+
+    authority = {field.name for field in dataclasses.fields(Suspension)}
+    built = _maximal_suspension()
+    default_marker = Suspension(reason="settled", status="completed")
+    undistinguished = {
+        name
+        for name in authority
+        if name not in {"reason", "status"}
+        and getattr(built, name) == getattr(default_marker, name)
+    }
+    assert undistinguished == set(), {
+        "fields_left_at_their_default": sorted(undistinguished),
+        "hint": "extend _maximal_suspension so every field is distinguishable from its default",
+    }
+
+
+# The transportable attributes of a ModelAdapterError: the keyword-only ``__init__`` params
+# minus ``error_code`` handling quirks, plus the post-hoc ``provider_usage`` stamp
+# (providers/base.py:mark_provider_usage), which is not a constructor argument.
+_ADAPTER_ERROR_STAMPED_ATTRS = frozenset({"provider_usage"})
+
+
+def _maximal_adapter_error() -> ModelAdapterError:
+    """A ModelAdapterError with every transportable fact set to a distinguishable value.
+
+    Traps encoded here: ``message`` is positional and sets no attribute (it is read back through
+    ``str(exc)``); ``error_code`` lands in ``vars`` only because a non-None value is passed
+    (otherwise the class attribute ``"model_error"`` shows through and ``vars`` disagrees with
+    ``getattr``); ``provider_error_code=None`` would be coerced to ``""``; and ``provider_usage``
+    has no constructor parameter at all.
+    """
+
+    exc = ModelAdapterError(
+        "upstream refused the turn",
+        error_code="custom_kernel_code",
+        provider_error_code="insufficient_quota",
+        retryable=True,
+        http_status=429,
+        provider_retried=True,
+        config_recoverable=True,
+    )
+    mark_provider_usage(exc, {"input_tokens": 11, "output_tokens": 22, "total_tokens": 33})
+    return exc
+
+
+def test_maximal_adapter_error_covers_every_authority_attribute() -> None:
+    """ModelAdapterError is not a dataclass: authority is the ctor signature plus the stamp."""
+
+    signature = _live_signature(ModelAdapterError.__init__)
+    keyword_only = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    authority = keyword_only | _ADAPTER_ERROR_STAMPED_ATTRS
+    carried = set(vars(_maximal_adapter_error()))
+    assert carried == authority, {
+        "missing": sorted(authority - carried),
+        "extra": sorted(carried - authority),
+    }
+    # ``message`` is positional and stores nothing; it is transportable only via ``str(exc)``.
+    assert "message" not in carried
+    assert str(_maximal_adapter_error()) == "upstream refused the turn"
+
+
+# Every key ``normalize_usage`` can emit, fed by one input that reaches all seven branches.
+_MAXIMAL_USAGE: dict[str, int] = {
+    "input_tokens": 101,
+    "output_tokens": 202,
+    "total_tokens": 303,
+    "cache_read_tokens": 404,
+    "cache_creation_tokens": 505,
+    "reasoning_tokens": 606,
+    "audio_tokens": 707,
+}
+
+NORMALIZED_USAGE_KEYS = frozenset(_MAXIMAL_USAGE)
+
+
+def test_maximal_usage_covers_the_normalizer_emitted_domain() -> None:
+    """The usage authority is behavioral: what ``normalize_usage`` can put on the wire.
+
+    Values must be positive ``int`` (the counters use ``type(v) is int``, which rejects ``bool``),
+    or a sub-count would be silently dropped and read as "this key cannot be emitted".
+    """
+
+    emitted = set(normalize_usage(dict(_MAXIMAL_USAGE)))
+    assert emitted == NORMALIZED_USAGE_KEYS, {
+        "missing": sorted(NORMALIZED_USAGE_KEYS - emitted),
+        "extra": sorted(emitted - NORMALIZED_USAGE_KEYS),
+    }
+    assert all(type(value) is int and value > 0 for value in _MAXIMAL_USAGE.values())
+
+
+def test_the_usage_authority_is_the_normalizers_assignable_domain_not_one_probe() -> None:
+    """The static half of the usage authority, and the one that catches a *new* emit branch.
+
+    The probe above proves the seven keys are reachable; it cannot prove there is no eighth,
+    because a branch keyed on an input the probe does not carry never runs. This reads the keys
+    the function can assign into its result at all -- of the live callable, so a wrapper that
+    adds a branch is censused too, not merely of the file as committed.
+    """
+
+    assignable = _emitted_result_keys(_live_function_body(normalize_usage))
+    assert assignable == NORMALIZED_USAGE_KEYS, {
+        "assignable_but_not_in_the_authority": sorted(assignable - NORMALIZED_USAGE_KEYS),
+        "in_the_authority_but_never_assigned": sorted(NORMALIZED_USAGE_KEYS - assignable),
+        "hint": "a new emit branch: extend _MAXIMAL_USAGE and every carrier census below",
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Alias tables
+# --------------------------------------------------------------------------------------
+
+# Wire key -> the ModelAdapterError fact it carries across the gateway hop.  Declared rather
+# than inferred, because three of the seven are renames.
+TRANSPORTABLE_ERROR_WIRE_ALIASES: dict[str, str] = {
+    # ``message`` is positional-only-in-effect: read back through ``str(exc)``, never an attribute.
+    "error": "message",
+    # Compat-frozen rename. The wire's ``error_code`` is the PROVIDER code; the kernel-level
+    # ``ModelAdapterError.error_code`` has no wire slot and resets to the class default on
+    # reconstruction (registered by-design above).
+    "error_code": "provider_error_code",
+    "retryable": "retryable",
+    # The classification whose only transport used to be the 4xx status ``_model_error_status``
+    # picks; it has its own key now, written unconditionally like the two booleans beside it.
+    "config_recoverable": "config_recoverable",
+    # Server-derived: ``_model_error_status`` picks the status, it is not copied off the exception.
+    "http_status": "http_status",
+    "provider_retried": "provider_retried",
+    # Omitted-when-empty, so any probe of this key must stamp a non-empty usage first.
+    "usage": "provider_usage",
+}
+
+# Transportable facts with no wire key at all. Empty today -- ``config_recoverable`` was the last
+# one and the burn-down gave it a key. Kept rather than deleted: the disjointness guards below are
+# the mechanism that notices the *next* such fact, and they are vacuously true over an empty set
+# instead of absent.
+TRANSPORTABLE_ERROR_UNCARRIED: frozenset[str] = frozenset()
+
+# Checkpoint spelling of the same fact (core/checkpoint.py:RunCheckpoint), registered by-design.
+CHECKPOINT_FIELD_ALIASES: dict[str, str] = {"http_status": "provider_http_status"}
+
+# Suspension.awaiting_task_ids has three spellings across its carriers.
+AWAITING_TASK_IDS_SPELLINGS: dict[str, str] = {
+    "core/result.py:Suspension": "awaiting_task_ids",
+    "core/schemas.py:run.awaiting_input": "task_ids",
+    "reference/backend/run_execution.py": "awaiting_task_ids",
+}
+
+
+def test_transportable_error_alias_table_is_total_over_the_authority() -> None:
+    """Every transportable attribute is either aliased to a wire key or registered uncarried."""
+
+    authority = set(vars(_maximal_adapter_error()))
+    accounted = set(TRANSPORTABLE_ERROR_WIRE_ALIASES.values()) | TRANSPORTABLE_ERROR_UNCARRIED
+    accounted.discard("message")  # not an attribute; asserted separately
+    # ``error_code`` is in ``vars`` only because the maximal builder passes a non-None value.
+    accounted.add("error_code")
+    assert authority == accounted, {
+        "unaccounted_attributes": sorted(authority - accounted),
+        "aliases_without_an_attribute": sorted(accounted - authority),
+    }
+
+
+def test_awaiting_task_ids_spellings_are_each_present_at_their_site() -> None:
+    assert AWAITING_TASK_IDS_SPELLINGS["core/result.py:Suspension"] in {
+        field.name for field in dataclasses.fields(Suspension)
+    }
+    awaiting = EVENT_DATA_SCHEMAS["run.awaiting_input"]["properties"]
+    assert AWAITING_TASK_IDS_SPELLINGS["core/schemas.py:run.awaiting_input"] in awaiting
+    assert "awaiting_task_ids" not in awaiting
+    backend = (PACKAGE / "reference" / "backend" / "run_execution.py").read_text(encoding="utf-8")
+    assert '"awaiting_task_ids"' in backend
+
+
+def test_checkpoint_alias_is_the_only_spelling_of_http_status_on_the_checkpoint() -> None:
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+
+    names = {field.name for field in dataclasses.fields(RunCheckpoint)}
+    assert CHECKPOINT_FIELD_ALIASES["http_status"] in names
+    assert "http_status" not in names
+
+
+# --------------------------------------------------------------------------------------
+# AST helpers — census the inline dict literals that no import can reach
+# --------------------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=None)
+def _module_tree(relative_path: str) -> ast.Module:
+    """Parsed once per module. ``loop.py`` alone is ~4k lines and a dozen censuses read it."""
+
+    path = PACKAGE / relative_path
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _dict_literal_keys(node: ast.Dict) -> tuple[frozenset[str], tuple[str, ...]]:
+    """A dict literal's constant string keys, *and the parts of it that are not that*.
+
+    ``_dict_keys`` returns only the first half. A ``**splat`` entry has a ``None`` key and a
+    computed key is not a ``Constant``, and both simply vanish from the set it returns — so a
+    literal that merges a mapping of unknown width was censused as the two keys spelled beside
+    it, and every census that treats a literal as *the* key set inherited that silence. The
+    second half is what a caller has to refuse on.
+    """
+
+    keys: set[str] = set()
+    refusals: list[str] = []
+    for key, value in zip(node.keys, node.values):
+        if key is None:
+            refusals.append(f"**{ast.unparse(value)}")
+        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+        else:
+            refusals.append(f"{ast.unparse(key)}: ...")
+    return frozenset(keys), tuple(refusals)
+
+
+def _pinned_dict_keys(node: ast.Dict, context: str) -> frozenset[str]:
+    """A literal's keys, where the caller pins that key set as *the* thing the literal carries.
+
+    The fourth resolution path onto the rule :func:`_dict_literal_keys` states, and the last one
+    still reading the weak half of it: the two literal-argument extractors below (and the manifest
+    census that spells one out inline) fed their matches through a helper that returned the
+    constant string keys and dropped everything else. Every one of them hands its result to an
+    equality pin, so adding ``**_error_fields(exc)`` to a pinned literal widened the artifact
+    while the pin stayed green — the same fail-open :func:`_dict_writes` and
+    :func:`_emit_data_keys` had already closed on the assignment side of the file.
+    """
+
+    keys, merged = _dict_literal_keys(node)
+    assert merged == (), {
+        "literal": context,
+        "line": node.lineno,
+        "merges_the_census_cannot_read": list(merged),
+        "hint": "the pinned key set is no longer the whole literal — resolve the merge here "
+        "rather than dropping it, or the pin passes while the artifact widens",
+    }
+    return keys
+
+
+@dataclass(frozen=True)
+class _DictWrites:
+    """Everything written into one name-bound dict inside one scope.
+
+    ``literals`` is what the name was *assigned*; ``added`` is every constant key written into it
+    afterwards (a subscript write, an analyzable ``update({...})`` or ``|= {...}`` merge);
+    ``dynamic`` is the subscript writes whose key is an expression, which only a caller that
+    knows the surrounding loop can resolve; ``refusals`` is every contribution that cannot be
+    read as a closed set of constant keys at all.
+
+    So ``keys`` is a *lower bound* and is the answer only when nothing was refused — which is why
+    every consumer below asserts ``unreadable`` empty rather than filtering it away.
+    """
+
+    name: str
+    literals: tuple[frozenset[str], ...]
+    added: frozenset[str]
+    dynamic: tuple[ast.expr, ...]
+    refusals: tuple[str, ...]
+
+    @property
+    def keys(self) -> frozenset[str]:
+        return frozenset().union(self.added, *self.literals)
+
+    @property
+    def unreadable(self) -> tuple[str, ...]:
+        return self.refusals + tuple(
+            f"{self.name}[{ast.unparse(index)}] = ..." for index in self.dynamic
+        )
+
+
+# Dict methods that only read. Anything else called on a tracked name is a mutation this census
+# cannot read, so it is refused by name rather than enumerated: the point is not to know every
+# mutator, it is that an unknown one must never pass as "no keys were added".
+_DICT_READ_METHODS = frozenset({"copy", "get", "items", "keys", "values"})
+
+# The same rule on the other side of the call, which is where round 3's version of it broke.
+# ``result.mutate()`` was refused and ``mutate(result)`` was not, so a tracked name *handed to* a
+# function wrote keys through a callee this census cannot see into and passed as "no keys were
+# added" — and that idiom is native to the censused code itself:
+# ``_accumulate_usage_mapping(state.total_usage, billed)`` in ``loop.py:_apump_turn`` folds one
+# mapping into another through exactly this shape. So a tracked name in an argument position is a
+# refusal unless the callee is listed here.
+#
+# Every entry is a *builtin that cannot reach a mapping's mutators*: it reads keys and returns a
+# new object. That keeps the list a proof rather than a per-callee audit — the alternative,
+# "these particular helpers looked harmless when I read them", is the hand transcription this
+# suite exists to stop trusting. Today's censused functions hand their dicts to exactly ONE call
+# between them (the emit below); a future ``len(metrics_data)`` is meant to pass here, and a
+# future ``_fold_web_counters(metrics_data, ctx)`` is meant to fail.
+_DICT_READ_CALLS = frozenset(
+    {
+        "bool",  # emptiness test
+        "dict",  # copies; writes into the copy are not writes into this name
+        "frozenset",  # iterates keys into a new frozenset
+        "len",  # reads the size
+        "list",  # iterates keys into a new list
+        "set",  # iterates keys into a new set
+        "sorted",  # iterates keys into a new list
+        "tuple",  # iterates keys into a new tuple
+    }
+)
+
+
+def test_every_exempted_callee_is_a_builtin() -> None:
+    """The "builtin that cannot reach a mutator" claim, mechanized rather than restated.
+
+    The justification above is what keeps this list a proof instead of a per-callee audit — and
+    it was prose. A helper named ``dict`` in the censused module, or a plain
+    ``_fold_counters`` added here because it "looked harmless when I read it", satisfied the
+    comment and defeated the rule. A name that does not resolve on ``builtins`` is not one this
+    list is allowed to exempt.
+    """
+
+    import builtins
+
+    unresolved = sorted(name for name in _DICT_READ_CALLS if not hasattr(builtins, name))
+    assert unresolved == [], {
+        "exempted_but_not_a_builtin": unresolved,
+        "hint": "the exemption list is 'builtins that read keys and return a new object'; a "
+        "project helper here is a per-callee audit, which is the hand transcription this "
+        "suite exists to stop trusting",
+    }
+    # ...and none of them is a mapping mutator that happens to live on builtins.
+    assert not _DICT_READ_CALLS & {"setattr", "vars", "exec", "eval", "delattr"}
+
+
+# The one non-builtin call a censused function hands a tracked dict to today, and the reason it
+# cannot simply be refused: it *is* the site :func:`_emit_data_keys` resolves the binding for
+# (``recorder.emit("metrics.updated", turn_id=..., data=metrics_data)`` in ``_apump_turn``).
+# Refusing it would refuse the census's own read. Narrow on purpose — the method name AND the
+# keyword — so ``emit(data=x)`` stays readable while ``enrich(data=x)`` does not.
+_CENSUSED_EMIT_ARGUMENT = ("emit", "data")
+
+
+@functools.lru_cache(maxsize=None)
+def _dict_writes(scope: ast.AST) -> dict[str, _DictWrites]:
+    """Every dict-shaped name in ``scope``, with everything written into it.
+
+    One walk, **every** name — not just the one name a caller happens to care about. That
+    asymmetry is the round-3 defect this replaces: the write census was applied to the result
+    dict and to nothing else, so a key written into the dict a copy loop *reads*
+    (``details["tool_tokens"] = ...`` ahead of ``for key, value in details.items():
+    result[key] = value``) reached the result through a name nobody was watching, and the census
+    reported the loop as carrying the source literal's keys alone.
+
+    A name is tracked if a dict literal is bound to it or a subscript is written into it. For a
+    tracked name every later contribution is either folded in (constant keys) or refused; the
+    one shape left to the caller is a computed subscript key, because only the caller knows
+    whether the expression is a loop variable it can resolve.
+
+    Round 3 read "contribution" as *what is written through this name here*, and both ways a dict
+    leaves a name unwritten-through walked past it:
+
+    * **handed to a call.** ``result.mutate()`` was refused and ``mutate(result)`` was not, so
+      ``enrich(result)`` or ``_fold_sub_counts(metrics_data, ...)`` wrote keys through a callee
+      this census cannot see into while the name reported a clean key set. An argument position is
+      a refusal now unless the callee is a proven-read-only builtin (:data:`_DICT_READ_CALLS`) or
+      the emit whose binding the census is there to read (:data:`_CENSUSED_EMIT_ARGUMENT`). A
+      ``*name`` / ``**name`` splat is *not* refused: the callee receives a fresh tuple/mapping and
+      cannot write back through it, which is the same reason ``.items()`` is a read.
+    * **aliased.** ``alias = result`` gives the same object a second name, and ``alias["k"] = v``
+      then makes ``alias`` tracked in its own right — with its own entry, which the consumer
+      (asking about *one* name) never reads. Tracking the alias is therefore not enough without
+      the flow analysis to merge the two entries, so the *source* refuses.
+    """
+
+    tracked: set[str] = set()
+    for node in ast.walk(scope):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
+            tracked.add(target.id)
+        if isinstance(node, ast.Assign):
+            for assigned in node.targets:
+                if isinstance(assigned, ast.Subscript) and isinstance(assigned.value, ast.Name):
+                    tracked.add(assigned.value.id)
+
+    literals: dict[str, list[frozenset[str]]] = {}
+    added: dict[str, set[str]] = {}
+    dynamic: dict[str, list[ast.expr]] = {}
+    refusals: dict[str, list[str]] = {}
+
+    def _fold(name: str, node: ast.Dict, context: str) -> frozenset[str]:
+        keys, merged = _dict_literal_keys(node)
+        refusals.setdefault(name, []).extend(f"{context} merges {item}" for item in merged)
+        return keys
+
+    def _handed_to(argument: ast.Name, position: str, call: ast.Call) -> None:
+        """A tracked name in an argument position of ``call`` — read, or written through?"""
+
+        if argument.id not in tracked:
+            return
+        if isinstance(call.func, ast.Name) and call.func.id in _DICT_READ_CALLS:
+            return
+        refusals.setdefault(argument.id, []).append(
+            f"{argument.id} handed to {ast.unparse(call.func)}(...) as {position}"
+        )
+
+    for node in ast.walk(scope):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            written = node.targets if isinstance(node, ast.Assign) else [node.target]
+            # ``alias = tracked`` (or ``self.x = tracked``, or ``payload["k"] = tracked``): the
+            # object escapes this name, and a write through the second handle is a write into
+            # this dict that this name's own census never sees.
+            if isinstance(node.value, ast.Name) and node.value.id in tracked:
+                refusals.setdefault(node.value.id, []).extend(
+                    f"{node.value.id} aliased to {ast.unparse(assigned)}" for assigned in written
+                )
+            for assigned in written:
+                if isinstance(assigned, ast.Name) and assigned.id in tracked:
+                    if isinstance(node.value, ast.Dict):
+                        literals.setdefault(assigned.id, []).append(
+                            _fold(assigned.id, node.value, f"{assigned.id} = {{...}}")
+                        )
+                    elif node.value is not None:
+                        # A rebinding to something this census cannot read is a key set of
+                        # unknown width standing where the literal's used to be.
+                        refusals.setdefault(assigned.id, []).append(
+                            f"{assigned.id} = {ast.unparse(node.value)}"
+                        )
+                elif (
+                    isinstance(assigned, ast.Subscript)
+                    and isinstance(assigned.value, ast.Name)
+                    and assigned.value.id in tracked
+                ):
+                    index = assigned.slice
+                    if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                        added.setdefault(assigned.value.id, set()).add(index.value)
+                    else:
+                        dynamic.setdefault(assigned.value.id, []).append(index)
+            continue
+        if isinstance(node, ast.AugAssign):
+            mutated = node.target
+            if isinstance(mutated, ast.Name):
+                name = mutated.id
+            elif isinstance(mutated, ast.Subscript) and isinstance(mutated.value, ast.Name):
+                name = mutated.value.id
+            else:
+                continue
+            if name not in tracked:
+                continue
+            if (
+                isinstance(mutated, ast.Name)
+                and isinstance(node.op, ast.BitOr)
+                and isinstance(node.value, ast.Dict)
+            ):
+                added.setdefault(name, set()).update(
+                    _fold(name, node.value, f"{name} |= {{...}}")
+                )
+            else:
+                refusals.setdefault(name, []).append(
+                    f"{ast.unparse(mutated)} {type(node.op).__name__}= ..."
+                )
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        # (1) the name is what the call was HANDED.
+        for position, argument in enumerate(node.args):
+            if isinstance(argument, ast.Name):
+                _handed_to(argument, f"positional {position}", node)
+        for keyword in node.keywords:
+            if keyword.arg is None or not isinstance(keyword.value, ast.Name):
+                continue  # ``f(**name)``: the callee gets a fresh mapping, so it is a read
+            if (
+                isinstance(node.func, ast.Attribute)
+                and (node.func.attr, keyword.arg) == _CENSUSED_EMIT_ARGUMENT
+            ):
+                continue  # the emit site whose binding _emit_data_keys resolves
+            _handed_to(keyword.value, f"{keyword.arg}=", node)
+        # (2) the name is what the call was made ON.
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            name, attribute = node.func.value.id, node.func.attr
+            if name not in tracked:
+                continue
+            if (
+                attribute == "update"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Dict)
+            ):
+                added.setdefault(name, set()).update(
+                    _fold(name, node.args[0], f"{name}.update({{...}})")
+                )
+            elif attribute not in _DICT_READ_METHODS:
+                refusals.setdefault(name, []).append(f"{name}.{attribute}(...)")
+
+    return {
+        name: _DictWrites(
+            name,
+            tuple(literals.get(name, ())),
+            frozenset(added.get(name, ())),
+            tuple(dynamic.get(name, ())),
+            tuple(refusals.get(name, ())),
+        )
+        for name in tracked
+    }
+
+
+@functools.lru_cache(maxsize=None)
+def _emit_data_keys(relative_path: str, event_type: str) -> frozenset[str]:
+    """Keys the module can put on ``recorder.emit("<event_type>", ..., data=...)``.
+
+    The emit site is an inline literal inside a long pump method, so it cannot be imported and
+    diffed — but it is exactly where a new key is added without a matching schema entry.
+
+    Every call site for the event type is counted, whatever shape its ``data=`` argument has.
+    Counting only the sites with a literal dict was a fail-open that the census's own comment
+    described as a twin check: a second emit passing ``data=some_name`` (the shape
+    ``metrics.updated`` already uses) left the count at one and the twin went uncensused. A site
+    this function cannot resolve is now a failure naming the shape, not a site it skips.
+
+    "Cannot resolve" then had to mean what it says. ``data=fn()`` refused, but the *resolver*
+    behind ``data=<name>`` had no refusal in it at all: it read dict literals and constant-key
+    subscript writes and dropped everything else, so ``data.update({...})``, ``data |= {...}``
+    and a ``{**extra}`` splat inside the literal each put a key on the wire that this function
+    reported as nonexistent — the same fail-open :func:`_emitted_result_keys` had closed on its
+    own side of the file and never bound on its twin. :func:`_dict_writes` now folds in what it
+    can read and refuses what it cannot, and an unreadable contribution fails the site.
+    """
+
+    tree = _module_tree(relative_path)
+    bound = _dict_writes(tree)
+    resolved: list[frozenset[str]] = []
+    unresolved: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "emit" or not node.args:
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and first.value == event_type):
+            continue
+        data = next((keyword.value for keyword in node.keywords if keyword.arg == "data"), None)
+        if isinstance(data, ast.Dict):
+            keys, merged = _dict_literal_keys(data)
+            if merged:
+                unresolved.append(f"line {node.lineno}: data={{...}} merges {list(merged)}")
+            else:
+                resolved.append(keys)
+        elif isinstance(data, ast.Name):
+            written = bound.get(data.id)
+            if written is None or len(written.literals) != 1:
+                bindings = 0 if written is None else len(written.literals)
+                unresolved.append(
+                    f"line {node.lineno}: data={data.id}, bound to {bindings} dict literals"
+                )
+            elif written.unreadable:
+                unresolved.append(
+                    f"line {node.lineno}: data={data.id}, written by "
+                    f"{sorted(written.unreadable)}"
+                )
+            else:
+                resolved.append(written.keys)
+        else:
+            unresolved.append(
+                f"line {node.lineno}: data="
+                + ("<absent>" if data is None else ast.unparse(data))
+            )
+    assert unresolved == [], {
+        "event_type": event_type,
+        "emit_sites_whose_data_the_census_cannot_read": unresolved,
+        "hint": "resolve the shape here rather than skipping the site — a skipped emit is a wire "
+        "key with no schema diff",
+    }
+    assert len(resolved) == 1, {
+        "event_type": event_type,
+        "emit_sites": len(resolved),
+        "key_sets": [sorted(item) for item in resolved],
+        "hint": "a second emit site is a twin that must be censused too",
+    }
+    return resolved[0]
+
+
+def _literal_dict_keys_where(relative_path: str, key: str, value: str) -> list[frozenset[str]]:
+    """Key sets of every dict literal in a module whose ``key`` is the constant ``value``.
+
+    Resolved through :func:`_pinned_dict_keys`, so a ``**`` splat or a computed key in one of the
+    matched literals is a failure here rather than a key set silently narrower than the record.
+    """
+
+    matches: list[frozenset[str]] = []
+    for node in ast.walk(_module_tree(relative_path)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for dict_key, dict_value in zip(node.keys, node.values):
+            if not (isinstance(dict_key, ast.Constant) and dict_key.value == key):
+                continue
+            if isinstance(dict_value, ast.Constant) and dict_value.value == value:
+                matches.append(
+                    _pinned_dict_keys(node, f"{relative_path}: {{{key!r}: {value!r}, ...}}")
+                )
+    return matches
+
+
+def _call_dict_arg_keys(relative_path: str, method: str) -> list[frozenset[str]]:
+    """Key sets of the single dict literal passed positionally to ``obj.<method>({...})``.
+
+    Strict like :func:`_literal_dict_keys_where` above, and for the same reason: the callers pin
+    the result as the whole artifact, so a merge into the literal must fail rather than vanish.
+    """
+
+    matches: list[frozenset[str]] = []
+    for node in ast.walk(_module_tree(relative_path)):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != method or not node.args:
+            continue
+        if isinstance(node.args[0], ast.Dict):
+            matches.append(
+                _pinned_dict_keys(node.args[0], f"{relative_path}: .{method}({{...}})")
+            )
+    return matches
+
+
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+def _function_node(relative_path: str, name: str, *, within: str | None = None) -> _FunctionNode:
+    """The one function/method named ``name`` (optionally inside class/function ``within``)."""
+
+    root: ast.AST = _module_tree(relative_path)
+    if within is not None:
+        root = next(
+            node
+            for node in ast.walk(root)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == within
+        )
+    found = [
+        node
+        for node in ast.walk(root)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(found) == 1, {"function": name, "definitions_found": len(found)}
+    return found[0]
+
+
+def _live_function_body(function: Any) -> _FunctionNode:
+    """Parse the source of the *live* callable, not of the file it was written in.
+
+    ``_module_tree`` censuses a path; this censuses whatever object the name is bound to right
+    now. That is the difference between "the repository declares N branches" and "the function
+    this suite just called declares N branches", and only the second one survives a wrapper.
+    """
+
+    tree = ast.parse(textwrap.dedent(_live_source(function)))
+    node = tree.body[0]
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)), type(node)
+    return node
+
+
+def _emitted_result_keys(function: _FunctionNode) -> frozenset[str]:
+    """Every string key ``function`` can write into the dict it returns.
+
+    The usage authority used to be a behavioral probe alone: feed one maximal input, collect the
+    keys that came back. A branch keyed on an input the probe does not carry
+    (``if usage.get("tool_tokens"): normalized["tool_tokens"] = ...``) is invisible to that, so
+    the normalizer could grow an eighth emitted key and the census would stay green. This reads
+    the *assignable domain* instead: the literal the result is built from, every constant-keyed
+    subscript write, and the keys of any dict the function copies in wholesale through a
+    ``for key, value in <dict>.items(): result[key] = value`` loop (which is how the priced
+    sub-counts actually land). An emit shape it cannot analyze fails rather than passing empty.
+
+    "Fails rather than passing empty" used to hold for exactly one shape — a computed subscript
+    key — and the docstring claimed it in general. Three other ways to write a key into a dict
+    were simply not looked at, so ``result.update({"tool_tokens": ...})``, ``result |= {...}``
+    and any augmented assignment onto it were each an eighth emitted key this census reported as
+    nonexistent.
+
+    Then the write census itself turned out to be bound on *one name*. The result dict was
+    watched; the dict a copy loop reads was not, so ``details["tool_tokens"] = ...`` written
+    ahead of ``for key, value in details.items(): result[key] = value`` put an eighth key on the
+    wire through a name nobody censused — and worse, a loop source with no dict literal bound to
+    it resolved to the empty set instead of refusing. :func:`_dict_writes` now answers for every
+    name, so a loop source resolves to *its* literal keys plus *its* constant writes, and a
+    contribution to either dict that cannot be read as constant keys — a splat inside the
+    literal, a computed key, a merge from a name, a rebinding, a mutator this census does not
+    model — is refused. So is a ``return`` of anything but the counted name: ``return {**result,
+    "tool_tokens": n}`` beside it is an emitted key no assignment ever spelled.
+    """
+
+    returned = [node.value for node in ast.walk(function) if isinstance(node, ast.Return)]
+    named = [node for node in returned if isinstance(node, ast.Name)]
+    assert len(named) == 1, {"returns_of_a_named_dict": len(named)}
+    result_name = named[0].id
+
+    unanalyzable: list[str] = [
+        f"return {ast.unparse(node)}"
+        for node in returned
+        if node is not None and not isinstance(node, ast.Name)
+    ]
+
+    # ``for key, value in <name>.items(): result[key] = value`` -> key is bound to <name>'s keys.
+    loop_sources: dict[str, str] = {}
+    for node in ast.walk(function):
+        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Tuple):
+            continue
+        names = [element.id for element in node.target.elts if isinstance(element, ast.Name)]
+        iterated = node.iter
+        if (
+            names
+            and isinstance(iterated, ast.Call)
+            and isinstance(iterated.func, ast.Attribute)
+            and iterated.func.attr == "items"
+            and isinstance(iterated.func.value, ast.Name)
+        ):
+            loop_sources[names[0]] = iterated.func.value.id
+
+    writes = _dict_writes(function)
+    nothing = _DictWrites("", (), frozenset(), (), ())
+
+    def _source_keys(source: str) -> frozenset[str]:
+        """The keys a ``<source>.items()`` copy loop can carry into the result."""
+
+        written = writes.get(source, nothing)
+        if not written.literals:
+            unanalyzable.append(
+                f"for key, value in {source}.items(): no dict literal is bound to {source}"
+            )
+            return frozenset()
+        unanalyzable.extend(written.unreadable)
+        return written.keys
+
+    result = writes.get(result_name, nothing)
+    unanalyzable.extend(result.refusals)
+    keys = set(result.keys)
+    for index in result.dynamic:
+        if isinstance(index, ast.Name) and index.id in loop_sources:
+            keys |= _source_keys(loop_sources[index.id])
+        else:
+            unanalyzable.append(f"{result_name}[{ast.unparse(index)}] = ...")
+    assert unanalyzable == [], {
+        "writes_the_census_cannot_read": sorted(set(unanalyzable)),
+        "hint": "a new emit shape: teach _dict_writes about it rather than dropping it — "
+        "an unread write is an emitted key the whole usage census below never hears about",
+    }
+    return frozenset(keys)
+
+
+# The gateway module's wire-reading helpers. A function that both constructs a
+# ``ModelAdapterError`` and reads the wire through one of these *is* an error reader.
+#
+# This is a HAND list, and every census below that resolves a key through it inherits its
+# blindness: ``_literal_wire_keys`` picks a reader's keys out of the arguments it hands these
+# helpers, so a twelfth helper carrying a twelfth key would make that key invisible and the pinned
+# read-set would still match. Both halves of it are derived and diffed against the module below --
+# ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use`` for the helpers that
+# read the wire mapping themselves, and
+# ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use`` for the ones handed
+# an already-extracted value.
+GATEWAY_WIRE_READ_HELPERS = frozenset(
+    {
+        "_gateway_string",
+        "_gateway_fragment_string",
+        "_exact_gateway_bool",
+        "_exact_gateway_int",
+        "_gateway_usage",
+        "_gateway_http_status_hint",
+        "usage_reported_by",
+        "_portable_gateway_payload",
+        "_gateway_reasoning_items",
+        "_validated_generation_echo",
+        "_validated_schema_echo",
+        "_validated_reasoning_echo",
+    }
+)
+
+# Where each registered helper is DEFINED. Everything the gateway client wrote for itself lives
+# in its own module; ``usage_reported_by`` is the lenient refusal-usage reader now SHARED with
+# the OpenAI adapter (it began here as ``_reported_error_usage``, and the source reader having
+# no equivalent is how a refusal reached this hop already reporting zero), so it lives in
+# ``providers/_common.py``. The census follows it across that boundary rather than losing the
+# key it carries: a helper this map cannot place resolves nowhere, and every read-key census
+# below would silently stop counting ``usage``.
+GATEWAY_WIRE_READ_HELPER_HOMES: dict[str, str] = {"usage_reported_by": "providers/_common.py"}
+
+
+def _helper_home(name: str) -> str:
+    return GATEWAY_WIRE_READ_HELPER_HOMES.get(name, "providers/gateway.py")
+
+
+def _gateway_import_homes() -> dict[str, str]:
+    """Every name ``providers/gateway.py`` imports from a module OF THIS PACKAGE, mapped to that
+    module's path relative to the package root.
+
+    The map above is a hand list, and a hand list can be wrong in two directions. One of them is
+    loud: a registered helper that no longer exists blows up in :func:`_function_node`. The other
+    was silent, and it is the case a NEW shared helper lands in — a helper the readers call that
+    is neither defined in ``gateway.py`` nor registered here resolves to nothing at all, so
+    :func:`_helper_home` never looks for it, the discovery below drops it for not being
+    ``reachable``, and every read-key census quietly stops counting the keys it carries. An
+    unregistered LOCAL helper is discovered and diffed; an unregistered FOREIGN one was invisible.
+
+    The import statement that made it callable is the answer, so it is read rather than trusted.
+    Only names imported from this package resolve: ``json``/``typing`` names are not helpers of
+    ours, and a module path that is not a file (a package ``__init__`` re-export) is left
+    unresolved rather than guessed at.
+    """
+
+    homes: dict[str, str] = {}
+    for node in ast.walk(_module_tree("providers/gateway.py")):
+        if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
+            continue
+        if not node.module.startswith("monoid_agent_kernel."):
+            continue
+        relative = node.module[len("monoid_agent_kernel.") :].replace(".", "/") + ".py"
+        if not (PACKAGE / relative).is_file():
+            continue
+        for alias in node.names:
+            homes[alias.asname or alias.name] = relative
+    return homes
+
+
+def _gateway_reader_callees() -> frozenset[str]:
+    """Every name the registered readers call: the reach of all three censuses in this family.
+
+    Written once because it *is* the shared premise -- "a helper is what a reader hands the wire
+    to" -- and three copies of the reach is three copies that can drift apart while each stays
+    internally consistent.
+    """
+
+    local = _all_functions("providers/gateway.py")
+    called: set[str] = set()
+    for reader in GATEWAY_ERROR_READERS:
+        for node in local[reader.split(":", 1)[1]]:
+            called |= _called_local_names(node)
+    return frozenset(called)
+
+
+def _foreign_wire_read_helper_homes() -> dict[str, str]:
+    """The derived twin of ``GATEWAY_WIRE_READ_HELPER_HOMES``: where each FOREIGN wire-reading
+    helper the registered readers call is defined.
+
+    A called name qualifies only if all three hold — ``gateway.py`` imports it from a module of
+    this package, that module defines a function by that name, and the function reads a key off
+    one of its parameters. That is the same predicate the local discovery uses
+    (:func:`_reads_a_mapping_parameter`), applied across the module boundary the hand map exists
+    to cross, so a builtin, a class, or a codec that takes a string is not mistaken for a helper.
+
+    One blind spot stays, and it is not the one this closes: a helper called through its module
+    (``_common.usage_reported_by(...)``) is an ``ast.Attribute``, which
+    :func:`_called_local_names` does not collect on any of these censuses. This module imports
+    its helpers by name, which is what makes the derivation total for it.
+    """
+
+    local = _all_functions("providers/gateway.py")
+    imported = _gateway_import_homes()
+    homes: dict[str, str] = {}
+    for name in sorted(_gateway_reader_callees() - set(local)):
+        home = imported.get(name)
+        if home is None:
+            continue
+        if any(_reads_a_mapping_parameter(node) for node in _all_functions(home).get(name, [])):
+            homes[name] = home
+    return homes
+
+
+# The helpers a derived scan can find: they take the wire mapping itself and read a key off it
+# (a literal one, or the ``key`` parameter their callers pass). Pinned in full, so a new
+# ``_gateway_float(payload, key, *, http_status)`` carrying a new key fails here.
+GATEWAY_MAPPING_READ_HELPERS = frozenset(
+    {
+        "_exact_gateway_bool",
+        "_exact_gateway_int",
+        "_gateway_fragment_string",
+        "_gateway_http_status_hint",
+        "_gateway_string",
+        "usage_reported_by",
+    }
+)
+# The registered helpers no mapping scan can reach: they validate an already-extracted
+# ``value: Any``, so they carry no wire key of their own and the caller names the key. Pinned in
+# full for the same reason as its sibling above, and derived the same way -- this list was the
+# hand-written half of the closing equality in
+# ``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use``, so a new value
+# validator could be added to *both* hand lists at once and the equality stayed green while
+# nothing had checked the module. ``_validated_generation_echo``/``_validated_schema_echo`` were
+# exactly that: this shape since they were written, registered nowhere until the derivation below
+# named them.
+GATEWAY_WIRE_VALUE_VALIDATORS = frozenset(
+    {
+        "_gateway_usage",
+        "_portable_gateway_payload",
+        "_gateway_reasoning_items",
+        "_validated_generation_echo",
+        "_validated_schema_echo",
+        "_validated_reasoning_echo",
+    }
+)
+
+
+def _literal_wire_keys(function: ast.AST) -> frozenset[str]:
+    """Wire keys named literally in ``function``: ``x.get("k")``, ``x["k"]``, ``"k" in x``, and
+    the literal key arguments it hands to the module's wire-reading helpers."""
+
+    keys: set[str] = set()
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            keys.add(node.args[0].value)
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            if isinstance(node.slice.value, str):
+                keys.add(node.slice.value)
+        elif (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.In)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+        ):
+            keys.add(node.left.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in GATEWAY_WIRE_READ_HELPERS
+        ):
+            for argument in node.args[1:]:
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    keys.add(argument.value)
+    return frozenset(keys)
+
+
+_HELPER_INTERNAL_READS: dict[str, frozenset[str]] = {}
+
+
+def _wire_keys_read_in(function: _FunctionNode) -> frozenset[str]:
+    """Every wire key ``function`` reads, including the ones a helper reads on its behalf.
+
+    ``usage_reported_by(payload)`` names no key at the call site -- the ``"usage"`` literal
+    lives inside the helper -- so a purely local scan reported the caller as never reading a key
+    it does read. One level of delegation is resolved, which is exactly as far as this module
+    delegates, and the helper is looked up through :func:`_helper_home` so a shared one living
+    outside the gateway module is still followed.
+    """
+
+    keys = set(_literal_wire_keys(function))
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in GATEWAY_WIRE_READ_HELPERS
+        ):
+            helper = node.func.id
+            if helper not in _HELPER_INTERNAL_READS:
+                _HELPER_INTERNAL_READS[helper] = _literal_wire_keys(
+                    _function_node(_helper_home(helper), helper)
+                )
+            keys |= _HELPER_INTERNAL_READS[helper]
+    return frozenset(keys)
+
+
+def _all_functions(relative_path: str) -> dict[str, list[_FunctionNode]]:
+    """Every function in the module *including* methods, keyed by name.
+
+    ``ast.walk`` rather than ``tree.body``: a scan of module-level definitions only is a
+    predicate on where a function was written, not on what it does, and moving a reader into a
+    class body is not a change to the wire it reads.
+    """
+
+    functions: dict[str, list[_FunctionNode]] = {}
+    for node in ast.walk(_module_tree(relative_path)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.setdefault(node.name, []).append(node)
+    return functions
+
+
+def _called_local_names(function: ast.AST) -> frozenset[str]:
+    return frozenset(
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    )
+
+
+def _constructs_directly(function: ast.AST, class_name: str) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == class_name
+        for node in ast.walk(function)
+    )
+
+
+def _parameters(function: _FunctionNode) -> frozenset[str]:
+    arguments = function.args
+    return frozenset(
+        argument.arg
+        for argument in (
+            list(arguments.posonlyargs) + list(arguments.args) + list(arguments.kwonlyargs)
+        )
+    )
+
+
+def _mapping_parameters(function: _FunctionNode) -> frozenset[str]:
+    """Parameters *annotated* as a mapping.
+
+    Kept annotation-based on purpose, and used for one thing only: asserting that the two
+    registered value validators still take an already-extracted value. What a function *does*
+    is :func:`_reads_a_mapping_parameter`'s question, and it is a different one.
+    """
+
+    arguments = function.args
+    return frozenset(
+        argument.arg
+        for argument in (
+            list(arguments.posonlyargs) + list(arguments.args) + list(arguments.kwonlyargs)
+        )
+        if argument.annotation is not None
+        and any(
+            token in ast.unparse(argument.annotation)
+            for token in ("Mapping", "dict", "Dict")
+        )
+    )
+
+
+def _reads_a_mapping_parameter(function: _FunctionNode) -> bool:
+    """``payload[k]`` / ``payload.get(k)`` / ``k in payload`` on *any* parameter.
+
+    The key may be a literal or the ``key`` parameter the caller passes: both make the function
+    the place a wire key is actually read, which is what the helper list is for.
+
+    It used to require the parameter's *annotation* to name a mapping type, which made this a
+    predicate on how a helper was spelled rather than on what it does: ``payload: Any`` — the
+    annotation the two registered value validators already carry — read a wire key without ever
+    being a wire reader. A parameter that is subscripted, ``.get``-ed or ``in``-tested is being
+    used as a mapping whatever it was annotated as, and that is the whole test.
+    """
+
+    parameters = _parameters(function)
+    if not parameters:
+        return False
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in parameters
+        ):
+            return True
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in parameters
+        ):
+            return True
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.In)
+            and isinstance(node.comparators[0], ast.Name)
+            and node.comparators[0].id in parameters
+        ):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------------------
+# The write census, censused
+# --------------------------------------------------------------------------------------
+
+# Synthetic on purpose, and the only tests in this file that are. Every mechanism above answers
+# a question about code that does not exist yet -- the drift a future commit writes -- and the
+# failure this suite keeps re-earning is a census that *answers* where it should refuse. Pinning
+# the refusal on today's normalizer alone cannot show that: today's normalizer is readable, so
+# the reader returns the same seven keys whether or not the refusals exist at all.
+
+
+def _parsed_function(source: str) -> _FunctionNode:
+    node = ast.parse(textwrap.dedent(source).strip()).body[0]
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)), type(node)
+    return node
+
+
+# Each of these was answered — silently, with a subset — before round 3.
+_UNREADABLE_RESULT_SOURCES: dict[str, str] = {
+    "a copy loop over a source with no dict literal bound to it": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            details = collect(payload)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a computed subscript key written into the copy loop's source": """
+        def build(name):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details[name] = 3
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a merge into the copy loop's source from a name": """
+        def build(extra):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details.update(extra)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+    "a splat inside the result literal": """
+        def build(extra):
+            result = {"input_tokens": 1, **extra}
+            return result
+    """,
+    "a second return that is not the counted name": """
+        def build(flag, value):
+            result = {"input_tokens": 1}
+            if flag:
+                return {**result, "tool_tokens": value}
+            return result
+    """,
+    # Round 4. Every entry above is a *write through the name*; the two shapes below are the two
+    # ways the dict leaves the name, and round 3 refused neither. The first is the realistic one —
+    # the censused package folds one mapping into another exactly this way
+    # (``_accumulate_usage_mapping(state.total_usage, billed)``), so the drift needs no new idiom.
+    "the result handed to a call that can mutate it": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            enrich(result, payload)
+            return result
+    """,
+    "the result aliased to a second name written through": """
+        def build(value):
+            result = {"input_tokens": 1}
+            alias = result
+            alias["tool_tokens"] = value
+            return result
+    """,
+    # ...and the twin of the first, on the other name this census answers for: refusing the
+    # argument position only where the *returned* dict is handed over would reproduce the
+    # one-of-two-halves shape the round-3 repair was built to end.
+    "the copy loop's source handed to a call": """
+        def build(payload):
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            enrich(details, payload)
+            for key, value in details.items():
+                result[key] = value
+            return result
+    """,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNREADABLE_RESULT_SOURCES))
+def test_the_assignable_domain_reader_refuses_the_writes_it_cannot_read(shape: str) -> None:
+    with pytest.raises(AssertionError):
+        _emitted_result_keys(_parsed_function(_UNREADABLE_RESULT_SOURCES[shape]))
+
+
+# The other half, and the one that matters more: a shape it *can* read must be read in full,
+# because a refusal and a subset are both failures of the same census. The first entry is the
+# round-3 drift itself -- a key written into the dict the copy loop reads -- and it has to come
+# back as an emitted key so the usage diff downstream fails on it, not as a refusal here.
+_READABLE_RESULT_SOURCES: dict[str, tuple[str, frozenset[str]]] = {
+    "a constant key written into the copy loop's source": (
+        """
+        def build():
+            result = {"input_tokens": 1}
+            details = {"audio_tokens": 2}
+            details["tool_tokens"] = 3
+            for key, value in details.items():
+                result[key] = value
+            return result
+        """,
+        frozenset({"input_tokens", "audio_tokens", "tool_tokens"}),
+    ),
+    "an analyzable update() merge into the result": (
+        """
+        def build(value):
+            result = {"input_tokens": 1}
+            result.update({"tool_tokens": value})
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
+    "an analyzable |= merge into the result": (
+        """
+        def build(value):
+            result = {"input_tokens": 1}
+            result |= {"tool_tokens": value}
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
+    # The read-only half of round 4's call-argument rule: a builtin that cannot reach a mapping's
+    # mutators is a read, so refusing it would make the census answer "unreadable" about code that
+    # is perfectly readable — a refusal and a subset are both failures of the same census.
+    "the result handed to read-only builtins": (
+        """
+        def build():
+            result = {"input_tokens": 1}
+            if len(result) and sorted(result) and dict(result):
+                result["tool_tokens"] = 2
+            return result
+        """,
+        frozenset({"input_tokens", "tool_tokens"}),
+    ),
+}
+
+
+def test_the_assignable_domain_reader_reads_the_writes_it_can() -> None:
+    for shape, (source, expected) in sorted(_READABLE_RESULT_SOURCES.items()):
+        assigned = _emitted_result_keys(_parsed_function(source))
+        assert assigned == expected, {
+            "shape": shape,
+            "missing": sorted(expected - assigned),
+            "extra": sorted(assigned - expected),
+        }
+
+
+# R2's twin: the ``data=<name>`` emit-site resolver reads bindings through the same mechanism,
+# and used to have no refusal in it at all — it collected dict literals and constant-key
+# subscript writes and dropped every other contribution, so a merge put a key on the wire that
+# the schema diff below never saw.
+_UNREADABLE_BINDING_SOURCES: dict[str, str] = {
+    "a merge from a name": 'data = {"error": 1}\ndata.update(extra)\n',
+    "an |= merge from a name": 'data = {"error": 1}\ndata |= extra\n',
+    "a splat inside the literal": 'data = {"error": 1, **extra}\n',
+    "a mutator this census does not model": 'data = {"error": 1}\ndata.setdefault("k", 2)\n',
+    "a rebinding to something unreadable": 'data = {"error": 1}\ndata = enrich(data)\n',
+    # Round 4, and the pair the round-3 rebinding entry above just misses: ``data = enrich(data)``
+    # refused because the NAME was rebound, while the same call one character shorter left the
+    # name bound to a dict this census had stopped being able to read.
+    "a call that can mutate what it was handed": 'data = {"error": 1}\nenrich(data)\n',
+    "an alias written through": 'data = {"error": 1}\nalias = data\nalias["attempt"] = 2\n',
+    # The emit exemption is keyed on an ATTRIBUTE call. A bare ``emit(data=x)`` — a module-level
+    # function that happens to share the method name — is an opaque callee like any other, and
+    # the two comments beside ``_CENSUSED_EMIT_ARGUMENT`` used to write it without the receiver,
+    # which reads as the opposite. Pinned so the narrow rule is a fact, not a description of one.
+    "a bare call sharing the emit method name": 'data = {"error": 1}\nemit(data=data)\n',
+}
+
+
+def test_the_emit_binding_resolver_refuses_and_folds_like_the_result_census() -> None:
+    for shape, source in sorted(_UNREADABLE_BINDING_SOURCES.items()):
+        written = _dict_writes(ast.parse(source))["data"]
+        assert written.unreadable, {
+            "shape": shape,
+            "resolved_to": sorted(written.keys),
+            "hint": "an emit site resolving through this binding would report a subset of the "
+            "keys it puts on the wire",
+        }
+    folded = _dict_writes(ast.parse('data = {"error": 1}\ndata.update({"attempt": 2})\n'))["data"]
+    assert folded.unreadable == () and folded.keys == {"error", "attempt"}
+    # The two argument positions the call rule must *not* refuse, or it refuses the census's own
+    # read: the emit site whose binding ``_emit_data_keys`` resolves, and a read-only builtin.
+    emitted = _dict_writes(
+        ast.parse('data = {"error": 1}\nrecorder.emit("run.failed", data=data)\nlen(data)\n')
+    )["data"]
+    assert emitted.unreadable == () and emitted.keys == {"error"}, {
+        "resolved_to": sorted(emitted.keys),
+        "refused": sorted(emitted.unreadable),
+        "hint": "refusing the emit binding would make every data=<name> site unresolvable",
+    }
+
+
+# The fourth resolution path onto the same rule, and the last one still reading the weak half of
+# it: the extractors that pull a literal out of an *argument* (the transcript records matched by
+# ``kind="model_turn"``, the ``write_failure`` bundle, the manifest's ``limits=``). Each hands its
+# answer to an equality pin, so a splat added to one of those literals used to widen the artifact
+# while the pin stayed green.
+_UNPINNABLE_LITERALS: dict[str, str] = {
+    "a splat merging a mapping of unknown width": '{"kind": "model_turn", **_error_fields(exc)}',
+    "a computed key": '{"kind": "model_turn", name: value}',
+}
+
+
+def _parsed_literal(source: str) -> ast.Dict:
+    expression = ast.parse(source).body[0]
+    assert isinstance(expression, ast.Expr) and isinstance(expression.value, ast.Dict)
+    return expression.value
+
+
+def test_the_pinned_literal_extractor_refuses_what_it_cannot_read_in_full() -> None:
+    for shape, source in sorted(_UNPINNABLE_LITERALS.items()):
+        with pytest.raises(AssertionError):
+            _pinned_dict_keys(_parsed_literal(source), shape)
+    readable = _parsed_literal('{"kind": "model_turn", "step": step}')
+    assert _pinned_dict_keys(readable, "readable") == {"kind", "step"}
+
+
+# --------------------------------------------------------------------------------------
+# Family 1 — Suspension
+# --------------------------------------------------------------------------------------
+
+# result.py:suspension_checkpoint_payload — ``turn`` is a projection artifact of local paths and
+# metrics, so the durable observation deliberately omits it (registered by-design).
+SUSPENSION_PAYLOAD_EXCLUSIONS = frozenset({"turn"})
+
+
+def test_1a_checkpoint_payload_carries_every_suspension_field_but_the_exclusions() -> None:
+    authority = {field.name for field in dataclasses.fields(Suspension)}
+    expected = authority - SUSPENSION_PAYLOAD_EXCLUSIONS
+    written = set(suspension_checkpoint_payload(_maximal_suspension()))
+    assert written == expected, {
+        "missing": sorted(expected - written),
+        "extra": sorted(written - expected),
+    }
+
+
+def test_1b_every_written_key_is_read_back_non_default() -> None:
+    """A parser that ignores a written key leaves no trace in any key set — only in the value."""
+
+    suspension = _maximal_suspension()
+    payload = suspension_checkpoint_payload(suspension)
+    restored = suspension_from_checkpoint_payload(payload)
+    assert restored == dataclasses.replace(suspension, turn=None)
+
+    baseline = Suspension(reason="settled", status="completed")
+    dropped = {
+        key
+        for key in payload
+        if key not in {"reason", "status"} and getattr(restored, key) == getattr(baseline, key)
+    }
+    assert dropped == set(), {
+        "written_but_read_back_as_default": sorted(dropped),
+        "hint": "the writer emits this key and the parser ignores it",
+    }
+
+
+def test_1b_the_parser_is_lenient_about_absence_by_design() -> None:
+    """A pre-v0.21 checkpoint carries neither ``config_recoverable`` nor its siblings.
+
+    The reader defaults every absent key rather than refusing the payload (see the comment on
+    ``config_recoverable`` in ``core/result.py:suspension_from_checkpoint_payload``): the
+    default *is* what those runs meant, and a checkpoint that cannot be read is a run that
+    cannot be recovered. Only ``reason``/``status`` are required, and their vocabularies are
+    still validated. Pinned so tightening it reads as the compatibility break it would be.
+    """
+
+    minimal = suspension_from_checkpoint_payload({"reason": "settled", "status": "completed"})
+    assert minimal == Suspension(reason="settled", status="completed")
+    with pytest.raises(ValueError):
+        suspension_from_checkpoint_payload({"reason": "invented", "status": "completed"})
+    with pytest.raises(ValueError):
+        suspension_from_checkpoint_payload({"reason": "settled", "status": "invented"})
+
+
+def test_1b_one_reason_vocabulary_spelled_in_three_places() -> None:
+    """The type, the decoder's guard and the FSM's edge table are three hand-kept copies.
+
+    ``terminal`` is deliberately absent from the FSM map: it is the one reason whose target
+    state depends on the suspension's error_code (cancelled vs failed), so
+    ``lifecycle.state_from_suspension`` resolves it before consulting the table.
+    """
+
+    declared = set(get_args(get_type_hints(Suspension)["reason"]))
+    assert declared == set(_SUSPENSION_REASONS), {
+        "in_the_type_only": sorted(declared - _SUSPENSION_REASONS),
+        "in_the_decoder_guard_only": sorted(_SUSPENSION_REASONS - declared),
+    }
+    assert set(REASON_TO_STATE) == declared - {"terminal"}, {
+        "unmapped_reasons": sorted(declared - {"terminal"} - set(REASON_TO_STATE)),
+        "mapped_but_not_a_reason": sorted(set(REASON_TO_STATE) - declared),
+    }
+
+
+# errors.py:TurnNotSettled copies the classification off the suspension it wraps, field by
+# field, so a caller can branch without reaching through ``.suspension``. That copy is a hand
+# list: a new Suspension classification field is not re-stamped unless someone remembers.
+TURN_NOT_SETTLED_RESTAMPED = frozenset(
+    {
+        "reason",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The two the burn-down added to the park and to this copy in one change: the blocking
+        # facade hands a driver an exception and nothing else, and ``insufficient_quota`` vs
+        # ``rate_limit_exceeded`` is the same retryable/http_status pair with opposite answers.
+        "provider_error_code",
+        "provider_retried",
+    }
+)
+
+
+def test_1b_the_not_settled_exception_restamps_exactly_the_registered_fields() -> None:
+    suspension = _maximal_suspension()
+    exc = TurnNotSettled(suspension)
+    stamped = set(vars(exc)) - {"suspension"}
+    assert stamped == TURN_NOT_SETTLED_RESTAMPED, {
+        "newly_restamped": sorted(stamped - TURN_NOT_SETTLED_RESTAMPED),
+        "no_longer_restamped": sorted(TURN_NOT_SETTLED_RESTAMPED - stamped),
+    }
+    # Every re-stamped name is a Suspension field carrying that suspension's value, so the copy
+    # cannot drift into a rename or a stale value.
+    fields = {field.name for field in dataclasses.fields(Suspension)}
+    assert stamped <= fields
+    for name in sorted(stamped):
+        assert getattr(exc, name) == getattr(suspension, name), name
+    assert exc.suspension is suspension
+
+
+# core/schemas.py:EVENT_DATA_SCHEMAS["turn.failed"] — additionalProperties is False, so this is
+# the total wire domain of the event, not a lower bound.
+TURN_FAILED_EVENT_KEYS = frozenset(
+    {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "http_status",
+        "config_recoverable",
+        # The burn-down's two: the attempt already made, and what the refused call already cost.
+        # ``provider_usage`` is the KERNEL spelling — the gateway wire's compat-frozen alias for
+        # the same fact is ``usage``, and this event names facts, not wire keys (see below).
+        "provider_retried",
+        "provider_usage",
+    }
+)
+
+
+def test_1c_turn_failed_schema_and_emit_site_agree_on_one_key_set() -> None:
+    schema = EVENT_DATA_SCHEMAS["turn.failed"]
+    declared = frozenset(schema["properties"])
+    assert schema["additionalProperties"] is False
+    assert declared == TURN_FAILED_EVENT_KEYS, {
+        "missing": sorted(TURN_FAILED_EVENT_KEYS - declared),
+        "extra": sorted(declared - TURN_FAILED_EVENT_KEYS),
+    }
+    emitted = _emit_data_keys("loop.py", "turn.failed")
+    assert emitted == declared, {
+        "emitted_not_declared": sorted(emitted - declared),
+        "declared_not_emitted": sorted(declared - emitted),
+    }
+
+
+def test_1c_turn_failed_now_names_every_fact_the_wire_carries() -> None:
+    """Cross-check against family 2, so the event and the wire cannot drift independently.
+
+    The event uses the KERNEL spelling of each fact where the wire uses its alias, so the
+    comparison runs through :data:`TRANSPORTABLE_ERROR_WIRE_ALIASES` rather than over raw keys.
+    """
+
+    declared = frozenset(EVENT_DATA_SCHEMAS["turn.failed"]["properties"])
+    wire_facts = {
+        alias if alias != "message" else "error"
+        for alias in TRANSPORTABLE_ERROR_WIRE_ALIASES.values()
+    }
+
+    # Both spellings of the provider code disagree with the wire's, on purpose: the event names
+    # the fact (``provider_error_code``) where the compat-frozen wire calls it ``error_code``.
+    assert "provider_error_code" in declared
+    assert "provider_error_code" in wire_facts
+
+    # The event named this from the start and the wire could not; the burn-down gave the wire a
+    # key without touching the event, which is the whole point of comparing them here.
+    assert "config_recoverable" in declared
+    assert "config_recoverable" in wire_facts
+
+    # And if a *next* fact joins the uncarried set, this event must still declare it.
+    assert TRANSPORTABLE_ERROR_UNCARRIED <= declared
+
+    # ...and the event now names every one of them. It used to drop the retry and the cost, and
+    # the transcript record written on the very same failure kept both -- so the event was the
+    # odd one out rather than the rule, which is what the burn-down closed.
+    assert wire_facts - declared == set(), {
+        "carried_by_the_wire_and_not_by_the_event": sorted(wire_facts - declared),
+    }
+    # The event spells each fact by its KERNEL name. ``usage`` is the wire's compat-frozen alias
+    # for ``provider_usage``, exactly as ``error_code`` is the wire's alias for
+    # ``provider_error_code``, and neither alias has a slot on this event.
+    assert "usage" not in declared
+    assert "provider_usage" in declared
+
+
+# core/schemas.py:TRANSCRIPT_RECORD_SCHEMA, model_turn branch. ``config_recoverable`` was written
+# by loop.py:_apump_turn and undeclared here, and the record stayed valid only because the branch
+# sets additionalProperties=True -- so the pin below is now "declares exactly what is written",
+# and a *next* undeclared key fails on it rather than being absorbed by the open cap.
+TRANSCRIPT_MODEL_TURN_DECLARED = frozenset(
+    {
+        "kind",
+        "step",
+        "response_id",
+        "final_text",
+        "tool_calls",
+        "usage",
+        "error",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "provider_retried",
+        "http_status",
+    }
+)
+
+
+def _transcript_model_turn_branch() -> dict[str, Any]:
+    for variant in TRANSCRIPT_RECORD_SCHEMA["oneOf"]:
+        if variant["properties"]["kind"]["const"] == "model_turn":
+            return variant
+    raise AssertionError("TRANSCRIPT_RECORD_SCHEMA has no model_turn branch")
+
+
+def test_1d_the_transcript_schema_declares_every_key_the_writer_writes() -> None:
+    """The open cap is a tolerance, not a declaration, so what it absorbs is pinned here."""
+
+    branch = _transcript_model_turn_branch()
+    declared = frozenset(branch["properties"])
+    assert declared == TRANSCRIPT_MODEL_TURN_DECLARED, {
+        "missing": sorted(TRANSCRIPT_MODEL_TURN_DECLARED - declared),
+        "extra": sorted(declared - TRANSCRIPT_MODEL_TURN_DECLARED),
+    }
+    written = [
+        keys
+        for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
+        if "error" in keys
+    ]
+    assert len(written) == 1, {"model_turn_failure_records_found": len(written)}
+    undeclared = written[0] - declared
+    assert undeclared == set(), {
+        "written_but_undeclared": sorted(undeclared),
+        "hint": "additionalProperties=True keeps the record valid; declare the key anyway",
+    }
+    assert branch["additionalProperties"] is True
+
+
+# The other ``kind="model_turn"`` record: the one written when the turn SUCCEEDS. It shares a
+# schema branch with the failure record above, so it is the same declared vocabulary minus the
+# error half -- ``provider_retried`` included, which is what the burn-down added: the record of a
+# retried-then-successful call used to read as a clean single attempt.
+TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS = frozenset(
+    {"kind", "step", "response_id", "final_text", "tool_calls", "usage", "provider_retried"}
+)
+
+
+def test_1d_the_success_transcript_record_states_the_retry_its_turn_reports() -> None:
+    written = [
+        keys
+        for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
+        if "error" not in keys
+    ]
+    assert len(written) == 1, {"model_turn_success_records_found": len(written)}
+    assert written[0] == TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS, {
+        "missing": sorted(TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS - written[0]),
+        "extra": sorted(written[0] - TRANSCRIPT_MODEL_TURN_SUCCESS_KEYS),
+    }
+    assert written[0] <= frozenset(_transcript_model_turn_branch()["properties"])
+    # The fact is stated by the record and present on the object it was written from -- and its
+    # failure twin states it too, so the two halves of one artifact cannot drift apart again.
+    assert "provider_retried" in {field.name for field in dataclasses.fields(ModelTurn)}
+    assert "provider_retried" in written[0]
+    failure = [
+        keys
+        for keys in _literal_dict_keys_where("loop.py", "kind", "model_turn")
+        if "error" in keys
+    ]
+    assert len(failure) == 1 and "provider_retried" in failure[0]
+
+
+def test_1e_the_checkpoint_alias_is_copied_at_exactly_two_sites() -> None:
+    """The rename lives in two hand-written copies: the snapshot and the restore.
+
+    ``http_status`` is spelled ``provider_http_status`` on the checkpoint (registered by-design),
+    and a rename is only safe while both ends of it are one edit apart. These are the two, named
+    by the census so a third copy -- or a dropped one -- is a failure rather than a silence.
+    """
+
+    tree = _module_tree("loop.py")
+    copies: dict[str, list[str]] = {"RunCheckpoint": [], "RunState": []}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id not in copies:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "provider_http_status":
+                continue
+            source = keyword.value
+            assert isinstance(source, ast.Attribute), ast.dump(source)
+            copies[node.func.id].append(f"{ast.unparse(source)}")
+    assert copies == {
+        # The snapshot reads the live run state; the restore reads the checkpoint back.
+        "RunCheckpoint": ["state.provider_http_status"],
+        "RunState": ["cp.provider_http_status"],
+    }, {"copy_sites": copies, "hint": "a third copy of the alias, or a lost one"}
+
+
+def test_1d_the_failure_bundle_and_the_event_beside_it_carry_the_same_status() -> None:
+    """loop.py:_record_failure emits run.failed and writes failure.json from the same state.
+
+    The bundle used to drop ``http_status`` while the event kept it, which is the same fact
+    written twice from one place and bound once -- so the pin is now an intersection rather than
+    an absence, and a key that reaches one of the two and not the other fails here.
+    """
+
+    event_keys = _emit_data_keys("loop.py", "run.failed")
+    bundles = _call_dict_arg_keys("loop.py", "write_failure")
+    assert len(bundles) == 1, {"write_failure_sites": len(bundles)}
+    assert "http_status" in event_keys
+    assert "http_status" in bundles[0], {
+        "hint": "the operator's restore aid must keep the status the log kept",
+    }
+    shared = {
+        "error",
+        "error_code",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "type",
+    }
+    assert shared <= (event_keys & bundles[0]), {
+        "carried_by_only_one_of_the_two": sorted(shared - (event_keys & bundles[0])),
+    }
+
+
+# The terminal-failure trio, pinned in full rather than probed for one key. ``run.failed`` is
+# ``turn.failed``'s terminal twin -- ``fail_recoverable`` promotes one into the other -- and the
+# burn-down gave it the classification that promotion used to lose, on the event and on the
+# bundle written from the same state in the same breath.
+RUN_FAILED_EVENT_KEYS = frozenset(
+    {
+        "error",
+        "error_code",
+        "type",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+    }
+)
+FAILURE_BUNDLE_KEYS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "error",
+        "error_code",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "type",
+        "last_good_seq",
+        "restore_hint",
+    }
+)
+
+# The SECOND writer of ``failure.json``, and the reason it is pinned beside the first: the two
+# are separate code writing one artifact under one schema id (``monoid.failure.v1``), and the
+# reference backend's is the one a worker crash leaves behind -- the case where the bundle is the
+# only record there is. It carries no ``provider_error_code`` (its callers hold an exception, not
+# the loop's classified run state) and adds ``failed_at``; every other key must match, so a field
+# added to one writer and not the other fails here rather than at an operator's console.
+REFERENCE_FAILURE_BUNDLE_KEYS = (FAILURE_BUNDLE_KEYS - {"provider_error_code"}) | {"failed_at"}
+
+
+def test_1d_run_failed_pins_its_schema_its_emit_site_and_its_bundle() -> None:
+    schema = EVENT_DATA_SCHEMAS["run.failed"]
+    declared = frozenset(schema["properties"])
+    assert schema["additionalProperties"] is False
+    assert declared == RUN_FAILED_EVENT_KEYS, {
+        "missing": sorted(RUN_FAILED_EVENT_KEYS - declared),
+        "extra": sorted(declared - RUN_FAILED_EVENT_KEYS),
+    }
+    emitted = _emit_data_keys("loop.py", "run.failed")
+    assert emitted == declared, {
+        "emitted_not_declared": sorted(emitted - declared),
+        "declared_not_emitted": sorted(declared - emitted),
+    }
+    bundles = _call_dict_arg_keys("loop.py", "write_failure")
+    assert bundles[0] == FAILURE_BUNDLE_KEYS, {
+        "missing": sorted(FAILURE_BUNDLE_KEYS - bundles[0]),
+        "extra": sorted(bundles[0] - FAILURE_BUNDLE_KEYS),
+    }
+
+
+def test_1d_the_reference_backend_writes_the_same_bundle_the_core_does() -> None:
+    """The twin writer of one durable artifact, diffed against the core's key set.
+
+    ``monoid.failure.v1`` has two independent writers and a permissive reader policy, so a field
+    that reaches one of them is invisible to the other's consumers and to every schema check --
+    which is exactly how the status this commit adds could have landed on one half. The
+    difference between them is pinned as a set, not tolerated as "roughly the same".
+    """
+
+    writer = _function_node(
+        "reference/backend/recovery.py", "write_failure_bundle", within="RecoveryService"
+    )
+    literals = [node for node in ast.walk(writer) if isinstance(node, ast.Dict)]
+    assert len(literals) == 1, {"dict_literals_in_the_writer": len(literals)}
+    written = _pinned_dict_keys(
+        literals[0], "reference/backend/recovery.py:write_failure_bundle"
+    )
+    assert written == REFERENCE_FAILURE_BUNDLE_KEYS, {
+        "missing": sorted(REFERENCE_FAILURE_BUNDLE_KEYS - written),
+        "extra": sorted(written - REFERENCE_FAILURE_BUNDLE_KEYS),
+        "hint": "a key reached one failure-bundle writer and not its twin",
+    }
+    assert "http_status" in written
+    # Stated as a difference so a *new* divergence between the two writers is a failure, not a
+    # silence: the reference writer holds an exception rather than the loop's classified state.
+    core = _call_dict_arg_keys("loop.py", "write_failure")[0]
+    assert core - written == {"provider_error_code"}
+    assert written - core == {"failed_at"}
+
+
+def test_1d_the_terminal_failure_record_keeps_the_classification_its_twin_carries() -> None:
+    """``turn.failed`` -> ``run.failed`` is a real promotion path; what it loses is pinned.
+
+    ``AgentLoop.fail_recoverable`` exists to turn an exhausted recoverable turn failure into the
+    terminal record, and ``close()`` performs the same promotion for an unrecovered park -- so a
+    config-recoverable terminal failure is an ordinary outcome, not a hypothetical. The
+    classification now survives the promotion; the remainder is stated as a set rather than
+    tolerated, so a *new* fact that reaches one event and not the other fails here.
+
+    The two that stop at the turn event are per-CALL facts, not classifications of the run:
+    ``provider_usage`` is what one refused call cost (the cumulative lane -- metrics.updated and
+    metrics.json -- is where a run's cost is reported, and it already carries these tokens), and
+    ``provider_retried`` describes attempts inside one adapter call (recorded per call on the
+    transcript record and the receipt). Promoting either onto the terminal record would mean
+    publishing one call's number as the run's.
+    """
+
+    turn_failed = frozenset(EVENT_DATA_SCHEMAS["turn.failed"]["properties"])
+    lost = turn_failed - RUN_FAILED_EVENT_KEYS
+    assert lost == {"provider_retried", "provider_usage"}, {
+        "lost_on_promotion": sorted(lost),
+        "hint": "a fact reached the turn event and not its terminal twin",
+    }
+    assert {"retryable", "config_recoverable"} <= RUN_FAILED_EVENT_KEYS
+    # And the durable park payload keeps both, so the fact exists at the moment of promotion.
+    payload = suspension_checkpoint_payload(_maximal_suspension())
+    assert {"retryable", "config_recoverable"} <= set(payload)
+
+
+# --------------------------------------------------------------------------------------
+# Family 2 — ModelAdapterError transport
+# --------------------------------------------------------------------------------------
+
+SERVER_ERROR_BODY_KEYS = frozenset(TRANSPORTABLE_ERROR_WIRE_ALIASES)
+
+# ``_error_body``'s own signature, pinned. Every parameter carries one wire key: the two
+# positionals become ``http_status``/``error``, the keyword-only ones keep their names. So the
+# parameter list and the wire key set determine each other, and a parameter added to the writer
+# fails here even if no census probe happens to pass it (which is exactly how a half-threaded
+# field stayed invisible: the probe below re-implements the call and simply never passed it).
+SERVER_ERROR_BODY_POSITIONALS: tuple[str, ...] = ("status", "message")
+SERVER_ERROR_BODY_POSITIONAL_WIRE_KEYS = frozenset({"http_status", "error"})
+
+
+def test_2a_the_error_body_signature_and_the_wire_key_set_determine_each_other() -> None:
+    signature = _live_signature(_error_body)
+    positional = tuple(
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    keyword_only = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    assert positional == SERVER_ERROR_BODY_POSITIONALS
+    accounted = keyword_only | SERVER_ERROR_BODY_POSITIONAL_WIRE_KEYS
+    assert accounted == SERVER_ERROR_BODY_KEYS, {
+        "parameters_without_a_wire_key": sorted(accounted - SERVER_ERROR_BODY_KEYS),
+        "wire_keys_without_a_parameter": sorted(SERVER_ERROR_BODY_KEYS - accounted),
+        "hint": "a new parameter must reach BOTH writers and the alias table, or fail here",
+    }
+
+
+def _maximal_error_body() -> dict[str, Any]:
+    exc = _maximal_adapter_error()
+    return _error_body(
+        _model_error_status(exc),
+        str(exc),
+        error_code=exc.provider_error_code,
+        retryable=exc.retryable,
+        config_recoverable=exc.config_recoverable,
+        provider_retried=exc.provider_retried,
+        usage=provider_usage_of(exc),
+    )
+
+
+def _write_exception_body(exc: Exception) -> tuple[dict[str, Any], HTTPStatus]:
+    """Drive the *real* ``_write_exception`` arm and capture what it would have sent.
+
+    ``_maximal_error_body`` re-implements the argument list ``_write_exception`` passes, so a
+    field threaded into the writer but not into that copy is invisible to every key diff -- the
+    flagship gap could be half-fixed silently. This runs the shipped handler method instead, on
+    an instance built without a socket, with only the final JSON write replaced.
+    """
+
+    handler_class = make_llm_gateway_handler(
+        _NO_GATEWAY_NEEDED,  # type: ignore[arg-type]
+        admin_token=None,
+    )
+    handler = handler_class.__new__(handler_class)
+    captured: dict[str, Any] = {}
+
+    def _capture(payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
+        captured["body"] = payload
+        captured["status"] = status
+
+    handler._write_json = _capture  # type: ignore[method-assign]
+    handler._write_exception(exc)  # type: ignore[attr-defined]
+    return captured["body"], captured["status"]
+
+
+class _NoGatewayNeeded:
+    """``_write_exception`` never touches the gateway the handler factory closes over."""
+
+
+_NO_GATEWAY_NEEDED = _NoGatewayNeeded()
+
+
+def test_2a_the_two_server_writers_answer_one_exception_identically() -> None:
+    """The twin binding: separate code, one wire contract, so they are diffed against each other.
+
+    ``_error_body`` is shared, but *what each writer passes it* is not -- and that argument list
+    is where a field goes missing. Driving both from one exception makes a half-threaded field a
+    difference in this dict rather than a silence.
+    """
+
+    exc = _maximal_adapter_error()
+    written, status = _write_exception_body(exc)
+    framed = _stream_error_frame(_StreamFrameHandler(), exc)
+
+    assert framed["type"] == "error"
+    assert written == {key: value for key, value in framed.items() if key != "type"}, {
+        "non_streamed_body": written,
+        "stream_error_frame": framed,
+        "hint": "a field reached one server writer and not its twin",
+    }
+    assert frozenset(written) == SERVER_ERROR_BODY_KEYS, {
+        "missing": sorted(SERVER_ERROR_BODY_KEYS - set(written)),
+        "extra": sorted(set(written) - SERVER_ERROR_BODY_KEYS),
+    }
+    assert status == HTTPStatus.TOO_MANY_REQUESTS
+    assert written["http_status"] == int(status)
+    # The exception's own facts, not the writer's defaults.
+    assert written["retryable"] is True
+    assert written["config_recoverable"] is True
+    assert written["provider_retried"] is True
+    assert written["usage"] == provider_usage_of(exc)
+
+
+def test_2a_a_config_recoverable_refusal_reaches_the_wire_as_a_422_and_as_a_flag() -> None:
+    """Both halves of the same statement, pinned on the real writer.
+
+    The status was the *only* thing a client could read this off, and it is a hint rather than a
+    statement: a 4xx says the request was at fault, not that configuration fixes it, and a
+    refusal raised with no HTTP status at all (an applied-parameters proof failure) had nothing
+    to leave behind. Now the classification rides its own key and the status still agrees with
+    it, so a change to either half is a failure here.
+    """
+
+    refused = ModelAdapterError(
+        "the upstream refused the shape",
+        provider_error_code="unsupported_request_shape",
+        retryable=False,
+        config_recoverable=True,
+    )
+    written, status = _write_exception_body(refused)
+    assert status == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert written["http_status"] == 422
+    assert written["config_recoverable"] is True
+    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(written)
+
+
+def test_2a_server_error_body_writes_exactly_the_alias_table() -> None:
+    body = _maximal_error_body()
+    assert frozenset(body) == SERVER_ERROR_BODY_KEYS, {
+        "missing": sorted(SERVER_ERROR_BODY_KEYS - set(body)),
+        "extra": sorted(set(body) - SERVER_ERROR_BODY_KEYS),
+    }
+    # No transportable fact is left without a key; a new one must join the table, not this gap.
+    assert TRANSPORTABLE_ERROR_UNCARRIED.isdisjoint(body)
+
+
+class _StreamFrameHandler:
+    """A ``_stream_error_frame`` handler is only touched on the non-ModelAdapterError path."""
+
+
+def test_2a_stream_error_frame_is_the_body_plus_a_type_tag() -> None:
+    """The twin writer: separate code, so a field added to one must be added to the other."""
+
+    frame = _stream_error_frame(_StreamFrameHandler(), _maximal_adapter_error())
+    expected = SERVER_ERROR_BODY_KEYS | {"type"}
+    assert frozenset(frame) == expected, {
+        "missing": sorted(expected - set(frame)),
+        "extra": sorted(set(frame) - expected),
+    }
+    assert frame["type"] == "error"
+    assert {key: value for key, value in frame.items() if key != "type"} == _maximal_error_body()
+
+
+def test_2a_both_writers_read_the_retry_off_a_raw_refusal_the_way_they_read_the_cost() -> None:
+    """The stamp does not belong to a type — and neither writer was reading it that way.
+
+    ``provider_usage_of`` is read ONCE above the branch in both writers, on the stated rule that
+    an adapter refusing in a raw ``ValueError``/``AttributeError`` has burned tokens as readily
+    as one refusing in a ``ModelAdapterError``. ``provider_retried`` sat inside the
+    ``ModelAdapterError`` arm alone, though ``mark_provider_retried`` stamps any
+    ``BaseException`` and the gateway client's own ``_stamp_retry`` documents exactly that. So a
+    third-party adapter that retried and then refused raw was reported one hop out as a clean
+    single attempt, on the one carrier a failed call has left — while the cost of those same
+    attempts rode the same body.
+    """
+
+    raw = ValueError("the upstream adapter refused its provider's payload")
+    mark_provider_retried(raw)
+    mark_provider_usage(raw, {"input_tokens": 120, "output_tokens": 340, "total_tokens": 460})
+
+    written, status = _write_exception_body(raw)
+    framed = _stream_error_frame(_StreamFrameHandler(), raw)
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert written["provider_retried"] is True, {
+        "body": written,
+        "hint": "the flag is readable on this exception and only the typed arm passed it",
+    }
+    assert framed["provider_retried"] is True, {
+        "frame": framed,
+        "hint": "the streamed twin of the same omission",
+    }
+    # Read once above the branch means the two facts travel together, whichever arm answers.
+    assert written["usage"] == framed["usage"] == provider_usage_of(raw)
+
+    # The counterweight: an unstamped raw refusal claims neither.
+    plain = ValueError("refused before the provider was reached")
+    unstamped, _status = _write_exception_body(plain)
+    assert unstamped["provider_retried"] is False
+    assert "usage" not in unstamped
+
+
+def test_2a_usage_is_omitted_when_the_failure_cost_nothing() -> None:
+    """By-design omit-when-empty: an error raised before a provider keeps its old wire shape."""
+
+    unstamped = ModelAdapterError("refused before dispatch", provider_error_code="gateway_error")
+    body = _error_body(
+        _model_error_status(unstamped), str(unstamped), usage=provider_usage_of(unstamped)
+    )
+    assert "usage" not in body
+    assert frozenset(body) == SERVER_ERROR_BODY_KEYS - {"usage"}
+
+
+# --- the minimal twin of the two maximal writer probes ---------------------------------
+
+# What each shipped writer emits for a failure that carries nothing and cost nothing. The
+# maximal probes above are the union of the wire; the difference between the two probes is the
+# conditional half, which on this family is exactly ``usage`` (the registered omit-when-empty
+# rule, and the only key ``_error_body`` makes conditional).
+#
+# Family 7 grew this twin in round 2 and family 2 did not, which left a hole with a name: every
+# family-2 probe feeds a *maximal* exception, so every fact on it is non-default, so a writer
+# that omitted a key whenever its value was falsy was indistinguishable from one that always
+# writes it. ``_error_body`` is shared and could not drift that way -- but ``_write_exception``
+# and ``_stream_error_frame`` each build their own argument list around it, and an
+# omit-when-falsy filter added on *their* side of that call (dropping ``provider_retried=False``,
+# say, which the client's default would silently absorb) is exactly the half-threaded-field shape
+# this family exists to catch. Both writers are driven, because they are separate code.
+GATEWAY_MINIMAL_ERROR_BODY_KEYS = SERVER_ERROR_BODY_KEYS - {"usage"}
+
+
+def _minimal_adapter_error() -> ModelAdapterError:
+    """The other end of ``_maximal_adapter_error``: every transportable fact at its default."""
+
+    return ModelAdapterError("upstream refused before the call cost anything")
+
+
+def test_2a_the_minimal_failure_pins_which_error_body_keys_are_conditional() -> None:
+    """The non-streamed writer, driven through the shipped handler like its maximal twin."""
+
+    exc = _minimal_adapter_error()
+    # The probe is only minimal if the exception really is: every fact at its default.
+    assert provider_usage_of(exc) == {}
+    assert (
+        exc.retryable,
+        exc.config_recoverable,
+        exc.provider_retried,
+        exc.provider_error_code,
+    ) == (False, False, False, "")
+
+    written, status = _write_exception_body(exc)
+    assert frozenset(written) == GATEWAY_MINIMAL_ERROR_BODY_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_ERROR_BODY_KEYS - set(written)),
+        "extra": sorted(set(written) - GATEWAY_MINIMAL_ERROR_BODY_KEYS),
+        "hint": "a key that vanished when its value was the default: that is an omit-when-empty "
+        "contract, and ``usage`` is the only one this wire has declared",
+    }
+    assert SERVER_ERROR_BODY_KEYS - GATEWAY_MINIMAL_ERROR_BODY_KEYS == {"usage"}
+    # Each surviving key carries the default itself, not an absence the client re-defaults.
+    assert status == HTTPStatus.BAD_GATEWAY
+    assert written["http_status"] == 502
+    assert written["retryable"] is False
+    assert written["config_recoverable"] is False
+    assert written["provider_retried"] is False
+    assert written["error_code"] == gateway_client.GATEWAY_BAD_RESPONSE
+    assert written["error"] == str(exc)
+
+
+def test_2a_the_minimal_failure_reaches_the_stream_writer_identically() -> None:
+    """The streamed twin, and the two writers diffed against each other on the minimal input.
+
+    ``test_2a_the_two_server_writers_answer_one_exception_identically`` does this for a maximal
+    exception; a filter that only fires on a falsy value needs the minimal one to show.
+    """
+
+    exc = _minimal_adapter_error()
+    framed = _stream_error_frame(_StreamFrameHandler(), exc)
+    expected = GATEWAY_MINIMAL_ERROR_BODY_KEYS | {"type"}
+    assert frozenset(framed) == expected, {
+        "missing": sorted(expected - set(framed)),
+        "extra": sorted(set(framed) - expected),
+        "hint": "the frame writer and the body writer must be conditional about the same keys",
+    }
+    assert framed["type"] == "error"
+    written, _ = _write_exception_body(exc)
+    assert written == {key: value for key, value in framed.items() if key != "type"}, {
+        "non_streamed_body": written,
+        "stream_error_frame": framed,
+        "hint": "a default reached one server writer and not its twin",
+    }
+
+
+def _maximal_wire_body() -> dict[str, Any]:
+    """The server body, which is now the whole wire.
+
+    This used to be ``_maximal_error_body()`` plus a hand-added ``config_recoverable`` — the one
+    fact the writers could not emit, added here so a reader that *did* read it would show up in
+    the behavioral census. The writers emit it now, so the two bodies are the same dict and the
+    reader censuses below read exactly what the server writes.
+    """
+
+    return _maximal_error_body()
+
+
+def _read_r1(body: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._parse_gateway_response(dict(body))
+    return caught.value
+
+
+def _read_r2(body: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._chunk_from_event({"type": "error", **body})
+    return caught.value
+
+
+def _read_r3(body: dict[str, Any]) -> ModelAdapterError:
+    return gateway_client._error_from_status_body(int(body["http_status"]), json.dumps(body))
+
+
+GATEWAY_ERROR_READERS = {
+    "providers/gateway.py:_parse_gateway_response": _read_r1,
+    "providers/gateway.py:_chunk_from_event": _read_r2,
+    "providers/gateway.py:_error_from_status_body": _read_r3,
+}
+
+
+@pytest.mark.parametrize("reader", sorted(GATEWAY_ERROR_READERS))
+def test_2b_every_reader_reconstructs_the_same_facts_and_loses_the_same_ones(reader: str) -> None:
+    """Behavioral census: a dropped read is invisible in a key diff, visible in the attributes."""
+
+    body = _maximal_wire_body()
+    got = GATEWAY_ERROR_READERS[reader](body)
+
+    carried = {
+        "provider_error_code": got.provider_error_code,
+        "retryable": got.retryable,
+        "config_recoverable": got.config_recoverable,
+        "http_status": got.http_status,
+        "provider_retried": got.provider_retried,
+        "provider_usage": provider_usage_of(got),
+    }
+    assert carried == {
+        "provider_error_code": body["error_code"],
+        "retryable": body["retryable"],
+        "config_recoverable": body["config_recoverable"],
+        "http_status": body["http_status"],
+        "provider_retried": body["provider_retried"],
+        "provider_usage": body["usage"],
+    }, {"reader": reader, "reconstructed": carried}
+
+    # The message survives, but R3 wraps it with the status line it was read from.
+    assert body["error"] in str(got)
+
+    # The registered loss. It flips to a failure the moment a reader starts binding it.
+    assert got.error_code == ModelAdapterError.error_code, (
+        "the kernel error_code has no wire slot; it must reconstruct to the class default"
+    )
+    # An instance attribute rather than a class default, so the read above is a real read.
+    assert "config_recoverable" not in vars(type(got))
+    assert "config_recoverable" in vars(got)
+
+
+def test_2b_r3_takes_http_status_from_the_status_line_not_the_body() -> None:
+    """The registered per-reader quirk: R3's status argument wins over the body's key."""
+
+    body = _maximal_wire_body()
+    got = gateway_client._error_from_status_body(500, json.dumps(body))
+    assert body["http_status"] == 429
+    assert got.http_status == 500
+
+
+def test_2b_r3_defaults_retryable_from_the_status_when_the_body_is_silent() -> None:
+    """R1/R2 default retryable to False; R3 derives it, so a silent 503 reads retryable."""
+
+    silent = {key: value for key, value in _maximal_wire_body().items() if key != "retryable"}
+    assert gateway_client._error_from_status_body(503, json.dumps(silent)).retryable is True
+    assert gateway_client._error_from_status_body(400, json.dumps(silent)).retryable is False
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._parse_gateway_response(dict(silent))
+    assert caught.value.retryable is False
+
+
+# What each reader reconstructs from a body carrying nothing but the message. These are the
+# values a *pre-field* gateway produces, so they are the compatibility contract of every added
+# key -- and they are per reader, because R3 derives two of them from the status line it was
+# read from while R1/R2 have no status to derive from.
+#
+# ``config_recoverable`` is in here for a different reason than it used to be: it was the fact no
+# reader read, and its ``False`` was the constructor default. It is now READ, with an explicit
+# ``default=False``, on all three readers -- so these entries are the compatibility contract of
+# the added key (an older gateway omits it and every reader answers "not config-fixable"), and a
+# reader that derived it from the status the way R3 derives ``retryable`` would fail here.
+SILENT_BODY_DEFAULTS: dict[str, dict[str, Any]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "provider_error_code": gateway_client.GATEWAY_BAD_RESPONSE,
+        "retryable": False,
+        "http_status": None,
+        "provider_retried": False,
+        "config_recoverable": False,
+        "provider_usage": {},
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "provider_error_code": gateway_client.GATEWAY_BAD_RESPONSE,
+        "retryable": False,
+        "http_status": None,
+        "provider_retried": False,
+        "config_recoverable": False,
+        "provider_usage": {},
+    },
+    # Read from a 503: ``retryable`` and the provider code are derived from the status, and
+    # ``http_status`` is the status line rather than an absent body key.
+    "providers/gateway.py:_error_from_status_body": {
+        "provider_error_code": gateway_client.GATEWAY_SERVER_ERROR,
+        "retryable": True,
+        "http_status": 503,
+        "provider_retried": False,
+        "config_recoverable": False,
+        "provider_usage": {},
+    },
+}
+
+_SILENT_BODY = {"error": "upstream refused with nothing else to say"}
+
+
+def _read_silent_r1() -> ModelAdapterError:
+    return _read_r1(dict(_SILENT_BODY))
+
+
+def _read_silent_r2() -> ModelAdapterError:
+    return _read_r2(dict(_SILENT_BODY))
+
+
+def _read_silent_r3() -> ModelAdapterError:
+    return gateway_client._error_from_status_body(503, json.dumps(_SILENT_BODY))
+
+
+SILENT_BODY_READERS = {
+    "providers/gateway.py:_parse_gateway_response": _read_silent_r1,
+    "providers/gateway.py:_chunk_from_event": _read_silent_r2,
+    "providers/gateway.py:_error_from_status_body": _read_silent_r3,
+}
+
+
+@pytest.mark.parametrize("reader", sorted(SILENT_BODY_READERS))
+def test_2b_every_reader_defaults_an_absent_key_the_registered_way(reader: str) -> None:
+    """The absent-key half of the reader census, over all three readers rather than two.
+
+    A default is a contract: it is what every gateway that predates a field answers, so
+    changing one silently reclassifies existing traffic (a ``retryable`` default flipped on the
+    stream reader alone turns every terse stream error into a retry the other transports do not
+    make). Pinning R1 and R3 while leaving R2 free is how that asymmetry stayed invisible.
+    """
+
+    got = SILENT_BODY_READERS[reader]()
+    reconstructed = {
+        "provider_error_code": got.provider_error_code,
+        "retryable": got.retryable,
+        "http_status": got.http_status,
+        "provider_retried": got.provider_retried,
+        "config_recoverable": got.config_recoverable,
+        "provider_usage": provider_usage_of(got),
+    }
+    assert reconstructed == SILENT_BODY_DEFAULTS[reader], {
+        "reader": reader,
+        "reconstructed": reconstructed,
+        "hint": "a default changed: that is a wire-compatibility change, not a refactor",
+    }
+    assert _SILENT_BODY["error"] in str(got)
+
+
+# --- the reader set itself, and what each reader reads ---------------------------------
+
+# Full read-key census per reader, pinned. A reader that grows a read of a key no writer
+# emits, or stops reading one, fails here.
+GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
+    "providers/gateway.py:_parse_gateway_response": frozenset(
+        {
+            # error half
+            "error",
+            "error_code",
+            "retryable",
+            "config_recoverable",
+            "http_status",
+            "provider_retried",
+            "usage",
+            # success half
+            "tool_calls",
+            "arguments",
+            "id",
+            "call_id",
+            "name",
+            "stop_reason",
+            "response_id",
+            "turn_handle",
+            "final_text",
+            # X-3: the provider-native reasoning artifacts the hop now relays.
+            "reasoning",
+            # O1: whose they are, per the side that built the upstream adapter.
+            "provider",
+        }
+    ),
+    "providers/gateway.py:_chunk_from_event": frozenset(
+        {
+            "error",
+            "error_code",
+            "retryable",
+            "config_recoverable",
+            "http_status",
+            "provider_retried",
+            "usage",
+            "type",
+            "text",
+            "index",
+            "arguments_fragment",
+            "id",
+            "name",
+            "stop_reason",
+            "response_id",
+            "turn_handle",
+            "generation_applied",
+            "schema_applied",
+            # B1's streamed twin, validated where its two echo siblings are.
+            "reasoning_applied",
+            # X-3's streamed twin: the terminal frame is the only frame that carries them.
+            "reasoning",
+            # O1's streamed twin, read off the same frame for the same reason.
+            "provider",
+        }
+    ),
+    # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
+    # ``usage`` is read for it by ``usage_reported_by``, not named at the call site.
+    "providers/gateway.py:_error_from_status_body": frozenset(
+        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
+    ),
+}
+
+
+def _discovered_gateway_error_readers() -> set[str]:
+    """Every function in the module that turns the wire into a ``ModelAdapterError``.
+
+    Two predicates, each widened after a drift walked straight past the old one:
+
+    *Where it is written.* The scan read ``tree.body`` — module-level definitions only — so a
+    reader born as a method inside a ``ClassDef`` was not a reader. ``_all_functions`` walks the
+    whole tree.
+
+    *How it raises.* "Constructs a ``ModelAdapterError``" meant a literal ``ModelAdapterError(...)``
+    call in the function's own body, so a reader that hands the job to a one-line local factory
+    evaded by moving the constructor one frame away. One level of delegation is resolved, which
+    is as far as this module delegates anywhere else (see ``_wire_keys_read_in``).
+
+    *How it reads.* "Reads the wire" meant *calling one of the registered helpers* — a spelled
+    predicate, and the last one left in this discovery. A reader that does its own
+    ``payload.get("error")`` and raises on it reads the wire by any definition and called no
+    helper, so it was not a reader; it is now, because reading a key off a parameter used as a
+    mapping is the same act whether a helper or the reader itself performs it. The registered
+    helpers are excluded by name: every one of them reads a key and raises, and a helper is what
+    the *other* censuses in this family are for
+    (``test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use`` and
+    ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use``), so counting
+    them here would only move the hand list, not derive it.
+
+    Which helper, though, is the part that mattered. "Calls a registered helper" counted the VALUE
+    validators too, and a value validator is handed something its caller already pulled off the
+    wire — so the moment ``_validated_generation_echo``/``_validated_schema_echo`` were registered,
+    their callers ``_check_generation_applied``/``_check_schema_applied`` became "readers": policy
+    checks that never touch a mapping, hold no wire in hand, and have none of a reader's pinned
+    key sets or round-trip behavior to answer for. Only the MAPPING-reading helpers count now, and
+    that loses no reader: getting a value out of the wire to hand onward means reading the mapping,
+    either directly (caught by ``_reads_a_mapping_parameter``) or through one of those helpers.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    constructing = {
+        name
+        for name, nodes in functions.items()
+        if any(_constructs_directly(node, "ModelAdapterError") for node in nodes)
+    }
+    discovered: set[str] = set()
+    for name, nodes in functions.items():
+        if name in GATEWAY_WIRE_READ_HELPERS:
+            continue
+        for node in nodes:
+            raises_a_model_error = _constructs_directly(node, "ModelAdapterError") or bool(
+                (_called_local_names(node) & constructing) - {name}
+            )
+            reads_the_wire = bool(
+                _called_local_names(node) & GATEWAY_MAPPING_READ_HELPERS
+            ) or _reads_a_mapping_parameter(node)
+            if raises_a_model_error and reads_the_wire:
+                discovered.add(f"providers/gateway.py:{name}")
+    return discovered
+
+
+def test_2b_the_registered_reader_list_is_every_reader_the_module_has() -> None:
+    """The reader list was a hand-written dict of three, so a fourth sibling joined unseen."""
+
+    discovered = _discovered_gateway_error_readers()
+    assert discovered == set(GATEWAY_ERROR_READERS), {
+        "unregistered_readers": sorted(discovered - set(GATEWAY_ERROR_READERS)),
+        "registered_but_no_longer_a_reader": sorted(set(GATEWAY_ERROR_READERS) - discovered),
+        "hint": "a fourth reader must join every reader census below, not just this one",
+    }
+    assert set(GATEWAY_ERROR_READERS) == set(SILENT_BODY_READERS) == set(GATEWAY_READER_WIRE_KEYS)
+
+
+def test_2b_the_helper_list_is_every_wire_reading_helper_the_readers_use() -> None:
+    """The second closed hand list in this family, derived rather than trusted.
+
+    ``GATEWAY_WIRE_READ_HELPERS`` is what ``_literal_wire_keys`` resolves a reader's keys
+    through, so a helper missing from it makes the keys it carries invisible to every read-key
+    census — and the pinned sets keep matching, because the key was never counted on either
+    side. Discovered here: a function that takes the wire mapping, reads a key off it, and is
+    called by one of the registered readers.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    called_by_readers = _gateway_reader_callees()
+    # A helper the readers call is a wire reader wherever it is defined. ``usage_reported_by``
+    # is shared with the OpenAI adapter and lives in ``providers/_common.py``, so a scan of this
+    # module alone stopped discovering it -- and a helper that is not discovered is one whose
+    # keys every census below quietly stops counting. The homes are DERIVED from this module's
+    # own imports rather than read off the hand map, so the next shared helper is discovered
+    # here (and diffed below) instead of being dropped for not being registered -- the one
+    # direction the hand map could be wrong in without saying so. Only names the readers
+    # actually call resolve, so this does not drag the whole shared module into the census.
+    reachable = dict(functions)
+    for helper, home in _foreign_wire_read_helper_homes().items():
+        reachable.setdefault(helper, _all_functions(home)[helper])
+    discovered = {
+        name
+        for name in called_by_readers
+        if name in reachable
+        and any(_reads_a_mapping_parameter(node) for node in reachable[name])
+    }
+    assert discovered == GATEWAY_MAPPING_READ_HELPERS, {
+        "newly_reading_the_wire_mapping": sorted(discovered - GATEWAY_MAPPING_READ_HELPERS),
+        "no_longer_reading_it": sorted(GATEWAY_MAPPING_READ_HELPERS - discovered),
+        "hint": "a new wire-reading helper: add it to GATEWAY_WIRE_READ_HELPERS or every read-key "
+        "census below silently stops counting the keys it carries",
+    }
+    assert discovered <= GATEWAY_WIRE_READ_HELPERS
+    # The hand list is exactly the discovered mapping readers plus the value validators, which
+    # take an already-extracted value and therefore name no key of their own. Both operands of
+    # this equality used to be hand-written, which is what made it a tautology dressed as a
+    # census: a new helper of either shape, added to two lists in one edit, kept it green. The
+    # left one is derived above and the right one in
+    # ``test_2b_the_value_validator_list_is_every_value_validator_the_readers_use`` below.
+    assert GATEWAY_MAPPING_READ_HELPERS | GATEWAY_WIRE_VALUE_VALIDATORS == (
+        GATEWAY_WIRE_READ_HELPERS
+    ), {
+        "registered_but_neither_discovered_nor_declared_a_value_validator": sorted(
+            GATEWAY_WIRE_READ_HELPERS - GATEWAY_MAPPING_READ_HELPERS - GATEWAY_WIRE_VALUE_VALIDATORS
+        ),
+    }
+    for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        # Both halves: the annotation still says "already-extracted value", and the body still
+        # does not read a key off it. The second is the load-bearing one — ``value: Any`` is
+        # exactly the annotation a helper that started subscripting its argument would keep.
+        assert _mapping_parameters(functions[name][0]) == frozenset(), {
+            "value_validator_now_takes_a_mapping": name,
+            "hint": "it reads its own key now: move it to GATEWAY_MAPPING_READ_HELPERS",
+        }
+        assert not _reads_a_mapping_parameter(functions[name][0]), {
+            "value_validator_now_reads_a_key_off_its_argument": name,
+            "hint": "it carries a wire key of its own now: move it to "
+            "GATEWAY_MAPPING_READ_HELPERS and account for the key it reads",
+        }
+
+
+def _discovered_gateway_wire_value_validators() -> set[str]:
+    """Every helper the registered readers hand an ALREADY-EXTRACTED value to for shape-checking.
+
+    The mirror image of the mapping-reader discovery above, and the same three-part predicate read
+    the other way round: a function one of the registered readers calls, that raises a
+    ``ModelAdapterError`` of its own, and that reads no key off any parameter. The last clause is
+    what separates the two families rather than a second hand list -- a helper reads the wire
+    mapping or it is handed a value already pulled off it, never both -- so the two derivations
+    partition ``GATEWAY_WIRE_READ_HELPERS`` instead of overlapping and leaving a remainder nobody
+    checks.
+
+    Two limits, stated because they are the shapes that would walk past this:
+
+    *Direct construction only.* ``_discovered_gateway_error_readers`` resolves one level of raise
+    delegation; this cannot, because a validator's own CALLERS delegate to it. Widening here would
+    discover ``_check_generation_applied``/``_check_schema_applied`` -- policy enforcement that
+    calls a validator and reads no mapping either -- and a census that names the enforcement
+    functions validators is not a census of validators. A validator that hands its raise to a
+    local factory therefore evades this; the raise sites in this module are all in the function
+    that decides them.
+
+    *Foreign helpers resolve, but only through an import this module makes.* Same reach as the
+    mapping half (``_foreign_wire_read_helper_homes``), so a value validator that moves into
+    ``providers/_common.py`` to be shared is still discovered rather than silently dropped for
+    living elsewhere.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    registered_readers = {name.split(":", 1)[1] for name in GATEWAY_ERROR_READERS}
+    reachable = dict(functions)
+    imported = _gateway_import_homes()
+    # Only names the readers actually call resolve, so this does not drag every imported module
+    # into the census -- the same restraint ``_foreign_wire_read_helper_homes`` states.
+    for name in _gateway_reader_callees() - set(functions):
+        if name in imported:
+            reachable[name] = _all_functions(imported[name]).get(name, [])
+    return {
+        name
+        for name in _gateway_reader_callees()
+        # A reader that calls a reader is not a value validator: the reader census owns those, the
+        # same way that one excludes the helpers by name. Vacuous today (no registered reader
+        # calls another), and the guard the first one meets -- a reader whose own wire reading is
+        # all done by helpers satisfies every other clause here.
+        if name not in registered_readers
+        and reachable.get(name)
+        and any(_constructs_directly(node, "ModelAdapterError") for node in reachable[name])
+        and not any(_reads_a_mapping_parameter(node) for node in reachable[name])
+    }
+
+
+def test_2b_the_value_validator_list_is_every_value_validator_the_readers_use() -> None:
+    """The other half of the helper list, derived rather than trusted.
+
+    ``GATEWAY_WIRE_VALUE_VALIDATORS`` was a pure hand list with nothing behind it, and it is one
+    operand of the closing equality in the test above -- whose other operand is derived. So the
+    equality proved the derived mapping readers were registered and proved nothing at all about
+    this side: a new validator of this shape, written into both hand lists in one edit, kept every
+    assertion in this family green while no scan had ever looked at the module. Two of the five it
+    now names were exactly that, sitting unregistered since they were written
+    (``_validated_generation_echo`` and ``_validated_schema_echo``, both handed
+    ``event.get(...)``/``applied`` by a reader with the key named at the call site).
+
+    Registration is not bookkeeping. These names are excluded from the READER discovery by name,
+    they are what ``_literal_wire_keys`` treats as key-carrying calls, and the per-validator
+    assertions above are what hold them to "reads no key of its own" -- an unregistered one is
+    held to none of it.
+    """
+
+    discovered = _discovered_gateway_wire_value_validators()
+    assert discovered == GATEWAY_WIRE_VALUE_VALIDATORS, {
+        "validates_a_wire_value_but_is_unregistered": sorted(
+            discovered - GATEWAY_WIRE_VALUE_VALIDATORS
+        ),
+        "registered_but_no_longer_a_value_validator": sorted(
+            GATEWAY_WIRE_VALUE_VALIDATORS - discovered
+        ),
+        "hint": "a new wire-value validator: add it to GATEWAY_WIRE_VALUE_VALIDATORS and "
+        "GATEWAY_WIRE_READ_HELPERS, or it is held to none of this family's rules",
+    }
+    assert discovered <= GATEWAY_WIRE_READ_HELPERS
+    # And the two families really are disjoint, which is what makes the closing equality above a
+    # partition rather than a coincidence: a helper counted twice would let one drop out of the
+    # union unnoticed.
+    assert discovered.isdisjoint(GATEWAY_MAPPING_READ_HELPERS)
+
+
+def test_2b_the_helper_home_map_is_every_foreign_helper_the_readers_call() -> None:
+    """The third closed hand list in this family, and the one with a silent failure mode.
+
+    ``GATEWAY_WIRE_READ_HELPERS`` is diffed against a scan of the gateway module, so an
+    unregistered helper defined THERE fails loudly. A helper defined in another module and left
+    out of the home map failed nothing: it is not in the module scan, so the discovery above
+    dropped it as unreachable, and ``_helper_home`` would not have known where to parse it
+    anyway -- the keys it reads simply stopped being counted, on both sides of every pinned
+    read-set. Derived from the imports that make it callable, so registering a home is now the
+    only way to keep the census green.
+    """
+
+    derived = _foreign_wire_read_helper_homes()
+    assert derived == GATEWAY_WIRE_READ_HELPER_HOMES, {
+        "called_by_a_reader_with_no_home_registered": sorted(
+            set(derived) - set(GATEWAY_WIRE_READ_HELPER_HOMES)
+        ),
+        "registered_but_no_reader_reaches_it": sorted(
+            set(GATEWAY_WIRE_READ_HELPER_HOMES) - set(derived)
+        ),
+        "moved": {
+            name: (GATEWAY_WIRE_READ_HELPER_HOMES[name], derived[name])
+            for name in set(derived) & set(GATEWAY_WIRE_READ_HELPER_HOMES)
+            if derived[name] != GATEWAY_WIRE_READ_HELPER_HOMES[name]
+        },
+        "hint": "a shared wire-reading helper: register its home AND add it to "
+        "GATEWAY_WIRE_READ_HELPERS, or every read-key census stops counting its keys",
+    }
+    # And each registered home really is where the helper lives, which is what ``_helper_home``
+    # promises its callers.
+    for helper, home in GATEWAY_WIRE_READ_HELPER_HOMES.items():
+        assert _helper_home(helper) == home
+        assert helper in _all_functions(home)
+
+
+@pytest.mark.parametrize("reader", sorted(GATEWAY_READER_WIRE_KEYS))
+def test_2b_each_reader_reads_exactly_the_keys_the_census_accounts_for(reader: str) -> None:
+    """Static twin of the behavioral census: a *read* that no writer answers is a dead read."""
+
+    read = _wire_keys_read_in(_function_node("providers/gateway.py", reader.split(":", 1)[1]))
+    expected = GATEWAY_READER_WIRE_KEYS[reader]
+    assert read == expected, {
+        "reader": reader,
+        "newly_read": sorted(read - expected),
+        "no_longer_read": sorted(expected - read),
+    }
+    # No reader may bind a fact the writers cannot emit, stated once per reader rather than
+    # inferred. Vacuous while the uncarried set is empty, and the guard the next such fact meets.
+    assert read.isdisjoint(TRANSPORTABLE_ERROR_UNCARRIED), {
+        "hint": "a reader binds a fact with no wire key: give it one or register the gap",
+    }
+    # Every error-family key the server can write is read back here (R3's status quirk aside).
+    unread = SERVER_ERROR_BODY_KEYS - read
+    assert unread <= {"http_status"} and (
+        not unread or reader.endswith("_error_from_status_body")
+    ), {"reader": reader, "written_but_never_read": sorted(unread)}
+
+
+def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> None:
+    """Server writer -> wire -> R1, diffed against the exception the server started from."""
+
+    origin = _maximal_adapter_error()
+    restored = _read_r1(_maximal_wire_body())
+
+    preserved = {
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "http_status",
+        "provider_retried",
+    }
+    for attribute in sorted(preserved):
+        assert getattr(restored, attribute) == getattr(origin, attribute), attribute
+    assert provider_usage_of(restored) == provider_usage_of(origin)
+
+    lost = {
+        attribute
+        for attribute in vars(origin)
+        if attribute not in preserved
+        and attribute != "provider_usage"
+        and getattr(restored, attribute, None) != getattr(origin, attribute)
+    }
+    assert lost == {"error_code"}, {
+        "lost_across_the_hop": sorted(lost),
+        "hint": "a shrinking loss set means a gap was fixed: update EXPECTED and the registry",
+    }
+
+
+GATEWAY_STATUS_FORWARDING_VALIDATORS = (
+    "_exact_gateway_bool",
+    "_gateway_string",
+    "_exact_gateway_int",
+    "_gateway_fragment_string",
+    "_gateway_usage",
+    "_portable_gateway_payload",
+    "_gateway_reasoning_items",
+    "_validated_generation_echo",
+    "_validated_schema_echo",
+    "_validated_reasoning_echo",
+)
+
+
+def _validators_that_refuse_the_wire() -> set[str]:
+    """Every registered wire helper that answers a malformed value by RAISING.
+
+    Which is the whole population the pin below is about: a helper that raises is a helper whose
+    refusal either names the status its caller already read or silently does not. The two lenient
+    readers on this wire drop out on their own terms -- ``_gateway_http_status_hint`` is where a
+    status comes FROM, and ``usage_reported_by`` never raises by design (it runs inside an
+    except-handler) -- so neither is asked for a parameter it has no error to put it on.
+    """
+
+    return {
+        name
+        for name in GATEWAY_WIRE_READ_HELPERS
+        if any(
+            _constructs_directly(node, "ModelAdapterError")
+            for node in _all_functions(_helper_home(name))[name]
+        )
+    }
+
+
+def test_2c_every_gateway_validator_forwards_the_status_it_knows() -> None:
+    """Sibling census: the same defect shape as a missing wire key, one call frame in.
+
+    Two of six carried the parameter, so the *same* malformed payload produced a classified
+    failure naming HTTP 400 or one naming nothing at all, decided by which field of it happened
+    to be malformed. Pinned as "all of them" rather than "the six known ones": the list WAS a
+    closed hand tuple of six, and it went stale the first time it was tested -- X-3's
+    ``_gateway_reasoning_items`` arrived carrying the parameter and joined nothing, because a
+    signature pin over a hand list can only check the names already on it. The population is
+    derived now, from the one property that makes the parameter meaningful (the helper raises), so
+    a tenth validator is held to this whether or not anyone remembers the tuple.
+
+    A signature pin is the right shape here and an incomplete proof on its own, because a
+    parameter can be accepted and dropped:
+    ``test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises``
+    (tests/test_gateway_provider.py) drives every one of them and reads the status back off the
+    raise. Note what today's *callers* can supply: the status a reader knows is the error-envelope
+    hint, and the newly-parameterized validators run on the non-error branches, so they are
+    threaded the same expression their siblings use and receive ``None`` from it. The asymmetry is
+    what is fixed -- a validator that cannot name a status its caller holds -- not a live loss at
+    those call sites.
+    """
+
+    raising = _validators_that_refuse_the_wire()
+    assert raising == set(GATEWAY_STATUS_FORWARDING_VALIDATORS), {
+        "raises_but_is_not_censused_here": sorted(
+            raising - set(GATEWAY_STATUS_FORWARDING_VALIDATORS)
+        ),
+        "censused_but_no_longer_raises": sorted(
+            set(GATEWAY_STATUS_FORWARDING_VALIDATORS) - raising
+        ),
+        "hint": "a new refusing validator: register it here and drive it in "
+        "test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_raises",
+    }
+    forwarding = {
+        name
+        for name in GATEWAY_STATUS_FORWARDING_VALIDATORS
+        if "http_status" in _live_signature(getattr(gateway_client, name)).parameters
+    }
+    assert forwarding == set(GATEWAY_STATUS_FORWARDING_VALIDATORS), {
+        "not_forwarding_http_status": sorted(
+            set(GATEWAY_STATUS_FORWARDING_VALIDATORS) - forwarding
+        ),
+        "hint": "a validator that cannot name the status its caller already read",
+    }
+
+
+def test_2c_no_status_parameter_made_a_wire_value_validator_read_a_key() -> None:
+    """The helper-census corollary of the fix above, stated where the fix could break it.
+
+    The value validators take an already-extracted value, name no wire key of their own, and are
+    excluded from the mapping-reader discovery on exactly that basis. Adding a scalar parameter
+    must not change that -- and a scalar named ``http_status`` is one edit away from being read off
+    the payload instead of passed in.
+
+    Stated over the registered set rather than over the four the original fix touched, which is
+    what makes it a rule instead of a receipt: ``_gateway_reasoning_items`` and then the two echo
+    validators joined that set afterwards, and each was held to this the moment it did.
+    """
+
+    functions = _all_functions("providers/gateway.py")
+    for name in sorted(GATEWAY_WIRE_VALUE_VALIDATORS):
+        node = functions[name][0]
+        assert "http_status" in {argument.arg for argument in node.args.kwonlyargs}
+        assert _mapping_parameters(node) == frozenset(), {"now_takes_a_mapping": name}
+        assert not _reads_a_mapping_parameter(node), {"now_reads_a_key": name}
+
+
+def test_2c_the_openai_classifier_sets_both_flags_on_every_branch() -> None:
+    """Every ModelAdapterError branch of the one adapter that can classify them.
+
+    Pinned per branch, not as a union: a union says "some branch carries the flag", which is the
+    half-bound shape this suite exists to catch. Both facts are properties of the call rather
+    than of its classification -- whether the SDK already retried it, and whether the remedy is
+    the caller's configuration -- so every branch must state both, including the tail that has
+    neither a status nor a code to reason from.
+    """
+
+    tree = _module_tree("providers/openai.py")
+    classifier = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_model_error_from_openai"
+    )
+    branches = [
+        node
+        for node in ast.walk(classifier)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelAdapterError"
+    ]
+    # Five: 4xx, 5xx, the connection family (retryable like its gateway twin), the body-code
+    # recovery, and the unclassified tail.
+    assert len(branches) == 5, {"classification_branches": len(branches)}
+    flagged = [
+        {
+            keyword.arg
+            for keyword in branch.keywords
+            if keyword.arg in {"provider_retried", "config_recoverable"}
+        }
+        for branch in branches
+    ]
+    assert flagged == [{"provider_retried", "config_recoverable"}] * 5, {
+        "flags_per_branch": [sorted(names) for names in flagged],
+        "hint": "a branch stopped stating one of the two: bind it, do not narrow this pin",
+    }
+    # And the recoverability verdict comes from one predicate at all four sites rather than four
+    # hand-written conditions, which is the only version of this that cannot fall out of step.
+    recoverability = {
+        ast.unparse(keyword.value).split("(")[0]
+        for branch in branches
+        for keyword in branch.keywords
+        if keyword.arg == "config_recoverable"
+    }
+    assert recoverability == {"_config_shaped_refusal"}, {
+        "config_recoverable_expressions": sorted(recoverability),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Family 3 — usage
+# --------------------------------------------------------------------------------------
+
+# reference/llm_gateway/service.py:LlmGatewayUsage — the tenant meter's total emitted domain.
+GATEWAY_METER_KEYS = frozenset({"tenant_id", "calls"}) | NORMALIZED_USAGE_KEYS
+
+
+def test_3a_tenant_meter_sums_every_priced_sub_count() -> None:
+    """Behavioral: ``add`` normalizes seven keys and must sum all seven.
+
+    A key diff cannot show this on its own -- the meter used to normalize all seven and add
+    three -- so the counts are read back by value against the maximal usage.
+    """
+
+    meter = LlmGatewayUsage(tenant_id="tenant-1")
+    meter.add(dict(_MAXIMAL_USAGE))
+    reported = meter.to_json()
+    assert frozenset(reported) == GATEWAY_METER_KEYS, {
+        "missing": sorted(GATEWAY_METER_KEYS - set(reported)),
+        "extra": sorted(set(reported) - GATEWAY_METER_KEYS),
+    }
+    assert NORMALIZED_USAGE_KEYS - set(reported) == set()
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
+
+
+def test_3a_a_sub_count_only_billed_call_is_visible_to_the_meter() -> None:
+    """Corollary A8, closed: the meter can now see a cost expressed only in sub-counts.
+
+    ``total_tokens`` stays 0 -- that is what the provider reported, and this ledger does not
+    invent a total the provider did not send. What changed is that the priced call is no longer
+    invisible: its cost is reported in the columns it was actually expressed in.
+    """
+
+    meter = LlmGatewayUsage(tenant_id="tenant-1")
+    meter.add({"cache_read_tokens": 5_000, "reasoning_tokens": 900})
+    reported = meter.to_json()
+    counted = (reported["input_tokens"], reported["output_tokens"], reported["total_tokens"])
+    assert counted == (0, 0, 0)
+    assert reported["cache_read_tokens"] == 5_000
+    assert reported["reasoning_tokens"] == 900
+    assert reported["calls"] == 1
+
+
+# core/schemas.py:EVENT_DATA_SCHEMAS["metrics.updated"] — the whole normalized usage vocabulary
+# now, plus the step/tool/web counters. It used to declare ``reasoning_tokens`` alone of the four
+# priced sub-counts, so a cache-heavy run's priced detail never reached a live consumer.
+METRICS_UPDATED_KEYS = (
+    frozenset(
+        {
+            "step",
+            "tool_calls",
+            "web_search_calls",
+            "web_fetch_calls",
+            "web_context_calls",
+            "web_failed_calls",
+        }
+    )
+    | NORMALIZED_USAGE_KEYS
+)
+
+
+def test_3b_metrics_updated_declares_every_priced_sub_count() -> None:
+    declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
+    assert declared == METRICS_UPDATED_KEYS, {
+        "missing": sorted(METRICS_UPDATED_KEYS - declared),
+        "extra": sorted(declared - METRICS_UPDATED_KEYS),
+    }
+    assert NORMALIZED_USAGE_KEYS - declared == set(), {
+        "emitted_by_the_normalizer_and_undeclared_here": sorted(
+            NORMALIZED_USAGE_KEYS - declared
+        ),
+    }
+
+
+# The one usage-bearing emit site the ``data={...}`` census cannot see: it passes a *name*
+# (``data=metrics_data``), so the literal lives in an assignment several statements earlier and
+# a key added there reaches the wire with no schema entry and no census.
+#
+# The four priced sub-counts are the conditional half: each is written only when the adapter
+# reported one, so a run that used no cache does not publish a column of zeros. Everything else
+# rides the literal unconditionally.
+METRICS_UPDATED_CONDITIONAL_KEYS = frozenset(
+    {"cache_read_tokens", "cache_creation_tokens", "reasoning_tokens", "audio_tokens"}
+)
+METRICS_UPDATED_UNCONDITIONAL_KEYS = METRICS_UPDATED_KEYS - METRICS_UPDATED_CONDITIONAL_KEYS
+
+
+def test_3b_the_metrics_emit_site_and_its_schema_agree_key_for_key() -> None:
+    """Read through :func:`_dict_writes`, so this census fails closed like the two beside it.
+
+    It used to be bespoke: the ``AnnAssign`` literal plus constant-key subscript writes, and
+    *nothing else looked at*. That is the same fail-open shape :func:`_emitted_result_keys` had
+    already closed and :func:`_emit_data_keys` closed with it — a ``metrics_data.update({...})``
+    or a ``{**extra}`` in the literal reached the wire with no schema entry and no failure here.
+    """
+
+    # The literal moved out of ``_apump_turn`` when the emission became one writer serving both
+    # the settled and the billed-refused path; the census follows the binding to its function.
+    pump = _function_node("loop.py", "_emit_metrics_updated")
+    written = _dict_writes(pump).get("metrics_data")
+    assert written is not None and len(written.literals) == 1, {
+        "metrics_data_literals": 0 if written is None else len(written.literals),
+    }
+    assert written.unreadable == (), {
+        "writes_the_census_cannot_read": sorted(written.unreadable),
+        "hint": "a contribution to metrics_data this census cannot resolve is a wire key with "
+        "no schema diff — teach _dict_writes about it rather than reporting the literal alone",
+    }
+    conditional = set(written.added)
+    assert written.literals[0] == METRICS_UPDATED_UNCONDITIONAL_KEYS, {
+        "emitted_always": sorted(written.literals[0]),
+        "expected": sorted(METRICS_UPDATED_UNCONDITIONAL_KEYS),
+    }
+    # Each priced sub-count is added only when the adapter reported one, which is why none of
+    # them can be censused off the literal alone.
+    assert conditional == METRICS_UPDATED_CONDITIONAL_KEYS, {
+        "emitted_conditionally": sorted(conditional),
+        "expected": sorted(METRICS_UPDATED_CONDITIONAL_KEYS),
+    }
+    declared = frozenset(EVENT_DATA_SCHEMAS["metrics.updated"]["properties"])
+    assert written.keys == declared, {
+        "emitted_not_declared": sorted(written.keys - declared),
+        "declared_not_emitted": sorted(declared - written.keys),
+    }
+
+
+def test_3e_the_otel_exporter_emits_the_two_standard_token_attributes_only() -> None:
+    """The by-design pin (registered): GenAI semantic conventions define exactly these two.
+
+    Pinned rather than asserted loosely, because the *reason* is portability across collectors:
+    widening it is a deliberate decision about a shared convention, and it should have to be
+    made here and not arrive as a side effect of adding a sub-count upstream.
+    """
+
+    data = {"usage": dict(_MAXIMAL_USAGE), "response_id": "resp_1", "has_final": True}
+    chat = _chat_finish_attrs(data)
+    subagent = _subagent_finish_attrs({"usage": dict(_MAXIMAL_USAGE), "status": "completed"})
+    for attrs in (chat, subagent):
+        usage_attrs = {key for key in attrs if key.startswith("gen_ai.usage.")}
+        assert usage_attrs == {"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"}, {
+            "usage_attributes": sorted(usage_attrs),
+            "hint": "widened? update EXPECTED and drop the by-design registry entry",
+        }
+    assert chat["gen_ai.usage.input_tokens"] == _MAXIMAL_USAGE["input_tokens"]
+    assert chat["gen_ai.usage.output_tokens"] == _MAXIMAL_USAGE["output_tokens"]
+
+
+def test_3e_the_lenient_error_usage_reader_passes_a_key_no_normalizer_emits() -> None:
+    """The registered leniency, pinned as the behavior it is rather than left as prose.
+
+    A malformed usage on an error path must not replace the failure being reported, so this
+    reader validates values and not names -- an unknown counter rides through. Tightening it to
+    the normalized domain is a real decision (it would silently drop a future sub-count a
+    gateway already reports), so it fails here first.
+    """
+
+    passed = usage_reported_by({"usage": {"foo_tokens": 5, **_MAXIMAL_USAGE}})
+    assert passed == {"foo_tokens": 5, **_MAXIMAL_USAGE}
+    assert set(passed) - NORMALIZED_USAGE_KEYS == {"foo_tokens"}
+    # Values are still judged: a bool is not a count, on this reader like on the other three.
+    assert usage_reported_by({"usage": {"input_tokens": True}}) == {}
+
+
+def test_3c_the_subagent_rollup_filters_through_the_usage_authority() -> None:
+    """The parent budget reads the normalizer's whole domain, and reads it from one place.
+
+    It used to read a literal three-key tuple, so a child's cache and reasoning tokens never
+    reached the parent -- an undercount in exactly the aggregate a bound is checked against. The
+    fix is a filter through the authority, not a wider hand copy, so this pin is two claims: the
+    module constant IS the census's authority, and the roll-up spells no usage key of its own.
+    """
+
+    from monoid_agent_kernel.providers._common import (
+        NORMALIZED_USAGE_KEYS as declared_authority,
+    )
+
+    assert declared_authority == NORMALIZED_USAGE_KEYS, {
+        "in_the_module_only": sorted(declared_authority - NORMALIZED_USAGE_KEYS),
+        "in_the_census_only": sorted(NORMALIZED_USAGE_KEYS - declared_authority),
+        "hint": "the constant beside normalize_usage must be its emitted domain",
+    }
+
+    child = _function_node("loop.py", "_run_subagent_child")
+    assert "NORMALIZED_USAGE_KEYS" in _names_in(child), {
+        "hint": "the roll-up no longer names the authority it is meant to filter through",
+    }
+    # ...and no hand-written subset of it survives anywhere in the function: a tuple, list or set
+    # display of usage keys is the shape this census caught the first time.
+    hand_written: list[frozenset[str]] = []
+    for node in ast.walk(child):
+        if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            continue
+        names = {
+            element.value
+            for element in node.elts
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        }
+        if names and names <= NORMALIZED_USAGE_KEYS:
+            hand_written.append(frozenset(names))
+    assert hand_written == [], {
+        "hand_written_usage_key_sets": [sorted(item) for item in hand_written],
+        "hint": "a second spelling of the usage domain beside the authority it filters through",
+    }
+
+
+class _SubclassedCount(IntEnum):
+    """An ``int`` subclass a provider SDK can plausibly hand back as a token count."""
+
+    SEVEN = 7
+
+
+def test_3d_the_five_siblings_of_one_stamp_agree_about_what_a_count_is() -> None:
+    """Same stamp, five predicates, one verdict — pinned so a sixth spelling fails here.
+
+    ``_recordable_usage`` used to answer ``isinstance(value, int)`` where its three siblings
+    answer ``type(value) is int``, so an ``IntEnum`` a provider SDK hands back as a token count
+    was a recordable usage on one path and no usage at all on the three that consume it — and
+    the receipt this one feeds would then reject what it had just accepted.
+
+    The receipt *constructor* was the fifth spelling of the same predicate:
+    ``ModelCallReceipt.__post_init__`` answered ``isinstance`` too, so it accepted the
+    ``IntEnum`` every reader beside it refuses — a receipt could carry a count no consumer of
+    the stamp would count. It differs from the four in failure mode, deliberately: the readers
+    sit on failure paths and filter silently (a malformed count must not replace the failure
+    being reported), the constructor sits on the success path and refuses loudly.
+    """
+
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
+
+    subclassed = {"input_tokens": _SubclassedCount.SEVEN}
+    stamped = ModelAdapterError("billed then refused")
+    mark_provider_usage(stamped, dict(subclassed))
+    assert vars(stamped)["provider_usage"] == subclassed
+
+    def constructor_counts_it(usage: dict[str, Any]) -> bool:
+        try:
+            ModelCallReceipt(usage=usage)
+        except WireValidationError:
+            return False
+        return True
+
+    verdicts = {
+        "providers/base.py:provider_usage_of": bool(provider_usage_of(stamped)),
+        "providers/_common.py:usage_reported_by": bool(
+            usage_reported_by({"usage": dict(subclassed)})
+        ),
+        "core/model_io.py:ModelCallReceipt.with_error": bool(
+            dict(ModelCallReceipt().with_error(stamped).usage)
+        ),
+        "model_call.py:_recordable_usage": bool(_recordable_usage(dict(subclassed))),
+        "core/model_io.py:ModelCallReceipt.__post_init__": constructor_counts_it(
+            dict(subclassed)
+        ),
+    }
+    assert verdicts == {
+        "providers/base.py:provider_usage_of": False,
+        "providers/_common.py:usage_reported_by": False,
+        "core/model_io.py:ModelCallReceipt.with_error": False,
+        "model_call.py:_recordable_usage": False,
+        "core/model_io.py:ModelCallReceipt.__post_init__": False,
+    }, {
+        "verdicts": verdicts,
+        "hint": "one stamp, one verdict: a sibling that disagrees reclassifies a billed call",
+    }
+
+
+def test_3d_a_bool_is_not_a_count_on_any_sibling() -> None:
+    """The one thing all five agree on, so the divergence above is about subclasses only."""
+
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+    from monoid_agent_kernel.core.wire_validation import WireValidationError
+
+    stamped = ModelAdapterError("boolean count")
+    mark_provider_usage(stamped, {"input_tokens": True})
+    assert provider_usage_of(stamped) == {}
+    assert usage_reported_by({"usage": {"input_tokens": True}}) == {}
+    assert dict(ModelCallReceipt().with_error(stamped).usage) == {}
+    assert _recordable_usage({"input_tokens": True}) == {}
+    with pytest.raises(WireValidationError, match="mapping of str to int"):
+        ModelCallReceipt(usage={"input_tokens": True})
+
+
+# --------------------------------------------------------------------------------------
+# Family 4 — applied-echo
+# --------------------------------------------------------------------------------------
+
+# reference/llm_gateway/service.py:_applied_echoes — the full key domain it can emit.
+APPLIED_ECHO_KEYS = frozenset({"generation_applied", "schema_applied", "reasoning_applied"})
+
+
+class _NativeEverything:
+    """An adapter declaring native support for every echoed feature, so every key is emitted."""
+
+    generation_support = "native"
+    structured_output_support = "native"
+    reasoning_support = "native"
+
+    def next_turn(self, request: Any) -> Any:  # pragma: no cover - never called
+        raise NotImplementedError
+
+
+def _maximal_echo_request() -> LlmGatewayTurnRequest:
+    return LlmGatewayTurnRequest(
+        protocol=LLM_TURN_PROTOCOL_VERSION,
+        model="gateway-model",
+        system_prompt="",
+        tools=(),
+        reasoning=ReasoningConfig(effort="high", summary="auto", on_unsupported="fail"),
+        generation=GenerationConfig(temperature=0.5),
+        output_schema={"type": "object"},
+    )
+
+
+def test_4a_the_applied_echo_domain_covers_all_three_features() -> None:
+    request = _maximal_echo_request()
+    config = ModelConfig(
+        provider="openai",
+        model=request.model,
+        reasoning=request.reasoning,
+        generation=request.generation,
+    )
+    echoes = _applied_echoes(request, _NativeEverything(), config)
+    assert frozenset(echoes) == APPLIED_ECHO_KEYS, {
+        "missing": sorted(APPLIED_ECHO_KEYS - set(echoes)),
+        "extra": sorted(set(echoes) - APPLIED_ECHO_KEYS),
+    }
+    # The v0.21-track:B1 gap this test used to register, closed: reasoning is the third
+    # proof, in the generation echo's shape (the forwarded block, comparable client-side).
+    assert echoes["reasoning_applied"] == {"effort": "high", "summary": "auto"}
+
+
+def test_4a_a_default_generation_block_is_absent_from_the_config_wire_by_design() -> None:
+    """The registered by-design omission, pinned in both directions.
+
+    ``ModelConfig.to_json`` feeds the request digest and the runtime-config semantic hash, so a
+    never-configured block must serialize byte-identically to a config predating the field. The
+    moment anything is set, the block appears -- which is what makes the omission a sentinel
+    rather than a loss.
+    """
+
+    default = ModelConfig().to_json()
+    assert "generation" not in default, {
+        "hint": "always emitted now? that changes every replay key: update the registry entry",
+    }
+    configured = ModelConfig(generation=GenerationConfig(temperature=0.5)).to_json()
+    assert configured["generation"] == {
+        "temperature": 0.5,
+        "top_p": None,
+        "max_output_tokens": None,
+        "on_unsupported": "fail",
+    }
+    assert set(configured) - set(default) == {"generation"}
+
+
+def test_4a_the_echo_domain_matches_the_writers_assignment_sites() -> None:
+    """Static twin of the behavioral probe: a third key added to the function fails here too."""
+
+    source = _live_source(_applied_echoes)
+    assigned = {
+        node.slice.value
+        for node in ast.walk(ast.parse(inspect.cleandoc(source)))
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "echoes"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+    assert assigned == set(APPLIED_ECHO_KEYS), {"assigned_in_source": sorted(assigned)}
+
+
+def test_4b_the_client_terminal_frame_reads_exactly_what_the_server_can_emit() -> None:
+    """Wire symmetry: the keys ``_applied_echoes`` writes are the keys the parser reads back."""
+
+    chunk = gateway_client._chunk_from_event(
+        {
+            "type": "turn_complete",
+            "turn_handle": "handle-1",
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            "stop_reason": "stop",
+            "generation_applied": {"temperature": 0.5},
+            "schema_applied": True,
+            "reasoning_applied": {"effort": "high"},
+        }
+    )
+    assert chunk.generation_applied == {"temperature": 0.5}
+    assert chunk.schema_applied is True
+    assert chunk.reasoning_applied == {"effort": "high"}
+
+    read = {
+        node.args[0].value
+        for node in ast.walk(
+            next(
+                item
+                for item in ast.walk(_module_tree("providers/gateway.py"))
+                if isinstance(item, ast.FunctionDef) and item.name == "_chunk_from_event"
+            )
+        )
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value in {"generation_applied", "schema_applied", "reasoning_applied"}
+    }
+    assert read == set(APPLIED_ECHO_KEYS), {
+        "read_by_the_client": sorted(read),
+        "written_by_the_server": sorted(APPLIED_ECHO_KEYS),
+    }
+
+
+# The client's three enforcement sites for the echo protocol. ``_chunk_from_event`` is only the
+# *reader*; these are where an unproven turn is actually refused, and a checker wired into one
+# of them is a policy that holds on one transport.
+ECHO_ENFORCEMENT_SITES: dict[str, int] = {
+    # (site -> how many times each checker is called there)
+    "providers/gateway.py:GatewayModelAdapter.next_turn": 1,
+    # Twice: once on the terminal frame, once on the frameless-stream fallback.
+    "providers/gateway.py:GatewayModelAdapter.astream_turn": 2,
+}
+ECHO_CHECK_FUNCTIONS = frozenset(
+    {"_check_generation_applied", "_check_schema_applied", "_check_reasoning_applied"}
+)
+
+
+def _echo_check_calls(function: _FunctionNode) -> list[str]:
+    return [
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id.startswith("_check_")
+        and node.func.id.endswith("_applied")
+    ]
+
+
+def test_4b_the_module_declares_exactly_the_checkers_the_census_knows() -> None:
+    declared = {
+        node.name
+        for node in _module_tree("providers/gateway.py").body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith("_check_")
+        and node.name.endswith("_applied")
+    }
+    assert declared == ECHO_CHECK_FUNCTIONS, {
+        "new_checker": sorted(declared - ECHO_CHECK_FUNCTIONS),
+        "removed_checker": sorted(ECHO_CHECK_FUNCTIONS - declared),
+        "hint": "a reasoning_applied checker must be wired at every site below",
+    }
+
+
+@pytest.mark.parametrize("site", sorted(ECHO_ENFORCEMENT_SITES))
+def test_4b_every_enforcement_site_runs_every_checker(site: str) -> None:
+    """The sync/stream/frameless triple, bound to one another rather than one at a time.
+
+    ``test_4b`` above censuses the stream *reader*; a checker added there and not to the sync
+    path (or to the frameless-stream fallback, which is the one an older gateway actually hits)
+    is a fail-closed policy that only closes on one of three routes -- the exact asymmetry the
+    frameless fallback was added to fix, one field later.
+    """
+
+    _, qualified = site.split(":", 1)
+    class_name, method = qualified.split(".", 1)
+    calls = _echo_check_calls(_function_node("providers/gateway.py", method, within=class_name))
+    expected = ECHO_ENFORCEMENT_SITES[site]
+    counts = {name: calls.count(name) for name in ECHO_CHECK_FUNCTIONS}
+    assert counts == dict.fromkeys(ECHO_CHECK_FUNCTIONS, expected), {
+        "site": site,
+        "checker_calls": counts,
+        "hint": "a checker is wired at this site a different number of times than its twin",
+    }
+    assert set(calls) == set(ECHO_CHECK_FUNCTIONS)
+
+
+def test_4b_the_sync_reader_reads_the_same_echo_keys_the_stream_reader_does() -> None:
+    """``next_turn`` reads the echo off a response body, ``_chunk_from_event`` off a frame."""
+
+    sync_read = {
+        key
+        for key in _literal_wire_keys(
+            _function_node("providers/gateway.py", "next_turn", within="GatewayModelAdapter")
+        )
+        if key.endswith("_applied")
+    }
+    assert sync_read == set(APPLIED_ECHO_KEYS), {
+        "read_on_the_sync_transport": sorted(sync_read),
+        "read_on_the_stream_transport": sorted(APPLIED_ECHO_KEYS),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Family 5 — the tool catalog
+# --------------------------------------------------------------------------------------
+#
+# The highest-carrier-count family in the repository and, until now, the least covered: one
+# ``ToolSpec`` is projected by six independent hand-written dict builders (two request writers,
+# one server reader, two record writers, one preview writer), each choosing its own subset. A
+# field added to the dataclass reaches none of them, and nothing says so.
+
+
+def _maximal_tool_spec() -> ToolSpec:
+    """Every ToolSpec field at a distinguishable non-default value."""
+
+    def _handler(_context: Any, _args: dict[str, Any]) -> Any:  # pragma: no cover - never run
+        raise NotImplementedError
+
+    return ToolSpec(
+        id="fs.read",
+        description="Read a file from the workspace.",
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+        capability="fs.read",
+        side_effect="write",
+        handler=_handler,
+        provider_name="workspace_read",
+        path_args=("path",),
+        preview_kind="shell",
+        emits_workspace_diff=True,
+        changed_paths_source="result_content",
+        result_payload_kind="shell_exec",
+        skip_emit_if_background=True,
+        guidance={"when": "reading a file"},
+        examples=({"path": "notes.md"},),
+        annotations={"readOnlyHint": True},
+    )
+
+
+def test_maximal_tool_spec_covers_every_authority_field() -> None:
+    built = _maximal_tool_spec()
+    default_marker = ToolSpec(
+        id="x",
+        description="x",
+        input_schema={},
+        capability="x",
+        side_effect="read",
+        handler=built.handler,
+    )
+    required = {"id", "description", "input_schema", "capability", "side_effect", "handler"}
+    undistinguished = {
+        field.name
+        for field in dataclasses.fields(ToolSpec)
+        if field.name not in required
+        and getattr(built, field.name) == getattr(default_marker, field.name)
+    }
+    assert undistinguished == set(), {
+        "fields_left_at_their_default": sorted(undistinguished),
+        "hint": "extend _maximal_tool_spec so every field is distinguishable from its default",
+    }
+    # ``exported_name`` is a derived property, not a field: it is how ``provider_name`` travels.
+    assert built.exported_name == "workspace_read"
+
+
+TOOL_SPEC_AUTHORITY = frozenset(field.name for field in dataclasses.fields(ToolSpec))
+
+# Shared justifications, so an omission is a stated reason rather than a shrug.
+_NOT_SERIALIZABLE = "a Python callable; nothing to put on a wire or in a record"
+_ENGINE_DISPATCH = (
+    "engine-local dispatch hint: it describes how the kernel runs and previews the call, not "
+    "what the model may send, so a provider/gateway request has no slot for it"
+)
+_MODEL_UNREADABLE = (
+    "prompt-side enrichment the kernel renders into the tool surface itself; a provider tool "
+    "definition has no field for it"
+)
+
+
+@dataclass(frozen=True)
+class ToolSpecCarrier:
+    """One projection of a ToolSpec, its wire keys, and what it does with each authority field."""
+
+    carrier: str
+    build: Any
+    # wire key -> the authority field it carries ("" = a constant this projection adds).
+    key_to_field: dict[str, str]
+    # authority field -> why this projection omits it.
+    omissions: dict[str, str]
+
+
+TOOL_SPEC_CARRIERS: tuple[ToolSpecCarrier, ...] = (
+    ToolSpecCarrier(
+        "providers/gateway.py:_gateway_tool_schema",
+        gateway_client._gateway_tool_schema,
+        {
+            "id": "id",
+            "name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "reference/studio/server.py:_gateway_tool_schema",
+        _studio_gateway_tool_schema,
+        {
+            "id": "id",
+            "name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "providers/openai.py:_openai_tool_schema",
+        _openai_tool_schema,
+        {
+            "type": "",  # the Responses API's own discriminator
+            "name": "provider_name",
+            "description": "description",
+            "parameters": "input_schema",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            # The provider addresses tools by name; the kernel id has no slot in this schema,
+            # which is exactly why ``exported_name`` has to be stable.
+            "id": "not carried: the Responses API keys a tool by name, and the kernel id is "
+            "recovered from the exported name on the way back",
+            "capability": "kernel authorization vocabulary; the provider neither reads nor "
+            "enforces it",
+            "side_effect": "kernel authorization vocabulary; the provider neither reads nor "
+            "enforces it",
+            "path_args": _ENGINE_DISPATCH,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+            "guidance": _MODEL_UNREADABLE,
+            "examples": _MODEL_UNREADABLE,
+            "annotations": _MODEL_UNREADABLE,
+        },
+    ),
+    ToolSpecCarrier(
+        "core/manifest.py:_tool_spec_payload",
+        _manifest_tool_spec_payload,
+        {
+            "id": "id",
+            "exported_name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+            "path_args": "path_args",
+            "guidance": "guidance",
+            "examples": "examples",
+            "annotations": "annotations",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+        },
+    ),
+    ToolSpecCarrier(
+        "core/tool_surface.py:_tool_spec_payload",
+        _transcript_tool_spec_payload,
+        {
+            "id": "id",
+            "exported_name": "provider_name",
+            "description": "description",
+            "input_schema": "input_schema",
+            "capability": "capability",
+            "side_effect": "side_effect",
+            "path_args": "path_args",
+            "guidance": "guidance",
+            "examples": "examples",
+            "annotations": "annotations",
+        },
+        {
+            "handler": _NOT_SERIALIZABLE,
+            "preview_kind": _ENGINE_DISPATCH,
+            "emits_workspace_diff": _ENGINE_DISPATCH,
+            "changed_paths_source": _ENGINE_DISPATCH,
+            "result_payload_kind": _ENGINE_DISPATCH,
+            "skip_emit_if_background": _ENGINE_DISPATCH,
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize("carrier", TOOL_SPEC_CARRIERS, ids=lambda item: item.carrier)
+def test_5a_every_tool_spec_projection_accounts_for_every_authority_field(
+    carrier: ToolSpecCarrier,
+) -> None:
+    """Each projection's key set is pinned, and each omitted field carries a stated reason.
+
+    The point is not that the subsets are equal -- they should not be, a provider schema is not
+    a durable record -- but that each difference is a decision someone wrote down. Six builders
+    choosing silently is how a new declarative hint reaches the engine and nothing else.
+    """
+
+    produced = carrier.build(_maximal_tool_spec())
+    assert frozenset(produced) == frozenset(carrier.key_to_field), {
+        "carrier": carrier.carrier,
+        "emitted_but_unregistered": sorted(set(produced) - set(carrier.key_to_field)),
+        "registered_but_not_emitted": sorted(set(carrier.key_to_field) - set(produced)),
+    }
+    accounted = {field for field in carrier.key_to_field.values() if field} | set(
+        carrier.omissions
+    )
+    assert accounted == TOOL_SPEC_AUTHORITY, {
+        "carrier": carrier.carrier,
+        "authority_fields_with_no_verdict": sorted(TOOL_SPEC_AUTHORITY - accounted),
+        "verdicts_for_fields_that_do_not_exist": sorted(accounted - TOOL_SPEC_AUTHORITY),
+        "hint": "a new ToolSpec field: carry it here or justify the omission",
+    }
+    for field_name, reason in carrier.omissions.items():
+        assert reason.strip(), (carrier.carrier, field_name)
+    # Every carried key really carries that field's value (a key set cannot show a mis-wiring).
+    spec = _maximal_tool_spec()
+    for key, field_name in carrier.key_to_field.items():
+        if not field_name:
+            continue
+        expected = spec.exported_name if field_name == "provider_name" else getattr(
+            spec, field_name
+        )
+        if isinstance(expected, tuple):
+            expected = [dict(item) if isinstance(item, dict) else item for item in expected]
+        assert produced[key] == expected, {"carrier": carrier.carrier, "key": key}
+
+
+def test_5b_only_the_record_projections_substitute_a_non_finite_schema() -> None:
+    """The request/record split, censused across all five projections at once.
+
+    A request keeps the value so the provider boundary refuses the call as a classified,
+    config-recoverable bad request; a record substitutes it because portable JSON cannot carry
+    it and a run's durability must not depend on a tool author's schema. Which side each
+    projection is on is a property of the projection, so it is pinned per projection.
+    """
+
+    spec = dataclasses.replace(
+        _maximal_tool_spec(),
+        input_schema={"type": "object", "enum": [float("nan")]},
+    )
+    substituting = set()
+    for carrier in TOOL_SPEC_CARRIERS:
+        produced = carrier.build(spec)
+        schema_key = "parameters" if "parameters" in produced else "input_schema"
+        if produced[schema_key]["enum"] == [None]:
+            substituting.add(carrier.carrier)
+        else:
+            assert produced[schema_key]["enum"][0] != produced[schema_key]["enum"][0]  # NaN
+    assert substituting == {
+        "core/tool_surface.py:_tool_spec_payload",
+        # An HTTP egress *describing* a request is a record of one, and this endpoint
+        # serializes with allow_nan=False.
+        "reference/studio/server.py:_gateway_tool_schema",
+        # The third record projection. It used to be portable only because ``RunManifest.to_json``
+        # normalizes the whole assembled manifest one frame up -- a property of its caller, not of
+        # itself -- and the transcript twin beside it had already needed the substitution locally.
+        "core/manifest.py:_tool_spec_payload",
+    }, {
+        "substituting_projections": sorted(substituting),
+        "hint": "a projection changed sides: that is a request/record decision, not a refactor",
+    }
+    # And the manifest's own output is unchanged, because ``to_json`` normalizes an
+    # already-normalized payload to itself: this closed a latent second-caller hazard without
+    # rewriting a byte of any manifest a run has already written.
+    from monoid_agent_kernel.core.manifest import RunManifest
+
+    manifest_payload = _manifest_tool_spec_payload(spec)
+    assert manifest_payload["input_schema"]["enum"] == [None]
+    assert normalize_json_ingress(manifest_payload) == manifest_payload
+    assert "normalize_json_ingress" in _live_source(RunManifest.to_json)
+
+
+# reference/llm_gateway/service.py:_parse_tool — the server's reader. Its schema spellings come
+# from the shared ``_TOOL_SCHEMA_KEYS`` tuple, so the reader and the server's ingress cannot
+# disagree about which keys hold a schema (bc77022).
+PARSE_TOOL_READ_KEYS = frozenset(
+    {"id", "name", "description", "capability", "side_effect", "input_schema", "parameters"}
+)
+
+
+def test_5c_the_server_reader_reads_exactly_what_the_request_writers_write() -> None:
+    parse_tool = _function_node("reference/llm_gateway/service.py", "_parse_tool")
+    read = {
+        node.args[1].value
+        for node in ast.walk(parse_tool)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "parse_str"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    }
+    # The two schema spellings arrive through the shared tuple, not as literals here.
+    assert any(
+        isinstance(node, ast.Name) and node.id == "_TOOL_SCHEMA_KEYS"
+        for node in ast.walk(parse_tool)
+    ), "the reader stopped using the shared schema-key tuple"
+    read |= set(_TOOL_SCHEMA_KEYS)
+    assert read == PARSE_TOOL_READ_KEYS, {
+        "newly_read": sorted(read - PARSE_TOOL_READ_KEYS),
+        "no_longer_read": sorted(PARSE_TOOL_READ_KEYS - read),
+    }
+    # Every key the gateway request writer emits is read back; the reverse holds through the
+    # ``parameters`` alias, which exists for tool entries written by a non-kernel client.
+    written = frozenset(gateway_client._gateway_tool_schema(_maximal_tool_spec()))
+    assert written <= read
+    assert read - written == {"parameters"}
+
+
+def test_5c_the_server_reader_reconstructs_only_the_fields_the_wire_carries() -> None:
+    """Behavioral twin: what a ToolSpec looks like after a round trip through the gateway."""
+
+    spec = _maximal_tool_spec()
+    restored = _parse_tool(gateway_client._gateway_tool_schema(spec))
+    survived = {
+        field.name
+        for field in dataclasses.fields(ToolSpec)
+        if field.name != "handler" and getattr(restored, field.name) == getattr(spec, field.name)
+    }
+    assert survived == {
+        "id",
+        "description",
+        "input_schema",
+        "capability",
+        "side_effect",
+        "provider_name",
+    }, {
+        "survived_the_hop": sorted(survived),
+        "hint": "the request wire carries six fields; the rest are engine-local by design",
+    }
+    # The server's stand-in handler refuses execution rather than pretending to run the tool.
+    assert restored.handler is not spec.handler
+
+
+# --------------------------------------------------------------------------------------
+# Family 6 — the checkpoint validator's field coverage
+# --------------------------------------------------------------------------------------
+
+# core/checkpoint.py:_validate_checkpoint_payload is driven by six hand-maintained field-name
+# frozensets plus a handful of inline branches. It is the durable-recovery boundary and it fails
+# OPEN: a field nobody listed is simply never type-checked, so a corrupt or hostile payload
+# reaches ``RunCheckpoint(**payload)`` with an arbitrary Python value in it. The names below are
+# the inline branches, listed here so the diff below is total.
+CHECKPOINT_INLINE_VALIDATED = frozenset(
+    {
+        "run_id",
+        "pending_user_input",
+        "previous_runtime_config",
+        "workspace_base",
+        # No longer "an object or null": the park payload has a schema of its own now
+        # (``_validate_suspension_payload``), shared with the receipt copy below.
+        "last_suspension",
+        "tool_call_counts",
+        "total_usage",
+        "subagent_usage",
+        "revoked_before",
+        "remaining_duration_s",
+        "queued_messages",
+        "active_input",
+        "applied_input_receipts",
+    }
+)
+# The documented exclusion: the codec owns the version envelope (core/durable.py), so the
+# payload validator never sees a checkpoint whose schema_version it did not accept.
+CHECKPOINT_UNVALIDATED = frozenset({"schema_version"})
+
+# And each bucket's MEMBERSHIP, not only the union of them. Moving ``error_code`` from
+# ``_CHECKPOINT_STRING_FIELDS`` to ``_CHECKPOINT_OPTIONAL_STRING_FIELDS`` — which changes it from
+# "must be a string" to "may be null" at the recovery boundary — left the union, the disjointness
+# and the count all unchanged and passed the whole suite. A validation bucket is a rule, and
+# which rule a field is under is the fact.
+CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
+    "_CHECKPOINT_STRING_FIELDS": frozenset(
+        {"status", "error", "error_code", "provider_error_code", "final_text"}
+    ),
+    "_CHECKPOINT_OPTIONAL_STRING_FIELDS": frozenset({"previous_turn_handle"}),
+    "_CHECKPOINT_NONNEGATIVE_INT_FIELDS": frozenset(
+        {
+            "seq",
+            "provider_http_status",
+            "total_tool_calls",
+            "output_retries",
+            "session_step",
+            "submit_local_step",
+            # The context-owned roll-ups, checkpointed in the burn-down so metrics.json
+            # reports one epoch rather than two.
+            "subagent_count",
+            "skill_activation_count",
+        }
+    ),
+    "_CHECKPOINT_BOOL_FIELDS": frozenset({"terminal", "revoked_all", "cancellation_requested"}),
+    "_CHECKPOINT_LIST_OF_DICT_FIELDS": frozenset(
+        {
+            "pending_observations",
+            "messages",
+            "hosted_tasks",
+            "workspace_delta",
+            "capability_leases",
+            "pending_capability_replays",
+            "pending_tool_approval_replays",
+            "outbox_requests",
+            # The evidence behind ``output_retries``, which rode this snapshot without it.
+            "output_failure_history",
+        }
+    ),
+    "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
+        {
+            "pending_binding_loads",
+            "reentry_queue",
+            "delivered_reentry_jobs",
+            "revoked_lease_ids",
+            "revoked_capabilities",
+            "inbox_seen_ids",
+            "applied_input_ids",
+            "skills_activated",
+        }
+    ),
+}
+
+
+def _live_checkpoint_buckets() -> dict[str, frozenset[str]]:
+    from monoid_agent_kernel.core import checkpoint as checkpoint_module
+
+    return {
+        name: value
+        for name, value in vars(checkpoint_module).items()
+        if name.startswith("_CHECKPOINT_") and isinstance(value, frozenset)
+    }
+
+
+def test_6a_every_checkpoint_field_is_validated_by_exactly_one_mechanism() -> None:
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+
+    frozensets = _live_checkpoint_buckets()
+    assert frozensets == CHECKPOINT_VALIDATION_BUCKETS, {
+        "buckets_that_gained_a_field": {
+            name: sorted(value - CHECKPOINT_VALIDATION_BUCKETS.get(name, frozenset()))
+            for name, value in frozensets.items()
+            if value - CHECKPOINT_VALIDATION_BUCKETS.get(name, frozenset())
+        },
+        "buckets_that_lost_a_field": {
+            name: sorted(value - frozensets.get(name, frozenset()))
+            for name, value in CHECKPOINT_VALIDATION_BUCKETS.items()
+            if value - frozensets.get(name, frozenset())
+        },
+        "new_buckets": sorted(set(frozensets) - set(CHECKPOINT_VALIDATION_BUCKETS)),
+        "removed_buckets": sorted(set(CHECKPOINT_VALIDATION_BUCKETS) - set(frozensets)),
+        "hint": "a field that MOVED between buckets is a changed validation rule at the "
+        "recovery boundary, and it leaves the union and the count untouched",
+    }
+    listed: set[str] = set()
+    for name, value in frozensets.items():
+        overlap = listed & set(value)
+        assert overlap == set(), {"field_in_two_buckets": sorted(overlap), "bucket": name}
+        listed |= set(value)
+
+    authority = set(RunCheckpoint.__dataclass_fields__)
+    covered = listed | CHECKPOINT_INLINE_VALIDATED
+    assert covered - authority == set(), {
+        "validated_but_not_a_field": sorted(covered - authority),
+        "hint": "a bucket names a field the dataclass dropped: the check is dead",
+    }
+    assert authority - covered == CHECKPOINT_UNVALIDATED, {
+        "unvalidated_fields": sorted(authority - covered),
+        "hint": "a new RunCheckpoint field escapes validation entirely — this validator fails "
+        "open, so an unlisted field is never type-checked at the recovery boundary",
+    }
+
+
+def test_6a_every_bucket_is_actually_consumed_by_the_validator() -> None:
+    """A bucket nobody loops over is a validation rule that does not run.
+
+    Membership and coverage are both computed from the bucket *contents*, so a new
+    ``_CHECKPOINT_FLOAT_FIELDS`` naming a real field satisfies the census above and the field
+    reads as validated — while ``_validate_checkpoint_payload`` never mentions it and the field
+    reaches ``RunCheckpoint(**payload)`` unchecked. The validator is asked whether it reads each
+    bucket by name.
+    """
+
+    validator = _function_node("core/checkpoint.py", "_validate_checkpoint_payload")
+    consumed = {node.id for node in ast.walk(validator) if isinstance(node, ast.Name)}
+    buckets = set(_live_checkpoint_buckets())
+    dangling = buckets - consumed
+    assert dangling == set(), {
+        "buckets_the_validator_never_reads": sorted(dangling),
+        "hint": "a declared bucket that no loop consumes validates nothing — this validator "
+        "fails open, so its fields are silently unchecked",
+    }
+    # ...and the validator does not read a bucket that no longer exists.
+    assert {name for name in consumed if name.startswith("_CHECKPOINT_")} == buckets
+
+
+def test_6a_the_inline_branches_named_here_are_the_branches_that_exist() -> None:
+    """The inline half is a hand list too, so it is diffed against the source it describes."""
+
+    validator = _function_node("core/checkpoint.py", "_validate_checkpoint_payload")
+    inline = {
+        node.left.value
+        for node in ast.walk(validator)
+        if isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.In)
+        and isinstance(node.left, ast.Constant)
+        and isinstance(node.left.value, str)
+    }
+    inline |= {
+        element.value
+        for node in ast.walk(validator)
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
+        for element in node.iter.elts
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    # ``run_id`` is read positionally rather than membership-tested, so it is added by hand.
+    inline.add("run_id")
+    assert inline == CHECKPOINT_INLINE_VALIDATED, {
+        "newly_inline": sorted(inline - CHECKPOINT_INLINE_VALIDATED),
+        "no_longer_inline": sorted(CHECKPOINT_INLINE_VALIDATED - inline),
+    }
+
+
+def test_6b_the_park_payload_has_a_schema_and_both_of_its_carriers_share_it() -> None:
+    """Was registered: ``last_suspension`` was validated as "an object or null" and no more.
+
+    Every field family 1 pins on the writer/reader pair was unpinned on the durable artifact, so
+    a park payload with a string ``retryable`` or an out-of-vocabulary ``status`` reached
+    ``suspension_from_checkpoint_payload`` — where it became a ValueError from another module, or
+    for the bools silently did not.
+
+    Pinned on BOTH carriers of one payload shape. The receipt copy
+    (``applied_input_receipts[*].suspension``) is written by the same
+    ``suspension_checkpoint_payload`` and read back by the same reader (the DBOS run driver does
+    exactly that), and it had the identical weaker check.
+    """
+
+    from monoid_agent_kernel.core.checkpoint import _validate_checkpoint_payload
+
+    park = suspension_checkpoint_payload(_maximal_suspension())
+    receipt = {"r-1": {"suspension": dict(park)}}
+
+    def _both(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """One park payload, in each of the two places a checkpoint can carry it."""
+
+        return [
+            {"run_id": "run_1", "last_suspension": payload},
+            {"run_id": "run_1", "applied_input_receipts": {"r-1": {"suspension": payload}}},
+        ]
+
+    # The real writer's output validates, and so does an explicit null / an absent field.
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": dict(park)})
+    _validate_checkpoint_payload({"run_id": "run_1", "applied_input_receipts": receipt})
+    _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": None})
+    _validate_checkpoint_payload({"run_id": "run_1"})
+    # A pre-v0.21 payload carries only what the reader requires; absence stays legal.
+    for candidate in _both({"reason": "settled", "status": "completed"}):
+        _validate_checkpoint_payload(candidate)
+
+    refused: list[dict[str, Any]] = [
+        {"anything": [1, 2, 3]},  # what the old "object or null" check accepted
+        {**park, "status": "running"},  # outside the durable status vocabulary
+        {**park, "reason": "unparked"},  # outside the park vocabulary
+        {**park, "retryable": "yes"},  # the mistyped bool the reader would have coerced
+        {**park, "config_recoverable": 1},
+        {**park, "provider_retried": "true"},
+        {**park, "error_code": 500},
+        {**park, "http_status": "429"},
+        {**park, "awaiting_task_ids": [1, 2]},
+    ]
+    for payload in refused:
+        for candidate in _both(payload):
+            with pytest.raises(ValueError):
+                _validate_checkpoint_payload(candidate)
+    with pytest.raises(ValueError):
+        _validate_checkpoint_payload({"run_id": "run_1", "last_suspension": "not an object"})
+
+    # The vocabularies are the reader's own, not a hand copy beside it.
+    from monoid_agent_kernel.core import checkpoint as checkpoint_module
+
+    validator = _function_node("core/checkpoint.py", "_validate_suspension_payload")
+    imported = {
+        alias.name
+        for node in ast.walk(validator)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert {"SUSPENSION_REASONS", "SUSPENSION_CHECKPOINT_STATUSES"} <= imported, {
+        "hint": "a hand copy of either vocabulary is how the validator and the reader drift",
+    }
+    assert not [
+        name
+        for name, value in vars(checkpoint_module).items()
+        if isinstance(value, frozenset) and _SUSPENSION_REASONS <= value
+    ], {"hint": "the park vocabulary got a second definition in the validator's module"}
+
+
+# --------------------------------------------------------------------------------------
+# Family 7 — the success envelope (the main wire)
+# --------------------------------------------------------------------------------------
+#
+# Families 2–4 census the failure wire and the proof wire. The wire that carries every ordinary
+# turn had no census at all: two hand-built server writers (a JSON body and an SSE terminal
+# frame) read back by two hand-written client parsers, with one fact renamed across the hop.
+
+GATEWAY_SUCCESS_BODY_KEYS = frozenset(
+    {
+        "protocol",
+        "turn_handle",
+        "final_text",
+        "tool_calls",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+        "generation_applied",
+        "schema_applied",
+        # B1: the reasoning member of the echo family — the forwarded block, request-
+        # conditional like its two siblings.
+        "reasoning_applied",
+        # X-3: the opaque provider-native reasoning items, present only when the upstream
+        # produced some. Conditional on the ANSWER rather than on the request, which is what
+        # separates it from the echoes beside it.
+        "reasoning",
+        # O1: whose artifacts those are -- the upstream the hop actually relayed, present only
+        # when the upstream adapter declares it. A third conditionality (see
+        # ``GATEWAY_CONDITIONAL_WIRE_KEYS``).
+        "provider",
+    }
+)
+GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
+    {
+        "type",
+        "turn_handle",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+        "generation_applied",
+        "schema_applied",
+        "reasoning_applied",
+        "reasoning",
+        "provider",
+    }
+)
+# The frame is the body minus what the deltas already delivered, minus the protocol tag the
+# stream states once in its content type. Declared, so a *new* omission is not read as one of
+# these.
+TERMINAL_FRAME_DELIBERATE_OMISSIONS = frozenset({"protocol", "final_text", "tool_calls"})
+
+
+class _EverythingAdapter:
+    """A stub upstream that answers one maximal turn and declares native support for both echoes.
+
+    Maximal means *every* ``ModelTurn`` field set to a distinguishable non-default value, which
+    ``test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default`` holds it to.
+    ``tool_calls`` was the field this class left empty, and the omission is exactly how the
+    ``reasoning`` gap survived: a wire census driven by a builder that never sets a field cannot
+    tell a writer that drops it from a writer that never had it to write.
+
+    Maximal in the OTHER direction too, since O1: the optional capabilities the writers probe the
+    *adapter* for, not just the fields they read off its turn
+    (``test_7b_the_maximal_upstream_declares_every_capability_the_writers_probe``). ``provider_name``
+    is deliberately not ``"openai"`` -- that is what the hop's own config says for every call, so a
+    key that could have come from there would prove nothing about where it came from.
+    """
+
+    generation_support = "native"
+    structured_output_support = "native"
+    reasoning_support = "native"
+    provider_name = "acme"
+
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        return ModelTurn(
+            response_id="provider_response_secret",
+            final_text="answered",
+            tool_calls=(ToolCall(id="call_1", name="fs_read", arguments={"path": "a.md"}),),
+            usage={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            raw={"anything": True},
+            reasoning=({"type": "reasoning", "id": "rs_1"},),
+            stop_reason="stop",
+            provider_retried=True,
+        )
+
+
+class _PlainAdapter:
+    """The MINIMAL upstream: no retry to report, no native-support declaration to echo, and — since
+    O1 — no ``provider_name`` either, which is what makes that key's conditionality visible.
+
+    Its counterpart to ``_EverythingAdapter`` is the point. A census driven only by the maximal
+    probe pins the *union* of the wire keys, so a writer that started omitting a key whenever it
+    holds its default value — ``provider_retried`` when the call was not retried — kept passing:
+    the maximal probe sets it True and the key stays. Required-vs-conditional is a property of
+    the wire, and only a minimal request can state it.
+    """
+
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        return ModelTurn(
+            response_id="provider_response_secret",
+            final_text="answered",
+            tool_calls=(),
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            stop_reason="stop",
+            provider_retried=False,
+        )
+
+
+def _gateway_and_token(adapter: Any = None) -> tuple[LlmGatewayBackend, str]:
+    manager = TokenManager.from_secret("c" * 32)
+    upstream = _EverythingAdapter() if adapter is None else adapter
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda _claims, _config: upstream,
+    )
+    token = manager.issue(
+        kind="llm_gateway",
+        audience="csp.llm-gateway",
+        run_id="run_1",
+        tenant_id="tenant_a",
+        user_id="user_a",
+        ttl_s=600,
+        metadata={"agent_config_hash": "census"},
+    )
+    return gateway, token
+
+
+def _maximal_turn_payload() -> dict[str, Any]:
+    """A request that exercises every optional block, so every echo is emitted."""
+
+    return {
+        "protocol": LLM_TURN_PROTOCOL_VERSION,
+        "model": "gateway-model",
+        "system_prompt": "sys",
+        "instruction": "do the thing",
+        "generation": {"temperature": 0.5},
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "output_schema": {"type": "object"},
+        "tools": [gateway_client._gateway_tool_schema(_maximal_tool_spec())],
+    }
+
+
+def _minimal_turn_payload() -> dict[str, Any]:
+    """A request that uses no optional feature at all, so no echo can be emitted."""
+
+    return {
+        "protocol": LLM_TURN_PROTOCOL_VERSION,
+        "model": "gateway-model",
+        "system_prompt": "sys",
+        "instruction": "do the thing",
+        "tools": [],
+    }
+
+
+# What the two writers emit for a request that configured nothing, answered by an upstream with
+# nothing to report. This is the REQUIRED half of each key set: the maximal sets above are the
+# union, and the difference between the two is precisely the conditional keys.
+GATEWAY_MINIMAL_BODY_KEYS = frozenset(
+    {
+        "protocol",
+        "turn_handle",
+        "final_text",
+        "tool_calls",
+        "usage",
+        "stop_reason",
+        "provider_retried",
+    }
+)
+GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
+    {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
+)
+# The keys that ride the wire only sometimes. THREE conditionalities, deliberately unified into
+# one set because the *wire* property is the same one: the three echoes appear only when the
+# request asked for the feature (registered by-design on ``_applied_echoes``: traffic that
+# configures none keeps its exact pre-W5 wire shape), ``reasoning`` appears only when the
+# upstream produced artifacts, and ``provider`` only when the upstream adapter DECLARES one --
+# request-conditional, answer-conditional, and upstream-conditional respectively. Widened by
+# union rather than by editing ``APPLIED_ECHO_KEYS``: that constant is the echo protocol's own
+# domain (family 4 diffs ``_applied_echoes`` against it), and folding a non-echo key into it
+# would report these as further applied-parameters proofs.
+GATEWAY_CONDITIONAL_WIRE_KEYS = frozenset(APPLIED_ECHO_KEYS) | {"reasoning", "provider"}
+
+
+def test_7a_the_minimal_request_pins_which_body_keys_are_conditional() -> None:
+    """The minimal twin of the maximal body census — the half that sees an omission.
+
+    ``provider_retried`` is the case this exists for: the maximal probe reports it True, so a
+    writer that emitted it only when true was indistinguishable from one that always emits it,
+    and the client's ``False`` default would have silently absorbed the change. Here the fact is
+    False and the key must still be on the wire.
+    """
+
+    gateway, token = _gateway_and_token(_PlainAdapter())
+    body = gateway.handle_turn(token, _minimal_turn_payload())
+    assert frozenset(body) == GATEWAY_MINIMAL_BODY_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_BODY_KEYS - set(body)),
+        "extra": sorted(set(body) - GATEWAY_MINIMAL_BODY_KEYS),
+        "hint": "a key that vanished when its value was the default: that is an omit-when-empty "
+        "contract, and it has to be declared like the two on _applied_echoes",
+    }
+    assert body["provider_retried"] is False
+    assert GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_MINIMAL_BODY_KEYS == GATEWAY_CONDITIONAL_WIRE_KEYS
+    assert GATEWAY_MINIMAL_BODY_KEYS <= GATEWAY_SUCCESS_BODY_KEYS
+
+
+def test_7a_the_minimal_request_pins_which_terminal_frame_keys_are_conditional() -> None:
+    """The streamed twin of the probe above, because the two writers are separate code."""
+
+    gateway, token = _gateway_and_token(_PlainAdapter())
+    frames = list(gateway.handle_turn_stream(token, _minimal_turn_payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert frozenset(terminal) == GATEWAY_MINIMAL_FRAME_KEYS, {
+        "missing": sorted(GATEWAY_MINIMAL_FRAME_KEYS - set(terminal)),
+        "extra": sorted(set(terminal) - GATEWAY_MINIMAL_FRAME_KEYS),
+        "hint": "the frame writer and the body writer must be conditional about the same keys",
+    }
+    assert terminal["provider_retried"] is False
+    assert (
+        GATEWAY_TERMINAL_FRAME_KEYS - GATEWAY_MINIMAL_FRAME_KEYS == GATEWAY_CONDITIONAL_WIRE_KEYS
+    )
+    # Both transports are conditional about exactly the same keys, which is the property that
+    # makes the echo protocol a protocol rather than two behaviours.
+    assert (GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_MINIMAL_BODY_KEYS) == (
+        GATEWAY_TERMINAL_FRAME_KEYS - GATEWAY_MINIMAL_FRAME_KEYS
+    )
+
+
+def test_7a_the_sync_success_body_writes_exactly_the_censused_key_set() -> None:
+    gateway, token = _gateway_and_token()
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    assert frozenset(body) == GATEWAY_SUCCESS_BODY_KEYS, {
+        "missing": sorted(GATEWAY_SUCCESS_BODY_KEYS - set(body)),
+        "extra": sorted(set(body) - GATEWAY_SUCCESS_BODY_KEYS),
+    }
+    # The opaque handle is the gateway's own; the provider's response id never leaves.
+    assert body["turn_handle"].startswith("turn_")
+    assert "provider_response_secret" not in json.dumps(body)
+    assert body["provider_retried"] is True
+
+
+def test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered() -> None:
+    gateway, token = _gateway_and_token()
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    terminal = frames[-1]
+    assert terminal["type"] == "turn_complete"
+    assert frozenset(terminal) == GATEWAY_TERMINAL_FRAME_KEYS, {
+        "missing": sorted(GATEWAY_TERMINAL_FRAME_KEYS - set(terminal)),
+        "extra": sorted(set(terminal) - GATEWAY_TERMINAL_FRAME_KEYS),
+    }
+    dropped = GATEWAY_SUCCESS_BODY_KEYS - GATEWAY_TERMINAL_FRAME_KEYS
+    assert dropped == TERMINAL_FRAME_DELIBERATE_OMISSIONS, {
+        "dropped_on_the_streamed_transport": sorted(dropped),
+        "hint": "a NEW omission here is a fact one transport carries and the other does not",
+    }
+    # The dropped facts really were delivered as deltas, so the omission is a re-encoding.
+    assert any(frame.get("type") == "text_delta" for frame in frames)
+    # Both transports answer the same echoes, built by the same function.
+    assert {key: terminal[key] for key in APPLIED_ECHO_KEYS} == {
+        "generation_applied": {"temperature": 0.5},
+        "schema_applied": True,
+        "reasoning_applied": {"effort": "high", "summary": "auto"},
+    }
+
+
+def test_7b_reasoning_artifacts_cross_the_gateway_hop_on_both_transports() -> None:
+    """X-3, and pinned as *symmetric* for the same reason the gap was: one wire key, four sites.
+
+    ``ModelTurn.reasoning`` is what the provider-native reasoning round-trip (DX-13a) replays,
+    and the gateway carried it on neither transport — so a run routed through the gateway
+    captured nothing and replayed nothing. Both halves are asserted here, wire and reader: a
+    body key nobody reads back is the same dead feature wearing a key name, which is precisely
+    the state the two readers were in while ``TurnComplete.to_json`` had already declared the
+    shape (providers/base.py).
+    """
+
+    gateway, token = _gateway_and_token()
+    upstream = _EverythingAdapter().next_turn(None)
+    assert upstream.reasoning, "the stub must actually produce reasoning artifacts"
+    expected = [dict(item) for item in upstream.reasoning]
+
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    assert body["reasoning"] == expected
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    assert frames[-1]["reasoning"] == expected
+    # Only the terminal frame. The deltas are the content channel and these are end-of-turn
+    # metadata; putting them on a delta would mean a cancelled stream half-delivers an artifact
+    # set that is only meaningful whole.
+    assert all("reasoning" not in frame for frame in frames[:-1])
+
+    # The behavioral half: the real readers, not a key-set diff. A reader that ignored the key
+    # would drop it without leaving a trace in any pinned set.
+    assert gateway_client._parse_gateway_response(dict(body)).reasoning == upstream.reasoning
+    assert gateway_client._chunk_from_event(dict(frames[-1])).reasoning == upstream.reasoning
+    for reader in ("_parse_gateway_response", "_chunk_from_event"):
+        assert "reasoning" in GATEWAY_READER_WIRE_KEYS[f"providers/gateway.py:{reader}"]
+
+
+def test_7b_the_maximal_upstream_turn_leaves_no_model_turn_field_at_its_default() -> None:
+    """The reflection guard this family did not have, and the reason the gap above survived.
+
+    Every other family in this suite pairs its maximal builder with a diff against the authority
+    (``_maximal_suspension`` against ``Suspension``'s fields, ``_MAXIMAL_USAGE`` against
+    ``normalize_usage``'s domain), because a builder that leaves a field at its default makes
+    that field invisible to every wire census driven by it — a writer that drops it and a writer
+    that never had it produce the identical body. ``ModelTurn.reasoning`` was such a field for
+    the whole life of family 7. The authority is ``dataclasses.fields(ModelTurn)`` and the
+    exclusion set is empty: a ninth field must be answered by the builder, not by this list.
+    """
+
+    turn = _EverythingAdapter().next_turn(None)
+    defaulted = sorted(
+        field.name
+        for field in dataclasses.fields(ModelTurn)
+        if getattr(turn, field.name) == _field_default(field)
+    )
+    assert defaulted == [], {
+        "left_at_its_default_by_the_maximal_builder": defaulted,
+        "hint": "set it to a distinguishable value in _EverythingAdapter — a field the maximal "
+        "probe never sets cannot be seen to be missing from either writer",
+    }
+
+
+# Every attribute the two success writers probe off the UPSTREAM ADAPTER rather than off its
+# turn, mapped to the wire key it decides. The turn-field guard above has no reach here: a writer
+# fed by ``getattr(adapter, ...)`` is invisible to a builder that answers a maximal turn from an
+# adapter that declares nothing, which is the same blindness one level out.
+ADAPTER_PROBED_WIRE_KEYS: dict[str, str] = {
+    "generation_support": "generation_applied",
+    "structured_output_support": "schema_applied",
+    "reasoning_support": "reasoning_applied",
+    "provider_name": "provider",
+}
+
+
+def test_7b_the_maximal_upstream_declares_every_capability_the_writers_probe() -> None:
+    """The adapter-shaped twin of the turn-field guard, and the same defect one level out.
+
+    ``ModelTurn.reasoning`` was invisible to this whole family because the maximal builder never
+    set it. A capability the maximal builder never DECLARES is invisible the same way and for the
+    same reason: the writer probes the adapter, reads nothing, omits the key, and a census driven
+    by that adapter cannot tell the omission from a writer that never had the key to write.
+    ``provider_name`` was exactly that on the day it was added.
+
+    The map is diffed against the writers, not trusted: a fourth probe added to either writer has
+    to be answered here, by declaring it on the stub, before it can be censused at all.
+    """
+
+    probed: set[str] = set()
+    for writer in ("_applied_echoes", "_relayed_provider_payload"):
+        for node in _all_functions("reference/llm_gateway/service.py")[writer]:
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = call.func.id if isinstance(call.func, ast.Name) else None
+                # The three probes are called through the shared readers in ``providers/base``
+                # (``generation_support`` / ``structured_output_support`` /
+                # ``resolved_provider_name``), each of which getattrs one adapter attribute.
+                probed |= {
+                    attribute
+                    for attribute, reader in _ADAPTER_PROBE_READERS.items()
+                    if name == reader
+                }
+    assert probed == set(ADAPTER_PROBED_WIRE_KEYS), {
+        "probed_by_a_writer_but_unregistered": sorted(probed - set(ADAPTER_PROBED_WIRE_KEYS)),
+        "registered_but_no_writer_probes_it": sorted(set(ADAPTER_PROBED_WIRE_KEYS) - probed),
+        "hint": "a new adapter-probed wire key: register it here AND declare it on "
+        "_EverythingAdapter, or no census in this family can see it go missing",
+    }
+    undeclared = sorted(
+        attribute
+        for attribute in ADAPTER_PROBED_WIRE_KEYS
+        if getattr(_EverythingAdapter, attribute, None) in (None, "", False)
+    )
+    assert undeclared == [], {
+        "left_undeclared_by_the_maximal_upstream": undeclared,
+        "hint": "declare it on _EverythingAdapter with a distinguishable value -- a capability "
+        "the maximal probe never declares cannot be seen to be missing from either writer",
+    }
+    # And the keys they decide really are on the wire the maximal probe produces.
+    assert set(ADAPTER_PROBED_WIRE_KEYS.values()) <= GATEWAY_SUCCESS_BODY_KEYS
+
+
+# Which shared reader in ``providers/base`` each probed adapter attribute is read through. The
+# writers never getattr these themselves — that is the point of the shared readers — so the
+# census follows the call rather than looking for an attribute access that is not there.
+_ADAPTER_PROBE_READERS: dict[str, str] = {
+    "generation_support": "generation_support",
+    "structured_output_support": "structured_output_support",
+    "reasoning_support": "reasoning_support",
+    "provider_name": "resolved_provider_name",
+}
+
+
+def _field_default(field: dataclasses.Field) -> Any:
+    """The declared default of one dataclass field, factory or not."""
+
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+        return field.default_factory()  # type: ignore[misc]
+    return object()  # no default: nothing can equal it, so the field is never "defaulted"
+
+
+# What each client parser reads on the SUCCESS path, pinned separately from the error path so
+# the two halves of one function cannot cover for each other.
+SUCCESS_READS_R1 = frozenset(
+    {
+        "error",
+        "provider_retried",
+        "retryable",
+        "usage",
+        "tool_calls",
+        "arguments",
+        "id",
+        "call_id",
+        "name",
+        "stop_reason",
+        "response_id",
+        "turn_handle",
+        "final_text",
+        "reasoning",
+        "provider",
+    }
+)
+TURN_COMPLETE_READS_R2 = frozenset(
+    {
+        "turn_handle",
+        "response_id",
+        "usage",
+        "stop_reason",
+        "generation_applied",
+        "schema_applied",
+        "reasoning_applied",
+        "reasoning",
+        "provider",
+    }
+)
+# Reads with no writer, each one accounted for.
+SUCCESS_DANGLING_READS: dict[str, str] = {
+    "error": "the envelope discriminator: one parser serves both shapes and tests this key "
+    "before branching, so it is read on the success path and written only on the error one",
+    "response_id": "alias: the gateway writes turn_handle, and the same parser also serves a "
+    "non-gateway body that spells it response_id — declared in the reader's key order",
+    "retryable": "defensive: the success path type-checks the key in case an error body arrives "
+    "without its error field, so a malformed envelope is refused rather than half-read",
+    "id": "alias inside a tool_call entry: the gateway writes call_id, the parser accepts either",
+}
+
+
+def _success_branch_reads() -> frozenset[str]:
+    parser = _function_node("providers/gateway.py", "_parse_gateway_response")
+    error_branch = next(
+        node
+        for node in parser.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == "error"
+    )
+    outside = ast.Module(
+        body=[statement for statement in parser.body if statement is not error_branch],
+        type_ignores=[],
+    )
+    return _literal_wire_keys(outside)
+
+
+def _turn_complete_branch_reads() -> frozenset[str]:
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    branch = next(
+        node
+        for node in ast.walk(reader)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and node.test.comparators
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "turn_complete"
+    )
+    return _literal_wire_keys(branch)
+
+
+def test_7c_the_client_reads_the_success_wire_the_server_writes() -> None:
+    read = _success_branch_reads()
+    assert read == SUCCESS_READS_R1, {
+        "newly_read": sorted(read - SUCCESS_READS_R1),
+        "no_longer_read": sorted(SUCCESS_READS_R1 - read),
+    }
+    # Nested tool-call keys are written per entry, not at the top level of the body.
+    nested = {"arguments", "id", "call_id", "name"}
+    top_level_read = read - nested
+    unwritten = top_level_read - GATEWAY_SUCCESS_BODY_KEYS
+    assert unwritten == set(SUCCESS_DANGLING_READS) - nested, {
+        "read_but_never_written": sorted(unwritten),
+        "accounted_for": sorted(SUCCESS_DANGLING_READS),
+    }
+    unread = GATEWAY_SUCCESS_BODY_KEYS - read - set(APPLIED_ECHO_KEYS)
+    assert unread == {"protocol"}, {
+        "written_but_never_read": sorted(unread),
+        "hint": "the client ignores the protocol tag: version negotiation is the server's job",
+    }
+    for reason in SUCCESS_DANGLING_READS.values():
+        assert reason.strip()
+
+
+def test_7c_the_client_reads_the_terminal_frame_the_server_writes() -> None:
+    read = _turn_complete_branch_reads()
+    assert read == TURN_COMPLETE_READS_R2, {
+        "newly_read": sorted(read - TURN_COMPLETE_READS_R2),
+        "no_longer_read": sorted(TURN_COMPLETE_READS_R2 - read),
+    }
+    # ``type`` and ``provider_retried`` are read before the branch, for every frame type.
+    pre_branch = _literal_wire_keys(_function_node("providers/gateway.py", "_chunk_from_event"))
+    assert {"type", "provider_retried"} <= pre_branch
+    unwritten = read - GATEWAY_TERMINAL_FRAME_KEYS
+    assert unwritten == {"response_id"}, {
+        "read_but_never_written": sorted(unwritten),
+        "hint": "the same turn_handle/response_id alias the sync parser carries",
+    }
+    assert GATEWAY_TERMINAL_FRAME_KEYS - read - {"type", "provider_retried"} == set()
+
+
+def test_7d_one_fact_two_spellings_across_the_success_hop() -> None:
+    """The alias is declared here rather than inferred, like the three in the error family."""
+
+    gateway, token = _gateway_and_token()
+    body = gateway.handle_turn(token, _maximal_turn_payload())
+    turn = gateway_client._parse_gateway_response(dict(body))
+    # Written as ``turn_handle``, reconstructed as ``ModelTurn.response_id``.
+    assert turn.response_id == body["turn_handle"]
+    assert "response_id" not in body
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    chunk = gateway_client._chunk_from_event(dict(frames[-1]))
+    assert chunk.response_id == frames[-1]["turn_handle"]
+
+
+# --- family 7, the cost half: what a refusal off this wire still owes -------------------
+#
+# A turn the reader refuses was generated and billed before the reader ever saw it, so the
+# refusal is the only carrier left for its cost (docs/CONTRACTS.md, "A refused turn was still
+# generated and billed"). That rule was bound to the ERROR envelope and to the terminal frame's
+# echo pair, and to nothing else: every other key of the same two success envelopes refused the
+# same billed payload for free, ``reasoning`` included the day it was added. So this is a
+# *table* diffed against the reader's own read set rather than a handful of cases — the next new
+# wire key has to answer here before it can repeat the miss.
+
+# The pre-branch reads of ``_chunk_from_event``: they run for every frame type, so no branch
+# below them can stamp for them. ``test_7c`` pins that they are read there.
+TERMINAL_FRAME_PRE_BRANCH_READS = frozenset({"type", "provider_retried"})
+
+# One malformed value per read key, keyed by the key it corrupts, patched over a REAL server
+# envelope. ``response_id`` needs its alias nulled on the frame reader (which reads
+# ``turn_handle`` first) and not on the body reader (which reads ``response_id`` first).
+SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "provider_retried": {"provider_retried": "yes"},
+        "retryable": {"retryable": "yes"},
+        "tool_calls": {"tool_calls": {"not": "an array"}},
+        "arguments": {"tool_calls": [{"call_id": "c1", "name": "n", "arguments": 7}]},
+        "id": {"tool_calls": [{"id": 7, "name": "n"}]},
+        "call_id": {"tool_calls": [{"call_id": 7, "name": "n"}]},
+        "name": {"tool_calls": [{"call_id": "c1", "name": 7}]},
+        "stop_reason": {"stop_reason": 7},
+        "final_text": {"final_text": 7},
+        "turn_handle": {"turn_handle": 7},
+        "response_id": {"response_id": 7},
+        "reasoning": {"reasoning": "not-an-array"},
+        "provider": {"provider": 7},
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "type": {"type": 7},
+        "provider_retried": {"provider_retried": "yes"},
+        "turn_handle": {"turn_handle": 7},
+        "response_id": {"turn_handle": None, "response_id": 7},
+        "stop_reason": {"stop_reason": 7},
+        "generation_applied": {"generation_applied": [1, 2]},
+        "schema_applied": {"schema_applied": 7},
+        "reasoning_applied": {"reasoning_applied": [1, 2]},
+        "reasoning": {"reasoning": "not-an-array"},
+        "provider": {"provider": 7},
+    },
+}
+# Reads with no probe, each one accounted for, like ``SUCCESS_DANGLING_READS`` above.
+UNPROBED_SUCCESS_ENVELOPE_READS: dict[str, dict[str, str]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "error": "the discriminator: a body carrying it selects the ERROR branch, whose own "
+        "reads are censused by family 7f below. The first version of this entry said that "
+        "branch 'builds and stamps its own failure' and treated that as covering it -- true "
+        "only when none of the five keys it reads on the way to building it is the malformed "
+        "one, which is exactly the hole 7f closes",
+        "usage": "the stamp's own source: when IT is the malformed key there is nothing "
+        "trustworthy left to stamp, and the lenient read is the declared behavior "
+        "(test_a_refusal_off_a_malformed_usage_invents_no_tokens, same file)",
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "usage": "same as the body reader's: the stamp cannot be read off the key that is "
+        "itself malformed",
+    },
+}
+
+
+def _refused_success_body(body: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._parse_gateway_response(dict(body))
+    return caught.value
+
+
+def _refused_terminal_frame(frame: dict[str, Any]) -> ModelAdapterError:
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._chunk_from_event(dict(frame))
+    return caught.value
+
+
+SUCCESS_ENVELOPE_REFUSAL_READERS: dict[str, Any] = {
+    "providers/gateway.py:_parse_gateway_response": _refused_success_body,
+    "providers/gateway.py:_chunk_from_event": _refused_terminal_frame,
+}
+
+
+def _billed_success_envelopes() -> dict[str, dict[str, Any]]:
+    """The two envelopes the shipped server writes for one billed turn, per reader."""
+
+    gateway, token = _gateway_and_token()
+    return {
+        "providers/gateway.py:_parse_gateway_response": gateway.handle_turn(
+            token, _maximal_turn_payload()
+        ),
+        "providers/gateway.py:_chunk_from_event": list(
+            gateway.handle_turn_stream(token, _maximal_turn_payload())
+        )[-1],
+    }
+
+
+def test_7e_every_success_envelope_read_is_probed_for_the_cost_it_carries() -> None:
+    """The derivation, so a NEW key cannot join either reader without answering the rule."""
+
+    derived = {
+        "providers/gateway.py:_parse_gateway_response": _success_branch_reads(),
+        "providers/gateway.py:_chunk_from_event": (
+            _turn_complete_branch_reads() | TERMINAL_FRAME_PRE_BRANCH_READS
+        ),
+    }
+    assert TERMINAL_FRAME_PRE_BRANCH_READS <= _literal_wire_keys(
+        _function_node("providers/gateway.py", "_chunk_from_event")
+    )
+    for reader, reads in derived.items():
+        probed = frozenset(SUCCESS_ENVELOPE_REFUSAL_PROBES[reader])
+        unprobed = frozenset(UNPROBED_SUCCESS_ENVELOPE_READS[reader])
+        assert probed.isdisjoint(unprobed), {"reader": reader}
+        assert probed | unprobed == reads, {
+            "reader": reader,
+            "read_but_never_probed": sorted(reads - probed - unprobed),
+            "probed_but_no_longer_read": sorted((probed | unprobed) - reads),
+            "hint": "a new read on the success wire: give it a malformed-value probe, or "
+            "register why the refusal it raises cannot carry the cost",
+        }
+        for reason in UNPROBED_SUCCESS_ENVELOPE_READS[reader].values():
+            assert reason.strip()
+
+
+@pytest.mark.parametrize(
+    "reader, key",
+    sorted(
+        (reader, key)
+        for reader, probes in SUCCESS_ENVELOPE_REFUSAL_PROBES.items()
+        for key in probes
+    ),
+)
+def test_7e_a_refusal_off_a_billed_success_envelope_carries_the_cost(
+    reader: str, key: str
+) -> None:
+    envelope = dict(_billed_success_envelopes()[reader])
+    billed = dict(envelope["usage"])
+    assert billed, "the server probe must report a cost, or this pin proves nothing"
+    envelope.update(SUCCESS_ENVELOPE_REFUSAL_PROBES[reader][key])
+
+    refused = SUCCESS_ENVELOPE_REFUSAL_READERS[reader](envelope)
+    assert refused.provider_error_code == gateway_client.GATEWAY_BAD_RESPONSE, {
+        "reader": reader,
+        "malformed_key": key,
+        "hint": "the probe must make THIS key the refusal, not something else",
+    }
+    assert provider_usage_of(refused) == billed, {
+        "reader": reader,
+        "malformed_key": key,
+        "reported_by_the_envelope": billed,
+        "carried_by_the_refusal": provider_usage_of(refused),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
+# --- family 7, the cost half on the ERROR envelope -------------------------------------
+#
+# 7e censuses the two SUCCESS envelopes, and it could only ever see them: ``_success_branch_reads``
+# DELETES the error branch from the AST before counting, so the five keys that branch reads were
+# invisible to the derivation, and ``_error_from_status_body`` -- the reader BOTH transports land
+# in for a non-200 -- appeared in no 7e table at all. Each of those readers reads its own per-key
+# block *before* the stamp that ends it, so a malformed key on an error envelope carrying valid
+# billed usage refused for free, on the shape most likely to be reporting a cost in the first
+# place: an error envelope exists because a call failed, and a call that failed after the upstream
+# generated is what the whole rule is for.
+#
+# Same mechanism as 7e, over the other half of the same two functions plus the third reader: the
+# probe table is diffed against an AST-fed read set, so a NEW key on the error wire has to answer
+# here before it can repeat the miss.
+
+
+def _error_branch_reads() -> frozenset[str]:
+    """The body reader's ERROR branch: exactly what ``_success_branch_reads`` throws away."""
+
+    parser = _function_node("providers/gateway.py", "_parse_gateway_response")
+    branch = next(
+        node
+        for node in parser.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == "error"
+    )
+    return _wire_keys_read_in(branch)  # type: ignore[arg-type]
+
+
+def _error_frame_branch_reads() -> frozenset[str]:
+    """The streamed twin: ``_chunk_from_event``'s ``error`` frame branch."""
+
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    branch = next(
+        node
+        for node in ast.walk(reader)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and node.test.comparators
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == "error"
+    )
+    return _wire_keys_read_in(branch)  # type: ignore[arg-type]
+
+
+def _delta_frame_branch_reads() -> frozenset[str]:
+    """Every read inside ``_chunk_from_event``'s ``*_delta`` branches, derived the same way."""
+
+    reader = _function_node("providers/gateway.py", "_chunk_from_event")
+    keys: set[str] = set()
+    for node in ast.walk(reader):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and node.test.comparators
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and isinstance(node.test.comparators[0].value, str)
+            and node.test.comparators[0].value.endswith("_delta")
+        ):
+            keys |= _wire_keys_read_in(node)  # type: ignore[arg-type]
+    return frozenset(keys)
+
+
+# One malformed value per key each ERROR reader validates, patched over the body the shipped
+# server writes. ``error`` is corrupted to a non-string rather than removed, so the body reader's
+# discriminator still selects the error branch and the probe measures that branch's read.
+ERROR_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "http_status": {"http_status": "429"},
+    },
+    "providers/gateway.py:_error_from_status_body": {
+        "error": {"error": 7},
+        "error_code": {"error_code": 7},
+        "retryable": {"retryable": "yes"},
+        "config_recoverable": {"config_recoverable": "yes"},
+        "provider_retried": {"provider_retried": "yes"},
+    },
+}
+# Reads with no probe, each one accounted for, exactly like the 7e table above.
+UNPROBED_ERROR_ENVELOPE_READS: dict[str, dict[str, str]] = {
+    "providers/gateway.py:_parse_gateway_response": {
+        "usage": "the stamp's own source: when IT is the malformed key there is nothing "
+        "trustworthy left to stamp, and the lenient read is the declared behavior",
+    },
+    "providers/gateway.py:_chunk_from_event": {
+        "usage": "same as the body reader's",
+    },
+    "providers/gateway.py:_error_from_status_body": {
+        "usage": "same as the body reader's; this reader names the key only through "
+        "``usage_reported_by``, which is the stamp itself",
+    },
+}
+
+# The ``*_delta`` branches of ``_chunk_from_event`` raise UNSTAMPED, and that is a registered
+# exclusion rather than a fourth hole. A delta is the content channel; end-of-turn metadata
+# (``usage``, the turn handle, the echoes) rides the terminal frame, which
+# ``test_7a_the_terminal_frame_is_the_body_minus_what_the_deltas_delivered`` pins as the
+# re-encoding boundary. So the shipped server never puts a cost on a delta, and a stamp there
+# would read a key that is never present: dead code standing in for a rule, and dead code that
+# would then have to be kept in step with the real one. The wire fact it rests on is asserted
+# below, so a server that started billing on a delta fails here rather than losing the money.
+UNGUARDED_DELTA_FRAME_READS: dict[str, str] = {
+    "text": "text_delta / reasoning_delta content fragment",
+    "index": "tool-call delta slot",
+    "arguments_fragment": "tool-call delta argument text",
+    "id": "tool-call delta call id",
+    "name": "tool-call delta tool name",
+}
+
+
+def _refused_error_status_body(body: dict[str, Any]) -> ModelAdapterError:
+    """R3 RETURNS its failure on the well-formed path; a malformed key makes it raise.
+
+    The status handed in is the envelope's own, so this also exercises the documented retry
+    decision: the raise escapes past ``_should_retry`` at both call sites, which is why a 429
+    with an unparseable body is refused rather than retried.
+    """
+
+    with pytest.raises(ModelAdapterError) as caught:
+        gateway_client._error_from_status_body(
+            int(_maximal_wire_body()["http_status"]), json.dumps(body)
+        )
+    return caught.value
+
+
+ERROR_ENVELOPE_REFUSAL_READERS: dict[str, Any] = {
+    "providers/gateway.py:_parse_gateway_response": _read_r1,
+    "providers/gateway.py:_chunk_from_event": _read_r2,
+    "providers/gateway.py:_error_from_status_body": _refused_error_status_body,
+}
+
+
+def test_7f_every_error_envelope_read_is_probed_for_the_cost_it_carries() -> None:
+    """The derivation, so a NEW key cannot join an error reader without answering the rule."""
+
+    derived = {
+        "providers/gateway.py:_parse_gateway_response": _error_branch_reads(),
+        "providers/gateway.py:_chunk_from_event": _error_frame_branch_reads(),
+        "providers/gateway.py:_error_from_status_body": _wire_keys_read_in(
+            _function_node("providers/gateway.py", "_error_from_status_body")
+        ),
+    }
+    assert set(derived) == set(GATEWAY_ERROR_READERS), {
+        "hint": "the error-envelope cost census covers exactly the registered error readers",
+    }
+    for reader, reads in derived.items():
+        probed = frozenset(ERROR_ENVELOPE_REFUSAL_PROBES[reader])
+        unprobed = frozenset(UNPROBED_ERROR_ENVELOPE_READS[reader])
+        assert probed.isdisjoint(unprobed), {"reader": reader}
+        assert probed | unprobed == reads, {
+            "reader": reader,
+            "read_but_never_probed": sorted(reads - probed - unprobed),
+            "probed_but_no_longer_read": sorted((probed | unprobed) - reads),
+            "hint": "a new read on the error wire: give it a malformed-value probe, or "
+            "register why the refusal it raises cannot carry the cost",
+        }
+        for reason in UNPROBED_ERROR_ENVELOPE_READS[reader].values():
+            assert reason.strip()
+
+    # The reads that run BEFORE either branch are guarded once, for every payload shape, and 7e
+    # probes them there. Stated rather than assumed, because "covered by the other family" is
+    # exactly the kind of claim that stops being true silently.
+    assert TERMINAL_FRAME_PRE_BRANCH_READS <= frozenset(
+        SUCCESS_ENVELOPE_REFUSAL_PROBES["providers/gateway.py:_chunk_from_event"]
+    )
+    assert "provider_retried" in (
+        SUCCESS_ENVELOPE_REFUSAL_PROBES["providers/gateway.py:_parse_gateway_response"]
+    )
+
+
+def test_7f_the_two_dual_shape_readers_have_no_read_outside_the_two_censuses() -> None:
+    """The closure: every key either reader reads is probed by 7e, by 7f, or registered here.
+
+    Both families derive from one branch each, so both could be complete while a third branch
+    read a key neither had ever heard of -- which is precisely what the error branch was to 7e.
+    Diffed against the full per-reader read census (family 2b), which is the authority.
+    """
+
+    body_reader = "providers/gateway.py:_parse_gateway_response"
+    frame_reader = "providers/gateway.py:_chunk_from_event"
+    assert _success_branch_reads() | _error_branch_reads() == GATEWAY_READER_WIRE_KEYS[
+        body_reader
+    ], {
+        "unaccounted": sorted(
+            GATEWAY_READER_WIRE_KEYS[body_reader]
+            - _success_branch_reads()
+            - _error_branch_reads()
+        ),
+    }
+    frame_covered = (
+        _turn_complete_branch_reads()
+        | TERMINAL_FRAME_PRE_BRANCH_READS
+        | _error_frame_branch_reads()
+        | _delta_frame_branch_reads()
+    )
+    assert frame_covered == GATEWAY_READER_WIRE_KEYS[frame_reader], {
+        "unaccounted": sorted(GATEWAY_READER_WIRE_KEYS[frame_reader] - frame_covered),
+        "hint": "a new frame branch: census its reads or register them like the deltas",
+    }
+
+
+@pytest.mark.parametrize(
+    "reader, key",
+    sorted(
+        (reader, key)
+        for reader, probes in ERROR_ENVELOPE_REFUSAL_PROBES.items()
+        for key in probes
+    ),
+)
+def test_7f_a_refusal_off_a_billed_error_envelope_carries_the_cost(
+    reader: str, key: str
+) -> None:
+    envelope = _maximal_wire_body()
+    billed = dict(envelope["usage"])
+    assert billed, "the server probe must report a cost, or this pin proves nothing"
+    assert envelope["error_code"] != gateway_client.GATEWAY_BAD_RESPONSE, (
+        "the envelope must classify itself differently, or the assertion below cannot tell "
+        "'this key was refused' from 'the envelope's own error came back'"
+    )
+    # Read before the probe patches it: the ``retryable`` probe is one of the corruptions.
+    assert envelope["retryable"] is True and envelope["http_status"] == 429
+    envelope.update(ERROR_ENVELOPE_REFUSAL_PROBES[reader][key])
+
+    refused = ERROR_ENVELOPE_REFUSAL_READERS[reader](envelope)
+    assert refused.provider_error_code == gateway_client.GATEWAY_BAD_RESPONSE, {
+        "reader": reader,
+        "malformed_key": key,
+        "hint": "the probe must make THIS key the refusal, not the envelope's own error",
+    }
+    # One rule with the success readers: a malformed envelope is a broken gateway, so the
+    # refusal is non-retryable however retryable the envelope claimed to be (this one says
+    # retryable=True on a 429, so both halves of that sentence bite).
+    assert refused.retryable is False
+    assert provider_usage_of(refused) == billed, {
+        "reader": reader,
+        "malformed_key": key,
+        "reported_by_the_envelope": billed,
+        "carried_by_the_refusal": provider_usage_of(refused),
+        "hint": "a refused turn was still generated and billed; the refusal is the only "
+        "carrier left for its cost",
+    }
+
+
+def test_7f_the_delta_frames_the_server_writes_carry_no_cost_to_lose() -> None:
+    """The assertion behind the delta exclusion -- a registry entry with none is prose."""
+
+    assert set(UNGUARDED_DELTA_FRAME_READS) == set(_delta_frame_branch_reads()), {
+        "newly_read_in_a_delta_branch": sorted(
+            _delta_frame_branch_reads() - set(UNGUARDED_DELTA_FRAME_READS)
+        ),
+        "registered_but_no_longer_read": sorted(
+            set(UNGUARDED_DELTA_FRAME_READS) - _delta_frame_branch_reads()
+        ),
+    }
+    for reason in UNGUARDED_DELTA_FRAME_READS.values():
+        assert reason.strip()
+
+    gateway, token = _gateway_and_token()
+    frames = list(gateway.handle_turn_stream(token, _maximal_turn_payload()))
+    deltas = frames[:-1]
+    assert deltas and any(frame.get("type") == "text_delta" for frame in deltas)
+    assert all("usage" not in frame for frame in deltas), {
+        "billed_delta_frames": [frame for frame in deltas if "usage" in frame],
+        "hint": "a delta now reports a cost: the *_delta branches need the stamp the error and "
+        "terminal branches carry, and this exclusion has to go",
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Registered-gap pins — a registry entry with no assertion is prose
+# --------------------------------------------------------------------------------------
+#
+# The registry's contract is "fixing a gap breaks this suite". That only holds for an entry with
+# an assertion behind it, and five round-1 entries had none: the drivers and consumers that were
+# *designed* for a fact and ignore it, the closed stream_closed schema, the unread ``turn.failed``
+# and the ``turn.interrupted`` vocabulary collision were described and never pinned. Each one
+# below flips to a failure the moment its gap is closed, which is the whole mechanism.
+
+
+def _handled_event_types(function: _FunctionNode, subject: str) -> frozenset[str]:
+    """Event types ``function`` dispatches on, read off ``<subject> == "x"`` / ``in {...}``."""
+
+    handled: set[str] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            continue
+        if ast.unparse(node.left) != subject:
+            continue
+        comparator = node.comparators[0]
+        if isinstance(node.ops[0], ast.Eq) and isinstance(comparator, ast.Constant):
+            handled.add(comparator.value)
+        elif isinstance(node.ops[0], ast.In) and isinstance(
+            comparator, (ast.Set, ast.Tuple, ast.List)
+        ):
+            handled |= {
+                element.value
+                for element in comparator.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            }
+    return frozenset(handled)
+
+
+def _names_in(function: ast.AST) -> frozenset[str]:
+    """Every identifier and string constant occurring in ``function``'s code."""
+
+    constants, identifiers = _code_occurrences(function)
+    return constants | identifiers
+
+
+def _getattr_names(function: ast.AST) -> frozenset[str]:
+    """The attribute names ``function`` reads through ``getattr(obj, "name", ...)``."""
+
+    return frozenset(
+        node.args[1].value
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    )
+
+
+def _attribute_reads_on(function: ast.AST, name: str) -> frozenset[str]:
+    """The attributes ``function`` reads straight off the local ``name`` — ``exc.retryable``.
+
+    The twin of :func:`_getattr_names`, and the reason a pin needs both. A census that collects
+    only the ``getattr(exc, "x", default)`` spelling pins the spelling and not the read: the
+    natural way to close a "this consumer never names the fact" gap is a plain
+    ``exc.config_recoverable``, which would leave a getattr-only pin green while the gap it
+    registers no longer exists.
+    """
+
+    return frozenset(
+        node.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+    )
+
+
+def test_the_driver_records_config_recoverable_without_branching_on_it() -> None:
+    """Was registered: the driver the classification was added for never named it.
+
+    Closed by *recording* rather than by parking. The decision the driver makes is
+    retry-vs-give-up, and a config-fixable failure is not fixable by the driver — it is fixable by
+    whoever reads the surface the driver feeds. So the fact is promoted onto the record (which
+    ``status()``/``result()`` serve) and control flow is unchanged, and both halves are pinned:
+    the read exists, and ``retryable`` is still the only thing the retry branch tests.
+    """
+
+    driver = _function_node("reference/backend/session_drive.py", "drive_open_session")
+    names = _names_in(driver)
+    assert "retryable" in names, "the driver stopped branching on retryable — recheck this pin"
+    assert "config_recoverable" in names, {
+        "hint": "the driver stopped reading the classification it promotes onto the record",
+    }
+    # The read is off the suspension and the write is onto the record — not the reverse, and not
+    # a second control-flow input smuggled in beside the first.
+    assert "config_recoverable" in _attribute_reads_on(driver, "suspension")
+    assert "config_recoverable" in _attribute_reads_on(driver, "record")
+    branched_on = {
+        ast.unparse(node.test)
+        for node in ast.walk(driver)
+        if isinstance(node, ast.If)
+    }
+    assert not [test for test in branched_on if "config_recoverable" in test], {
+        "branches_testing_the_classification": sorted(
+            test for test in branched_on if "config_recoverable" in test
+        ),
+        "hint": "D2 was 'expose it, do not park on it' — a branch here is a control-flow change",
+    }
+    assert "suspension.retryable" in branched_on
+
+
+# core/model_io.py:ModelCallReceipt.with_error — every fact it lifts off the exception, by name.
+RECEIPT_ERROR_FACTS = frozenset(
+    {
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        # The sixth: waiting-may-help and configuration-will-help are two facts, and the receipt
+        # used to record only the first.
+        "config_recoverable",
+        "http_status",
+        "provider_retried",
+        # Read too, and for the same reason the wire carries it: a failure after a billed answer.
+        "provider_usage",
+    }
+)
+
+
+def test_the_call_receipt_reads_every_fact_the_exception_transports() -> None:
+    """Was registered as "five facts and not the sixth"; the sixth is read now.
+
+    Both spellings of a read are collected. ``with_error`` takes ``BaseException``, so it reaches
+    every fact through ``getattr(exc, ..., default)`` — but a plain ``exc.config_recoverable`` on
+    a narrowed branch is the other natural spelling, and a pin that censused the getattr form
+    alone would have stayed green through the fix that closed the gap.
+    """
+
+    with_error = _function_node("core/model_io.py", "with_error", within="ModelCallReceipt")
+    positional = [argument.arg for argument in with_error.args.args if argument.arg != "self"]
+    assert positional == ["exc"], {"with_error_parameters": positional}
+    read = _getattr_names(with_error) | _attribute_reads_on(with_error, "exc")
+    assert read == RECEIPT_ERROR_FACTS, {
+        "newly_read": sorted(read - RECEIPT_ERROR_FACTS),
+        "no_longer_read": sorted(RECEIPT_ERROR_FACTS - read),
+        "hint": "the receipt's read set is the record's whole vocabulary",
+    }
+    # ...and every fact it reads reaches the durable record, rather than being read and dropped.
+    from monoid_agent_kernel.core.model_io import ModelCallReceipt
+
+    written = set(ModelCallReceipt().to_json())
+    assert read - written == {"provider_usage"}, {
+        "read_but_never_written": sorted(read - written),
+        "hint": "provider_usage is folded into ``usage``; anything else here is a dropped fact",
+    }
+    # Every fact it does read is a real attribute of the exception it reads them from.
+    maximal = _maximal_adapter_error()
+    assert read <= set(vars(maximal)) | {"provider_usage"}
+
+
+# core/schemas.py, MODEL_CONTENT_RECORD_SCHEMA's stream_closed branch. additionalProperties is
+# False, so this is the total domain of the record and adding a fact to it is a schema change.
+STREAM_CLOSED_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "run_id",
+        "stream_id",
+        "status",
+        "final_text",
+        "usage",
+        "error_code",
+        "retryable",
+        # Joined in the burn-down, schema and writer in one change because the cap below is
+        # closed: the live lane now classifies with the same two words the park carries.
+        "config_recoverable",
+        "finished_at",
+    }
+)
+
+
+def _stream_closed_branch() -> dict[str, Any]:
+    from monoid_agent_kernel.core.schemas import MODEL_CONTENT_RECORD_SCHEMA
+
+    for variant in MODEL_CONTENT_RECORD_SCHEMA["oneOf"]:
+        if variant["properties"]["kind"].get("const") == "stream_closed":
+            return variant
+    raise AssertionError("MODEL_CONTENT_RECORD_SCHEMA has no stream_closed branch")
+
+
+def test_the_stream_closed_record_classifies_with_the_whole_vocabulary() -> None:
+    """Was registered: the live stream lane carried retryable and no config_recoverable.
+
+    Pinned on all three carriers of one record, because ``additionalProperties`` is False: the
+    outcome type, the writer's literal, and the schema branch have to move together or the record
+    fails its own validation.
+    """
+
+    from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+
+    branch = _stream_closed_branch()
+    declared = frozenset(branch["properties"])
+    assert declared == STREAM_CLOSED_RECORD_KEYS, {
+        "missing": sorted(STREAM_CLOSED_RECORD_KEYS - declared),
+        "extra": sorted(declared - STREAM_CLOSED_RECORD_KEYS),
+    }
+    assert branch["additionalProperties"] is False, {
+        "hint": "the closed cap is why adding a fact here is a schema change, not a patch",
+    }
+    assert {"retryable", "config_recoverable"} <= declared
+    # The writer's literal: what ``close()`` actually puts on the record.
+    written = _literal_dict_keys_where("core/model_content.py", "kind", "stream_closed")
+    assert len(written) == 1, {"stream_closed_writers": len(written)}
+    assert written[0] == STREAM_CLOSED_RECORD_KEYS, {
+        "written": sorted(written[0]),
+        "hint": "the writer and the closed schema must name the same keys",
+    }
+    # ...and the outcome the writer reads them off carries both classifications.
+    outcome_fields = {field.name for field in dataclasses.fields(ModelStreamOutcome)}
+    assert {"retryable", "config_recoverable"} <= outcome_fields
+    # Optional on the record, so a sidecar written before the key existed still validates.
+    assert "config_recoverable" not in branch["required"]
+
+
+# The three consumers of one event stream, and the event types each one dispatches on. Pinned
+# per consumer, because the defect here was not a missing branch anywhere in particular — it was
+# that no two of them handled the same set and nothing said so.
+#
+# Converged in the burn-down: the two parks (``run.waiting``, ``run.awaiting_input``) and the
+# classification (``turn.failed``) are now handled by all three, so the sets differ only by the
+# events a consumer's *surface* has no slot for. Those differences are named in
+# ``EVENT_CONSUMER_SINK_ONLY`` / ``EVENT_CONSUMER_OFFLINE_ONLY`` below and asserted as the whole
+# remaining diff, so a fourth divergence cannot appear quietly.
+EVENT_CONSUMERS: dict[str, tuple[str, str | None, str]] = {
+    # name -> (module, enclosing class, the expression it switches on)
+    "core/projections.py:_apply_event_projection": (
+        "core/projections.py",
+        None,
+        "event_type",
+    ),
+    "reference/backend/run_state.py:record_event": (
+        "reference/backend/run_state.py",
+        "RunStateMutationService",
+        "event.type",
+    ),
+    "recorder.py:StatusJsonSink.emit": ("recorder.py", "StatusJsonSink", "event.type"),
+}
+# What every status consumer must handle: the lifecycle edges, both parks, and the recoverable
+# turn failure whose classification is the only thing a parked run has to show.
+EVENT_CONSUMER_CORE = frozenset(
+    {
+        "run.started",
+        "run.finished",
+        "run.failed",
+        "run.waiting",
+        "run.awaiting_input",
+        "run.resumed",
+        "turn.failed",
+        "model.turn.started",
+    }
+)
+# The progress detail two of the three project. The backend record has no slot for any of it —
+# it carries lifecycle + classification and the run dir carries the rest — so this is a surface
+# difference, not a hole.
+EVENT_CONSUMER_PROGRESS = frozenset(
+    {
+        "agent.config.updated",
+        "tool.call.started",
+        "tool.call.finished",
+        "tool.call.failed",
+        "workspace.proposal.updated",
+    }
+)
+# The pause park's session-lane projection, handled by the two status-file readers. NOT part of
+# ``EVENT_CONSUMER_CORE``: the backend record's pause state is owned by session_drive (the
+# driver observes the ``paused`` Suspension directly and a ``record_event`` state write would
+# race it — the same reason its ``turn.failed`` branch never touches state), so the record
+# deliberately has no branch for this event.
+EVENT_CONSUMER_PAUSE = frozenset({"session.state.changed"})
+EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
+    # The offline projection reads the *committed log*, so it can also fold the durable proposal
+    # lifecycle that the two live sinks never see (they fire before the artifacts are written).
+    "core/projections.py:_apply_event_projection": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
+    | frozenset(
+        {
+            "proposal.package.exported",
+            "proposal.approved",
+            "proposal.rejected",
+            "proposal.applied",
+            "proposal.conflict",
+        }
+    ),
+    # The narrowest surface: an in-memory lifecycle record. No progress detail by design.
+    "reference/backend/run_state.py:record_event": EVENT_CONSUMER_CORE,
+    # The fan-out sink. Its two extras are the live-only projections nothing durable carries.
+    # (``job.*`` is matched by prefix rather than equality, so it is outside this census by
+    # construction.)
+    "recorder.py:StatusJsonSink.emit": EVENT_CONSUMER_CORE
+    | EVENT_CONSUMER_PROGRESS
+    | EVENT_CONSUMER_PAUSE
+    | frozenset({"plan.updated", "metrics.updated"}),
+}
+
+
+@pytest.mark.parametrize("consumer", sorted(EVENT_CONSUMERS))
+def test_each_status_consumer_handles_the_whole_core_of_one_event_stream(
+    consumer: str,
+) -> None:
+    """Was registered (three entries): two projections, each blind to the park the other saw."""
+
+    relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
+    name = consumer.split(":", 1)[1].split(".")[-1]
+    handled = _handled_event_types(
+        _function_node(relative_path, name, within=class_name), subject
+    )
+    expected = EVENT_CONSUMER_HANDLED[consumer]
+    assert handled == expected, {
+        "consumer": consumer,
+        "newly_handled": sorted(handled - expected),
+        "no_longer_handled": sorted(expected - handled),
+        "hint": "a consumer that gained or lost a branch changes what an operator can read",
+    }
+    # The convergence itself, restated per consumer so no single one can drift back out of it.
+    assert EVENT_CONSUMER_CORE <= handled, {
+        "consumer": consumer,
+        "core_events_not_handled": sorted(EVENT_CONSUMER_CORE - handled),
+        "hint": "the three readers of one stream agreed on this core; this one no longer does",
+    }
+
+
+def test_the_three_run_status_projections_differ_only_by_what_their_surface_carries() -> None:
+    """The diff itself, so the convergence is the assertion rather than an inference."""
+
+    offline = EVENT_CONSUMER_HANDLED["core/projections.py:_apply_event_projection"]
+    backend = EVENT_CONSUMER_HANDLED["reference/backend/run_state.py:record_event"]
+    control = EVENT_CONSUMER_HANDLED["recorder.py:StatusJsonSink.emit"]
+    # Both parks and the classification, on all three.
+    for handled in (offline, backend, control):
+        assert {"run.waiting", "run.awaiting_input", "turn.failed"} <= handled
+    # The pause projection, on both status-file readers and deliberately NOT on the record:
+    # session_drive owns the record's lifecycle and observes the paused Suspension directly, so
+    # a record_event state write would race it (the reason is on EVENT_CONSUMER_PAUSE).
+    assert EVENT_CONSUMER_PAUSE <= offline and EVENT_CONSUMER_PAUSE <= control
+    assert not (EVENT_CONSUMER_PAUSE & backend)
+    # The whole remaining difference, named. Nothing is handled by one reader alone except the
+    # durable proposal lifecycle (only the log reader sees it) and the two live-only projections
+    # (only the fan-out sink can build them).
+    assert offline - control == {
+        "proposal.package.exported",
+        "proposal.approved",
+        "proposal.rejected",
+        "proposal.applied",
+        "proposal.conflict",
+    }
+    assert control - offline == {"plan.updated", "metrics.updated"}
+    # The backend record is a strict subset of both: it carries lifecycle + classification only.
+    assert backend < offline and backend < control
+    assert backend == EVENT_CONSUMER_CORE
+
+
+# The classification key-subset each status-consumer branch copies off its event, pinned per
+# branch. This is the cell the "status.json projection" future family predicted: three
+# consumers each hand-copy keys out of ``turn.failed``/``run.failed`` data, and a fact added to
+# the event reaches N-1 of them unless something diffs the copies. The event-type pins above
+# say each consumer HAS the branch; these say what the branch CARRIES.
+#
+# ``turn.failed``'s carried set is its emit set minus ``provider_usage`` (metering, not
+# classification — it stays off every status surface). ``run.failed``'s is exactly the event's
+# own key set: the terminal vocabulary deliberately drops ``provider_retried``.
+TURN_FAILED_STATUS_CARRIED = TURN_FAILED_EVENT_KEYS - {"provider_usage"}
+STATUS_CONSUMER_BRANCH_READS: dict[tuple[str, str], frozenset[str]] = {
+    ("recorder.py:StatusJsonSink.emit", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    ("recorder.py:StatusJsonSink.emit", "run.failed"): RUN_FAILED_EVENT_KEYS,
+    ("core/projections.py:_apply_event_projection", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The offline projection's terminal branch reads the ``provider_retried`` slot the event
+    # never carries — that IS the heal (the projection declares the key, so clearing it means
+    # assigning the absent-key default) — and has no ``error_type`` slot, so ``type`` is the
+    # one run.failed key it does not copy (a declared surface difference with the sink).
+    ("core/projections.py:_apply_event_projection", "run.failed"): (
+        RUN_FAILED_EVENT_KEYS - {"type"}
+    )
+    | {"provider_retried"},
+    ("reference/backend/run_state.py:record_event", "turn.failed"): TURN_FAILED_STATUS_CARRIED,
+    # The record's ``run.failed`` branch copies the event's whole classification, exactly like
+    # its ``turn.failed`` twin. Its previous error-pair-only pin was justified twice and both
+    # justifications proved false on a path: "the driver's park promotion assigns all five"
+    # fails for terminals minted at the close boundary (pending-cancel, unrecovered-turn-
+    # failure, unsettled-close — fixed by the ``record_run_result`` heal), and the heal in turn
+    # KEEPS the record's values at a FAILED terminal — which are defaults for a FRESH terminal
+    # that never parked (a non-recoverable failure on the stream lane, or any first-turn
+    # failure), so live ``status()`` omitted the classification status.json carried. ``type``
+    # is not copied (the record has no ``error_type`` slot — declared surface difference with
+    # the sink); ``provider_retried`` is assigned the terminal vocabulary's constant False,
+    # not read from data (run.failed does not carry it).
+    ("reference/backend/run_state.py:record_event", "run.failed"): RUN_FAILED_EVENT_KEYS
+    - {"type"},
+}
+
+
+def _module_level_functions(relative_path: str) -> dict[str, Any]:
+    return {
+        node.name: node
+        for node in _module_tree(relative_path).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _event_data_reads(relative_path: str, body: list[ast.stmt]) -> frozenset[str]:
+    """Constant keys ``body`` reads off event data, following same-module helper calls.
+
+    Two spellings of a read are collected, for the reason the receipt pin collects both
+    ``getattr`` forms: the inline ``data.get("key")`` and the guarded-helper call
+    ``_event_flag(data, "key")``. Helper calls resolved by name in the same module are
+    followed (``_assign_failure_classification`` reads five keys the call site never spells),
+    so a read moved into a helper stays censused. Attribute calls other than ``.get`` are NOT
+    reads — ``self.state.pop("key")`` is a clear, and counting it as a read would let a
+    dropped copy hide behind its own cleanup.
+    """
+
+    helpers = _module_level_functions(relative_path)
+    read: set[str] = set()
+    visited: set[str] = set()
+
+    def _collect(nodes: list[ast.stmt]) -> None:
+        for node in nodes:
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "get"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                ):
+                    read.add(call.args[0].value)
+                elif isinstance(call.func, ast.Name):
+                    for argument in call.args:
+                        if isinstance(argument, ast.Constant) and isinstance(
+                            argument.value, str
+                        ):
+                            read.add(argument.value)
+                    helper = helpers.get(call.func.id)
+                    if helper is not None and call.func.id not in visited:
+                        visited.add(call.func.id)
+                        _collect(helper.body)
+
+    _collect(body)
+    return frozenset(read)
+
+
+@pytest.mark.parametrize("consumer_branch", sorted(STATUS_CONSUMER_BRANCH_READS))
+def test_each_status_consumer_branch_copies_its_pinned_classification_subset(
+    consumer_branch: tuple[str, str],
+) -> None:
+    consumer, event_type = consumer_branch
+    relative_path, class_name, subject = EVENT_CONSUMERS[consumer]
+    name = consumer.split(":", 1)[1].split(".")[-1]
+    function = _function_node(relative_path, name, within=class_name)
+    branches = [
+        node.body
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Eq)
+        and ast.unparse(node.test.left) == subject
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value == event_type
+    ]
+    assert len(branches) == 1, {"consumer": consumer, "branches_for": event_type}
+    read = _event_data_reads(relative_path, branches[0])
+    expected = STATUS_CONSUMER_BRANCH_READS[consumer_branch]
+    assert read == expected, {
+        "consumer": consumer,
+        "event_type": event_type,
+        "newly_read": sorted(read - expected),
+        "no_longer_read": sorted(expected - read),
+        "hint": "a classification fact reached this consumer's branch on one reader and not "
+        "its pinned subset — update every twin in the same change",
+    }
+    assert "provider_usage" not in read, {
+        "consumer": consumer,
+        "hint": "provider_usage is metering, not classification; it stays off status surfaces",
+    }
+
+
+def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
+    """Registered BY DESIGN: one key name, two vocabularies, on two sibling events.
+
+    ``data.reason`` on ``turn.interrupted``/``turn.paused`` names the CAUSE (``user_stop`` /
+    ``user_pause``); ``Suspension.reason`` names the PARK (``interrupted`` / ``paused``). The
+    assertions are unchanged from when this was a burn-down entry — they pin the emit's literals
+    and the proof that neither value is a member of the park vocabulary it shares a field name
+    with — but what they pin is now a declared fact rather than a defect: merging the two would
+    make one field answer two questions.
+
+    The genuine half of the old entry is closed below: the pause park emits a turn-lane event of
+    its own now, so the two sibling parks ARE observable the same way.
+    """
+
+    for event_type, cause in (("turn.interrupted", "user_stop"), ("turn.paused", "user_pause")):
+        emitted = _emit_data_keys("loop.py", event_type)
+        assert emitted == {"reason"}, {"event": event_type, "emitted": sorted(emitted)}
+        values = _literal_dict_keys_where("loop.py", "reason", cause)
+        assert len(values) == 1, {"event": event_type, "reason_literals": len(values)}
+        assert values[0] == {"reason"}
+        assert cause not in _SUSPENSION_REASONS, {
+            "event": event_type,
+            "hint": "the cause and park vocabularies merged — this entry says they must not",
+        }
+    assert {"interrupted", "paused"} <= _SUSPENSION_REASONS
+    # The asymmetry that WAS a defect: the pause park emitted only a session-lane event.
+    paused_emits = [
+        node
+        for node in ast.walk(_module_tree("loop.py"))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "emit"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "turn.paused"
+    ]
+    assert len(paused_emits) == 1, {
+        "turn_paused_emit_sites": len(paused_emits),
+        "hint": "the pause park's turn-lane event is the interrupt's twin: exactly one site",
+    }
+    # Both are declared event types with a data schema, and the schemas are the same shape.
+    from monoid_agent_kernel.core.events import AgentEventType
+    from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
+
+    assert {"turn.interrupted", "turn.paused"} <= set(get_args(AgentEventType))
+    assert (
+        EVENT_DATA_SCHEMAS["turn.paused"]["properties"]
+        == EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]
+    )
+    assert EVENT_DATA_SCHEMAS["turn.paused"]["additionalProperties"] is False
+
+
+def test_every_error_expression_the_result_payload_serves_is_filtered() -> None:
+    """Was registered (round 2, leak-adjacent): three of four paths out of one payload filtered.
+
+    ``record.error`` and ``metrics["error"]`` come pre-filtered from their writers
+    (``public_view.py:public_error_message`` in ``run_state.py``/``loop_phases.py``); the ready
+    branch of ``result()`` served ``result.error`` — the deliberately raw ``AgentRunResult.error``
+    — straight to an HTTP response. The filter landed in the projection, so the route stays a
+    dumb serializer.
+
+    Pinned at *both* ends, and that is still the point: the route hands what ``result()`` returns
+    to ``_write_json`` unchanged, so the wire's contents are decided by these two functions
+    together. A filter that moved to the route, or a route that stopped writing the dict whole,
+    is a change to where the boundary is and has to be re-argued.
+    """
+
+    projection = _function_node("reference/backend/projection.py", "result")
+    served: list[str] = []
+    for node in ast.walk(projection):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "error":
+                served.append(ast.unparse(value))
+    assert sorted(served) == [
+        "public_error_message(result.error)",
+        "record.error",
+    ], {
+        "error_expressions_served": sorted(served),
+        "hint": "``record.error`` arrives pre-filtered from record_run_result; the raw "
+        "AgentRunResult.error is filtered here. A third expression is an unproven one",
+    }
+    # The route is the dumb serializer this arrangement depends on: it writes the projection's
+    # dict wholesale and applies no filter of its own.
+    route = _function_node("reference/backend/http.py", "do_GET", within="make_backend_handler")
+    served_wholesale = [
+        ast.unparse(node.args[0])
+        for node in ast.walk(route)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_write_json"
+        and node.args
+        and "backend.result(" in ast.unparse(node.args[0])
+    ]
+    assert served_wholesale == ["backend.result(run_id, self._bearer_token())"], {
+        "how_the_route_writes_the_projection": served_wholesale,
+        "hint": "the route stopped writing result() unchanged — the filter's placement assumed "
+        "it did",
+    }
+    assert "public_error_message" not in _names_in(route), {
+        "hint": "two filters on one value: decide which one owns it",
+    }
+    # The two sibling writers this branch now agrees with, asserted and not assumed.
+    assert "public_error_message" in _names_in(
+        _function_node("reference/backend/run_state.py", "record_run_result")
+    )
+    assert "public_error_message" in _names_in(
+        _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+    )
+
+
+def _snapshot_written_keys() -> frozenset[str]:
+    """The RunCheckpoint field names ``loop.py:snapshot`` actually writes."""
+
+    snapshot = _function_node("loop.py", "snapshot")
+    calls = [
+        node
+        for node in ast.walk(snapshot)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "RunCheckpoint"
+    ]
+    assert len(calls) == 1, {"run_checkpoint_construction_sites": len(calls)}
+    return frozenset(keyword.arg for keyword in calls[0].keywords if keyword.arg)
+
+
+def _rehydrate_read_attributes() -> frozenset[str]:
+    """The ``cp.<field>`` reads ``loop.py:_rehydrate`` makes off the checkpoint."""
+
+    return _attribute_reads_on(_function_node("loop.py", "_rehydrate"), "cp")
+
+
+def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_write() -> None:
+    """Was registered (round 2, three cells of the uncensused run-state carriage family).
+
+    Two of the three closed here: the retry budget's evidence, and the context-owned roll-ups
+    metrics.json reports beside the RunState totals. Pinned on all three legs — the checkpoint
+    field, the snapshot write, and the restore read — because a field written and never read back
+    is a snapshot that grew without the restore noticing.
+    """
+
+    from monoid_agent_kernel.core.checkpoint import RunCheckpoint
+    from monoid_agent_kernel.loop import AgentToolContext, RunState
+
+    written = _snapshot_written_keys()
+    restored = _rehydrate_read_attributes()
+    state_fields = {field.name for field in dataclasses.fields(RunState)}
+    context_fields = {field.name for field in dataclasses.fields(AgentToolContext)}
+
+    # (a) output_retries rides, and so does the history the attempt numbering is derived from.
+    assert {"output_retries", "output_failure_history"} <= state_fields
+    assert {"output_retries", "output_failure_history"} <= written
+    assert {"output_retries", "output_failure_history"} <= restored
+    assert "output_failure_history" in RunCheckpoint.__dataclass_fields__
+
+    # (b) the context-owned counters ride beside their RunState twins, so metrics.json reports
+    # one epoch rather than pre-restart totals beside post-restart subagent and skill counts.
+    context_counters = {
+        "subagent_count",
+        "subagent_usage",
+        "skill_activation_count",
+        "skills_activated",
+    }
+    assert context_counters <= context_fields
+    assert {"total_usage", "total_tool_calls"} <= written
+    assert context_counters <= written, {
+        "still_dropped": sorted(context_counters - written),
+        "hint": "one epoch: every counter build_metrics reads must survive the restart",
+    }
+    assert context_counters <= restored, {
+        "written_but_never_read_back": sorted(context_counters - restored),
+    }
+    assert context_counters <= set(RunCheckpoint.__dataclass_fields__)
+    metrics_names = _names_in(
+        _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+    )
+    assert context_counters <= metrics_names, {
+        "hint": "these are the counters that reach metrics.json beside the restored totals",
+    }
+
+    # (c) still open, narrowed: the tool SERVICE counters. ``build_metrics`` splats three
+    # service metrics blocks into the same file and none of them has a checkpoint slot.
+    service_metric_keys = {
+        "shell_calls",
+        "failed_shell_calls",
+        "total_shell_duration_s",
+        "web_search_calls",
+        "web_fetch_calls",
+    }
+    assert service_metric_keys.isdisjoint(RunCheckpoint.__dataclass_fields__), {
+        "carried_now": sorted(service_metric_keys & set(RunCheckpoint.__dataclass_fields__)),
+        "hint": "the narrowed registry entry says these have no durable slot: update both",
+    }
+    splatted = {
+        ast.unparse(value)
+        for node in ast.walk(
+            _function_node("loop_phases.py", "build_metrics", within="LoopFinalizer")
+        )
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if key is None
+    }
+    assert {
+        "context.shell_service.metrics()",
+        "context.jobs_service.background_metrics()",
+        "context.web_service.metrics()",
+    } <= splatted, {
+        "metrics_blocks_splatted": sorted(splatted),
+        "hint": "the narrowed entry names these three service blocks",
+    }
+
+
+def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
+    """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
+
+    The flag is the request; the token is only the channel a boundary check reads it through. So
+    the restore mints one when the loop has none, exactly as ``astream`` and ``LoopSession.cancel``
+    do — pinned as "the guard is the flag alone, and a token is minted", because re-introducing a
+    token precondition anywhere in that branch restores the defect.
+    """
+
+    assert "cancellation_requested" in _snapshot_written_keys()
+    restore = _function_node("loop.py", "_rehydrate")
+    guards = [
+        ast.unparse(node.test)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.If) and "cancellation_requested" in ast.unparse(node.test)
+    ]
+    assert guards == ["cp.cancellation_requested"], {
+        "restore_guards": guards,
+        "hint": "a second condition on this branch is the asymmetry that was closed",
+    }
+    minting = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CancellationToken"
+    ]
+    assert minting == ["CancellationToken()"], {
+        "tokens_minted_during_restore": minting,
+        "hint": "without minting, a loop rebuilt with no token silently un-cancels the run",
+    }
+    cancels = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cancel"
+    ]
+    assert cancels == ["self.cancellation_token.cancel()"], {"cancel_calls": cancels}
+
+
+def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
+    """The gateway meter's twin, pinned behaviorally and cross-asserted against it.
+
+    Two meters, one omission: both summed input/output/total and dropped the four priced
+    sub-counts, and fixing one of them would have left the other. The cross-assert below is what
+    makes them one rule rather than two that happen to agree today.
+    """
+
+    from monoid_agent_kernel.reference.backend.run_state import TenantUsage
+
+    meter = TenantUsage("tenant-1")
+    meter.add_metrics({**_MAXIMAL_USAGE, "web_search_calls": 3})
+    reported = meter.to_json()
+    dropped = NORMALIZED_USAGE_KEYS - set(reported)
+    assert dropped == set(), {"dropped_sub_counts": sorted(dropped)}
+    # ...and the gateway's ledger drops exactly the same nothing, so the two agree by rule.
+    assert dropped == NORMALIZED_USAGE_KEYS - GATEWAY_METER_KEYS
+    summed = {key: reported[key] for key in NORMALIZED_USAGE_KEYS}
+    assert summed == _MAXIMAL_USAGE, {
+        "metered": summed,
+        "hint": "a sub-count is reported as a column and not actually summed into it",
+    }
+    assert reported["web_search_calls"] == 3
+
+
+def test_both_terminal_paths_meter_the_run_through_one_seam() -> None:
+    """``record_run_failure`` metered nothing at all while its sibling fed the ledger.
+
+    Pinned as "one seam", not as "both call ``add_metrics``": the two paths report CUMULATIVE
+    totals from different sources (the last checkpoint, and ``AgentRunResult.metrics``), so the
+    guard against billing a metered-then-recovered-then-completed run twice is that a single
+    function owns the per-run high-water mark. A second caller of ``add_metrics`` would be a
+    second place that has to remember the mark.
+    """
+
+    failure = _function_node(
+        "reference/backend/run_state.py", "record_run_failure", within="RunStateMutationService"
+    )
+    success = _function_node(
+        "reference/backend/run_state.py", "record_run_result", within="RunStateMutationService"
+    )
+    seam = _function_node(
+        "reference/backend/run_state.py", "_meter_run", within="RunStateMutationService"
+    )
+    assert "_meter_run" in _names_in(success)
+    assert "_meter_run" in _names_in(failure), {
+        "hint": "the failure path meters nothing again",
+    }
+    assert "add_metrics" in _names_in(seam)
+    for path in (failure, success):
+        assert "add_metrics" not in _names_in(path), {
+            "hint": "a second ledger writer beside the seam that owns the high-water mark",
+        }
+
+
+def test_the_settle_mappers_answer_a_terminal_limited_run_one_way() -> None:
+    """Was registered (round 2): one run, three surfaces, three states — then a fourth.
+
+    ``state_from_suspension`` said FAILED, ``session_state_from_run_status("limited")`` said
+    LIMITED, and ``LoopSession.close`` said COMPLETED — for one budget- or validator-limited run.
+    LIMITED is canonical. The v0.21 burn-down then found the mapper this census had NOT seated at
+    the table diverging the same way: ``LoopSession._derive_after_settle`` (the blocking
+    ``submit()`` twin of the pump) read only the terminal flag and said FAILED where
+    ``run_until_suspended`` said LIMITED — and ``close()`` then crashed the FSM on the
+    ``'failed' -> 'limited'`` edge. All four are pinned value-level, because a *divergence* is
+    what this census exists to catch; the cancel case is pinned beside each, because the
+    harmonization runs through the same branch cancel does.
+    """
+
+    from monoid_agent_kernel.core.lifecycle import (
+        LoopSession,
+        SessionState,
+        session_state_from_run_status,
+        state_from_suspension,
+    )
+
+    parked = Suspension(
+        reason="terminal", status="limited", error_code="output_validator_unsatisfied"
+    )
+
+    class _ClosingLoop:
+        def __init__(self, status: str, error_code: str = "") -> None:
+            self._status = status
+            self._error_code = error_code
+
+        def close(self) -> Any:
+            return dataclasses.replace(
+                _maximal_turn(), status=self._status, error_code=self._error_code
+            )
+
+    def _closed(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_ClosingLoop(status, error_code))  # type: ignore[arg-type]
+        session.close()
+        return session.state
+
+    class _TerminalSettledLoop:
+        # The shape _derive_after_settle reads: a live session object whose terminal flag the
+        # loop raised at the settle boundary (max_tool_calls, cancel, a non-recoverable error).
+        class _Session:
+            terminal = True
+
+        _session = _Session()
+
+    def _derived(status: str, error_code: str = "") -> SessionState:
+        session = LoopSession(loop=_TerminalSettledLoop())  # type: ignore[arg-type]
+        return session._derive_after_settle(
+            dataclasses.replace(_maximal_turn(), status=status, error_code=error_code)
+        )
+
+    verdicts = {
+        "core/lifecycle.py:state_from_suspension": state_from_suspension(parked),
+        "core/lifecycle.py:session_state_from_run_status": session_state_from_run_status(
+            "limited", terminal=True
+        ),
+        "core/lifecycle.py:LoopSession.close": _closed("limited"),
+        "core/lifecycle.py:LoopSession._derive_after_settle": _derived("limited"),
+    }
+    assert set(verdicts.values()) == {SessionState.LIMITED}, {
+        "verdicts": {name: value.value for name, value in verdicts.items()},
+        "hint": "the settle mappers over one run must not answer two ways again",
+    }
+    # Cancel still escapes to its own terminal state on all four, and a real failure to FAILED.
+    cancelled = Suspension(reason="terminal", status="limited", error_code="cancelled")
+    assert state_from_suspension(cancelled) is SessionState.CANCELLED
+    assert (
+        session_state_from_run_status("limited", error_code="cancelled", terminal=True)
+        is SessionState.CANCELLED
+    )
+    assert _closed("limited", "cancelled") is SessionState.CANCELLED
+    assert _derived("limited", "cancelled") is SessionState.CANCELLED
+    assert state_from_suspension(Suspension(reason="terminal", status="failed")) is (
+        SessionState.FAILED
+    )
+    assert _closed("failed") is SessionState.FAILED
+    assert _derived("failed") is SessionState.FAILED
+    assert _closed("completed") is SessionState.COMPLETED
+    # ...and ``close`` reaches them through the shared mapper rather than its own == test,
+    # while the pump and blocking settle halves share the terminal precedence literally.
+    close_source = _live_source(LoopSession.close)
+    assert "session_state_from_run_status" in close_source, {
+        "hint": "a fourth hand-rolled terminal mapping is how the first three diverged",
+    }
+    assert "_terminal_outcome_state" in _live_source(state_from_suspension)
+    assert "_terminal_outcome_state" in _live_source(LoopSession._derive_after_settle), {
+        "hint": "the blocking settle twin re-rolling the precedence is how the fourth diverged",
+    }
+    assert REASON_TO_STATE["limited"] is SessionState.LIMITED
+
+
+def test_the_recovery_park_is_built_inside_the_durable_status_vocabulary() -> None:
+    """Was registered (round 2): reference/backend/recovery.py minted Suspension(status="running").
+
+    Latent — the synthetic park is re-driven rather than serialized — but nothing on the type said
+    so, and the first path that checkpointed it raised at the recovery boundary it exists to
+    serve. Pinned as the in-vocabulary mint plus a round-trip that now SUCCEEDS.
+    """
+
+    recovered = _function_node("reference/backend/recovery.py", "run_recovered")
+    minted = [
+        {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in node.keywords
+            if keyword.arg
+        }
+        for node in ast.walk(recovered)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Suspension"
+    ]
+    assert minted == [
+        {"reason": "'awaiting_tasks'", "status": "'completed'", "has_external": "True"}
+    ], {"suspensions_minted_during_recovery": minted}
+
+    synthetic = Suspension(reason="awaiting_tasks", status="completed", has_external=True)
+    payload = suspension_checkpoint_payload(synthetic)
+    assert payload["status"] == "completed"
+    assert suspension_from_checkpoint_payload(payload) == synthetic
+    # The vocabulary itself, so a widened reader does not quietly make this pin vacuous.
+    from monoid_agent_kernel.core.result import SUSPENSION_CHECKPOINT_STATUSES
+
+    assert SUSPENSION_CHECKPOINT_STATUSES == {"completed", "failed", "limited"}
+    assert "running" not in SUSPENSION_CHECKPOINT_STATUSES
+
+
+# --------------------------------------------------------------------------------------
+# FUTURE_FAMILIES — the numeric claims, pinned so they rot loudly
+# --------------------------------------------------------------------------------------
+#
+# A declared-but-uncensused family is a prediction, and a prediction with a stale number is
+# worse than none. The counts in the risk notes are asserted here against the code they
+# describe.
+
+
+def _future_family(name: str) -> FutureFamily:
+    return next(family for family in FUTURE_FAMILIES if family.family == name)
+
+
+# core/manifest.py:build_run_manifest — the four limits the durable record of a run carries.
+MANIFEST_LIMIT_KEYS = frozenset(
+    {"max_steps", "max_tool_calls", "max_bytes_read", "max_duration_s"}
+)
+RUN_LIMITS_FIELD_COUNT = 15
+
+
+def test_future_family_run_limits_carries_four_of_fifteen() -> None:
+    from monoid_agent_kernel.core.spec import RunLimits
+
+    fields = {field.name for field in dataclasses.fields(RunLimits)}
+    assert len(fields) == RUN_LIMITS_FIELD_COUNT, {
+        "run_limits_fields": sorted(fields),
+        "hint": "the '4 of 15' claim in FUTURE_FAMILIES is now wrong: update both",
+    }
+    builder = _function_node("core/manifest.py", "build_run_manifest")
+    carried = [
+        # Strict, like the two literal-argument extractors above: this list is diffed for
+        # equality against MANIFEST_LIMIT_KEYS, so a ``**`` merge into the literal must fail
+        # rather than leave the pin green while the manifest carries more than four limits.
+        _pinned_dict_keys(keyword.value, "core/manifest.py: limits={...}")
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "limits" and isinstance(keyword.value, ast.Dict)
+    ]
+    assert len(carried) == 1, {"manifest_limits_literals": len(carried)}
+    assert carried[0] == MANIFEST_LIMIT_KEYS, {
+        "carried_into_the_manifest": sorted(carried[0]),
+        "hint": "widened? update EXPECTED and the FUTURE_FAMILIES risk note together",
+    }
+    assert carried[0] <= fields
+    assert _future_family("run limits").carrier_count == 1
+
+
+def test_future_family_stream_frames_has_two_hand_built_carriers() -> None:
+    """The frame writer and the frame reader, and the chunk union they both re-implement."""
+
+    from monoid_agent_kernel.providers.base import ModelStreamChunk
+
+    members = {member.__name__ for member in get_args(ModelStreamChunk)}
+    assert members == {"TextDelta", "ReasoningDelta", "ToolCallDelta", "TurnComplete"}, {
+        "chunk_union": sorted(members),
+        "hint": "a fifth chunk type must reach both hand-built carriers",
+    }
+    writer = _function_node("reference/llm_gateway/service.py", "_chunk_to_frame")
+    branches = {
+        ast.unparse(node.args[1])
+        for node in ast.walk(writer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "isinstance"
+        and len(node.args) == 2
+    }
+    # ``TurnComplete`` is dropped by design: the gateway mints its own terminal frame.
+    assert branches == members - {"TurnComplete"}, {
+        "frame_writer_branches": sorted(branches),
+        "hint": "a chunk type the frame writer cannot translate is dropped silently",
+    }
+    # The two carriers bound to each other: every frame type the writer can put on the wire is a
+    # frame type the reader dispatches on, and the reader's extra two are the gateway's own
+    # terminal/error frames (which no ``ModelStreamChunk`` produces).
+    written = {
+        value.value
+        for node in ast.walk(writer)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if isinstance(key, ast.Constant)
+        and key.value == "type"
+        and isinstance(value, ast.Constant)
+    }
+    read = _handled_event_types(
+        _function_node("providers/gateway.py", "_chunk_from_event"), "event_type"
+    )
+    assert written == {"text_delta", "reasoning_delta", "tool_call_delta"}, sorted(written)
+    assert written <= read, {
+        "written_but_not_dispatched_on": sorted(written - read),
+        "hint": "a frame the writer emits and the reader drops",
+    }
+    assert read - written == {"turn_complete", "error"}
+    assert _future_family("stream frames").carrier_count == 2
+
+
+# core/schemas.py:STATUS_SCHEMA — what the operator-facing status file declares about itself.
+# The classification block joined in the burn-down, declared with its writer (the sink's
+# ``turn.failed`` branch) under the stream_closed precedent: declare even under an open cap.
+STATUS_SCHEMA_KEYS = frozenset(
+    {
+        "run_id",
+        "state",
+        "terminal",
+        "last_event_seq",
+        "last_event_type",
+        "updated_at",
+        "provider_error_code",
+        "http_status",
+        "retryable",
+        "config_recoverable",
+        "provider_retried",
+    }
+)
+
+
+def test_future_family_status_json_is_already_wider_than_its_own_schema() -> None:
+    from monoid_agent_kernel.core.schemas import STATUS_SCHEMA
+
+    declared = frozenset(STATUS_SCHEMA["properties"])
+    assert declared == STATUS_SCHEMA_KEYS, {
+        "missing": sorted(STATUS_SCHEMA_KEYS - declared),
+        "extra": sorted(declared - STATUS_SCHEMA_KEYS),
+        "hint": "the schema moved: recheck the FUTURE_FAMILIES claim it backs",
+    }
+    assert STATUS_SCHEMA["additionalProperties"] is True, {
+        "hint": "the cap closed: every undeclared key the sink writes is now a failure",
+    }
+    # The claim itself: the sink writes a ``metrics`` block the schema never declares.
+    sink = _function_node("recorder.py", "emit", within="StatusJsonSink")
+    written = {
+        node.slice.value
+        for node in ast.walk(sink)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "state"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+    assert "metrics" in written and "metrics" not in declared, {
+        "written_but_undeclared": sorted(written - declared),
+        "hint": "declared now? update EXPECTED and the FUTURE_FAMILIES risk note",
+    }
+    assert _future_family("status.json projection").carrier_count == 2
+
+
+# --------------------------------------------------------------------------------------
+# New-carrier backstop
+# --------------------------------------------------------------------------------------
+
+# Every module that *carries* each headline field today, by AST occurrence rather than by
+# substring. Substring containment fails open in the direction that matters: a file whose only
+# mention is a comment or a docstring counted as a carrier, so the pinned set said the census
+# had accounted for a file that has no code for the field at all (``validated_call.py`` for
+# ``provider_retried`` was exactly that, and it makes the same mistake in reverse invisible --
+# deleting the only real use while a prose mention keeps the entry green). A carrier is a file
+# where the name occurs in *code*: an exact string constant, or an identifier that contains it
+# (``mark_provider_usage``, ``provider_usage_of`` -- the helpers through which most files carry
+# the fact). Paths are relative to ``src/monoid_agent_kernel``.
+CARRIER_FILES: dict[str, frozenset[str]] = {
+    "config_recoverable": frozenset(
+        {
+            # Joined in the burn-down: the immutable record of one call, the live stream lane
+            # (outcome type, sidecar writer/reader) that used to classify with half the
+            # vocabulary.
+            # Joined in the burn-down's durable batch: the park payload has a schema now, and
+            # this is one of the fields it type-checks.
+            "core/checkpoint.py",
+            # Joined in W6-1: the durable model-call ledger records the whole failure
+            # classification, so a keyless or failed call can be triaged from the artifact alone.
+            "core/model_calls.py",
+            "core/model_content.py",
+            "core/model_io.py",
+            "core/model_stream.py",
+            # Joined in the burn-down's carriage sweep: the offline run-status projection
+            # carries the full classification a parked turn.failed emits.
+            "core/projections.py",
+            "core/result.py",
+            "core/schemas.py",
+            "errors.py",
+            "loop.py",
+            # Joined in the carriage sweep: metrics.json states the failed run's verdict.
+            "loop_phases.py",
+            # Joined in W7-0: the kernel retry predicate refuses a config-recoverable failure
+            # even when it is marked retryable -- re-sending cannot help a call whose config
+            # must change first.
+            "model_call.py",
+            # Joined in W7-2: the synthesized per-attempt child span carries the entry's whole
+            # failure taxonomy (`monoid.model.attempt.config_recoverable`) -- the parent chat
+            # span already carried retryable/http_status, and an attempt child naming only
+            # half the taxonomy would tell a trace reader "waiting may help" without "a config
+            # change will".
+            "observability/otel.py",
+            "providers/gateway.py",
+            "providers/openai.py",
+            # Joined in W6-4b: a replay miss is the client-side park shape by construction --
+            # ReplayMiss pins config_recoverable=True so a session survives a miss and only a
+            # closing one-shot facade promotes it, the same classification a provider 4xx gets.
+            "providers/replay.py",
+            # Joined in the carriage sweep: status.json (the live sink) carries the same set
+            # its offline twin projects.
+            "recorder.py",
+            # Joined in the burn-down: the backend record that carries the classification to the
+            # surfaces an operator reads (type, protocol, the driver that promotes it, and the
+            # projection that serves it).
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
+            "reference/backend/recovery.py",
+            "reference/backend/run_state.py",
+            # Joined in the Codex review cycle: the live stream broker frame carries the same
+            # classification pair its model-content sidecar records — retryable alone told a
+            # live consumer half the park's vocabulary.
+            "reference/backend/model_stream.py",
+            "reference/backend/run_types.py",
+            "reference/backend/service.py",
+            "reference/backend/session_drive.py",
+            "reference/llm_gateway/http.py",
+        }
+    ),
+    "provider_retried": frozenset(
+        {
+            "contracts.py",
+            # Joined in the burn-down's durable batch: see config_recoverable above.
+            "core/checkpoint.py",
+            # Joined in W6-1: see config_recoverable above. `attempts` and this are not the same
+            # fact, so a ledger carrying only the first would show a gateway's three internal
+            # retries as one clean call.
+            "core/model_calls.py",
+            "core/model_io.py",
+            # Joined in W6-2: the replay corpus's response body carries the flag because a
+            # replayed turn must answer with what the original turn declared -- a corpus that
+            # dropped it would replay a retried call as a clean one.
+            "core/model_payloads.py",
+            # Joined in the carriage sweep, with core/projections.py and recorder.py: the two
+            # status readers carry the parked fact and drop it at terminal, like the event.
+            "core/projections.py",
+            # Joined in the burn-down: the park type that records the failed turn, its event
+            # schema, and the loop that writes both plus the two transcript records.
+            "core/result.py",
+            "core/schemas.py",
+            "errors.py",
+            "loop.py",
+            "model_call.py",
+            "observability/otel.py",
+            "providers/base.py",
+            "providers/gateway.py",
+            # Joined in the burn-down: the classifier reports the retries its own SDK made.
+            "providers/openai.py",
+            # Joined in W6-4b: the replay adapter reconstructs the flag the corpus recorded
+            # (see core/model_payloads.py above) back onto the replayed ModelTurn -- dropping
+            # it here would replay a retried call as a clean one, the exact lie W6-2 recorded
+            # the field to prevent.
+            "providers/replay.py",
+            "recorder.py",
+            # Joined in the carriage sweep: the backend record carries all five park facts
+            # (type, protocol, event capture, the driver's promotion, and the projections
+            # that serve them) — provider_retried while parked, dropped at terminal.
+            "reference/backend/ports.py",
+            "reference/backend/projection.py",
+            # ``reference/backend/recovery.py`` LEFT this set in the round-3 fix: the give-up
+            # status artifact's ``provider_retried`` POP (the same drop the sink's
+            # ``run.failed`` branch makes) moved into the ONE shared quarantine writer,
+            # ``run_state.write_failure_status_artifact`` — run_state.py below already
+            # carries it, and recovery now calls the shared writer instead of naming the
+            # fact itself.
+            "reference/backend/run_state.py",
+            "reference/backend/run_types.py",
+            "reference/backend/session_drive.py",
+            "reference/llm_gateway/http.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+    "provider_usage": frozenset(
+        {
+            "core/model_io.py",
+            # Joined in the burn-down: turn.failed declares what the refused call cost.
+            "core/schemas.py",
+            "loop.py",
+            # Joined in W7-0: the kernel retry loop reads the stamp off each attempt it
+            # swallows so the receipt can sum what the whole logical call cost. W7-1 moved
+            # the read behind `with_error`'s probe and added the write: the terminal error
+            # is restamped (`mark_provider_usage`) with the merged total, so the loop's
+            # failure accounting sees the whole call, not the last attempt.
+            "model_call.py",
+            "providers/base.py",
+            "providers/gateway.py",
+            # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in
+            # this set could only report a cost the adapter that first saw the provider's
+            # billed body had recorded, and this one recorded none -- a refusal off a billed
+            # Responses body escaped unstamped, so the whole chain metered zero.
+            "providers/openai.py",
+            "reference/llm_gateway/http.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+    "reasoning_tokens": frozenset(
+        {
+            "core/schemas.py",
+            "loop.py",
+            "providers/_common.py",
+            # Joined in the burn-down: the two tenant ledgers now sum the priced sub-counts
+            # instead of folding them away.
+            "reference/backend/run_state.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+    # The applied-echo family: three fields, one carrier set — the wire type, the client's
+    # readers/checkers, and the server writer. ``reasoning_applied`` was pinned EMPTY while it
+    # was the registered v0.21-track:B1 gap, so the first carrier had to arrive through the
+    # echo censuses above rather than on one transport quietly; B1 closed it on all three
+    # files at once.
+    "generation_applied": frozenset(
+        {
+            "providers/base.py",
+            "providers/gateway.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+    "schema_applied": frozenset(
+        {
+            "providers/base.py",
+            "providers/gateway.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+    "reasoning_applied": frozenset(
+        {
+            "providers/base.py",
+            "providers/gateway.py",
+            "reference/llm_gateway/service.py",
+        }
+    ),
+}
+
+
+def _python_files(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+def _code_occurrences(tree: ast.AST) -> tuple[frozenset[str], frozenset[str]]:
+    """(exact string constants, identifiers) named in code — never in comments or docstrings."""
+
+    constants: set[str] = set()
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            constants.add(node.value)
+        elif isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+        elif isinstance(node, ast.arg):
+            identifiers.add(node.arg)
+        elif isinstance(node, ast.keyword) and node.arg:
+            identifiers.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            identifiers.add(node.name)
+        elif isinstance(node, ast.alias):
+            identifiers.add(node.name)
+            if node.asname:
+                identifiers.add(node.asname)
+    return frozenset(constants), frozenset(identifiers)
+
+
+# Parsing the package once per headline field costs seconds; the census is meant to be cheap
+# enough that nobody is tempted to skip it.
+_CODE_OCCURRENCE_CACHE: dict[Path, tuple[frozenset[str], frozenset[str]]] = {}
+
+
+_SOURCE_CACHE: dict[Path, str] = {}
+
+
+def _carries_in_code(path: Path, field_name: str) -> bool:
+    if path not in _SOURCE_CACHE:
+        _SOURCE_CACHE[path] = path.read_text(encoding="utf-8")
+    source = _SOURCE_CACHE[path]
+    if field_name not in source:
+        # Not named anywhere, comments included, so it cannot be named in code either.
+        return False
+    if path not in _CODE_OCCURRENCE_CACHE:
+        _CODE_OCCURRENCE_CACHE[path] = _code_occurrences(ast.parse(source, filename=str(path)))
+    constants, identifiers = _CODE_OCCURRENCE_CACHE[path]
+    return field_name in constants or any(field_name in name for name in identifiers)
+
+
+@pytest.mark.parametrize("field_name", sorted(CARRIER_FILES))
+def test_no_unregistered_carrier_file_appears_for_a_headline_field(field_name: str) -> None:
+    found = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in _python_files(PACKAGE)
+        if _carries_in_code(path, field_name)
+    }
+    expected = CARRIER_FILES[field_name]
+    assert found == expected, {
+        "new carrier file for": field_name,
+        "detail": "new carrier file for "
+        f"{field_name} — extend the census or register the site",
+        "added": sorted(found - expected),
+        "removed": sorted(expected - found),
+    }
+
+
+# The carriers no Python scan reaches. A wire key is a contract with things outside this
+# package too: the shipped Studio bundle reads the event stream, and the two documents below
+# are what a third-party client implements against. A rename that breaks them is a rename that
+# breaks a deployment, so it fails a test that names the file.
+EXTRA_CARRIERS: dict[str, tuple[str, ...]] = {
+    # Glob, because the bundle's filename carries a content hash.
+    "src/monoid_agent_kernel/reference/studio/web/dist/assets/index-*.js": (
+        "turn.failed",
+        "retryable",
+        "metrics.updated",
+        "input_tokens",
+        "total_tokens",
+    ),
+    "docs/CONTRACTS.md": (
+        "config_recoverable",
+        "provider_retried",
+        "retryable",
+        "turn.failed",
+        "http_status",
+        # X-3: the success envelope's reasoning key, bound to the paragraph that documents it
+        # for the third-party clients this document is the contract for.
+        #
+        # NOT the bare word "reasoning": this check is a whole-file substring scan, and the
+        # document already said "reasoning" fifteen times before X-3 added anything (the
+        # request-side reasoning block, the delta channels, the ZDR round-trip). A pin that is
+        # satisfied by prose the change did not write is not a pin -- deleting the entire new
+        # paragraph left it green. These two anchors exist nowhere in the document at
+        # release/v0.21.0 and exactly once in it now: the sentence that states the relay
+        # contract, and the response-envelope example that shows its shape.
+        "relayed verbatim",
+        '"reasoning": [{"type": "reasoning"',
+        # B1: the reasoning echo's two load-bearing sentences, anchored the same way and for
+        # the same reason -- the document said "reasoning_applied" several times the moment
+        # the feature landed, so the bare key name would be satisfied by any surviving
+        # mention. These phrases exist nowhere at the pre-B1 base and exactly once each now:
+        # the empty-object-is-proof rule, and the three-spellings disambiguation.
+        "empty object as a proof, not an absence",
+        "artifact array and echo object on the response",
+        # W6-0: the digest generation rule. The bare words "domain" and "generation" are all
+        # over this document, and even "generation change" predates W6-0 in the very rule this
+        # sentence replaces -- so the anchor is the clause that states the *mechanism*, which
+        # exists nowhere at 6f4b21b and exactly once now.
+        "carried as the single wrapper key",
+        # W6-1: the ledger's exclusion rule. Not "model_calls.jsonl" and not
+        # "destination_digest" -- the first would stay green after the paragraph explaining
+        # *why* the endpoint is absent is deleted, and the second appears in this document
+        # already. The anchor is the clause naming the hazard, absent at 41c8550 and present
+        # exactly once now.
+        "never the preimage of a digest it also records",
+        # W6-2: the corpus's reassembly contract. Not "model_payloads.jsonl" (stays green after
+        # the paragraph stating the byte-identity rule is deleted) and not "reassemble" alone
+        # (this suite and the validator prose would satisfy it). The anchor is the clause that
+        # states the contract, absent at 5ceaa93 and present exactly once now.
+        "reassembles to the exact bytes the key was taken over",
+    ),
+    "docs/OBSERVABILITY.md": (
+        "metrics.updated",
+        "input_tokens",
+        "total_tokens",
+        "retryable",
+    ),
+}
+
+
+@pytest.mark.parametrize("pattern", sorted(EXTRA_CARRIERS))
+def test_the_non_python_carriers_still_name_the_fields_they_read(pattern: str) -> None:
+    """Substring here on purpose: minified JavaScript and prose have no AST this suite parses.
+
+    The claim is only "this file still mentions this wire key", which is exactly the claim that
+    catches a rename: the shipped UI reads `turn.failed`/`retryable`/`metrics.updated` and its
+    token counters by name out of the event stream, and it is built from source this suite
+    cannot see.
+    """
+
+    matches = sorted(ROOT.glob(pattern))
+    assert matches, {"no_file_matches": pattern, "hint": "a carrier moved or was deleted"}
+    for path in matches:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        missing = [field_name for field_name in EXTRA_CARRIERS[pattern] if field_name not in text]
+        assert missing == [], {
+            "carrier": path.relative_to(ROOT).as_posix(),
+            "fields_no_longer_named": missing,
+            "hint": "a wire-key rename that this carrier was not part of",
+        }
+
+
+def test_every_registered_carrier_file_is_a_known_carrier_of_its_field() -> None:
+    """The backstop's pinned sets and the gap registry must not drift apart."""
+
+    registered_paths = {gap.carrier.split(":", 1)[0] for gap in KNOWN_GAPS}
+    all_carriers = frozenset().union(*CARRIER_FILES.values())
+    # ``core/checkpoint.py`` and ``core/spec.py`` carry aliased facts under other names
+    # (``provider_http_status``, an omitted ``generation`` block), so no headline-name scan
+    # reaches them and they are registered without appearing in one.
+    # ``core/spec.py`` carries an aliased fact under another name (an omitted ``generation``
+    # block), so no headline-name scan reaches it and it is registered without appearing in one.
+    # This set is kept MINIMAL on purpose: an entry here that is also a scanned carrier reads as
+    # "no scan can reach this file", which stops being true the moment the file gains the field —
+    # exactly the stale-exemption drift the rest of this suite exists to catch.
+    alias_only = {"core/spec.py"}
+    unaccounted = registered_paths - all_carriers - alias_only
+    assert unaccounted == set(), {"registered_but_not_a_scanned_carrier": sorted(unaccounted)}
+    stale = alias_only & all_carriers
+    assert stale == set(), {
+        "exempted_but_actually_scanned": sorted(stale),
+        "hint": "a headline scan reaches this file now: drop its exemption",
+    }
+    # Every family the census covers must not also be declared as one it does not.
+    covered_families = {gap.family for gap in KNOWN_GAPS}
+    declared_future = {family.family for family in FUTURE_FAMILIES}
+    assert covered_families.isdisjoint(declared_future), {
+        "declared_uncensused_but_registered_as_covered": sorted(
+            covered_families & declared_future
+        ),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Failure-quarantine writer census — every failure.json writer ends the run out loud
+# --------------------------------------------------------------------------------------
+#
+# Finding shape (PR #94 round 3): ``record_run_failure`` was the THIRD ``failure.json``
+# writer and the only one with no terminal statement — no status artifact, no ``run.failed``
+# — so after a restart every artifact-backed status surface served the run's old park
+# (``awaiting_input, terminal=false``) forever while ``recover_runs`` skipped the dir on
+# failure.json.  The rule is structural, so it is bound structurally: every function in src
+# that writes ``failure.json`` (directly, or through one of the two primitive writers) must,
+# in its own control flow, either write the terminal status artifact through the ONE shared
+# writer (``run_state.write_failure_status_artifact``) or emit ``run.failed`` (the loop's
+# lane — its ``StatusJsonSink`` consumes that event into the same artifact).  A fourth
+# writer that does neither fails HERE, not at an operator's console.
+
+_FAILURE_BUNDLE_PRIMITIVE_NAMES = frozenset({"write_failure", "write_failure_bundle"})
+_TERMINAL_STATUS_WRITER = "write_failure_status_artifact"
+
+#: The two functions that construct ``failure.json`` and write it themselves.  Their CALLERS
+#: are what the pairing census below binds; the primitives are data movement.
+FAILURE_JSON_PRIMITIVE_WRITERS = frozenset(
+    {
+        ("recorder.py", "AgentRecorder.write_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.write_failure_bundle"),
+    }
+)
+
+#: Every function that invokes a failure-bundle primitive, pinned exactly.  A new caller
+#: fails the pin (and then the pairing assertion says what it owes).
+FAILURE_QUARANTINE_WRITERS = frozenset(
+    {
+        ("loop.py", "AgentLoop._record_failure"),
+        ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+        ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+        ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        ("reference/backend/service.py", "RunnerBackend._write_failure_bundle"),
+    }
+)
+
+#: Delegating seams with no decision of their own.  Verified structurally below (a
+#: non-docstring body of exactly one delegating call) so logic cannot hide behind the
+#: exemption; their callers reach the primitives through injected callables named
+#: ``write_failure_bundle`` and are censused as callers themselves.
+_FAILURE_BUNDLE_PASS_THROUGHS = frozenset(
+    {("reference/backend/service.py", "RunnerBackend._write_failure_bundle")}
+)
+
+
+def _iter_src_functions():
+    """Every function definition under src, as ``(module, dotted qualname, node)``."""
+
+    def walk(node: ast.AST, prefix: str, rel: str):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qual = prefix + child.name
+                yield rel, qual, child
+                yield from walk(child, qual + ".", rel)
+            elif isinstance(child, ast.ClassDef):
+                yield from walk(child, prefix + child.name + ".", rel)
+            else:
+                yield from walk(child, prefix, rel)
+
+    for path in sorted(PACKAGE.rglob("*.py")):
+        rel = path.relative_to(PACKAGE).as_posix()
+        yield from walk(_module_tree(rel), "", rel)
+
+
+def _own_nodes(func: ast.AST):
+    """A function's own control flow: nested defs/lambdas excluded (they run when called,
+    not when the writer runs), so a terminal statement inside a closure cannot satisfy the
+    pairing and a nested def's writer call is attributed to the nested def."""
+
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _own_calls(func: ast.AST) -> list[tuple[str, ast.Call]]:
+    calls: list[tuple[str, ast.Call]] = []
+    for node in _own_nodes(func):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name):
+            calls.append((target.id, node))
+        elif isinstance(target, ast.Attribute):
+            calls.append((target.attr, node))
+    return calls
+
+
+def _emits_run_failed(func: ast.AST) -> bool:
+    for name, call in _own_calls(func):
+        if name != "emit" or not call.args:
+            continue
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and first.value == "run.failed":
+            return True
+    return False
+
+
+def test_the_failure_json_primitive_writers_are_exactly_the_censused_two() -> None:
+    """A third function that constructs failure.json itself bypasses the caller census below,
+    so the primitives are pinned first: mentioning the filename and writing json atomically in
+    one function is the shape both writers have and no reader has."""
+
+    found = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if any(
+            isinstance(node, ast.Constant) and node.value == "failure.json"
+            for node in _own_nodes(func)
+        )
+        and any(name == "write_json_atomic" for name, _ in _own_calls(func))
+    )
+    assert found == FAILURE_JSON_PRIMITIVE_WRITERS, {
+        "new_primitives": sorted(str(site) for site in found - FAILURE_JSON_PRIMITIVE_WRITERS),
+        "gone_primitives": sorted(str(site) for site in FAILURE_JSON_PRIMITIVE_WRITERS - found),
+        "hint": "a new direct failure.json writer: census it here and bind its callers below",
+    }
+
+
+def test_every_failure_json_writer_is_paired_with_a_terminal_statement() -> None:
+    """The census: each discovered caller of a failure-bundle primitive must, in the same
+    control flow, write the shared terminal status artifact or emit ``run.failed``."""
+
+    sites: dict[tuple[str, str], ast.AST] = {}
+    for module, qual, func in _iter_src_functions():
+        if (module, qual) in FAILURE_JSON_PRIMITIVE_WRITERS:
+            continue
+        if any(name in _FAILURE_BUNDLE_PRIMITIVE_NAMES for name, _ in _own_calls(func)):
+            sites[(module, qual)] = func
+
+    assert frozenset(sites) == FAILURE_QUARANTINE_WRITERS, {
+        "new_writers": sorted(
+            str(site) for site in frozenset(sites) - FAILURE_QUARANTINE_WRITERS
+        ),
+        "gone_writers": sorted(
+            str(site) for site in FAILURE_QUARANTINE_WRITERS - frozenset(sites)
+        ),
+        "hint": "a failure.json writer appeared or moved: census it here AND pair it with a "
+        "terminal statement (the shared status-artifact writer, or a run.failed emit)",
+    }
+
+    unbound: list[str] = []
+    for (module, qual), func in sorted(sites.items()):
+        if (module, qual) in _FAILURE_BUNDLE_PASS_THROUGHS:
+            # The exemption is earned structurally, not granted: a pass-through has no body
+            # beyond its docstring and the one delegating call.
+            body = [
+                stmt
+                for stmt in func.body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                )
+            ]
+            delegates = (
+                len(body) == 1
+                and isinstance(body[0], (ast.Expr, ast.Return))
+                and isinstance(body[0].value, ast.Call)
+                and isinstance(body[0].value.func, ast.Attribute)
+                and body[0].value.func.attr in _FAILURE_BUNDLE_PRIMITIVE_NAMES
+            )
+            assert delegates, {
+                "pass_through": f"{module}:{qual}",
+                "hint": "no longer a pure delegation -- it now owes the pairing itself",
+            }
+            continue
+        writes_artifact = any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+        if not (writes_artifact or _emits_run_failed(func)):
+            unbound.append(f"{module}:{qual}")
+
+    assert unbound == [], {
+        "writers_with_no_terminal_statement": unbound,
+        "hint": "a failure.json write that leaves status.json parked: after a restart every "
+        "status surface reports the dead run as a healthy park forever",
+    }
+
+
+def test_the_terminal_quarantine_artifact_has_one_writer_and_three_callers() -> None:
+    """One shared writer, all three quarantine lanes through it — the fix that replaced two
+    hand-rolled artifact writes.  A fourth lane must appear here (and in the census above)."""
+
+    definitions = frozenset(
+        (module, qual)
+        for module, qual, _func in _iter_src_functions()
+        if qual.split(".")[-1] == _TERMINAL_STATUS_WRITER
+    )
+    assert definitions == frozenset(
+        {("reference/backend/run_state.py", _TERMINAL_STATUS_WRITER)}
+    ), {"definitions": sorted(str(site) for site in definitions)}
+
+    callers = frozenset(
+        (module, qual)
+        for module, qual, func in _iter_src_functions()
+        if qual.split(".")[-1] != _TERMINAL_STATUS_WRITER
+        and any(name == _TERMINAL_STATUS_WRITER for name, _ in _own_calls(func))
+    )
+    assert callers == frozenset(
+        {
+            ("reference/backend/recovery.py", "RecoveryService.attempt_resume"),
+            ("reference/backend/recovery.py", "RecoveryService._record_checked_load_failure"),
+            ("reference/backend/run_state.py", "RunStateMutationService.record_run_failure"),
+        }
+    ), {
+        "callers": sorted(str(site) for site in callers),
+        "hint": "the quarantine artifact rides all three failure lanes through ONE writer",
+    }
+
+
+# --------------------------------------------------------------------------------------
+# SSE frame-writer census — every line-framed writer escapes what its readers call a line
+# --------------------------------------------------------------------------------------
+#
+# Finding shape: SSE is a LINE protocol and "line" is not the same word on both ends of it.
+# ``json.dumps(..., ensure_ascii=False)`` leaves U+2028 LINE SEPARATOR, U+2029 PARAGRAPH
+# SEPARATOR and U+0085 NEXT LINE in the body as themselves — JSON escapes every other member of
+# ``str.splitlines``' set (the C0 controls) whatever ``ensure_ascii`` says, so those three are the
+# whole of what a frame writer must escape for itself. The line-splitting readers clients use
+# (httpx's ``aiter_lines``, whose splitter IS ``str.splitlines``) break the frame there and hand
+# their parser JSON that stops mid-string.
+#
+# It went unseen because the reader that can see it is the one this repo does not use on these
+# routes: a browser's ``EventSource`` breaks on CR/LF only, and the suite's own SSE helpers split
+# the body on ``\n\n`` or read it whole. So the UI and the tests were both structurally unable to
+# notice, and when the gateway writer was fixed the three twins on the backend and studio routes
+# kept the defect — the dispatch-shape asymmetry this file exists for, on a fifth pair of rails.
+#
+# The rule is therefore bound by construction rather than by remembering it: a function that
+# frames an SSE event serializes with ``ensure_ascii=True``, stated rather than defaulted into.
+# The writer set is pinned in full because the failure mode here is a NEW writer, not a changed
+# one — a sixth route added with the smaller encoding would otherwise ship the same bug again.
+
+_SSE_FRAME_WRITERS = (
+    ("core/event_subscription.py", "EventSubscriptionFrame.to_sse"),
+    ("reference/backend/http.py", "make_backend_handler.BackendHttpHandler._stream_run_sse"),
+    ("reference/backend/model_stream.py", "LiveModelStreamFrame.to_sse"),
+    (
+        "reference/llm_gateway/http.py",
+        "make_llm_gateway_handler.LlmGatewayHttpHandler._write_sse_frame",
+    ),
+    ("reference/studio/server.py", "_make_handler.StudioHandler._sse_send"),
+)
+
+
+def _own_constant_text(func: ast.AST) -> list[str]:
+    """Every string/bytes constant in a function's OWN body, bytes decoded.
+
+    Both spellings are load-bearing: two of these writers frame with ``b"data: "`` and three with
+    an f-string, and a scan that saw only one of them would census half the set.
+    """
+
+    texts: list[str] = []
+    for node in _own_nodes(func):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            value = node.value
+            texts.append(value.decode("utf-8", "replace") if isinstance(value, bytes) else value)
+    return texts
+
+
+def _sse_frame_writers() -> dict[tuple[str, str], ast.AST]:
+    """Every function that FRAMES an SSE event, discovered rather than listed.
+
+    Both halves of the framing are required — a ``data:`` field and the blank line that ends the
+    event — which is what separates a writer from the readers that also spell ``data: ``
+    (``providers/gateway.py`` and ``mcp/client.py`` parse the prefix off a line and never write a
+    terminator). A writer that split those two halves across functions would drop out of this
+    discovery, which is what the full pin below is for.
+    """
+
+    writers: dict[tuple[str, str], ast.AST] = {}
+    for module, qual, func in _iter_src_functions():
+        texts = _own_constant_text(func)
+        if any("data: " in text for text in texts) and any("\n\n" in text for text in texts):
+            writers[(module, qual)] = func
+    return writers
+
+
+def test_the_sse_frame_writers_are_exactly_the_censused_five() -> None:
+    """A sixth SSE route must register here, which is where it is told the rule below."""
+
+    assert frozenset(_sse_frame_writers()) == frozenset(_SSE_FRAME_WRITERS), {
+        "unregistered": sorted(
+            f"{module}:{qual}"
+            for module, qual in set(_sse_frame_writers()) - set(_SSE_FRAME_WRITERS)
+        ),
+        "registered_but_gone": sorted(
+            f"{module}:{qual}"
+            for module, qual in set(_SSE_FRAME_WRITERS) - set(_sse_frame_writers())
+        ),
+        "hint": "a new SSE writer: register it, and dump its payload with ensure_ascii=True",
+    }
+
+
+@pytest.mark.parametrize("module,qual", _SSE_FRAME_WRITERS)
+def test_each_sse_frame_writer_escapes_the_unicode_line_separators(module: str, qual: str) -> None:
+    """The rule itself, on every writer rather than on the one a bug report arrived about.
+
+    ``ensure_ascii`` must be stated, not defaulted into: the studio writer was accidentally
+    correct — it simply never passed the argument — and an edit that "made the encoding smaller"
+    the way the length-delimited bodies do would have broken it silently.
+    """
+
+    writers = _sse_frame_writers()
+    func = writers.get((module, qual))
+    assert func is not None, f"{module}:{qual} no longer frames an SSE event"
+    dumps = [
+        node
+        for node in _own_nodes(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "dumps"
+    ]
+    assert dumps, {
+        "writer": f"{module}:{qual}",
+        "hint": "an SSE writer that serializes elsewhere escapes nothing here -- the census "
+        "above cannot follow it, so keep the dump in the frame writer",
+    }
+    for call in dumps:
+        flags = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        ensure_ascii = flags.get("ensure_ascii")
+        assert isinstance(ensure_ascii, ast.Constant) and ensure_ascii.value is True, {
+            "writer": f"{module}:{qual}",
+            "line": call.lineno,
+            "hint": "U+2028/U+2029/U+0085 survive ensure_ascii=False and split the frame for "
+            "every str.splitlines reader (httpx aiter_lines); pass ensure_ascii=True",
+        }
+
+
+# --------------------------------------------------------------------------------------
+# Abandonable calls: every exit that drops a produced answer hands it back
+# --------------------------------------------------------------------------------------
+
+_ABANDONABLE_ENTRIES = ("await_abandonable_call", "abandon_unwaited_call")
+"""The two ways a caller hands a live call to ``core/_sync_bridge.py``.
+
+Not ``detach_unfinished_call``: it is the bridge's own plumbing, reached only through these two,
+and the bridge is the module whose internal drop paths a previous round already counted.
+"""
+
+
+def _abandonable_call_sites() -> dict[str, list[tuple[ast.Call, bool]]]:
+    """Every call to an abandonable-call entry point in the package, grouped by the function
+    that makes it, with whether it passes ``on_discarded``."""
+
+    sites: dict[str, list[tuple[ast.Call, bool]]] = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        for owner in ast.walk(_module_tree(relative)):
+            if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            found = [
+                (node, any(keyword.arg == "on_discarded" for keyword in node.keywords))
+                for node in ast.walk(owner)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _ABANDONABLE_ENTRIES
+            ]
+            if found:
+                sites[f"{relative}:{owner.name}"] = found
+    return sites
+
+
+def test_every_abandonable_call_site_routes_its_discards() -> None:
+    """A caller that knows where a discarded answer belongs says so on *every* exit it has.
+
+    The rule this pins was already written down: a callee holding shared state cannot tell which
+    of its caller's exits was taken, so an answer dropped on any of them leaves that state saying
+    work was delivered that never was. The replay adapter advances a per-key cursor when it hands
+    an answer over, so one unrouted exit means the next caller is served a different call's
+    recording -- structurally valid, and wrong.
+
+    A previous round counted the drop paths and found four, wired all four, and said so in a
+    commit message. The count was taken by reading ``core/_sync_bridge.py``; the fifth was a
+    *caller's* other exit, in ``model_call.py``, where an accessor raising before the wait is
+    entered abandons a call that is already live. Reading a module cannot find a site outside it,
+    which is why this census is over call sites and not over a file -- the same correction, one
+    level up, as the reader/schema census that stopped being a hand-kept field table.
+
+    Stated as consistency rather than as a list, so it needs no exemption for the callers that
+    correctly pass nothing: the native tool handler's callee holds no cursor, and a function that
+    routes discards nowhere is not the failure. A function that routes them on one exit and not
+    its twin is.
+    """
+
+    inconsistent = {
+        owner: {
+            "routed": [call.lineno for call, routed in found if routed],
+            "unrouted": [call.lineno for call, routed in found if not routed],
+        }
+        for owner, found in _abandonable_call_sites().items()
+        if len({routed for _call, routed in found}) > 1
+    }
+    assert not inconsistent, {
+        "sites": inconsistent,
+        "hint": "this function abandons a live call on one exit without the discard hook it "
+        "passes on another; the callee cannot tell the exits apart, so a replay slot stays "
+        "spent and the next caller receives the following recording",
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Every ``pattern`` in every schema, against the dialect its validator actually speaks
+# --------------------------------------------------------------------------------------
+
+# JSON Schema calls ``pattern`` an ECMA-262 regex, ``jsonschema`` runs it through Python's ``re``,
+# and the two disagree at one position: ``$`` matches immediately before a single trailing newline
+# under ``re`` and only at end of input under ECMA-262. Every pattern in this repository was
+# spelled with a bare ``$``, so ``monoid validate`` certified ``"<digest>\n"``, ``"<timestamp>\n"``
+# and ``"<key>\n"`` -- values every other edge in the kernel refuses.
+#
+# Discovered, never listed. The hand-listed candidate lattice of the census this replaces is
+# exactly why the hole survived being reviewed: it proved agreement on the ten strings its author
+# thought of, and a trailing newline was not one of them.
+
+_PATTERN_PROBES: tuple[str, ...] = (
+    "",
+    "x",
+    "Z",
+    "2026-01-01T00:00:00Z",
+    "run.started",
+    "idem_0123456789abcdef",
+    "0123456789abcdef" * 4,
+)
+"""One string per pattern family, at minimum. A pattern no probe satisfies fails the census."""
+
+_LINE_TERMINATORS: tuple[str, ...] = ("\n", "\r", "\r\n", "\n\n", "\u2028", "\u0085")
+
+
+def _schema_patterns() -> dict[str, set[str]]:
+    """Every ``pattern`` reachable from a module-level schema, and where it was found.
+
+    Over ``sys.modules`` rather than over ``core.schemas``, because a schema is a plain dict that
+    any module may define and this census must not be scoped to the one file that happened to
+    hold them all when it was written.
+    """
+
+    import importlib
+    import pkgutil
+    import sys
+
+    import monoid_agent_kernel
+
+    for found in pkgutil.walk_packages(monoid_agent_kernel.__path__, "monoid_agent_kernel."):
+        try:
+            importlib.import_module(found.name)
+        except Exception:  # noqa: BLE001 - an optional-extra module is not this census's business
+            continue
+
+    patterns: dict[str, set[str]] = {}
+
+    def walk(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            found = node.get("pattern")
+            if isinstance(found, str):
+                patterns.setdefault(found, set()).add(where)
+            for key, value in node.items():
+                walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{where}[{index}]")
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("monoid_agent_kernel"):
+            continue
+        for attribute in dir(module):
+            if not attribute.isupper():
+                continue
+            try:
+                value = getattr(module, attribute)
+            except Exception:  # noqa: BLE001 - a lazy attribute is not a schema
+                continue
+            if isinstance(value, dict):
+                walk(value, f"{name}.{attribute}")
+
+    return patterns
+
+
+def test_the_pattern_census_found_the_schemas_it_is_supposed_to_police() -> None:
+    """Fail closed: a discovery that finds nothing would let every test below pass vacuously."""
+
+    patterns = _schema_patterns()
+    assert len(patterns) >= 5, {
+        "found": sorted(patterns),
+        "hint": "schema discovery collapsed; the patterns below are no longer being checked",
+    }
+
+
+def test_every_schema_pattern_has_a_probe_that_satisfies_it() -> None:
+    """The witness requirement, without which the terminator census proves nothing.
+
+    A pattern no probe matches cannot be tested for the hole -- there is no accepted value to
+    append a newline to -- and a census that skips what it cannot test is the failure mode this
+    file was rewritten to remove. So a new pattern with no probe fails here, loudly, rather than
+    passing the test below by never being exercised.
+    """
+
+    from jsonschema import Draft202012Validator
+
+    unwitnessed = {
+        pattern: sorted(sites)
+        for pattern, sites in _schema_patterns().items()
+        if not any(
+            Draft202012Validator({"type": "string", "pattern": pattern}).is_valid(probe)
+            for probe in _PATTERN_PROBES
+        )
+    }
+    assert not unwitnessed, {
+        "patterns": unwitnessed,
+        "hint": "add a string this pattern accepts to _PATTERN_PROBES, or the terminator census "
+        "silently stops covering it",
+    }
+
+
+def test_no_schema_pattern_accepts_a_value_with_a_line_terminator_appended() -> None:
+    """The class of defect, stated once over every member of the class.
+
+    Behavioural rather than textual: a census that grepped for a trailing ``$`` would pass a
+    pattern spelled ``[^\\n]*$`` and fail one whose ``$`` is inside a group, so this drives the
+    real ``Draft202012Validator`` and asks what it certifies.
+    """
+
+    from jsonschema import Draft202012Validator
+
+    leaks: dict[str, list[str]] = {}
+    for pattern, sites in _schema_patterns().items():
+        validator = Draft202012Validator({"type": "string", "pattern": pattern})
+        for probe in _PATTERN_PROBES:
+            if not validator.is_valid(probe):
+                continue
+            for terminator in _LINE_TERMINATORS:
+                if validator.is_valid(probe + terminator):
+                    leaks.setdefault(pattern, []).append(
+                        f"{probe + terminator!r} at {sorted(sites)[0]}"
+                    )
+    assert not leaks, {
+        "patterns": leaks,
+        "hint": "this pattern's end anchor stops before a line terminator; use END_OF_INPUT so "
+        "the same value is refused under Python's re and under ECMA-262 alike",
+    }

@@ -29,6 +29,7 @@ AgentEventType = Literal[
     "model.turn.finished",
     "turn.failed",
     "turn.interrupted",
+    "turn.paused",
     "model.input.degraded",
     "tool.call.started",
     "tool.call.finished",

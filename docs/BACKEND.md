@@ -44,6 +44,28 @@ monoid backend serve \
   --web-gateway-url http://127.0.0.1:8090
 ```
 
+`--llm-gateway-provider` (default `openai`, `none` to disable) names the **upstream**
+provider behind `--llm-gateway-url`, not the hop. It becomes
+`GatewayModelAdapter.provider_name` on every adapter the backend builds — including the
+ones recovery rebuilds after a restart — which tags relayed reasoning artifacts so they
+only replay to a matching provider, and attributes the model-call receipt and its OTel
+`gen_ai.provider.name`. In-process embedders set the same value with the
+`RunnerBackend(llm_gateway_provider=...)` field.
+
+`--model-calls-file`, `--model-payload-file` and `--model-content-file` turn on the three
+private per-run sidecars — the model-call ledger, the replay corpus, and the streamed
+model-content log. Each is off by default and each is **deployment-wide**: the boolean is read
+whenever this process builds an activation (a submitted run, and the one recovery rebuilds), so
+it applies to every tenant's runs with no per-run override, and a subagent inherits it into its
+own run directory. Two of the three are content — `model_payloads.jsonl` carries the request and
+response bodies in full, and `model-content.jsonl` the streamed text; only the ledger is
+metadata-only. `--model-content-file` additionally **selects provider streaming**, so on a
+deployment it moves every tenant's model call to the streaming dispatch; the other two leave the
+dispatch shape alone. Nothing in the kernel deletes any of them: `monoid gc` collects orphaned
+chunks, never a healthy corpus. Decide retention before enabling. In-process embedders set the same three with
+the matching `RunnerBackend(model_calls_file=..., model_payload_file=..., model_content_file=...)`
+fields; see [OBSERVABILITY.md](OBSERVABILITY.md) for what each artifact records.
+
 ## Start the Web gateway
 
 For local contract testing, start the reference fake WebGateway:

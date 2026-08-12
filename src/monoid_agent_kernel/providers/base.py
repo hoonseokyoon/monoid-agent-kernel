@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from copy import copy
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import (
+    RETRY_LAYERS,
+    ModelConfig,
+    validate_generation_config,
+    validate_reasoning_config,
+)
+from monoid_agent_kernel.core.model_io import is_absent_or_valid, is_valid_idempotency_key
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
+    portable_type_name,
 )
 from monoid_agent_kernel.errors import ModelAdapterError
-from monoid_agent_kernel.providers._common import normalize_usage
+from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
 from monoid_agent_kernel.tools.base import ToolSpec, normalize_tool_spec
 
 # Why a model turn ended, promoted from the raw provider payload onto the typed turn surface.
@@ -29,8 +37,10 @@ StopReason = Literal["stop", "length", "refusal", "tool_calls"]
 def format_async_result_text(output: dict[str, Any]) -> str:
     """Render a background/hosted (``is_background``) observation as user-message text.
     The injector may pre-format a ``message``; otherwise a generic async-result preamble
-    is used (covers shell background jobs). Shared by the loop's by-value message log and
-    the OpenAI adapter's by-reference fallback so the wording stays identical."""
+    is used (covers shell background jobs). One renderer, so every route that turns a hosted
+    result into a user message words it identically -- today that is the loop's by-value
+    message log (``loop.py``), the only remaining caller: the OpenAI adapter's by-reference
+    fallback was deleted with the shape itself, which that adapter now refuses outright."""
     message = output.get("message") if isinstance(output, dict) else None
     if message:
         return str(message)
@@ -118,11 +128,14 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
-    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call`` output
-    # items), captured verbatim and in their original order so the engine can round-trip them
-    # on the next by-value turn. Opaque to the core — never displayed, never reconstructed; an
-    # adapter that has no reasoning leaves this empty (the neutral seam). See the OpenAI adapter
-    # and the loop's assistant-message append for capture + re-injection.
+    # Provider-native reasoning artifacts (e.g. OpenAI ``reasoning``/``function_call``/``message``
+    # output items), captured verbatim and in their original order so the engine can round-trip
+    # them on the next by-value turn. Uninterpreted by the core — never displayed, never
+    # reconstructed — but not opaque: only the reasoning-type entries are provider-encrypted,
+    # while a paired ``message``/``function_call`` entry duplicates the plaintext of
+    # ``final_text``/``tool_calls``. Anything that logs or truncates this must treat it as model
+    # content. An adapter that has no reasoning leaves this empty (the neutral seam). See the
+    # OpenAI adapter and the loop's assistant-message append for capture + re-injection.
     reasoning: tuple[dict[str, Any], ...] = ()
     # Why the turn ended (promoted from ``raw``). ``None`` when the adapter does not report one.
     stop_reason: StopReason | None = None
@@ -161,6 +174,95 @@ class ModelRequest:
     # by-reference handle + ``instruction``/``observations`` delta. ``system_prompt`` is
     # NOT part of ``messages`` — it is regenerated each turn and applied separately.
     messages: tuple[dict[str, Any], ...] | None = None
+    # ResponseContract delivery (W5): a standard JSON Schema the final answer should satisfy,
+    # provider-neutral data. An adapter that declares ``structured_output_support = "native"``
+    # translates it into its provider's constrained-decoding dialect **verbatim, never
+    # transformed** — the request digest identifies exactly what was asked for. Adapters
+    # without the declaration ignore it, and post-hoc validation remains the guarantee either
+    # way (native delivery only reduces repairs). ``None`` = unconstrained.
+    output_schema: dict[str, Any] | None = None
+    # The retry-scope token this call presents (W7-3) — a carriage channel, not an input: the
+    # runner issues one per call at its keying block and OVERWRITES whatever a caller set,
+    # because a respected caller value would let one request object hand two calls the same
+    # retry scope. Constant across kernel re-dispatches and adapter-internal retries; only the
+    # gateway transport puts it on the wire (``Idempotency-Key``), other adapters ignore it.
+    # Deliberately outside the replay key: ``_request_identity._request_payload`` enumerates
+    # what the digest covers, and this token is per-issuance, not content.
+    idempotency_key: str = ""
+
+
+def _declared_support(
+    adapter: Any, attribute: str, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """The fail-closed probe shared by every opt-in adapter capability declaration.
+
+    One rule for all of them: only the exact string ``"native"`` claims the capability.
+    Absence, ``None``, ``True``, and unknown future spellings all read as ``"none"``, so a
+    consumer can never over-trust an adapter that did not explicitly claim it — and the two
+    capabilities below cannot drift into different notions of "declared".
+
+    Read off the *instance*. An adapter whose answer is fixed declares with a ``ClassVar``;
+    one whose answer depends on configuration declares with a **callable** taking the
+    effective per-call config (``request.model or self.config`` — the config the adapter will
+    actually enforce with). ``config`` is passed through to it, because the claim and the
+    enforcement must read the same policy: a forwarding transport probed on its *standing*
+    config alone would mint proof for a call it enforces under a different per-call policy.
+    An attribute that raises — on read or on call — is not a claim: the failure reads as
+    ``"none"`` like any other non-declaration, because a probe that can take the call down is
+    a worse contract than one that under-claims.
+    """
+
+    try:
+        value = getattr(adapter, attribute, "none")
+        if callable(value):
+            value = value(config)
+    except Exception:
+        return "none"
+    return "native" if value == "native" else "none"
+
+
+def structured_output_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` translates :attr:`ModelRequest.output_schema` into provider-native
+    constrained decoding.
+
+    Opt-in declaration, like ``supports_multimodal``: adapters set a
+    ``structured_output_support`` class attribute, or define it as a method taking the
+    effective per-call :class:`ModelConfig` when the answer depends on policy. Pass ``config``
+    when probing on behalf of a specific call; ``None`` probes the adapter's standing
+    configuration.
+    """
+
+    return _declared_support(adapter, "structured_output_support", config)
+
+
+def generation_support(
+    adapter: Any, config: ModelConfig | None = None
+) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.generation` to the provider request.
+
+    The twin of :func:`structured_output_support`, and for the same reason: a transport that
+    *forwards* generation parameters to an adapter cannot know whether that adapter puts them
+    on the wire. Only an adapter that declares this may be used to justify an
+    applied-parameters proof; anything else must be reported as unproven so a fail-closed
+    client refuses the turn rather than trusting parameters nobody applied.
+    """
+
+    return _declared_support(adapter, "generation_support", config)
+
+
+def reasoning_support(adapter: Any, config: ModelConfig | None = None) -> Literal["native", "none"]:
+    """Whether ``adapter`` applies :attr:`ModelConfig.reasoning` to the provider request.
+
+    The third member of the capability family above, same fail-closed rule, one difference
+    worth naming: a conditional declaration answers off ``reasoning.on_unsupported`` — its own
+    feature family's policy knob — where the generation/schema pair deliberately shares
+    ``generation.on_unsupported``. A reasoning claim read off another family's knob would mint
+    proof for a call whose own policy said best-effort.
+    """
+
+    return _declared_support(adapter, "reasoning_support", config)
 
 
 class ModelAdapter(Protocol):
@@ -245,17 +347,86 @@ class MultimodalModelAdapter(Protocol):
 
 
 class ProviderNamedModelAdapter(Protocol):
-    """An adapter that identifies whose opaque reasoning items it produces.
+    """An adapter that identifies whose provider-native reasoning items it produces.
 
     The loop reads ``provider_name`` via ``getattr(adapter, "provider_name", None)`` and tags
     captured :attr:`ModelTurn.reasoning` with provider+model, so items only round-trip back to
     a matching adapter and model. Omitting it means "do not tag": reasoning is not replayed,
     which is the correct neutral behavior for an adapter with no provider-native reasoning
     artifacts.
+
+    ``None`` carries that same sense from a *declared* member: ``str | None`` because a
+    forwarding adapter's upstream is a per-deployment setting, and a deployment fronting an
+    upstream with no reasoning artifacts has to be able to say so without dropping the attribute
+    (``GatewayModelAdapter.provider_name`` is exactly that field). Every reader already spells
+    the two the same way -- ``getattr(..., None)`` then a falsy check -- so declaring ``str``
+    only made the shipped adapter fail a type it satisfies behaviorally.
     """
 
     @property
-    def provider_name(self) -> str: ...
+    def provider_name(self) -> str | None: ...
+
+
+_UNREAD: Any = object()
+"""``declared`` was not supplied, so :func:`resolved_provider_name` reads it itself.
+
+A sentinel rather than ``None`` because ``None`` is a real answer from a declaring adapter -- a
+``GatewayModelAdapter`` built without one returns exactly that -- and it must keep meaning "declares
+nothing, use the config" rather than "I did not ask".
+"""
+
+
+def resolved_provider_name(
+    adapter: Any, config: ModelConfig | None, *, declared: Any = _UNREAD
+) -> str | None:
+    """The provider that ACTUALLY serves a call: what the adapter declares, else the config's.
+
+    One expression, because the answer is written to three surfaces that a reader compares --
+    the model-stream context's ``provider``, ``run.started``'s ``model_provider`` (and through it
+    every ``gen_ai.provider.name`` the event-driven OTel sink writes), and the receipt-derived
+    span's own fallback. They disagreed for one release: through a gateway the receipt named the
+    upstream and the event named the transport, for the same call.
+
+    A *forwarding* adapter declares its upstream, so preferring the declaration is what makes
+    these spans describe the model that answered rather than the hop the answer arrived over.
+    ``ModelConfig.provider`` remains the fallback and stays recorded verbatim on the run manifest,
+    so the transport is never lost.
+
+    Tolerant by construction: this feeds telemetry, and a third-party ``provider_name`` property
+    that raises -- or whose ``str()`` does -- must not take a run down over an attribute nothing
+    branches on.
+
+    ``declared`` is a declaration the caller has **already read**, supplied so that this does not
+    read it a second time. Mirroring ``ModelCallRunner``'s defensive probe, including its
+    ``normalize_unicode_scalars``, made the two byte-identical on any value -- but only on a value
+    that does not change between reads. A ``provider_name`` property that answers once and then
+    raises gave the receipt ``openai`` and the replay key the config's ``gateway``, for one call, so
+    the key could no longer be reproduced from the record that describes it. Handing the read in
+    closes that by construction rather than by resemblance: the caller that records a declaration
+    and the key taken beside it now derive from one read.
+
+    Normalization is idempotent (it maps surrogates to U+FFFD and leaves everything else alone), so
+    a caller passing an already-normalized string gets that string back unchanged.
+
+    Tolerance means "keep going", not "answer nothing": the declaration guard FALLS THROUGH to
+    the config fallback rather than returning. It used to return ``None`` there, which made the
+    one documented expression give two answers on exactly the path it exists for -- the
+    model-stream context reported no provider at all while ``run.started``, the receipt and the
+    OTel span beside them all reported the configured transport for the same call.
+    """
+
+    try:
+        if declared is _UNREAD:
+            declared = getattr(adapter, "provider_name", None)
+        if declared:
+            return normalize_unicode_scalars(str(declared))
+    except Exception:
+        pass  # unreadable declaration: fall through to the config, do not answer nothing
+    try:
+        fallback = config.provider if config is not None else None
+        return normalize_unicode_scalars(str(fallback)) if fallback else None
+    except Exception:
+        return None
 
 
 class ConfiguredModelAdapter(Protocol):
@@ -280,12 +451,21 @@ class AddressedModelAdapter(Protocol):
 
     An adapter may route by more than its :class:`ModelConfig` -- a per-instance override, an
     environment variable, a tenant-specific host -- so the config alone does not identify the
-    service that answered. A caller recording a call's identity asks for the resolved destination
-    and folds it into that identity; omitting the member means "the config is the whole story",
+    service that answered. A caller recording a call asks for the resolved destination and records
+    it *beside* the call's identity; omitting the member means "the config is the whole story",
     which is correct for an adapter that routes on config alone.
 
-    The value is hashed, never recorded, so an internal hostname stays internal. Raising is
-    permitted and treated as "unknown".
+    The value is never recorded in plaintext -- an internal hostname stays internal -- and it is
+    also not folded into the replay key, which is a change from what this member first existed for.
+    Hashing it into the key made that key unreproducible: nothing a record holds could reconstruct
+    a preimage the rules forbid recording, so a recorded key could not be recomputed, verified, or
+    diagnosed on a miss. What the caller records instead is a *status* naming which outcome this
+    probe had and a keyed digest of the value, which lets two calls be compared without the digest
+    becoming a guessing oracle for the host.
+
+    Raising is permitted and is reported as its own outcome rather than as "no destination" --
+    those are a broken deployment and a working one, and reading them as the same thing is what
+    the status exists to stop.
     """
 
     def resolve_destination(self, config: ModelConfig) -> str: ...
@@ -387,9 +567,22 @@ class TurnComplete:
     # caller out of chunks, so an adapter that retried before committing its stream has no other
     # place to say so.
     provider_retried: bool = False
+    # The gateway transport's applied-parameters echo (scope §5 D-a), riding the terminal frame
+    # because the streaming caller has no response object to read it from. ``None`` = the wire
+    # never mentioned it (an older gateway, or a transport with no echo).
+    generation_applied: dict[str, Any] | None = None
+    # The schema twin of ``generation_applied`` (W5 PR 4): whether the gateway forwarded
+    # ``output_schema`` to an upstream that natively enforces it. A sibling key, not a member
+    # of the generation echo -- changing an existing key's shape is how old clients break.
+    schema_applied: bool | None = None
+    # The reasoning member of the echo family (v0.21 B1): the forwarded reasoning block, in
+    # the generation echo's shape because reasoning has values a client can compare. ``{}`` is
+    # a real proof (``effort="default"`` forwards an empty block), so only ``None`` means the
+    # wire never mentioned it.
+    reasoning_applied: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "type": "turn_complete",
             "response_id": self.response_id,
             "usage": dict(self.usage),
@@ -397,6 +590,13 @@ class TurnComplete:
             "stop_reason": self.stop_reason,
             "provider_retried": self.provider_retried,
         }
+        if self.generation_applied is not None:
+            payload["generation_applied"] = dict(self.generation_applied)
+        if self.schema_applied is not None:
+            payload["schema_applied"] = self.schema_applied
+        if self.reasoning_applied is not None:
+            payload["reasoning_applied"] = dict(self.reasoning_applied)
+        return payload
 
 
 ModelStreamChunk = TextDelta | ReasoningDelta | ToolCallDelta | TurnComplete
@@ -406,6 +606,13 @@ def _normalize_required_text(value: Any, field_name: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
     return normalize_unicode_scalars(value)
+
+
+def _model_layer(value: Any) -> str:
+    if value not in RETRY_LAYERS:
+        rendered = ", ".join(RETRY_LAYERS)
+        raise ValueError(f"model.retry.layer must be one of: {rendered}")
+    return value
 
 
 def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
@@ -418,6 +625,27 @@ def _normalize_retry_codes(value: Any) -> tuple[str, ...]:
             raise ValueError("model.retry.retry_on entries must be non-empty strings")
         normalized.append(text)
     return tuple(normalized)
+
+
+def new_idempotency_key() -> str:
+    """Mint one retry-scope token, for whoever owns a call's retry scope.
+
+    Public and shared because there is more than one such owner: ``ModelCallRunner`` for a call
+    the kernel drives, and the reference gateway's service for the upstream hop it drives
+    itself -- a hop with its own retry loop, hence its own scope. A second copy of this
+    expression is how the two would come to differ; the same reasoning promoted
+    ``capped_backoff`` out of one module when its second caller appeared.
+
+    Random rather than derived, and that is the contract: two byte-identical requests share a
+    replay slot by design -- content cannot separate them -- so the token that separates their
+    provider work must be content-independent. Prefixed the way the kernel's other minted ids
+    are (``cap_req_``, ``lease_``, ``outbox_``), so a log line names what kind of id it holds.
+    Conforms by construction to :data:`~monoid_agent_kernel.core.model_io.IDEMPOTENCY_KEY_PATTERN`
+    -- the rule itself lives beside the receipt field it describes, because its two enforcers sit
+    on opposite sides of a one-way import boundary. Pinned by test rather than trusted.
+    """
+
+    return f"idem_{uuid.uuid4().hex}"
 
 
 def _normalize_optional_text(value: Any, field_name: str) -> str | None:
@@ -495,15 +723,11 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
 
     if config is None:
         return None
-    reasoning = _copy_with_fields(
-        config.reasoning,
-        effort=_normalize_required_text(config.reasoning.effort, "model.reasoning.effort"),
-        summary=_normalize_required_text(config.reasoning.summary, "model.reasoning.summary"),
-        on_unsupported=_normalize_required_text(
-            config.reasoning.on_unsupported,
-            "model.reasoning.on_unsupported",
-        ),
-    )
+    # validate_reasoning_config enforces the enum, so a passing value is already inside the
+    # portable ASCII domain -- same reasoning as the generation call below, same single rule
+    # source as the JSON codec. Per-field text normalization here accepted any non-empty
+    # string, leaving direct-Python reasoning the one construction route that failed open.
+    reasoning = validate_reasoning_config(config.reasoning)
     retry = _copy_with_fields(
         config.retry,
         max_attempts=_positive_control_int(config.retry.max_attempts, "model.retry.max_attempts"),
@@ -532,7 +756,14 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
             inclusive=True,
         ),
         retry_on=_normalize_retry_codes(config.retry.retry_on),
+        # Membership against the tuple the JSON codec validates with, not a local edition of
+        # it: a layer value accepted by one construction route and refused by the other would
+        # select different retry loops for the same config.
+        layer=_model_layer(config.retry.layer),
     )
+    # validate_generation_config enforces the enum, so a passing on_unsupported is already
+    # inside the portable ASCII domain -- no per-field text normalization step is needed.
+    generation = validate_generation_config(config.generation)
     return _copy_with_fields(
         config,
         provider=_normalize_required_text(config.provider, "model.provider"),
@@ -546,6 +777,7 @@ def normalize_model_config(config: ModelConfig | None) -> ModelConfig | None:
         gateway_url=_normalize_optional_text(config.gateway_url, "model.gateway_url"),
         reasoning=reasoning,
         retry=retry,
+        generation=generation,
     )
 
 
@@ -572,6 +804,43 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
     messages = None
     if request.messages is not None:
         messages = tuple(normalize_json_ingress(request.messages))
+    output_schema = request.output_schema
+    if output_schema is not None:
+        if not isinstance(output_schema, dict):
+            raise ValueError("model request output_schema must be an object or null")
+        # Strings and containers are normalized; non-finite floats are deliberately NOT
+        # substituted. Everything else here is model *content*, where turning a stray ``NaN``
+        # into ``null`` loses nothing -- but this is a control document the contract promises
+        # to deliver **verbatim**. Substituting rewrote ``{"enum": [NaN]}`` into
+        # ``{"enum": [null]}``: a different constraint, silently enforced by the provider, and
+        # the strict serializer that exists to refuse the value (``allow_nan=False``, on both
+        # adapters) never got to see it. Left in place, the request is refused as the
+        # config-recoverable bad request it is.
+        output_schema = normalize_json_ingress(output_schema, substitute_nonfinite=False)
+    # Refused rather than repaired, and refused HERE rather than only at the transport: a
+    # caller who spelled a key that cannot go on a header has a bug, and the ingress that
+    # already refuses a non-finite control or a malformed output_schema is where this repo
+    # says so. The runner mints its own key AFTER this call, so a run-driven request never
+    # reaches this branch; it exists for the direct integrator who builds the request.
+    idempotency_key = request.idempotency_key
+    # The EMPTY STRING is what spells absence on this field, and it is the only thing that
+    # does. A truthiness pre-filter also waved through ``None``, ``False``, ``0``, ``0.0``,
+    # ``[]`` and ``{}`` -- a caller who supplied something, which then reached a transport
+    # that omits what it cannot validate, so the key silently vanished instead of being
+    # refused. Same absence-vs-value conflation this field has now produced at three types:
+    # ``null`` read as a missing key on the wire, a present-empty container read as a missing
+    # log, and every falsy value read as a missing token. Asked through
+    # ``is_absent_or_valid`` rather than spelled as ``!= ""`` here, because that comparison is
+    # a question the value may answer: a ``str`` subclass whose ``__ne__`` returns False
+    # walked past this branch, and its underlying string went on to the transport this branch
+    # exists to keep it away from -- the fourth type, and the first one that was a string.
+    # The ledger mint had the same shape and the same hole; the rule lives in one body now,
+    # so neither boundary can drift from the other.
+    if not is_absent_or_valid(idempotency_key, is_valid_idempotency_key):
+        raise ValueError(
+            "model request idempotency_key must be 1-128 ASCII characters from "
+            "[A-Za-z0-9._+-] starting with a letter or digit"
+        )
     return _copy_with_fields(
         request,
         instruction=_normalize_optional_text(request.instruction, "model request instruction"),
@@ -587,6 +856,7 @@ def normalize_model_request(request: ModelRequest) -> ModelRequest:
         observations=observations,
         model=normalize_model_config(request.model),
         messages=messages,
+        output_schema=output_schema,
     )
 
 
@@ -641,7 +911,26 @@ def _normalize_model_turn(turn: Any) -> Any:
                     call,
                     id=_normalize_required_text(getattr(call, "id"), "model tool call id"),
                     name=_normalize_required_text(getattr(call, "name"), "model tool call name"),
-                    arguments=normalize_json_ingress(arguments),
+                    # The fifth Python-object ingress, and the one that reaches the
+                    # checkpoint: these arguments ride the assistant message into
+                    # `state.messages` and out through `RunCheckpoint.to_json`, whose
+                    # `dataclasses.asdict` has no memo and dies on a shape this copy
+                    # keeps.
+                    #
+                    # Where the refusal LANDS depends on the arm, and it is worth
+                    # being exact because an earlier version of this comment was not.
+                    # With no settled outcome it escapes to `normalize_model_turn`,
+                    # which converts it to a classified `ModelAdapterError`. With one
+                    # -- a `final_text`, or a `refusal`/`length` stop reason -- the
+                    # `except` below drops the call and keeps the paid answer, so the
+                    # refusal is NOT converted and nothing is reported. That is not a
+                    # hole in the protection: a settled answer wins in `AgentLoop`, so
+                    # such a call never executes, and dropping it is what keeps its
+                    # arguments out of the checkpoint this bound exists to protect.
+                    # What it costs is the record -- silently -- and both arms are
+                    # pinned in `tests/test_json_ingress.py` so the asymmetry cannot
+                    # drift into one nobody chose.
+                    arguments=normalize_json_ingress(arguments, refuse_unportable=True),
                 )
             )
         except Exception:
@@ -651,6 +940,16 @@ def _normalize_model_turn(turn: Any) -> Any:
 
     reasoning = getattr(turn, "reasoning", ())
     if not isinstance(reasoning, (list, tuple)):
+        # DIVERGENCE, deliberate: the stream twin (``_normalize_model_stream_chunk``, on
+        # ``TurnComplete``) RAISES on this same non-sequence, while the turn path coerces to ().
+        # It is wire-observable — a custom adapter returning a malformed ``reasoning`` has its
+        # turn silently stripped and its stream hard-failed — and it stands because the two
+        # paths have different jobs. This one, per the docstring above, must keep accepting the
+        # structurally-compatible legacy objects that predate the protocol, where an attribute
+        # of an unexpected shape means "this adapter has no reasoning" rather than "this adapter
+        # is broken"; there is no reasoning to lose. The stream path is the strict ingress: its
+        # chunks are the protocol's own dataclasses, so a bad value there is a real defect, and
+        # a silently-emptied terminal frame would drop artifacts the round-trip needs.
         reasoning = ()
     normalized_reasoning = normalize_json_ingress(reasoning)
     reasoning = (
@@ -691,15 +990,54 @@ def _normalize_model_turn(turn: Any) -> Any:
         return ModelTurn(**changes)
 
 
+def _refused_turn_usage(turn: Any) -> dict[str, int]:
+    """What a turn the normalizer refused reported spending.
+
+    ``usage_reported_by`` owns the verdict on a count -- real non-negative ints, names unjudged,
+    nothing raised on a failure path -- and reads a wire *payload*. A turn reaches the normalizer
+    as either shape: the gateway hands it a decoded object, the kernel hands it a ``ModelTurn``.
+    Both are reduced to the one shape that function reads, so "what counts as a reported cost"
+    stays in a single place rather than gaining a sixth spelling here.
+    """
+
+    if isinstance(turn, Mapping):
+        return usage_reported_by(turn)
+    try:
+        usage = getattr(turn, "usage", None)
+        return usage_reported_by({"usage": dict(usage)}) if isinstance(usage, Mapping) else {}
+    except Exception:
+        return {}
+
+
 def normalize_model_turn(turn: Any) -> Any:
-    """Normalize provider output and classify an unusable response as a model failure."""
+    """Normalize provider output and classify an unusable response as a model failure.
+
+    A refusal here is about the turn's *shape*, and the shape being wrong does not un-bill the
+    counts sitting beside it: the upstream produced this turn and charged for it before anything
+    looked at it. ``usage_reported_by`` is that rule -- "the refusal is the only carrier left for
+    its cost" -- and this function is where the raw turn and the escaping error are both in hand,
+    which is the only place the two can be joined.
+
+    Stamped here rather than at the call sites because there are four of them and one is an
+    inline expression (``normalize_model_turn(adapter.next_turn(...))`` in the gateway service),
+    where the raw turn is never bound to a name and no handler could reach it. A stamp applied
+    per caller is also a rule three callers can be written without; applied here, a fifth caller
+    added tomorrow carries the bill on the day it exists.
+
+    ``ModelAdapterError`` from the normalizer below is re-raised rather than rebuilt, and is
+    stamped on the way past for the same reason -- it is equally fresh, and equally carries
+    nothing.
+    """
 
     try:
         return _normalize_model_turn(turn)
-    except ModelAdapterError:
+    except ModelAdapterError as already_classified:
+        mark_provider_usage(already_classified, _refused_turn_usage(turn))
         raise
     except Exception as exc:
-        raise ModelAdapterError("model adapter returned a non-portable response") from exc
+        refusal = ModelAdapterError("model adapter returned a non-portable response")
+        mark_provider_usage(refusal, _refused_turn_usage(turn))
+        raise refusal from exc
 
 
 def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
@@ -743,6 +1081,12 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
         if reasoning is None:
             reasoning = ()
         if not isinstance(reasoning, (list, tuple)):
+            # DIVERGENCE, deliberate: the one-shot twin (``_normalize_model_turn``) coerces this
+            # same non-sequence to () instead of raising. Strictness belongs here — a stream
+            # chunk is one of this protocol's own dataclasses, not a legacy duck-typed object,
+            # so a malformed value is a defect rather than "no reasoning", and emptying it
+            # quietly would drop the terminal frame's artifacts on the floor. See the comment at
+            # the turn-path site for why tolerance belongs there.
             raise ValueError("turn complete reasoning must be an array or null")
         normalized_reasoning = normalize_json_ingress(reasoning)
         reasoning = (
@@ -764,7 +1108,7 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
                 "turn complete provider_retried",
             ),
         )
-    raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+    raise ValueError(f"unsupported model stream fragment: {portable_type_name(chunk)}")
 
 
 def normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
@@ -877,7 +1221,7 @@ class ModelStreamIngressNormalizer:
                 )
             ]
         if not isinstance(chunk, TurnComplete):
-            raise ValueError(f"unsupported model stream fragment: {type(chunk).__name__}")
+            raise ValueError(f"unsupported model stream fragment: {portable_type_name(chunk)}")
         terminal = normalize_model_stream_chunk(chunk)
         emitted = self.finish()
         emitted.append(terminal)
@@ -908,6 +1252,39 @@ class ModelStreamIngressNormalizer:
         return [chunk for _sequence, chunk in pending]
 
 
+def portable_usage_value(value: Any) -> bool:
+    """Whether one usage count is a portable non-negative integer.
+
+    The rule the *loop's summation* applies, named here so the replay adapter can apply the
+    same one to a recorded turn before it becomes a turn at all. Two copies of a rule disagree
+    the day it changes, and here the disagreement would surface as a corpus that replays into a
+    model error blamed on a model that was never called.
+
+    Scope, because the name is broader than the fact. This is not a package-wide predicate:
+    ``provider_usage_of``, ``usage_reported_by``, ``_usage_count`` and ``_recordable_usage``
+    each still spell it inline, and they agree today by measurement rather than by
+    construction. Nor is it the rule the *live* ingress applies -- ``normalize_usage`` runs
+    first there and keeps a fixed key list, so a live provider returning ``{"weird": -5}`` is
+    accepted with ``weird`` dropped while the replay precheck refuses that body. The precheck
+    is deliberately the stricter of the two: a corpus is untrusted input and a refusal costs a
+    rerun, where a fabricated turn costs a wrong answer.
+
+    ``type(value) is int`` rather than ``isinstance``: ``True`` is an ``int`` and a boolean
+    token count is a provider bug, not a count of one.
+    """
+
+    return type(value) is int and value >= 0
+
+
+def unportable_usage_key(usage: Mapping[str, Any]) -> str | None:
+    """The first usage entry that is not portable, named -- or ``None`` when all of them are."""
+
+    for key, value in usage.items():
+        if not portable_usage_value(value):
+            return key
+    return None
+
+
 def mark_provider_retried(error: BaseException) -> None:
     """Record on an escaping error that the adapter's retry loop had already run.
 
@@ -926,6 +1303,72 @@ def mark_provider_retried(error: BaseException) -> None:
         pass
 
 
+def mark_provider_usage(error: BaseException, usage: Mapping[str, int] | None) -> None:
+    """Record on an escaping error the token usage the provider already reported.
+
+    Some failures happen *after* the provider produced — and billed for — a complete answer.
+    The applied-parameters proof refusals are the clearest case: the turn parsed, its usage is
+    known, and only then is the turn refused. Without this, the receipt for that call carries
+    an empty usage, the loop's post-turn accounting never runs, and a paid call disappears
+    from the metrics and from the cumulative token budget — a budget that under-counts is a
+    bound that does not hold.
+
+    The guarded-setattr twin of :func:`mark_provider_retried`, for the same reason: an
+    exception type that refuses the attribute (``__slots__``) simply carries no usage rather
+    than replacing the provider's failure with an ``AttributeError``. Read back by
+    ``ModelCallReceipt.with_error`` through ``getattr``.
+    """
+
+    if not usage:
+        return
+    try:
+        error.provider_usage = dict(usage)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def mark_provider_error_code(error: BaseException, code: str) -> None:
+    """Name the class of failure on an escaping error that was minted without one.
+
+    A refusal raised by a field validator deep inside a reader knows its key and nothing else, so
+    it mints a bare ``ModelAdapterError``; one hop out the reference gateway resolves
+    ``exc.provider_error_code or GATEWAY_BAD_RESPONSE`` and blames the HOP's wire for an upstream
+    payload defect. Backfill only: a refusal that DOES name a code knows something the caller
+    completing it does not, and keeps it.
+
+    The guarded-setattr sibling of :func:`mark_provider_retried` and :func:`mark_provider_usage`,
+    for the same reason and in one copy for the same reason: an exception type that refuses the
+    attribute (``__slots__``) simply stays unnamed rather than replacing the provider's failure
+    with an ``AttributeError`` raised *inside* an except-handler. The read is inside the guard
+    too -- a third-party subclass may expose the name as a property that raises.
+    """
+
+    try:
+        if getattr(error, "provider_error_code", None):
+            return
+        error.provider_error_code = code  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def provider_usage_of(error: BaseException) -> dict[str, int]:
+    """Read back what :func:`mark_provider_usage` stamped, as clean non-negative counts.
+
+    One reader for every consumer of the stamp -- the loop's budget, the reference gateway's
+    tenant meter, the error envelope that carries it across a hop. A guarded read like the
+    stamp itself, and it filters rather than raises: a malformed count on a *failure* path
+    must not replace the failure being reported.
+    """
+
+    try:
+        usage = getattr(error, "provider_usage", None)
+    except Exception:
+        return {}
+    if not isinstance(usage, Mapping):
+        return {}
+    return {str(key): value for key, value in usage.items() if type(value) is int and value >= 0}
+
+
 @dataclass
 class RetryProgress:
     """What an adapter has managed to report about a call that may never return one.
@@ -940,9 +1383,15 @@ class RetryProgress:
     Mutated rather than replaced, because that is what crosses a thread: the worker runs under a
     copy of the caller's context, so `ContextVar.set` there is invisible here, while a write to the
     object both sides already hold is not.
+
+    `retried` is monotone, which makes a second report invisible to it -- the exact property
+    per-attempt attribution cannot live with when the kernel retry layer asks "did a loop below
+    run during *this* dispatch". `count` carries what the bool discards; the bool stays, kept in
+    step by the one reporter, so every existing reader keeps meaning what it meant.
     """
 
     retried: bool = False
+    count: int = 0
 
 
 _RETRY_PROGRESS: ContextVar[RetryProgress | None] = ContextVar(
@@ -962,6 +1411,9 @@ def report_provider_retried() -> None:
     progress = _RETRY_PROGRESS.get()
     if progress is not None:
         progress.retried = True
+        # One writer keeps the pair consistent; per-call there is one worker, so the
+        # read-modify-write needs no lock the bool beside it never needed.
+        progress.count += 1
 
 
 @contextmanager
@@ -1026,18 +1478,42 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     for index in order:
         slot = slots[index]
         raw = slot["args"].strip()
+        # Both refusals below are refusals of a turn the provider already produced and BILLED:
+        # the deltas were delivered and the terminal frame reported the cost, which the fold is
+        # still holding. The one-shot twin of this act pays through the OpenAI reader's stamping
+        # seam; unstamped here, a streamed turn was metered at zero at the tenant ledger and in
+        # the run's token budget. ``provider_retried`` rides along for the same reason it does
+        # on every other refusal: it is a fact about attempts already made. The meter skips an
+        # empty mapping, so a stream that reported no cost still invents none.
+        #
+        # The CODE, though, deliberately does not converge with that seam's. The OpenAI reader
+        # backfills ``openai_bad_response`` onto its bare refusals; these two keep
+        # ``stream_bad_tool_args``, and this module never speaks a provider's name -- the fold
+        # is reached by every adapter, including third-party ones whose provider it cannot know.
+        # So one class of defect really does carry two codes across the sync/streamed pair, and
+        # that is the intended answer rather than an unbound twin: the ingress voice attributes
+        # the *shape* of the failure, the adapter voice attributes its *source*. Recorded here
+        # because a silent cell in a twin census reads as an oversight to the next reviewer.
         try:
             arguments = loads_model_json_ingress(raw) if raw else {}
         except ValueError as exc:
-            raise ModelAdapterError(
+            unparsable = ModelAdapterError(
                 f"invalid streamed tool-call arguments for {slot['name']}",
                 provider_error_code="stream_bad_tool_args",
-            ) from exc
+                retryable=False,
+                provider_retried=provider_retried,
+            )
+            mark_provider_usage(unparsable, usage)
+            raise unparsable from exc
         if not isinstance(arguments, dict):
-            raise ModelAdapterError(
+            wrong_type = ModelAdapterError(
                 f"streamed tool-call arguments for {slot['name']} are not an object",
                 provider_error_code="stream_bad_tool_args",
+                retryable=False,
+                provider_retried=provider_retried,
             )
+            mark_provider_usage(wrong_type, usage)
+            raise wrong_type
         call_id = slot["id"] if slot["id"] is not None else ""
         name = slot["name"] if slot["name"] is not None else ""
         tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
@@ -1045,11 +1521,35 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     # common cases so the loop's branch still works — tool calls present → tool_calls, else stop.
     if stop_reason is None:
         stop_reason = "tool_calls" if tool_calls else "stop"
+    try:
+        # Provably a re-normalization: every chunk passed the ingress above, whose
+        # TurnComplete branch already ran normalize_usage. Guarded rather than deleted —
+        # removing normalization is a loosening-shaped edit, and a future path that reaches
+        # this fold with garbage must refuse in the ingress's classified voice, not raw.
+        normalized_usage = normalize_usage(usage) if usage else {}
+    except Exception as exc:
+        # Classified the way the ingress classifies, flags included. The constructor's defaults
+        # are deterministic, not arbitrary -- ``retryable`` is False and ``provider_retried`` is
+        # False -- so the two keywords do different work: ``retryable=False`` restates the
+        # default where a reader would otherwise have to go look it up, while
+        # ``provider_retried`` is the one fact the fold is holding that a default would throw
+        # away, since a stream the SDK re-sent would report a clean single attempt. No usage
+        # stamp -- ``usage`` is
+        # itself the malformed key here, and the tolerance rule on a failure path is to record
+        # nothing rather than raise a second failure over the first. Unreachable through this
+        # function (the ingress above pre-normalizes every chunk), so what binds this shape is
+        # a source-level pin: test_the_folds_usage_renormalization_stays_structurally_guarded
+        # in tests/test_llm_gateway_stream.py.
+        raise ModelAdapterError(
+            "model adapter returned a non-portable stream fragment",
+            retryable=False,
+            provider_retried=provider_retried,
+        ) from exc
     return ModelTurn(
         response_id=response_id,
         final_text="".join(text_parts) if text_parts else None,
         tool_calls=tuple(tool_calls),
-        usage=normalize_usage(usage) if usage else {},
+        usage=normalized_usage,
         reasoning=reasoning,
         stop_reason=stop_reason,
         provider_retried=provider_retried,

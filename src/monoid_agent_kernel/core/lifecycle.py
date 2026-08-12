@@ -25,8 +25,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.result import AgentTurnResult, Suspension
-from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.core.result import (
+    AgentTurnResult,
+    Suspension,
+    suspension_from_checkpoint_payload,
+)
+from monoid_agent_kernel.errors import NativeAgentError, TurnNotSettled
 
 if TYPE_CHECKING:
     from monoid_agent_kernel.loop import AgentLoop
@@ -67,19 +71,37 @@ REASON_TO_STATE: dict[str, SessionState] = {
 }
 
 
+def _terminal_outcome_state(status: str, error_code: str) -> SessionState:
+    """The one precedence for a dead run's settled outcome.
+
+    Cancel first — it arrives as ``status="limited"``, ``error_code="cancelled"``, so the order
+    is load-bearing — then a terminal ``status="limited"`` maps to ``LIMITED`` (a budget or
+    output-validator exhaustion is not a failure), and anything else to ``FAILED``. Shared by
+    ``state_from_suspension`` (the pump half) and ``LoopSession._derive_after_settle`` (the
+    blocking half): the blocking twin used to read only the terminal flag and answered FAILED
+    where the pump answered LIMITED or CANCELLED for the identical run.
+    """
+    if error_code == "cancelled":
+        return SessionState.CANCELLED
+    if status == "limited":
+        return SessionState.LIMITED
+    return SessionState.FAILED
+
+
 def state_from_suspension(suspension: Suspension) -> SessionState:
     """Project a pump ``Suspension`` onto a ``SessionState``.
 
-    ``"terminal"`` always means the loop set ``_Session.terminal=True`` — a dead run.
-    Cancel arrives as ``reason="terminal"`` with ``error_code="cancelled"`` and maps to
-    the distinct ``CANCELLED`` state; any other terminal maps to ``FAILED``. (Clean
-    ``COMPLETED`` is reached only via ``close()`` returning a successful
+    ``"terminal"`` always means the loop set ``_Session.terminal=True`` — a dead run. Its
+    ``status`` then decides which terminal state, because the park carries the answer and
+    guessing produced three of them: this function reported ``FAILED``,
+    ``session_state_from_run_status("limited")`` reported ``LIMITED`` and ``LoopSession.close``
+    reported ``COMPLETED``, for one budget-limited run. ``LIMITED`` is canonical; the precedence
+    lives in :func:`_terminal_outcome_state` so the blocking settle twin cannot drift from it.
+    (Clean ``COMPLETED`` is reached only via ``close()`` returning a successful
     ``AgentRunResult``, never via a ``Suspension``.)
     """
     if suspension.reason == "terminal":
-        return (
-            SessionState.CANCELLED if suspension.error_code == "cancelled" else SessionState.FAILED
-        )
+        return _terminal_outcome_state(suspension.status, suspension.error_code)
     try:
         return REASON_TO_STATE[suspension.reason]
     except KeyError as exc:  # pragma: no cover - guards a future unmapped reason
@@ -93,7 +115,20 @@ def state_from_suspension(suspension: Suspension) -> SessionState:
 #: this table before assigning. Terminal states have an empty out-set. The table is
 #: permissive about ``COMPLETED`` / ``FAILED`` from any live state because ``close()`` and
 #: ``cancel()`` can finalize a run from any non-terminal park.
-_LIVE_FINALIZE = frozenset({SessionState.COMPLETED, SessionState.FAILED, SessionState.CANCELLED})
+# ``LIMITED`` joins the finalize set because ``close()`` can now land there: a terminal
+# budget- or validator-limited result maps to LIMITED rather than being folded into COMPLETED,
+# and the state a limited close produces has to be reachable from whichever park the run was
+# sitting in when it was closed. (LIMITED is still not in ``TERMINAL_STATES``: the vocabulary
+# value is shared by a live limited park and a terminal limited result, and a live one is
+# resumable — which is why it keeps a ``RUNNING`` out-edge of its own below.)
+_LIVE_FINALIZE = frozenset(
+    {
+        SessionState.COMPLETED,
+        SessionState.FAILED,
+        SessionState.CANCELLED,
+        SessionState.LIMITED,
+    }
+)
 LEGAL_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
     SessionState.CREATED: frozenset({SessionState.IDLE}) | _LIVE_FINALIZE,
     SessionState.IDLE: frozenset({SessionState.RUNNING}) | _LIVE_FINALIZE,
@@ -191,6 +226,15 @@ def lifecycle_from_status_artifact(
     New artifacts carry ``state`` plus an explicit ``terminal`` flag. Legacy artifacts carry
     ``status`` only, so terminal result statuses are inferred there, including bare
     ``status="limited"`` from pre-``state`` terminal-limited runs.
+
+    ``failure_present`` (a ``failure.json`` beside the artifact) outranks any NON-terminal
+    reading: a parked artifact + a failure bundle means the run is dead — the failure paths
+    that mint the bundle without a live recorder leave the artifact saying whatever the run
+    last parked as, and this reader-side backstop also covers run dirs quarantined before the
+    writers learned to make the terminal statement themselves. A TERMINAL artifact still wins
+    over ``failure_present``: the close is the later, stronger statement (a run can close
+    limited or cancelled with an older bundle still on disk). Deleting the bundle — the
+    restore-hint flow — restores the parked reading exactly as before.
     """
     status_payload = payload or {}
     state_value = status_payload.get("state")
@@ -221,6 +265,10 @@ def lifecycle_from_status_artifact(
                 not state_text and status_text in {"completed", "failed", "limited", "cancelled"}
             ):
                 terminal = True
+        if failure_present and not terminal:
+            # After the legacy inference on purpose, so an inferred terminal (a real close)
+            # still outranks the bundle and only a genuinely parked reading is overridden.
+            return SessionState.FAILED, True
         return state, terminal
     if failure_present:
         return SessionState.FAILED, True
@@ -340,13 +388,62 @@ class LoopSession:
     produces (a returned ``Suspension`` + the live ``_Session.terminal`` flag). ``_state``
     is a convenience cache for synchronous callers; ``inspect()`` always recomputes from
     live loop state. Nothing new is persisted — on restore a fresh facade derives its
-    state from the restored loop, never from a stored facade field.
+    state from the restored loop, never from a stored facade field: construction over a
+    loop that already has a live session (``restore()`` ran, or ``open()`` preceded the
+    wrap) seeds the FSM from that session — the terminal outcome for a terminal session,
+    the last committed park (``last_suspension``) for a parked one, ``IDLE`` for an
+    open-but-unpumped one — so ``resume()``/``submit()`` continue exactly where the pump
+    would. A fresh un-opened loop still yields ``CREATED``, and an explicitly passed
+    ``_state`` (the backend's ``LoopSession(loop, _state=record.state)``) always wins over
+    derivation.
     """
 
     loop: AgentLoop
     _state: SessionState = SessionState.CREATED
     _last_suspension: Suspension | None = None
     _cancel_reason: str = ""
+
+    def __post_init__(self) -> None:
+        # Seeding, not a transition: there is no prior state to validate an edge from (a
+        # restored park like AWAITING_INPUT has no legal CREATED-> edge, by design). Gated on
+        # the CREATED default so a caller-supplied state is never fought — and a loop with a
+        # live session is not CREATED in any truthful reading, so deriving in that one
+        # remaining case is strictly more honest than keeping the default.
+        if self._state is SessionState.CREATED:
+            derived = self._derive_initial_state()
+            if derived is not None:
+                self._state = derived
+
+    def _derive_initial_state(self) -> SessionState | None:
+        """The initial state of an already-activated loop, from what the loop exposes.
+
+        ``None`` — no live session — means "not opened here": stay CREATED. A terminal
+        session maps through the one shared terminal precedence (its ``RunState`` carries
+        the restored ``status``/``error_code``, which is also what a bootstrap-failure
+        session carries). A parked session maps its last committed park payload through the
+        same reader/projector the pump half uses — ``restore()`` rehydrates
+        ``last_suspension`` from the checkpoint, so this is precisely the boundary the run
+        parked at. A session with no park yet is open-but-unpumped: IDLE. (``getattr``
+        throughout: the facade also wraps test doubles that model only the slice they
+        exercise.)
+        """
+        session = getattr(self.loop, "_session", None)
+        if session is None:
+            return None
+        if getattr(session, "terminal", False):
+            state = getattr(session, "state", None)
+            return _terminal_outcome_state(
+                getattr(state, "status", "failed") or "failed",
+                getattr(state, "error_code", "") or "",
+            )
+        last = getattr(session, "last_suspension", None)
+        if isinstance(last, Mapping):
+            suspension = suspension_from_checkpoint_payload(last)
+            # Seed the facade's park cache too, so inspect() reports the restored
+            # last_suspension_reason / awaiting_task_ids instead of None over a parked run.
+            self._last_suspension = suspension
+            return state_from_suspension(suspension)
+        return SessionState.IDLE
 
     @property
     def state(self) -> SessionState:
@@ -359,10 +456,50 @@ class LoopSession:
     def _derive_after_settle(self, turn: AgentTurnResult) -> SessionState:
         session = self.loop._session
         if session is not None and session.terminal:
-            return SessionState.FAILED
+            # The blocking twin of the pump's terminal park: same inputs, same precedence,
+            # one shared mapper (``state_from_suspension`` routes its ``reason="terminal"``
+            # branch through the identical function). Reading only the terminal flag here
+            # answered FAILED for a terminal-limited or cancelled turn while
+            # ``run_until_suspended`` answered LIMITED/CANCELLED for the identical run — and
+            # ``close()`` then crashed the FSM on the ``'failed' -> 'limited'`` edge.
+            return _terminal_outcome_state(turn.status, turn.error_code)
         if turn.status == "limited":
             return SessionState.LIMITED
         return SessionState.AWAITING_INPUT
+
+    def _loop_is_dead(self) -> bool:
+        """Whether the wrapped loop can no longer pump this run.
+
+        True when the live session is terminal, or when the loop finalized this activation:
+        ``close()`` / ``discard_uncommitted()`` / ``release_parked()`` each set the loop's
+        monotonic ``_finalized`` flag at the same site where they null ``_session``. A loop
+        with no session that never finalized is "not started yet", not dead — regardless of
+        the facade's own state: the previous ``state is not CREATED`` heuristic read the
+        backend's aopen window (loop attached and findable, ``run.started`` already recorded
+        RUNNING, ``open()`` yet to assign ``_session`` on its worker thread) as dead, and a
+        health probe answered alive=False/terminal=True for a run milliseconds from its
+        first pump. The one predicate behind ``health()``, ``inspect()``, and the
+        close-failure landing — liveness answered per-call-site is how the facade came to
+        report alive-and-accepting over a dead loop.
+        """
+        session = self.loop._session
+        if session is None:
+            return bool(getattr(self.loop, "_finalized", False))
+        return bool(session.terminal)
+
+    def _require_pumpable(self) -> None:
+        """Refuse a pump over a dead loop BEFORE any FSM write, with the loop's own typed
+        error codes, so a refused ``submit()``/``resume()`` never moves the facade off its
+        truthful state. (Writing RUNNING first wedged the facade there when the loop then
+        refused: RUNNING accepts no input and, post-close, has no legal way back out.)"""
+        session = self.loop._session
+        if session is None:
+            raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
+        if session.terminal:
+            raise NativeAgentError(
+                "run reached a terminal state and cannot accept more input",
+                error_code="run_terminal",
+            )
 
     # --- lifecycle delegation ---------------------------------------------------------
 
@@ -374,15 +511,27 @@ class LoopSession:
         )
 
     def submit(self, user_input: Any) -> AgentTurnResult:
-        """Blocking convenience: run one user turn to settle. Mirrors ``AgentLoop.submit``."""
+        """Blocking convenience: run one user turn to settle. Mirrors ``AgentLoop.submit``,
+        including its typed park: ``TurnNotSettled`` re-raises after the FSM transition."""
+        self._require_pumpable()
         self._set_state(SessionState.RUNNING)
-        turn = self.loop.submit(user_input)
+        try:
+            turn = self.loop.submit(user_input)
+        except TurnNotSettled as exc:
+            # The blocking twin of run_until_suspended's mapping below: the park must move
+            # the FSM exactly as the Suspension-returning half does, or this facade reports
+            # RUNNING (can_accept_input=False) for a session that is in fact parked and
+            # accepting input.
+            self._last_suspension = exc.suspension
+            self._set_state(state_from_suspension(exc.suspension))
+            raise
         self._set_state(self._derive_after_settle(turn))
         return turn
 
     def run_until_suspended(self, user_input: Any | None = None) -> Suspension:
         """Non-blocking pump: step until the run suspends, mapping the returned
         ``Suspension`` onto a state. With ``None`` it resumes a parked run."""
+        self._require_pumpable()
         self._set_state(SessionState.RUNNING)
         suspension = self.loop.run_until_suspended(user_input)
         self._last_suspension = suspension
@@ -390,9 +539,29 @@ class LoopSession:
         return suspension
 
     def close(self) -> Any:
-        result = self.loop.close()
+        try:
+            result = self.loop.close()
+        except BaseException:
+            # ``AgentLoop.close`` discards the activation (``_session = None``) before
+            # re-raising, so a facade left in its park state would keep answering
+            # "accepting input" over the dead loop forever. Land on FAILED when the loop is
+            # in fact dead and that edge is legal; an already-terminal facade keeps its
+            # (truthful) answer, and a never-opened CREATED facade stays CREATED.
+            if self._loop_is_dead() and can_transition(self._state, SessionState.FAILED):
+                self._set_state(SessionState.FAILED)
+            raise
         status = getattr(result, "status", "completed")
-        self._set_state(SessionState.FAILED if status == "failed" else SessionState.COMPLETED)
+        # Routed through the one mapper rather than an ``== "failed"`` test. That test folded
+        # every non-failed terminal into COMPLETED, so a budget- or validator-limited run — the
+        # exact case the LIMITED state exists for — closed as a clean success, while the two
+        # other mappers over the same run answered FAILED and LIMITED.
+        self._set_state(
+            session_state_from_run_status(
+                status,
+                error_code=getattr(result, "error_code", "") or "",
+                terminal=True,
+            )
+        )
         return result
 
     # --- control: pause / resume / cancel ---------------------------------------------
@@ -413,8 +582,9 @@ class LoopSession:
 
     def cancel(self, reason: str = "") -> None:
         """Request a terminal cancel. One-way signal: the next step boundary raises and the
-        driving pump settles the run terminal (the facade then maps it to ``FAILED``).
-        ``reason`` is retained for reporting (``inspect``/control results)."""
+        driving pump settles the run terminal (the facade then maps it to ``CANCELLED``, on
+        the blocking and pump halves alike). ``reason`` is retained for reporting
+        (``inspect``/control results)."""
         self._cancel_reason = reason
         token = self.loop.cancellation_token
         if token is None:
@@ -431,7 +601,10 @@ class LoopSession:
             return SessionInspection(
                 state=self._state,
                 run_id=run_id,
-                terminal=False,
+                # No session means either "not opened yet" (CREATED — not terminal) or a
+                # torn-down activation (closed/discarded/released — nothing left to pump).
+                # Hardcoding False here reported a closed run as live.
+                terminal=self._loop_is_dead(),
                 pending_tasks=False,
                 awaiting_task_ids=(),
                 last_suspension_reason=None,
@@ -451,11 +624,14 @@ class LoopSession:
 
     def health(self) -> SessionHealth:
         session = self.loop._session
-        terminal = bool(session.terminal) if session is not None else False
+        dead = self._loop_is_dead()
         pending = self.loop.has_pending_tasks() if session is not None else False
         return SessionHealth(
             state=self._state,
-            alive=not terminal,
-            can_accept_input=self._state in _CAN_ACCEPT_INPUT,
+            alive=not dead,
+            # Bound to the same liveness predicate as ``alive``: a park state over a dead
+            # loop (post-close, or a terminal-limited session) used to answer the
+            # self-contradictory (alive=False, can_accept_input=True).
+            can_accept_input=(not dead) and self._state in _CAN_ACCEPT_INPUT,
             has_pending_tasks=pending,
         )

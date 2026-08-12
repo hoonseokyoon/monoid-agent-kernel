@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from monoid_agent_kernel.core.json_ingress import (
+    portable_class_name,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.wire_validation import (
     optional_list,
     parse_bool,
@@ -30,8 +34,8 @@ def _coerce_output(value: object, model: type[_T]) -> _T:
     if isinstance(value, dict):
         return model(**value)
     raise TypeError(
-        f"final_output is {type(value).__name__}, which is not a {model.__name__} "
-        "and cannot be coerced"
+        f"final_output is {portable_type_name(value)}, which is not a "
+        f"{portable_class_name(model)} and cannot be coerced"
     )
 
 
@@ -86,7 +90,14 @@ class Suspension:
     or a gateway-flagged retryable error): the session is **not** terminal, the
     conversation up to the user message is preserved, and a caller may re-issue
     the turn via ``arun_until_suspended(None)`` or park for new user input.
-    ``retryable``/``http_status`` carry the classification for that decision.
+    ``retryable``/``http_status``/``config_recoverable``/``provider_error_code``/
+    ``provider_retried`` carry the classification for that decision
+    (``config_recoverable`` — the error's remedy is configuration the user fixes
+    and resends, so park rather than backoff-retry; ``provider_error_code`` — the
+    provider's own code, which is what distinguishes an ``insufficient_quota`` a
+    human must fix from a ``rate_limit_exceeded`` a backoff clears; ``provider_retried``
+    — whether the adapter's own retry budget was already spent, so a driver does not
+    read an exhausted retry as an untried one).
     ``interrupted`` — an external caller stopped the current turn (a "stop"); like
     ``turn_failed`` the session is **not** terminal (no error), so a caller parks for
     the next user message. ``paused`` — a cooperative pause froze the turn at the start of
@@ -94,8 +105,11 @@ class Suspension:
     ``run_until_suspended(None)`` re-pump resumes the same turn where it left off. The
     non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the failure
     (``"failed"``) for ``turn_failed`` since ``RunStatus`` has no non-terminal value, so
-    callers must branch on ``reason``, not ``status``, to detect a live run. For every
-    reason except ``awaiting_tasks`` a settle checkpoint ran and ``turn`` carries its result.
+    callers must branch on ``reason``, not ``status``, to detect a live run. Every reason
+    except ``awaiting_tasks`` persists a checkpoint, but only the settled outcomes
+    (``settled``/``limited``/``terminal``) attach an ``AgentTurnResult`` as ``turn``:
+    ``turn_failed``/``interrupted``/``paused`` produced nothing to settle, so ``turn`` is
+    ``None`` there and the blocking facades surface those parks as ``TurnNotSettled``.
     """
 
     reason: Literal[
@@ -110,9 +124,23 @@ class Suspension:
     turn: AgentTurnResult | None = None
     retryable: bool = False
     http_status: int | None = None
+    config_recoverable: bool = False
+    # The provider's own failure code (``insufficient_quota``, ``rate_limit_exceeded``, ...).
+    # ``error_code`` above is the KERNEL classification; this is what the provider said, and it
+    # is the fact a driver deciding "re-attempt or ask the user to fix config" actually reads.
+    # It lived only on the loop's live ``RunState`` before v0.21, so it did not survive a
+    # checkpoint restore — the park did, and the reason for it did not.
+    provider_error_code: str = ""
+    # Whether the adapter's own retry loop already ran. ``retryable`` forecasts a *future*
+    # attempt; this is a fact about attempts already made, and the two are independent (an
+    # exhausted budget leaves a retryable error nobody will retry again).
+    provider_retried: bool = False
 
 
-_SUSPENSION_REASONS = frozenset(
+# The park vocabulary and the durable status vocabulary, one definition each. Public because the
+# checkpoint validator schema-checks the park payload against exactly what the reader below
+# accepts — a second hand-copy of either set is how the two ends drift apart.
+SUSPENSION_REASONS = frozenset(
     {
         "settled",
         "awaiting_tasks",
@@ -123,6 +151,10 @@ _SUSPENSION_REASONS = frozenset(
         "paused",
     }
 )
+SUSPENSION_CHECKPOINT_STATUSES = frozenset({"completed", "failed", "limited"})
+
+# Retained spelling for the in-module readers below and for existing importers.
+_SUSPENSION_REASONS = SUSPENSION_REASONS
 
 
 def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
@@ -142,6 +174,9 @@ def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
         "has_external": suspension.has_external,
         "retryable": suspension.retryable,
         "http_status": suspension.http_status,
+        "config_recoverable": suspension.config_recoverable,
+        "provider_error_code": suspension.provider_error_code,
+        "provider_retried": suspension.provider_retried,
     }
 
 
@@ -150,9 +185,9 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
 
     reason = parse_str(payload, "reason")
     status = parse_str(payload, "status")
-    if reason not in _SUSPENSION_REASONS:
+    if reason not in SUSPENSION_REASONS:
         raise ValueError(f"unsupported durable suspension reason: {reason!r}")
-    if status not in {"completed", "failed", "limited"}:
+    if status not in SUSPENSION_CHECKPOINT_STATUSES:
         raise ValueError(f"unsupported durable suspension status: {status!r}")
     raw_task_ids = optional_list(payload, "awaiting_task_ids")
     if any(not isinstance(task_id, str) for task_id in raw_task_ids):
@@ -169,6 +204,13 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
         has_external=parse_bool(payload, "has_external"),
         retryable=parse_bool(payload, "retryable"),
         http_status=http_status,
+        # Absent on pre-v0.21 checkpoints; the default (False) is what those runs meant.
+        config_recoverable=parse_bool(payload, "config_recoverable"),
+        # Absent on checkpoints written before v0.21 added them to the park observation; the
+        # defaults ("" / False) are what those runs meant — no provider code was recorded, and
+        # no adapter-side retry was known to have happened.
+        provider_error_code=parse_str(payload, "provider_error_code"),
+        provider_retried=parse_bool(payload, "provider_retried"),
     )
 
 

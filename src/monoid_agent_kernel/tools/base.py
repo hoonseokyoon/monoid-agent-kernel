@@ -8,7 +8,11 @@ from typing import Any, Literal, Protocol
 from jsonschema import Draft202012Validator, ValidationError
 
 from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    UnportableValueError,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+)
 from monoid_agent_kernel.errors import ToolExecutionError
 
 ToolSideEffect = Literal["read", "write", "artifact", "run", "shell"]
@@ -85,7 +89,18 @@ def normalize_tool_result(result: ToolResult) -> ToolResult:
         raise ValueError("tool result content must be an object")
     if not isinstance(result.media, (list, tuple)):
         raise ValueError("tool result media must be an array")
-    content = normalize_json_ingress(result.content)
+    try:
+        # Refusing here is what turns "one hostile value" into a failed *call*. The values this
+        # rejects — bytes, an integer past the portable digit bound, arbitrary objects — used to
+        # pass the normalizer untouched and crash `json.dumps` at the transcript write, which sits
+        # before `tool.call.finished`: the run died as `internal_error` with no observation the
+        # model could correct. The transcript stays raw by contract, so the boundary is the fix.
+        content = normalize_json_ingress(result.content, refuse_unportable=True)
+    except UnportableValueError as exc:
+        raise ToolExecutionError(
+            f"tool result content is not portable JSON: {exc}",
+            error_code="tool_result_unportable",
+        ) from exc
     if not isinstance(content, dict):
         raise ValueError("tool result content must be an object")
     return _copy_with_fields(
@@ -211,7 +226,16 @@ def normalize_tool_spec(spec: ToolSpec) -> ToolSpec:
         spec,
         id=_required_text(spec.id, "tool id"),
         description=_required_text(spec.description, "tool description"),
-        input_schema=normalize_json_ingress(spec.input_schema),
+        # Strings and containers are normalized; non-finite floats are deliberately NOT
+        # substituted -- the same rule ``normalize_model_request`` applies to ``output_schema``,
+        # for the same reason. A tool's ``input_schema`` is a control document, not model
+        # content: the registry builds its ``Draft202012Validator`` from this copy and the
+        # provider is sent this copy, so substituting rewrote ``{"enum": [NaN]}`` into
+        # ``{"enum": [null]}`` -- a different constraint, silently validated against and
+        # silently enforced -- while the strict serializer that exists to refuse the value
+        # (``allow_nan=False``, on both adapters) never got to see it. Left in place, the
+        # request is refused at that boundary as the config-recoverable bad request it is.
+        input_schema=normalize_json_ingress(spec.input_schema, substitute_nonfinite=False),
         capability=_required_text(spec.capability, "tool capability"),
         side_effect=_required_text(spec.side_effect, "tool side_effect"),
         provider_name=_optional_text(spec.provider_name, "tool provider_name"),

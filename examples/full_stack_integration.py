@@ -156,7 +156,11 @@ def _runtime_config(*, model: str, reasoning_effort: str) -> AgentRuntimeConfig:
         definition_id="full-stack-integration",
         model=ModelConfig(
             model=model,
-            reasoning=ReasoningConfig(effort=reasoning_effort),
+            # The scripted fake upstream honestly declares no reasoning_support, so under the
+            # default "fail" the reasoning_applied echo check refuses every turn of this
+            # scenario. It demonstrates the stack, not transport proof: state the best-effort
+            # policy, exactly as the messy-workspace scenario and Studio's offline mode do.
+            reasoning=ReasoningConfig(effort=reasoning_effort, on_unsupported="omit"),
         ),
         tools=(
             ToolBinding(

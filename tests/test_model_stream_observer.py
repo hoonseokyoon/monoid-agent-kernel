@@ -275,9 +275,49 @@ def test_partial_output_closes_observer_as_failed(tmp_path: Path) -> None:
     ]
 
 
+def test_a_config_fixable_stream_failure_says_so_on_the_outcome(tmp_path: Path) -> None:
+    """The live lane classified a park with half the vocabulary the park itself carries.
+
+    ``retryable`` reached the outcome from the raised ``ModelAdapterError``; the sibling fact on
+    the same exception did not, so the stream_closed record could say "waiting will not help" and
+    never "changing the configuration will".
+    """
+    observer = _RecordingObserver()
+    adapter = _ScriptedStreamAdapter(
+        [
+            TextDelta("partial"),
+            ModelAdapterError(
+                "the configured model is not available to this account",
+                retryable=False,
+                config_recoverable=True,
+            ),
+        ]
+    )
+    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,))
+
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.close()
+
+    assert (suspension.retryable, suspension.config_recoverable) == (False, True)
+    assert observer.writers[0].outcomes == [
+        ModelStreamOutcome(
+            status="failed",
+            final_text="partial",
+            error_code="model_error",
+            retryable=False,
+            config_recoverable=True,
+        )
+    ]
+
+
 def test_model_stream_outcome_requires_boolean_retryability() -> None:
     with pytest.raises(ValueError, match="retryable must be a boolean"):
         ModelStreamOutcome(status="failed", retryable=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="config_recoverable must be a boolean"):
+        ModelStreamOutcome(status="failed", config_recoverable=1)  # type: ignore[arg-type]
 
 
 def test_observer_factory_open_push_and_close_failures_are_isolated(tmp_path: Path) -> None:

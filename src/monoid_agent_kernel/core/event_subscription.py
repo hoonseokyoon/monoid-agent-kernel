@@ -77,21 +77,33 @@ class EventSubscriptionFrame:
         return str(int(self.event["seq"]))
 
     def to_sse(self) -> bytes:
-        """Serialize the frame using SSE ids for replay-safe reconnects."""
+        """Serialize the frame using SSE ids for replay-safe reconnects.
+
+        ``ensure_ascii=True`` on both payloads, unlike the paged JSON body the same events are
+        served as. A line is the whole framing here and the two ends disagree about what one is:
+        U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE survive an
+        ``ensure_ascii=False`` dump as themselves, and the line-splitting readers clients use --
+        httpx's ``aiter_lines``, whose splitter is ``str.splitlines`` -- break on all three. The
+        frame arrives truncated mid-string, and because the split also swallows this frame's
+        ``id:`` the reader's ``Last-Event-ID`` resume lands on the wrong seq. Event data is not
+        content-free (tool arguments and results, error messages, model text on the events that
+        carry it), so escaping is the frame writer's job, not the event's. The length-delimited
+        body cannot be split by a character and keeps its smaller encoding.
+        """
 
         if self.kind == "heartbeat":
             return f": {self.comment}\n\n".encode("utf-8")
         if self.kind == "end":
             payload = json.dumps(
                 dict(self.lifecycle or {}),
-                ensure_ascii=False,
+                ensure_ascii=True,
                 separators=(",", ":"),
                 allow_nan=False,
             )
             return f"event: end\ndata: {payload}\n\n".encode("utf-8")
         assert self.event is not None
         payload = json.dumps(
-            dict(self.event), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            dict(self.event), ensure_ascii=True, separators=(",", ":"), allow_nan=False
         )
         return f"id: {self.event_id}\ndata: {payload}\n\n".encode("utf-8")
 

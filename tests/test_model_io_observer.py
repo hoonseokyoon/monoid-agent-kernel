@@ -104,6 +104,55 @@ def test_none_mode_strips_the_receipts_content_derived_digests_too() -> None:
     assert (returned.prompt_digest, returned.request_digest) == ("sha-prompt", "sha-request")
 
 
+def test_a_none_mode_consumer_is_told_the_key_was_withheld_not_that_there_was_none() -> None:
+    """Two facts that used to be one empty string.
+
+    `none` clears the key, and a payload that could not be encoded never had one. A consumer
+    holding a keyless receipt could not tell which had happened -- so a corpus reader could not
+    tell a policy decision from a defect. `withheld` is the policy; `absent` is the defect.
+    """
+    withheld, genuinely_absent = Recorder(), Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(request_digest="sha-request", digest_status="ok"),
+        content=CONTENT,
+        subscriptions=(ModelIOSubscription(withheld, CapturePolicy(mode="none")),),
+    )
+    dispatch_model_call(
+        receipt=ModelCallReceipt(request_digest="", digest_status="absent"),
+        content=CONTENT,
+        subscriptions=(ModelIOSubscription(genuinely_absent, CapturePolicy(mode="none")),),
+    )
+
+    assert withheld.captures[0].receipt.digest_status == "withheld"
+    assert withheld.captures[0].receipt.request_digest == ""
+    # Not overwritten: no policy removed a key that no policy ever saw.
+    assert genuinely_absent.captures[0].receipt.digest_status == "absent"
+
+
+def test_a_none_mode_consumer_still_learns_where_the_call_went() -> None:
+    """The destination fields are deployment metadata, not content.
+
+    `none` promises the consumer learns nothing about what was said. Where the call was routed is
+    not what was said, and the digest is keyed, so it discloses nothing about the endpoint either --
+    withholding it would break an operational consumer for no privacy gain, which is the same rule
+    that keeps token counts and timings on a `none`-mode receipt.
+    """
+    recorder = Recorder()
+
+    dispatch_model_call(
+        receipt=ModelCallReceipt(
+            destination_status="resolved", destination_digest="sha-destination"
+        ),
+        content=CONTENT,
+        subscriptions=(ModelIOSubscription(recorder, CapturePolicy(mode="none")),),
+    )
+    delivered = recorder.captures[0].receipt
+
+    assert delivered.destination_status == "resolved"
+    assert delivered.destination_digest == "sha-destination"
+
+
 def test_only_none_mode_loses_the_receipt_digests() -> None:
     recorders = [Recorder() for _ in range(3)]
     dispatch_model_call(

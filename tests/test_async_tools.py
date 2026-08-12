@@ -20,7 +20,7 @@ from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
-from monoid_agent_kernel.core._sync_bridge import start_abandonable_sync_call
+from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, start_abandonable_sync_call
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -450,7 +450,9 @@ def test_sync_tool_finishing_within_the_grace_is_not_abandoned(
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
     assert workers[0].is_alive() is False
-    assert [record for record in caplog.records if "abandoned a synchronous call" in record.message] == []
+    assert [
+        record for record in caplog.records if "abandoned a synchronous call" in record.message
+    ] == []
 
 
 def test_late_task_from_abandoned_sync_tool_is_cancelled() -> None:
@@ -649,7 +651,9 @@ def test_sync_tool_child_thread_keeps_the_call_authorization(tmp_path: Path) -> 
             runtime_config_provider=runtime_provider(
                 runtime_config(
                     bindings=(
-                        tool_binding("sync.child_thread", scope=ToolScope(allowed_paths=("notes/*",))),
+                        tool_binding(
+                            "sync.child_thread", scope=ToolScope(allowed_paths=("notes/*",))
+                        ),
                     )
                 )
             ),
@@ -717,7 +721,9 @@ def test_child_thread_of_an_abandoned_handler_is_refused_not_widened(tmp_path: P
             runtime_config_provider=runtime_provider(
                 runtime_config(
                     bindings=(
-                        tool_binding("sync.abandoned_parent", scope=ToolScope(allowed_paths=("notes/*",))),
+                        tool_binding(
+                            "sync.abandoned_parent", scope=ToolScope(allowed_paths=("notes/*",))
+                        ),
                     )
                 )
             ),
@@ -732,9 +738,7 @@ def test_child_thread_of_an_abandoned_handler_is_refused_not_widened(tmp_path: P
     assert seen == [False]
 
 
-def _late_awaitable_provider(
-    workers: list[threading.Thread], returned: list[object]
-) -> type:
+def _late_awaitable_provider(workers: list[threading.Thread], returned: list[object]) -> type:
     """A raw-``ToolSpec`` provider whose sync handler returns an awaitable only after its run has
     given up on it. Raw, because that is the shape that can return an awaitable at all -- the
     ``@tool`` decorator wraps whatever the function returns in a ``ToolResult``."""
@@ -1083,3 +1087,48 @@ def test_capability_grant_replays_async_tool_once(tmp_path: Path) -> None:
     events = _event_types(result.run_dir)
     replay_finished = len(events) - 1 - events[::-1].index("tool.call.finished")
     assert events.index("capability.granted") < replay_finished
+
+
+def test_the_disposal_rule_handles_every_shape_it_claims_to() -> None:
+    """The rule the abandonment path and the replay wrapper now share, driven directly.
+
+    It was a closure over one caller's outcome tuple, so the second caller that needed it --
+    a synchronous wrapper refusing an awaitable its inner handed back -- could not reach it
+    and would have grown a twin. Extracted, it needs its own gate: a closure that only ever
+    ran behind an abandonment had no test that named it.
+    """
+
+    async def _never_awaited() -> None:  # pragma: no cover - closed before it runs
+        raise AssertionError("the coroutine body must never run")
+
+    coroutine = _never_awaited()
+    dispose_unawaited(coroutine)
+    assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+
+    async def _futures() -> None:
+        loop = asyncio.get_running_loop()
+        pending: asyncio.Future[None] = loop.create_future()
+        dispose_unawaited(pending)
+        assert pending.cancelled(), "a live-loop future is cancelled so it stops running"
+
+        settled: asyncio.Future[None] = loop.create_future()
+        settled.set_exception(RuntimeError("nobody read this"))
+        dispose_unawaited(settled, on_live_loop=False)
+        # Consumed rather than skipped: an unretrieved exception is what warns at collection,
+        # and reading a settled future's outcome touches no loop.
+        assert settled.exception() is not None
+
+        dead: asyncio.Future[None] = loop.create_future()
+        dispose_unawaited(dead, on_live_loop=False)
+        assert not dead.cancelled(), "a pending future on a closed loop is left alone"
+        dead.cancel()
+
+    asyncio.run(_futures())
+
+    class _ExoticAwaitable:
+        def __await__(self):  # pragma: no cover - never awaited
+            yield
+
+    exotic = _ExoticAwaitable()
+    dispose_unawaited(exotic)  # no generic disposal exists; leaving it alone is the contract
+    assert inspect.isawaitable(exotic)

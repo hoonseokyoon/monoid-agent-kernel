@@ -23,17 +23,38 @@ from __future__ import annotations
 import copy
 import re
 import secrets
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from functools import lru_cache
-from typing import Any, Literal, Protocol, runtime_checkable
+from types import UnionType
+from typing import (
+    Any,
+    Literal,
+    Protocol,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+    runtime_checkable,
+)
 
 from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe
+from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.json_ingress import (
+    MAX_PORTABLE_CONTAINER_DEPTH,
+    exact_elements,
+    exact_items,
+    exact_text,
+    normalize_json_ingress,
+    normalize_unicode_scalars,
+    portable_type_name,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import (
     WireValidationError,
@@ -360,17 +381,20 @@ class DefaultRedactor:
         if isinstance(value, str):
             return policy.redact_text(value)
         if isinstance(value, Mapping):
+            # `exact_text` and `exact_items`, not `str(key)` and `value.items()`: the
+            # key answering `lower()` decides whether this field is a secret, and the
+            # mapping answering `items()` decides which fields are judged at all.
             return {
-                str(key): (
+                exact_text(key): (
                     policy.replacement
-                    if policy.names_a_secret(str(key))
+                    if policy.names_a_secret(exact_text(key))
                     else self.redact(item, policy=policy)
                 )
-                for key, item in value.items()
+                for key, item in exact_items(value)
             }
         # `str` is a Sequence, and bytes have no text semantics we may assume, so both are excluded.
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return [self.redact(item, policy=policy) for item in value]
+            return [self.redact(item, policy=policy) for item in exact_elements(value)]
         return value
 
 
@@ -397,6 +421,213 @@ def redacted_or_none(
         return applied.redact(value, policy=policy)
     except Exception:
         return None
+
+
+# The one ceiling the digest gate and the payload-recording gate share: whatever gets a key gets
+# recorded, and what exceeds it is refused whole -- never truncated. Decimal, agreeing with
+# ``AgentRunSpec.max_message_log_bytes`` so the two numbers cannot drift, but that knob is a
+# different owner's and measures a different thing: it sums a run's ``messages``, while this
+# bounds one call's whole identity payload -- system prompt, tool definitions, instruction and
+# observations included. So a request can still pass every run limit and exceed this; what the
+# shared number buys is that such a call is now a NAMED condition (``too_large``) rather than an
+# unexplained ``absent``, not that the case is gone. Raising this only turns refusals into keys;
+# lowering it orphans every corpus recorded above the new value, so it moves up or not at all.
+MAX_MODEL_PAYLOAD_BYTES = 8_000_000
+
+DIGEST_STATUSES = ("not_reached", "ok", "absent", "withheld", "too_large")
+"""Why ``ModelCallReceipt.request_digest`` holds what it holds.
+
+``absent`` means no key was issued because canonical JSON could not carry the payload -- a defect
+in the payload. ``too_large`` means no key was issued because the payload exceeded
+:data:`MAX_MODEL_PAYLOAD_BYTES` -- an operational condition rather than a defect, though not one an
+operator can configure their way out of: that constant is a build-time value, and it bounds the
+whole identity payload rather than the message log the run limits bound, so a request can pass
+every limit and still be refused a key. The two were one value, and a consumer holding a keyless
+record could not tell a payload to file a bug about from one to make smaller. ``withheld`` means a key was issued and a ``none``-mode policy
+removed it. ``not_reached`` means the call was refused before a key was computed at all.
+"""
+
+DESTINATION_STATUSES = (
+    "not_reached",
+    "not_declared",
+    "declined",
+    "resolved",
+    "unavailable",
+)
+"""Which of the destination probe's outcomes happened.
+
+``not_declared`` is an adapter that routes on config alone and never offered the member;
+``declined`` is one that offered it and answered with nothing; ``unavailable`` is one whose probe
+raised. That last is not a transient condition to shrug at: the shipped gateway resolver raises
+deterministically when no URL is configured anywhere, so ``unavailable`` is usually a deployment
+whose every call is about to fail. All three used to be the same empty string, and the collapse was
+invisible because each produced a key that looked fine.
+"""
+
+
+_IDEMPOTENCY_KEY_BODY = r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
+"""What an idempotency key may be spelled as, once, so its two enforcers cannot drift.
+
+The rule lives in ``core`` rather than beside its first caller because it has two enforcers on
+opposite sides of an import boundary that cannot be crossed the other way: ``core/schemas.py``
+states it to ``monoid validate``, and ``providers/base.py`` states it to a request being built.
+``core`` never imports ``providers``, so a rule owned there could only have been copied -- and a
+hand-copied twin regex is a drift waiting to happen. Both forms below derive from this body.
+
+Bounded at 128 characters and free of control characters because this is the one field on a model
+call that reaches a *transport header* rather than a JSON string: JSON escapes a control
+character, an HTTP header does not, and neither ``http.client`` nor ``httpx`` refuses an obsolete
+folded value.
+"""
+
+IDEMPOTENCY_KEY_PATTERN = re.compile(rf"{_IDEMPOTENCY_KEY_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+IDEMPOTENCY_KEY_JSON_PATTERN = rf"^(|{_IDEMPOTENCY_KEY_BODY}){END_OF_INPUT}"
+"""The ECMA-262 form for JSON Schema, empty-allowed the way ``prompt_digest``'s pattern is.
+
+Empty is a legal recorded value -- a refused call was never keyed -- so the ledger admits it
+explicitly rather than by omitting the constraint, exactly as the optional-digest pattern does for
+a digest that may not have been issued. ``\\Z`` and ``re.ASCII`` do not exist in ECMA-262, which is
+why this is derived from the body rather than from the compiled pattern's source -- and why the
+end of input is asserted by :data:`~monoid_agent_kernel.core._json_schema.END_OF_INPUT` rather than
+by a bare ``$``, which under ``jsonschema``'s Python engine would also have matched just before a
+trailing newline.
+"""
+
+
+def is_valid_idempotency_key(value: Any) -> bool:
+    """Whether ``value`` may be presented as an idempotency key on a header or written to a log.
+
+    Empty is *not* valid here: absence is spelled by not calling this, and each caller says what
+    absence means for it. Bounded so an unauthenticated client cannot choose the length of a log
+    line.
+    """
+
+    return isinstance(value, str) and IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+
+
+RECORDED_DIGEST_BODY = r"[0-9a-f]{64}"
+"""What a recorded content digest may be spelled as, once, so its enforcers cannot drift.
+
+Same argument as ``_IDEMPOTENCY_KEY_BODY`` above, one field family over: ``core/schemas.py``
+states this rule to ``monoid validate`` (both of its digest pattern forms compose this body),
+and ``model_call_record`` states it to a receipt being minted into a ledger line (W7-4). The
+producers already hold the shape by construction -- every digest here is hex SHA-256 output --
+so the spelling exists for values a producer did not mint: a receipt loaded from foreign JSON,
+whose reader deliberately transports what it was given. (``model_payloads.is_chunk_sha256``
+states its own 64-hex rule on purpose and is not a projection of this one: a chunk reference
+becomes a *filename*, so that check is a path-safety boundary every reader re-establishes,
+with its own reasons written beside it.)
+"""
+
+RECORDED_DIGEST_PATTERN = re.compile(rf"{RECORDED_DIGEST_BODY}\Z", re.ASCII)
+"""The Python form, for validating a value in hand."""
+
+
+def is_recorded_digest(value: Any) -> bool:
+    """Whether ``value`` is a digest in hand: exactly 64 lowercase hex characters.
+
+    Empty is *not* valid here, the same line ``is_valid_idempotency_key`` draws: absence is
+    the in-band empty string on every optional-digest field, a status field says why, and
+    each caller states what absence means where it stands -- the ledger's mint guard admits
+    it (a refused call's line is empty and explained), a caller comparing two digests in
+    hand does not.
+    """
+
+    return isinstance(value, str) and RECORDED_DIGEST_PATTERN.fullmatch(value) is not None
+
+
+def is_absent_or_valid(value: Any, is_valid: Callable[[Any], bool]) -> bool:
+    """Whether ``value`` is this repo's in-band absence -- the empty string -- or something
+    ``is_valid`` certifies. Judged without consulting the object's own opinion of itself.
+
+    Type before value, the rule ``_validate_counts`` states one field family over: a
+    comparison asks the *value*, and a value may answer. A guard spelling the absence arm as
+    ``value != ""`` is False for a ``str`` subclass whose ``__ne__`` returns False, so the
+    pattern check behind it never runs -- while ``json.dumps`` and an HTTP header both go on
+    reading the underlying string, which is exactly the value the guard existed to refuse.
+    Requiring the exact ``str`` type first makes the emptiness comparison and the pattern the
+    string's own answers, and refuses every non-string in the same breath.
+
+    Both boundaries that admit an empty spelling ask through here -- the ledger mint in
+    ``core/model_calls.py`` and request ingress in ``providers/base.py`` -- so the rule cannot
+    hold at one and drift at the other. The positive-gate callers (``providers/gateway.py``,
+    the reference gateway's header reader) need nothing: asking ``is_valid`` directly never
+    consults equality, and they omit what they cannot certify rather than raising.
+    """
+
+    return type(value) is str and (value == "" or is_valid(value))
+
+
+def destination_digest(value: str) -> str:
+    """An id for a call's destination, for a receipt to record *where* without recording *what*.
+
+    Keyed, under the same per-process key and for the same reason as :attr:`RedactionPolicy.digest`
+    -- read that docstring first, because the argument is identical and this preimage is weaker. A
+    hostname is drawn from a far smaller space than a redaction literal: an unkeyed digest of one is
+    a confirm-a-guess oracle for anyone holding a candidate list, which is the disclosure the
+    "hashed, never recorded" rule exists to prevent. Domain separation does not help; guessing is
+    not a collision.
+
+    The cost is the same cost: this identifies a destination **within one process**, not across
+    restarts. That is what a live receipt consumer needs -- "are these two calls going to different
+    places" -- and it is not what a durable corpus needs. A record that must be joined after a
+    restart needs a deployment-supplied key, which is a deployment-time secret rather than a kernel
+    default, and choosing that is deliberately left to whoever first persists these receipts.
+    """
+
+    return canonical_hmac_sha256({"destination": value}, _DIGEST_KEY) if value else ""
+
+
+def _validated_status(value: Any, key: str, allowed: tuple[str, ...]) -> str:
+    """Refuse a closed kernel enum's non-member, wherever the value entered.
+
+    One function for the constructor and the reader, because they used to disagree: `from_json`
+    refused a non-member while `to_json` happily emitted one, so ``ModelCallReceipt(
+    digest_status="okay")`` wrote an audit record this same class rejects on the way back in. A
+    record that can be written and not read fails in the consumer, long after the writer that
+    caused it is gone -- and the writer is the only place the mistake was ever fixable.
+    """
+
+    if not isinstance(value, str) or value not in allowed:
+        raise WireValidationError(f"model call {key} must be one of {allowed}")
+    return value
+
+
+def _parsed_status(
+    payload: Mapping[str, Any],
+    key: str,
+    allowed: tuple[str, ...],
+    *,
+    witness: str,
+    witnessed: str,
+) -> str:
+    """Read a closed kernel enum: unknown is refused, and a *missing key* reads as the default
+    unless the field it describes says otherwise.
+
+    ``witness`` names the digest this status explains, and ``witnessed`` the one outcome that could
+    have produced a non-empty one. Both defaults are ``not_reached`` -- "the call was refused before
+    we got that far" -- which is the right reading of silence on a receipt written before these
+    fields existed, and the wrong reading of silence on one that carries the value. That record
+    would deny its own contents, ``to_json`` writes the denial back, and the first read/write makes
+    it permanent: a consumer asking the status whether a replay key exists would discard a real one.
+
+    Inferred from silence only. A payload that *states* a status keeps it verbatim even where it
+    contradicts its digest, because that combination is a bug in whatever wrote it and quietly
+    repairing it here would hide the writer that has one.
+
+    Silence is a key that is not there -- ``key not in payload``, not ``payload.get(key) is None``.
+    A key present and holding ``null`` is a corrupt record, and every other string on this receipt
+    already refuses one (``parse_str`` separates missing from present-and-mistyped; ``http_status``
+    is nullable only because it is declared ``int | None``). Conflating the two was harmless while
+    both landed on the default and stopped being harmless the moment absence began to infer: it
+    would have handed a malformed payload a status it never carried.
+    """
+
+    if key not in payload:
+        return witnessed if parse_str(payload, witness) else allowed[0]
+    return _validated_status(payload[key], key, allowed)
 
 
 @dataclass(frozen=True)
@@ -534,7 +765,12 @@ def content_length(value: Any) -> int | None:
 # otherwise turn a bad payload into a failed call. `core.tool_approval` has the same-named function
 # with the same shape; bounding one and not the other is precisely the twin-miss this release keeps
 # finding, and this side fires *earlier* -- during the model-call publish, before tool dispatch.
-MAX_JSONISH_DEPTH = 64
+# Imported rather than spelled again -- three sites bound the same model-authored
+# argument, and the shared constant is what keeps them from drifting apart. This site
+# ELIDES where the other two raise, which is deliberate and explained below: a marker is
+# what a digest wants, and it is also what makes a depth cap dangerous on a cyclic input,
+# so the cycle guard below is not optional here the way it is where the bound raises.
+MAX_JSONISH_DEPTH = MAX_PORTABLE_CONTAINER_DEPTH
 
 # What replaces a subtree past the bound. A marker rather than a raise: this runs inside digest and
 # observer publication, where the caller wants an identifier for the payload, not an exception.
@@ -578,6 +814,262 @@ def _jsonish(value: Any, _depth: int = 0, _ancestors: frozenset[int] = frozenset
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _annotation_admits(annotation: Any, wanted: Any) -> bool:
+    """Whether ``annotation`` names ``wanted`` outright or as a union member.
+
+    A parameterized container is not a match: ``Mapping[str, int]`` has ``int`` among its args and
+    is not an integer field. Only a bare annotation or a union of them counts, which is what keeps
+    the two censuses below off ``usage`` -- whose *values* are governed by their own loop.
+    """
+
+    if annotation is wanted:
+        return True
+    return get_origin(annotation) in (Union, UnionType) and wanted in get_args(annotation)
+
+
+@lru_cache(maxsize=None)
+def _field_names_admitting(cls: type, wanted: Any) -> frozenset[str]:
+    """The record's own fields whose declared type admits ``wanted``.
+
+    Derived from the annotations rather than restated beside them, for the reason the wire-key
+    tuple below already gives: a field added tomorrow joins the rule the day it exists, not the
+    day someone remembers a list. Cached because both censuses run on every construction and
+    every read of these records.
+    """
+
+    hints = get_type_hints(cls)
+    return frozenset(
+        entry.name
+        for entry in dataclass_fields(cls)
+        if _annotation_admits(hints.get(entry.name), wanted)
+    )
+
+
+def _validate_counts(record: Any, label: str) -> None:
+    """Every count on ``record`` is a real integer -- one predicate, applied by enumeration.
+
+    ``bool`` is an ``int`` subclass, so a count validated by comparison alone admits ``True``:
+    ``True < 1`` is ``False``, so a bounds check passes it, ``True == 1`` satisfies the receipt's
+    ordered-index invariant, and ``to_json`` then emits a JSON boolean where
+    ``MODEL_CALLS_RECORD_SCHEMA`` requires an integer -- a record this kernel writes and its own
+    schema refuses to read back.
+
+    The rule itself is not new here. The usage loops on both records already spell
+    ``type(value) is not int`` and explain why; it had simply been applied to the mapping values
+    and to none of the scalar counts standing beside them. Stated once and enumerated so the two
+    records cannot drift apart again, which is exactly how they got here.
+
+    A field declared nullable may hold ``None``; that too is read off the annotation.
+    """
+
+    nullable = _field_names_admitting(type(record), type(None))
+    for name in sorted(_field_names_admitting(type(record), int)):
+        value = getattr(record, name)
+        if value is None and name in nullable:
+            continue
+        # ``isinstance`` minus ``bool``, NOT ``type(value) is int``. The first spelling of this
+        # rule was the stricter one and it broke a documented acceptance: ``with_error`` reads
+        # ``http_status`` off an arbitrary exception under
+        # ``isinstance(http_status, bool) or not isinstance(http_status, int)`` -- excluding
+        # ``bool`` by name while admitting every other ``int`` subclass, because an
+        # ``http.HTTPStatus`` is what an HTTP client hands back -- and the ``replace()`` inside
+        # it then re-ran this check and refused the value its own reader had just accepted.
+        #
+        # Narrowed to the defect this census was written for rather than exempting the one field
+        # that was noticed: the finding was ``bool``, and only ``bool``. A per-field exemption
+        # would have left the same over-reach standing on the other six counts.
+        #
+        # ``usage`` keeps the stricter ``type(value) is not int`` in its own loop, deliberately
+        # and for a reason that does not apply here: its four sibling readers spell the same, so
+        # an ``IntEnum`` token count accepted there would be dropped by every one of them. These
+        # scalars have no such readers -- they are emitted straight to JSON, where an ``IntEnum``
+        # serializes as the integer it is.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise WireValidationError(f"{label} {name} must be an integer")
+
+
+def _refuse_null_wire_values(payload: Mapping[str, Any], cls: type, label: str) -> None:
+    """A key present and holding ``null`` is a corrupt record, not an absent one.
+
+    Absence on these records means one thing -- a writer that predates the field -- and the
+    defaults reconstruct what that writer meant. ``null`` means a writer that had the field and
+    wrote nothing into it, which no writer here has ever done: ``to_json`` emits an object for
+    every one of them. Collapsing the two put an explicit null onto the field's legacy default,
+    and the defaults are load-bearing: an empty ``usage`` still satisfies the receipt's
+    cross-entry sum invariant, and an empty ``attempt_log`` reads as "no ledger was ever written"
+    rather than as the erasure it is.
+
+    Enumerated over the record's own fields, minus the ones declared nullable, so this cannot be
+    the rule for the fields someone remembered. The per-field required-key pin is a different
+    question and remains one: it asks whether the key is present, and a key holding null is.
+    """
+
+    nullable = _field_names_admitting(cls, type(None))
+    required = frozenset(entry.name for entry in dataclass_fields(cls)) - nullable
+    nulls = sorted(key for key in required if key in payload and payload[key] is None)
+    if nulls:
+        raise WireValidationError(f"{label} fields must not be null: {', '.join(nulls)}")
+
+
+@dataclass(frozen=True)
+class ModelCallAttempt:
+    """One kernel dispatch inside a settled call, as the receipt's log records it.
+
+    Same rule as the receipt that carries it: metadata only — taxonomy, counts, timings — so the
+    log is as safe to hand to a ``none``-mode observer as the receipt is. Success is spelled the
+    way the receipt spells it: an empty ``error_code``. There is no separate outcome enum, because
+    the receipt's own convention already answers the question and a second vocabulary for the same
+    fact is a divergence waiting to be recorded.
+
+    No wall-clock instant, deliberately — the receipt carries ``latency_ms`` and no instant, and
+    the ledger line's ``recorded_at`` is the anchor for the whole call (see
+    ``core/model_calls.py:model_call_record``). ``elapsed_ms`` covers the dispatch only;
+    ``backoff_ms`` is the measured wait the kernel imposed *between* this dispatch and the one
+    before it, so the first entry has none to report and a receipt refuses any other value there
+    (``None`` is the field's absence -- a record predating it -- and stays legal). Every
+    duration here is the floor of the same
+    monotonic clock, and floors sum to at most the floor of the sum, so
+    ``sum(elapsed_ms) + sum(backoff_ms) <= latency_ms`` exactly — the remainder is the keying
+    and settle overhead that falls outside the dispatch loop.
+
+    ``provider_retried`` here is what the adapter reported through the progress channel *during
+    this attempt's dispatch*, plus what this attempt's own outcome object declared. The receipt's
+    flag additionally folds whole-call evidence, so the entry can read ``False`` where the receipt
+    reads ``True`` — the entry is the per-attempt attribution, the receipt is the call's.
+
+    ``stream_committed`` is whether a streamed chunk had been delivered when this attempt settled.
+    Delivery closes the retry window, so it can only be ``True`` on the final entry.
+    """
+
+    index: int = 1
+    elapsed_ms: int = 0
+    error_code: str = ""
+    provider_error_code: str = ""
+    retryable: bool = False
+    config_recoverable: bool = False
+    http_status: int | None = None
+    provider_retried: bool = False
+    usage: Mapping[str, int] = field(default_factory=dict)
+    stream_committed: bool = False
+    # The measured wait between this dispatch and the one before it (W7-2) -- so on the first
+    # entry there is nothing to measure and the receipt refuses anything but 0. A duration and
+    # never an instant -- the entry's own timing rule -- and measured around the wait rather
+    # than copied from the schedule, so a capped sleep records what happened. ``None`` means the
+    # record predates the field, which is why ``to_json`` omits the key instead of inventing a
+    # null no writer ever wrote or a 0 that claims a measurement never taken. Appended last
+    # under the positional-stability rule the receipt states.
+    backoff_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        # Type before bounds: a comparison cannot tell an integer from a bool, so the bounds
+        # checks below are only meaningful once every count is known to be one.
+        _validate_counts(self, "model call attempt")
+        if self.index < 1:
+            raise ValueError("model call attempt index must be positive")
+        if self.elapsed_ms < 0:
+            raise ValueError("model call attempt elapsed_ms must not be negative")
+        if self.backoff_ms is not None and self.backoff_ms < 0:
+            raise ValueError("model call attempt backoff_ms must not be negative")
+        # The same usage rule the receipt enforces, spelled the same way: a log whose entries
+        # admitted what the receipt refuses could not honor the sum invariant the runner pins
+        # (entry usage totals equal the receipt's usage on either settle exit).
+        for key, value in self.usage.items():
+            if not isinstance(key, str) or type(value) is not int:
+                raise WireValidationError("model call attempt usage must be a mapping of str to int")
+            if value < 0:
+                raise WireValidationError(
+                    f"model call attempt usage {key!r} must not be negative"
+                )
+        object.__setattr__(self, "usage", dict(self.usage))
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether this dispatch produced the turn — the receipt's own convention."""
+        return self.error_code == ""
+
+    def to_json(self) -> dict[str, Any]:
+        payload = {
+            "index": self.index,
+            "elapsed_ms": self.elapsed_ms,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
+            "http_status": self.http_status,
+            "provider_retried": self.provider_retried,
+            "usage": dict(self.usage),
+            "stream_committed": self.stream_committed,
+        }
+        # Omitted, not nulled: absence is the wire spelling of "written before the field
+        # existed", and it must survive a round trip -- a legacy line re-serialized with an
+        # unconditional key would refuse itself on the next read.
+        if self.backoff_ms is not None:
+            payload["backoff_ms"] = self.backoff_ms
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: Any) -> ModelCallAttempt:
+        payload = require_object(payload, "model_call_attempt")
+        # An entry is read whole or refused, which is not the rule one level up and must not be.
+        # ``attempt_log`` itself is optional because its absence means exactly one thing -- a
+        # writer that predates the field -- and defaults there reconstruct what that writer meant.
+        # The keys an entry was BORN with have no predecessor to be lenient toward: they were
+        # written by a writer that knew all of them or the entry was not written by this record
+        # at all. Defaulting them turned `{}` into a successful, zero-duration, unbilled dispatch
+        # numbered 1, which then satisfied both of the receipt's cross-entry invariants -- a
+        # corrupt audit line reading as data, the one outcome an audit surface may not produce.
+        # The ledger schema has required every one of them since the field shipped; this is the
+        # reader agreeing with it. A key added AFTER the entry shipped is the other generation:
+        # it does have predecessors -- every line the earlier writer filled -- so it follows the
+        # record-level absence rule instead, named per key in ``_ATTEMPT_OPTIONAL_WIRE_KEYS``.
+        missing = [
+            name
+            for name in _ATTEMPT_WIRE_KEYS
+            if name not in payload and name not in _ATTEMPT_OPTIONAL_WIRE_KEYS
+        ]
+        if missing:
+            raise WireValidationError(
+                "model call attempt is missing required fields: " + ", ".join(missing)
+            )
+        # Present-and-null is the other half of the same question, and the pin above cannot ask
+        # it: a key holding ``null`` satisfies ``name in payload``.
+        _refuse_null_wire_values(payload, cls, "model call attempt")
+        raw_status = payload.get("http_status")
+        return cls(
+            index=parse_int(payload, "index", default=1),
+            elapsed_ms=parse_int(payload, "elapsed_ms"),
+            error_code=parse_str(payload, "error_code"),
+            provider_error_code=parse_str(payload, "provider_error_code"),
+            retryable=parse_bool(payload, "retryable"),
+            config_recoverable=parse_bool(payload, "config_recoverable"),
+            http_status=None if raw_status is None else parse_int(payload, "http_status"),
+            provider_retried=parse_bool(payload, "provider_retried"),
+            usage=_optional_object(payload, "usage") or {},
+            stream_committed=parse_bool(payload, "stream_committed"),
+            # Absent means the line predates the field; present must be an integer. ``null`` is
+            # neither generation -- no writer omits by writing null -- and ``parse_int`` refuses
+            # it, which keeps this reader saying what the schema says (``"type": "integer"``)
+            # instead of re-opening the reader-lenient/schema-strict split one field over.
+            backoff_ms=(
+                None if "backoff_ms" not in payload else parse_int(payload, "backoff_ms")
+            ),
+        )
+
+
+# Derived from the record, not restated beside it: a field added to ``ModelCallAttempt`` becomes
+# required on the wire the moment it exists, rather than the moment someone remembers a list.
+_ATTEMPT_WIRE_KEYS: tuple[str, ...] = tuple(
+    entry.name for entry in dataclass_fields(ModelCallAttempt)
+)
+
+# The exemption is a policy with a reason, not a forgotten field: a key added after the entry
+# shipped (``backoff_ms``, W7-2) has predecessors -- every line the earlier writer filled -- and
+# requiring it would refuse ledgers this same package wrote. Absence of a key in this set reads
+# as "written before the field existed", the record-level rule applied per key; everything not
+# named here stays required the moment it exists, which is the derivation above doing its job.
+_ATTEMPT_OPTIONAL_WIRE_KEYS: frozenset[str] = frozenset({"backoff_ms"})
 
 
 @dataclass(frozen=True)
@@ -626,19 +1118,114 @@ class ModelCallReceipt:
     error_code: str = ""
     provider_error_code: str = ""
     retryable: bool = False
+    # The sixth fact the exception carries. ``retryable`` says "waiting may help";
+    # ``config_recoverable`` says "changing configuration will". A receipt that recorded only the
+    # first could not tell an auditor why an exhausted retry budget was never going to succeed.
+    config_recoverable: bool = False
     http_status: int | None = None
     redaction_digest: str = ""
     capture_downgrades: int = 0
+    # What the replay key was taken under, and whether one was issued at all. An empty
+    # ``request_digest`` used to be the answer to four different questions -- the payload could not
+    # be canonically encoded, it exceeded the size cap, the call was refused before a key was ever
+    # computed, or a ``none``-mode policy withheld it -- and nothing downstream could tell them
+    # apart. A consumer holding a keyless record could not say whether it was looking at a defect
+    # or at a policy.
+    digest_generation: str = ""
+    digest_status: str = "not_reached"
+    # Where the call was going, as a fact beside the key rather than inside it. The endpoint is
+    # deliberately never recorded in plaintext, which is exactly why hashing it into the replay key
+    # made that key unreproducible: nothing a record holds could reconstruct the preimage. The
+    # status names which of the four probe outcomes happened; the digest is keyed (see
+    # :func:`destination_digest`) so that comparing two calls stays possible without turning the
+    # receipt into a guessing oracle for an internal hostname.
+    destination_status: str = "not_reached"
+    destination_digest: str = ""
+    # One entry per kernel dispatch, in order. Empty on receipts written before the field
+    # existed, on refused calls (``attempts == 0``), and on any receipt a caller builds
+    # without one -- the empty arm is not reserved for zero dispatches, which is why neither
+    # wire reader may treat an empty log beside a positive ``attempts`` as impossible.
+    # Otherwise one entry per attempt, so the log is either absent or complete. Both halves of "complete" are enforced below rather
+    # than left to the writer: the indices are ``1..attempts`` in order (a log naming some
+    # attempts twice and others not at all could not answer the question it exists for, and
+    # counting alone cannot tell the two apart), and the entries' usage sums to this receipt's
+    # (a breakdown that disagrees with its total leaves a reader nothing to believe). Appended
+    # last so positional construction predating this field keeps meaning what it meant.
+    attempt_log: tuple[ModelCallAttempt, ...] = ()
+    # The retry-scope token the call was keyed with -- issued by the runner in the same block
+    # that computes the digests, once per call and before the first dispatch, so it is constant
+    # across kernel re-dispatches and adapter-internal retries and reissued on resume. Recorded
+    # as ISSUED, not as sent: only the gateway transport presents it on the wire, so a key on a
+    # fake or replay call's receipt says the call was keyed, nothing more. Deliberately outside
+    # the replay key: two identical requests share a replay slot precisely because content
+    # cannot tell them apart, and a token meant to separate their provider work must therefore
+    # be content-independent. Empty means the call never reached the keying block (refused by
+    # the cancel/deadline check or by ingress normalization) or the record predates the field.
+    # Appended after ``attempt_log`` under the same positional-stability rule it states.
+    idempotency_key: str = ""
 
     def __post_init__(self) -> None:
+        # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
+        # so a comparison admits the bool it exists to bound.
+        _validate_counts(self, "model call")
         if self.attempts < 0:
             raise ValueError("model call attempts must not be negative")
+        if type(self.attempt_log) is not tuple:
+            object.__setattr__(self, "attempt_log", tuple(self.attempt_log))
+        for entry in self.attempt_log:
+            if not isinstance(entry, ModelCallAttempt):
+                raise WireValidationError(
+                    "model call attempt_log entries must be ModelCallAttempt records"
+                )
+        # "Exactly once" is the claim, so the indices carry it rather than the count. A length
+        # check accepts a log of the right size naming one dispatch twice and another not at
+        # all -- well-formed in every other field, and unanswerable for the question the log
+        # exists for, with nothing in the record to say so. The empty half of the rule has a
+        # wire side this constructor cannot see -- absence and ``[]`` parse to the same tuple
+        # -- and neither reader tries to: both spellings mean an unitemized call, the second
+        # because every build before W7-4 wrote it for exactly that. Only the writers
+        # converged; see ``to_json``.
+        if self.attempt_log and tuple(entry.index for entry in self.attempt_log) != tuple(
+            range(1, self.attempts + 1)
+        ):
+            raise ValueError(
+                "model call attempt_log must be empty or name every attempt exactly once"
+            )
+        # A wait is what separates two dispatches, so the first entry has none to report:
+        # nothing of this call precedes its first dispatch, and a line saying otherwise claims
+        # the kernel waited for something it had not yet done. Checkable here -- unlike the
+        # timeline inequality the same field takes part in, which needs a `latency_ms` the
+        # runner has not stamped yet when it attaches the log -- because this one reads the
+        # entries alone, and their own waits are final by the time they arrive. `None` is the
+        # field's absence and not a wait of zero, so it stays legal: a record that predates the
+        # field says nothing here rather than saying nothing happened.
+        first_backoff = self.attempt_log[0].backoff_ms if self.attempt_log else None
+        if first_backoff is not None and first_backoff != 0:
+            raise ValueError(
+                "model call attempt_log first entry backoff_ms must be 0: "
+                "nothing precedes the first dispatch"
+            )
         if self.latency_ms < 0:
             raise ValueError("model call latency_ms must not be negative")
         if self.capture_downgrades < 0:
             raise ValueError("model call capture_downgrades must not be negative")
+        # The two closed enums, refused here as well as on the wire and through the same function.
+        # `from_json` rejected a non-member while `to_json` emitted one, so this class could write
+        # an audit record it would not read back -- a failure that surfaces in the consumer, long
+        # after the writer that caused it. `ModelCallCapture` has always refused a `mode` outside
+        # `CAPTURE_MODES` in its own `__post_init__`; these two were the pair that did not.
+        # `replace` re-runs this, which is what puts the subscription narrowing and `with_error`
+        # under the same rule rather than only the direct constructor.
+        _validated_status(self.digest_status, "digest_status", DIGEST_STATUSES)
+        _validated_status(self.destination_status, "destination_status", DESTINATION_STATUSES)
         for key, value in self.usage.items():
-            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+            # ``type(value) is not int`` rather than ``isinstance``: the same "what is a
+            # countable int" its four sibling readers spell (``provider_usage_of``,
+            # ``usage_reported_by``, ``with_error``, ``_recordable_usage``). ``isinstance``
+            # here accepted every ``int`` subclass -- an ``IntEnum`` a provider SDK hands back
+            # as a token count is the real shape -- so this constructor admitted a count that
+            # every reader of the stamp had just refused. Excluding ``bool`` is now implied.
+            if not isinstance(key, str) or type(value) is not int:
                 raise WireValidationError("model call usage must be a mapping of str to int")
             # Every other counter on this receipt refuses a negative, and usage is the one that gets
             # summed: a single ``{"input_tokens": -100}`` in an audit payload silently subtracts from
@@ -646,6 +1233,19 @@ class ModelCallReceipt:
             if value < 0:
                 raise WireValidationError(f"model call usage {key!r} must not be negative")
         object.__setattr__(self, "usage", dict(self.usage))
+        # The entries are this receipt's own breakdown of its bill, so a log that does not add up
+        # to that bill is not a breakdown of it -- and nothing else in the record says which of
+        # the two is wrong. The docstring above gave "a sum over its usage would silently
+        # disagree with the receipt's" as the reason the log is all-or-nothing; unchecked, that
+        # was a rationale rather than a rule. Read after the normalization above, so the sum and
+        # the total are compared on the same terms.
+        if self.attempt_log:
+            summed: dict[str, int] = {}
+            for entry in self.attempt_log:
+                for key, value in entry.usage.items():
+                    summed[key] = summed.get(key, 0) + value
+            if summed != self.usage:
+                raise ValueError("model call attempt_log usage must sum to the receipt's usage")
 
     @property
     def succeeded(self) -> bool:
@@ -668,11 +1268,17 @@ class ModelCallReceipt:
         recorded by its type name rather than its message: an arbitrary exception's message can carry
         request content, and the whole point of the receipt is that it holds none.
         """
+        # Read once, before the `try`, and read so that it cannot raise: the fallback below is an
+        # `except` handler, and spelling it `type(exc).__name__` made the handler re-raise -- an
+        # exception escaping the one object documented to survive any exception. The same read also
+        # bounds the name, which reaches the wire as `error_code`: measured, 1,000,000 characters.
+        type_name = portable_type_name(exc)
         try:
-            error_code = getattr(exc, "error_code", "") or type(exc).__name__
-            normalized_error_code = normalize_unicode_scalars(str(error_code))
+            error_code = getattr(exc, "error_code", "") or type_name
+            # `exact_text`, not `str`: a `str` subclass answering `__str__` forges this code.
+            normalized_error_code = normalize_unicode_scalars(exact_text(error_code))
         except Exception:
-            normalized_error_code = type(exc).__name__
+            normalized_error_code = type_name
         try:
             provider_error_code = normalize_unicode_scalars(
                 str(getattr(exc, "provider_error_code", "") or "")
@@ -684,6 +1290,13 @@ class ModelCallReceipt:
             retryable = retryable_value if type(retryable_value) is bool else False
         except Exception:
             retryable = False
+        try:
+            config_recoverable_value = getattr(exc, "config_recoverable", False)
+            config_recoverable = (
+                config_recoverable_value if type(config_recoverable_value) is bool else False
+            )
+        except Exception:
+            config_recoverable = False
         try:
             http_status = getattr(exc, "http_status", None)
         except Exception:
@@ -697,12 +1310,41 @@ class ModelCallReceipt:
             )
         except Exception:
             provider_retried = False
+        # What the provider already produced and billed for before the call was refused. A
+        # failure after a complete answer is a real shape -- the applied-parameters proof
+        # refusals parse a turn, read its usage, and only then reject it -- and a receipt that
+        # reports zero there drops a paid call out of the metrics and out of the cumulative
+        # token budget. Same guarded read as `provider_retried`, and the same combine rule: a
+        # receipt that already carried counts keeps them.
+        try:
+            stamped_usage = getattr(exc, "provider_usage", None)
+        except Exception:
+            stamped_usage = None
+        usage = self.usage
+        # ``and not self.attempt_log``: the entries are this receipt's own per-dispatch breakdown
+        # of its bill, and a total read off an exception cannot restate them -- writing one over
+        # them produces a record ``__post_init__`` refuses, which would come out of this method as
+        # a ``ValueError`` *instead of* the failure it was called to report. Every read here is
+        # guarded for that reason; the sum invariant added one more way to break the same promise.
+        # The same rule the line below already follows for ``provider_retried``, one field wider:
+        # a receipt that already carried the fact keeps what it carried.
+        if not usage and not self.attempt_log and isinstance(stamped_usage, Mapping):
+            try:
+                usage = {
+                    str(key): int(value)
+                    for key, value in stamped_usage.items()
+                    if type(value) is int and value >= 0
+                }
+            except Exception:
+                usage = self.usage
         return replace(
             self,
             error_code=normalized_error_code,
             provider_error_code=provider_error_code,
             retryable=retryable,
+            config_recoverable=config_recoverable,
             http_status=http_status,
+            usage=usage,
             # A failed call is the one most likely to have been retried, so the marker has to
             # survive the failure path too -- recording it only on success would deny retries in
             # exactly the exhausted-budget case.
@@ -715,7 +1357,7 @@ class ModelCallReceipt:
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "context": self.context.to_json(),
             "model": self.model.to_json(),
             "provider_name": self.provider_name,
@@ -729,15 +1371,59 @@ class ModelCallReceipt:
             "error_code": self.error_code,
             "provider_error_code": self.provider_error_code,
             "retryable": self.retryable,
+            "config_recoverable": self.config_recoverable,
             "http_status": self.http_status,
             "redaction_digest": self.redaction_digest,
             "capture_downgrades": self.capture_downgrades,
+            "digest_generation": self.digest_generation,
+            "digest_status": self.digest_status,
+            "destination_status": self.destination_status,
+            "destination_digest": self.destination_digest,
+            "idempotency_key": self.idempotency_key,
         }
+        # Emitted only when there is something to itemize. Presence IS the claim -- one entry
+        # per dispatch, indices ``1..attempts`` -- so this writer gives an empty log no
+        # spelling of its own: absence covers a record that predates the field, a call with
+        # zero dispatches, and a receipt built without a log, which coincide in every readable
+        # fact. Emitting ``[]`` unconditionally gave that one value a second spelling and made
+        # a parsed pre-field receipt come back wearing it. The readers still accept both --
+        # every build before this one wrote ``[]`` for an empty log, at whatever ``attempts``
+        # the receipt carried, and those lines are honest records of unitemized calls.
+        # ``idempotency_key`` above keeps the opposite rule on purpose: its absence spelling
+        # is the in-band empty string, so the key itself always travels.
+        if self.attempt_log:
+            payload["attempt_log"] = [entry.to_json() for entry in self.attempt_log]
+        return payload
 
     @classmethod
     def from_json(cls, payload: Any) -> ModelCallReceipt:
         payload = require_object(payload, "model_call_receipt")
+        # Absence on this record is legacy and reads as the field's default; ``null`` is a writer
+        # that had the field and wrote nothing, which no writer here has ever done. Applied over
+        # the record's own fields, so ``context``, ``model`` and ``usage`` -- which collapsed the
+        # same way ``attempt_log`` did -- are covered by the rule rather than by three checks.
+        _refuse_null_wire_values(payload, cls, "model call receipt")
         usage = _optional_object(payload, "usage") or {}
+        # Absent on every receipt written before this field existed, which is legal and reads
+        # as an empty log beside an intact ``attempts`` count; present-but-mistyped is refused,
+        # like every other field here. A present log of the wrong length is refused by
+        # ``__post_init__`` — that shape is a bug in a writer, not a legacy to absorb. A
+        # present-but-EMPTY log is read, not refused, at every ``attempts`` count: it is the
+        # spelling every build before W7-4 gave an unitemized call, because ``to_json``
+        # emitted the key unconditionally and an empty log is a legal receipt at any count
+        # (empty *or* complete — the empty arm was never reserved for refused calls). The
+        # runner never wrote that pair, but the runner is not the only writer: a receipt
+        # handed straight to ``AgentRecorder.record_settled_call`` carries whatever log it
+        # was built with, and the default is none. Refusing it here would convict the lines
+        # the previous build wrote through its own public API. The convergence W7-4 makes is
+        # the writer's alone (see ``to_json``): one spelling produced, both still read.
+        raw_attempt_log = payload.get("attempt_log")
+        if raw_attempt_log is None:
+            attempt_log: tuple[ModelCallAttempt, ...] = ()
+        elif isinstance(raw_attempt_log, list):
+            attempt_log = tuple(ModelCallAttempt.from_json(item) for item in raw_attempt_log)
+        else:
+            raise WireValidationError("attempt_log must be an array")
         context_payload = _optional_object(payload, "context")
         model_payload = _optional_object(payload, "model")
         raw_status = payload.get("http_status")
@@ -759,9 +1445,43 @@ class ModelCallReceipt:
             error_code=parse_str(payload, "error_code"),
             provider_error_code=parse_str(payload, "provider_error_code"),
             retryable=parse_bool(payload, "retryable"),
+            # Absent on every receipt written before this field existed, which is legal and
+            # reads as False; present-but-mistyped is refused, like every other bool here.
+            config_recoverable=parse_bool(payload, "config_recoverable"),
             http_status=None if raw_status is None else parse_int(payload, "http_status"),
             redaction_digest=parse_str(payload, "redaction_digest"),
             capture_downgrades=parse_int(payload, "capture_downgrades"),
+            # Absent on every receipt written before these fields existed, which is legal; the
+            # statuses then read as the "we never got that far" default *except* where the digest
+            # they describe is there to say otherwise (see :func:`_parsed_status`), and the
+            # generation stays empty because a legacy key was taken under rules this record cannot
+            # name. Present-but-mistyped is refused, like every other string here. The statuses are
+            # closed kernel enums rather than free strings -- unlike ``stop_reason``, whose openness
+            # exists because a *provider* may add a value -- so an unknown one is a bug in a writer,
+            # not a provider surprise to absorb.
+            digest_generation=parse_str(payload, "digest_generation"),
+            digest_status=_parsed_status(
+                payload,
+                "digest_status",
+                DIGEST_STATUSES,
+                witness="request_digest",
+                witnessed="ok",
+            ),
+            destination_status=_parsed_status(
+                payload,
+                "destination_status",
+                DESTINATION_STATUSES,
+                # The only arm that answers with a value: `not_declared`, `declined` and
+                # `unavailable` all produce an empty digest, so a non-empty one names `resolved`
+                # and nothing else.
+                witness="destination_digest",
+                witnessed="resolved",
+            ),
+            destination_digest=parse_str(payload, "destination_digest"),
+            attempt_log=attempt_log,
+            # Absent on every receipt written before the field existed, which is legal and reads
+            # as "never keyed"; present-but-mistyped is refused, like every other string here.
+            idempotency_key=parse_str(payload, "idempotency_key"),
         )
 
 
@@ -867,7 +1587,9 @@ def redacted_fields_or_none(
     if not isinstance(redacted, Mapping):
         return None
     try:
-        normalized = normalize_json_ingress({str(key): value for key, value in redacted.items()})
+        normalized = normalize_json_ingress(
+            {exact_text(key): value for key, value in exact_items(redacted)}
+        )
     except Exception:
         return None
     return normalized if isinstance(normalized, Mapping) else None
@@ -946,6 +1668,11 @@ def _receipt_for_subscription(
     }
     if mode == "none":
         changes.update(dict.fromkeys(_CONTENT_DERIVED_RECEIPT_FIELDS, ""))
+        # Say that the key was taken away rather than leaving the consumer to read the empty
+        # string as "there was never one". Only when there *was* one: overwriting ``absent`` with
+        # ``withheld`` would claim a policy removed a key that no policy ever saw.
+        if receipt.digest_status == "ok":
+            changes["digest_status"] = "withheld"
     return replace(receipt, **changes)
 
 

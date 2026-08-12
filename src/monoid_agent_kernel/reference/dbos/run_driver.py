@@ -25,7 +25,7 @@ from monoid_agent_kernel.core.checkpoint import (
     load_latest_checked,
 )
 from monoid_agent_kernel.core.json_ingress import is_finite_json_number
-from monoid_agent_kernel.core.lifecycle import state_from_suspension
+from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspension
 from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_checkpoint_payload,
@@ -283,13 +283,26 @@ class DbosRunReceipt:
         terminal = raw_receipt.get("terminal")
         checkpoint_sha256 = str(raw_receipt.get("checkpoint_sha256") or "")
         state = state_from_suspension(suspension).value
+        # One-release compatibility. v0.21 harmonized the terminal-limited mapping: a TERMINAL
+        # ``status="limited"`` boundary now projects to LIMITED, where every release before it
+        # projected to FAILED. A receipt written by a pre-v0.21 process therefore recorded
+        # "failed" for a boundary this process now names "limited", and rejecting it would turn
+        # a rolling upgrade into a lost idempotency receipt (the run would be driven twice).
+        # The widening applies ONLY where the mapping actually changed: a cancel boundary also
+        # arrives ``status="limited"`` (with ``error_code="cancelled"``) and a live-limited
+        # park carries it too, but pre-v0.21 processes already recorded "cancelled"/"limited"
+        # there — so at those boundaries a "failed" receipt is corrupt, not compatible.
+        # REMOVE once no pre-v0.21 receipt can still be in flight — one release after v0.21.
+        accepted_states = {state}
+        if state == SessionState.LIMITED.value and suspension.reason == "terminal":
+            accepted_states.add(SessionState.FAILED.value)
         if (
             isinstance(checkpoint_seq, bool)
             or not isinstance(checkpoint_seq, int)
             or checkpoint_seq <= command.checkpoint_seq
             or not isinstance(terminal, bool)
             or _SHA256_HEX(checkpoint_sha256) is None
-            or raw_receipt.get("state") != state
+            or raw_receipt.get("state") not in accepted_states
         ):
             raise NativeAgentError(
                 "completed resume receipt has invalid boundary metadata",

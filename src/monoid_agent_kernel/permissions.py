@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 import pathspec
 
-from monoid_agent_kernel._policy_util import dedupe, str_tuple
+from monoid_agent_kernel._policy_util import dedupe, matches_the_kernel_defaults, str_tuple
 from monoid_agent_kernel.core.json_ingress import normalize_unicode_scalars
 from monoid_agent_kernel.errors import PermissionDenied
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -423,6 +423,30 @@ class PermissionPolicy:
         object.__setattr__(
             self, "redact_patterns", validate_internal_path_patterns(self.redact_patterns)
         )
+
+    @property
+    def is_default(self) -> bool:
+        """Whether this policy declares anything at all — the gate the loop's adoption rides.
+
+        The third member of the ``is_default`` family, and it was the third site of the same
+        defect: ``LoopBootstrapper`` asked ``loop.permission_policy == PermissionPolicy()``,
+        and a generated dataclass ``__eq__`` is class-exact, so a deployment's extension
+        subclass with both pattern tuples empty answered "the caller configured this". The
+        operator's ``spec.permission_policy`` was then silently *not* adopted, and the loop
+        enforced the empty policy at every ``self.permission_policy`` site while the subagent
+        sites read ``self.spec.permission_policy`` directly — half a run honouring the
+        operator's deny/redact lists and half not. Such subclasses reach the gate intact by
+        design: the spec validator gates on ``isinstance``.
+
+        Read over the fields this class declares, never over ``type(self)``'s, and the reason
+        is the same one :func:`matches_the_kernel_defaults` states for its config siblings —
+        said here in enforcement rather than projection terms. ``check_paths`` and the
+        redaction readers match ``deny_patterns`` and ``redact_patterns`` and nothing else, so
+        an extension field cannot change what this policy *does*; a gate that could see it
+        would answer a question no enforcement path asks.
+        """
+
+        return matches_the_kernel_defaults(self, PermissionPolicy)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> PermissionPolicy:

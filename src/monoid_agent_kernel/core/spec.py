@@ -4,8 +4,9 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
+from monoid_agent_kernel._policy_util import matches_the_kernel_defaults
 from monoid_agent_kernel.core.content import (
     ContentPart,
     TextPart,
@@ -22,12 +23,43 @@ WorkspaceBackendKind = Literal["overlay", "staging"]
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]
 ReasoningSummary = Literal["off", "auto", "detailed"]
 
+_REASONING_EFFORTS = get_args(ReasoningEffort)
+_REASONING_SUMMARIES = get_args(ReasoningSummary)
+# Shared by reasoning and generation: what to do when a transport cannot prove the
+# setting was applied.
+_MODEL_FALLBACK_MODES = ("fail", "omit")
+
+
+def _model_choice(value: Any, field_name: str, choices: tuple[str, ...]) -> Any:
+    if value not in choices:
+        rendered = ", ".join(choices)
+        raise ValueError(f"{field_name} must be one of: {rendered}")
+    return value
+
 
 @dataclass(frozen=True)
 class ReasoningConfig:
     effort: ReasoningEffort = "medium"
     summary: ReasoningSummary = "off"
     on_unsupported: Literal["fail", "omit"] = "fail"
+
+    @property
+    def is_default(self) -> bool:
+        """Whether the caller configured reasoning at all — the gate the applied echo rides.
+
+        The generation twin can read its projected payload for this (every default field
+        projects to nothing), but the default reasoning config projects a non-empty provider
+        block (``{"effort": "medium"}``), so payload truthiness would claim every call
+        configured reasoning. Field-by-field comparison against the defaults is the honest
+        sentinel; the one thing it cannot see — an explicit ``effort="medium"`` — is exactly
+        as invisible as an explicit ``temperature=None`` is to generation's gate.
+
+        Read over the fields this class declares, never over ``type(self)``'s: see
+        :func:`matches_the_kernel_defaults` for why an extension's own fields must be as
+        invisible here as they already are to ``to_json`` and ``build_reasoning_payload``.
+        """
+
+        return matches_the_kernel_defaults(self, ReasoningConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ReasoningConfig:
@@ -36,10 +68,12 @@ class ReasoningConfig:
         if not isinstance(payload, dict):
             raise ValueError("model reasoning config must be an object or null")
         defaults = cls()
-        return cls(
-            effort=payload.get("effort", defaults.effort),
-            summary=payload.get("summary", defaults.summary),
-            on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+        return validate_reasoning_config(
+            cls(
+                effort=payload.get("effort", defaults.effort),
+                summary=payload.get("summary", defaults.summary),
+                on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+            )
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -48,6 +82,28 @@ class ReasoningConfig:
             "summary": self.summary,
             "on_unsupported": self.on_unsupported,
         }
+
+
+def validate_reasoning_config(reasoning: ReasoningConfig) -> ReasoningConfig:
+    """Fail-closed check shared by the JSON codec and direct-Python normalization.
+
+    The reasoning twin of :func:`validate_generation_config`, and for the same reason: one
+    rule source for both ingresses, so a value accepted from JSON can never diverge from a
+    value accepted from a constructor. Before this existed, the codec and the gateway server
+    both rejected an unknown effort while a Python-constructed one sailed through
+    ``normalize_model_config`` to fail mid-run as a provider 400.
+    """
+
+    if not isinstance(reasoning, ReasoningConfig):
+        raise ValueError("model.reasoning must be a ReasoningConfig")
+    _model_choice(reasoning.effort, "model.reasoning.effort", _REASONING_EFFORTS)
+    _model_choice(reasoning.summary, "model.reasoning.summary", _REASONING_SUMMARIES)
+    _model_choice(
+        reasoning.on_unsupported,
+        "model.reasoning.on_unsupported",
+        _MODEL_FALLBACK_MODES,
+    )
+    return reasoning
 
 
 def _model_control_number(
@@ -94,8 +150,150 @@ def _model_text(value: Any, field_name: str, *, allow_none: bool = False) -> str
     return value
 
 
+def _generation_number(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: int | float,
+    maximum: int | float,
+    exclusive_minimum: bool = False,
+) -> int | float | None:
+    """Validate an optional sampling control; ``None`` delegates to the provider default."""
+
+    if value is None:
+        return None
+    if type(value) not in (int, float):
+        raise ValueError(f"{field_name} must be a finite number or null")
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite:
+        raise ValueError(f"{field_name} must be a finite number or null")
+    below = value <= minimum if exclusive_minimum else value < minimum
+    if below or value > maximum:
+        lower = f"greater than {minimum}" if exclusive_minimum else f"at least {minimum}"
+        raise ValueError(f"{field_name} must be {lower} and at most {maximum}")
+    return value
+
+
+@dataclass(frozen=True)
+class GenerationConfig:
+    """Per-call sampling controls. ``None`` on a value field delegates to the provider default.
+
+    ``on_unsupported`` is enforced where non-application is detectable: the gateway transport
+    echoes what it applied, so ``"fail"`` rejects a turn whose parameters were silently dropped
+    by an older server. A direct provider call has no echo; there the provider's own error is
+    the only signal, so ``"fail"`` and ``"omit"`` behave identically.
+    """
+
+    temperature: int | float | None = None
+    top_p: int | float | None = None
+    max_output_tokens: int | None = None
+    on_unsupported: Literal["fail", "omit"] = "fail"
+
+    @property
+    def is_default(self) -> bool:
+        """Whether the caller set any sampling control — the gate ``ModelConfig.to_json`` reads.
+
+        The same field-based rule as the reasoning twin, and for the same reason
+        (:func:`matches_the_kernel_defaults`). Its consumer is a serialization gate rather than
+        an echo, so a class-exact answer here made an all-defaults extension emit the
+        ``generation`` key — changing the runtime-config semantic hash that durable recovery
+        compares across restarts, and the gateway wire, while changing nothing either of them is
+        about. Two gates read this property now: ``ModelConfig.to_json`` above, and the replay
+        key's own projection (``providers._request_identity._model_identity``), which restates the omission rather
+        than inheriting it.
+        """
+
+        return matches_the_kernel_defaults(self, GenerationConfig)
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any] | None) -> GenerationConfig:
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("model generation config must be an object or null")
+        defaults = cls()
+        return validate_generation_config(
+            cls(
+                temperature=payload.get("temperature", defaults.temperature),
+                top_p=payload.get("top_p", defaults.top_p),
+                max_output_tokens=payload.get("max_output_tokens", defaults.max_output_tokens),
+                on_unsupported=payload.get("on_unsupported", defaults.on_unsupported),
+            )
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_output_tokens": self.max_output_tokens,
+            "on_unsupported": self.on_unsupported,
+        }
+
+
+def validate_generation_config(generation: GenerationConfig) -> GenerationConfig:
+    """Fail-closed check shared by the JSON codec and direct-Python normalization.
+
+    One rule source for both ingresses, so a range accepted from JSON can never diverge from
+    the range accepted from a constructor.
+    """
+
+    if not isinstance(generation, GenerationConfig):
+        raise ValueError("model.generation must be a GenerationConfig")
+    _generation_number(
+        generation.temperature,
+        "model.generation.temperature",
+        minimum=0,
+        maximum=2,
+    )
+    _generation_number(
+        generation.top_p,
+        "model.generation.top_p",
+        minimum=0,
+        maximum=1,
+        exclusive_minimum=True,
+    )
+    if generation.max_output_tokens is not None and (
+        type(generation.max_output_tokens) is not int or generation.max_output_tokens < 1
+    ):
+        raise ValueError(
+            "model.generation.max_output_tokens must be an integer greater than zero or null"
+        )
+    _model_choice(
+        generation.on_unsupported,
+        "model.generation.on_unsupported",
+        _MODEL_FALLBACK_MODES,
+    )
+    return generation
+
+
+RETRY_LAYERS: tuple[str, ...] = ("adapter", "kernel")
+"""Who runs the retry loop for a model call: the adapter's own transport loop, or the kernel.
+
+Module-level and unprefixed because the direct-construction normalizer in ``providers.base``
+validates against the same tuple — the literals live once. A second spelling is how the
+reasoning enums briefly grew a third, hand-copied edition (see ``_runtime_config_ingress``'s
+note), and a layer value accepted by one route and refused by the other would select
+*different loops* for the same config.
+"""
+
+
 @dataclass(frozen=True)
 class ModelRetryConfig:
+    """Transport retry policy: the schedule, the codes, and who runs the loop (``layer``).
+
+    ``layer`` names the single owner of the retry loop for a call, so attempts cannot be
+    multiplied by two loops stacking. ``"adapter"`` (the default) is the shipped behavior:
+    the adapter's own loop retries and the kernel makes exactly one adapter call.
+    ``"kernel"`` moves the loop into ``ModelCallRunner``: the runner re-dispatches the
+    already-keyed request and hands the adapter a neutralized policy, and a compliant
+    adapter seeing ``layer="kernel"`` must not run a loop of its own. The schedule fields
+    govern whichever layer loops; ``retry_on`` remains the adapter loop's code selector —
+    the kernel judges by the error taxonomy (``retryable``), not by this list.
+    """
+
     max_attempts: int = 3
     initial_delay_s: float = 0.5
     max_delay_s: float = 4.0
@@ -107,6 +305,7 @@ class ModelRetryConfig:
         "gateway_rate_limited",
         "gateway_server_error",
     )
+    layer: str = "adapter"
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ModelRetryConfig:
@@ -141,10 +340,13 @@ class ModelRetryConfig:
                 allow_zero=True,
             ),
             retry_on=_model_retry_codes(payload.get("retry_on", defaults.retry_on)),
+            layer=_model_choice(
+                payload.get("layer", defaults.layer), "model.retry.layer", RETRY_LAYERS
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "max_attempts": self.max_attempts,
             "initial_delay_s": self.initial_delay_s,
             "max_delay_s": self.max_delay_s,
@@ -152,6 +354,13 @@ class ModelRetryConfig:
             "jitter_s": self.jitter_s,
             "retry_on": list(self.retry_on),
         }
+        # Emitted only when configured, for the reason `ModelConfig.to_json` gives for
+        # `generation`: this dict feeds the runtime-config semantic hash, so a config that
+        # never chose a layer must serialize byte-identically to one written before the
+        # field existed.
+        if self.layer != "adapter":
+            payload["layer"] = self.layer
+        return payload
 
 
 @dataclass(frozen=True)
@@ -162,6 +371,7 @@ class ModelConfig:
     timeout_s: int | float = 600
     gateway_url: str | None = None
     retry: ModelRetryConfig = field(default_factory=ModelRetryConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any] | None) -> ModelConfig:
@@ -186,10 +396,11 @@ class ModelConfig:
                 allow_none=True,
             ),
             retry=ModelRetryConfig.from_json(payload.get("retry")),
+            generation=GenerationConfig.from_json(payload.get("generation")),
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "provider": self.provider,
             "model": self.model,
             "reasoning": self.reasoning.to_json(),
@@ -197,6 +408,15 @@ class ModelConfig:
             "gateway_url": self.gateway_url,
             "retry": self.retry.to_json(),
         }
+        # The one key emitted only when configured, unlike every sibling: this dict feeds the
+        # runtime-config semantic hash (durable recovery compares it across versions), so a
+        # never-configured block must serialize byte-identically to a config that predates the
+        # field. The replay key holds the same rule for the same reason but no longer through
+        # here -- W6-0 gave it a hand-listed projection (`providers._request_identity._model_identity`), so this
+        # serializer stopped being a co-author of every recorded key.
+        if not self.generation.is_default:
+            payload["generation"] = self.generation.to_json()
+        return payload
 
 
 def _validate_run_limit(

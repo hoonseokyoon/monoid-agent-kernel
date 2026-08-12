@@ -56,6 +56,8 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
+| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
+| `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
 | `workspace-index` | durable | `monoid.workspace-index.v1` | json-schema | `monoid.workspace-index.v1`<br>`native-agent-runner.workspace-index.v1` |
@@ -196,6 +198,27 @@ its own `monoid.model-content.v1` identifier, and readers also accept the legacy
 compatibility window, settled text is written to both it and `transcript.jsonl`; hydration reads
 the sidecar first and falls back to the transcript for any unresolved digest.
 
+`model_calls.jsonl` is optional in the same way, and single-namespace: it has never existed under
+`native-agent-runner.*`, so `monoid.model-calls.v1` is the only accepted reader version. A record
+is a declared projection of the in-process `ModelCallReceipt` rather than its serialization, so
+the two shapes are deliberately not interchangeable — a recorded line does not round-trip through
+`ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.
+Adding a field to `ModelCallReceipt` therefore does not change this artifact; adding one *here*
+is a schema change like any other, because `additionalProperties` is false.
+
+`model_payloads.jsonl` follows the same two rules (optional; single-namespace, literal enum) and
+adds a third that is this artifact's whole contract: every `model_request` record must reassemble
+to the exact preimage of its `request_digest`, and `monoid validate` recomputes that per record —
+resolving chunk references from inline records and the `model_payloads/` directory, re-encoding,
+and comparing hashes. Unreferenced files in the chunk directory are not integrity issues (a
+crashed write may orphan one) — reclaiming them is `monoid gc`'s job: report-only by default,
+deletion under `--apply`, nothing younger than `--min-age-s` ever touched, and never run beside a
+live writer of the same run directory. A referenced chunk that fails its hash, or a request
+record that does not reassemble, is an integrity issue, and the collector preserves the
+validator's verdict by construction — it deletes only what no record resolves, so
+`monoid validate` reports the same issues after a sweep as before it. The record kinds share one
+`oneOf` schema the way `model-content.v1`'s four kinds do.
+
 A checkpoint schema bump affects every non-terminal run. The release that first writes the new
 version must also read the previous version and restore its message queue, inbox dedupe set,
 hosted tasks, continuation handle, runtime limits, and blob references. Keep that previous-version
@@ -214,6 +237,327 @@ Durable readers therefore migrate the unmarked bare spelling in `manifest.v1`, `
 `checkpoint.v1`, and retained `command-inbox.v1` runtime-config payloads. Fresh operator
 configuration rejects a bare `!`; `\!` remains its explicit literal spelling. An unmarked legacy
 `\!` retains its old literal-backslash/PurePath meaning and is never widened to `!`.
+The v0.21 `monoid.llm-turn.v1` writer adds `generation` and `output_schema` to the request and
+`generation_applied` / `schema_applied` / `reasoning_applied` to the response and terminal
+stream frame without
+changing either protocol identifier (the `metadata_generation` precedent). Every new key is
+present only when the caller configured the feature, so traffic that does not use it keeps its
+exact previous wire shape (for `reasoning_applied`, "configured" means a non-default
+`ModelConfig.reasoning` — the codec-default config demands no proof, and the explicit
+`effort="default"` sentinel is configured and proven by an empty `{}` echo). Version skew
+fails closed on the client: under the default
+`generation.on_unsupported="fail"`, a server that does not echo is refused rather than allowed
+to silently discard parameters; the reasoning proof is governed by its own family's
+`reasoning.on_unsupported` the same way, so a deployment that wants reasoning display
+preferences over a non-proving transport (the reference Studio's offline mode is one) states
+`"omit"` on that field rather than losing the fail-closed default elsewhere. Separately, `ModelConfig.to_json` emits its `generation` block
+only when configured — a generation-free runtime config keeps its pre-v0.21 `config_hash`, and
+a *configured* one intentionally does not verify across mixed-version backend-run recovery
+(configure generation only on a fully rolled fleet).
+
+The same v0.21 writer adds `reasoning` to the response body and the terminal `turn_complete`
+stream frame, again without changing the protocol identifier. Its conditionality is the mirror
+image of the request keys above: those are *request*-conditional (present when the caller
+configured the feature), while `reasoning` is **response**-conditional — present only when the
+upstream actually produced artifacts — so traffic whose upstream produces none keeps its exact
+previous wire shape either way. Skew is lossless in both directions: an old client ignores the
+additive array, and a new client reading an old server (or a stream that ends without a terminal
+frame) reads the absence as `()` through the permissive response reader. The only consequence of
+that skew is that the provider-native reasoning round-trip does not happen on that hop — the loop
+appends no reasoning block for an empty tuple, and the next turn is an ordinary untagged one.
+
+The same writer adds `provider` beside it, on the same two carriers and again without changing the
+protocol identifier. Its conditionality is a third one: not request-conditional like the echoes and
+not answer-conditional like `reasoning`, but **upstream**-conditional — present only when the
+upstream adapter the gateway built declares a `provider_name`, so a deployment whose upstream
+declares none keeps its exact previous wire shape. Skew is lossless in both directions and the
+default direction is the important one: a new client reading an old server sees no key, and an
+absent key gates nothing, so it keeps trusting its own configured declaration exactly as it did
+before — that is the pre-v0.21 behavior, unchanged. An old client reading a new server ignores the
+key. When both ends are new and they *disagree*, the client drops that turn's relayed `reasoning`
+and nothing else: the artifacts are unreadable by whichever provider is really behind the hop, the
+turn's text, tool calls, usage and handle are untouched, and the client's own declaration keeps
+naming the provider on the reasoning tag, the receipt, and every OTel `gen_ai.provider.name`. The
+consequence of a mismatch is therefore the same one skew already has — no reasoning round-trip on
+that hop — rather than a refusal or a changed attribution.
+
+Failing *open* is scoped to **absence**, and only absence: a key that is not there proves
+nothing, so nothing is refused. A key that IS there must be an array of objects, because that is
+the only shape the replay path can hand back to a provider; a present-but-malformed value is
+refused non-retryably as `gateway_bad_response` by both readers (body and terminal frame). One
+skew case reaches that refusal in a way worth naming: the same protocol uses a `reasoning` key on
+the **request** body for the reasoning *config* object, so a third-party gateway that echoes
+request keys onto its response answers an array-valued key with an object and is refused. That is
+the correct outcome — the value is unusable for replay either way — but the cause is not obvious
+from the error, so check for a request echo before suspecting the upstream's artifacts. Since
+B1 there are **three** `reasoning*` spellings on this protocol — the request's config object,
+the response's artifact array, and the response's `reasoning_applied` echo object — and the
+last two ride the same envelopes with different shapes, so a generic echo-the-request gateway
+now trips the object/array mismatch in both directions; implement the three keys separately
+rather than by prefix.
+
+`provider` is held to the same rule by the same readers: absent is unknown and gates nothing, but
+present must be a string, and a non-string is `gateway_bad_response` on both transports. Note what
+that separates — a *malformed* attribution is refused, while a *disagreeing* one is not: the first
+means the envelope cannot be read, the second means it was read and says something the client did
+not expect, which is a fact about a deployment rather than a broken wire.
+
+The v0.21 preview payload budget is a projection-only change: no event schema value, artifact
+identifier, or wire key moves, exhaustion spends the `truncated_keys` / `truncated_items`
+vocabulary that already existed, and `validate_run_dir` reads directories written on either side
+of the change. The same release makes five Python-object ingress boundaries — a tool result's `content`,
+`emit_artifact` metadata, a hosted task's request and result, and a model turn's tool-call
+`arguments` — refuse values no portable JSON writer can spell. Four of them refuse scalars (`bytes`, integers past the 4300-digit decoder bound, arbitrary
+objects) as a *classified call failure* (`tool_result_unportable` and its per-boundary siblings)
+where such a value previously reached a writer that could not spell it and ended the run as
+`internal_error`. Which writer depends on the boundary, and naming one for all of them was wrong: a
+tool result and artifact metadata die at the transcript write, a hosted task's result at
+`task.json`. The refusal fires only where that writer is actually reached — a duplicate report, or
+a first report arriving after the task was cancelled, is answered as the no-op it already was,
+before the payload is judged, because that path stores nothing and publishes nothing. Runs that
+used to die now complete with a failed call the model can observe and correct; no retained artifact is convicted retroactively, because these values could never be
+written to one — the refusal moves the failure earlier and names it, it does not change what any
+reader accepts. Callers whose payloads arrive through a JSON parse are unaffected: the bounded
+decoders never admitted these values in the first place.
+
+Later in the same release those boundaries stop admitting unportable *containers* as well as
+unportable scalars, under the same flag and the same per-boundary classification. A container that
+is reachable from itself is refused — the normalizer preserved the cycle rather than failing on it,
+so the copy reached `json.dumps` as `ValueError: Circular reference detected` and
+`dataclasses.asdict` as `RecursionError` — and so is one taller than
+`MAX_PORTABLE_CONTAINER_DEPTH` (64), measured as a height over the finished copy rather than as a
+path depth, because the walk memoises and a shared subtree is charged at whichever reference it
+reaches first. The bound is 64 and not the decoder's 512 for a measured reason: on CPython 3.11
+`dataclasses.asdict` dies at 492 containers while the model-JSON decoder admits 512, so every depth
+in [492, 512] cleared each gate it met and then killed the run at the checkpoint writer.
+
+The fifth boundary is the one that reaches the checkpoint — a model turn's tool-call arguments ride
+the assistant message into `state.messages` and out through `RunCheckpoint.to_json` — and it
+classifies differently from the other four. It has no `*_unportable` code of its own; the refusal
+escapes to `normalize_model_turn`, which answers `ModelAdapterError("model adapter returned a
+non-portable response")`. That is a terminal classification, not a config-recoverable one: the loop
+does not re-prompt on it, so what is bought is a named failure instead of a `_CheckpointPersistError`
+from the persistence layer. One asymmetry is deliberate and is recorded here because it is
+observable: when the same turn also carries a settled outcome — a `final_text`, or a `refusal` /
+`length` stop reason — the surrounding leniency drops the offending call and keeps the paid answer
+instead of raising. That leniency predates the bound. The call could not have run anyway (a settled
+answer wins in `AgentLoop`) and dropping it keeps exactly the value the bound exists to keep out of
+the checkpoint, but nothing reports the drop.
+
+One v0.21 change moves an existing wire *answer* rather than adding a key: when the reference
+gateway's shipped OpenAI upstream refuses its provider's malformed payload, the HTTP answer is
+now a non-retryable 502 `openai_bad_response` (carrying the billed `usage`), where the shapes
+that used to escape unclassified answered 400 `gateway_bad_request` or 500 with
+`retryable: true`, and the shapes refused without a code of their own answered 502
+`gateway_bad_response` — the hop's own wire named for an upstream payload defect. A client that
+retried on that 500 was re-buying tokens for a payload defect; a client that read the 400 as its
+own bad request was mis-remediating; and one malformed body answered two different codes
+depending on which transport read it.
+
+Read the recoverability move literally, because this kernel's own client does. `AgentLoop`
+(`_recoverable_turn_error`) reads `retryable` **first**, then `config_recoverable`, and only
+then the status range — treating any 4xx as a *recoverable* turn failure (the turn fails, the
+session survives, the caller can fix and resend) and an un-flagged 5xx as terminal. **Both**
+answers that moved therefore move from a park to a terminal run failure, by different routes:
+the 400 was recoverable on its status range and its replacement is a 5xx outside that range,
+and the 500 was recoverable on `retryable: true` alone — which is now `false`, so the flag that
+carried it no longer does. Either way a client that previously got a suspension it could resume
+from now gets a `failure.json` and a terminal session. That direction is intended. It converges
+the hop with in-process behavior, where a malformed upstream payload has always ended the run,
+and no amount of resending the same call fixes a payload the upstream produced. The 500 half
+stops a second kind of bleeding at the same time: `retryable: true` invited a client to re-buy
+exactly the tokens the defect had already spent.
+
+The third group changed its name, and some of its members gained a key. The shapes that already
+answered 502 `gateway_bad_response` — refusals minted without a code of their own — were already
+`retryable: false` and already terminal for this client, and none of them moved: same status,
+same `retryable` / `config_recoverable`, same verdict from `_recoverable_turn_error`. Read that
+as two sub-groups, because only the first is a pure rename:
+
+- The roughly a dozen raised **inside** the adapter's two stamped regions (the body mapping and
+  the stream-terminal construction) were already carrying their billed `usage` and their
+  `provider_retried` before v0.21. For these, `error_code` changed and nothing else did — an
+  honest attribution, not a new recoverability, and a client keyed to anything but the code sees
+  no change.
+- The ones raised **around** those regions joined the group in v0.21 and gained more than a
+  name: the stream's per-frame field validators and the blocking path's `_coerce_response` used
+  to escape with no cost and no retry evidence at all, and both now travel the same completion
+  seam. So their 502 body can carry `provider_retried: true` where it always said `false`, and
+  it can carry a `usage` object where it previously had **no `usage` key at all** — the writer
+  omits that key when the failure cost nothing, so a turn the upstream billed for is a wire
+  *shape* change on these shapes, not just a value change. A client that sums `usage` across
+  failures will now count tokens on calls it used to count as free. That is the correction: they
+  really were billed.
+
+Both sub-groups keep `retryable: false` and the same terminal verdict, so nothing about
+recoverability moved for either.
+
+If you implement this answer in your own gateway, write `"retryable": false` **and** the
+`error_code` explicitly into the 502 body. The client derives each of those from the status line
+only when its own key is absent, and its retry gate (`_should_retry`) needs both: a bare 502
+derives `retryable: true` *and* the error code `gateway_server_error`, which is in the default
+`model.retry.retry_on`. So a body omitting **both** keys is re-sent until
+`model.retry.max_attempts` (3) is spent — three attempts, two retries — re-buying exactly the
+tokens this change exists to stop paying for. Writing either key alone already breaks that
+conjunction; write both anyway, so the body states its verdict instead of leaving half of it to
+a default derived from the status line.
+
+Raw refusals from third-party adapters keep their previous arms and their stamped-usage
+carriage, and v0.21 adds one field to them: both gateway error writers now read
+`provider_retried` off the escaping exception on **every** arm rather than on the
+`ModelAdapterError` arm alone, so an adapter that retried and then refused in its own exception
+type reports `provider_retried: true` where the body always said `false`. The key was already
+written unconditionally, so this is a value change on an existing key, not a shape change.
+
+The v0.21 gateway error writer adds `config_recoverable` to the non-200 error body and the
+terminal SSE `type: "error"` frame, again without changing the protocol identifier. Unlike the
+request keys above it is written unconditionally, beside `retryable` and `provider_retried`,
+because a reader must not have to tell "not config-fixable" apart from "a server that never
+mentions it" — both mean `false`. Skew is symmetric and lossless in both directions: an old
+client ignores the additive key and keeps deriving the classification from the 4xx status as
+before, and a new client reading an old server's body defaults the field to `false`, which is
+the value that server's failures already carried. `TRANSCRIPT_RECORD_SCHEMA`'s `model_turn`
+branch declares the same field, which the writer had always emitted under an open
+`additionalProperties`; no stored transcript changes and no reader has to migrate.
+
+Both writers of `monoid.failure.v1` — the core's `run_dir/failure.json` and the reference
+backend's — add `http_status`, written as `null` when the failure never reached a provider, and
+`retryable` / `config_recoverable`, the classification the `run.failed` event beside them
+carries. The artifact's reader policy is permissive and its consumers read keys off the JSON, so
+an older bundle simply has no such key and a reader must treat "absent" and `null`/`false`
+alike. The schema identifier is unchanged.
+
+The durable park observation inside `monoid.checkpoint.v1` (`last_suspension`) gains
+`provider_error_code` and `provider_retried`, and `turn.failed` / `run.failed` /
+`TRANSCRIPT_RECORD_SCHEMA`'s `model_turn` branch gain the event fields that carry the same facts
+(`provider_retried`, `provider_usage`, `retryable`, `config_recoverable`). All are additive:
+the park reader defaults every absent key, so a pre-v0.21 checkpoint restores exactly as before,
+and the event schemas grow optional properties without changing a `required` list. No checkpoint
+schema version bump, and no reader has to migrate.
+
+`status.json` additionally becomes a recovery input without any shape change: the Reference
+backend's resume paths now read its terminal projection (via the same tolerant
+`lifecycle_from_status_artifact` reader, so a legacy bare `status: "limited"` keeps its
+pre-`state` terminal-limited meaning) to recognize a run that already closed, where before it
+was observability only. A missing or unreadable artifact changes nothing — recovery proceeds as
+it always did. Relatedly, a run cancelled at a park now commits an ordinary
+`monoid.checkpoint.v1` park snapshot at the ack (`cancellation_requested`, an existing field)
+and a terminal one at close; pre-existing readers need no migration.
+
+`ModelRetryConfig` grows `layer` (`"adapter"` | `"kernel"`), naming the single owner of the
+retry loop for a model call. `to_json` emits the key only when it departs the default, so a
+config that never chose a layer serializes byte-identically to one written before the field
+existed and keeps its runtime-config hash; `from_json` reads an absent key as `"adapter"`,
+which is what pre-W7 configs meant. The request-identity projection already excluded the
+whole `retry` block, so recorded replay keys do not move either way. A pre-W7 reader handed
+a `"kernel"` config ignores the unknown key and behaves as `"adapter"` — it retries in the
+adapter loop — which is the pre-W7 behavior, never a multiplication.
+
+`ModelCallReceipt` grows `attempt_log` — one record per kernel dispatch (index, elapsed,
+the failure taxonomy, that attempt's billed usage, per-attempt `provider_retried`, and
+whether a streamed chunk had committed the call when the attempt settled) — and the
+`model-calls.v1` ledger line carries it. Additive on both surfaces: `from_json` reads an
+absent key as an empty log beside an intact `attempts` count, which is what every record
+written before the field existed means; the ledger schema declares the key without
+requiring it, so `monoid validate` still passes directories older writers filled; and a
+present log that does not name every attempt exactly once is refused — that shape is a
+writer bug, not a legacy to absorb, and `monoid validate` now says so too rather than only
+the constructor. W7-4 converges the empty corner on the writer's side only: the writers omit
+an empty log, so absence is the one spelling this build produces for "nothing itemized", while
+a present `[]` — what every build between W7-1 and W7-4 wrote for that same value, at whatever
+`attempts` the receipt carried — is still read as an empty log by `from_json` and still passes
+`monoid validate`. The readers stay put on purpose. An empty log is legal on a receipt at any
+count (the log is empty *or* complete, and its empty arm was never reserved for refused calls),
+the projection emitted the key unconditionally, and `AgentRecorder.record_settled_call` is
+public — so the previous build wrote `[]` beside a positive count for every receipt handed to
+it without entries, a default `ModelCallReceipt()` and its `attempts: 1` first among them.
+Refusing that pair would have convicted the directories those builds filled; every one of them
+keeps validating. Leniency stops at the key for the fields an entry shipped with: those have
+no writer predating them, so every one is required and a partial entry is refused instead of
+completed from defaults. (W7-2 later adds `backoff_ms` to the entry; that key has
+predecessors and follows the record-level absence rule — its own paragraph below.) Run totals (`metrics.json`, `state.total_usage`, the token budget, the child
+roll-up) now read the settled receipt's usage, which folds spend from attempts a kernel
+retry absorbed — including on a run the boundary ended, where a cancelled, timed-out or
+interrupted call's absorbed attempts now reach the totals as well; transcript `model_turn`
+rows keep the turn's own usage, so a reader reconciles totals as transcript rows plus
+absorbed spend. Old readers of the *totals* surfaces see only values that were always legal:
+larger numbers, which every one of those readers already accepted.
+
+The ledger is not one of those surfaces and must not be described as one. `model_calls.jsonl`
+has **no released reader**: the artifact, its writer, `MODEL_CALLS_RECORD_SCHEMA` and the
+`monoid.model-calls.v1` identifier all arrive in the same unreleased v0.21 line that adds
+`attempt_log` — nothing at or below `v0.20.1` mentions any of them. So there is no population
+of older readers to be compatible *with* here, and the additive-key reasoning that applies to
+the open-`additionalProperties` surfaces above does not transfer: this record schema is closed
+(`additionalProperties: false`), and by the rule stated in the `model_calls.jsonl` section
+above, adding a key to it is a schema change like any other. The backward property that does
+hold is the reader-side one already stated: the schema declares `attempt_log` without requiring
+it, so a v0.21 validator still accepts lines a pre-`attempt_log` v0.21 build wrote.
+
+W7-3 adds `idempotency_key` to `ModelCallReceipt` and to the same ledger line, under exactly the
+reasoning of the previous paragraph and inside the same unreleased window: a schema change to a
+closed schema, made where there is still no released reader to break, under the unchanged
+`monoid.model-calls.v1` identifier. The schema declares the key without requiring it — the
+`attempt_log` precedent — so `monoid validate` keeps passing directories pre-W7-3 v0.21 builds
+filled, and absence on a line means exactly one thing: a writer that predates the field. On the
+receipt's own JSON, `from_json` reads an absent key as `""` ("never keyed"), which is what every
+record written before the field existed means. The key is deliberately excluded from the replay
+key and from the payloads corpus, so no recorded replay identity moves; it is randomly issued
+per call, so replaying a corpus issues fresh keys without touching the equivalence oracle, which
+reads the payloads corpus and never opens the ledger. The value never reaches `status.json`,
+`metrics.json`, or the event stream — carriage is receipt and ledger only, plus the
+`Idempotency-Key` HTTP header on the gateway transport.
+
+W7-2 adds `backoff_ms` to the attempt *entry*, on the receipt and the same ledger line — the
+measured wait the kernel imposed before that dispatch, 0 on the first entry — inside the same
+unreleased window and under the same closed-schema reasoning. It is the first key added to the
+entry after the entry shipped, so the read-whole-or-refused rule gains its stated boundary:
+keys the entry was born with stay required; `backoff_ms` is declared without being required,
+absence meaning a line a W7-1 writer filled, and `monoid validate` keeps passing those
+directories. `to_json` and the ledger projection omit the key when the value is unknown rather
+than emitting null (a value no writer ever wrote) or 0 (a measurement never taken), so legacy
+lines round-trip unchanged; a present null is refused by reader and schema alike. Timing stays
+duration-only — no wall-clock instant joins the entry — and the recorded durations satisfy
+`sum(elapsed_ms) + sum(backoff_ms) <= latency_ms` on one monotonic clock.
+
+In the same window, every `pattern` across the artifact schemas stops accepting a trailing
+newline. `jsonschema` evaluates `pattern` with Python's `re`, where `$` matches immediately before
+a final newline, so `monoid validate` had been certifying `"<digest>\n"`, `"<timestamp>\n"`,
+`"<event.type>\n"` and `"<key>\n"` on `event.v1`, `manifest.v1`, `model-calls.v1`,
+`model-payloads.v1`, `workspace-*`, `approval` and `apply-result` lines. This is a **validation
+tightening, not a schema-version change**: every identifier is unchanged, no writer in this
+project has ever emitted such a value, and the only directories that stop validating are ones
+carrying a value the rest of the kernel already refused. Third parties validating these schemas
+with an ECMA-262 engine see no change at all — the new spelling is redundant there and
+load-bearing only under Python's `re`.
+
+**That window closes at v0.21.0.** Every argument above rests on the same premise — the artifact,
+its writer, its schema and its identifier all arrived inside one unreleased line, so there was no
+population of older readers to be compatible *with*, and a closed schema (`additionalProperties:
+false`) could take a new key without the identifier moving. v0.21.0 is the release that creates
+that population. From it onward `monoid.model-calls.v1` has a released reader, and so do the
+schemas whose `pattern` spelling this section tightened; the next key added to any of them is an
+ordinary compatibility event, decided by the rules at the top of this document rather than by the
+absence of anyone to break. The reasoning above is kept as written because it was true when those
+changes were made — this paragraph dates it, it does not retract it.
+
+`status.json` and `metrics.json` grow the failure-classification keys their readers already had
+event-side (`provider_error_code`, `http_status` — spelled `provider_http_status` on metrics —
+`retryable`, `config_recoverable`, and on status.json while parked, `provider_retried`), and
+`status.json` can now say `state: "paused"` for a cooperatively paused run. All additive under
+each schema's open `additionalProperties`, declared in `STATUS_SCHEMA` / `METRICS_SCHEMA`
+without an identifier change: absent keys on a pre-v0.21 artifact mean what those runs meant —
+no live failure classified, no pause projected — and a reader must treat "absent" and the
+default (`false` / `null` / `""`) alike.
+
+`metrics.updated` grows the three priced sub-counts beside `reasoning_tokens`
+(`cache_read_tokens`, `cache_creation_tokens`, `audio_tokens`), each emitted only when the
+adapter reported one — an absent sub-count means "not reported", not zero. Both tenant-usage
+JSON projections (the gateway's `/internal/llm/tenants/{id}/usage` and the backend's
+`tenant_usage`) gain the same four keys. Neither is a versioned artifact in the inventory above
+and neither has a serialized reader contract; the additions are new keys on a read-only
+projection, so a consumer that ignores them stays correct.
+
 The same durable readers keep pre-v0.20 `PurePath` matching for stored patterns that the current
 grammar rejects, while fresh inputs remain strict. Runtime-config hashes omit only the
 `path_pattern_encoding` representation marker at `tools[*].scope`; raw path arrays and every other

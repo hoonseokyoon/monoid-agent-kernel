@@ -320,7 +320,13 @@ def _default_runtime_config() -> dict[str, Any]:
             "provider": "gateway",
             "model": "gpt-5.5",
             "gateway_url": "http://127.0.0.1:8080/internal/llm/turns",
-            "reasoning": {"effort": "low", "summary": "off"},
+            # The scaffold demonstrates the stack, not transport proof, and it points at a
+            # local gateway an adopter is as likely to start with the fake provider (which
+            # honestly declares no reasoning_support) as with a real one -- under the default
+            # "fail" the reasoning_applied echo check would refuse the very first turn of a
+            # brand-new agent. The effort/summary here are display-grade preferences, so state
+            # the best-effort policy, exactly as Studio and both scenarios do.
+            "reasoning": {"effort": "low", "summary": "off", "on_unsupported": "omit"},
         },
         "prompt": {
             "persona_segments": ["Work directly in the workspace and keep changes focused."],

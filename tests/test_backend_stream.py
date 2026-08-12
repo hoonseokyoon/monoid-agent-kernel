@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from monoid_agent_kernel.core.content import TextPart
-from support.http import serving
+from support.http import LINE_SEPARATORS, serving, sse_data_frames_by_line
 from support.runtime import runtime_config
 
 from monoid_agent_kernel.errors import ModelAdapterError
@@ -117,6 +117,45 @@ def test_backend_streams_run_over_sse(tmp_path: Path, backend_factory: Any) -> N
     assert frames[-1] == frames[-1] and frames[-1]["kind"] == "result"
     assert frames[-1]["status"] == "completed"
     assert frames[-1]["final_text"] == "Hello"
+
+
+def test_a_line_splitting_client_reads_a_run_stream_whose_model_emitted_a_separator(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """SSE is a line protocol and the two ends did not agree on what a line is.
+
+    The writer dumped with ``ensure_ascii=False``, so U+2028, U+2029 and U+0085 went onto the wire
+    as themselves and a ``str.splitlines`` reader -- httpx's ``aiter_lines``, what any third-party
+    consumer of this route reads with -- broke the frame there. The client then parsed JSON that
+    stopped mid-string and saw a failed run the server had produced, framed and already metered.
+
+    Both carriers are pinned because they are separate frames: the ``delta`` frames are raw model
+    text, and the terminal ``result`` frame carries ``final_text`` even when no delta did. The
+    reader is the point of the test -- :func:`_read_sse` above splits on ``\\n\\n`` and passes
+    against the bug.
+    """
+
+    pytest.importorskip("httpx")
+    answer = f"before{LINE_SEPARATORS}after"
+    workspace = _workspace(tmp_path)
+    chunks = [
+        TextDelta(answer),
+        TurnComplete(response_id="prov", usage={"total_tokens": 5}),
+    ]
+    backend = _streaming_backend(backend_factory, workspace, chunks)
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    with serving(server) as base_url:
+        frames = sse_data_frames_by_line(
+            f"{base_url}/v1/runs/stream",
+            token="admin",
+            payload=_run_payload(workspace),
+        )
+
+    deltas = [f for f in frames if f["kind"] == "delta" and f.get("type") == "text_delta"]
+    assert "".join(f["text"] for f in deltas) == answer
+    assert frames[-1]["kind"] == "result"
+    assert frames[-1]["status"] == "completed"
+    assert frames[-1]["final_text"] == answer
 
 
 def test_backend_stream_rejects_non_admin(tmp_path: Path, backend_factory: Any) -> None:

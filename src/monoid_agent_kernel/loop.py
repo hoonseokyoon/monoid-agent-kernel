@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import fnmatch
 import inspect
 import json
@@ -32,6 +33,7 @@ from monoid_agent_kernel.core.checkpoint import (
 from monoid_agent_kernel.core.events import AgentEvent, EventSink
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
+    ModelCallReceipt,
     ModelIOSubscription,
     close_model_io_subscriptions,
 )
@@ -66,9 +68,11 @@ from monoid_agent_kernel.core.media import (
     resolve_wire_messages,
 )
 from monoid_agent_kernel.core.json_ingress import (
+    UnportableValueError,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
+    portable_type_name,
 )
 from monoid_agent_kernel.core.context import (
     ContextProvider,
@@ -152,6 +156,7 @@ from monoid_agent_kernel.errors import (
     PermissionDenied,
     RunCancelled,
     RunTimeout,
+    TurnNotSettled,
     ToolExecutionError,
     TurnInterrupted,
     TurnPaused,
@@ -200,7 +205,13 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolObservation,
     format_async_result_text,
+    mark_provider_retried,
+    mark_provider_usage,
+    portable_usage_value,
+    provider_usage_of,
+    resolved_provider_name,
 )
+from monoid_agent_kernel.providers._common import NORMALIZED_USAGE_KEYS, prune_dead_reasoning
 from monoid_agent_kernel.public_view import (
     args_preview,
     finish_args_preview,
@@ -251,6 +262,68 @@ def _binding_matches(binding: ToolBinding, patterns: tuple[str, ...]) -> bool:
     )
 
 
+def _unrecovered_turn_failure(
+    last_suspension: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Read a durable park back as ``_Session.unrecovered_turn_failure``, or ``None``.
+
+    Only ``turn_failed`` rehydrates: it is the one park that is a *failure the driver has not
+    yet given up on*, and closing on it is giving up. ``settled``/``limited``/``terminal``
+    already recorded their outcome, and ``interrupted``/``paused``/``awaiting_tasks`` are not
+    failures at all -- promoting any of those would invent a failed run out of an ordinary
+    recovery.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return None
+    if last_suspension.get("reason") != "turn_failed":
+        return None
+    error = last_suspension.get("error")
+    error_code = last_suspension.get("error_code")
+    return (
+        str(error) if isinstance(error, str) else "",
+        str(error_code) if isinstance(error_code, str) else "",
+    )
+
+
+def _midturn_park(last_suspension: Mapping[str, Any] | None) -> str | None:
+    """Read a durable mid-turn park back as ``_Session.midturn_park``, or ``None``.
+
+    Only ``paused`` and ``interrupted`` rehydrate: they are the two parks whose turn never
+    settled, and closing on one is abandoning that turn — the close boundary must record
+    that honestly rather than finalize a clean success (see ``_promote_unsettled_close``).
+    ``settled``/``limited``/``terminal`` recorded an outcome and ``turn_failed`` has its
+    own promotion; promoting any of those would misname an ordinary close. ``awaiting_tasks``
+    is deliberately outside this predicate: a task park is normally ended by cancel/drain
+    (which the pending-cancel promotion already records), and widening this promotion to it
+    is a separate decision.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return None
+    reason = last_suspension.get("reason")
+    return reason if reason in ("paused", "interrupted") else None
+
+
+def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[bool, bool]:
+    """Read ``(retryable, config_recoverable)`` back off a durable park observation.
+
+    The live ``RunState`` twins of these are not ``RunCheckpoint`` fields — the park payload
+    already carries them, and a second durable spelling of one fact is the drift this census
+    keeps finding. So the restore reads them here, the same way
+    :func:`_unrecovered_turn_failure` reads the promotion it must survive with: across a
+    restore the committed checkpoint is the only evidence there is, and a promotion that
+    forgets the classification records a config-fixable failure as an unclassified one.
+    """
+
+    if not isinstance(last_suspension, Mapping):
+        return (False, False)
+    return (
+        bool(last_suspension.get("retryable", False)),
+        bool(last_suspension.get("config_recoverable", False)),
+    )
+
+
 def _recoverable_turn_error(exc: BaseException) -> bool:
     """Whether a model-turn exception is *recoverable* — the session should survive and the
     turn can be re-attempted (after backoff, or after the user fixes config) rather than
@@ -258,12 +331,17 @@ def _recoverable_turn_error(exc: BaseException) -> bool:
 
     Recoverable = a ``ModelAdapterError`` that is gateway-flagged ``retryable`` (transient:
     timeouts, network, 429, exhausted 5xx) OR any 4xx (config/auth/rate-limit the user can fix
-    and resend against). Everything else — a generic exception, or an un-flagged 5xx — stays
-    terminal, matching today's behavior.
+    and resend against) OR flagged ``config_recoverable`` (the client-side statement of the
+    same 4xx fact: an applied-parameters proof refusal carries no HTTP status, but its remedy
+    is config the user fixes and resends — the identical condition reported by a gateway
+    server as HTTP 400 already ended only the turn). Everything else — a generic exception,
+    or an un-flagged 5xx — stays terminal, matching today's behavior.
     """
     if not isinstance(exc, ModelAdapterError):
         return False
     if exc.retryable:
+        return True
+    if getattr(exc, "config_recoverable", False):
         return True
     status = exc.http_status
     return status is not None and 400 <= status < 500
@@ -424,7 +502,18 @@ class AgentToolContext(ToolContext):
         path = normalize_unicode_scalars(path)
         kind = normalize_unicode_scalars(kind)
         label = None if label is None else normalize_unicode_scalars(label)
-        metadata = normalize_json_ingress(metadata)
+        try:
+            # The tool-result refusal's census twin: this metadata is handed straight to the
+            # ToolContext seam by a custom handler, so it never crossed a JSON parse and can carry
+            # what no writer downstream — the observation back to the model, the transcript — can
+            # spell. Raised as a classified tool error, the emitting call fails and the run keeps
+            # going, which is what "one hostile value costs its own call" means here.
+            metadata = normalize_json_ingress(metadata, refuse_unportable=True)
+        except UnportableValueError as exc:
+            raise ToolExecutionError(
+                f"artifact metadata is not portable JSON: {exc}",
+                error_code="artifact_metadata_unportable",
+            ) from exc
         data, _digest = self.workspace.read_bytes(path)
         artifact = self.recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
@@ -787,6 +876,16 @@ class RunState:
     error_code: str = ""
     provider_error_code: str = ""
     provider_http_status: int | None = None
+    # Classification of the failure this state describes, carried for exactly as long as
+    # ``provider_error_code``/``provider_http_status`` beside it: set on a recoverable turn
+    # failure, cleared at the next submit, and read by ``_record_failure`` so the promotion of a
+    # park into the terminal record keeps the two flags the park itself carried.
+    #
+    # Deliberately NOT new ``RunCheckpoint`` fields: the durable park observation
+    # (``last_suspension``) already carries both, and that is what ``_rehydrate`` reads them back
+    # from — so the restore path has one authority rather than two that can disagree.
+    retryable: bool = False
+    config_recoverable: bool = False
     final_text: str = ""
     # Whether ``final_text`` came from the model — its response text, or the ``summary`` argument of
     # a ``run.finish`` tool call — rather than being authored by the kernel. Only model-authored text
@@ -854,6 +953,19 @@ class _Session:
     # The observable boundary paired with the latest checkpoint. Backend-owned persistence can
     # commit another snapshot (for example after a task report) without losing this observation.
     last_suspension: dict[str, Any] | None = None
+    # The unpromoted turn_failed park, ``(error, error_code)``. Set by the recoverable branch,
+    # cleared at every pump entry (a re-attempt that settles leaves it cleared; one that fails
+    # again re-sets it), read by ``close()`` to promote an unrecovered park to the terminal
+    # failure record. Deliberately NOT derived from ``last_suspension``: that field only
+    # updates when the park's checkpoint snapshot committed, and the promotion must not
+    # depend on checkpointing having worked.
+    unrecovered_turn_failure: tuple[str, str] | None = None
+    # The un-promoted mid-turn park: ``"paused"`` / ``"interrupted"``, or ``None``. Set by the
+    # two park handlers, cleared at every pump entry (a resume that settles leaves it cleared),
+    # read by ``close()`` to refuse finalizing a never-settled turn as a clean success. NOT
+    # derived from ``last_suspension``, for the same reason ``unrecovered_turn_failure`` is not:
+    # the promotion must not depend on the park's checkpoint commit having worked.
+    midturn_park: str | None = None
     # Recovery-driver input identities survive every later snapshot without coupling the loop to
     # a command transport or orchestration implementation.
     applied_input_ids: set[str] = field(default_factory=set)
@@ -909,6 +1021,19 @@ class AgentLoop:
     # Persist private streamed model content to ``model-content.jsonl``. The recorder owns the
     # file and returns a failure-shielded writer; public events/status remain content-free.
     model_content_file: bool = False
+    # Persist one metadata record per settled model call to ``model_calls.jsonl``. Independent of
+    # the content sidecar above and of ``stream_model_calls``: a ledger of what was called needs
+    # no provider streaming, and folding it into that selection would change cancellation and
+    # interrupt granularity for a run that asked only for receipts.
+    model_calls_file: bool = False
+    # Persist request preimages and settled response bodies to ``model_payloads.jsonl`` (with a
+    # ``model_payloads/`` chunk directory) -- the replay corpus. Independent of the ledger switch
+    # above: either sidecar is meaningful alone, the two have different privacy classes (the
+    # ledger is metadata, the corpus is content), and this one is likewise deliberately NOT part
+    # of the ``wants_content_stream`` selection -- a run that asked only for a corpus must not
+    # have its cancellation and interrupt granularity changed by a streaming drive it never
+    # requested.
+    model_payload_file: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
     # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
@@ -957,6 +1082,15 @@ class AgentLoop:
     capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
+    # Monotonic "this activation was torn down" fact. Set at exactly the sites that null
+    # ``_session`` on a teardown path — ``close()``, ``release_parked()``,
+    # ``discard_uncommitted()`` (the async facades all route through these) — and never by a
+    # successful ``open()``/``restore()``. It exists so an observer (``LoopSession._loop_is_dead``)
+    # can distinguish "not/not-yet opened" (``_session is None`` because bootstrap has not
+    # assigned it — including the backend's aopen window, where the loop is already findable)
+    # from "finalized" (``_session is None`` because teardown ran), instead of guessing from
+    # its own FSM state.
+    _finalized: bool = field(default=False, init=False, repr=False)
     _restoring: bool = field(default=False, init=False, repr=False)
     _model_io_subscriptions_closed: bool = field(default=False, init=False, repr=False)
     # Core-owned per-run event loop for sync callers. Runs continuously on a dedicated
@@ -1191,6 +1325,9 @@ class AgentLoop:
         Blocking wrapper over ``run_until_suspended``: when the run parks on tasks it
         waits in-process (shell monitor completes them, or an external thread reports
         a hosted-task result) and resumes, returning only once the turn settles.
+        A park that settles nothing — a recoverable turn failure, an interrupt, a
+        pause — raises :class:`TurnNotSettled` (the session stays alive; the
+        exception's ``suspension`` carries the evidence).
 
         Sync facade over :meth:`asubmit`; from an async context call ``asubmit``."""
         return self._run_sync(self.asubmit(user_input))
@@ -1208,7 +1345,18 @@ class AgentLoop:
                 session.res.deadline,
             )
             suspension = await self.arun_until_suspended(None)
-        assert suspension.turn is not None  # non-awaiting reasons always checkpoint
+        if suspension.turn is None:
+            # turn_failed / interrupted / paused: nothing settled, so there is no
+            # AgentTurnResult to hand back. The non-blocking pump returns the park as a
+            # Suspension the driver inspects; a blocking facade's only channel is an
+            # exception, so the park surfaces typed. The assert this replaces encoded the
+            # stale claim that every non-awaiting reason attaches a turn — it crashed
+            # submit()/run_once() (and the fork-subagent path through arun_once) with a
+            # message-less AssertionError on the first recoverable turn failure, and under
+            # ``python -O`` it was stripped and returned None typed as AgentTurnResult.
+            # The astream half already handled this (``_astream_drive`` returns the
+            # suspension); this binds the rule on its blocking twin.
+            raise TurnNotSettled(suspension)
         return suspension.turn
 
     def astream(self, user_input: str | tuple[ContentPart, ...]) -> RunStream:
@@ -1268,7 +1416,9 @@ class AgentLoop:
         ``None`` it resumes a run parked on a task (whose result was already injected
         via report_task_result). Returns why the run suspended without blocking on
         tasks — the caller decides how to wait. Every non-``awaiting_tasks`` reason
-        runs a settle checkpoint and attaches the ``AgentTurnResult`` as ``turn``.
+        persists a checkpoint; the settled outcomes (``settled``/``limited``/``terminal``)
+        attach the ``AgentTurnResult`` as ``turn``, while ``turn_failed``/``interrupted``/
+        ``paused`` settle nothing and carry ``turn=None`` — branch on ``reason``.
 
         Sync facade over :meth:`arun_until_suspended`."""
         return self._run_sync(self.arun_until_suspended(user_input))
@@ -1418,6 +1568,11 @@ class AgentLoop:
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
+        # A fresh pump supersedes the prior park: if this attempt settles, the failure was
+        # recovered; if it fails again, the branch below re-sets it. The mid-turn park marker
+        # follows the same rule — a resumed pause/interrupt that runs is no longer frozen.
+        session.unrecovered_turn_failure = None
+        session.midturn_park = None
         state, res = session.state, session.res
         if user_input is not None:
             session.active_turn_id = None
@@ -1428,6 +1583,8 @@ class AgentLoop:
             state.error_code = ""
             state.provider_error_code = ""
             state.provider_http_status = None
+            state.retryable = False
+            state.config_recoverable = False
             state.final_text = ""
             state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
@@ -1481,6 +1638,16 @@ class AgentLoop:
                     Suspension(reason="terminal", status="failed"),
                     error=state.error,
                     error_code=state.error_code,
+                    # The classification the run.failed emit above read, on the park a driver
+                    # actually holds. The Suspension always had these fields; the terminal
+                    # construction dropped them, so a backend promoting "what the park knew"
+                    # promoted defaults over the truth its own event log carried.
+                    # (``provider_retried`` stays default: a per-call fact the terminal
+                    # vocabulary drops, exactly as ``run.failed`` does.)
+                    retryable=state.retryable,
+                    http_status=state.provider_http_status,
+                    config_recoverable=state.config_recoverable,
+                    provider_error_code=state.provider_error_code,
                     turn=self._checkpoint_on_settle(state, res),
                 )
                 self._persist_checkpoint(session, result)
@@ -1493,6 +1660,8 @@ class AgentLoop:
             # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
             state.provider_error_code = exc.provider_error_code
             state.provider_http_status = exc.http_status
+            state.retryable = exc.retryable
+            state.config_recoverable = exc.config_recoverable
             res.recorder.emit(
                 "turn.failed",
                 turn_id=session.active_turn_id,
@@ -1503,6 +1672,12 @@ class AgentLoop:
                     "provider_error_code": exc.provider_error_code,
                     "http_status": exc.http_status,
                     "retryable": exc.retryable,
+                    "config_recoverable": exc.config_recoverable,
+                    "provider_retried": exc.provider_retried,
+                    # What the refused call already cost. Empty when nothing was billed, which
+                    # is the ordinary case; the transcript twin written on this same failure has
+                    # always carried it, and this event is the copy an operator actually reads.
+                    "provider_usage": _billed_usage(exc),
                 },
                 level="warning",
             )
@@ -1513,7 +1688,13 @@ class AgentLoop:
                 error_code=exc.error_code,
                 retryable=exc.retryable,
                 http_status=exc.http_status,
+                config_recoverable=exc.config_recoverable,
+                provider_error_code=exc.provider_error_code,
+                provider_retried=exc.provider_retried,
             )
+            # Remembered on the session (not just the returned Suspension) so a close() with
+            # no later settle can promote this park to the terminal failure record.
+            session.unrecovered_turn_failure = (result.error, result.error_code)
             self._persist_checkpoint(session, result)
             return result
         except TurnInterrupted:
@@ -1530,6 +1711,9 @@ class AgentLoop:
                 level="info",
             )
             state.pending_observations = ()
+            # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
+            # no later settle refuses to finalize this abandoned turn as a clean success.
+            session.midturn_park = "interrupted"
             result = Suspension(reason="interrupted", status="completed")
             self._persist_checkpoint(session, result)
             return result
@@ -1541,12 +1725,26 @@ class AgentLoop:
             # pending_observations + the step counter), so a paused run also survives a restart.
             # ``status`` is cosmetic here; branch on ``reason``.
             self._pause_requested = False
+            # The turn-lane twin of ``turn.interrupted``, and the same CAUSE vocabulary. Without
+            # it the two sibling parks were not observable the same way: a stop emitted a
+            # turn-lane event and a pause emitted only the session-lane one below, so a consumer
+            # watching turns saw one park and not the other.
+            res.recorder.emit(
+                "turn.paused",
+                turn_id=session.active_turn_id,
+                parent_id=session.active_turn_parent_id,
+                data={"reason": "user_pause"},
+                level="info",
+            )
             # Literal state names keep the engine decoupled from the FSM module (the lifecycle
             # layer sits ABOVE the loop); they match SessionState.RUNNING/PAUSED values.
             res.recorder.emit(
                 "session.state.changed",
                 data={"state": "paused", "from": "running", "reason": "pause_requested"},
             )
+            # The frozen turn never settled; a close over this park must not read the
+            # per-submit reset state as a clean success (twin of the interrupt marker above).
+            session.midturn_park = "paused"
             result = Suspension(reason="paused", status="completed")
             self._persist_checkpoint(session, result)
             return result
@@ -1557,6 +1755,12 @@ class AgentLoop:
                 Suspension(reason="terminal", status="failed"),
                 error=state.error,
                 error_code=state.error_code,
+                # The twin of the non-recoverable ModelAdapterError arm above: the same state
+                # the run.failed emit read, on the returned park.
+                retryable=state.retryable,
+                http_status=state.provider_http_status,
+                config_recoverable=state.config_recoverable,
+                provider_error_code=state.provider_error_code,
                 turn=self._checkpoint_on_settle(state, res),
             )
             self._persist_checkpoint(session, result)
@@ -1605,6 +1809,89 @@ class AgentLoop:
                 status="failed",
                 error=session.state.error,
                 error_code=session.state.error_code,
+                # The inherited classification the promotion kept — the durable observation of
+                # this park is where a post-restart reader learns what the run died of.
+                retryable=session.state.retryable,
+                http_status=session.state.provider_http_status,
+                config_recoverable=session.state.config_recoverable,
+                provider_error_code=session.state.provider_error_code,
+            ),
+        )
+
+    def _promote_pending_cancel(self, session: _Session) -> None:
+        """Promote a cancellation acknowledged at a quiescent park to the terminal cancelled
+        outcome — the close-boundary twin of the pump's ``RunCancelled`` handler, in the same
+        vocabulary (``status="limited"``, ``error_code="cancelled"``, a kept terminal park).
+
+        A cancel that lands while a turn is stepping raises at the next boundary check and the
+        pump settles it terminal, so it never reaches here un-terminal. A cancel that lands
+        while the run sits parked has no pump to raise in: ``close()`` then read the per-submit
+        reset state and recorded the cancelled run as a clean success — and the completed-run
+        cleanup below deleted the very checkpoints a cancelled run keeps for restore. A no-op
+        when nothing is pending or the run already settled terminal."""
+        token = self.cancellation_token
+        if session.terminal or token is None or not token.requested:
+            return
+        state = session.state
+        exc = RunCancelled("run cancelled")
+        state.status = "limited"
+        state.error = str(exc)
+        state.error_code = error_code_for_exception(exc)
+        # A settled park's final text SURVIVES the cancel: the answer the turn produced is
+        # the run's, and the cancel statement already lives in error/error_code ("cancelled").
+        # v0.20 returned the answer with the wrong COMPLETED status; the status fix must not
+        # silently take the answer with it. Only a park with no text of its own — a mid-turn
+        # cancel, whose per-submit reset cleared it — gets the kernel's stop notice, exactly
+        # like the pump's ``RunCancelled`` handler (where the reset has always run first).
+        # Preserved text keeps its provenance flag, so a model answer stays digested on
+        # ``run.finished`` rather than being republished inline.
+        if not state.final_text:
+            state.final_text = "Stopped because the run was cancelled."
+            state.final_text_is_model_output = False
+        session.terminal = True
+        self._persist_checkpoint(
+            session,
+            Suspension(
+                reason="terminal",
+                status="limited",
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+            ),
+        )
+
+    def _promote_unsettled_close(self, session: _Session) -> None:
+        """Promote a close over a mid-turn park (``paused``/``interrupted``) to an honest
+        limited outcome — the third close-boundary promotion, beside the pending cancel and
+        the unrecovered turn failure.
+
+        A paused turn is frozen at a step boundary with its observations still unsent; an
+        interrupted turn was abandoned before settling. ``close()`` used to read the
+        per-submit reset state for both and finalize a clean COMPLETED with an empty answer
+        — and the completed-run cleanup then deleted the only checkpoints holding the frozen
+        turn. Backend-reachable via ``pause_run`` + idle timeout, so this is not a
+        facade-only corner. ``status="limited"`` / ``error_code="closed_unsettled"`` (one
+        code for both variants; documented in CONTRACTS.md) keeps the checkpoints — the
+        delete gates on ``status == "completed"`` — and the minted park carries an empty
+        classification: nothing here is a provider failure. A settled ``awaiting_input``
+        park is NOT this (its turn completed; close finalizes the success it was), and an
+        acknowledged cancel — the operator's stronger verdict — runs first and stands this
+        promotion down via ``session.terminal``."""
+        if session.terminal or session.midturn_park is None:
+            return
+        state = session.state
+        state.status = "limited"
+        state.error = f"run closed while its turn was {session.midturn_park}; the turn never settled"
+        state.error_code = "closed_unsettled"
+        session.terminal = True
+        self._persist_checkpoint(
+            session,
+            Suspension(
+                reason="terminal",
+                status="limited",
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
             ),
         )
 
@@ -1633,6 +1920,25 @@ class AgentLoop:
         run.finished, close the recorder, and return the cumulative result."""
         session = self._require_open()
         try:
+            # Ordered before the turn-failure promotion below: a cancel acknowledged at an
+            # errored park is the operator's later, stronger verdict, and after it the run is
+            # terminal so the failure promotion correctly stands down.
+            self._promote_pending_cancel(session)
+            if session.unrecovered_turn_failure is not None and not session.terminal:
+                # Closing on an unrecovered turn_failed park IS the driver giving up — the
+                # same promotion ``fail_recoverable`` performs explicitly. Without it,
+                # finalize read the per-turn reset state and recorded this run as a clean
+                # success (run.finished status=completed, no failure.json), and the
+                # completed-run cleanup below then deleted the very checkpoints the park
+                # preserves for an operator-driven restore. One seam here covers run_once,
+                # the fork-subagent child, and a direct open/submit/close driver alike.
+                error, error_code = session.unrecovered_turn_failure
+                self.fail_recoverable(
+                    error or "turn failed", error_code=error_code or "model_error"
+                )
+            # Third and last: a mid-turn park (paused/interrupted) whose turn never settled.
+            # A no-op once either promotion above already terminalized the run.
+            self._promote_unsettled_close(session)
             result = self._finalize(session.state, session.res)
         except BaseException:
             # A failed terminal transition cannot remain submit-capable with already-closed
@@ -1653,6 +1959,7 @@ class AgentLoop:
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.
+            self._finalized = True
             self._session = None
             self._bootstrap_resources = None
             self._stream_sink = None
@@ -1694,6 +2001,9 @@ class AgentLoop:
             except BaseException:
                 pass
             raise
+        # The RUN stays durably resumable (a NEW loop restores the committed boundary); THIS
+        # activation is torn down, and deadness is a per-activation fact.
+        self._finalized = True
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1736,6 +2046,7 @@ class AgentLoop:
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
         self._close_model_io_subscriptions(resources)
+        self._finalized = True
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
@@ -1782,7 +2093,26 @@ class AgentLoop:
                     session.state.messages = [dict(message) for message in normalized_messages]
                 if seed_media_blobs:
                     session.state.media_blobs = dict(seed_media_blobs)
-                await self.asubmit(user_input)
+                try:
+                    await self.asubmit(user_input)
+                except TurnNotSettled as parked:
+                    # One-shot: there is no next submit for the park to stay alive for, and
+                    # the finally below closes the run — where an unrecovered turn_failed
+                    # park is promoted to the terminal failure record (failure.json,
+                    # run.failed, checkpoints kept). That record IS this call's result, so
+                    # it returns as the failed AgentRunResult instead of escaping past the
+                    # close that wrote it: the escape skipped the fork-subagent roll-up and
+                    # terminal event, and left the CLI with a raw traceback.
+                    #
+                    # Absorbed for exactly the park close() can promote, and no wider.
+                    # ``TurnNotSettled`` also carries ``interrupted`` and ``paused``, which
+                    # produce no record at all — swallowing those finalized the run
+                    # ``completed`` with no settled answer, telling a caller who asked it to
+                    # stop that it had succeeded, and letting the completed-run cleanup
+                    # delete the checkpoints the park preserved. They surface typed instead,
+                    # after the same close() the absorbed case gets.
+                    if parked.reason != "turn_failed":
+                        raise
         finally:
             result = self.close()
         return result
@@ -1913,12 +2243,18 @@ class AgentLoop:
         invocation_context: InvocationContext,
         step: int,
         turn_id: str,
-    ) -> ModelTurn:
+    ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
         The dispatch, the cancel/deadline race and the receipt live in ``ModelCallRunner``. What
         stays here is the part that is genuinely about *this* run: which consumer the chunks go to,
         and whether a cooperative stop applies.
+
+        The receipt comes back beside the turn because the two answer different questions and
+        the caller needs both: the turn is what the model said, the receipt is what the call
+        cost. Under the kernel retry layer the receipt's ``usage`` carries absorbed attempts'
+        spend the turn cannot know about, and the accumulation that feeds ``total_usage``, the
+        metrics event, and the token budget reads the receipt for exactly that reason.
 
         A live ``RunStream`` relays every provider chunk and does **not** honour the turn interrupt
         -- that has always been a step-boundary signal on this path. Autonomous streaming honours
@@ -1954,13 +2290,7 @@ class AgentLoop:
 
         if wants_stream:
             if wants_content_stream:
-                try:
-                    provider_value = getattr(self.model_adapter, "provider_name", None)
-                    if not provider_value and request.model is not None:
-                        provider_value = request.model.provider
-                    provider = str(provider_value) if provider_value else None
-                except Exception:
-                    provider = None
+                provider = resolved_provider_name(self.model_adapter, request.model)
                 try:
                     model_value = request.model.model if request.model is not None else None
                     model = str(model_value) if model_value else None
@@ -2027,8 +2357,9 @@ class AgentLoop:
         outcome_usage: Mapping[str, Any] | None = None
         outcome_error_code: str | None = None
         outcome_retryable = False
+        outcome_config_recoverable = False
         try:
-            turn, _receipt = await runner.acall(
+            turn, receipt = await runner.acall(
                 request,
                 context=invocation_context,
                 deadline=deadline,
@@ -2039,7 +2370,12 @@ class AgentLoop:
             outcome_status = "interrupted"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "interrupted"
-            raise TurnInterrupted("turn interrupted") from exc
+            # Through the carrying rule for the same reason the translator below is: this replaces
+            # one exception with another, and a freshly built ``TurnInterrupted`` carries none of
+            # what the runner stamped on the abort -- including the bill for every attempt a kernel
+            # retry absorbed before the turn was stopped. Those attempts completed and were charged
+            # for; the interrupt did not un-spend them.
+            raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
         except RunCancelled:
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
@@ -2066,7 +2402,22 @@ class AgentLoop:
                 outcome_retryable = isinstance(exc, ModelAdapterError) and exc.retryable is True
             except Exception:
                 outcome_retryable = False
-            raise
+            # Read off the same exception, on the same terms: the live lane classifies the park
+            # with the same two words the park itself carries.
+            try:
+                outcome_config_recoverable = (
+                    isinstance(exc, ModelAdapterError) and exc.config_recoverable is True
+                )
+            except Exception:
+                outcome_config_recoverable = False
+            # Translated here for the same reason ``ModelCallAborted`` is: the runner raises what
+            # the adapter raised, and the caller answers for a model call in one arm typed to
+            # ``ModelAdapterError``. An untranslated third-party exception took the generic arm
+            # instead and arrived there stripped of the bill the runner had just stamped on it.
+            failure = _as_model_adapter_error(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
         else:
             outcome_status = "completed"
             outcome_final_text = turn.final_text
@@ -2080,6 +2431,7 @@ class AgentLoop:
                         usage=outcome_usage,
                         error_code=outcome_error_code,
                         retryable=outcome_retryable,
+                        config_recoverable=outcome_config_recoverable,
                     )
                 except Exception:
                     # Outcome capture is diagnostic too. Preserve the terminal status even if a
@@ -2091,7 +2443,7 @@ class AgentLoop:
                         writer.close(outcome)
                     except Exception:  # observers cannot replace the provider outcome
                         _LOGGER.debug("model stream observer close failed", exc_info=True)
-        return turn
+        return turn, receipt
 
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:
         """Bind caller provenance to this loop's durable, monotonic model-call address."""
@@ -2151,15 +2503,25 @@ class AgentLoop:
                 state.provider_error_code = exc.provider_error_code
             if exc.http_status is not None:
                 state.provider_http_status = exc.http_status
+            # Same rule for the classification: the synthetic promotion wrapper carries the
+            # defaults, so an asserted flag on it wins and silence keeps what the park recorded.
+            if exc.retryable:
+                state.retryable = True
+            if exc.config_recoverable:
+                state.config_recoverable = True
         else:
             # A fresh terminal failure reflects THIS exception — clearing any stale provider detail
             # an earlier, unrelated recoverable turn.failed may have left on the state.
             if isinstance(exc, ModelAdapterError):
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
+                state.retryable = exc.retryable
+                state.config_recoverable = exc.config_recoverable
             else:
                 state.provider_error_code = ""
                 state.provider_http_status = None
+                state.retryable = False
+                state.config_recoverable = False
         state.final_text = ""
         state.final_text_is_model_output = False
         res.recorder.emit(
@@ -2167,11 +2529,22 @@ class AgentLoop:
             data={
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
-                "type": type(exc).__name__,
+                # `portable_type_name`, not `type(exc).__name__`: a tool handler raises whatever
+                # class it likes, and the name is read off that class, so its metaclass answers.
+                # Raising there took `run_once` out entirely -- no `run.failed`, no `failure.json`,
+                # no terminal record of any kind, from inside the code that exists to write one.
+                # A 1,000,000-character class name is the same site's other direction: measured, a
+                # 1,000,433-byte `run.failed` and a 1,000,373-byte failure bundle.
+                "type": portable_type_name(exc),
                 # Provider failure detail (codes/status, never the raw body) — mirrors turn.failed
                 # so the real cause (e.g. insufficient_quota / HTTP 429) reaches logs and the UI.
                 "provider_error_code": state.provider_error_code,
                 "http_status": state.provider_http_status,
+                # The classification the promoted turn.failed carried. Without it the terminal
+                # log of a config-fixable failure could not say it was one, and the driver that
+                # gave up left no record of *what* it gave up on.
+                "retryable": state.retryable,
+                "config_recoverable": state.config_recoverable,
             },
             level="error",
         )
@@ -2187,7 +2560,19 @@ class AgentLoop:
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
                 "provider_error_code": state.provider_error_code,
-                "type": type(exc).__name__,
+                # Same state the run.failed emit above reads. The operator's restore aid used to
+                # drop the one field the log beside it kept, so diagnosing a failure from the
+                # bundle alone could not tell a 429 from a 400 from a transport error.
+                "http_status": state.provider_http_status,
+                # Read from the same state as the event above, for the same reason: the operator
+                # restoring from this bundle alone must be able to tell "resend after fixing the
+                # config" from "this will fail again the same way".
+                "retryable": state.retryable,
+                "config_recoverable": state.config_recoverable,
+                # Read the same way as the event above, and for the sharper reason: this bundle is
+                # the operator's restore aid, so an exception that answers for its own class name
+                # destroyed the only record of the failure being recorded.
+                "type": portable_type_name(exc),
                 "last_good_seq": last_good_seq,
                 "restore_hint": (
                     f"restore checkpoint seq {last_good_seq} for run {self.spec.run_id} "
@@ -2236,6 +2621,25 @@ class AgentLoop:
 
     # --- durable persistence (state snapshots at safe recovery boundaries) ---
 
+    def at_quiescent_park(self) -> bool:
+        """Whether this activation is idle at a committed suspension boundary. Pure read.
+
+        True only for a live (non-terminal) session holding a committed park observation.
+        ``arun_until_suspended`` clears ``last_suspension`` synchronously at pump entry —
+        before its first await — and only the park's own checkpoint commit restores it, so a
+        callable running on the same event loop that drives the pump reads an exact
+        in-flight marker here: either the run is parked (True) or a pump owns the state
+        (False). A terminal or torn-down activation answers False — for a caller deciding
+        whether a park snapshot is safe, those mean "nothing left to snapshot". The backend's
+        cancel ack uses this to refuse re-committing a park checkpoint over a turn that has
+        already resumed (same-seq ``put`` would replace the committed park's content)."""
+        session = self._session
+        return (
+            session is not None
+            and not session.terminal
+            and session.last_suspension is not None
+        )
+
     def snapshot(self) -> RunCheckpoint | None:
         """Capture the run's current safe state as a ``RunCheckpoint``, or ``None`` when
         a durable snapshot is unsafe right now. Pure read — never mutates state or jobs.
@@ -2282,7 +2686,17 @@ class AgentLoop:
             ),
             total_tool_calls=state.total_tool_calls,
             output_retries=state.output_retries,
+            # The budget's evidence, beside the budget. Restoring the counter without the
+            # history renumbered a mid-repair run's attempts from 1 and dropped
+            # failures_by_validator out of metrics.json.
+            output_failure_history=[dict(entry) for entry in state.output_failure_history],
             total_usage=dict(state.total_usage),
+            # The AgentToolContext-owned roll-ups, so metrics.json reports one epoch rather
+            # than pre-restart token totals beside post-restart subagent/skill counts.
+            subagent_count=res.context.subagent_count,
+            subagent_usage=dict(res.context.subagent_usage),
+            skill_activation_count=res.context.skill_activation_count,
+            skills_activated=list(res.context.skills_activated),
             messages=list(state.messages),
             session_step=session.session_step,
             submit_local_step=session.submit_local_step,
@@ -2477,12 +2891,15 @@ class AgentLoop:
                 )
             except (AttributeError, TypeError, ValueError) as exc:
                 raise AgentConfigError(f"invalid restored runtime config: {exc}") from exc
+        restored_retryable, restored_config_recoverable = _park_classification(cp.last_suspension)
         state = RunState(
             status=cp.status,
             error=cp.error,
             error_code=cp.error_code,
             provider_error_code=cp.provider_error_code,
             provider_http_status=cp.provider_http_status,
+            retryable=restored_retryable,
+            config_recoverable=restored_config_recoverable,
             final_text=cp.final_text,
             # Fail closed. Provenance is not in the checkpoint, so a restored non-empty final_text is
             # assumed to be the model's: over-digesting a resumed kernel message costs a sentence in
@@ -2503,6 +2920,7 @@ class AgentLoop:
             previous_runtime_config=previous_runtime_config,
             total_tool_calls=cp.total_tool_calls,
             output_retries=cp.output_retries,
+            output_failure_history=[dict(entry) for entry in cp.output_failure_history],
             total_usage=dict(cp.total_usage)
             or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             messages=list(cp.messages),
@@ -2513,6 +2931,13 @@ class AgentLoop:
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
         )
+        # The context-owned roll-ups, restored beside their RunState twins above so
+        # ``build_metrics`` reports one epoch. The context is rebuilt per activation, so these
+        # are the only counters on it that have a durable slot at all.
+        res.context.subagent_count = cp.subagent_count
+        res.context.subagent_usage = dict(cp.subagent_usage)
+        res.context.skill_activation_count = cp.skill_activation_count
+        res.context.skills_activated = list(cp.skills_activated)
         # Reinstall durable (approved) capability leases so a human-approved capability is not
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:
@@ -2556,6 +2981,18 @@ class AgentLoop:
             # Continue the sequence so the next park commits cp.seq + 1.
             checkpoint_seq=cp.seq,
             last_suspension=(dict(cp.last_suspension) if cp.last_suspension is not None else None),
+            # Rehydrated, because the promotion has to survive the process boundary it exists
+            # for. The live field is deliberately not derived from ``last_suspension`` (a park
+            # whose snapshot failed to commit must still promote), but that argument runs the
+            # other way here: across a restore the checkpoint is the *only* evidence, and it
+            # demonstrably committed -- this code is reading it. Without this, a crash-and-
+            # recover of exactly the run the park preserves checkpoints for closed
+            # ``completed``, wrote no failure record, and let the completed-run cleanup delete
+            # them. A later settle clears it at pump entry, same as in-process.
+            unrecovered_turn_failure=_unrecovered_turn_failure(cp.last_suspension),
+            # Same argument, same boundary: a restored paused/interrupted park that is then
+            # closed without a resume must promote exactly as the in-process park would.
+            midturn_park=_midturn_park(cp.last_suspension),
             applied_input_ids=set(cp.applied_input_ids),
             active_input=(dict(cp.active_input) if cp.active_input is not None else None),
             applied_input_receipts={
@@ -2579,7 +3016,17 @@ class AgentLoop:
         crashed = self._crashed_shell_observations(res)
         if crashed:
             state.pending_observations = state.pending_observations + crashed
-        if cp.cancellation_requested and self.cancellation_token is not None:
+        if cp.cancellation_requested:
+            # Unconditional. ``snapshot()`` writes this flag whenever the token was cancelled,
+            # and the restore used to apply it only when a token was already installed — so a
+            # recovery driver that rebuilds the loop without one (the ordinary shape: a fresh
+            # AgentLoop has ``cancellation_token=None``) silently un-cancelled a run whose
+            # cancellation was durable. Minting here matches ``astream`` above and
+            # ``LoopSession.cancel``: the flag is the request, the token is only the channel a
+            # boundary check reads it through. An embedder deliberately re-running a cancelled
+            # checkpoint clears ``cancellation_requested`` before restoring.
+            if self.cancellation_token is None:
+                self.cancellation_token = CancellationToken()
             self.cancellation_token.cancel()
 
     @staticmethod
@@ -2809,18 +3256,31 @@ class AgentLoop:
             emit_output_deltas=self.emit_output_deltas,
             stream_model_calls=self.stream_model_calls,
             model_content_file=self.model_content_file,
+            # Inherited like the content switch. The child builds its own recorder over its own
+            # run directory, so its ledger lands there rather than here -- which is why every
+            # record carries ``root_run_id``.
+            model_calls_file=self.model_calls_file,
+            model_payload_file=self.model_payload_file,
             model_stream_observer_factories=self.model_stream_observer_factories,
         )
         child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
+        # The child's metrics FILTERED to the usage vocabulary. The authority is
+        # ``providers/_common.py:NORMALIZED_USAGE_KEYS`` -- the whole emitted domain of
+        # ``normalize_usage`` -- rather than a hand-written three-key tuple, which meant a
+        # child's cache and reasoning tokens never reached the parent's budget: an undercount in
+        # exactly the aggregate a bound is checked against. Filtered rather than splatted,
+        # because ``result.metrics`` also carries ``steps_limit`` / ``tool_calls`` /
+        # ``duration_s``, and folding those into a token total would corrupt it.
         usage = {
             key: result.metrics[key]
-            for key in ("input_tokens", "output_tokens", "total_tokens")
+            for key in NORMALIZED_USAGE_KEYS
             if isinstance(result.metrics, dict) and key in result.metrics
         }
-        # Report-only roll-up onto the parent context (NOT total_usage; see field comment).
+        # Report-only roll-up onto the parent context, AND into the parent's cumulative
+        # ``total_usage`` -- a child's tokens are spent on the parent's budget.
         if self._session is not None:
             parent_ctx = self._session.res.context
             parent_ctx.subagent_count += 1
@@ -3102,6 +3562,92 @@ class AgentLoop:
             },
         )
         state.previous_runtime_config = config
+
+    def _account_billed_model_call(
+        self,
+        exc: BaseException,
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> dict[str, int]:
+        """The one route a failed model call's already-billed spend takes into the run's totals.
+
+        Two arms end a model call by re-raising, and the accounting was written into one of them.
+        A rule living inside a handler is a rule bound to the exception types that handler
+        catches: ``except ModelAdapterError`` covers a provider's refusal and nothing else, so a
+        run boundary -- which is a ``NativeAgentError`` and takes the next arm -- carried its
+        absorbed attempts' bill out of the loop with no one reading it. Written once here so the
+        arms cannot answer the question differently; each arm still decides whether it has a
+        transcript row to write, which is the part that genuinely differs between them.
+
+        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
+        the totals moved, and a meter that publishes only when a turn *settles* leaves a run whose
+        model calls all failed billed reporting a cost of zero.
+        """
+
+        billed = _billed_usage(exc)
+        if not billed:
+            return {}
+        _accumulate_usage_mapping(state.total_usage, billed)
+        self._emit_metrics_updated(
+            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
+        )
+        return billed
+
+    def _emit_metrics_updated(
+        self,
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+    ) -> None:
+        """Publish the run's cumulative meters after one model call, settled or refused.
+
+        The ONE writer of ``metrics.updated``. It was inline in the success path, so the
+        ModelAdapterError arm — which accumulates the billed usage of a call that failed *after*
+        the provider charged for it — moved the totals without publishing them, and a run whose
+        only model call failed billed never published its cost at all. A second inline emit
+        would have been a twin to keep in step; one function is the binding.
+        """
+
+        metrics_data: dict[str, Any] = {
+            "step": step,
+            "tool_calls": state.total_tool_calls,
+            "input_tokens": state.total_usage["input_tokens"],
+            "output_tokens": state.total_usage["output_tokens"],
+            "total_tokens": state.total_usage["total_tokens"],
+            "web_search_calls": context.web_service.web_search_calls,
+            "web_fetch_calls": context.web_service.web_fetch_calls,
+            "web_context_calls": context.web_service.web_context_calls,
+            "web_failed_calls": context.web_service.web_failed_calls,
+        }
+        # The priced sub-counts, each published only when the adapter reported one -- a run that
+        # used no cache must not read as one whose cache saved nothing. ``reasoning_tokens`` was
+        # the only one of the four on this event (R10's studio meter), so a cache-heavy run's
+        # priced detail never reached a live consumer at all. Spelled out one key at a time on
+        # purpose: a loop over a key tuple writes a computed subscript, which the carriage census
+        # cannot read, and an unreadable write is a wire key with no schema diff.
+        if state.total_usage.get("cache_read_tokens"):
+            metrics_data["cache_read_tokens"] = state.total_usage["cache_read_tokens"]
+        if state.total_usage.get("cache_creation_tokens"):
+            metrics_data["cache_creation_tokens"] = state.total_usage["cache_creation_tokens"]
+        if state.total_usage.get("reasoning_tokens"):
+            metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
+        if state.total_usage.get("audio_tokens"):
+            metrics_data["audio_tokens"] = state.total_usage["audio_tokens"]
+        recorder.emit(
+            "metrics.updated",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data=metrics_data,
+        )
 
     async def _apump_turn(
         self, state: RunState, res: _RunResources, session: _Session
@@ -3388,7 +3934,17 @@ class AgentLoop:
             # By-value wire copy: the durable log stays by-reference; a multimodal adapter
             # gets media resolved to wire blocks here (once per turn, not per retry). A
             # text-only adapter receives the by-reference log and projects it to text.
-            wire_messages = tuple(state.messages)
+            #
+            # Reasoning blocks that fall outside the active replay window (everything before the
+            # last user message) are dropped from that copy: the adapter's own replay rule
+            # ignores them, so they are bytes the provider provably discards -- and they
+            # accumulate, one per user turn, re-sent on every later request, against the wire cap
+            # here and the receiving server's body limit past it. ``state.messages`` and the
+            # checkpoint keep every block verbatim; only the request is pruned. This is the one
+            # seam every request is built through, so the prune binds all of them: the sync
+            # facade runs this same coroutine, and the streaming path builds its request from
+            # this same ``wire_messages``.
+            wire_messages = prune_dead_reasoning(state.messages)
             if getattr(self.model_adapter, "supports_multimodal", False):
                 # Tool-result image eviction runs on the by-reference copy BEFORE resolution,
                 # so dropped images are never read/encoded. Off unless a keep-N is configured.
@@ -3448,7 +4004,7 @@ class AgentLoop:
                 }
             )
             try:
-                turn = await self._acall_model(
+                turn, call_receipt = await self._acall_model(
                     request,
                     deadline,
                     res.model_runner,
@@ -3459,6 +4015,12 @@ class AgentLoop:
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
+                # A failure after a billed answer still costs tokens. The proof refusals parse
+                # a complete turn, read its usage, and only then reject it -- so the provider
+                # generated the output and charged for it while this path returns no turn and
+                # never reaches the accumulation below. Counted here, or the cumulative token
+                # budget silently under-counts every refused call and the metrics report a run
+                # cheaper than it was.
                 recorder.transcript(
                     {
                         "kind": "model_turn",
@@ -3466,21 +4028,96 @@ class AgentLoop:
                         "response_id": None,
                         "final_text": None,
                         "tool_calls": [],
-                        "usage": {},
+                        "usage": dict(_billed_usage(exc)),
                         "error": str(exc),
                         "error_code": exc.error_code,
                         "provider_error_code": exc.provider_error_code,
                         "retryable": exc.retryable,
                         "http_status": exc.http_status,
+                        "config_recoverable": exc.config_recoverable,
+                        "provider_retried": exc.provider_retried,
                     }
                 )
+                self._account_billed_model_call(
+                    exc,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                )
                 raise
-            except NativeAgentError:
+            except NativeAgentError as exc:
+                # The twin of the arm above, and for a while the one that accounted for nothing.
+                # Every run boundary is a ``NativeAgentError`` -- ``RunCancelled``, ``RunTimeout``,
+                # the ``TurnInterrupted`` the abort is translated into -- so a call the run itself
+                # ended landed here and dropped whatever a kernel retry had already absorbed. Those
+                # attempts are completed, billed wire calls that finished before anything was
+                # cancelled: the ledger names them, and the totals did not. No transcript row goes
+                # with it -- there is no model_turn to describe and no taxonomy to describe it
+                # with; the boundary writes its own record, and this arm answers only for the bill.
+                self._account_billed_model_call(
+                    exc,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_started.event_id,
+                )
                 raise
             except Exception as exc:
-                raise ModelAdapterError(str(exc)) from exc
+                # The same translator ``_acall_model`` raises through, so the two doors into this
+                # handler cannot disagree about what a model failure carries. Reached only by an
+                # exception raised *around* the call rather than by it, since the boundary below
+                # already speaks this vocabulary.
+                raise _as_model_adapter_error(exc) from exc
+            except (asyncio.CancelledError, KeyboardInterrupt) as exc:
+                # A stop, not a failure -- and not an ``Exception`` either, so it reached none of
+                # the three arms above. Not "fell through" them: there was no arm, which is why an
+                # enumeration of arms could not see it. The runner stamps the cumulative bill onto
+                # whatever escapes, and on these two nothing read it.
+                #
+                # These two account and the arm below does not, because the difference is whether
+                # the run outlives the stop. A host that cancels the driving task still finalizes
+                # the run and reports its totals; a Ctrl-C leaves the recorder and its sinks open.
+                # The spend was incurred by attempts that completed *before* the stop arrived.
+                #
+                # Guarded, unlike its siblings, and that difference is deliberate: accounting
+                # publishes ``metrics.updated`` through the recorder, an observer there may raise,
+                # and an exception escaping this handler would REPLACE the stop -- a coroutine
+                # that swallows a ``CancelledError`` is a broken coroutine, which is a worse
+                # outcome than a lost meter. The accumulation happens before the publish inside
+                # the call, so the totals still move when only the event fails.
+                with contextlib.suppress(Exception):
+                    self._account_billed_model_call(
+                        exc,
+                        recorder,
+                        state,
+                        context,
+                        step=step,
+                        turn_id=turn_id,
+                        parent_id=turn_started.event_id,
+                    )
+                raise
+            except BaseException:
+                # ``SystemExit`` and ``GeneratorExit`` -- everything outside ``Exception`` that the
+                # arm above does not name -- and by convention anything else raised outside the
+                # ``Exception`` hierarchy means "do not run ordinary cleanup". Interpreter and
+                # generator teardown is where a recorder's sinks are closing or already closed, and
+                # an accounting side effect there buys a meter nobody will read at the price of
+                # touching a closing file. Deliberately silent, and written down rather than left
+                # to an absent arm: an arm that does not exist records no decision, which is how
+                # the cancellation above went four rounds without one.
+                raise
             self._check_run_boundary(deadline)
-            _accumulate_usage(state.total_usage, turn)
+            # The receipt, not the turn: the two agree everywhere except under a retry layer,
+            # where the receipt's usage carries absorbed attempts' spend the turn cannot know
+            # about. The transcript row below keeps ``turn.usage`` -- the model's statement --
+            # so the reconciliation rule is: totals == transcript rows + absorbed spend, and
+            # the ledger's receipt is the per-call authority for both.
+            _accumulate_usage_mapping(state.total_usage, call_receipt.usage)
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
             # Append the assistant reply to the by-value log (text + any tool calls).
             assistant_message: dict[str, Any] = {
@@ -3513,6 +4150,10 @@ class AgentLoop:
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
                     "usage": turn.usage,
+                    # Carried by ``ModelTurn`` and by the call receipt, and dropped here: the
+                    # replay artifact of a retried-then-successful call read as a clean single
+                    # attempt. Its failure twin above records the same fact.
+                    "provider_retried": turn.provider_retried,
                 }
             )
             recorder.emit(
@@ -3533,26 +4174,13 @@ class AgentLoop:
                     "usage": turn.usage,
                 },
             )
-            metrics_data: dict[str, Any] = {
-                "step": step,
-                "tool_calls": state.total_tool_calls,
-                "input_tokens": state.total_usage["input_tokens"],
-                "output_tokens": state.total_usage["output_tokens"],
-                "total_tokens": state.total_usage["total_tokens"],
-                "web_search_calls": context.web_service.web_search_calls,
-                "web_fetch_calls": context.web_service.web_fetch_calls,
-                "web_context_calls": context.web_service.web_context_calls,
-                "web_failed_calls": context.web_service.web_failed_calls,
-            }
-            # Surface reasoning tokens (the priced, invisible "thinking" sub-count) when the
-            # adapter reports them, so the studio meter can show the reasoning share (R10).
-            if state.total_usage.get("reasoning_tokens"):
-                metrics_data["reasoning_tokens"] = state.total_usage["reasoning_tokens"]
-            recorder.emit(
-                "metrics.updated",
+            self._emit_metrics_updated(
+                recorder,
+                state,
+                context,
+                step=step,
                 turn_id=turn_id,
                 parent_id=turn_started.event_id,
-                data=metrics_data,
             )
 
             if not turn.tool_calls:
@@ -5131,12 +5759,83 @@ class AgentLoop:
         self.permission_policy.check_paths(operation, paths)  # type: ignore[arg-type]
 
 
-def _accumulate_usage(total_usage: dict[str, int], turn: ModelTurn) -> None:
-    """Sum every integer usage field across turns. The core three always exist; optional
-    priced sub-counts (cache_read/cache_creation/reasoning/audio) accumulate too when the
-    adapter reports them, so they reach metrics and the token-budget check."""
-    for key, value in turn.usage.items():
-        if type(value) is not int or value < 0:
+def _billed_usage(exc: BaseException) -> dict[str, int]:
+    """Usage a failing call already incurred, as stamped by ``mark_provider_usage``.
+
+    A call can fail *after* the provider produced and billed a complete answer -- the
+    applied-parameters proof refusals are exactly that shape. Those tokens are spent whether or
+    not the turn is accepted, so they belong in the run's totals; a budget that skips them is a
+    bound that does not hold. Guarded read, like every other fact carried on an exception here.
+    """
+
+    return provider_usage_of(exc)
+
+
+def _as_model_adapter_error(exc: BaseException) -> BaseException:
+    """What the loop raises in place of a provider failure the adapter did not classify.
+
+    A model call's failure accounting lives in one arm -- ``except ModelAdapterError`` -- because
+    that is the type the runner raises. A third-party adapter is free to raise its own, and the
+    generic arm used to build a fresh ``ModelAdapterError`` out of the message alone: the stamps
+    the runner had just written onto the original died with it, so every absorbed attempt's bill
+    fell out of ``total_usage``, the metrics event and the token budget. That is the same hole the
+    receipt handover closed on the arm that *was* a ``ModelAdapterError``, left open on its twin.
+
+    What travels is what ``mark_provider_usage`` and ``mark_provider_retried`` wrote -- facts
+    stamped onto an escaping error precisely so they survive it -- read back through
+    ``ModelCallReceipt.with_error``, which is where "what did this exception carry" is spelled
+    once. What deliberately does NOT travel is classification: ``retryable``, ``http_status`` and
+    their siblings decide whether a run parks or terminalizes, and synthesizing them from
+    attributes that merely happen to exist on an arbitrary exception would change that outcome
+    for shapes nobody specified. An unclassified failure stays unclassified; it stops being
+    unbilled.
+
+    Returns its argument unchanged when that is already the loop's vocabulary (any
+    ``NativeAgentError``, which includes ``ModelAdapterError`` itself) or is not an ``Exception``
+    at all -- a ``KeyboardInterrupt`` is not a model failure.
+    """
+
+    if isinstance(exc, NativeAgentError) or not isinstance(exc, Exception):
+        return exc
+    return _carrying_stamps(ModelAdapterError(str(exc)), exc)
+
+
+def _carrying_stamps(replacement: BaseException, original: BaseException) -> BaseException:
+    """Move what was stamped on an escaping error onto the error that replaces it.
+
+    Every fact the runner writes onto a failure -- the bill through ``mark_provider_usage``, the
+    adapter's own retry through ``mark_provider_retried`` -- is written *onto the exception*
+    precisely so it survives the exception's escape. Building a replacement out of the original's
+    message alone therefore does the one thing those stamps exist to prevent, and the loop spelled
+    that rebuild in two places: the translator below, and the ``ModelCallAborted`` handler that
+    hands the turn layer a ``TurnInterrupted``. One of them carried the stamps.
+
+    Read back through ``ModelCallReceipt.with_error`` -- the single reader of exception-carried
+    facts -- so a translation cannot disagree with the receipt built for the same call. Only the
+    stamps travel: taxonomy stays with the type that classified itself, since ``retryable`` and
+    ``http_status`` decide park-vs-terminal and no replacement may inherit a fate it was not given.
+    """
+
+    probe = ModelCallReceipt().with_error(original)
+    mark_provider_usage(replacement, probe.usage)
+    if probe.provider_retried:
+        mark_provider_retried(replacement)
+    return replacement
+
+
+def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, int]) -> None:
+    """The one summation rule for every usage carrier that feeds the run's totals.
+
+    The core three always exist in the totals; optional priced sub-counts
+    (cache_read/cache_creation/reasoning/audio) accumulate too when reported, so they reach
+    metrics and the token-budget check. Fed by the settled receipt -- whose usage folds
+    absorbed attempts' spend the turn cannot know about -- and by billed failure stamps at
+    the park. The old turn-reading twin is gone: two summation functions over one rule was
+    the drift shape, and its last caller switched to the receipt.
+    """
+
+    for key, value in usage.items():
+        if not portable_usage_value(value):
             raise ModelAdapterError(
                 f"model usage {key} must be a non-negative integer",
                 provider_error_code="model_bad_response",

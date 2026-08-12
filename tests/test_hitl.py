@@ -11,9 +11,12 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.errors import ToolExecutionError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -94,6 +97,119 @@ def test_report_result_is_idempotent_first_report_wins(tmp_path: Path) -> None:
     assert second["delivered"] is False and second["duplicate"] is True
     assert task.result == {"answer": "Ada"}  # not clobbered
     assert manager._reentry_queue.count(task.job_id) == 1  # no double reentry
+
+    loop.close()
+
+
+def test_an_unportable_task_request_or_result_is_refused_at_ingress(tmp_path: Path) -> None:
+    """The tool-result refusal's census twins ③ and ④: hosted-task payloads are Python objects too.
+
+    ``start_task`` and ``report_result`` both take dicts that never crossed a JSON parse — an
+    in-process reporter can hand them ``bytes`` or an integer past the portable digit bound, which
+    the normalizer deliberately leaves alone and ``task.json``'s writer then cannot serialize. The
+    refusal fires before any state moves *on the path that moves state*: a refused report leaves the
+    task running, unclobbered, and a correct report afterwards still lands. A task that has already
+    finished has no such writer ahead of it and is answered without judging the payload at all --
+    the two pins below.
+    """
+    loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+
+    with pytest.raises(ToolExecutionError) as refused_request:
+        manager.start_task("hitl", {"prompt": b"\x00"})
+    assert refused_request.value.error_code == "task_request_unportable"
+
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    with pytest.raises(ToolExecutionError) as refused_result:
+        manager.report_result(task.job_id, {"answer": 10**4700})
+    assert refused_result.value.error_code == "task_result_unportable"
+    assert task.result is None, "the refused report half-landed"
+    assert task.status == "running"
+
+
+def test_a_cyclic_task_payload_is_refused_at_the_same_two_boundaries(tmp_path: Path) -> None:
+    """The container generation of the pin above: a shape no writer can carry, not a scalar.
+
+    A dict that contains itself clears the normalizer's memo without complaint -- the second visit
+    short-circuits, so the walk finishes -- and then dies at ``task.json``'s writer with
+    ``ValueError: Circular reference detected``, a run-death with no observation. One predicate
+    covers both generations, so the shape costs the call and not the run, under the error codes
+    these boundaries already speak.
+    """
+    loop = _build_loop(
+        tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")])
+    )
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+
+    cyclic_request: dict = {}
+    cyclic_request["self"] = cyclic_request
+    with pytest.raises(ToolExecutionError) as refused_request:
+        manager.start_task("hitl", cyclic_request)
+    assert refused_request.value.error_code == "task_request_unportable"
+
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    cyclic_result: dict = {}
+    cyclic_result["self"] = cyclic_result
+    with pytest.raises(ToolExecutionError) as refused_result:
+        manager.report_result(task.job_id, cyclic_result)
+    assert refused_result.value.error_code == "task_result_unportable"
+    assert task.result is None, "the refused report half-landed"
+    assert task.status == "running"
+
+    delivered = manager.report_result(task.job_id, {"answer": "Ada"})
+    assert delivered["delivered"] is True
+
+    loop.close()
+
+
+def test_a_duplicate_report_is_a_no_op_even_when_its_body_is_unportable(tmp_path: Path) -> None:
+    """A refusal protects a writer, and this path reaches none.
+
+    The retry's body is not the reporter's choice -- it is whatever the first attempt sent, resent
+    -- so judging it turns "first report wins" into an error for exactly the callers idempotency
+    exists for. Nothing here is stored or published, so there is nothing for the refusal to defend:
+    the no-op answers first.
+    """
+    loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    assert manager.report_result(task.job_id, {"answer": "Ada"})["delivered"] is True
+
+    for stale in ({"answer": b"\x00"}, {"answer": 10**4700}, {"answer": object()}):
+        duplicate = manager.report_result(task.job_id, stale)
+        assert duplicate["duplicate"] is True and duplicate["delivered"] is False
+        assert duplicate["status"] == "answered"
+
+    assert task.result == {"answer": "Ada"}, "the refused duplicate clobbered the stored result"
+    assert manager._reentry_queue.count(task.job_id) == 1, "the no-op re-published the task"
+
+    loop.close()
+
+
+def test_a_cancelled_task_answers_a_late_report_rather_than_judging_its_body(tmp_path: Path) -> None:
+    """The already-finished branch is not reached only by duplicates.
+
+    ``cancel`` sets ``finished_at`` and a cancelled result, so a reporter that was already working
+    when the cancellation landed takes this branch on its **first and only** report. The answer it
+    gets back -- ``status: "cancelled"`` -- is what tells it to stop; a reporter that decides that
+    from "did this raise" instead never does.
+    """
+    loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
+    loop.open()
+    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    task = manager.start_task("hitl", {"prompt": "Pick a name"})
+    manager.cancel(task.job_id)
+    cancelled_result = task.result
+    assert task.finished_at is not None and cancelled_result is not None
+
+    answered = manager.report_result(task.job_id, {"answer": b"\x00"})
+
+    assert answered["duplicate"] is True and answered["delivered"] is False
+    assert answered["status"] == "cancelled", "the late reporter never learns why it was refused"
+    assert task.result == cancelled_result
 
     loop.close()
 

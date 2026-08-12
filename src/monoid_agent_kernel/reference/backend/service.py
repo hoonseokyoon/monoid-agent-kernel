@@ -63,6 +63,7 @@ from monoid_agent_kernel.errors import NativeAgentError, PermissionDenied
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.providers.base import ModelAdapter
+from monoid_agent_kernel.providers.gateway import DEFAULT_RELAYED_PROVIDER
 from monoid_agent_kernel.identifiers import (
     BACKEND_AUDIENCE,
     BACKEND_AUDIENCES,
@@ -108,7 +109,11 @@ from monoid_agent_kernel.reference.backend.projection import (
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
-from monoid_agent_kernel.reference.backend.recovery import RecoveryContext, RecoveryService
+from monoid_agent_kernel.reference.backend.recovery import (
+    RecoveryContext,
+    RecoveryService,
+    ResumeOutcome,
+)
 from monoid_agent_kernel.reference.backend.runtime_config import (
     RuntimeConfigContext,
     RuntimeConfigService,
@@ -365,6 +370,20 @@ class RunnerBackend:
     token_manager: TokenManager
     allowed_workspace_roots: tuple[Path, ...]
     llm_gateway_url: str
+    # Whose native reasoning artifacts the gateway at ``llm_gateway_url`` relays -- its UPSTREAM,
+    # never the hop. It becomes ``GatewayModelAdapter.provider_name`` on every adapter this
+    # backend builds (submitted runs and recovery's rebuilds alike), which tags the opaque
+    # reasoning items so they only replay to a matching provider, and names the provider on the
+    # model-call receipt and its OTel span. Defaults to the reference gateway's own upstream;
+    # ``None`` (or the string ``"none"``) means "do not tag", the right answer for a gateway
+    # fronting an upstream with no reasoning artifacts. Deliberately a backend field and NOT a
+    # ``ModelConfig`` one: it describes the deployment's transport, not the agent's config, and
+    # ``ModelConfig`` feeds ``config_hash`` (a new field there would invalidate durable recovery
+    # metadata for every existing run).
+    # Keyword-only so it can live beside the URL it describes without rebinding the positional
+    # arguments that predate it: an embedder's fifth positional was ``model_adapter_factory``
+    # and must stay so.
+    llm_gateway_provider: str | None = field(default=DEFAULT_RELAYED_PROVIDER, kw_only=True)
     model_adapter_factory: ModelAdapterFactory | None = None
     web_gateway_url: str | None = None
     allowed_apply_roots: tuple[Path, ...] = ()
@@ -393,6 +412,19 @@ class RunnerBackend:
     # Optional private model-content sidecar. The embedding application decides the entitlement;
     # the backend only wires the resulting boolean into every root/recovered activation.
     model_content_file: bool = False
+    # The other two recording sidecars, carried the same way: the per-run model-call ledger
+    # (`model_calls.jsonl`) and the private replay corpus (`model_payloads.jsonl` plus its
+    # chunk directory). Keyword-only because the positional argument list that predates them
+    # is a pinned public surface, like ``llm_gateway_provider`` above.
+    #
+    # The embedding application decides the entitlement here too, with one difference worth
+    # stating: the corpus is content-classified like ``model_content_file``, but unlike it has no
+    # shipped reader -- no projection, no hydration, no HTTP route serves it -- so filesystem
+    # access to the run directory is the only control over it, and there is no retention verb.
+    # These are also deployment-wide: a multi-tenant backend records every tenant's runs or none,
+    # since ``BackendRunRequest`` carries no per-run override.
+    model_calls_file: bool = field(default=False, kw_only=True)
+    model_payload_file: bool = field(default=False, kw_only=True)
     # Process-local, root-multiplexed presentation channel. Its observer receives parent and child
     # model streams by their authoritative root lineage. Omit it to expose no live content API.
     model_stream_broker: LiveModelStreamBroker | None = None
@@ -438,9 +470,21 @@ class RunnerBackend:
     # a retryable failure before it is dead-lettered as failed.
     outbox_max_attempts: int = 5
     # Retry schedule for a failed outbox send: capped exponential backoff with **full jitter**
-    # (delay = uniform(0, min(cap, base * factor**attempts))). The next-attempt time is stamped on
-    # the request (durable), so the schedule survives a restart; the watchdog redrive tick (below)
-    # dispatches a request once its time arrives, decoupling retry timing from run activity.
+    # (delay = uniform(0, ceiling); ceiling = base * factor**attempts, bounded by cap). The cap
+    # binds the EXPONENT and not only the product -- these four fields carry no validation, taking
+    # the power first lets it leave the float range before the cap is consulted, and the schedule
+    # runs AFTER sender.send returns, where a raise would lose the receipt for a side effect that
+    # already happened. It is `providers/_common.capped_backoff`, the model-retry loops' own
+    # schedule, under one rule standing ahead of every base/cap shortcut: growth it cannot resolve
+    # resolves UPWARD, to the cap -- a NaN factor, an infinite one, and a zero base under either
+    # (`0 * inf` is nan, not zero). A zero ceiling is uniform(0, 0), which is not a slower retry
+    # but an unthrottled one. A CAP it cannot resolve resolves the same direction, to the largest
+    # representable wait: `nan` and `-inf` reach `max(0.0, .)` as that same zero ceiling, and
+    # `+inf` stamps a next-attempt time no drain can ever select and no record can carry. The
+    # next-attempt
+    # time is stamped on the request (durable), so the schedule survives a restart; the watchdog
+    # redrive tick (below) dispatches a request once its time arrives, decoupling retry timing
+    # from run activity.
     outbox_retry_base_s: float = 1.0
     outbox_retry_factor: float = 2.0
     outbox_retry_cap_s: float = 300.0
@@ -577,6 +621,7 @@ class RunnerBackend:
                     **kwargs,
                 ),
                 append_event=append_event_to_run,
+                checkpoint_store_provider=lambda: self.checkpoint_store,
                 event_sequencer=_RUN_EVENT_SEQUENCER,
                 logger=_LOGGER,
             )
@@ -587,6 +632,7 @@ class RunnerBackend:
             BackendLoopFactoryContext(
                 run_root_provider=lambda: self.run_root,
                 llm_gateway_url_provider=lambda: self.llm_gateway_url,
+                llm_gateway_provider_provider=lambda: self.llm_gateway_provider,
                 web_gateway_url_provider=lambda: self.web_gateway_url,
                 model_adapter_factory_provider=lambda: self.model_adapter_factory,
                 token_manager_provider=lambda: self.token_manager,
@@ -595,6 +641,8 @@ class RunnerBackend:
                 emit_output_deltas_provider=lambda: self.emit_output_deltas,
                 stream_model_calls_provider=lambda: self.stream_model_calls,
                 model_content_file_provider=lambda: self.model_content_file,
+                model_calls_file_provider=lambda: self.model_calls_file,
+                model_payload_file_provider=lambda: self.model_payload_file,
                 model_stream_observer_factories_provider=lambda root_run_id: (
                     ()
                     if self.model_stream_broker is None
@@ -699,6 +747,7 @@ class RunnerBackend:
                 drive_open_session=self._drive_open_session,
                 record_run_result=self._record_run_result,
                 record_run_failure=self._record_run_failure,
+                meter_abandoned_run=self._run_state.meter_abandoned_run,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
             )
@@ -759,6 +808,7 @@ class RunnerBackend:
                 active_record=self._active_record,
                 run_dir_for=lambda run_id: self.run_root / run_id,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
+                run_on_shared_loop=self._run_on_shared_loop,
                 enqueue_message_and_checkpoint=self._enqueue_message_and_checkpoint,
                 persist_checkpoint_from_any_thread=self._persist_run_checkpoint_from_any_thread,
                 checkpoint_store_provider=lambda: self.checkpoint_store,
@@ -1033,26 +1083,29 @@ class RunnerBackend:
         """Run a thread-safe callback on the process-shared run loop (fire-and-forget)."""
         _get_shared_loop().call_soon_threadsafe(fn, *args)
 
-    def _enqueue_message_and_checkpoint(self, record: BackendRunRecord, message: Any) -> None:
-        """Enqueue an inbox message on the shared loop and persist the queue snapshot before returning."""
+    def _run_on_shared_loop(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` on the process-shared run loop and wait for it to finish.
 
-        def _enqueue_and_persist() -> None:
-            record.message_queue.put_nowait(message)
-            self._persist_run_checkpoint(record)
+        Inline when already on that loop (blocking on a future there would deadlock);
+        otherwise scheduled via ``call_soon_threadsafe`` and awaited through a
+        ``concurrent.futures.Future``, so the caller observes ``fn``'s outcome — including
+        its exception — before returning. This is the ordering seam control actions use
+        when a read-then-write must not interleave with the drive's own loop iterations:
+        everything inside ``fn`` runs as ONE callable on the loop that owns the drive."""
 
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop is _get_shared_loop():
-            _enqueue_and_persist()
+            fn()
             return
 
         done: Future[None] = Future()
 
         def _complete() -> None:
             try:
-                _enqueue_and_persist()
+                fn()
             except BaseException as exc:
                 done.set_exception(exc)
             else:
@@ -1060,6 +1113,15 @@ class RunnerBackend:
 
         _get_shared_loop().call_soon_threadsafe(_complete)
         done.result(timeout=10.0)
+
+    def _enqueue_message_and_checkpoint(self, record: BackendRunRecord, message: Any) -> None:
+        """Enqueue an inbox message on the shared loop and persist the queue snapshot before returning."""
+
+        def _enqueue_and_persist() -> None:
+            record.message_queue.put_nowait(message)
+            self._persist_run_checkpoint(record)
+
+        self._run_on_shared_loop(_enqueue_and_persist)
 
     def spawn_coroutine(self, coro: Any) -> Any:
         """Schedule a coroutine on the process-shared run loop; returns a
@@ -1948,6 +2010,9 @@ class RunnerBackend:
         error_code: str,
         exc_type: str,
         overwrite: bool,
+        http_status: int | None = None,
+        retryable: bool = False,
+        config_recoverable: bool = False,
     ) -> None:
         """Write ``run_dir/failure.json`` (the operator-facing failure bundle, same schema
         as the core's). ``overwrite=False`` preserves a bundle the loop already wrote
@@ -1959,6 +2024,9 @@ class RunnerBackend:
             error_code=error_code,
             exc_type=exc_type,
             overwrite=overwrite,
+            http_status=http_status,
+            retryable=retryable,
+            config_recoverable=config_recoverable,
         )
 
     def _read_recover_attempts(self, run_dir: Path) -> int:
@@ -2002,11 +2070,13 @@ class RunnerBackend:
         tracked in-memory, terminal checkpoints, and runs missing run.json are skipped."""
         return self._recovery.recover_runs()
 
-    def _attempt_resume(self, run_dir: Path, run_id: str) -> bool:
-        """Resume one run from its latest checkpoint. Returns True on success. Skips runs
-        with no resumable checkpoint or missing run.json. On a resume exception, bumps the
-        durable attempt counter and, once ``max_recover_attempts`` is reached, marks the run
-        unrecoverable (durable failure.json) so it is never retried into a crash loop."""
+    def _attempt_resume(self, run_dir: Path, run_id: str) -> ResumeOutcome:
+        """Resume one run from its latest checkpoint, answering a typed ``ResumeOutcome``
+        (resumed / closed / already-live / failed) rather than a bare bool, so the session
+        boundary can refuse a dead run as dead and a lost claim race as already-live. On a
+        resume exception, bumps the durable attempt counter and, once
+        ``max_recover_attempts`` is reached, marks the run unrecoverable (durable
+        failure.json) so it is never retried into a crash loop."""
         return self._recovery.attempt_resume(run_dir, run_id)
 
     def resume_run(self, run_id: str, token: str) -> dict[str, Any]:

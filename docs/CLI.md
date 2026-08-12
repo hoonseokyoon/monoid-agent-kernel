@@ -16,6 +16,15 @@ monoid run \
   --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns
 ```
 
+`--llm-gateway-provider` names the **upstream** provider that gateway relays (default
+`openai`, matching the reference gateway's own upstream). It is not the transport: it
+tags the provider-native reasoning artifacts the gateway carries back, so they only
+replay to a matching provider, and it is the provider attributed on the model-call
+receipt and OTel's `gen_ai.provider.name`. Pass `--llm-gateway-provider none` for a
+gateway whose upstream has no reasoning artifacts — that disables tagging. A deployment
+whose gateway fronts something other than OpenAI must set this, or the tag names a
+provider that cannot read the items back.
+
 Run spec and runtime config are separate. `AgentRunSpec` carries workspace,
 limits, and permission boundary values — it no longer carries the instruction,
 which is delivered as the first user turn (CLI `--instruction`, or
@@ -200,6 +209,192 @@ Three optional features on `monoid run`, each off unless its flag is set:
 
 See [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) and [SKILLS_DESIGN.md](SKILLS_DESIGN.md)
 for the design of these surfaces.
+
+## Recording model calls
+
+Three opt-in artifacts, off unless their flag is set, on both `monoid run` and
+`monoid backend serve`:
+
+- `--model-calls-file` — `model_calls.jsonl`, one metadata record per settled model call,
+  including the failed ones: timings, token usage, failure taxonomy and the replay key. It
+  carries no content and no endpoint.
+- `--model-payload-file` — `model_payloads.jsonl` plus a `model_payloads/` directory of
+  content-addressed chunks: the exact request bytes each replay key was hashed over, and the
+  settled response bodies with provider reasoning included.
+- `--model-content-file` — `model-content.jsonl`, the streamed output and reasoning text of each
+  call. Content, like the corpus. It also selects provider streaming, which the other two do not.
+
+```bash
+monoid run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --runtime-config-file examples/runtime-config.json \
+  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns \
+  --model-calls-file --model-payload-file
+```
+
+Four things to know before turning the second one on.
+
+**It is content, and `--redact-path` does not reach it.** Path redaction masks the public event
+and status stream; private run artifacts keep real paths and contents, as `transcript.jsonl`
+already does. A workspace file your redaction policy hides from events is in the corpus in full
+if the model was shown it. `--deny-path` helps but does not cover this: it refuses tool and shell
+*path arguments*, and removes denied files from an isolated-copy shell workspace — a shell command
+that reads a denied file by other means still returns the bytes to the model, and from there to
+the corpus.
+
+**It grows with the conversation and nothing deletes it.** A turn's request is the whole
+conversation so far, so a long run's corpus lands in the same order of magnitude as its
+`transcript.jsonl`, and enabling it can roughly double a run directory. Repeated content is
+stored once per activation (tool definitions, messages and observations are content-addressed),
+but there is no per-run cap and no retention verb: `monoid gc` collects only chunks *no record
+resolves*, so a healthy corpus is never collected. Deleting one means deleting the files.
+
+**Subagents inherit it, into their own directories.** A child run records into its own run
+directory beside the parent's, joined by `root_run_id`. `monoid validate` and `monoid gc` each
+take one run directory, so a run tree needs one invocation per member.
+
+**Verify with `monoid validate RUN_DIR`** — it re-checks every record against its schema and
+re-derives each request digest from the stored bytes, reporting issues rather than showing
+content. **Sweep crash litter with `monoid gc RUN_DIR --apply`**, never beside a live writer of
+the same directory. Both verbs are covered in
+[OBSERVABILITY.md](OBSERVABILITY.md), which also documents the hardlink hazard: a backup that
+deduplicates a run directory disables these writers on the next activation, and each says so with
+one `WARNING` naming the artifact it will not write. If you configured no logging, that line
+reaches stderr; if you configured some, the loggers are `monoid_agent_kernel.recorder` and
+`monoid_agent_kernel.core.model_content`.
+
+## Replaying a recorded run
+
+`--replay-from RUN_DIR_OR_ID` serves every model call from a recorded corpus instead of a live
+provider. Pure replay builds no live adapter at all — no gateway URL, no token, no
+`--allow-direct-provider-api`, no provider gate — because an offline replay needs none of them:
+
+```bash
+monoid run \
+  --workspace examples/workspaces/edit_markdown_notes \
+  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
+  --runtime-config-file examples/runtime-config.json \
+  --replay-from runs/RUN_ID
+```
+
+**Only the model is replayed. Tools re-execute for real**, against your workspace, with real
+side effects — replay a run that deleted files and it deletes them again. A tool that answers
+differently than it did (a changed workspace, a clock, a network call) changes the next turn's
+request, and that turn misses: the diagnosis names the diverging terms (`observations`,
+`messages`) by name and digest, never by content.
+
+**The same conversation must carry the same key.** The replay key's model identity is authored
+by this run's runtime config — not by the corpus — so the config must match the recorded run.
+A config that cannot match anything recorded is refused before the run starts (the preflight
+names expected and actual, e.g. the model names); `--replay-fallthrough` softens that to a
+warning and serves misses from the live adapter this command would have built anyway
+(recording flags compose, so `--replay-from ... --model-payload-file` records the run as it
+went — the new-episodes shape). One caveat on that second corpus: a call the *inner* adapter
+served is keyed under the wrapper's provider term. Where the wrapper's derivation declared —
+the shipped gateway default, and every corpus that cannot testify — that term *is* the
+original's resolved provider and the keys agree; where it declined, the recording is faithful
+but not interchangeable with one made live. `docs/CONTRACTS.md` carries the detail as the
+third ledger delta.
+
+**Answers replay in recorded order, each once.** A request the original run made twice gets
+the first answer, then the second, then an `exhausted` miss. A miss without fallthrough fails
+the turn — exit non-zero, `error_code: "replay_miss"` in `failure.json` with the sub-reason in
+`provider_error_code`, checkpoints kept. Five of the six sub-reasons reach `failure.json`:
+`no_key`, `absent`, `not_recorded`, `exhausted` and `identity_mismatch`. `generation_mismatch` is
+preflight-exclusive, and structurally so rather than by accident: the miss fires iff
+`self._generations and generation not in self._generations`, which is the *same predicate*, from
+the same function with the same argument, that `generation_divergence` hands the preflight — and
+the preflight always runs. No corpus can pass one and fail the other. A union that *mixes* a
+current source with a retired one satisfies neither, so its calls come back `absent`, which
+`docs/CONTRACTS.md` states as a limit of the union.
+
+`identity_mismatch` is different, and the contrast is the point: the preflight refuses only a
+config that can match *nothing* recorded, so a corpus holding more than one model identity — the
+ordinary shape as soon as a subagent declares its own `model:` — passes with a warning, and then
+a call recorded under the other identity misses at run time.
+What the preflight refuses *before* a run directory exists arrives as an exit-1 message on
+stderr; `--replay-fallthrough` softens those refusals to warnings and serves the calls live.
+
+**Naming more than one source is an ordered union.** `--replay-from` is repeatable, and
+"file order, each answer once" spans the sources in the order the flags were given. Wherever
+two sources can answer one key, that order decides which answer each call gets — and where one
+source recorded a refusal at that position, it decides whether the call is answered at all.
+Two recordings of the *same* conversation are the obvious case: the same prompt run twice, or
+a crashed run beside its rerun.
+
+A family is not exempt. Nothing run-scoped is in the key, so two children with the same
+definition and the same prompt — an ordinary fan-out — record **the same key in two different
+run directories**, and naming them in the other order swaps their answers. The run still exits
+0 and reports `completed`; the only signal is the preflight's crossed-key warning, which for a
+family names the children and asks you to give them in spawn order. Take it seriously: a
+family union whose children are distinguishable by prompt has no crossed keys and will not
+warn. Nothing in the finished run records which source answered, since
+`attributes.replay_from` is the whole list.
+
+**Three shapes replay does not reproduce.** A run whose calls were concurrent — background
+subagents draining together — issues the same key from more than one caller, and which caller
+receives which recording is the scheduler's answer both times; the recording never fixed that
+order, so the replay cannot either. The consumption cursor lives in the process: a replay that
+crashes and durably resumes starts its counting again, so a key with more than one recorded
+answer is re-served from the first. And a turn that failed recoverably *while recording* is not
+replayable at that position: the retry recomputes its key without the `instruction` term the
+first attempt carried, so the answer is recorded under a key the replay's first attempt does
+not compute, and that attempt earns `absent` — a request record with no answer — while the
+answer sits one record below. Record the corpus you intend to replay from a run that did not
+retry.
+
+**Concurrency and `--replay-fallthrough` together lose a position, not just an order.** The
+paragraph above is about *which* caller gets which recording. This is a stronger shape, and it is
+measurable rather than theoretical. A refused record does not advance the cursor when it is read —
+deliberately, because a parked turn's re-attempt has to earn the same refusal rather than the next
+call's answer — so two concurrent callers on one key both stand on it. If both then fall through
+and are answered live, both report that the conversation moved past that call, and the cursor
+advances **once**: one slot, refused once, however many callers heard about it.
+
+Measured on a key recorded as `[refused, A, B]`: two concurrent fallthroughs, then a third call,
+and the third call is served `A` — the answer the second call would have been given had it not gone
+live. Every later call on that key is shifted by one for the rest of the run.
+
+Neither obvious remedy is available inside the current contract. Advancing once per *served* caller
+re-breaks the guarantee that a spend arriving after the conversation has moved on cannot disturb it
+(a rule an earlier review round added, and one this suite pins). Handing the second concurrent
+caller the *next* entry instead would give the faithful mapping, but it requires the corpus to tell
+a concurrent sibling from a park re-attempt — a reservation model, and a change to what a take is.
+Recorded here as a limit rather than closed: replay a run whose concurrency the recording fixed, or
+do not combine background fan-out with `--replay-fallthrough` on a shared key.
+
+`--replay-fallthrough` will get such a run to finish, but it is not a way to replay it. Once
+one call falls through, the live answer enters `messages`, so every later key diverges and
+every later call falls through too — a run that reports `completed` at exit 0 having contacted
+(and billed) a live provider for every one of its calls, with the recorded answer one record
+below never recovered. Nothing in the finished run says so: with `--model-calls-file` every
+line is still stamped `replay_from`, and without it the run directory says nothing about replay
+at all.
+
+**A run that spawned subagents is a family.** Children record into their own run directories,
+so name them too — `--replay-from` is repeatable — or the child's first call is the miss. With
+the union the child's calls replay; the parent's first *post-spawn* turn is a documented v1
+limit either way, because the spawn observation the model saw embeds per-run identifiers
+(`child_run_id`, `task_id`, `traceparent`) that a replay honestly cannot reproduce.
+
+**Replay does not stream.** The adapter serves whole turns, so a replay run combined with a
+streaming-selecting flag (`--model-content-file`) degrades to one-shot: the answer arrives
+complete, and no token deltas are produced. `model-content.jsonl` is still written — the
+one-shot answer lands in it as a single record, alongside a `stream_opened` entry naming the
+configured provider, which is the provider this run did not call.
+
+**Provenance and privacy.** Every ledger line of a replay run carries
+`attributes.replay_from` (the source run ids, comma-joined), inherited by children. Three limits
+on that. `--run-id` is not validated, so a run id containing a comma produces a
+`replay_from` an auditor cannot split back into the sources it names. The ledger is opt-in: without `--model-calls-file` a replay run is indistinguishable
+from a live one to anyone auditing the run directory — `manifest.json`, `status.json`,
+`metrics.json` and `events.jsonl` say nothing about replay, and `model_provider` names the
+configured provider. And the attribute is stamped by this command, not by the adapter: a run
+driven programmatically through `ReplayModelAdapter` carries no `replay_from` at all. The
+corpus you replay from is content-classified — replaying somebody else's run directory means
+reading their conversation bytes — and the source is never written to: a replay run records
+into its own directory only.
 
 ## Streaming JSON
 

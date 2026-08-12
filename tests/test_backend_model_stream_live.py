@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from support.http import LINE_SEPARATORS, sse_data_frames_by_line
 from support.runtime import runtime_config
 
 from monoid_agent_kernel.core.model_content import (
@@ -119,6 +120,31 @@ def test_failed_close_carries_retryability_to_live_consumers() -> None:
     assert closed.kind == "closed"
     assert closed.retryable is True
     assert closed.to_json()["retryable"] is True
+
+
+def test_failed_close_carries_config_recoverability_to_live_consumers() -> None:
+    """The other half of the park's vocabulary: the model-content sidecar receives the full
+    classification, so the live broker frame must not tell the same consumer half of it —
+    a config-fixable failure read as merely non-retryable hides that a reissue will succeed."""
+    broker = LiveModelStreamBroker(generation="config")
+    writer = broker.observer("root-1").open(_context())
+    writer.push(ModelStreamDelta(channel="output", text="partial"))
+    writer.close(
+        ModelStreamOutcome(
+            status="failed",
+            final_text="partial",
+            error_code="model_error",
+            retryable=False,
+            config_recoverable=True,
+        )
+    )
+
+    closed = broker.subscribe("root-1", after_cursor="config:0").poll()[-1]
+
+    assert closed.kind == "closed"
+    assert closed.retryable is False
+    assert closed.config_recoverable is True
+    assert closed.to_json()["config_recoverable"] is True
 
 
 def test_broker_isolates_root_rings() -> None:
@@ -831,6 +857,75 @@ def test_backend_subscription_requires_root_token_and_enabled_broker(
 
 
 @pytest.mark.integration
+def test_model_stream_sse_frames_survive_a_line_splitting_reader(backend_factory: Any) -> None:
+    """The third writer of the same shape, and the one a separator reaches first.
+
+    ``LiveModelStreamFrame.to_sse`` dumped with ``ensure_ascii=False``. This channel is model
+    content by definition -- every ``delta`` is raw provider text -- so U+2028, U+2029 or U+0085
+    lands here as soon as a model emits one, and a ``str.splitlines`` reader (httpx's
+    ``aiter_lines``) breaks the frame there. The split also swallows the frame's ``id:``, which is
+    the cursor a reconnect resumes from, so the reader loses its place as well as the frame. The
+    existing route test reads with ``readline`` and cannot see any of that.
+    """
+
+    pytest.importorskip("httpx")
+    workspace = backend_factory.workspace()
+    broker = LiveModelStreamBroker(generation="separators")
+    backend = backend_factory.create(workspace=workspace, model_stream_broker=broker)
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant",
+            user_id="user",
+            workspace_root=workspace,
+            instruction="finish",
+            runtime_config=runtime_config("run.finish"),
+        )
+    )
+    assert backend.wait_for_run(submission.run_id, timeout_s=10).value == "completed"
+    carried = f"before{LINE_SEPARATORS}after"
+    writer = broker.observer(submission.run_id).open(
+        _context(
+            root_run_id=submission.run_id,
+            run_id=submission.run_id,
+            stream_id="separator-fixture",
+        )
+    )
+    writer.push(ModelStreamDelta(channel="output", text=carried))
+
+    server = create_backend_server(backend, host="127.0.0.1", port=0, admin_token="admin")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        # The route stays open after the last frame, so the read is bounded by a count rather
+        # than by the stream ending: the opened frame this fixture published, then its delta.
+        frames = sse_data_frames_by_line(
+            f"{base_url}/v1/runs/{submission.run_id}/model-stream?cursor=separators:2",
+            token=submission.run_token,
+            headers={"Accept": "text/event-stream"},
+            stop_after=2,
+        )
+    finally:
+        broker.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    deltas = [frame for frame in frames if frame["kind"] == "delta"]
+    assert deltas, {
+        "kinds": [frame["kind"] for frame in frames],
+        "hint": "the delta frame never arrived whole",
+    }
+    assert deltas[0]["text"] == carried
+    # The byte offsets are computed off the unescaped text, so escaping the wire must not move
+    # them -- a client splicing deltas by offset would tear otherwise.
+    assert (deltas[0]["start_offset"], deltas[0]["end_offset"]) == (
+        0,
+        len(carried.encode("utf-8")),
+    )
+
+
+@pytest.mark.integration
 def test_backend_http_model_stream_prefers_last_event_id_and_disconnect_is_passive(
     backend_factory: Any,
 ) -> None:
@@ -970,6 +1065,13 @@ def test_delta_frame_validates_offsets_and_non_delta_frames_reject_them() -> Non
             cursor=cursor,
             root_run_id="root",
             retryable=1,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="config_recoverable must be a boolean"):
+        LiveModelStreamFrame(
+            kind="closed",
+            cursor=cursor,
+            root_run_id="root",
+            config_recoverable=1,  # type: ignore[arg-type]
         )
 
 

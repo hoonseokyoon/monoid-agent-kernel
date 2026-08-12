@@ -7,13 +7,59 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import best_match
 
 from monoid_agent_kernel.core._event_log import iter_committed_jsonl_records
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._json_schema import END_OF_INPUT
+from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.model_calls import (
+    MODEL_CALL_KIND,
+    MODEL_CALLS_FILENAME,
+    MODEL_CALLS_SCHEMA_VERSION,
+)
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
+from monoid_agent_kernel.core.model_payloads import (
+    MODEL_PAYLOADS_DIRNAME,
+    MODEL_PAYLOADS_FILENAME,
+    MODEL_PAYLOADS_SCHEMA_VERSION,
+    MODEL_REQUEST_KIND,
+    MODEL_RESPONSE_KIND,
+    PAYLOAD_CHUNK_KIND,
+    RESPONSE_MALFORMED,
+    RESPONSE_REFERENCE,
+    UNRECORDED_REASONS,
+    is_chunk_sha256,
+    reassemble_request_preimage,
+    response_reference,
+)
+from monoid_agent_kernel.core._verified_file import read_verified_bytes
+from monoid_agent_kernel.core.model_io import (
+    DESTINATION_STATUSES,
+    DIGEST_STATUSES,
+    IDEMPOTENCY_KEY_JSON_PATTERN,
+    MAX_MODEL_PAYLOAD_BYTES,
+    RECORDED_DIGEST_BODY,
+)
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
+
+
+TIMESTAMP_PATTERN = rf"Z{END_OF_INPUT}"
+"""Ends with the UTC designator -- unanchored at the front on purpose, the way it always was."""
+
+EVENT_TYPE_PATTERN = rf"^[a-z]+(\.[a-z_]+)+{END_OF_INPUT}"
+"""A dotted lowercase event name, whole and nothing after it."""
+
+SHA256_PATTERN = rf"^{RECORDED_DIGEST_BODY}{END_OF_INPUT}"
+"""A digest that must be present."""
+
+OPTIONAL_SHA256_PATTERN = rf"^(|{RECORDED_DIGEST_BODY}){END_OF_INPUT}"
+"""A digest that may not have been issued, where empty is the recorded spelling of absence.
+
+Both forms compose the one body ``core/model_io.py`` owns (W7-4), the way the idempotency-key
+forms do: these schema patterns and the ledger's mint guard are enforcers of one rule, and a
+retyped twin regex is how enforcers drift."""
 
 
 EVENT_SCHEMA: dict[str, Any] = {
@@ -35,8 +81,8 @@ EVENT_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "turn_id": {"type": ["string", "null"]},
         "parent_id": {"type": ["string", "null"]},
-        "timestamp": {"type": "string", "pattern": "Z$"},
-        "type": {"type": "string", "pattern": "^[a-z]+(\\.[a-z_]+)+$"},
+        "timestamp": {"type": "string", "pattern": TIMESTAMP_PATTERN},
+        "type": {"type": "string", "pattern": EVENT_TYPE_PATTERN},
         "level": {"enum": ["debug", "info", "warning", "error"]},
         "data": {"type": "object"},
     },
@@ -124,6 +170,11 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": _STR,
             "provider_error_code": _STR,
             "http_status": {"type": ["integer", "null"]},
+            # The terminal twin of ``turn.failed`` carries the same classification it does:
+            # ``fail_recoverable`` promotes one into the other, so a config-fixable failure that
+            # a driver gave up on must still say it was config-fixable in the record of giving up.
+            "retryable": _BOOL,
+            "config_recoverable": _BOOL,
         },
         required=("error_code",),
     ),
@@ -190,12 +241,34 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "provider_error_code": _STR,
             "http_status": {"type": ["integer", "null"]},
             "retryable": _BOOL,
+            "config_recoverable": _BOOL,
+            # Whether the adapter's own retry budget was already spent before this park.
+            "provider_retried": _BOOL,
+            # What the refused call already cost. A failure *after* a billed answer is an
+            # ordinary shape (the applied-parameters proof refusals are exactly that), and the
+            # transcript twin written on the same failure has always recorded it. Named for the
+            # kernel fact, not for the gateway wire's compat-frozen ``usage`` alias — the event
+            # spells ``provider_error_code`` for the same reason.
+            "provider_usage": _OBJ,
         },
         required=("error_code",),
     ),
+    # ``reason`` here is a CAUSE vocabulary — what stopped the turn ("user_stop") — and it is
+    # deliberately NOT ``Suspension.reason``, which is a PARK vocabulary naming the state the
+    # session came to rest in ("interrupted"). One key name, two domains, on purpose: the event
+    # answers "why did this stop", the park answers "where is the run now". A reader that joins
+    # them by name is reading two different questions. See docs/CONTRACTS.md, event reads.
     "turn.interrupted": _data_schema(
         {"reason": _STR},
         required=(),
+    ),
+    # The interrupt's twin, and the same cause vocabulary ("user_pause"). The pause park used to
+    # emit no event of its own — only a ``session.state.changed`` — so two sibling parks were not
+    # observable the same way: a consumer watching the turn lane saw the stop and missed the
+    # pause. Observability only; no projection consumes it.
+    "turn.paused": _data_schema(
+        {"reason": _STR},
+        required=("reason",),
     ),
     "model.output.delta": _data_schema(
         {"text": _STR},
@@ -216,7 +289,13 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "input_tokens": _INT,
             "output_tokens": _INT,
             "total_tokens": _INT,
+            # The priced sub-counts, each present only when the adapter reported one. All four
+            # are billed differently from a plain input token, so a live consumer that sees only
+            # ``reasoning_tokens`` cannot show what a cache-heavy run actually cost.
+            "cache_read_tokens": _INT,
+            "cache_creation_tokens": _INT,
             "reasoning_tokens": _INT,
+            "audio_tokens": _INT,
             "web_search_calls": _INT,
             "web_fetch_calls": _INT,
             "web_context_calls": _INT,
@@ -539,7 +618,7 @@ MANIFEST_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("manifest.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "created_at": {"type": "string", "pattern": "Z$"},
+        "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "mode": {"enum": ["read-only", "propose", "apply"]},
         "workspace_backend": {"enum": ["overlay", "staging"]},
         "workspace_root": {"type": "string"},
@@ -572,7 +651,7 @@ WORKSPACE_BASE_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("workspace-base.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "created_at": {"type": "string", "pattern": "Z$"},
+        "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "workspace_root": {"type": "string"},
         "workspace_backend": {"enum": ["overlay", "staging"]},
         "entries": {
@@ -584,7 +663,7 @@ WORKSPACE_BASE_SCHEMA: dict[str, Any] = {
                     "path": {"type": "string"},
                     "kind": {"enum": ["file", "dir", "other"]},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": ["string", "null"], "pattern": SHA256_PATTERN},
                 },
                 "additionalProperties": False,
             },
@@ -621,7 +700,7 @@ WORKSPACE_INDEX_SCHEMA: dict[str, Any] = {
     "properties": {
         "schema_version": schema_version_property("workspace-index.v1"),
         "run_id": {"type": "string", "minLength": 1},
-        "generated_at": {"type": "string", "pattern": "Z$"},
+        "generated_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "workspace_root": {"type": "string"},
         "max_entries": {"type": "integer", "minimum": 1},
         "max_hash_bytes": {"type": "integer", "minimum": 0},
@@ -635,7 +714,7 @@ WORKSPACE_INDEX_SCHEMA: dict[str, Any] = {
                     "path": {"type": "string"},
                     "kind": {"enum": ["file", "dir", "other"]},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": ["string", "null"], "pattern": SHA256_PATTERN},
                     "hash_status": {"enum": ["hashed", "too_large", "not_file", "error"]},
                 },
                 "additionalProperties": False,
@@ -684,6 +763,13 @@ TRANSCRIPT_RECORD_SCHEMA: dict[str, Any] = {
                 "error_code": {"type": "string"},
                 "provider_error_code": {"type": "string"},
                 "retryable": {"type": "boolean"},
+                # The failure record's writer has always emitted this beside ``retryable``; the
+                # branch only stayed valid because ``additionalProperties`` is True here.
+                "config_recoverable": {"type": "boolean"},
+                # Written by BOTH model_turn records (success and failure): the private replay
+                # artifact of a retried-then-successful call used to read as a clean single
+                # attempt, which is exactly the case where the retry evidence matters most.
+                "provider_retried": {"type": "boolean"},
                 "http_status": {"type": ["integer", "null"]},
             },
             "additionalProperties": True,
@@ -802,7 +888,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "step": {"type": "integer", "minimum": 1},
                 "provider": {"type": ["string", "null"]},
                 "model": {"type": ["string", "null"]},
-                "started_at": {"type": "string", "pattern": "Z$"},
+                "started_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -828,7 +914,7 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "channel": {"enum": ["output", "reasoning"]},
                 "text": {"type": "string"},
                 "text_len": {"type": "integer", "minimum": 0},
-                "emitted_at": {"type": "string", "pattern": "Z$"},
+                "emitted_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -857,7 +943,12 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "usage": {"type": ["object", "null"]},
                 "error_code": {"type": ["string", "null"]},
                 "retryable": {"type": "boolean"},
-                "finished_at": {"type": "string", "pattern": "Z$"},
+                # Additive and optional: a sidecar written before this key existed still
+                # validates, and the reader defaults it to False. Declared in the same change as
+                # the writer because ``additionalProperties`` is False here — a record key with
+                # no schema slot is a validation failure, not a forward-compatible extra.
+                "config_recoverable": {"type": "boolean"},
+                "finished_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
             },
             "additionalProperties": False,
         },
@@ -877,9 +968,280 @@ MODEL_CONTENT_RECORD_SCHEMA: dict[str, Any] = {
                 "kind": {"const": "settled_text"},
                 "run_id": {"type": "string", "minLength": 1},
                 "final_text": {"type": "string"},
-                "final_text_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "final_text_digest": {"type": "string", "pattern": SHA256_PATTERN},
                 "final_text_len": {"type": "integer", "minimum": 0},
-                "recorded_at": {"type": "string", "pattern": "Z$"},
+                "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
+            },
+            "additionalProperties": False,
+        },
+    ]
+}
+
+# The private model-call ledger. A literal single-element enum rather than
+# ``schema_version_property``: that helper emits the legacy namespace beside the current one, and
+# this artifact has never existed under it — advertising a reader for records that cannot exist is
+# a false compatibility claim, and the ledger's own reader-version pin refuses it.
+_MODEL_CALL_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["provider", "model", "reasoning"],
+    "properties": {
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "reasoning": {
+            "type": "object",
+            "required": ["effort", "summary", "on_unsupported"],
+            "properties": {
+                "effort": {"type": "string"},
+                "summary": {"type": "string"},
+                "on_unsupported": {"enum": ["fail", "omit"]},
+            },
+            "additionalProperties": False,
+        },
+        # Omitted when the caller configured no sampling control, which is why it is not required.
+        "generation": {
+            "type": "object",
+            "required": ["temperature", "top_p", "max_output_tokens", "on_unsupported"],
+            "properties": {
+                "temperature": {"type": ["number", "null"]},
+                "top_p": {"type": ["number", "null"]},
+                "max_output_tokens": {"type": ["integer", "null"]},
+                "on_unsupported": {"enum": ["fail", "omit"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "schema_version",
+        "kind",
+        "run_id",
+        "root_run_id",
+        "call_index",
+        "recorded_at",
+        "context",
+        "model",
+        "provider_name",
+        "prompt_digest",
+        "request_digest",
+        "digest_generation",
+        "digest_status",
+        "destination_status",
+        "stop_reason",
+        "usage",
+        "latency_ms",
+        "attempts",
+        "provider_retried",
+        "error_code",
+        "provider_error_code",
+        "retryable",
+        "config_recoverable",
+        "http_status",
+        "capture_downgrades",
+    ],
+    "properties": {
+        "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
+        "kind": {"const": MODEL_CALL_KIND},
+        "run_id": {"type": "string", "minLength": 1},
+        "root_run_id": {"type": "string", "minLength": 1},
+        "call_index": {"type": "integer", "minimum": 0},
+        "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
+        "context": {
+            "type": "object",
+            "required": [
+                "run_id",
+                "skill_id",
+                "skill_digest",
+                "step_id",
+                "attempt",
+                "batch_id",
+                "item_id",
+                "case_id",
+                "traceparent",
+                "tracestate",
+                "attributes",
+            ],
+            "properties": {
+                "run_id": {"type": "string"},
+                "skill_id": {"type": "string"},
+                "skill_digest": {"type": "string"},
+                "step_id": {"type": "string"},
+                "attempt": {"type": "integer", "minimum": 1},
+                "batch_id": {"type": "string"},
+                "item_id": {"type": "string"},
+                "case_id": {"type": "string"},
+                "traceparent": {"type": "string"},
+                "tracestate": {"type": "string"},
+                "attributes": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "model": _MODEL_CALL_CONFIG_SCHEMA,
+        "provider_name": {"type": "string"},
+        # Empty is a valid answer and ``digest_status`` says which reason it is, so the
+        # pattern admits both the key and its absence rather than requiring one.
+        "prompt_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
+        "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
+        "digest_generation": {"type": "string"},
+        "digest_status": {"enum": list(DIGEST_STATUSES)},
+        # Declared and not required: the writer always emits it -- the in-band empty string
+        # is its absence spelling -- so absence on a line means exactly one thing, a writer
+        # that predates the field, and ``validate_run_dir`` keeps passing directories
+        # pre-W7-3 builds filled. (``attempt_log`` below spells absence by omitting the key
+        # instead; the asymmetry is each field's own rule.)
+        #
+        # Format-constrained like the two digests beside it rather than left an open string:
+        # this key is a token the kernel MINTS to a closed shape, not an open vocabulary a
+        # provider may extend (which is why ``stop_reason`` and ``provider_error_code`` carry
+        # no pattern and this does). The pattern is DERIVED from the same body
+        # ``is_valid_idempotency_key`` compiles, so an imported or third-party line cannot be
+        # certified against a rule the rest of the kernel does not hold. Empty is admitted
+        # explicitly, the ``^(|...)$`` idiom the digests use: a refused call was never keyed.
+        "idempotency_key": {"type": "string", "pattern": IDEMPOTENCY_KEY_JSON_PATTERN},
+        "destination_status": {"enum": list(DESTINATION_STATUSES)},
+        "stop_reason": {"type": "string"},
+        "usage": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "latency_ms": {"type": "integer", "minimum": 0},
+        "attempts": {"type": "integer", "minimum": 0},
+        # Declared but not required: the sweep validator reads ledgers earlier v0.21 builds
+        # filled, and absence means nothing was itemized -- a writer that predates the field,
+        # a refused call that never dispatched, or a receipt built without a log (this writer
+        # omits an empty log; the ones before it spelled the same value ``[]``, which stays
+        # legal and is why no ``minItems`` appears here). What a JSON Schema cannot state is
+        # how a *non-empty* log stands to the line around it, which is
+        # ``_validate_model_call_attempt_logs``'s job. A present entry is written whole or
+        # refused: the closed shape is the record's own rule, one level down.
+        "attempt_log": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "index",
+                    "elapsed_ms",
+                    "error_code",
+                    "provider_error_code",
+                    "retryable",
+                    "config_recoverable",
+                    "http_status",
+                    "provider_retried",
+                    "usage",
+                    "stream_committed",
+                ],
+                "properties": {
+                    "index": {"type": "integer", "minimum": 1},
+                    "elapsed_ms": {"type": "integer", "minimum": 0},
+                    "error_code": {"type": "string"},
+                    "provider_error_code": {"type": "string"},
+                    "retryable": {"type": "boolean"},
+                    "config_recoverable": {"type": "boolean"},
+                    "http_status": {"type": ["integer", "null"]},
+                    "provider_retried": {"type": "boolean"},
+                    "usage": {
+                        "type": "object",
+                        "additionalProperties": {"type": "integer", "minimum": 0},
+                    },
+                    "stream_committed": {"type": "boolean"},
+                    # W7-2: declared and not required -- an entry a W7-1 writer filled carries
+                    # ten keys and stays valid, absence meaning the line predates the field.
+                    # Integer only, never null: no writer omits by writing null, and the reader
+                    # (``ModelCallAttempt.from_json``) refuses it under the same rule.
+                    "backoff_ms": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "provider_retried": {"type": "boolean"},
+        "error_code": {"type": "string"},
+        "provider_error_code": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
+        "http_status": {"type": ["integer", "null"]},
+        "capture_downgrades": {"type": "integer", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
+
+
+def _payloads_envelope(kind: str) -> dict[str, Any]:
+    return {
+        "schema_version": {"enum": [MODEL_PAYLOADS_SCHEMA_VERSION]},
+        "kind": {"const": kind},
+        "run_id": {"type": "string", "minLength": 1},
+        "root_run_id": {"type": "string", "minLength": 1},
+        "recorded_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
+    }
+
+
+_PAYLOADS_ENVELOPE_KEYS = ["schema_version", "kind", "run_id", "root_run_id", "recorded_at"]
+
+# Three kinds under one namespace, discriminated the way MODEL_CONTENT_RECORD_SCHEMA's four are:
+# oneOf with a const kind per branch, additionalProperties refused per branch, and a literal
+# single-element schema_version enum because this artifact never existed under the legacy prefix
+# (the model-calls ledger states the same rule).
+MODEL_PAYLOADS_RECORD_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": [*_PAYLOADS_ENVELOPE_KEYS, "sha256", "text"],
+            "properties": {
+                **_payloads_envelope(PAYLOAD_CHUNK_KIND),
+                "sha256": {"type": "string", "pattern": SHA256_PATTERN},
+                "text": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                *_PAYLOADS_ENVELOPE_KEYS,
+                "request_digest",
+                "digest_generation",
+                "refs",
+                "payload",
+            ],
+            "properties": {
+                **_payloads_envelope(MODEL_REQUEST_KIND),
+                # Never empty: a keyless call has nothing to file a preimage under, so the
+                # record simply does not exist (unlike the response branch below).
+                "request_digest": {"type": "string", "pattern": SHA256_PATTERN},
+                "digest_generation": {"type": "string", "minLength": 1},
+                "refs": {"type": "boolean"},
+                # Deliberately untyped. The recipe arm always produces an object, but the
+                # verbatim arm exists for "a preimage the recipe shape does not fit", and a
+                # future digest generation need not wrap its terms at all. What makes a
+                # request record valid is that it reassembles to its digest, which
+                # ``_validate_model_payload_digests`` checks; a type here would reject a
+                # faithful record for the shape of bytes it is faithful to.
+                "payload": {},
+            },
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "required": [
+                *_PAYLOADS_ENVELOPE_KEYS,
+                "call_index",
+                "request_digest",
+                "unrecorded_reason",
+                "response",
+            ],
+            "properties": {
+                **_payloads_envelope(MODEL_RESPONSE_KIND),
+                "call_index": {"type": "integer", "minimum": 0},
+                # Empty is legal here: the ledger line this index joins says why there was no
+                # key (its ``digest_status``), and this record still names the answer.
+                "request_digest": {"type": "string", "pattern": OPTIONAL_SHA256_PATTERN},
+                "unrecorded_reason": {"enum": list(UNRECORDED_REASONS)},
+                # The inline body, a chunk reference to an offloaded one, or null with
+                # ``unrecorded_reason`` saying why. Body keys are content, not contract, so the
+                # object arm stays open the way the request ``payload`` does.
+                "response": {"type": ["object", "null"]},
             },
             "additionalProperties": False,
         },
@@ -905,10 +1267,10 @@ PROPOSAL_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "updated_at": {"type": "number"},
         "mode": {"enum": ["read-only", "propose", "apply"]},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "diff_path": {"type": "string"},
         "diff_bytes": {"type": "integer", "minimum": 0},
-        "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff_sha256": {"type": "string", "pattern": SHA256_PATTERN},
         "changed_paths": {"type": "array", "items": {"type": "string"}},
         "files": {
             "type": "array",
@@ -944,6 +1306,15 @@ METRICS_SCHEMA: dict[str, Any] = {
         "duration_s": {"type": "number", "minimum": 0},
         "error": {"type": "string"},
         "error_code": {"type": "string"},
+        # The failure classification, declared with its writer (the ``stream_closed``
+        # precedent: declare even under ``additionalProperties: True``, because an open cap is
+        # a tolerance, not a declaration). The code/status pair is written whenever the run
+        # recorded provider detail; the two booleans only on a failed run, where the state
+        # they are read from is classified fresh.
+        "provider_error_code": {"type": "string"},
+        "provider_http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
     },
     "additionalProperties": True,
 }
@@ -955,9 +1326,23 @@ STATUS_SCHEMA: dict[str, Any] = {
         "run_id": {"type": "string", "minLength": 1},
         "state": {"type": "string"},
         "terminal": {"type": "boolean"},
-        "last_event_seq": {"type": "integer", "minimum": 1},
+        # ``minimum: 0``, not 1: the event sink always writes >= 1, but the failure-quarantine
+        # writer (``run_state.write_failure_status_artifact``) can mint this artifact over a
+        # run that never wrote status.json, and its honest seed is 0 — "no committed event
+        # known to this writer". Every reader already accepts 0 (and reconciles against the
+        # committed log tail).
+        "last_event_seq": {"type": "integer", "minimum": 0},
         "last_event_type": {"type": "string"},
         "updated_at": {"type": "string"},
+        # The classification a parked ``turn.failed`` writes into this artifact (declared
+        # with the writer, the same rule as METRICS_SCHEMA above). Cleared on unpark and
+        # healed at a non-failed terminal, so absence means "no live failure to classify" —
+        # which is also what absence on a pre-v0.21 artifact meant.
+        "provider_error_code": {"type": "string"},
+        "http_status": {"type": ["integer", "null"]},
+        "retryable": {"type": "boolean"},
+        "config_recoverable": {"type": "boolean"},
+        "provider_retried": {"type": "boolean"},
     },
     "additionalProperties": True,
 }
@@ -1122,9 +1507,9 @@ PACKAGE_SCHEMA: dict[str, Any] = {
         "schema_version": schema_version_property("proposal-package.v1"),
         "run_id": {"type": "string", "minLength": 1},
         "created_at": {"type": "string"},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
+        "diff_sha256": {"type": "string", "pattern": SHA256_PATTERN},
+        "package_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "files": {
             "type": "array",
             "items": {
@@ -1135,7 +1520,7 @@ PACKAGE_SCHEMA: dict[str, Any] = {
                     "role": {"type": "string"},
                     "workspace_path": {"type": "string"},
                     "size": {"type": "integer", "minimum": 0},
-                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "sha256": {"type": "string", "pattern": SHA256_PATTERN},
                 },
                 "additionalProperties": False,
             },
@@ -1163,14 +1548,14 @@ APPROVAL_SCHEMA: dict[str, Any] = {
         "schema_version": schema_version_property("approval.v1"),
         "approval_id": {"type": "string"},
         "decision": {"enum": ["approved", "rejected"]},
-        "package_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "package_hash": {"type": "string", "pattern": SHA256_PATTERN},
+        "proposal_hash": {"type": "string", "pattern": SHA256_PATTERN},
         "approved_paths": {"type": "array", "items": {"type": "string"}},
         "rejected_paths": {"type": "array", "items": {"type": "string"}},
         "approver_id": {"type": "string"},
         "approved_at": {"type": "string"},
         "note": {"type": "string"},
-        "approval_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_hash": {"type": "string", "pattern": SHA256_PATTERN},
     },
     "additionalProperties": False,
 }
@@ -1195,7 +1580,7 @@ APPLY_RESULT_SCHEMA: dict[str, Any] = {
         "conflicts": {"type": "array", "items": {"type": "object"}},
         "approval_hash": {"type": "string"},
         "package_hash": {"type": "string"},
-        "apply_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "apply_hash": {"type": "string", "pattern": SHA256_PATTERN},
     },
     "additionalProperties": False,
 }
@@ -1254,8 +1639,30 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
         _validate_settled_text_digests(transcript_path, issues)
     model_content_path = run_dir / MODEL_CONTENT_FILENAME
     if model_content_path.exists():
-        _validate_jsonl_file(model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues)
+        # Both content-classified artifacts, so both redact: binding this on one of the two
+        # would be the twin miss this package keeps making.
+        _validate_jsonl_file(
+            model_content_path, MODEL_CONTENT_RECORD_SCHEMA, issues, redact_instance=True
+        )
         _validate_settled_text_digests(model_content_path, issues)
+    # Optional like the content sidecar beside it, and for the same reason: it exists only for a
+    # run that asked for it, so its absence is a configuration, not a defect. No digest
+    # recomputation pass -- the ledger holds no content-addressed field -- but it does now carry
+    # claims that span two of its own values, and a schema cannot relate one entry to another.
+    model_calls_path = run_dir / MODEL_CALLS_FILENAME
+    if model_calls_path.exists():
+        _validate_jsonl_file(model_calls_path, MODEL_CALLS_RECORD_SCHEMA, issues)
+        _validate_model_call_attempt_logs(model_calls_path, issues)
+    # Optional for the same reason as its two sidecar siblings. Unlike the ledger, this one DOES
+    # get a recomputation pass: the corpus's whole contract is that every request record
+    # reassembles to the exact bytes its key was taken over, and a validator that only
+    # shape-checked would bless a corpus that cannot honor it.
+    model_payloads_path = run_dir / MODEL_PAYLOADS_FILENAME
+    if model_payloads_path.exists():
+        _validate_jsonl_file(
+            model_payloads_path, MODEL_PAYLOADS_RECORD_SCHEMA, issues, redact_instance=True
+        )
+        _validate_model_payload_digests(run_dir, issues)
     jobs_dir = run_dir / "artifacts" / "jobs"
     if jobs_dir.exists():
         for job_path in sorted(jobs_dir.glob("*/job.json")):
@@ -1307,6 +1714,169 @@ def _validate_settled_text_digests(path: Path, issues: list[ValidationIssue]) ->
             issues.append(ValidationIssue(label, "settled_text length does not match final_text"))
 
 
+def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue]) -> None:
+    """Relate each ledger line's ``attempt_log`` to the three record fields it itemizes and to
+    the one rule its entries owe each other.
+
+    A JSON Schema validates every entry against its own shape and can say nothing about how one
+    entry stands to another, or to the record around it. ``ModelCallReceipt.__post_init__``
+    refuses three cross-entry claims -- indices exactly ``1..attempts`` in order, entry usage
+    summing to the receipt's, and no wait recorded before the first dispatch -- and nothing
+    constructs a receipt on the way through ``monoid validate``, which reads the ledger as JSON.
+    So a line the record could not have produced (``attempts: 2`` under indices ``[1, 1]``;
+    entries billing 3 beside a total of 99; a wait booked ahead of the call's own first reach
+    into the adapter) passed the sweep clean, which is the one answer a validator must never
+    give about a corrupt artifact.
+
+    One claim is this surface's alone -- the dispatches, plus the waits between them, fitting
+    inside the call's own ``latency_ms`` -- which is a fact about when the two values exist
+    rather than an omission. ``model_call.py`` attaches the log at its failure and its
+    answering exit while ``latency_ms`` is still the field's default; ``_publish`` stamps the
+    measured duration afterwards, on every exit. A constructor check would therefore fire on
+    every retried call, weighing real dispatch durations against a latency of zero. This line is
+    the first place both values are settled and present together. Consumers that lay the entries
+    out on a timeline -- the OTel preset's per-attempt children -- bound their own arithmetic
+    rather than trust the record, because reporting a corrupt line is not the same as stopping
+    one from being read back.
+
+    The relationship pass the ledger did not have, alongside the ones its sidecar siblings do
+    (manifest against workspace index, proposal against its hashes, settled text against its
+    digests, payload records against their keys). An unitemized log makes no claim to check,
+    in either of its two spellings: absence, which is what this build writes and what every
+    record predating the field carries, and a present ``[]``, which is what builds between
+    W7-1 and W7-4 wrote for the same value at whatever ``attempts`` the receipt held. Both
+    are read as "nothing itemized" and neither is reported -- the claims below are about the
+    entries a log actually names.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return  # already reported by the schema pass
+    for index, raw_line in enumerate(raw.split(b"\n"), start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # already reported by the schema pass
+        if not line.strip():
+            continue
+        try:
+            record = loads_json_ingress(line)
+        except (ValueError, RecursionError):
+            continue  # already reported by the schema pass
+        if not isinstance(record, dict):
+            continue
+        entries = record.get("attempt_log")
+        if not isinstance(entries, list):
+            continue  # absent, or shape the schema already refused
+        label = f"{path.name}:{index}"
+        attempts = record.get("attempts")
+        counted = isinstance(attempts, int) and not isinstance(attempts, bool)
+        if not entries:
+            # Nothing to relate, at any count. ``[]`` is what every build before W7-4 wrote
+            # for an empty log -- the projection emitted the key unconditionally, and a
+            # receipt without entries is legal at any ``attempts`` -- so the count beside it
+            # says nothing about the writer. Reporting the positive-count arm would convict
+            # directories the previous build filled while certifying the zero arm written by
+            # the same line of code.
+            continue
+        if not all(isinstance(entry, dict) for entry in entries):
+            continue  # shape is the schema's job
+        if counted:
+            named = [entry.get("index") for entry in entries]
+            if named != list(range(1, attempts + 1)):
+                issues.append(
+                    ValidationIssue(
+                        label, "attempt_log must name every attempt exactly once, in order"
+                    )
+                )
+        # The wait that separates two dispatches cannot precede the first one. The record refuses
+        # this itself; repeated here because nothing constructs a record on this path, and a line
+        # can satisfy every other claim -- indices in order, usage summing, durations fitting --
+        # while still reporting a wait before the call had done anything to wait after.
+        first_backoff = entries[0].get("backoff_ms")
+        if (
+            isinstance(first_backoff, int)
+            and not isinstance(first_backoff, bool)
+            and first_backoff != 0
+        ):
+            issues.append(
+                ValidationIssue(
+                    label,
+                    "attempt_log first entry backoff_ms must be 0: "
+                    "nothing precedes the first dispatch",
+                )
+            )
+        # Checked before the usage block, which returns early on a shape the schema owns: two
+        # independent claims about one line, and the second must not be skipped by the first's
+        # excuse for leaving.
+        latency_ms = record.get("latency_ms")
+        occupied: int | None = _attempt_timeline_ms(entries)
+        if (
+            occupied is not None
+            and isinstance(latency_ms, int)
+            and not isinstance(latency_ms, bool)
+            and occupied > latency_ms
+        ):
+            issues.append(
+                ValidationIssue(
+                    label, "attempt_log dispatches and waits must fit inside the line's latency_ms"
+                )
+            )
+        usage = record.get("usage")
+        if not isinstance(usage, dict):
+            continue  # shape is the schema's job
+        summed: dict[str, int] | None = _summed_attempt_usage(entries)
+        if summed is not None and summed != usage:
+            issues.append(
+                ValidationIssue(label, "attempt_log usage must sum to the record's usage")
+            )
+
+
+def _summed_attempt_usage(entries: list[Any]) -> dict[str, int] | None:
+    """Key-wise total of the entries' usage, or ``None`` when a count is not one.
+
+    ``None`` rather than a partial sum: a malformed count is the schema's finding, already
+    reported, and a total computed around it would be a second and *wrong* finding on the same
+    line -- a validator inventing a disagreement out of corruption it did not cause.
+    """
+    summed: dict[str, int] = {}
+    for entry in entries:
+        counts = entry.get("usage")
+        if not isinstance(counts, dict):
+            return None
+        for key, value in counts.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                return None
+            summed[key] = summed.get(key, 0) + value
+    return summed
+
+
+def _attempt_timeline_ms(entries: list[Any]) -> int | None:
+    """Total time the entries account for: every dispatch plus every wait they recorded.
+
+    ``None`` rather than a partial total when a duration is not a count, for the reason
+    ``_summed_attempt_usage`` gives -- a figure computed around corruption the schema already
+    reported would be a second and wrong finding on the same line.
+
+    An absent ``backoff_ms`` contributes zero and is not corruption: it is a line written before
+    the field, whose unrecorded waits can only make the true total larger than this one. That
+    direction is the safe one for a check that reports totals which are *too large*, so a legacy
+    line is never accused on the strength of what it could not say.
+    """
+    total = 0
+    for entry in entries:
+        elapsed = entry.get("elapsed_ms")
+        if not isinstance(elapsed, int) or isinstance(elapsed, bool):
+            return None
+        backoff = entry.get("backoff_ms", 0)
+        if backoff is None:
+            backoff = 0
+        if not isinstance(backoff, int) or isinstance(backoff, bool):
+            return None
+        total += elapsed + backoff
+    return total
+
+
 def _read_json_artifact(path: Path) -> tuple[Any, ValidationIssue | None]:
     """Decode and parse one JSON artifact, returning the problem instead of raising it.
 
@@ -1350,16 +1920,254 @@ def _validate_json_file(path: Path, schema: dict[str, Any], issues: list[Validat
 
 
 def _validate_object(
-    payload: Any, schema: dict[str, Any], issues: list[ValidationIssue], label: str
+    payload: Any,
+    schema: dict[str, Any],
+    issues: list[ValidationIssue],
+    label: str,
+    *,
+    redact_instance: bool = False,
 ) -> None:
+    """Report one object's schema errors, optionally without quoting the object back.
+
+    ``redact_instance`` is for the content-classified artifacts. jsonschema builds its message out
+    of the *instance* -- a top-level ``oneOf`` failure prints the whole record -- and
+    ``monoid validate``'s issues go to a terminal and into ``--json`` output, so an unmatched line
+    of ``model_payloads.jsonl`` or ``model-content.jsonl`` would republish a conversation, or a
+    whole system prompt, out of the private run directory. The trigger is not an attack but the
+    compatibility policy: both artifacts pin a literal ``schema_version`` enum of v1 spellings only, so
+    the first version bump makes every line of every retained run directory fail at once. The
+    failing keyword and the path locate the problem; the value is the payload.
+    """
+
     validator = Draft202012Validator(schema)
     for error in sorted(validator.iter_errors(payload), key=lambda item: list(item.path)):
         suffix = ".".join(str(part) for part in error.path)
         issue_path = f"{label}.{suffix}" if suffix else label
-        issues.append(ValidationIssue(issue_path, error.message))
+        if not redact_instance:
+            issues.append(ValidationIssue(issue_path, error.message))
+            continue
+        # Both redacted schemas are a bare top-level ``oneOf``, so the outer error is always
+        # ``oneOf`` at the root: reporting the keyword alone would give a maintainer one identical
+        # line per record and no way to tell a version bump from a truncated write. Descend to the
+        # branch the record *claims* to be -- its ``kind`` is a schema literal, so naming it costs
+        # nothing -- and report that branch's keyword and path. Both come from the schema and the
+        # instance's key structure, never from a value. ``best_match`` alone is not enough here:
+        # its relevance heuristic picks whichever branch failed shallowest, which for a bumped
+        # ``schema_version`` is a *different* kind's missing-required error.
+        detail = best_match(_discriminated_errors(payload, schema) or error.context or [error])
+        detail = detail if detail is not None else error
+        location = detail.json_path
+        where = "" if location in ("$", "") else f" at {location}"
+        issues.append(
+            ValidationIssue(
+                issue_path, f"does not satisfy the {detail.validator} constraint{where}"
+            )
+        )
 
 
-def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[ValidationIssue]) -> None:
+def _discriminated_errors(payload: Any, schema: dict[str, Any]) -> list[Any]:
+    """The errors of the ``oneOf`` branch ``payload``'s ``kind`` names, if it names one.
+
+    The two content artifacts discriminate their branches with ``{"kind": {"const": ...}}``, which
+    is exactly the information a redacted report may use: it is a schema literal, and it is the
+    difference between "this record is broken somehow" and "this record's ``schema_version`` is
+    from a version you do not read".
+    """
+
+    if not isinstance(payload, dict):
+        return []
+    kind = payload.get("kind")
+    for branch in schema.get("oneOf", ()):
+        if branch.get("properties", {}).get("kind", {}).get("const") == kind:
+            return list(Draft202012Validator(branch).iter_errors(payload))
+    return []
+
+
+def _validate_model_payload_digests(run_dir: Path, issues: list[ValidationIssue]) -> None:
+    """Re-verify the corpus's self-verification: chunks hash to their names, request records
+    reassemble to the bytes their key was taken over, response references resolve.
+
+    Reads the file leniently -- lines the schema pass already reported are skipped here rather
+    than reported twice -- and treats every reassembly failure as an issue on the record that
+    cannot honor its digest, naming the line. Unreferenced files in the chunk directory are NOT
+    issues: a crashed write may orphan one, and reclaiming it is ``monoid gc``'s job, not this
+    pass's -- integrity is only what a record references. The collector keeps the converse
+    promise (it deletes nothing this pass resolves), bound by a spy test over this function's
+    reader rather than by sharing its code.
+    """
+
+    path = run_dir / MODEL_PAYLOADS_FILENAME
+    chunk_dir = run_dir / MODEL_PAYLOADS_DIRNAME
+    records: list[tuple[int, dict[str, Any]]] = []
+    chunks: dict[str, bytes] = {}
+    try:
+        lines = path.read_bytes().split(b"\n")
+    except OSError:
+        return
+    for index, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            payload = loads_json_ingress(raw_line.decode("utf-8"))
+        except Exception:
+            continue  # the schema pass already reported this line
+        if not isinstance(payload, dict):
+            continue
+        records.append((index, payload))
+        if payload.get("kind") == PAYLOAD_CHUNK_KIND:
+            text = payload.get("text")
+            sha = payload.get("sha256")
+            if not isinstance(text, str) or not isinstance(sha, str):
+                continue
+            data = text.encode("utf-8")
+            if sha256_bytes(data) != sha:
+                issues.append(
+                    ValidationIssue(f"{path.name}:{index}", "chunk text does not match its sha256")
+                )
+                continue
+            chunks[sha] = data
+
+    # One slot, deliberately. Caching every resolved chunk beside the inline ones turned this
+    # command's footprint from O(largest chunk) into O(total offloaded corpus) -- measured at
+    # 42.1 MB against 3.2 MB over forty 1 MB chunks, and with an 8 MB ceiling per chunk and no
+    # bound on the count, a large run directory costs gigabytes on the one command an operator
+    # runs before trusting it. Records that name one chunk are adjacent, so a single slot keeps
+    # the re-read the memo was added to stop, without keeping the corpus.
+    last_resolved: tuple[str, bytes] | None = None
+
+    def resolve(sha: str) -> bytes:
+        nonlocal last_resolved
+        if sha in chunks:
+            return chunks[sha]
+        if last_resolved is not None and last_resolved[0] == sha:
+            return last_resolved[1]
+        # A reference becomes a filename here, so this is where the writer's constraint has to be
+        # re-established: everything it writes is 64 hex, and an absolute or ``..``-relative string
+        # joined onto ``chunk_dir`` discards the base and names any file on the machine. The hash
+        # check below cannot stand in for it -- it happens after the read.
+        if not is_chunk_sha256(sha):
+            raise ValueError("chunk reference is not a content-addressed name")
+        data = read_verified_bytes(chunk_dir / sha, max_bytes=MAX_MODEL_PAYLOAD_BYTES)
+        if data is None:
+            raise ValueError(f"offloaded chunk {sha} is not a readable run-directory file")
+        if sha256_bytes(data) != sha:
+            raise ValueError(f"offloaded chunk {sha} does not match its name")
+        # Held for the next caller only, because N records may name ONE chunk and every one of
+        # them used to re-read it. A content-addressed name means the bytes cannot have changed
+        # between two reads of the same run directory.
+        last_resolved = (sha, data)
+        return data
+
+    parsed_bodies: dict[str, str | None] = {}
+    for index, payload in records:
+        kind = payload.get("kind")
+        if kind == MODEL_REQUEST_KIND:
+            digest = payload.get("request_digest")
+            refs = payload.get("refs")
+            if not isinstance(digest, str) or not isinstance(refs, bool):
+                continue  # shape issues are the schema pass's report
+            try:
+                rebuilt = reassemble_request_preimage(payload.get("payload"), resolve, refs=refs)
+            except Exception:
+                issues.append(
+                    ValidationIssue(f"{path.name}:{index}", "request payload cannot be reassembled")
+                )
+                continue
+            if sha256_bytes(rebuilt) != digest:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        "request payload does not reassemble to its request_digest",
+                    )
+                )
+                continue
+            # Resolving is not believing -- on this half too. What stood here instead was a
+            # comment declining this arm, on the reasoning that reassembly is a canonical
+            # encode and a digest-valid preimage is therefore canonical JSON by construction.
+            # That enumerated three of the encoder's refusals (non-finite values, over-long
+            # ints, surrogates) and omitted nesting, which the encoder does not bound and the
+            # reader does. The writer now refuses such a preimage, but corpora written before
+            # that gate still hold these records, and this is the command an operator runs on a
+            # run directory that arrived from somewhere else. A record that reassembles and
+            # hashes correctly and *still* cannot be read testifies to nothing, and saying so
+            # here is the difference between an unreadable corpus and a silent one.
+            try:
+                loads_json_ingress(rebuilt.decode("utf-8"))
+            except Exception as error:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        # Bounded: these messages come from the parser's own fixed vocabulary
+                        # and carry positions rather than content, but the corpus is untrusted
+                        # input and a validator report is not the place to find that out.
+                        f"request payload is not readable by the replay reader: {str(error)[:200]}",
+                    )
+                )
+        elif kind == MODEL_RESPONSE_KIND:
+            # Through the shared trichotomy, not an inline shape test: the replay reader
+            # refuses through the same function, so the two consumers cannot disagree about
+            # which objects are references. The ``malformed`` arm is new strictness this
+            # gained from the share -- a single-key marker object carrying a non-sha value
+            # used to be skipped as data here while being unmistakably writer-shaped.
+            shape, sha = response_reference(payload.get("response"))
+            if shape == RESPONSE_MALFORMED:
+                issues.append(
+                    ValidationIssue(
+                        f"{path.name}:{index}",
+                        "response reference is not a content-addressed name",
+                    )
+                )
+            elif shape == RESPONSE_REFERENCE:
+                if sha in parsed_bodies:
+                    # The verdict is a property of the bytes and the bytes are named by their
+                    # hash, so a second record naming this chunk needs neither the read nor the
+                    # re-hash that produced it. Skipping the resolve entirely -- rather than
+                    # resolving and then not parsing -- is what keeps the bytes transient.
+                    problem = parsed_bodies[sha]
+                    if problem is not None:
+                        issues.append(ValidationIssue(f"{path.name}:{index}", problem))
+                    continue
+                try:
+                    resolved = resolve(sha)
+                except Exception:
+                    issues.append(
+                        ValidationIssue(
+                            f"{path.name}:{index}",
+                            "response reference does not resolve to a recorded chunk",
+                        )
+                    )
+                    continue
+                # Resolving is not believing. Re-hashing proves the bytes are the ones the
+                # writer named, not that they are a body any reader will accept: the sha names
+                # whatever was planted, so an offloaded body could carry JSON the ingress rules
+                # forbid and still pass every check here. The replay reader refuses such a body;
+                # without this arm ``monoid validate`` would certify the corpus clean and the
+                # operator would meet the refusal at run time with a green integrity report.
+                #
+                # Memoized by sha, because the answer is a property of the bytes and the bytes
+                # are named by their hash. Parsing per RECORD instead of per CHUNK made this the
+                # dominant cost of the command: 4,000 records naming one 8 MB chunk took ~62
+                # minutes, where one parse takes about a second.
+                if sha not in parsed_bodies:
+                    try:
+                        loads_json_ingress(resolved.decode("utf-8"))
+                        parsed_bodies[sha] = None
+                    except Exception:
+                        parsed_bodies[sha] = (
+                            "response body is not JSON this kernel's readers accept"
+                        )
+                problem = parsed_bodies[sha]
+                if problem is not None:
+                    issues.append(ValidationIssue(f"{path.name}:{index}", problem))
+
+
+def _validate_jsonl_file(
+    path: Path,
+    schema: dict[str, Any],
+    issues: list[ValidationIssue],
+    *,
+    redact_instance: bool = False,
+) -> None:
     # Decode per line and REPORT undecodable bytes, matching the twin ``_validate_event_file``.
     #
     # Strict whole-file decoding raised ``UnicodeDecodeError`` out of ``monoid validate`` — the
@@ -1389,7 +2197,9 @@ def _validate_jsonl_file(path: Path, schema: dict[str, Any], issues: list[Valida
             message = exc.msg if isinstance(exc, json.JSONDecodeError) else "decoder limit exceeded"
             issues.append(ValidationIssue(f"{path.name}:{index}", f"invalid JSON: {message}"))
             continue
-        _validate_object(payload, schema, issues, f"{path.name}:{index}")
+        _validate_object(
+            payload, schema, issues, f"{path.name}:{index}", redact_instance=redact_instance
+        )
 
 
 def _validate_event_file(path: Path, issues: list[ValidationIssue]) -> None:

@@ -1038,3 +1038,188 @@ def test_backend_bounds_concurrent_runs(tmp_path: Path) -> None:
     release.set()
     assert backend.wait_for_run(first.run_id, timeout_s=10) is SessionState.COMPLETED
     assert backend.wait_for_run(second.run_id, timeout_s=10) is SessionState.COMPLETED
+
+
+def _jsonl_lines(path: Path) -> list[dict]:
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+
+def test_backend_model_sidecar_switches_reach_the_run_directory(tmp_path: Path) -> None:
+    """The two recording switches are deployment wiring, exactly like ``model_content_file``
+    beside them: the embedding application decides, the backend carries the booleans into the
+    activation it builds. Until this wiring existed neither sidecar was reachable from a shipped
+    shape, while the CLI already shipped ``monoid gc`` -- a consumer verb for an artifact
+    nothing could produce. The witness is the digest join, not file existence: the ledger
+    line's 64-hex key must name the corpus request record beside it, so a switch that produced
+    an empty file could not pass."""
+    workspace = _workspace(tmp_path)
+    backend = RunnerBackend(
+        run_root=tmp_path / "runs",
+        token_manager=_token_manager(),
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(response_id="turn_1", final_text="done")]
+        ),
+        model_calls_file=True,
+        model_payload_file=True,
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="Record this call.",
+            runtime_config=_default_config(),
+        )
+    )
+
+    assert backend.wait_for_run(submission.run_id, timeout_s=10) is SessionState.COMPLETED
+
+    ledger_lines = _jsonl_lines(submission.run_dir / "model_calls.jsonl")
+    assert ledger_lines, "the ledger switch reached the activation"
+    digest = ledger_lines[0]["request_digest"]
+    assert len(digest) == 64
+    request_records = [
+        record
+        for record in _jsonl_lines(submission.run_dir / "model_payloads.jsonl")
+        if record.get("kind") == "model_request"
+    ]
+    assert [record["request_digest"] for record in request_records] == [digest]
+
+
+def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> None:
+    """``BackendLoopFactory.build`` serves the submitted run AND recovery's rebuild, so the
+    recording switches must survive a takeover without being re-supplied per run. The witness
+    is the activation-restart signature the ledger contract documents: ``call_index`` restarts
+    at zero on a durable reopen, so a ledger holding two index-0 lines proves two activations
+    both recorded -- the second being the one recovery built."""
+    workspace = _workspace(tmp_path)
+    run_root = tmp_path / "runs"
+    token_manager = _token_manager()
+
+    class ApprovalProvider:
+        def get_tools(self, context: ToolContext | None = None) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                return ToolResult(ok=True, content={"value": "ok"})
+
+            return [
+                ToolSpec(
+                    id="demo.approval",
+                    description="approval demo",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    provider = ApprovalProvider()
+    first_adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("demo_approval", {"value": "ok"}, "call_1"),)),
+            # The approval starts as an async task and the model is consulted again with that
+            # observation, so the first activation makes TWO recorded calls before the session
+            # parks -- ledger indexes [0, 1].
+            ModelTurn(final_text="park"),
+        ]
+    )
+    backend1 = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: first_adapter,
+        tool_providers=(provider,),
+        model_calls_file=True,
+        model_payload_file=True,
+    )
+    submission = backend1.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="use approval",
+            runtime_config=runtime_config(
+                bindings=(
+                    tool_binding("demo.approval", authorization="ask"),
+                    tool_binding("run.finish"),
+                )
+            ),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+
+    def pending_approval_tasks(backend: RunnerBackend) -> list:
+        record = backend._record(run_id)
+        if record.loop is None or record.loop._session is None:
+            return []
+        return [
+            task
+            for task in record.loop._session.res.context.job_manager.list_jobs()
+            if task.get("kind") == "tool_approval" and task.get("status") == "running"
+        ]
+
+    assert eventually(lambda: bool(pending_approval_tasks(backend1)))
+    assert eventually(lambda: backend1.checkpoint_store.latest(run_id) is not None)
+    # Hand over only after the first activation has finished writing, so the recorded index
+    # sequence is deterministic rather than racing the takeover. The barrier is the adapter's
+    # exhaustion, not a line count: `>= 2` would also be satisfied by an activation that went on
+    # to make a third call, releasing the gate mid-write and racing the assertion below against
+    # a line that had not landed. `FakeModelAdapter` answers past its script rather than raising,
+    # so counting scripted turns is the only statement of "this activation is done asking".
+    ledger_path = submission.run_dir / "model_calls.jsonl"
+    assert eventually(lambda: len(first_adapter.requests) == 2)
+    assert eventually(lambda: len(_jsonl_lines(ledger_path)) == 2)
+    # `shutdown(drain=False)` on a backend with no broker and no watchdog is close to inert -- it
+    # does not end the parked session or close the recorder's handle, and nothing in the backend
+    # does. What makes `[0, 1, 0]` safe is the barrier above: the adapter's script is exhausted,
+    # so the first activation has no fourth turn to take. This call is teardown hygiene, placed
+    # before the takeover so the two backends' lifetimes do not overlap for the rest of the test.
+    backend1.shutdown(drain=False)
+
+    backend2 = RunnerBackend(
+        run_root=run_root,
+        token_manager=token_manager,
+        allowed_workspace_roots=(workspace,),
+        llm_gateway_url="http://llm-gateway.internal/v1/turns",
+        model_adapter_factory=lambda _spec, _token: FakeModelAdapter(
+            turns=[ModelTurn(final_text="done")]
+        ),
+        tool_providers=(provider,),
+        model_calls_file=True,
+        model_payload_file=True,
+    )
+    backend2.max_recover_attempts = 10_000
+    try:
+        assert eventually(lambda: run_id in backend2.recover_runs() or run_id in backend2._records)
+        assert eventually(lambda: bool(pending_approval_tasks(backend2)))
+        task_id = pending_approval_tasks(backend2)[0]["task_id"]
+        backend2.report_task_result(run_id, token, task_id=task_id, result={"approved": True})
+
+        assert eventually(lambda: len(_jsonl_lines(ledger_path)) >= 3)
+        backend2.cancel_run(run_id, token)
+        backend2.wait_for_run(run_id, timeout_s=20)
+
+        ledger_lines = _jsonl_lines(ledger_path)
+        assert [line["call_index"] for line in ledger_lines] == [0, 1, 0]
+        assert all(len(line["request_digest"]) == 64 for line in ledger_lines)
+        request_records = [
+            record
+            for record in _jsonl_lines(submission.run_dir / "model_payloads.jsonl")
+            if record.get("kind") == "model_request"
+        ]
+        assert {record["request_digest"] for record in request_records} == {
+            line["request_digest"] for line in ledger_lines
+        }, "every activation's ledger line joins a recorded preimage"
+    finally:
+        # In a `finally` because this is teardown, not a step: an earlier assertion failing would
+        # otherwise leave the handle open and turn one failed assertion into a failure plus a
+        # tmp_path removal error on Windows.
+        backend2.shutdown(drain=False)

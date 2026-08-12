@@ -6,7 +6,7 @@ from pathlib import Path
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
-from monoid_agent_kernel.loop import AgentLoop, _accumulate_usage
+from monoid_agent_kernel.loop import AgentLoop, _accumulate_usage_mapping
 from monoid_agent_kernel.providers._common import normalize_usage
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -51,9 +51,11 @@ def test_normalize_usage_preserves_openai_nested_details() -> None:
 
 
 def test_accumulate_usage_sums_detail_keys() -> None:
+    # The one summation rule every carrier of usage feeds through: receipts on the settled
+    # path (whose usage folds absorbed attempts' spend), billed failure stamps at the park.
     total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    _accumulate_usage(total, ModelTurn(usage={"input_tokens": 10, "total_tokens": 15, "cache_read_tokens": 8}))
-    _accumulate_usage(total, ModelTurn(usage={"input_tokens": 5, "total_tokens": 7, "cache_read_tokens": 2}))
+    _accumulate_usage_mapping(total, {"input_tokens": 10, "total_tokens": 15, "cache_read_tokens": 8})
+    _accumulate_usage_mapping(total, {"input_tokens": 5, "total_tokens": 7, "cache_read_tokens": 2})
     assert total["input_tokens"] == 15
     assert total["total_tokens"] == 22
     assert total["cache_read_tokens"] == 10

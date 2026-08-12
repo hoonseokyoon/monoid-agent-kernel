@@ -348,6 +348,20 @@ def evict_tool_result_images(
     return tuple(result)
 
 
+WIRE_MEDIA_CARRIERS = ("content", "media")
+"""The message keys that can carry media onto the wire, in resolution order.
+
+A user multimodal turn carries its parts in a ``content`` list; a tool message carries returned
+media in a top-level ``media`` list. Both are resolved, so both move a request's preimage.
+
+Named here rather than spelled out at each reader because the second reader is the replay
+adapter's ``supports_multimodal`` derivation, one package over, and it read ``content`` alone --
+so a corpus whose images came back from a tool derived text-only and missed every lookup after
+that turn. Two hand-maintained lists of the same thing is the defect shape this repository keeps
+paying for; one list with two readers cannot drift.
+"""
+
+
 def resolve_wire_messages(
     messages: tuple[dict[str, Any], ...],
     resolver: MediaResolver,
@@ -366,14 +380,10 @@ def resolve_wire_messages(
     resolved_messages: list[dict[str, Any]] = []
     for message in messages:
         new_message = message
-        # User multimodal turns carry parts in a ``content`` list.
-        content = message.get("content")
-        if isinstance(content, list):
-            new_message = {**new_message, "content": _resolve_part_list(content, resolver)}
-        # Tool messages carry returned media in a top-level ``media`` list.
-        media = message.get("media")
-        if isinstance(media, list):
-            new_message = {**new_message, "media": _resolve_part_list(media, resolver)}
+        for carrier in WIRE_MEDIA_CARRIERS:
+            parts = message.get(carrier)
+            if isinstance(parts, list):
+                new_message = {**new_message, carrier: _resolve_part_list(parts, resolver)}
         resolved_messages.append(new_message)
     return tuple(resolved_messages)
 

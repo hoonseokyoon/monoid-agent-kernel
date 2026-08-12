@@ -67,6 +67,72 @@ def consume_task_outcome(task: asyncio.Future[Any]) -> None:
         pass
 
 
+def hand_back_discarded(produced: Any, on_discarded: Callable[[Any], None] | None) -> None:
+    """Give a produced-but-undelivered outcome back to whoever made it, contained.
+
+    One rule with four callers, and that is the whole reason it is a function. A run boundary can
+    throw away a real result in four places -- the boundary check finding the task already done,
+    the awaiter's own cleanup finding it done a moment later, the detach path's late completion,
+    and a synchronous worker settling inside the abandonment grace after its waiter was cancelled
+    -- and the rule was first bound on one of them. For a stateless callee that gap is nothing;
+    for one holding shared state it is a silent corruption, because the callee has already done
+    the work and recorded that it did. The replay adapter advances a per-key cursor when it hands
+    an answer over, so an answer dropped on any of these four paths stays spent and the next
+    caller receives a structurally valid turn belonging to a different call.
+
+    Contained the way disposal is: handing a result back is hygiene, and hygiene must never
+    replace the boundary that is the caller's real answer.
+    """
+
+    if produced is None or on_discarded is None:
+        return
+    try:
+        on_discarded(produced)
+    except Exception:  # noqa: BLE001 - see the docstring: hygiene never becomes the verdict
+        _LOGGER.exception("discarded-outcome hook failed")
+
+
+def consume_and_hand_back(
+    task: asyncio.Future[Any], on_discarded: Callable[[Any], None] | None
+) -> None:
+    """:func:`consume_task_outcome`, plus the outcome it consumed given back to its producer."""
+
+    produced: Any = None
+    try:
+        produced = task.result()
+    except BaseException:
+        produced = None
+    hand_back_discarded(produced, on_discarded)
+
+
+def dispose_unawaited(payload: Any, *, on_live_loop: bool = True) -> None:
+    """Dispose an awaitable nobody will await.
+
+    A coroutine is closed so its cleanup runs and it cannot surface as an unawaited-coroutine
+    warning; a future or task is cancelled and consumed so it stops running and cannot surface as
+    a never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
+
+    ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there is
+    unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no longer
+    run, so there is nothing to stop and no outcome to read. An *already settled* one is different:
+    reading its outcome touches no loop, and an unretrieved exception is exactly what warns at
+    collection, so that case is consumed rather than skipped.
+
+    One rule with two callers: the abandonment path below, and a synchronous wrapper that refuses
+    an awaitable its inner handed back. Both are disposing something for the same reason, and the
+    second was written because the first was a closure nobody outside this module could reach.
+    """
+
+    if inspect.iscoroutine(payload):
+        payload.close()
+    elif isinstance(payload, asyncio.Future):
+        if on_live_loop:
+            payload.cancel()
+            payload.add_done_callback(consume_task_outcome)
+        elif payload.done():
+            consume_task_outcome(payload)
+
+
 @dataclass(frozen=True)
 class AbandonableSyncCall(Generic[_T]):
     """A blocking call in flight on a daemon thread, as the two handles an awaiter needs.
@@ -82,6 +148,14 @@ class AbandonableSyncCall(Generic[_T]):
     result: asyncio.Future[_T]
     settled: asyncio.Future[None]
     warn_if_unsettled: Callable[[], None]
+    set_discard_hook: Callable[[Callable[[Any], None] | None], None]
+    """Tell the worker where to hand a result that arrives after its waiter was cancelled.
+
+    Set by the awaiter rather than passed at construction, because only the awaiter knows whether
+    the callee is one that cares -- and the call is already running by the time it is chosen. A
+    worker settling inside the abandonment grace produced a real result that nobody will read;
+    without this it was dropped where only awaitables are disposed of, so a ``ModelTurn`` simply
+    vanished and the cursor it had already advanced stayed advanced."""
 
 
 def start_abandonable_sync_call(
@@ -130,6 +204,7 @@ def start_abandonable_sync_call(
     future: asyncio.Future[_T] = loop.create_future()
     settled: asyncio.Future[None] = loop.create_future()
     outcome: list[tuple[bool, Any]] = []
+    discard_hook: list[Callable[[Any], None] | None] = [None]
     # Match ``asyncio.to_thread``, which runs its target in a copy of the caller's context. Without
     # this the worker would start with an empty context, so a sync adapter or handler reading
     # credentials, tenant identity, or tracing state from a ``ContextVar`` would see defaults. The
@@ -141,34 +216,35 @@ def start_abandonable_sync_call(
         """Dispose an awaitable that arrived after the run gave up on the call.
 
         A sync tool handler may return one, and the normal path accepts any awaitable, so the late
-        path has to handle the same shapes. Nothing downstream will await this one: a coroutine is
-        closed so its cleanup runs and it cannot surface as an unawaited-coroutine warning, and a
-        future or task is cancelled and consumed so it stops running and cannot surface as a
-        never-retrieved exception. Any other awaitable has no generic disposal and is left alone.
-
-        ``on_live_loop`` is False when the run's loop has already closed. Cancelling a future there
-        is unsafe -- it schedules callbacks on the dead loop -- and a still-pending future can no
-        longer run, so there is nothing to stop and no outcome to read. An *already settled* one is
-        different: reading its outcome touches no loop, and an unretrieved exception is exactly what
-        warns at collection, so that case is consumed rather than skipped.
+        path has to handle the same shapes. ``dispose_unawaited`` above carries the disposal rule
+        and the reasoning about ``on_live_loop``; what belongs here is only that a call which
+        *failed* left no awaitable to dispose of.
         """
 
         succeeded, payload = outcome[0]
         if not succeeded:
             return
-        if inspect.iscoroutine(payload):
-            payload.close()
-        elif isinstance(payload, asyncio.Future):
-            if on_live_loop:
-                payload.cancel()
-                payload.add_done_callback(consume_task_outcome)
-            elif payload.done():
-                consume_task_outcome(payload)
+        dispose_unawaited(payload, on_live_loop=on_live_loop)
+
+    def set_discard_hook(hook: Callable[[Any], None] | None) -> None:
+        discard_hook[0] = hook
+
+    def hand_back_late_outcome() -> None:
+        """The waiter is gone, so this result is discarded -- tell whoever produced it.
+
+        Distinct from ``discard_late_awaitable``, which disposes an awaitable so it cannot warn.
+        Both run on the same drop; only this one reaches a callee holding shared state.
+        """
+
+        succeeded, payload = outcome[0]
+        if succeeded:
+            hand_back_discarded(payload, discard_hook[0])
 
     def deliver() -> None:
         if not settled.done():
             settled.set_result(None)
         if future.done():
+            hand_back_late_outcome()
             discard_late_awaitable(on_live_loop=True)
             return
         succeeded, payload = outcome[0]
@@ -210,11 +286,19 @@ def start_abandonable_sync_call(
             loop.call_soon_threadsafe(deliver)
         except RuntimeError:
             # The run was abandoned and its loop has since closed, so ``deliver`` will never run.
-            # Nothing will await a late awaitable either, so discard it here instead.
+            # Nothing will await a late awaitable either, so discard it here instead. The hand-back
+            # still matters: the callee may outlive the run -- a sibling family shares one adapter
+            # -- and its shared state is wrong whether or not a loop is left to hear about it.
+            hand_back_late_outcome()
             discard_late_awaitable(on_live_loop=False)
 
     threading.Thread(target=worker, name=thread_name, daemon=True).start()
-    return AbandonableSyncCall(result=future, settled=settled, warn_if_unsettled=warn_if_unsettled)
+    return AbandonableSyncCall(
+        result=future,
+        settled=settled,
+        warn_if_unsettled=warn_if_unsettled,
+        set_discard_hook=set_discard_hook,
+    )
 
 
 async def await_abandonable_call(
@@ -224,6 +308,7 @@ async def await_abandonable_call(
     token: CancellationToken | None,
     grace_s: float,
     check_boundary: Callable[[float | None], None],
+    on_discarded: Callable[[Any], None] | None = None,
 ) -> Any:
     """Await a call while propagating run cancellation and the run deadline.
 
@@ -252,6 +337,11 @@ async def await_abandonable_call(
 
     sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
     task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
+    if sync_call is not None:
+        # The blocking worker cannot be interrupted, so it may still produce a result long after
+        # this function has raised. That is the fourth of the four drop paths, and the only one
+        # the awaiter cannot reach from here.
+        sync_call.set_discard_hook(on_discarded)
     loop = asyncio.get_running_loop()
     cancelled: asyncio.Future[None] = loop.create_future()
     outcome_consumed = False
@@ -279,7 +369,19 @@ async def await_abandonable_call(
         await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         # Checked before the result is read, so a boundary that lands in the same tick as a
         # completed call still wins. A run told to stop must not report work it decided not to do.
-        check_boundary(deadline)
+        # A boundary that wins over a COMPLETED call leaves a result nobody will ever see, and
+        # for a caller holding shared state that is not the same as the call never happening: the
+        # replay adapter has already advanced its cursor by the time this raises, so the discarded
+        # answer stays consumed and every later consumer is shifted by one. ``on_discarded`` is the
+        # only place that can tell them apart, because it is the only place that knows both that a
+        # result exists and that it is being thrown away.
+        try:
+            check_boundary(deadline)
+        except BaseException:
+            if task.done() and on_discarded is not None:
+                outcome_consumed = True
+                consume_and_hand_back(task, on_discarded)
+            raise
         if task.done():
             outcome_consumed = True
             try:
@@ -294,16 +396,23 @@ async def await_abandonable_call(
         if not cancelled.done():
             cancelled.cancel()
         if not task.done():
-            await detach_unfinished_call(task, sync_call, grace_s=grace_s)
+            await detach_unfinished_call(
+                task, sync_call, grace_s=grace_s, on_discarded=on_discarded
+            )
         elif not outcome_consumed:
             # The callee finished -- possibly by raising -- in the same loop turn that made a run
             # boundary observable, so ``check_boundary`` raised before anything read the outcome.
             # Nothing downstream will read it now either, and an unretrieved exception surfaces as a
-            # "Future exception was never retrieved" warning at collection.
-            consume_task_outcome(task)
+            # "Future exception was never retrieved" warning at collection. It is a produced result
+            # nobody will see, exactly like the one the boundary check catches a few lines up, so it
+            # goes back the same way: the task completing on this side of that check rather than the
+            # other is a scheduling detail, not a difference the callee should be able to observe.
+            consume_and_hand_back(task, on_discarded)
 
 
-async def abandon_unwaited_call(pending: Any, *, grace_s: float) -> None:
+async def abandon_unwaited_call(
+    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None
+) -> None:
     """Release a call that was started but whose wait will never be entered.
 
     ``await_abandonable_call`` sets up its cleanup *inside* itself, so anything that fails between
@@ -312,11 +421,24 @@ async def abandon_unwaited_call(pending: Any, *, grace_s: float) -> None:
     when it is collected. Normalizes ``pending`` the same way the wait does, so the two cannot
     disagree about what a call is, and then hands it to the ordinary detach path -- an abandonment
     here is a real abandonment and is reported like one.
+
+    It carries the discard hook for the same reason the wait does, and the omission was the fifth
+    drop path after a previous round counted four and said so. The four were counted by reading
+    *this file*; this one is a caller's other exit, so the census that would have found it has to
+    be over call sites rather than over a module --
+    ``test_every_abandonable_call_site_routes_its_discards`` is that census. A callee holding
+    shared state cannot tell which exit the caller took: a replay worker that returns a hit after
+    an accessor raised has already advanced its cursor, so the answer is dropped, the slot stays
+    spent, and the next caller is handed the following recording.
     """
 
     sync_call = pending if isinstance(pending, AbandonableSyncCall) else None
     task = sync_call.result if sync_call is not None else asyncio.ensure_future(pending)
-    await detach_unfinished_call(task, sync_call, grace_s=grace_s)
+    if sync_call is not None:
+        # Both halves, not just the detach: a blocking worker still inside the provider delivers
+        # through `deliver`, which reads this hook and never the argument below.
+        sync_call.set_discard_hook(on_discarded)
+    await detach_unfinished_call(task, sync_call, grace_s=grace_s, on_discarded=on_discarded)
 
 
 async def detach_unfinished_call(
@@ -324,6 +446,7 @@ async def detach_unfinished_call(
     sync_call: AbandonableSyncCall[Any] | None,
     *,
     grace_s: float,
+    on_discarded: Callable[[Any], None] | None = None,
 ) -> None:
     """Release the awaiter's hold on a call that outlived a run boundary.
 
@@ -357,7 +480,9 @@ async def detach_unfinished_call(
                 "one task per abandoned call; enforce a timeout at its I/O edge.",
                 grace_s,
             )
+    # An async callee that settles anyway -- inside the grace above, or later through the
+    # callback -- produced a result the run will never read. Same drop, same rule.
     if task.done():
-        consume_task_outcome(task)
+        consume_and_hand_back(task, on_discarded)
     else:
-        task.add_done_callback(consume_task_outcome)
+        task.add_done_callback(lambda finished: consume_and_hand_back(finished, on_discarded))

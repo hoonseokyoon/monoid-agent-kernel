@@ -23,6 +23,7 @@ from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
     normalize_json_ingress,
     parse_finite_json_float,
+    portable_class_name,
 )
 from monoid_agent_kernel.identifiers import namespaced_id
 
@@ -42,16 +43,28 @@ ReportProvenanceStatus = Literal["available", "unavailable"]
 
 
 def safe_exception_summary(exc: BaseException) -> str:
-    """Return a diagnostic category without copying exception text into CI artifacts."""
+    """Return a diagnostic category without copying exception text into CI artifacts.
 
-    category = next(
-        (
-            cls.__name__
-            for cls in type(exc).__mro__
-            if cls.__module__ == "builtins" and issubclass(cls, BaseException)
-        ),
-        "Exception",
-    )
+    Every read here goes through the exception's *class*, so its metaclass answers all three of
+    them: ``__mro__``, ``__module__`` and ``__name__``. The ``builtins`` filter looks like it keeps
+    a hostile class out of the name read, and does not -- a class carrying ``__module__ =
+    "builtins"`` in its own dict passes the filter with no code at all, and then this function
+    raises from inside the summary a CI artifact is written with. ``portable_class_name`` takes the
+    name away from the metaclass and bounds it; the ``except`` is for the other two reads, and
+    unlike the one in ``portable_class_name`` it is reachable -- measured.
+    """
+
+    try:
+        category = next(
+            (
+                portable_class_name(cls)
+                for cls in type(exc).__mro__
+                if cls.__module__ == "builtins" and issubclass(cls, BaseException)
+            ),
+            "Exception",
+        )
+    except Exception:
+        category = "Exception"
     return f"{category}: details redacted"
 
 

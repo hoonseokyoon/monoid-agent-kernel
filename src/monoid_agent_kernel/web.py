@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from monoid_agent_kernel._version import user_agent
-from monoid_agent_kernel.core.json_ingress import loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import exact_text, loads_json_ingress
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.env import getenv
 
@@ -97,6 +97,11 @@ class WebGatewayClient:
 
 
 def public_query_preview(query: str) -> dict[str, Any]:
+    # The size and the digest are the whole content of this descriptor -- the query itself is
+    # withheld -- so both are taken from the base string. A `str` subclass overriding `encode`
+    # answers for itself, and this marker would then report a length and a digest of something
+    # other than what ran. See `json_ingress.exact_text`.
+    query = exact_text(query)
     return {
         "redacted": True,
         "type": "str",
@@ -106,6 +111,7 @@ def public_query_preview(query: str) -> dict[str, Any]:
 
 
 def public_url_preview(url: str) -> dict[str, Any]:
+    url = exact_text(url)
     parsed = urlparse(url)
     return {
         "redacted": True,

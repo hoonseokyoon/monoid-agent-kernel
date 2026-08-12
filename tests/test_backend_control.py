@@ -15,15 +15,17 @@ from support.http import http_json, serving
 from support.runtime import runtime_config, tool_binding
 from support.waiting import eventually
 
+from monoid_agent_kernel.core._util import write_json_atomic
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.capability import AutoGrantBroker
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.events import make_agent_event
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
-from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError, PermissionDenied
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -33,7 +35,9 @@ from monoid_agent_kernel.reference.backend.service import (
     BackendRunRecord,
     BackendRunRequest,
     RunnerBackend,
+    _CLOSE_SESSION,
     _RESUME_SESSION,
+    _RUN_META_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
@@ -138,6 +142,167 @@ def test_task_resume_events_promote_awaiting_tasks_to_running(
     record.terminal = True
 
 
+def test_record_event_captures_the_whole_classification_a_turn_failed_carries(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The record captured error/error_code and dropped the five facts beside them.
+
+    The state stays untouched — session_drive owns this record's lifecycle — but the
+    classification must reach the record, or GET /status answers with half the taxonomy the
+    event beside it carries.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_turn_failed_classified"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="turn.failed",
+            data={
+                "error": "model rejected the key",
+                "error_code": "model_error",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+                "provider_retried": True,
+            },
+        ),
+    )
+
+    assert record.error == "model rejected the key"
+    assert record.error_code == "model_error"
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.http_status == 422
+    assert record.retryable is False
+    assert record.config_recoverable is True
+    assert record.provider_retried is True
+    # The state-untouched rule stays: the park that follows names the state.
+    assert record.state is SessionState.RUNNING
+
+    # The guarded-reader rule stays too: a truthy string must not become a claim.
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=2,
+            event_type="turn.failed",
+            data={
+                "error": "boom",
+                "error_code": "model_error",
+                "retryable": "yes, definitely",
+                "http_status": "422",
+            },
+        ),
+    )
+    assert record.retryable is False
+    assert record.http_status is None
+
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
+def test_record_event_captures_the_whole_classification_a_run_failed_carries(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The run.failed twin of the turn.failed capture: a fresh terminal has no park to promote.
+
+    A non-recoverable model failure on the stream lane (or a first-turn failure anywhere)
+    reaches its terminal without ever parking, so the driver's park promotion never runs and
+    ``record_run_result``'s FAILED heal keeps whatever the record has — defaults. The event
+    beside the record carries the whole classification; copying only the error pair left live
+    ``status()``/``result()`` omitting the provider classification status.json carries.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_run_failed_classified"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="run.failed",
+            data={
+                "error": "provider rejected the request (HTTP 422)",
+                "error_code": "model_error",
+                "type": "ModelAdapterError",
+                "provider_error_code": "insufficient_quota",
+                "http_status": 422,
+                "retryable": False,
+                "config_recoverable": True,
+            },
+        ),
+    )
+
+    assert record.state is SessionState.FAILED
+    assert record.terminal is True
+    assert record.error_code == "model_error"
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.http_status == 422
+    assert record.retryable is False
+    assert record.config_recoverable is True
+    # The terminal vocabulary drops the per-call fact (run.failed does not even carry it).
+    assert record.provider_retried is False
+
+
+def test_a_model_turn_starting_unparks_a_paused_record_and_clears_the_stale_failure(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """PAUSED joins the park-clear set, and the unpark clears the dead turn's answer.
+
+    The record's clear set named two of the three non-terminal parks, so a resumed pause
+    served state="paused" through the whole resumed turn — and a retried turn kept the
+    previous failure's error while running.
+    """
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_paused_unpark"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.state = SessionState.PAUSED
+    record.error = "model rejected the key"
+    record.error_code = "model_error"
+    record.provider_error_code = "insufficient_quota"
+    record.http_status = 422
+    record.retryable = True
+    record.config_recoverable = True
+    record.provider_retried = True
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(run_id=run_id, seq=1, event_type="model.turn.started"),
+    )
+
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == ""
+    assert record.error_code == ""
+    assert record.provider_error_code == ""
+    assert record.http_status is None
+    assert record.retryable is False
+    assert record.config_recoverable is False
+    assert record.provider_retried is False
+
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
 def test_run_finished_event_defers_terminal_until_result_is_recorded(
     tmp_path: Path,
     backend_factory: Any,
@@ -214,6 +379,925 @@ def test_record_run_failure_writes_bundle_before_terminal_flip(
     assert not (run_dir / "failure.json").exists()
     with backend._lock:
         backend._records.pop(run_id, None)
+
+
+def test_the_backend_failure_bundle_states_the_classification_the_exception_carried(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The reference backend writes the same ``monoid.failure.v1`` artifact the core does, and
+    its copy is the one a worker crash leaves behind -- the case where the bundle is the only
+    record there is. An operator restoring from it must be able to tell "resend after fixing the
+    config" from "this will fail again the same way"."""
+
+    from monoid_agent_kernel.errors import ModelAdapterError
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_classification"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(
+        run_id,
+        ModelAdapterError(
+            "the gateway sent no generation_applied echo",
+            provider_error_code="gateway_generation_not_applied",
+            retryable=False,
+            config_recoverable=True,
+        ),
+    )
+
+    bundle = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert bundle["config_recoverable"] is True
+    assert bundle["retryable"] is False
+
+
+def test_a_run_that_dies_of_an_exception_meters_what_it_had_already_spent(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """A run that dies of a driver exception after N billed turns left the tenant ledger
+    reporting zero for every one of them -- not even the run count -- while
+    ``record_run_result`` beside it fed the same ledger. It never produces an
+    ``AgentRunResult``, so what it spent lives in the last committed checkpoint."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_metered"
+    record = _backend_record(run_id, backend.run_root / run_id, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={
+                "input_tokens": 40,
+                "output_tokens": 20,
+                "total_tokens": 60,
+                "reasoning_tokens": 5,
+            },
+        )
+    )
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 60
+    assert usage["reasoning_tokens"] == 5
+
+
+def test_a_failure_with_no_checkpoint_meters_from_the_status_projection(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The fallback: a run that died before its first park has no checkpoint, and the operator
+    status file on disk holds the last ``metrics.updated`` payload. With neither, the run is
+    still counted -- which is more than the ledger used to say."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_status_fallback"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.joinpath("status.json").write_text(
+        json.dumps({"run_id": run_id, "metrics": {"total_tokens": 25, "input_tokens": 25}}),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+
+
+def test_a_metered_failure_that_is_recovered_and_completes_is_not_billed_twice(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Both terminal paths report CUMULATIVE totals, from different sources. Without a per-run
+    high-water mark, a run metered on failure and then recovered to completion would have every
+    pre-crash token counted a second time -- and the run counted as two runs."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_then_recovered"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+        )
+    )
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+    backend._record_run_result(
+        run_id,
+        AgentRunResult(
+            run_id=run_id,
+            status="completed",
+            final_text="recovered and finished",
+            run_dir=run_dir,
+            diff_path=run_dir / "diff.patch",
+            proposal_path=run_dir / "proposal.json",
+            # The cumulative total of the whole run: the 60 already metered, plus 30 more.
+            metrics={"input_tokens": 60, "output_tokens": 30, "total_tokens": 90},
+        ),
+    )
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 90
+    assert usage["input_tokens"] == 60
+    assert usage["output_tokens"] == 30
+
+
+def test_a_corrupt_status_metric_is_dropped_not_raised(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The status.json fallback used to pass values through untouched, so one corrupt
+    metric turned failure-recording into an escaping ValueError — after ``runs`` was
+    already incremented, and past ``run_execution``'s failure paths, eating the streaming
+    client's terminal frame. Unreadable read-keys are dropped per key; the readable ones
+    still reach the ledger, and ``record_run_result``'s strictness for kernel-written
+    values is untouched."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_corrupt_status_metrics"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "metrics": {
+                    "input_tokens": 12.5,  # not a count
+                    "output_tokens": -3,  # not a count either
+                    "total_tokens": 25,
+                    "status": "failed",  # never was a count
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))  # must not raise
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+
+
+def test_failure_metering_takes_the_fresher_reading_per_key(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Checkpoints commit at parks; status.json updates per billed event. A run that parks
+    at T1, bills more turns, then dies mid-turn has status.json ahead of its checkpoint —
+    and the all-or-nothing fallback (checkpoint wins if present) meant T2-T1 never reached
+    the ledger. Per-key max over the validated readings is strictly closer to "billed once
+    per token", and the high-water delta semantics are unchanged."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_stale_checkpoint_fresh_status"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            terminal=False,
+            total_usage={"input_tokens": 200, "output_tokens": 100, "total_tokens": 300},
+        )
+    )
+    run_dir.joinpath("status.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "metrics": {"input_tokens": 300, "output_tokens": 150, "total_tokens": 450},
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("died mid-turn after the park"))
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["input_tokens"] == 300
+    assert usage["output_tokens"] == 150
+    assert usage["total_tokens"] == 450
+
+
+def test_record_run_failure_writes_the_terminal_status_artifact(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The THIRD failure.json writer makes the same terminal statement the give-up sites make.
+
+    ``record_run_failure`` wrote failure.json and flipped the in-memory record FAILED but never
+    touched ``status.json`` — so after a restart every status surface served the run's old park
+    (``awaiting_input, terminal=false``) forever, while ``recover_runs`` skipped the dir on
+    failure.json: byte-for-byte the symptom the recovery give-up sites already fixed. The
+    statement now goes through the ONE shared writer, with this lane's own honest marker and
+    the failure's own error_code (not ``unrecoverable``)."""
+
+    from monoid_agent_kernel.core.schemas import STATUS_SCHEMA, _validate_json_file
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_status_artifact"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # The park-shaped artifact a crashed driver leaves behind, with identity + metrics riding.
+    write_json_atomic(
+        run_dir / "status.json",
+        {
+            "run_id": run_id,
+            "state": "awaiting_input",
+            "terminal": False,
+            "last_event_seq": 7,
+            "last_event_type": "run.awaiting_input",
+            "updated_at": "2026-08-03T00:00:00Z",
+            "metrics": {"input_tokens": 25, "total_tokens": 25},
+            "provider_retried": True,
+        },
+    )
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.AWAITING_INPUT
+    # What a prior turn.failed park recorded — the four facts a FAILED terminal keeps.
+    record.retryable = True
+    record.http_status = 429
+    record.config_recoverable = True
+    record.provider_error_code = "rate_limit"
+    record.provider_retried = True
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(run_id, RuntimeError("worker boom"))
+
+    artifact = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    assert (artifact["state"], artifact["terminal"]) == ("failed", True)
+    assert "worker boom" in artifact["error"]
+    # The failure's own error code — not the recovery lane's "unrecoverable".
+    assert artifact["error_code"] == "internal_error"
+    assert artifact["error_type"] == "RuntimeError"
+    # This lane's own honest marker — recovery did not give this run up; its driver died.
+    assert artifact["recorded_by_run_failure"] is True
+    assert "given_up_by_recovery" not in artifact
+    # The terminal vocabulary drops the per-call fact, exactly as run.failed does.
+    assert "provider_retried" not in artifact
+    # Merged over the prior payload: identity and metrics survive.
+    assert artifact["metrics"] == {"input_tokens": 25, "total_tokens": 25}
+    assert artifact["last_event_seq"] == 7
+    issues: list = []
+    _validate_json_file(run_dir / "status.json", STATUS_SCHEMA, issues)
+    assert issues == [], issues
+    # The offline projection honors the quarantine marker over the stale (park-ending) log.
+    projection = project_run_status(run_dir)
+    assert (projection["state"], projection["terminal"]) == ("failed", True)
+    # And the record states what the artifact states: the EXCEPTION's own classification,
+    # through the same guarded reads — not the last park's. The run died of this driver
+    # exception, and a bare RuntimeError claims nothing, so the park's stale 429/rate_limit
+    # facts must not survive on the live record while status.json beside it says otherwise.
+    # (Pin flipped from "the four park facts stay": that kept live status()/result()
+    # disagreeing with the just-written artifact until the record was released.)
+    assert record.state is SessionState.FAILED
+    assert record.terminal is True
+    assert record.provider_retried is False
+    assert record.retryable is False
+    assert record.http_status is None
+    assert record.config_recoverable is False
+    assert record.provider_error_code == ""
+
+
+def test_record_run_failure_copies_a_classified_exception_onto_the_record(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """A classified driver death answers the same on the live record and the artifact.
+
+    ``record_run_failure`` wrote the exception's provider code, HTTP status and recovery flags
+    into status.json but mutated only the error pair on the live record — so ``status()`` /
+    ``result()``, which prefer the active record, served default or stale classification while
+    the durable artifact beside them carried the truth."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_classified_record"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend._record_run_failure(
+        run_id,
+        ModelAdapterError(
+            "provider rejected the request (HTTP 422)",
+            error_code="model_error",
+            provider_error_code="insufficient_quota",
+            retryable=False,
+            config_recoverable=True,
+            http_status=422,
+            provider_retried=True,
+        ),
+    )
+
+    artifact = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    # One answer on both surfaces, from the same guarded reads.
+    for surface_value, artifact_key in (
+        (record.retryable, "retryable"),
+        (record.config_recoverable, "config_recoverable"),
+        (record.http_status, "http_status"),
+        (record.provider_error_code, "provider_error_code"),
+    ):
+        assert surface_value == artifact[artifact_key]
+    assert record.config_recoverable is True
+    assert record.http_status == 422
+    assert record.provider_error_code == "insufficient_quota"
+    assert record.retryable is False
+    # The terminal vocabulary still drops the per-call fact on both.
+    assert record.provider_retried is False
+    assert "provider_retried" not in artifact
+
+
+def _giveup_recovery_meta(run_id: str, workspace: Path) -> dict[str, Any]:
+    config = _config()
+    return {
+        "schema_version": _RUN_META_SCHEMA_VERSION,
+        "run_id": run_id,
+        "tenant_id": "tenant_a",
+        "user_id": "user_a",
+        "workspace_root": str(workspace),
+        "runtime_config": config.to_json(),
+        "runtime_config_hash": config.config_hash,
+    }
+
+
+def test_recovery_giveup_after_max_attempts_meters_the_checkpointed_spend(
+    tmp_path: Path,
+    backend_factory: Any,
+    monkeypatch: Any,
+) -> None:
+    """The resume-failed-max-attempts give-up wrote failure.json and stopped: a run that
+    crashed after N billed turns and can never be resumed was never counted and its
+    checkpointed spend never reached any ledger — the exact class the failure path closes.
+    The give-up has no live record, so it goes through the record-free metering seam."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    backend.max_recover_attempts = 1
+    run_id = "run_unrecoverable_spend"
+    run_dir = backend.run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    backend.checkpoint_store.put(
+        RunCheckpoint(
+            run_id=run_id,
+            seq=3,
+            terminal=False,
+            total_usage={"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+        )
+    )
+    write_json_atomic(run_dir / "run.json", _giveup_recovery_meta(run_id, workspace))
+
+    def _boom(stored: Any, meta: Any) -> None:
+        del stored, meta
+        raise RuntimeError("resume boom")
+
+    monkeypatch.setattr(backend._recovery, "resume_from_checkpoint", _boom)
+
+    assert backend.recover_runs() == []
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "unrecoverable"
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 60
+    assert usage["input_tokens"] == 40
+
+
+def test_corrupt_durable_state_giveup_meters_from_the_status_projection(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The other give-up: corrupt durable state quarantines the run without a resume
+    attempt. The checkpoint is unreadable by construction, so the spend comes from the
+    status projection — same source hierarchy as the failure path."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_corrupt_state_spend"
+    run_dir = backend.run_root / run_id
+    backend.checkpoint_store.put(RunCheckpoint(run_id=run_id, seq=1, terminal=False))
+    manifest = run_dir / "checkpoints" / "1" / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["schema_version"] = "monoid.checkpoint.v99"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    write_json_atomic(run_dir / "run.json", _giveup_recovery_meta(run_id, workspace))
+    write_json_atomic(
+        run_dir / "status.json",
+        {"run_id": run_id, "metrics": {"input_tokens": 25, "total_tokens": 25}},
+    )
+
+    assert backend.recover_runs() == []
+    failure = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_code"] == "checkpoint_unsupported_version"
+
+    usage = backend.tenant_usage("tenant_a")
+    assert usage["runs"] == 1
+    assert usage["total_tokens"] == 25
+
+
+def test_cancelling_a_parked_run_records_cancelled_and_keeps_checkpoints(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """Cancelling a PARKED run acked ``cancel_requested: true`` and then recorded a clean
+    COMPLETED — the per-submit reset state was "completed", so ``run.finished`` said so,
+    ``record_run_result`` overwrote error_code to "", and close() DELETED the checkpoints.
+    The same cancel mid-turn correctly landed CANCELLED. The close boundary now promotes an
+    acknowledged cancel through the same vocabulary the mid-run handler uses."""
+
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+    record = backend._record(run_id)
+    assert record.error_code == "cancelled"
+    result = record.result
+    assert result is not None
+    assert (result.status, result.error_code) == ("limited", "cancelled")
+    # A cancelled run keeps its checkpoints — only a clean completion has nothing to restore.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+    assert stored.checkpoint.cancellation_requested is True
+    finished = [e for e in _events(backend, run_id) if e["type"] == "run.finished"]
+    assert finished and finished[-1]["data"]["status"] == "limited"
+    assert finished[-1]["data"]["error_code"] == "cancelled"
+
+
+def test_cancel_of_a_parked_run_is_durable_at_the_ack(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The park checkpoint predates the cancel (``cancellation_requested=False``), and
+    cancel_run only cancelled the in-memory token — so a crash between the ack and the
+    terminal record restored the run UNcancelled, despite what the operator was told.
+    A cancel of a quiescent (parked) run now commits a checkpoint carrying the flag before
+    the ack returns; the restore path already honors it (test_cancellation.py)."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(
+        workspace=workspace,
+        turns=[
+            ModelTurn(
+                response_id="r1",
+                tool_calls=(fake_tool_call("hitl_request", {"prompt": "Pick"}, "c1"),),
+            ),
+            ModelTurn(final_text="never reached"),
+        ],
+    )
+    # Wide poll so the parked drive cannot wake and terminalize between the ack and our read.
+    backend.task_wait_poll_s = 2.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="ask the human",
+            runtime_config=runtime_config("hitl.request"),
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_TASKS)
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.cancellation_requested is False
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+
+    # Durable BEFORE the drive wakes: the ack checkpoint is a park artifact, not terminal.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.cancellation_requested is True
+    assert stored.checkpoint.terminal is False
+
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+
+class _ErrorScriptAdapter:
+    """Drives a script of turns/exceptions: a ModelTurn is returned, an exception raised."""
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.requests: list[Any] = []
+
+    def next_turn(self, request: Any) -> Any:
+        self.requests.append(request)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _classified_error() -> ModelAdapterError:
+    return ModelAdapterError(
+        "quota exhausted",
+        http_status=422,
+        retryable=False,
+        config_recoverable=True,
+        provider_error_code="insufficient_quota",
+        provider_retried=True,
+    )
+
+
+def _error_script_backend(
+    backend_factory: Any, workspace: Path, script: list[Any]
+) -> RunnerBackend:
+    def factory(spec: Any, llm_gateway_token: str) -> _ErrorScriptAdapter:
+        del spec, llm_gateway_token
+        return _ErrorScriptAdapter(script)
+
+    backend = backend_factory.create(workspace=workspace, model_adapter_factory=factory)
+    backend.idle_timeout_s = 30.0
+    return backend
+
+
+_TERMINAL_CLASSIFICATION_KEYS = (
+    "retryable",
+    "http_status",
+    "config_recoverable",
+    "provider_error_code",
+    "provider_retried",
+)
+
+_EMPTY_TERMINAL_CLASSIFICATION = {
+    "retryable": False,
+    "http_status": None,
+    "config_recoverable": False,
+    "provider_error_code": "",
+    "provider_retried": False,
+}
+
+
+def _assert_one_terminal_answer(
+    backend: RunnerBackend,
+    run_id: str,
+    token: str,
+    *,
+    state: str,
+    error_code: str,
+    classification: dict[str, Any],
+) -> None:
+    """The cell that caught the terminal-heal twin-miss: the live record, the durable
+    status.json, and the offline projection must serve ONE answer at a terminal — the same
+    state/terminal pair, the same error_code, the same five classification facts."""
+
+    live = backend.status(run_id, token)
+    run_dir = backend._record(run_id).run_dir
+    status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    projection = project_run_status(run_dir)
+
+    views = {
+        "live record": {
+            "state": live["state"],
+            "terminal": live["terminal"],
+            "error_code": live["error_code"],
+            **{key: live.get(key) for key in _TERMINAL_CLASSIFICATION_KEYS},
+        },
+        "status.json": {
+            "state": status_payload.get("state"),
+            "terminal": status_payload.get("terminal"),
+            "error_code": status_payload.get("error_code", ""),
+            # Absent keys carry their reader defaults, matching _status_payload_classification.
+            "retryable": status_payload.get("retryable", False),
+            "http_status": status_payload.get("http_status"),
+            "config_recoverable": status_payload.get("config_recoverable", False),
+            "provider_error_code": status_payload.get("provider_error_code", ""),
+            "provider_retried": status_payload.get("provider_retried", False),
+        },
+        "offline projection": {
+            "state": projection["state"],
+            "terminal": projection["terminal"],
+            "error_code": projection["error_code"],
+            **{key: projection.get(key) for key in _TERMINAL_CLASSIFICATION_KEYS},
+        },
+    }
+    expected = {"state": state, "terminal": True, "error_code": error_code, **classification}
+    for reader, view in views.items():
+        assert view == expected, {"reader": reader, "view": view, "expected": expected}
+
+
+def _close_session(backend: RunnerBackend, run_id: str) -> None:
+    """Deterministic idle-close: the same signal the idle timeout's park wait resolves to."""
+    backend._call_soon(backend._record(run_id).message_queue.put_nowait, _CLOSE_SESSION)
+
+
+def test_cancelled_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """Empirically traced: cancel of a turn_failed park healed status.json but the live
+    record kept the dead turn's five facts beside error_code="cancelled" — the two branches
+    of the same status() endpoint disagreed across a restart. The record-side terminal heal
+    in record_run_result closes the third consumer of the one rule."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(backend_factory, workspace, [_classified_error()])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+    # The park carried the classification onto the record (the park promotion's job).
+    assert backend._record(run_id).config_recoverable is True
+
+    backend.cancel_run(run_id, token)
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="cancelled",
+        error_code="cancelled",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+
+
+def test_failed_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The FAILED cell: the give-up promotion keeps the four what-it-died-of facts on every
+    reader and drops the per-call provider_retried on every reader — the record used to
+    keep provider_retried=True while the terminal vocabulary dropped it everywhere else."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(backend_factory, workspace, [_classified_error()])
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+    assert backend._record(run_id).provider_retried is True
+
+    _close_session(backend, run_id)  # closing on the unrecovered park IS the give-up
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.FAILED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="failed",
+        error_code="model_error",
+        classification={
+            "retryable": False,
+            "http_status": 422,
+            "config_recoverable": True,
+            "provider_error_code": "insufficient_quota",
+            "provider_retried": False,
+        },
+    )
+
+
+def test_completed_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The COMPLETED cell: a run that failed a turn, recovered on a resend, settled, and
+    closed clean must read clean on all three readers."""
+
+    workspace = _workspace(tmp_path)
+    backend = _error_script_backend(
+        backend_factory,
+        workspace,
+        [_classified_error(), ModelTurn(response_id="r2", final_text="fixed")],
+    )
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="hello",
+            runtime_config=_config(),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
+
+    backend.send_message(run_id, token, "resend after config fix")
+    assert eventually(
+        lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT
+        and backend._record(run_id).error_code == ""
+    )
+    _close_session(backend, run_id)
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.COMPLETED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="completed",
+        error_code="",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+
+
+def test_limited_close_boundary_terminal_serves_one_classification(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """The LIMITED cell — a paused mid-turn run whose session is closed (pause_run + idle
+    timeout, the finding-2 trace, driven end-to-end through the backend): the run must not
+    finalize a clean COMPLETED with deleted checkpoints, and all three readers must agree
+    on the closed_unsettled outcome."""
+
+    workspace = _workspace(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def factory(spec: Any, llm_gateway_token: str) -> FakeModelAdapter:
+        del spec, llm_gateway_token
+        return FakeModelAdapter(
+            turns=[
+                ModelTurn(response_id="r1", tool_calls=(fake_tool_call("test_gate", {}, "c1"),)),
+                ModelTurn(response_id="r2", final_text="never reached"),
+            ]
+        )
+
+    backend = backend_factory.create(
+        workspace=workspace,
+        model_adapter_factory=factory,
+        tool_providers=(_GateToolProvider(entered, release),),
+    )
+    backend.idle_timeout_s = 30.0
+    submission = backend.submit_run(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="go",
+            runtime_config=runtime_config("test.gate"),
+            multi_turn=True,
+        )
+    )
+    run_id, token = submission.run_id, submission.run_token
+    assert entered.wait(timeout=10)
+    assert backend.pause_run(run_id, token)["pause_requested"] is True
+    release.set()
+    assert eventually(lambda: backend._record(run_id).state is SessionState.PAUSED)
+
+    _close_session(backend, run_id)  # the user never resumes; the session idles out
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
+
+    _assert_one_terminal_answer(
+        backend,
+        run_id,
+        token,
+        state="limited",
+        error_code="closed_unsettled",
+        classification=_EMPTY_TERMINAL_CLASSIFICATION,
+    )
+    # ...and the checkpoints holding the frozen turn survive the close.
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None
+    assert stored.checkpoint.terminal is True
+
+
+def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump(
+    tmp_path: Path, backend_factory: Any
+) -> None:
+    """TOCTOU half (a): the old cancel path read record.state on the HTTP thread and
+    persisted later on the shared loop — a park state read just before the drive resumed
+    let a mid-turn snapshot land at the SAME seq as the committed park checkpoint,
+    replacing its content (LocalFsCheckpointStore.put overwrites same-seq). The check and
+    the snapshot now run as one callable on the drive's own loop, gated on the loop-level
+    quiescence marker (``at_quiescent_park``), so a mid-pump cancel skips the park
+    re-commit entirely (the pump's own boundary check owns durability there — the
+    documented honest window)."""
+
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+    record = backend._record(run_id)
+    stored = backend.checkpoint_store.latest(run_id)
+    assert stored is not None and stored.checkpoint.last_suspension is not None
+    park_seq = stored.seq
+
+    # The exact marker the pump clears synchronously at entry, before its first await —
+    # from any shared-loop callable's view this IS "a pump owns the state now".
+    record.loop._session.last_suspension = None
+
+    ack = backend.cancel_run(run_id, token)
+    assert ack["cancel_requested"] is True
+
+    # The committed park checkpoint's content is untouched (no same-seq overwrite): the
+    # ack is honestly non-durable in this window rather than durably corrupting the park.
+    manifest = json.loads(
+        (record.run_dir / "checkpoints" / str(park_seq) / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["last_suspension"] is not None
+    assert manifest["cancellation_requested"] is False
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+
+def test_cancel_ack_racing_a_close_is_still_a_successful_cancel(
+    tmp_path: Path, backend_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU half (b): an idle-timeout close landing between the ack and the persist made
+    ``snapshot()`` raise run_not_open — and cancel_run 500'd AFTER acknowledging the
+    cancel. A run that just ended is exactly what the caller asked for: the persist's
+    run_not_open/run_terminal is swallowed (debug-logged) and the ack stands."""
+
+    def _closed(self: RunnerBackend, record: Any) -> None:
+        del self, record
+        raise NativeAgentError("run is not open; call open() first", error_code="run_not_open")
+
+    monkeypatch.setattr(RunnerBackend, "_persist_run_checkpoint_from_any_thread", _closed)
+    workspace = _workspace(tmp_path)
+    backend = _backend(backend_factory, workspace, [ModelTurn(response_id="r1", final_text="hi")])
+    run_id, token = _parked_multi_turn_run(backend, workspace)
+
+    ack = backend.cancel_run(run_id, token)
+
+    assert ack["cancel_requested"] is True
+    assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
+
+
+def test_the_backend_failure_bundle_claims_no_classification_it_was_not_given(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    """The other half: a plain worker exception carries no provider verdict, and the guarded
+    read must answer ``False`` rather than promoting a truthy attribute into a claim."""
+
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_failure_unclassified"
+    run_dir = backend.run_root / run_id
+    record = _backend_record(run_id, run_dir, workspace)
+    record.state = SessionState.RUNNING
+    with backend._lock:
+        backend._records[run_id] = record
+
+    boom = RuntimeError("worker boom")
+    boom.retryable = "yes, definitely"  # type: ignore[attr-defined]
+    backend._record_run_failure(run_id, boom)
+
+    bundle = json.loads((run_dir / "failure.json").read_text(encoding="utf-8"))
+    assert bundle["retryable"] is False
+    assert bundle["config_recoverable"] is False
 
 
 def test_usage_comes_from_terminal_result_not_metric_events(

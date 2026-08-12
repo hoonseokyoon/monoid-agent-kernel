@@ -9,6 +9,7 @@ independent recovery unit and reports an opened stream without a valid close as 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import threading
@@ -20,6 +21,13 @@ from pathlib import Path
 from typing import Any, BinaryIO, Literal, TextIO, TypeAlias
 
 from monoid_agent_kernel.core._util import utc_timestamp
+from monoid_agent_kernel.core._verified_file import (
+    VerifiedFileIdentity,
+    file_identity,
+    open_verified_append_text,
+    open_verified_regular_fd,
+    verified_file_is_safe,
+)
 from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
     normalize_json_ingress,
@@ -42,6 +50,10 @@ MODEL_CONTENT_FILENAME = "model-content.jsonl"
 DEFAULT_MODEL_CONTENT_BATCH_INTERVAL_S = 0.25
 DEFAULT_MODEL_CONTENT_SEGMENT_BYTES = 4096
 _WINDOWS_REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+_LOGGER = logging.getLogger("monoid_agent_kernel.core.model_content")
+"""Named under ``core`` like every other logger in this package (``core.model_stream``,
+``core.sync_bridge``), so a deployment that quiets or routes ``monoid_agent_kernel.core`` reaches
+this one too."""
 
 _ACTIVE_STORE_LOCK = threading.RLock()
 _ACTIVE_STORES: dict[str, set[weakref.ReferenceType[ModelContentStore]]] = {}
@@ -68,6 +80,7 @@ class ModelContentSnapshot:
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
     retryable: bool = False
+    config_recoverable: bool = False
     segment_count: int = 0
     last_segment_index: int | None = None
 
@@ -94,12 +107,10 @@ class ModelContentReadResult:
         object.__setattr__(self, "settled_texts", dict(self.settled_texts))
 
 
-@dataclass(frozen=True)
-class ModelContentFileIdentity:
-    """Stable identity for one verified sidecar inode."""
-
-    device: int
-    inode: int
+# The sidecar was the first artifact to need a verified inode identity, so the name it was given
+# is this module's. The type itself is not about model content and now lives beside the verified
+# open that produces it; this alias keeps the sidecar-local vocabulary readable.
+ModelContentFileIdentity = VerifiedFileIdentity
 
 
 @dataclass(frozen=True)
@@ -286,14 +297,14 @@ class ModelContentStore:
                 # longer prove a live descriptor/path identity, so explicit hydration retries.
                 return False
             if not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 return False
             writers = tuple(self._writers)
         for writer in writers:
             writer._flush_pending()
         with self._lock:
             if self._disabled or not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 return False
             return True
 
@@ -318,7 +329,7 @@ class ModelContentStore:
             if self._closing or self._closed:
                 return None
             if self._disabled or not self._handle_matches_path_locked():
-                self._disabled = True
+                self._disable_locked("the sidecar was replaced after it was opened")
                 raise OSError("active model-content descriptor no longer matches its path")
             # A writer stays active until its terminal append (or abandonment flush) completes and
             # unregisters it. Treating its earlier private ``_closed`` flag as authoritative would
@@ -327,12 +338,12 @@ class ModelContentStore:
             identity: ModelContentFileIdentity | None = None
             if self._handle is not None:
                 try:
-                    identity = _file_identity(os.fstat(self._handle.fileno()))
+                    identity = file_identity(os.fstat(self._handle.fileno()))
                 except (OSError, ValueError) as exc:
-                    self._disabled = True
+                    self._disable_locked("its descriptor became unavailable")
                     raise OSError("active model-content descriptor is unavailable") from exc
             if stream_ids and identity is None:
-                self._disabled = True
+                self._disable_locked("a live writer lost its verified descriptor")
                 raise OSError("active model-content writer has no verified descriptor")
             return ActiveModelContentState(
                 store_count=1,
@@ -392,49 +403,53 @@ class ModelContentStore:
             except (OSError, UnicodeError):
                 # A partial write may have torn the current line.  Disable this handle so a later
                 # record cannot be glued to it; the next recorder instance isolates the tail.
-                self._disabled = True
+                self._disable_locked("an append failed and may have torn its line")
                 return False
         return True
 
     def _ensure_handle_locked(self) -> TextIO | None:
         if self._handle is not None:
             return self._handle
-        descriptor: int | None = None
-        handle: TextIO | None = None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = _open_verified_regular_fd(
-                self.path,
-                os.O_RDWR | os.O_CREAT | os.O_APPEND,
-            )
-            if descriptor is None:
-                self._disabled = True
-                return None
-            size = os.fstat(descriptor).st_size
-            torn_tail = False
-            if size:
-                os.lseek(descriptor, size - 1, os.SEEK_SET)
-                torn_tail = os.read(descriptor, 1) != b"\n"
-            handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
-            descriptor = None  # owned by ``handle`` from here
-            if torn_tail:
-                handle.write("\n")
-                handle.flush()
-            self._handle = handle
-        except (OSError, ValueError):
-            self._disabled = True
-            self._handle = None
-            if handle is not None:
-                try:
-                    handle.close()
-                except OSError:
-                    pass
-            elif descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        # Refusal is terminal. The verified open declines a planted link or a special file, which is
+        # a property of the path rather than a transient, so retrying on the next segment only
+        # re-runs the same refusal.
+        handle = open_verified_append_text(self.path)
+        if handle is None:
+            self._disable_locked("it could not be safely opened")
+            return None
+        self._handle = handle
         return self._handle
+
+    def _disable_locked(self, reason: str) -> None:
+        """Stop this store for good, and say so once. Caller holds ``_lock``.
+
+        This is the oldest of the three sidecar writers and the one that owns its own open, so a
+        rule bound where the *recorder* logs leaves it silent -- which is how it was written first.
+        Its terminal state has several doors, not one: a refused open, a torn append, three
+        detections that the file under the descriptor is no longer the file at the path, and two
+        that the descriptor itself is gone. The substitution ones are what the open-time check
+        refuses, noticed one moment later, and a reader cannot tell a truncated sidecar from a
+        complete one, so silence there is worse than at the door that was already loud.
+
+        The message names ``self.path.name`` -- the basename of the file this store was pointed
+        at, never the directory holding it. Hardcoding ``MODEL_CONTENT_FILENAME`` instead would
+        name a file that does not exist for a caller who chose another one. The guarantee is
+        exactly "a basename, not a path": for every shipped configuration that basename is the
+        sidecar filename, and a caller who points this class at a *directory* gets that
+        directory's name -- which is also a caller whose open is about to fail, since the
+        constructor stores the path verbatim while the registry key normalizes it.
+        """
+
+        if self._disabled:
+            return
+        self._disabled = True
+        artifact = self.path.name
+        _LOGGER.warning(
+            "%s: %s; this activation records no more of it",
+            artifact,
+            reason,
+            extra={"monoid_run_id": self.run_id, "monoid_artifact": artifact},
+        )
 
 
 class _ModelContentWriter:
@@ -494,6 +509,7 @@ class _ModelContentWriter:
                 "usage": None if outcome.usage is None else dict(outcome.usage),
                 "error_code": outcome.error_code,
                 "retryable": outcome.retryable,
+                "config_recoverable": outcome.config_recoverable,
                 "finished_at": utc_timestamp(),
             }
         )
@@ -588,6 +604,7 @@ class _RecoveredStream:
     usage: Mapping[str, Any] | None = None
     error_code: str | None = None
     retryable: bool = False
+    config_recoverable: bool = False
 
     def snapshot(self) -> ModelContentSnapshot:
         # A valid segment after a malformed/missing record has no trustworthy placement offset.
@@ -609,6 +626,7 @@ class _RecoveredStream:
             usage=self.usage,
             error_code=self.error_code,
             retryable=self.retryable,
+            config_recoverable=self.config_recoverable,
             segment_count=len(ordered),
             last_segment_index=indexes[-1] if indexes else None,
         )
@@ -784,19 +802,11 @@ def _model_content_file_path(path: Path) -> Path:
 def model_content_file_is_safe(path: Path, *, allow_missing: bool = True) -> bool:
     """Whether a sidecar path is absent or an ordinary file, without following links.
 
-    A missing file is safe for the lazy writer to create unless ``allow_missing`` is false. Existing
-    links, directories, FIFOs, devices, and other special files fail closed for readers and writers.
+    The sidecar-named entry point for :func:`verified_file_is_safe`, kept because Studio calls it
+    by this name; the rule it applies belongs to every run-directory artifact, not to this one.
     """
 
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return allow_missing
-    except OSError:
-        return False
-    # A hard link is also an indirection across the run-directory boundary: appending here mutates
-    # the same inode through every other name. Sidecars are process-created single-link artifacts.
-    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    return verified_file_is_safe(path, allow_missing=allow_missing)
 
 
 def model_content_file_identity(
@@ -817,7 +827,7 @@ def model_content_file_identity(
         raise OSError("model-content sidecar metadata is unavailable") from exc
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise OSError("model-content sidecar is not a verified single-link regular file")
-    return _file_identity(metadata)
+    return file_identity(metadata)
 
 
 def model_content_file_matches_identity(
@@ -832,47 +842,6 @@ def model_content_file_matches_identity(
         return False
 
 
-def _file_identity(metadata: os.stat_result) -> ModelContentFileIdentity:
-    return ModelContentFileIdentity(device=metadata.st_dev, inode=metadata.st_ino)
-
-
-def _open_verified_regular_fd(
-    path: Path,
-    flags: int,
-    *,
-    expected_identity: ModelContentFileIdentity | None = None,
-) -> int | None:
-    """Open ``path`` without accepting a link/special-file swap before the first I/O."""
-
-    if not model_content_file_is_safe(path):
-        return None
-    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags, 0o666)
-    except OSError:
-        return None
-    try:
-        opened = os.fstat(descriptor)
-        named = path.lstat()
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(named.st_mode)
-            or opened.st_nlink != 1
-            or named.st_nlink != 1
-            or not os.path.samestat(opened, named)
-            or (expected_identity is not None and _file_identity(opened) != expected_identity)
-        ):
-            os.close(descriptor)
-            return None
-    except OSError:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        return None
-    return descriptor
-
-
 def open_model_content_for_read(
     path: Path,
     *,
@@ -881,7 +850,7 @@ def open_model_content_for_read(
     """Open the fixed sidecar for a verified, no-indirection binary read."""
 
     path = _model_content_file_path(path)
-    descriptor = _open_verified_regular_fd(
+    descriptor = open_verified_regular_fd(
         path,
         os.O_RDONLY,
         expected_identity=expected_identity,
@@ -1019,6 +988,9 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
     usage = record.get("usage")
     error_code = record.get("error_code")
     retryable = record.get("retryable", False)
+    # Optional and defaulted, like ``retryable``: a sidecar written before this key existed is a
+    # valid record, not a skipped one. Present-but-mistyped is still refused below.
+    config_recoverable = record.get("config_recoverable", False)
     finished_at = record.get("finished_at")
     if final_text is not None and not isinstance(final_text, str):
         return False
@@ -1028,6 +1000,8 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
         return False
     if type(retryable) is not bool:
         return False
+    if type(config_recoverable) is not bool:
+        return False
     if not isinstance(finished_at, str) or not finished_at.endswith("Z"):
         return False
     recovered.status = status
@@ -1035,6 +1009,7 @@ def _apply_close(streams: dict[str, _RecoveredStream], record: dict[str, Any]) -
     recovered.usage = usage
     recovered.error_code = error_code
     recovered.retryable = retryable
+    recovered.config_recoverable = config_recoverable
     return True
 
 

@@ -672,6 +672,50 @@ def test_metrics_report_subagent_usage_separately(tmp_path: Path) -> None:
     assert result.metrics["total_tokens"] == 10
 
 
+def test_a_childs_priced_sub_counts_reach_the_parents_accounting(tmp_path: Path) -> None:
+    """The roll-up read a hard-coded three-key tuple, so a child's cache and reasoning tokens
+    stopped at the child -- an undercount in exactly the aggregate a bound is checked against.
+    It filters the child's metrics through the normalizer's whole emitted domain now, which is
+    also why it must stay a filter: ``result.metrics`` carries ``tool_calls`` and ``duration_s``
+    beside the counts, and folding those into a token total would corrupt it."""
+
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X"), ModelTurn(final_text="parent done")],
+        child=[
+            ModelTurn(
+                final_text="child done",
+                usage={
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                    "cache_read_tokens": 400,
+                    "cache_creation_tokens": 50,
+                    "reasoning_tokens": 6,
+                    "audio_tokens": 2,
+                },
+            )
+        ],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config())
+
+    result = loop.run_once("go")
+
+    rolled = result.metrics["subagent_usage"]
+    assert rolled["reasoning_tokens"] == 6
+    assert rolled["cache_read_tokens"] == 400
+    assert rolled["cache_creation_tokens"] == 50
+    assert rolled["audio_tokens"] == 2
+    assert result.metrics["reasoning_tokens"] == 6
+    assert result.metrics["cache_read_tokens"] == 400
+    # Only usage rides the roll-up: a non-count metric of the child must not land in the
+    # parent's token totals.
+    assert "duration_s" not in rolled
+    assert "tool_calls" not in rolled
+    # And the budget is unchanged -- it reads the three headline counts, not the sub-counts.
+    assert result.status == "completed"
+    assert result.metrics["total_tokens"] == 10
+
+
 def test_subagent_usage_counts_against_parent_token_budget(tmp_path: Path) -> None:
     adapter = RoutingAdapter(
         parent=[_spawn_call("do X"), ModelTurn(final_text="should not be called")],

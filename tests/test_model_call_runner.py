@@ -7,7 +7,9 @@ import contextlib
 import json
 import threading
 import time
+from urllib.error import URLError
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,7 +22,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelCallCapture,
     ModelIOSubscription,
 )
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.errors import (
@@ -29,9 +31,12 @@ from monoid_agent_kernel.errors import (
     RunCancelled,
     RunTimeout,
 )
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
+    SettledModelCall,
     _digest,
+    _encoded_digest,
     _prompt_payload,
     _request_payload,
 )
@@ -45,7 +50,10 @@ from monoid_agent_kernel.providers.base import (
     ToolObservation,
     TurnComplete,
     assemble_streamed_turn,
+    collect_retry_reports,
+    mark_provider_usage,
     normalize_model_request,
+    provider_usage_of,
     report_provider_retried,
 )
 from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
@@ -1382,16 +1390,19 @@ def test_a_container_hook_that_raises_costs_the_key_not_the_call(factory: Any) -
     assert _digest({"v": factory()}) == ""
 
 
-def test_the_replay_key_separates_calls_to_different_destinations() -> None:
-    """Two adapters with identical configs can address different services.
+def test_the_receipt_separates_calls_to_different_destinations_without_naming_them() -> None:
+    """Two adapters with identical configs can address different services -- and now say so.
 
-    `GatewayModelAdapter` lets a per-instance `gateway_url` outrank the config, so a config-only key
-    matched calls that went to different hosts and could return different answers. The destination
-    is hashed rather than recorded, so an internal hostname stays internal.
+    `GatewayModelAdapter` lets a per-instance `gateway_url` outrank the config, so two calls with
+    identical content can go to different hosts. That fact used to live *inside* the replay key,
+    where it made the key unreproducible: the destination is deliberately never recorded, so
+    nothing a record holds could reconstruct it and a miss could not even be diagnosed. It is now
+    beside the key instead -- a keyed digest a consumer can compare and no one can read a hostname
+    out of -- and the key itself describes only what was asked for.
     """
     config = ModelConfig(model="m", gateway_url="http://shared.invalid/x")
 
-    def keyed(url: str) -> str:
+    def observed(url: str) -> Any:
         adapter = GatewayModelAdapter(config=config, gateway_url=url, token="t")
         observer = RecordingObserver()
 
@@ -1405,21 +1416,27 @@ def test_the_replay_key_separates_calls_to_different_destinations() -> None:
                 ).acall(REQUEST)
 
         asyncio.run(run())
-        return observer.captures[0].receipt.request_digest
+        return observer.captures[0].receipt
 
-    first = keyed("http://tenant-a.invalid/x")
-    second = keyed("http://tenant-b.invalid/x")
+    first = observed("http://tenant-a.invalid/x")
+    second = observed("http://tenant-b.invalid/x")
 
-    assert first != second
-    assert first == keyed("http://tenant-a.invalid/x")
-    assert "tenant-a" not in first
+    assert first.request_digest == second.request_digest, "same request, same key"
+    assert first.destination_digest != second.destination_digest, "different service, said so"
+    assert first.destination_digest == observed("http://tenant-a.invalid/x").destination_digest
+    assert "tenant-a" not in first.destination_digest
+    assert first.destination_status == "resolved"
 
 
-def test_an_adapter_that_names_no_destination_still_gets_a_key() -> None:
-    """The member is opt-in, and a resolver that raises must not cost the call its key either.
+def test_an_adapter_that_names_no_destination_is_told_apart_from_one_that_cannot() -> None:
+    """Declining and failing are two facts, and `""` used to be the answer to both.
 
-    Refusing a key whenever the destination is unknown would refuse one for every adapter that
-    routes on config alone, which is most of them.
+    An adapter that routes on config alone has no destination concept; one whose resolver raises
+    is misconfigured and every call it makes is about to fail. `_resolve_gateway_url` raises
+    deterministically when no URL is configured anywhere, so this is not a transient-vs-absent
+    distinction -- it is a working deployment against a broken one, and both used to mint the same
+    valid-looking key. Neither costs the call its key: refusing one whenever the destination is
+    unknown would refuse one for every adapter that routes on config alone, which is most of them.
     """
 
     class Silent:
@@ -1436,12 +1453,19 @@ def test_an_adapter_that_names_no_destination_still_gets_a_key() -> None:
             del request
             return ModelTurn(final_text="answer")
 
-    async def key(adapter: Any) -> str:
+    async def receipt_for(adapter: Any) -> Any:
         _turn, receipt = await ModelCallRunner(adapter=adapter).acall(REQUEST)
-        return receipt.request_digest
+        return receipt
 
-    assert asyncio.run(key(Silent())) != ""
-    assert asyncio.run(key(Unroutable())) != ""
+    silent = asyncio.run(receipt_for(Silent()))
+    unroutable = asyncio.run(receipt_for(Unroutable()))
+
+    assert silent.request_digest != ""
+    assert unroutable.request_digest != ""
+    assert silent.destination_status == "not_declared"
+    assert unroutable.destination_status == "unavailable"
+    assert silent.destination_digest == ""
+    assert unroutable.destination_digest == ""
 
 
 def test_a_marker_shaped_string_is_ordinary_caller_text() -> None:
@@ -1562,7 +1586,7 @@ def test_an_absent_message_log_is_not_an_empty_one() -> None:
 
     assert _digest(_prompt_payload(absent)) != _digest(_prompt_payload(empty))
     keys = [
-        _digest(_request_payload(r, ModelConfig(), provider="p", destination="d"))
+        _digest(_request_payload(r, ModelConfig(), provider="p"))
         for r in (absent, empty)
     ]
     assert keys[0] != keys[1] and "" not in keys
@@ -2029,14 +2053,16 @@ def test_a_truncated_payload_gets_no_replay_key_rather_than_a_misleading_one() -
     call. Refusing to issue a key is the safe half: the call still happens, it is just not
     replayable.
     """
+    # Sized past MAX_MODEL_PAYLOAD_BYTES -- the cap is the wire's since W6-2, so the old
+    # million-int payload (~6.9 MB) is now legitimately keyable and no longer exercises this.
     huge = ModelRequest(
-        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_000_100))},)
+        instruction="hi", system_prompt="s", tools=(), messages=({"v": list(range(1_300_000))},)
     )
     huge_but_different = ModelRequest(
         instruction="hi",
         system_prompt="s",
         tools=(),
-        messages=({"v": list(range(1_000_099)) + [-999]},),
+        messages=({"v": list(range(1_299_999)) + [-999]},),
     )
 
     assert _digest(_prompt_payload(huge)) == ""
@@ -2173,6 +2199,20 @@ def test_the_retry_channel_does_not_leak_between_calls() -> None:
 def test_reporting_a_retry_outside_a_runner_is_inert() -> None:
     """An adapter used directly is not broken by calling the seam with nobody listening."""
     report_provider_retried()  # must not raise
+
+
+def test_the_retry_channel_counts_every_report() -> None:
+    """`retried` answers "did any loop below run" and is monotone, so a second report is
+    invisible to it -- which is exactly what per-attempt attribution cannot live with. `count`
+    carries what the bool discards; the bool stays, derived, so every existing reader keeps
+    meaning what it meant."""
+
+    with collect_retry_reports() as progress:
+        assert (progress.count, progress.retried) == (0, False)
+        report_provider_retried()
+        assert (progress.count, progress.retried) == (1, True)
+        report_provider_retried()
+        assert (progress.count, progress.retried) == (2, True)
 
 
 # --- a broken adapter must not cost the call, the receipt, or the run ----------------------------
@@ -2493,11 +2533,13 @@ def test_a_by_reference_call_shows_an_empty_message_log_not_a_null_one() -> None
     assert by_value.captures[0].content["previous_turn_handle"] == ""
 
 
-def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
+def test_a_resolver_that_answers_nothing_is_declined_not_absent() -> None:
     """The third way an adapter declines a destination: answering, with nothing.
 
-    Unguarded, `str(None)` puts the text `"None"` into the replay key -- a destination no adapter
-    has, shared by every adapter that returns `None`.
+    Unguarded, `str(None)` recorded the text `"None"` -- a destination no adapter has, shared by
+    every adapter that returns one. It is now `declined`, which is a different fact from the
+    `not_declared` of an adapter that never offered the member and from the `unavailable` of one
+    whose probe raised.
     """
 
     class Vague:
@@ -2513,10 +2555,13 @@ def test_a_resolver_that_answers_nothing_still_leaves_the_key_empty() -> None:
         _turn, receipt = await ModelCallRunner(adapter=Vague()).acall(REQUEST)
         return receipt
 
-    empty = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination=""))
-    stringified = _digest(_request_payload(REQUEST, ModelConfig(), provider="", destination="None"))
-    assert asyncio.run(run()).request_digest == empty
-    assert empty != stringified, "the two must be distinguishable for this test to mean anything"
+    receipt = asyncio.run(run())
+    assert receipt.destination_status == "declined"
+    assert receipt.destination_digest == ""
+    # The key does not move with any of it: the endpoint left the payload entirely.
+    assert receipt.request_digest == _digest(
+        _request_payload(REQUEST, ModelConfig(), provider="gateway")
+    )
 
 
 def test_a_config_of_the_wrong_type_is_not_written_into_the_receipt() -> None:
@@ -2699,12 +2744,16 @@ def test_a_close_that_finishes_in_time_is_not_reported_as_abandoned(caplog: Any)
     assert not caplog.records, f"an ordinary close was reported as abandoned: {caplog.records}"
 
 
-def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> None:
-    """The probe is tolerant at the lookup, not only at the call.
+def test_a_probe_that_raises_on_lookup_is_unavailable_not_absent() -> None:
+    """The probe is tolerant at the lookup, not only at the call -- and now says which it was.
 
-    `resolve_destination` is opt-in, so an adapter may expose it as a property -- and a property that
-    raised took the whole call down, over a replay key. The sibling probes guarded the `getattr`;
+    `resolve_destination` is opt-in, so an adapter may expose it as a property, and a property that
+    raised took the whole call down over a replay key. The sibling probes guarded the `getattr`;
     this one guarded only the invocation, which is the half a `def` happens to exercise.
+
+    Tolerating it is right; recording it as "no destination" was not. That collapsed a working
+    deployment and a broken one into one answer, and the collapse was invisible because both
+    produced a key that looked fine.
     """
 
     class RaisingLookup:
@@ -2722,9 +2771,12 @@ def test_a_destination_probe_that_raises_on_lookup_still_keeps_the_call() -> Non
 
     turn, receipt = asyncio.run(run())
     assert turn.final_text == "answer"
+    # See the sibling above on `provider="gateway"`: the slot resolves through the config when an
+    # adapter declares nothing, and this adapter declares nothing but a raising property.
     assert receipt.request_digest == _digest(
-        _request_payload(REQUEST, ModelConfig(), provider="", destination="")
+        _request_payload(REQUEST, ModelConfig(), provider="gateway")
     )
+    assert receipt.destination_status == "unavailable"
 
 
 def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_probe() -> None:
@@ -2773,6 +2825,66 @@ def test_a_host_whose_adapter_changes_is_read_once_per_call_and_not_once_per_pro
         0,
         1,
     ], f"the adapter must be read exactly once per call, was read {len(reads)}x"
+
+
+def test_the_key_names_the_provider_the_receipt_records() -> None:
+    """One read of the declaration per call, for the same reason the adapter itself gets one.
+
+    The sibling above binds "one adapter per call" and stops there. The *declaration on that
+    adapter* was still read twice -- once for `ModelCallReceipt.provider_name`, once for the replay
+    key -- and a `provider_name` property that answers and then stops answering made the two
+    disagree. The receipt then said `openai` while the key had been taken under the config's
+    `gateway`, which is precisely the failure W6-0 exists to remove: a key whose preimage the
+    record cannot reconstruct cannot be recomputed, cannot be verified, and a miss cannot be told
+    apart from a defect.
+
+    The property is checked both ways round. Agreeing with a *stable* adapter's key is the part
+    that says which of the two values won -- an implementation that resolved both to the fallback
+    would agree with itself and still be wrong.
+    """
+
+    class OnceThenUnreadable:
+        """A declaration that answers the first read and raises after it -- a cached property
+        whose refresh fails, a proxy that loses its upstream, a lazily-resolved client."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def provider_name(self) -> str:
+            self.reads += 1
+            if self.reads > 1:
+                raise RuntimeError("declaration went unreadable")
+            return "openai"
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    class Stable:
+        provider_name = "openai"
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer")
+
+    request = replace(REQUEST, model=ModelConfig(provider="gateway"))
+
+    async def run(adapter: Any) -> Any:
+        return (await ModelCallRunner(adapter=adapter).acall(request))[1]
+
+    unstable = OnceThenUnreadable()
+    flickering = asyncio.run(run(unstable))
+    steady = asyncio.run(run(Stable()))
+
+    assert flickering.provider_name == "openai"
+    assert flickering.request_digest == steady.request_digest, (
+        "the key must name the provider the receipt records, not a second read of it"
+    )
+    assert flickering.request_digest == _digest(
+        _request_payload(request, ModelConfig(provider="gateway"), provider="openai")
+    )
+    assert unstable.reads == 1, f"the declaration was read {unstable.reads}x, must be once"
 
 
 def test_a_close_is_granted_the_grace_and_the_grace_is_read_live(caplog: Any) -> None:
@@ -3149,3 +3261,1765 @@ def test_interruption_is_mid_turn_only_while_something_consumes_deltas() -> None
     # `StreamingAdapter.next_turn`, so the generator that would have been polled between chunks was
     # never entered -- the abort predicate is never consulted, and the call runs to completion.
     assert asyncio.run(without_consumer()).final_text == "one-shot fallback"
+
+
+# --- the receipt sink: a seam the caller's return value cannot reach ------------------------------
+
+
+class _RaisingAdapter:
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        raise ModelAdapterError(
+            "upstream refused",
+            provider_error_code="rate_limit",
+            retryable=True,
+            http_status=429,
+        )
+
+
+def test_a_failed_call_reaches_the_settled_sink_the_caller_never_receives_one_from() -> None:
+    """The sink exists because `acall`'s return value is not a delivery channel for a failure.
+
+    A failed call publishes its receipt and then re-raises (see `acall`), and it does not stamp the
+    receipt onto the exception -- so the caller holding `turn, receipt = await runner.acall(...)`
+    gets an exception and nothing else. A durable ledger wired to that return value would record
+    only the calls that succeeded, which is the opposite of what an audit trail is for.
+
+    Both halves are asserted from one runner: the success arm proves the sink is not a
+    failure-only hook (and hands over the turn), and the failure arm proves the receipt carries
+    the classification the exception did -- and no turn, because there is none.
+    """
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(adapter=SyncAdapter(), settled_sink=recorded.append)
+    turn, returned = asyncio.run(runner.acall(REQUEST))
+
+    assert turn.final_text == "answer"
+    assert [call.receipt.request_digest for call in recorded] == [returned.request_digest]
+    assert recorded[0].receipt.error_code == ""
+    assert recorded[0].turn is turn
+
+    failing = ModelCallRunner(adapter=_RaisingAdapter(), settled_sink=recorded.append)
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(failing.acall(REQUEST))
+
+    assert len(recorded) == 2
+    failed = recorded[1].receipt
+    assert recorded[1].turn is None
+    assert failed.error_code != ""
+    assert failed.provider_error_code == "rate_limit"
+    assert failed.http_status == 429
+    assert failed.retryable is True
+    # The key is taken before dispatch, so a failed call is still identifiable -- which is the
+    # whole reason to record it beside the successful ones rather than in a separate lane.
+    assert failed.request_digest
+    assert failed.digest_status == "ok"
+
+
+def test_the_sink_is_handed_the_settled_receipt_and_not_the_one_before_dispatch() -> None:
+    """`capture_downgrades` is resolved by delivery, so recording before it is recording a zero.
+
+    `latency_ms` is stamped before delivery and `capture_downgrades` after it. A sink placed either
+    side of `dispatch_model_call` sees one of them unset, and the field that goes quiet is the one
+    that says a consumer was denied the content it asked for -- an audit record that always reads
+    "nothing was withheld" is worse than one that omits the question.
+    """
+    recorded: list[SettledModelCall] = []
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(),
+        # A policy that knows it *had* a redactor and no longer has one: the pipeline treats the
+        # missing machinery as a redaction failure and downgrades this consumer to `digest`.
+        subscriptions=(
+            ModelIOSubscription(
+                observer=observer,
+                policy=CapturePolicy(mode="redacted", restored_without_redactor=True),
+            ),
+        ),
+        settled_sink=recorded.append,
+    )
+    _turn, returned = asyncio.run(runner.acall(REQUEST))
+
+    assert observer.captures[0].was_downgraded is True
+    assert returned.capture_downgrades == 1
+    assert len(recorded) == 1
+    assert recorded[0].receipt.capture_downgrades == 1
+    assert recorded[0].receipt.latency_ms == returned.latency_ms
+
+
+def test_a_raising_sink_does_not_fail_a_call_the_provider_was_paid_for() -> None:
+    """The containment rule observers already have, spelled for the sink.
+
+    A recorder that cannot write is not a reason to discard an answer the provider has already
+    billed for, and it is not a reason to reclassify a failure either: on the failure arm the
+    `ModelAdapterError` must escape carrying the taxonomy it arrived with, not whatever the sink
+    threw. That second half is the one a bare try/except around the call would not catch.
+    """
+
+    def explode(call: SettledModelCall) -> None:
+        del call
+        raise RuntimeError("ledger is on fire")
+
+    turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter(), settled_sink=explode).acall(REQUEST)
+    )
+    assert turn.final_text == "answer"
+    assert receipt.error_code == ""
+
+    with pytest.raises(ModelAdapterError) as failure:
+        asyncio.run(
+            ModelCallRunner(adapter=_RaisingAdapter(), settled_sink=explode).acall(REQUEST)
+        )
+    assert failure.value.provider_error_code == "rate_limit"
+    assert failure.value.http_status == 429
+    assert failure.value.retryable is True
+
+
+def test_a_dispatch_that_raises_still_records_the_call_it_could_not_deliver(
+    monkeypatch: Any,
+) -> None:
+    """Recording is in a `finally`, not after the delivery it does not depend on.
+
+    `dispatch_model_call` contains its own observers, so this is a defence against the pipeline
+    itself breaking -- and the two call sites fail in opposite directions when it does. The failure
+    path publishes inside `contextlib.suppress(Exception)`, so a record placed after delivery is
+    lost with no trace; the success path publishes unguarded, so the same placement fails a paid
+    call. A naive "record after dispatch" implementation passes the success arm of every other test
+    in this section and dies here.
+    """
+    from monoid_agent_kernel import model_call as model_call_module
+
+    def explode(**kwargs: Any) -> Any:
+        del kwargs
+        raise RuntimeError("dispatch is broken")
+
+    monkeypatch.setattr(model_call_module, "dispatch_model_call", explode)
+    recorded: list[SettledModelCall] = []
+    observer = RecordingObserver()
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(),
+        subscriptions=(
+            ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+        ),
+        settled_sink=recorded.append,
+    )
+
+    with pytest.raises(RuntimeError, match="dispatch is broken"):
+        asyncio.run(runner.acall(REQUEST))
+
+    # Delivery never happened, and the record still names the call.
+    assert observer.captures == []
+    assert len(recorded) == 1
+    assert recorded[0].receipt.request_digest
+    # The receipt a broken dispatch leaves behind is the pre-delivery one, so the count it could
+    # not resolve stays at its floor rather than being invented.
+    assert recorded[0].receipt.capture_downgrades == 0
+
+
+# --- One size gate, three named refusals (W6-2) ---------------------------------------------------
+
+
+def test_a_payload_between_the_old_digest_cap_and_the_wire_cap_gets_a_key() -> None:
+    """4 MiB was the digest cap while 8,000,000 bytes was the message-log cap, so the band between
+    them shipped calls that transmitted successfully and silently had no replay key. One constant
+    now gates both: what can be sent can be keyed."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * (5 * 1024 * 1024), tools=())
+        )
+    )
+    assert receipt.request_digest != ""
+    assert receipt.digest_status == "ok"
+
+
+def test_a_payload_over_the_ceiling_is_a_named_condition_not_a_missing_key() -> None:
+    """`absent` used to cover both "cannot be encoded" (a defect in the payload) and "over the cap"
+    (an operational condition, answered by raising the cap or offloading). A consumer holding a
+    keyless record could not tell which one it was looking at."""
+    _turn, receipt = asyncio.run(
+        ModelCallRunner(adapter=SyncAdapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="x" * 8_000_001, tools=())
+        )
+    )
+    assert receipt.request_digest == ""
+    assert receipt.digest_status == "too_large"
+
+
+def test_an_unencodable_payload_is_still_absent_so_the_distinction_is_real() -> None:
+    """The split would be cosmetic if every refusal drifted to the new value."""
+    hostile = _encoded_digest({"v": 10**5000})
+    assert (hostile.digest, hostile.status) == ("", "absent")
+
+    oversized = _encoded_digest({"v": "x" * 8_000_001})
+    assert (oversized.digest, oversized.status) == ("", "too_large")
+
+
+def test_a_payload_under_the_old_cap_keeps_the_digest_it_always_had() -> None:
+    """Witness, not red: the cap moved up, which only turns refusals into keys. A payload that had
+    a digest under the old cap must keep it byte-for-byte, or the raise would rekey every recorded
+    corpus. Recomputed through `canonical_sha256` rather than compared to a golden constant, so the
+    thing pinned is the encoding itself."""
+    payload = _request_payload(REQUEST, ModelConfig(), provider="fake")
+
+    assert _digest(payload) == canonical_sha256(payload)
+
+
+# --- The preimage the sink receives (W6-2) --------------------------------------------------------
+
+
+def test_the_preimage_the_sink_receives_is_the_bytes_the_key_was_hashed_over() -> None:
+    """D-a's whole content: the sink is handed the encoder's own output, not a re-derivation it
+    would have to reconstruct from the receipt -- which it cannot, because the key's provider term
+    came from an adapter resolution only the call itself performed."""
+    import hashlib
+
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    _turn, receipt = asyncio.run(runner.acall(REQUEST))
+
+    call = recorded[0]
+    assert call.request_preimage is not None
+    assert hashlib.sha256(call.request_preimage).hexdigest() == receipt.request_digest
+    assert receipt.digest_status == "ok"
+
+
+def test_a_failed_call_still_hands_the_sink_its_preimage() -> None:
+    """The corpus wants "what was asked" for failures too; the request side of a failed call is
+    exactly as recordable as a successful one's, because the key is taken before dispatch."""
+    import hashlib
+
+    recorded: list[SettledModelCall] = []
+    failing = ModelCallRunner(
+        adapter=_RaisingAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(failing.acall(REQUEST))
+
+    call = recorded[0]
+    assert call.turn is None
+    assert call.request_preimage is not None
+    assert hashlib.sha256(call.request_preimage).hexdigest() == call.receipt.request_digest
+
+
+def test_a_call_refused_before_its_key_hands_the_sink_no_preimage() -> None:
+    """A boundary crossed before the digest means no key and therefore no preimage -- `None` here
+    is truthful, not a capture failure."""
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(
+        adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
+    )
+    with pytest.raises(RunTimeout):
+        asyncio.run(runner.acall(REQUEST, deadline=time.monotonic() - 1.0))
+
+    assert len(recorded) == 1
+    assert recorded[0].request_preimage is None
+    assert recorded[0].receipt.digest_status == "not_reached"
+
+
+def test_the_preimage_is_not_captured_unless_asked_for() -> None:
+    """The knob exists so a ledger-only run does not hold up to 8 MB per in-flight call for bytes
+    its sink never reads. The digests themselves are computed either way."""
+    recorded: list[SettledModelCall] = []
+    runner = ModelCallRunner(adapter=SyncAdapter(), settled_sink=recorded.append)
+    _turn, receipt = asyncio.run(runner.acall(REQUEST))
+
+    assert recorded[0].request_preimage is None
+    assert receipt.request_digest != ""
+    assert receipt.digest_status == "ok"
+
+
+# --- the kernel retry layer ---------------------------------------------------------------------
+
+
+def _kernel_model(max_attempts: int = 3) -> ModelConfig:
+    """A kernel-layer policy with a zero schedule, so tests never actually wait."""
+
+    return ModelConfig(
+        retry=ModelRetryConfig(
+            layer="kernel", max_attempts=max_attempts, initial_delay_s=0.0, jitter_s=0.0
+        )
+    )
+
+
+class _FlakyAdapter:
+    """Fails `failures` times through `error_factory`, then answers with billed usage."""
+
+    def __init__(self, failures: int, error_factory: Any = None) -> None:
+        self.calls = 0
+        self.failures = failures
+        self.error_factory = error_factory or (
+            lambda: ModelAdapterError("transient", retryable=True)
+        )
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.error_factory()
+        return ModelTurn(final_text="answer", usage={"output_tokens": 7})
+
+
+def _acall(adapter: Any, request: ModelRequest, **kwargs: Any) -> RecordingObserver:
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, **kwargs)
+
+    asyncio.run(run())
+    return observer
+
+
+def test_the_kernel_layer_pays_for_another_attempt_and_the_receipt_counts_it() -> None:
+    """Under `layer="kernel"` the runner re-dispatches a retryable failure; `attempts` counts it.
+
+    `provider_retried` stays False on purpose: kernel attempts are the kernel's own fact,
+    carried by `attempts`, and the adapter flag keeps meaning what it always meant -- a loop
+    BELOW the adapter boundary ran. One settled capture for the whole logical call, because
+    retry is transport: the request was keyed once and answered once.
+    """
+
+    adapter = _FlakyAdapter(failures=1)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    assert adapter.calls == 2
+    assert len(observer.captures) == 1
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is True
+    assert receipt.attempts == 2
+    assert receipt.provider_retried is False
+
+
+def test_the_default_layer_still_makes_exactly_one_attempt() -> None:
+    adapter = _FlakyAdapter(failures=1)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+    with pytest.raises(ModelAdapterError):
+        _acall(adapter, request)
+
+    assert adapter.calls == 1
+
+
+# --- the idempotency key: issued at keying, constant across dispatches --------------------------
+
+
+class _KeyCapturingAdapter:
+    """Fails ``failures`` times, capturing the request's idempotency key at every dispatch."""
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.seen: list[str] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.seen.append(request.idempotency_key)
+        if len(self.seen) <= self.failures:
+            raise ModelAdapterError("transient", retryable=True)
+        return ModelTurn(final_text="answer")
+
+
+def test_the_runner_issues_one_key_per_call_and_every_dispatch_carries_it() -> None:
+    """Issued in the keying block -- per call, before the first dispatch -- and constant across
+    kernel re-dispatches: the loop reuses the request rather than rebuilding it, so the key the
+    receipt records is the key every attempt presented."""
+
+    adapter = _KeyCapturingAdapter(failures=2)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    receipt = _acall(adapter, request).captures[0].receipt
+
+    assert receipt.attempts == 3
+    assert receipt.idempotency_key.startswith("idem_")
+    assert adapter.seen == [receipt.idempotency_key] * 3
+
+
+def test_every_call_gets_its_own_key_even_over_the_same_request_object() -> None:
+    """Two calls are two retry scopes even when their content is byte-identical. Identical
+    requests share a replay slot by design -- content cannot separate them -- which is exactly
+    why the token that separates their provider work is issued per call, not derived. Issuance
+    is uniform: this adapter never opens a socket and its calls are keyed all the same."""
+
+    adapter = _KeyCapturingAdapter()
+    first = _acall(adapter, REQUEST).captures[0].receipt
+    second = _acall(adapter, REQUEST).captures[0].receipt
+
+    assert first.idempotency_key.startswith("idem_")
+    assert second.idempotency_key.startswith("idem_")
+    assert first.idempotency_key != second.idempotency_key
+
+
+def test_the_runner_is_the_single_issuer_and_overwrites_a_caller_value() -> None:
+    """A respected caller value would let one request object hand two calls the same scope --
+    the collision the per-call issuer exists to prevent -- so the field is a carriage channel,
+    not an input."""
+
+    adapter = _KeyCapturingAdapter()
+    request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), idempotency_key="caller-chosen"
+    )
+    receipt = _acall(adapter, request).captures[0].receipt
+
+    assert receipt.idempotency_key != "caller-chosen"
+    assert receipt.idempotency_key.startswith("idem_")
+    assert adapter.seen == [receipt.idempotency_key]
+
+
+def test_the_minted_key_satisfies_the_rule_its_transports_enforce() -> None:
+    """The mint and the validator must not drift: every edge omits or refuses a key outside
+    the token shape, so a mint that ever left it would silently stop being carried.
+
+    Read off ``providers.base``, where the minter lives because the runner is not its only
+    caller -- the reference gateway keys the upstream hop it drives with the same function.
+    Two copies of the expression is how the two issuers would come to differ.
+    """
+
+    from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+    from monoid_agent_kernel.providers.base import new_idempotency_key
+
+    for _ in range(64):
+        assert is_valid_idempotency_key(new_idempotency_key())
+
+
+class _NeverUnequal(str):
+    """A ``str`` that answers *for* its value instead of about it: ``__ne__`` returns False,
+    so any guard spelling "is this the in-band absence?" as ``value != ""`` skips the check
+    behind it while the transport goes on reading the underlying string."""
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        pytest.param("ok\r\n X-Injected: yes", id="obs-fold"),
+        pytest.param("ok\r\nX-Injected: yes", id="bare-crlf"),
+        pytest.param("ok\nforged", id="lf"),
+        pytest.param("A" * 129, id="too-long"),
+        pytest.param("-leading-punctuation", id="bad-first-character"),
+        pytest.param("key with spaces", id="space"),
+        pytest.param("ké", id="non-ascii"),
+        # Not strings at all. Only the empty string spells absence here; every other falsy
+        # value is a caller who supplied *something* and would otherwise have watched it
+        # vanish at the transport, which omits what it cannot validate. A truthiness
+        # pre-filter reads all six as "no key given" -- the absence-vs-value conflation this
+        # field has now produced three times, at three different types.
+        pytest.param(None, id="none"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param([], id="empty-list"),
+        pytest.param({}, id="empty-dict"),
+        # The seventh, and the only one of them that IS a string: a subclass whose ``__ne__``
+        # returns False answers the ``!= ""`` pre-filter for the value rather than about it,
+        # so the pattern check behind it never runs. The ledger mint carried the same shape
+        # and the same hole; both ask through one predicate now.
+        pytest.param(_NeverUnequal("bad\nkey"), id="equality-overload"),
+    ],
+)
+def test_request_ingress_refuses_a_key_that_could_not_go_on_a_header(hostile: object) -> None:
+    """Refused where this repo refuses a non-finite control or a malformed output_schema.
+
+    The runner mints after normalization so a run-driven call never reaches this branch; it
+    exists for the direct integrator, whose bad key would otherwise reach a transport that --
+    probed -- neither `http.client` nor `httpx` defends against when it is obs-folded.
+    """
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        normalize_model_request(
+            ModelRequest(instruction="hi", system_prompt="sys", tools=(), idempotency_key=hostile)
+        )
+
+    # Counterweight: the shape the runner mints survives ingress untouched.
+    kept = normalize_model_request(
+        ModelRequest(
+            instruction="hi", system_prompt="sys", tools=(), idempotency_key="idem_abc123"
+        )
+    )
+    assert kept.idempotency_key == "idem_abc123"
+
+
+def test_a_call_refused_before_keying_records_no_key() -> None:
+    """The keying block sits past the cancel/deadline check, so a refused call was never keyed:
+    ``""`` beside ``attempts == 0``, the receipt's own two-armed audit shape."""
+
+    adapter = _KeyCapturingAdapter()
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST, deadline=time.time() - 1.0)
+
+    with pytest.raises(RunTimeout):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 0
+    assert receipt.idempotency_key == ""
+    assert adapter.seen == []
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        pytest.param(lambda: ModelAdapterError("terminal", retryable=False), id="not-retryable"),
+        pytest.param(
+            lambda: ModelAdapterError("fix config", retryable=True, config_recoverable=True),
+            id="config-recoverable",
+        ),
+        pytest.param(lambda: RuntimeError("not an adapter error"), id="untyped"),
+    ],
+)
+def test_the_kernel_loop_refuses_what_the_taxonomy_refuses(error_factory: Any) -> None:
+    """The kernel judges by the taxonomy alone: no `ModelAdapterError`, no retry; marked
+    non-retryable or config-recoverable, no retry -- re-sending cannot help a call whose
+    config must change first."""
+
+    adapter = _FlakyAdapter(failures=99, error_factory=error_factory)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    with pytest.raises((ModelAdapterError, RuntimeError)):
+        _acall(adapter, request)
+
+    assert adapter.calls == 1
+
+
+def test_exhaustion_re_raises_the_last_error_with_the_attempts_it_cost() -> None:
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 3
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert receipt.succeeded is False
+
+
+def test_swallowed_attempts_usage_reaches_the_receipt() -> None:
+    """An attempt the loop absorbed still cost tokens, and the receipt is the only carrier left.
+
+    The turn keeps the final answer's own usage -- it describes what the model said -- while
+    the receipt sums what the whole logical call cost, which is what an audit or a meter
+    reads. The run's cumulative token budget still counts settled turns; that boundary is
+    documented, not accidental.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=1, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert receipt.usage["output_tokens"] == 12
+    assert receipt.succeeded is True
+
+
+def test_an_exhausted_call_still_accounts_every_billed_attempt() -> None:
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    # Two swallowed attempts at 5 plus the final error's own stamp, which `with_error` reads.
+    assert observer.captures[0].receipt.usage["output_tokens"] == 15
+
+
+def test_a_turn_the_normalizer_refuses_still_reports_what_it_was_billed() -> None:
+    """The refusal is about the turn's shape; the counts beside it were still charged.
+
+    ``normalize_model_turn`` builds a *fresh* ``ModelAdapterError``, so the escaping error
+    carried no ``provider_usage`` and ``with_error`` -- which reads exactly that stamp -- put an
+    empty usage on the receipt, while the raw turn holding well-formed counts was still in
+    scope one frame away. A paid call then left no trace in the metrics or in the cumulative
+    token budget, which is the failure ``mark_provider_usage`` exists to prevent and already
+    prevents for the applied-parameters refusals that parse a turn, read its usage, and only
+    then reject it.
+
+    The malformed field is deliberately NOT the usage: a bad count is dropped by
+    ``_recordable_usage`` and there is nothing to carry. This is the shape where the bill is
+    intact and something else about the turn is not.
+
+    The entry the log gets for this dispatch carries the same counts, because the sum invariant
+    is what would otherwise refuse the receipt -- one attempt, and the receipt's total is that
+    attempt's.
+    """
+
+    class BilledButMalformedAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(
+                final_text="answer",
+                usage={"input_tokens": 7, "output_tokens": 11},
+                provider_retried="yes",  # type: ignore[arg-type]
+            )
+
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=BilledButMalformedAdapter(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(REQUEST)
+
+    with pytest.raises(ModelAdapterError, match="non-portable response") as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.succeeded is False
+    assert dict(receipt.usage) == {"input_tokens": 7, "output_tokens": 11}
+    # The stamp itself, so a receipt that got the counts some other way cannot pass this.
+    assert provider_usage_of(caught.value) == {"input_tokens": 7, "output_tokens": 11}
+    # And the ledger still adds up to the bill it is a breakdown of.
+    assert [dict(entry.usage) for entry in receipt.attempt_log] == [
+        {"input_tokens": 7, "output_tokens": 11}
+    ]
+    # The refused turn's own retry claim is still not consulted -- only its counts travel.
+    assert receipt.attempt_log[0].provider_retried is False
+
+
+def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> None:
+    """Derived census, widened off ``loop.py`` to the function every caller goes through.
+
+    This is the third appearance of one shape -- a fresh exception built where a stamped one was
+    available. ``loop.py``'s wrap was the first, its boundary arms the second, and the existing
+    census in ``test_loop.py`` is scoped to that file, so it walked straight past this one. The
+    widening is deliberately not "the same AST rule over more files": the carrier here is a
+    single function, so the instrument asserts that *it* carries on every arm that can leave,
+    and that no caller re-implements the carrying.
+
+    Scoped to the function rather than to its four call sites because one of them --
+    ``normalize_model_turn(adapter.next_turn(...))`` in the gateway service -- never binds the
+    raw turn to a name, so a per-caller stamp is not merely duplicated there, it is impossible.
+
+    What this census still cannot see, stated because a green census that is blind is worse than
+    no census:
+
+    - It reads ``providers/base.py`` only. A *different* function that refuses a billed turn
+      somewhere else is a fourth appearance of the shape, and nothing here enumerates it.
+    - It proves each arm calls the stamper, not that the stamper was handed the right value: a
+      site passing ``{}`` or the wrong object still satisfies it. The behavioural test above is
+      what pins the value, and only for the one arm it drives.
+    - ``_refused_turn_usage`` returning ``{}`` for a shape it does not recognize is invisible
+      here and would look identical to a turn that reported nothing.
+    - It does not forbid a caller from stamping too. It cannot: ``model_call.py`` legitimately
+      stamps the *cumulative* whole-call bill on the escaping error, which is a different fact
+      about a different total, and no syntactic rule separates that from a re-implementation of
+      this one. An earlier draft of this census asserted "no caller stamps" and reddened on that
+      correct site -- an instrument needing an exemption list for a legitimate caller is
+      measuring the wrong thing, so the clause was removed rather than given one.
+    """
+
+    import ast
+
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "monoid_agent_kernel"
+        / "providers"
+        / "base.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    normalizer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "normalize_model_turn"
+    )
+
+    # Every handler that lets an exception leave -- re-raised or rebuilt -- stamps first.
+    unstamped = {}
+    for handler in ast.walk(normalizer):
+        if not isinstance(handler, ast.ExceptHandler):
+            continue
+        leaves = any(isinstance(node, ast.Raise) for node in ast.walk(handler))
+        stamps = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "mark_provider_usage"
+            for node in ast.walk(handler)
+        )
+        if leaves and not stamps:
+            unstamped[handler.lineno] = ast.unparse(handler).splitlines()[0]
+
+    assert unstamped == {}, {
+        "arms_that_leave_without_carrying_the_bill": unstamped,
+        "hint": "mark_provider_usage(<escaping error>, _refused_turn_usage(turn))",
+    }
+
+    # Both arms exist, so deleting one cannot pass by deleting the shape above.
+    stamp_sites = [
+        node.lineno
+        for node in ast.walk(normalizer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "mark_provider_usage"
+    ]
+    assert len(stamp_sites) == 2, {"stamp_sites": stamp_sites}
+
+    # Every caller reaches the normalizer by that name, so the carrying above is on the path of
+    # all of them. Enumerated rather than asserted about one, because the count is the part that
+    # goes stale: a fifth caller is covered by construction, and a caller that stopped going
+    # through this function would drop out of this set and be visible here.
+    repo_src = Path(__file__).resolve().parents[1] / "src"
+    callers = sorted(
+        str(path.relative_to(repo_src)).replace("\\", "/")
+        for path in repo_src.rglob("*.py")
+        if path != source_path
+        and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "normalize_model_turn"
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    )
+    assert callers == [
+        "monoid_agent_kernel/model_call.py",
+        "monoid_agent_kernel/reference/llm_gateway/service.py",
+    ], {"callers": callers}
+
+
+def test_a_refused_backoff_does_not_bill_its_attempt_twice(monkeypatch: Any) -> None:
+    """The attempt whose backoff cannot fit the deadline is the terminal one, billed once.
+
+    `with_error` reads the escaping error's own `provider_usage` stamp, so an attempt belongs
+    in `spent_usage` only once the loop has committed to ABSORBING it. Recorded any earlier,
+    the one error the deadline check then re-raises is both the swallowed attempt and the
+    terminal outcome, and the receipt carries its cost twice -- a meter reading double for a
+    call that reached the provider once. The counter-arm is the test above: attempts the loop
+    really did absorb still sum, 15 for three billed calls at 5.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    assert adapter.calls == 1
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    assert receipt.usage["output_tokens"] == 5
+
+
+def test_the_attempt_log_names_every_dispatch_and_sums_to_the_receipt() -> None:
+    """One entry per kernel dispatch, in order, whose usage totals are the receipt's usage.
+
+    The absorbed attempt keeps its own taxonomy and its own bill; the answering attempt keeps
+    the turn's. The receipt's `usage` is exactly their sum on the success exit -- the invariant
+    that makes the log auditable instead of decorative.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=1, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    assert [entry.index for entry in receipt.attempt_log] == [1, 2]
+    first, second = receipt.attempt_log
+    assert first.succeeded is False
+    assert first.retryable is True
+    assert dict(first.usage) == {"output_tokens": 5}
+    assert first.stream_committed is False
+    assert second.succeeded is True
+    # The answering entry mirrors the receipt's own normalized reading (`_recordable_usage`
+    # zero-fills the core three) -- the same shape, or the sum below could not close.
+    assert second.usage["output_tokens"] == 7
+    assert all(entry.elapsed_ms >= 0 for entry in receipt.attempt_log)
+    summed: dict[str, int] = {}
+    for entry in receipt.attempt_log:
+        for key, value in entry.usage.items():
+            summed[key] = summed.get(key, 0) + value
+    assert summed == dict(receipt.usage)
+
+
+def test_the_backoff_wait_lands_on_the_entry_it_delayed(monkeypatch: Any) -> None:
+    """`backoff_ms` is the wait BEFORE that entry's dispatch: 0 on the first entry, and the
+    sleep an absorbed failure earned lands on the entry it delayed, not the one that caused it.
+
+    Measured around the wait rather than copied from the schedule, so a capped or interrupted
+    sleep records what happened rather than what was asked for. The lower bound is generous on
+    purpose -- the pin is "a real wait was recorded on the right entry", not a timer-precision
+    claim.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    observer = _acall(_FlakyAdapter(failures=1), request)
+
+    receipt = observer.captures[0].receipt
+    first, second = receipt.attempt_log
+    assert first.backoff_ms == 0
+    assert second.backoff_ms is not None
+    assert second.backoff_ms >= 25
+
+
+def test_a_zero_schedule_records_a_zero_wait_not_an_absent_one() -> None:
+    """0 and None are different answers on this field: the runner always knows the wait it
+    imposed, so a zero-schedule run records 0 -- absence stays reserved for entries parsed
+    from lines written before the field existed."""
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    observer = _acall(_FlakyAdapter(failures=1), request)
+
+    receipt = observer.captures[0].receipt
+    assert [entry.backoff_ms for entry in receipt.attempt_log] == [0, 0]
+
+
+def test_an_exhausted_calls_waits_are_logged_and_fit_inside_its_latency(monkeypatch: Any) -> None:
+    """The failure exit threads the wait too, and the timeline algebra closes: dispatch times
+    plus recorded waits never exceed the whole call's `latency_ms` -- the remainder is keying
+    and settle overhead. Every duration is floored from the same monotonic clock, and floors
+    sum to at most the floor of the sum, so the inequality is exact rather than statistical.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=_FlakyAdapter(failures=99),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    waits = [entry.backoff_ms for entry in receipt.attempt_log]
+    assert waits[0] == 0
+    assert all(wait is not None and wait >= 25 for wait in waits[1:])
+    assert (
+        sum(entry.elapsed_ms for entry in receipt.attempt_log)
+        + sum(wait or 0 for wait in waits)
+        <= receipt.latency_ms
+    )
+
+
+def test_a_refused_turns_entry_carries_the_wait_that_preceded_it(monkeypatch: Any) -> None:
+    """The third construction site holds the rule the other two hold: the terminal entry for a
+    turn the normalizer refuses is built outside the dispatch loop, and it still names the
+    backoff that delayed its dispatch."""
+
+    class _FailsThenRefuses:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls = getattr(self, "calls", 0) + 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.03)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=_FailsThenRefuses(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    first, second = receipt.attempt_log
+    assert first.backoff_ms == 0
+    assert second.backoff_ms is not None
+    assert second.backoff_ms >= 25
+
+
+def test_a_single_dispatch_call_logs_one_entry_and_a_refused_call_logs_none() -> None:
+    """The log is not a kernel-layer exclusive: every settled call names its dispatches.
+
+    Under the default layer a call is one dispatch, so the log is one entry mirroring the
+    receipt. A call refused before the adapter was reached made no dispatch, and its empty
+    log says so beside `attempts == 0` -- the two-armed invariant, exercised on both arms.
+    """
+
+    observer = _acall(SyncAdapter(), REQUEST)
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert entry.index == 1
+    assert entry.succeeded is True
+    assert dict(entry.usage) == dict(receipt.usage)
+
+    refused_observer = RecordingObserver()
+
+    async def refuse() -> None:
+        await ModelCallRunner(
+            adapter=SyncAdapter(),
+            subscriptions=(
+                ModelIOSubscription(
+                    observer=refused_observer, policy=CapturePolicy(mode="digest")
+                ),
+            ),
+        ).acall(REQUEST, deadline=time.time() - 1.0)
+
+    with pytest.raises(RunTimeout):
+        asyncio.run(refuse())
+
+    refused = refused_observer.captures[0].receipt
+    assert refused.attempts == 0
+    assert refused.attempt_log == ()
+
+
+def test_an_exhausted_call_logs_every_attempt_and_restamps_the_cumulative_cost() -> None:
+    """The terminal error leaves carrying what the whole logical call cost.
+
+    The loop's failure accounting reads the escaping error's stamp (`_billed_usage`), and a
+    stamp naming only the last attempt under-counts every absorbed one. Restamped after the
+    failed receipt is built -- `with_error` reads this same stamp, and a cumulative stamp read
+    back there would land the absorbed spend on the receipt twice. The log names all three
+    dispatches with their own bills; the receipt and the stamp agree on the sum.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert [entry.index for entry in receipt.attempt_log] == [1, 2, 3]
+    assert all(not entry.succeeded for entry in receipt.attempt_log)
+    assert all(dict(entry.usage) == {"output_tokens": 5} for entry in receipt.attempt_log)
+    assert receipt.usage["output_tokens"] == 15
+    assert provider_usage_of(caught.value) == {"output_tokens": 15}
+
+
+def test_a_refused_backoff_logs_its_attempt_once_and_keeps_the_stamp_it_earned(
+    monkeypatch: Any,
+) -> None:
+    """The deadline-refusal arm of the absorb commit point, at log level.
+
+    The attempt whose backoff cannot fit the deadline is the terminal one: one entry, its own
+    bill, and the escaping error still carries its own stamp untouched -- nothing was absorbed,
+    so there is nothing cumulative to say.
+    """
+
+    def billed_failure() -> ModelAdapterError:
+        error = ModelAdapterError("billed refusal", retryable=True)
+        mark_provider_usage(error, {"output_tokens": 5})
+        return error
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99, error_factory=billed_failure)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert dict(entry.usage) == {"output_tokens": 5}
+    assert receipt.usage["output_tokens"] == 5
+    assert provider_usage_of(caught.value) == {"output_tokens": 5}
+
+
+def test_the_channel_report_lands_on_the_attempt_that_made_it() -> None:
+    """Per-attempt attribution: the adapter's own loop reported during dispatch two, so entry
+    two carries it and entry one does not. The receipt's flag stays the whole call's."""
+
+    class SecondDispatchReports:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            report_provider_retried()
+            return ModelTurn(final_text="answer", usage={"output_tokens": 7})
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(SecondDispatchReports(), request)
+
+    receipt = observer.captures[0].receipt
+    first, second = receipt.attempt_log
+    assert first.provider_retried is False
+    assert second.provider_retried is True
+    assert receipt.provider_retried is True
+
+
+def test_a_turn_declared_retry_lands_on_the_attempt_that_answered() -> None:
+    """The outcome-carried flag is attempt-scoped too: the turn that declares it belongs to
+    exactly one dispatch."""
+
+    class TurnDeclares:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(final_text="answer", provider_retried=True)
+
+    observer = _acall(TurnDeclares(), REQUEST)
+
+    receipt = observer.captures[0].receipt
+    (entry,) = receipt.attempt_log
+    assert entry.provider_retried is True
+    assert receipt.provider_retried is True
+
+
+def test_a_turn_the_normalizer_refuses_still_logs_its_dispatch() -> None:
+    """The fallback arm: the failure happened between the dispatch's return and the settle,
+    so no attempt-scoped probe exists and the entry mirrors the receipt -- driven, not
+    assumed, because the two arms build the entry from different sources."""
+
+    class MalformedTurn:
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=MalformedTurn(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 1
+    (entry,) = receipt.attempt_log
+    assert entry.succeeded is False
+    assert entry.error_code == receipt.error_code
+
+
+def test_a_refused_turn_does_not_inherit_an_earlier_attempts_retry_report() -> None:
+    """The fallback arm's retry flag is attempt-scoped too, and it was the whole call's fold.
+
+    The entry for a turn the normalizer refuses is built from the failed receipt, because that
+    is where the exception's facts were already extracted. ``provider_retried`` is the one field
+    on that receipt which is NOT this attempt's: the settle handler folds the call's whole retry
+    history onto the escaping error first (``if progress.retried: mark_provider_retried(exc)``),
+    and ``with_error`` reads it back. So an adapter that retried internally during dispatch one
+    and then returned an unusable turn on dispatch two marked dispatch TWO as having reported a
+    retry it never made -- an audit log that misattributes the fact it exists to attribute.
+
+    The sibling arms already avoid exactly this: the in-loop entry probes the exception before
+    the fold is applied, and the success entry counts channel reports across its own dispatch.
+    This is the third construction site, holding the rule the other two hold.
+    """
+
+    class ReportsThenRefuses:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                report_provider_retried()
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="answer", usage={"output_tokens": "seven"})  # type: ignore[dict-item]
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=ReportsThenRefuses(),
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(Exception):
+        asyncio.run(run())
+
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 2
+    first, second = receipt.attempt_log
+    assert first.provider_retried is True
+    assert second.provider_retried is False
+    # The receipt keeps the fold: one call did see a provider retry. Only the per-attempt row
+    # narrows, which is the whole reason the log exists beside the count.
+    assert receipt.provider_retried is True
+
+
+def test_every_attempt_entry_scopes_its_retry_flag_to_its_own_dispatch() -> None:
+    """Derived census over all three construction sites, not a pin on the arm that was wrong.
+
+    ``ModelCallAttempt`` is built in three places -- the absorbed-attempt probe, the
+    normalizer-refusal fallback, and the answering attempt -- and ``provider_retried`` is the
+    field with a wrong source lying right next to the right one: the receipt in scope carries the
+    whole CALL's fold, so reading it is a one-word slip that produces a plausible, wrong log.
+    Two sites had the rule and the third did not, which is precisely the asymmetry this
+    repository keeps re-earning, so the instrument enumerates the sites instead of asserting
+    against the one that got fixed.
+
+    The rule is spelled as provenance rather than value: every entry's ``provider_retried`` is
+    computed from ``reports_before`` -- the channel count snapshotted when THIS dispatch began --
+    and none of them reaches into ``failed``, the settled receipt whose flag the outer handler
+    has already folded. A fourth construction site, or a fold creeping back into any of the
+    three, reddens here before any behaviour test would notice.
+    """
+
+    import ast
+    from pathlib import Path as _Path
+
+    source = (
+        _Path(__file__).resolve().parents[1] / "src" / "monoid_agent_kernel" / "model_call.py"
+    ).read_text(encoding="utf-8")
+    sites = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelCallAttempt"
+    ]
+    assert len(sites) == 3, {"construction_sites": [node.lineno for node in sites]}
+
+    expressions: dict[int, str] = {}
+    for node in sites:
+        flags = [keyword for keyword in node.keywords if keyword.arg == "provider_retried"]
+        assert len(flags) == 1, {
+            "line": node.lineno,
+            "hint": "an entry that omits the flag defaults it, which is a claim not a reading",
+        }
+        expressions[node.lineno] = ast.unparse(flags[0].value)
+
+    unscoped = {
+        line: expression
+        for line, expression in expressions.items()
+        if "reports_before" not in expression or "failed." in expression
+    }
+    assert unscoped == {}, {
+        "sites_not_scoped_to_their_own_dispatch": unscoped,
+        "hint": "count this dispatch's own reports: progress.count > reports_before",
+    }
+
+
+class _FlakyStream:
+    """A stream that dies once -- before its first chunk, or after delivering one."""
+
+    def __init__(self, *, fail_before_first: bool) -> None:
+        self.opens = 0
+        self.fail_before_first = fail_before_first
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        del request
+        self.opens += 1
+        if self.opens == 1:
+            if self.fail_before_first:
+                raise ModelAdapterError("dead before the first frame", retryable=True)
+            yield TextDelta("partial")
+            raise ModelAdapterError("dead mid-stream", retryable=True)
+        yield TextDelta("whole")
+        yield TurnComplete(response_id="r2", usage={"output_tokens": 2}, stop_reason="stop")
+
+
+def test_a_delivered_chunk_closes_the_retry_window() -> None:
+    """Once the consumer holds a chunk, a retry would replay it downstream; the loop refuses.
+
+    The counter-arm retries a stream that died before delivering anything, and the consumer
+    sees only the second attempt's chunks -- the same commit line every lower loop already
+    draws (the gateway's `committed`, the SDK's pre-stream retry window).
+    """
+
+    delivered: list[Any] = []
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    mid_stream = _FlakyStream(fail_before_first=False)
+    with pytest.raises(ModelAdapterError):
+        _acall(mid_stream, request, delta_consumer=delivered.append)
+    assert mid_stream.opens == 1
+
+    delivered.clear()
+    pre_first = _FlakyStream(fail_before_first=True)
+    observer = _acall(pre_first, request, delta_consumer=delivered.append)
+    assert pre_first.opens == 2
+    assert observer.captures[0].receipt.attempts == 2
+    texts = [chunk.text for chunk in delivered if isinstance(chunk, TextDelta)]
+    assert texts == ["whole"]
+
+
+def test_delivery_is_marked_before_the_consumer_runs() -> None:
+    """The ordering proof, promoted from the W7-0 reassessment probe.
+
+    The consumer receives the chunk and then raises an error dressed retryable. If `delivered`
+    were marked AFTER the inner consumer ran, the predicate would see an undelivered retryable
+    failure and reopen the stream -- replaying the side effect the consumer already performed.
+    Correct order: one open, one side effect, the failure propagates.
+    """
+
+    class OneChunkStream:
+        def __init__(self) -> None:
+            self.opens = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            self.opens += 1
+            yield TextDelta("side-effectful chunk")
+            yield TurnComplete(response_id="r", stop_reason="stop")
+
+    stream = OneChunkStream()
+    side_effects: list[Any] = []
+
+    def poisoned_consumer(chunk: Any) -> None:
+        side_effects.append(chunk)
+        raise ModelAdapterError("consumer failure dressed as retryable", retryable=True)
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    with pytest.raises(ModelAdapterError):
+        _acall(stream, request, delta_consumer=poisoned_consumer)
+
+    assert stream.opens == 1
+    assert len(side_effects) == 1
+
+
+def test_a_consumer_exception_is_not_retried_and_keeps_its_type() -> None:
+    """A consumer bug must not masquerade as a provider failure.
+
+    The RuntimeError propagates untouched -- retrying it would replay the delivered chunk, and
+    reclassifying it would blame a provider for the caller's own consumer.
+    """
+
+    class OneChunkStream:
+        def __init__(self) -> None:
+            self.opens = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+            del request
+            self.opens += 1
+            yield TextDelta("chunk")
+            yield TurnComplete(response_id="r", stop_reason="stop")
+
+    stream = OneChunkStream()
+
+    def raising_consumer(chunk: Any) -> None:
+        del chunk
+        raise RuntimeError("consumer bug")
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    with pytest.raises(RuntimeError, match="consumer bug"):
+        _acall(stream, request, delta_consumer=raising_consumer)
+
+    assert stream.opens == 1
+
+
+def test_the_kernel_loop_retries_the_anext_and_awaitable_shapes_too() -> None:
+    """The two dispatch shapes W7-0's tests did not drive, promoted from the reassessment.
+
+    All four shapes share the one dispatch point the kernel loop wraps, but a rule proven on
+    two of four parallel halves is this codebase's house defect -- so the other two are driven,
+    not assumed.
+    """
+
+    class AnextFlaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def anext_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient", retryable=True)
+            return ModelTurn(final_text="ok")
+
+    class AwaitableFlaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> Any:
+            del request
+            self.calls += 1
+            me = self
+
+            async def answer() -> ModelTurn:
+                if me.calls == 1:
+                    raise ModelAdapterError("transient", retryable=True)
+                return ModelTurn(final_text="ok")
+
+            return answer()
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+
+    coroutine_shape = AnextFlaky()
+    observer = _acall(coroutine_shape, request)
+    assert coroutine_shape.calls == 2
+    assert observer.captures[0].receipt.attempts == 2
+
+    awaitable_shape = AwaitableFlaky()
+    observer = _acall(awaitable_shape, request)
+    assert awaitable_shape.calls == 2
+    assert observer.captures[0].receipt.attempts == 2
+
+
+def test_kernel_retry_rides_the_replay_fallthrough_without_spinning_the_corpus() -> None:
+    """The composite the reassessment drove by hand: miss -> flaky inner -> retry -> miss ->
+    inner answers. The miss itself is never retried (`replay_miss` pins retryable=False), so
+    the kernel's second attempt walks the same miss-then-inner path instead of spinning on
+    the corpus, and the answer is the inner's."""
+
+    from monoid_agent_kernel.providers.replay import ReplayModelAdapter
+
+    class FlakyInner:
+        provider_name = "flaky"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                raise ModelAdapterError("transient under fallthrough", retryable=True)
+            return ModelTurn(final_text="served live", usage={"total_tokens": 7})
+
+    inner = FlakyInner()
+    adapter = ReplayModelAdapter([], inner=inner)
+    request = ModelRequest(
+        instruction="never recorded", system_prompt="sys", tools=(), model=_kernel_model()
+    )
+    observer = _acall(adapter, request)
+
+    receipt = observer.captures[0].receipt
+    assert inner.calls == 2
+    assert receipt.attempts == 2
+    assert receipt.succeeded is True
+    assert receipt.usage["total_tokens"] == 7
+
+
+def test_stream_committed_marks_only_the_attempt_that_delivered() -> None:
+    """The commit flag is per-entry and can only be true on the final one.
+
+    A stream that died before its first chunk logs an uncommitted failure; the attempt that
+    answered logs committed. And on the mid-stream death -- delivery already made -- the one
+    terminal entry records that the window was closed when it settled.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    sink: list[Any] = []
+
+    pre_first = _FlakyStream(fail_before_first=True)
+    observer = _acall(pre_first, request, delta_consumer=sink.append)
+    first, second = observer.captures[0].receipt.attempt_log
+    assert first.stream_committed is False
+    assert second.stream_committed is True
+
+    sink.clear()
+    mid_stream = _FlakyStream(fail_before_first=False)
+    mid_observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=mid_stream,
+            subscriptions=(
+                ModelIOSubscription(observer=mid_observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, delta_consumer=sink.append)
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    (terminal,) = mid_observer.captures[0].receipt.attempt_log
+    assert terminal.succeeded is False
+    assert terminal.stream_committed is True
+
+
+class _StreamingAdapter:
+    """Delivers a chunk and settles -- no failure, so the call takes exactly one dispatch.
+
+    Answers the non-streaming door too, so the same adapter can be called with and without a
+    consumer: the point of the second call is a settled turn that delivered nothing.
+    """
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        del request
+        yield TextDelta("whole")
+        yield TurnComplete(response_id="r1", usage={"output_tokens": 2}, stop_reason="stop")
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        return ModelTurn(response_id="r1", final_text="whole", usage={"output_tokens": 2})
+
+
+@pytest.mark.parametrize(
+    "model",
+    [ModelConfig(), _kernel_model()],
+    ids=["adapter_layer_default", "kernel_layer"],
+)
+def test_stream_committed_reports_delivery_under_either_retry_layer(model: ModelConfig) -> None:
+    """The field says "was a chunk delivered", and it was answered only where a window existed.
+
+    ``delivered`` was tracked by wrapping the consumer, and the wrapper was installed only when
+    the kernel owns the retry loop -- because that is where the flag is *used*, to refuse a retry
+    that would replay a chunk the consumer already holds. But the flag is also *recorded*, on
+    every call, and ``layer`` defaults to ``"adapter"``: every shipped streaming call wrote
+    ``stream_committed: false`` onto its ledger line while the consumer was holding its chunks.
+    A definite ``false`` is not "the question does not apply here" -- the key is present and the
+    reader has no way to tell those apart.
+
+    The sibling arm was the one the earlier per-entry test drove, and it was right the whole
+    time; the parametrization is the point, not the second row.
+    """
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=model)
+    sink: list[Any] = []
+
+    observer = _acall(_StreamingAdapter(), request, delta_consumer=sink.append)
+
+    (entry,) = observer.captures[0].receipt.attempt_log
+    assert sink, "the adapter delivered nothing, so this proves nothing"
+    assert entry.stream_committed is True
+
+    # And a call with no consumer at all still says False: nothing was delivered *to anyone*.
+    silent = _acall(_StreamingAdapter(), request)
+    assert silent.captures[0].receipt.attempt_log[0].stream_committed is False
+
+
+def test_the_backoff_respects_the_deadline_instead_of_sleeping_into_it(
+    monkeypatch: Any,
+) -> None:
+    """Sleeping into a certain timeout wastes wall clock and masks the provider's own error.
+
+    When the remaining deadline cannot fit the scheduled backoff, the loop re-raises the
+    transient failure itself -- the actual problem -- rather than waiting to convert it into
+    a `RunTimeout` that names nothing.
+    """
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 10.0)
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request, deadline=time.time() + 5.0)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 1
+    assert observer.captures[0].receipt.attempts == 1
+
+
+def test_an_extreme_schedule_does_not_replace_the_provider_error_with_an_arithmetic_one() -> None:
+    """The kernel loop's backoff may not lose the failure taxonomy to its own arithmetic.
+
+    Every field here passes `ModelRetryConfig.from_json`: `backoff_multiplier` is checked for
+    finiteness and positivity, never for an upper bound, and `max_attempts` only for being an
+    integer above zero. The fourth attempt's schedule therefore raises the exponent to two, and
+    a cap applied only to the product would let `1e308 ** 2` overflow INSIDE the handler for the
+    retryable `ModelAdapterError` -- so the caller would see an `OverflowError` carrying no
+    `retryable`, no `code`, and no `http_status`, and the receipt would stop at three attempts.
+    """
+
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(
+        instruction="hi",
+        system_prompt="sys",
+        tools=(),
+        model=ModelConfig(
+            retry=ModelRetryConfig(
+                layer="kernel",
+                max_attempts=4,
+                initial_delay_s=0.001,
+                max_delay_s=0.001,
+                backoff_multiplier=1e308,
+                jitter_s=0.0,
+            )
+        ),
+    )
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(request)
+
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.retryable is True
+    assert adapter.calls == 4
+    assert observer.captures[0].receipt.attempts == 4
+
+
+def test_a_cancellation_interrupts_the_backoff_wait(monkeypatch: Any) -> None:
+    """The backoff runs under the same race as the attempts, so a cancel wakes it."""
+
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 30.0)
+    adapter = _FlakyAdapter(failures=99)
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    token = CancellationToken()
+    timer = threading.Timer(0.2, token.cancel)
+    started = time.monotonic()
+
+    async def run() -> None:
+        timer.start()
+        await ModelCallRunner(adapter=adapter, current_cancellation_token=lambda: token).acall(
+            request, deadline=time.time() + 300.0
+        )
+
+    try:
+        with pytest.raises(RunCancelled):
+            asyncio.run(run())
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 10.0
+    assert adapter.calls == 1
+
+
+def test_the_kernel_hands_the_adapter_a_neutralized_policy() -> None:
+    """The dispatch copy carries `max_attempts=1` with the layer preserved.
+
+    `max_attempts=1` silences any config-honoring loop -- even a third-party adapter that
+    never learned `layer` exists -- while the preserved layer value lets an adapter whose
+    loop lives outside the config (the OpenAI SDK) comply on its own. The receipt keeps the
+    caller's policy: it describes the call as configured, not the neutralized dispatch copy.
+    """
+
+    seen: list[ModelConfig] = []
+
+    class RecordingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            assert request.model is not None
+            seen.append(request.model)
+            return ModelTurn(final_text="answer")
+
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model())
+    observer = _acall(RecordingAdapter(), request)
+
+    assert seen[0].retry.max_attempts == 1
+    assert seen[0].retry.layer == "kernel"
+    receipt = observer.captures[0].receipt
+    assert receipt.model.retry.max_attempts == 3
+    assert receipt.model.retry.layer == "kernel"
+
+
+class _TenantRetryConfig(ModelRetryConfig):
+    """An extension retry policy whose convenience constructor is narrower than its fields.
+
+    The kernel supports these deliberately: `providers/base._copy_with_fields` (and
+    `model_call`'s own copy of it) exist so an ingress boundary rewrites a config by copying
+    fields instead of calling `dataclasses.replace`, which would dispatch back through this
+    narrower `__init__` with every inherited field.
+    """
+
+    def __init__(self, layer: str = "kernel") -> None:
+        super().__init__(layer=layer, initial_delay_s=0.0, jitter_s=0.0)
+
+
+class _TenantModelConfig(ModelConfig):
+    """The `ModelConfig` twin of the probe above."""
+
+    def __init__(self, retry: ModelRetryConfig) -> None:
+        super().__init__(retry=retry)
+
+
+def test_the_neutralized_policy_does_not_re_run_an_extension_constructor() -> None:
+    """The kernel layer's dispatch copy obeys the rule every other config rewrite obeys.
+
+    `normalize_model_config` copies fields precisely so a public subclass with a smaller
+    constructor survives ingress; the layer's neutralization is another rewrite of the same
+    object and must copy too. `dataclasses.replace` would re-run both constructors with every
+    inherited field and raise `TypeError` before the adapter is ever reached -- a config the
+    kernel accepts on every other path refused by the one layer that rewrites it, and only
+    under `layer="kernel"`.
+    """
+
+    seen: list[ModelConfig] = []
+
+    class RecordingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            assert request.model is not None
+            seen.append(request.model)
+            return ModelTurn(final_text="answer")
+
+    request = ModelRequest(
+        instruction="hi",
+        system_prompt="sys",
+        tools=(),
+        model=_TenantModelConfig(retry=_TenantRetryConfig()),
+    )
+    observer = _acall(RecordingAdapter(), request)
+
+    dispatched = seen[0]
+    assert isinstance(dispatched, _TenantModelConfig)
+    assert isinstance(dispatched.retry, _TenantRetryConfig)
+    assert dispatched.retry.max_attempts == 1
+    assert dispatched.retry.layer == "kernel"
+    # The receipt still describes the call as configured, extension type included.
+    receipt_retry = observer.captures[0].receipt.model.retry
+    assert isinstance(receipt_retry, _TenantRetryConfig)
+    assert receipt_retry.max_attempts == 3
+
+
+def test_the_retry_layer_leaves_the_replay_key_where_it_was() -> None:
+    """Neither the layer nor the neutralized dispatch copy may reach the request identity."""
+
+    kernel_request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=_kernel_model()
+    )
+    plain_request = ModelRequest(
+        instruction="hi", system_prompt="sys", tools=(), model=ModelConfig()
+    )
+
+    kernel_receipt = _acall(_FlakyAdapter(failures=1), kernel_request).captures[0].receipt
+    plain_receipt = _acall(SyncAdapter(), plain_request).captures[0].receipt
+
+    assert kernel_receipt.request_digest == plain_receipt.request_digest
+    assert kernel_receipt.digest_status == "ok"
+
+
+def test_the_two_layers_do_not_multiply(monkeypatch: Any) -> None:
+    """The end-to-end dedup pin: kernel loop x gateway adapter = kernel attempts, not the product.
+
+    Three configured attempts under `layer="kernel"` must reach the wire exactly three times
+    -- the gateway's own loop, which would have made three per dispatch, answers one under
+    the kernel's layer. `provider_retried` stays False because the adapter's loop never ran;
+    the three attempts are the kernel's, on `attempts`.
+    """
+
+    calls: list[int] = []
+
+    def _refused(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append(1)
+        raise URLError("unreachable")
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", _refused)
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway._retry_delay", lambda *_a: 0.0)
+    monkeypatch.setattr("monoid_agent_kernel.model_call.retry_delay_s", lambda *_a: 0.0)
+
+    adapter = GatewayModelAdapter(
+        ModelConfig(
+            gateway_url="http://gateway.local/internal/llm/turns",
+            retry=ModelRetryConfig(layer="kernel", max_attempts=3),
+        ),
+        token="run-token",
+    )
+    observer = RecordingObserver()
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            subscriptions=(
+                ModelIOSubscription(observer=observer, policy=CapturePolicy(mode="digest")),
+            ),
+        ).acall(ModelRequest(instruction="hi", system_prompt="sys", tools=()))
+
+    with pytest.raises(ModelAdapterError):
+        asyncio.run(run())
+
+    assert len(calls) == 3
+    receipt = observer.captures[0].receipt
+    assert receipt.attempts == 3
+    assert receipt.provider_retried is False

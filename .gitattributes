@@ -11,3 +11,10 @@
 studio-ui/index.html text eol=lf
 src/monoid_agent_kernel/reference/studio/web/dist/index.html text eol=lf
 src/monoid_agent_kernel/reference/studio/web/dist/assets/*.js whitespace=-trailing-space
+# A replay corpus is content-addressed: an offloaded chunk lands at `model_payloads/<sha256>`
+# whose *filename is the hash of its bytes*, and the reader re-hashes before it believes one.
+# With core.autocrlf=true git's text auto-detection would rewrite such a file on a Windows
+# checkout and every resolution would fail there and only there. The checked-in corpus is
+# inline-only today, so nothing is broken yet; pinning the tree closes it before the first
+# offloaded fixture rather than after someone spends a day on it.
+tests/fixtures/** -text

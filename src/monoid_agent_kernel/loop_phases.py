@@ -14,11 +14,10 @@ from monoid_agent_kernel.core.manifest import build_run_manifest
 from monoid_agent_kernel.core.model_io import content_length
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
-    OutputRetry,
-    OutputValidator,
     OutputValidatorError,
-    ValidationOutcome,
-    validate_validation_outcome,
+    build_repair_message,
+    failures_by_validator,
+    run_output_validators,
 )
 from monoid_agent_kernel.core.result import (
     AgentArtifact,
@@ -35,7 +34,7 @@ from monoid_agent_kernel.core.tool_surface import (
 from monoid_agent_kernel.core.workspace import Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
-from monoid_agent_kernel.permissions import PermissionPolicy
+from monoid_agent_kernel.providers.base import resolved_provider_name
 from monoid_agent_kernel.public_view import (
     public_error_message,
     public_path,
@@ -79,47 +78,9 @@ class SettleDecision:
     defect: tuple[str, BaseException] | None = None
 
 
-def _output_repair_message(failures: list[tuple[str, str]]) -> str:
-    lines = [
-        "Your final response did not satisfy the required output format. "
-        "Correct it and respond again:"
-    ]
-    for validator_id, feedback in failures:
-        lines.append(
-            f"- ({validator_id}) {feedback}" if feedback else f"- ({validator_id}) invalid output"
-        )
-    return "\n".join(lines)
-
-
-def _run_output_validators(
-    validators: tuple[OutputValidator, ...], view: FinalOutputView
-) -> tuple[list[tuple[str, str]], list[tuple[str, Any]], tuple[str, BaseException] | None]:
-    failures: list[tuple[str, str]] = []
-    ok_values: list[tuple[str, Any]] = []
-    for validator in validators:
-        try:
-            outcome = validate_validation_outcome(validator.validate(view))
-        except OutputRetry as exc:
-            outcome = ValidationOutcome(ok=False, feedback=exc.feedback)
-        except ValueError as exc:
-            outcome = ValidationOutcome(ok=False, feedback=str(exc))
-        except Exception as exc:
-            return failures, ok_values, (validator.id, exc)
-        if outcome.ok:
-            ok_values.append((validator.id, outcome.value))
-        else:
-            failures.append((validator.id, outcome.feedback))
-    return failures, ok_values, None
-
-
-def _failures_by_validator(history: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for attempt in history:
-        for failure in attempt.get("failures", ()):
-            vid = str(failure.get("validator_id", ""))
-            counts[vid] = counts.get(vid, 0) + 1
-    return counts
-
+# The validation routine, the repair text, and the history rollup were promoted to
+# ``core.output_validator`` (W5 PR 3) so the standalone validated call shares them verbatim;
+# this module keeps only the loop-side orchestration around them.
 
 _OUTPUT_CONTRACT_STOPPED = "Stopped: the final response did not satisfy the output contract."
 
@@ -132,10 +93,16 @@ class LoopBootstrapper:
 
     def bootstrap(self) -> _RunResources:
         loop = self._loop
-        if (
-            loop.permission_policy == PermissionPolicy()
-            and loop.spec.permission_policy != PermissionPolicy()
-        ):
+        # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
+        # class-exact, so a deployment's extension subclass with both pattern tuples empty read
+        # as "the caller configured this" and the operator's spec policy was silently not
+        # adopted -- leaving the loop enforcing the empty policy at every
+        # ``self.permission_policy`` site while the subagent sites read
+        # ``self.spec.permission_policy`` directly, so half the run honoured the operator's
+        # lists and half did not. Such a subclass reaches here intact by design (the spec
+        # validator gates on ``isinstance``). Same gate the two model configs use, spelled the
+        # same way: see ``PermissionPolicy.is_default``.
+        if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
         workspace = workspace_factory(loop.spec)
@@ -146,6 +113,11 @@ class LoopBootstrapper:
             extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
             status_file=loop.status_file,
             model_content_file=loop.model_content_file,
+            model_calls_file=loop.model_calls_file,
+            model_payload_file=loop.model_payload_file,
+            # Resolved once here rather than per record: the recorder owns the whole ledger
+            # envelope, and this is the same proven-lineage root the model-stream context uses.
+            root_run_id=loop._validated_root_run_id(),
             reopen=loop._restoring,
         )
         model_stream_observers = loop._materialize_model_stream_observers()
@@ -207,6 +179,17 @@ class LoopBootstrapper:
             # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
             # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
             subscriptions=tuple(loop.model_io_subscriptions),
+            # A bound method, not a closure: the recorder already owns the run id, the root, the
+            # switch and the counter, so there is nothing for a closure to capture. Gated on both
+            # sides -- here and in the method -- the same way ``recorder.open_model_stream`` is.
+            settled_sink=(
+                recorder.record_settled_call
+                if (loop.model_calls_file or loop.model_payload_file)
+                else None
+            ),
+            # The corpus needs the exact bytes the key was hashed over; the ledger alone does
+            # not, and must not pay the per-call buffering for them.
+            capture_request_preimage=loop.model_payload_file,
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
@@ -304,7 +287,24 @@ class LoopBootstrapper:
                     "mode": loop.spec.mode,
                     "workspace_backend": loop.spec.workspace_backend,
                     "workspace_base_path": "workspace.base.json",
-                    "model_provider": (initial_runtime_config.model or ModelConfig()).provider,
+                    # The provider that will SERVE this run, not the transport it travels over.
+                    # A forwarding adapter (the gateway) declares its upstream, and this event
+                    # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
+                    # so filling it from the raw config made that span disagree with the
+                    # receipt-derived span beside it about the same call. The transport is not
+                    # lost: ``manifest.json`` (written three lines up) records the configured
+                    # ``model_provider`` verbatim, and it is the run's configuration record.
+                    #
+                    # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
+                    # reaches the config itself, on the tolerance path too, and its docstring
+                    # says so. What is left is this event's schema obligation: ``model_provider``
+                    # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
+                    # (outside the declared Literal, but constructible) would resolve to ``None``
+                    # and emit null. Kept as that guarantee, not as a second resolution rule.
+                    "model_provider": resolved_provider_name(
+                        loop.model_adapter, initial_runtime_config.model or ModelConfig()
+                    )
+                    or (initial_runtime_config.model or ModelConfig()).provider,
                     "model": (initial_runtime_config.model or ModelConfig()).model,
                     "reasoning_effort": (
                         initial_runtime_config.model or ModelConfig()
@@ -365,7 +365,7 @@ class LoopSettleCoordinator:
 
         view = self.build_final_output_view(state, res, context)
         failures, ok_values, defect = await asyncio.to_thread(
-            _run_output_validators, validators, view
+            run_output_validators, validators, view
         )
         if defect is not None:
             return SettleDecision(kind="defect", defect=defect)
@@ -441,7 +441,7 @@ class LoopSettleCoordinator:
                 "output.validator.exhausted",
                 data={
                     "retries": state.output_retries,
-                    "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                    "failures_by_validator": failures_by_validator(state.output_failure_history),
                     "history": list(state.output_failure_history),
                 },
                 level="warning",
@@ -462,7 +462,7 @@ class LoopSettleCoordinator:
         if decision.kind == "reprompt":
             state.pending_observations = ()
             state.messages.append(
-                {"role": "user", "content": _output_repair_message(list(decision.failures))}
+                {"role": "user", "content": build_repair_message(list(decision.failures))}
             )
             return None
 
@@ -584,12 +584,23 @@ class LoopFinalizer:
         if state.output_failure_history:
             metrics["output_validation"] = {
                 "retries": state.output_retries,
-                "failures_by_validator": _failures_by_validator(state.output_failure_history),
+                "failures_by_validator": failures_by_validator(state.output_failure_history),
             }
         if state.provider_error_code:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
+        if state.status == "failed":
+            # The verdict beside the code/status pair above: retryable (waiting may help) and
+            # config_recoverable (configuration will) are two facts, and this artifact carried
+            # neither. Gated on the failed status because that is the one terminal outcome
+            # ``_record_failure`` classifies fresh — on a completed or limited run the state
+            # pair can be a recovered turn's leftovers, and publishing a stale ``retryable``
+            # on a clean run is the staleness this release exists to remove.
+            # (``provider_retried`` is deliberately absent: a per-call fact with no run-level
+            # source — RunState never carries it — and the terminal vocabulary drops it.)
+            metrics["retryable"] = state.retryable
+            metrics["config_recoverable"] = state.config_recoverable
         if state.error:
             # Through the same filter `events.jsonl`, `status.json` and `failure.json` use. This was
             # the one surface carrying it raw, and `_error_from_status_body` embeds the *entire* LLM
