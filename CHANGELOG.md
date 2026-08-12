@@ -7,6 +7,91 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path
+
+- **Gap 6 closes at ingestion, which was one of the two fixes its own entry named.**
+  `MAX_ARGUMENT_DEPTH` was reached only through the approval-request builder, so an `ask`-gated
+  call rejected a deep argument and an `allow`-gated one carried it into the message history and
+  on to `RunCheckpoint.to_json`. Measured on this interpreter rather than estimated:
+  `dataclasses.asdict` dies at **492** containers while the model-JSON decoder that admitted them
+  stops at **512**, so every depth in [492, 512] cleared every gate it met and then killed the run
+  at the checkpoint writer — `_CheckpointPersistError` out of `run_once`, with no classified
+  record of what happened. The Python-object arm had no bound at all: 5,000 levels accepted. A
+  fifth refusing boundary at `_normalize_model_turn` now carries the bound on the route a model's
+  own tool-call arguments take, and the failure is a classified `ModelAdapterError` an operator
+  can read. Honestly scoped: that is **terminal**, not correctable — a bare `ModelAdapterError`
+  is not recoverable and the loop does not re-prompt on it, so the model does not get a chance to
+  flatten its arguments. The entry's other fix — dropping `asdict`, which also drops its deep copy
+  and would let a checkpoint share mutable state with the live loop — stays on the durability
+  surface for 0.22, and the "known gap, deliberately not closed" comment is retired naming that
+  half specifically. **With this, all four gaps the 0.20.0 notes left open are addressed in
+  0.21**: gap 3 and gaps 7–8 in the Track D entries below, gap 6 here.
+- **A container no longer decides what the copy of it contains.** `normalize_json_ingress` asked
+  `source.items()`, `len(source)` and `source[i]`, so a `dict` or `list` subclass wrote the record
+  every later reader sees — the checkpoint, the transcript, the preview, the operator's redact
+  patterns. The scalar generations' argument does not transfer and was not reused: measured,
+  `json.dumps` reads a `list` subclass's real storage but takes a `dict` subclass's overridden
+  `items()`, so "what will a writer spell" answers opposite ways on the two halves and settles
+  neither. The argument that does hold is that **the copy is the record**. Reading length and
+  elements from the same base slot pair also removes the `IndexError` route structurally: two
+  questions that cannot disagree.
+- **A container reachable from itself is refused before the writer that cannot spell it.** The
+  walk memoises a container before descending, so the second visit short-circuits and a
+  self-referential input produced a self-referential *copy* at path depth 2 — accepted, then
+  fatal at `json.dumps` (`Circular reference detected`) or `asdict` (`RecursionError`), neither at
+  the boundary that took it. No depth bound would ever have caught it. The refusal is a
+  three-colour walk over the finished copy: an ancestor hit is a cycle, a memo hit is legitimate
+  sharing and stays shared. The depth bound rides the same pass as a **height** computed on the
+  way out, not a counter carried in — measured, a carried counter peaked at 252 on a copy that
+  was 501 containers tall and killed `asdict`, because the memo charges a shared subtree at
+  whichever reference the walk reaches first while `asdict` has no memo. One constant, 64, now
+  serves the three sites that bound container nesting, each documenting whether it raises or
+  elides, because those two behaviours must not be unified even though the number should be.
+- All of this is **opt-in per boundary**. Four existing pins forbid a default-on refusal, and
+  that is checked by mutant rather than asserted: making the flag default to `True` reddens three
+  of them.
+
+### Fixed — a cap that is not a number is not a cap
+
+- **`capped_backoff` resolves an unusable `max_delay_s` before any arm reads it.** The schedule
+  was made total under one rule — growth it cannot resolve resolves upward, to the cap — and the
+  rule is vacuous when the cap is what cannot be resolved. `nan` and `-inf` left every
+  `min(max_delay_s, .)` answering something not above zero, which every caller floors to **no
+  backoff at all**: the retry loops through `if delay > 0`, the outbox through
+  `uniform(0, max(0.0, ceiling))` = `uniform(0, 0)` — an unthrottled resend against the endpoint
+  that just refused, which is the state the multiplier arm was fixed to prevent, reached through
+  the other argument. `+inf` is the far end: it answers ordinary products until one leaves the
+  float range, then `asyncio.sleep(inf)` is a timer that never fires, and at the outbox it stamps
+  a `next_attempt_at` that `due_outbox` never selects and `OutboxRequest.to_json` refuses
+  (`parse_float` — finite only), in the checkpoint export that runs *after* the send: the receipt
+  for a dispatch that reached the endpoint is lost and the request goes again. An unusable cap
+  resolves to `sys.float_info.max`, above the multiplier arm because the first-attempt exit
+  returns `min(max_delay_s, initial_delay_s)` and reads the cap on its own. An unlimited cap stays
+  unlimited: for every product the schedule can represent, `min(inf, product)` and
+  `min(float_info.max, product)` are the same number. The doors stay unvalidated — the same
+  decision the multiplier arm was settled under, restated rather than revisited.
+
+### Fixed — the last reads that let a type name itself, and a relation that keeps them closed
+
+- **Fourteen expressions still asked a class for its own name.** Enumerated by AST across 193
+  modules, not from memory. The published ones reach observers, `run.failed.error`,
+  `failure.json`, `status.json` and the CLI's JSON output (where an exit-code predicate reads
+  one); the rest raise, and raising is not lesser exposure — `type(x).__name__` inside a `raise`
+  is evaluated *before* the exception exists, so a hostile metaclass replaces the classified
+  error with its own. Measured: a `TypeError` explaining what an integrator passed became a
+  `RuntimeError` from inside a hostile `__getattribute__`. The census that keeps this closed
+  counts three spellings (attribute, `getattr`, base slot), does not count a read already wrapped
+  in a reader, and tracks a **count** per site rather than a set — two of the three surviving
+  reads share a module, an owner and a spelling, and a set would collapse them.
+- **A restart test now waits on the durable fact it is about to read.** Nine tests waited for an
+  in-memory record and then built a second backend over the same run root, racing the status
+  writer; three said so in a comment while doing it. The rule is a relation over the source
+  rather than a list of the nine, and it is checked in both directions and in order — a durable
+  wait standing *before* the in-memory one, which is what three of them actually had, is still a
+  violation. Test-only: this makes the race legible, it does not make the writer reliable. If the
+  artifact is never written, these now fail deterministically at the wait instead of
+  intermittently three constructions later.
+
 ### Changed — the preview is bounded as a payload, not only per piece: budgeted traversal (Track D)
 
 - **Every traversal-built preview now spends one byte budget across everything it appends.**
