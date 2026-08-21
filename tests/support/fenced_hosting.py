@@ -20,7 +20,12 @@ from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
 )
 from monoid_agent_kernel.core.outcome import TerminalOutcome
-from monoid_agent_kernel.hosting import CommitResult, StorageCapabilities, WriterToken
+from monoid_agent_kernel.hosting import (
+    CommitResult,
+    ModelInvocationRecord,
+    StorageCapabilities,
+    WriterToken,
+)
 
 
 _FENCED_CAPABILITIES = StorageCapabilities(
@@ -55,7 +60,7 @@ class DeterministicFencedRunSink:
     _checkpoint_heads: dict[str, int] = field(default_factory=dict)
     _events: dict[tuple[str, int], tuple[str, AgentEvent]] = field(default_factory=dict)
     _invocations: dict[
-        tuple[str, str, int], tuple[str, DurableModelInvocation]
+        tuple[str, str, int], tuple[str, ModelInvocationRecord]
     ] = field(default_factory=dict)
     _invocation_heads: dict[tuple[str, str], int] = field(default_factory=dict)
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
@@ -204,7 +209,13 @@ class DeterministicFencedRunSink:
                 content_digest=digest,
                 winner_digest=transition_winner,
             )
-        self._invocations[key] = (digest, invocation)
+        detached_blobs = dict(blobs)
+        record = ModelInvocationRecord(
+            revision=invocation.revision,
+            invocation=invocation,
+            _blob_reader=lambda sha256: detached_blobs[sha256],
+        )
+        self._invocations[key] = (digest, record)
         self._invocation_heads[(invocation.run_id, invocation.logical_call_id)] = invocation.revision
         return CommitResult(
             status="committed",
@@ -226,9 +237,10 @@ class DeterministicFencedRunSink:
             ):
                 return None
             return ""
-        previous_digest, previous = self._invocations[
+        previous_digest, previous_record = self._invocations[
             (invocation.run_id, invocation.logical_call_id, previous_revision)
         ]
+        previous = previous_record.invocation
         if invocation.revision != previous.revision + 1:
             return previous_digest
         if any(
@@ -273,18 +285,18 @@ class DeterministicFencedRunSink:
         self,
         run_id: str,
         logical_call_id: str,
-    ) -> DurableLoadResult[DurableModelInvocation]:
+    ) -> DurableLoadResult[ModelInvocationRecord]:
         head = self._invocation_heads.get((run_id, logical_call_id))
         if head is None:
             return MODEL_INVOCATION_CODEC.missing()
-        invocation = self._invocations[(run_id, logical_call_id, head)][1]
+        record = self._invocations[(run_id, logical_call_id, head)][1]
         return DurableLoadResult(
             status="loaded",
             family=MODEL_INVOCATION_CODEC.family,
             current_schema=MODEL_INVOCATION_CODEC.current_schema,
-            value=invocation,
-            observed_schema=invocation.schema_version,
-            sequence=invocation.revision,
+            value=record,
+            observed_schema=record.invocation.schema_version,
+            sequence=record.revision,
         )
 
 
@@ -301,7 +313,15 @@ class DeterministicFencedRunHarness:
 
     def claim_writer(self, run_id: str, owner_id: str) -> WriterToken:
         generation = self._generations.get(run_id, 0) + 1
-        self._generations[run_id] = generation
         token = WriterToken(run_id=run_id, owner_id=owner_id, generation=generation)
-        self._writers[run_id] = token
+        self.set_current_writer(token)
         return token
+
+    def set_current_writer(self, writer_token: WriterToken) -> None:
+        """Install an exact authoritative token for deterministic contract setup."""
+
+        current = self._writers.get(writer_token.run_id)
+        if current is not None and writer_token.generation <= current.generation:
+            raise ValueError("writer generation must advance within a run")
+        self._generations[writer_token.run_id] = writer_token.generation
+        self._writers[writer_token.run_id] = writer_token

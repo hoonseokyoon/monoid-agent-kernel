@@ -51,6 +51,10 @@ BROKER_CONTRACT_PROFILE = "capability-broker-contract"
 REDACTOR_CONTRACT_PROFILE = "redactor-contract"
 MODEL_IO_CONTRACT_PROFILE = "model-io-observer-contract"
 FENCED_RUN_SINK_CONTRACT_PROFILE = "fenced-run-sink-contract"
+_CONTRACT_CHECKPOINT_BLOB = b"contract checkpoint workspace bytes\n"
+_CONTRACT_CHECKPOINT_BLOB_SHA256 = hashlib.sha256(_CONTRACT_CHECKPOINT_BLOB).hexdigest()
+_CONTRACT_INVOCATION_BLOB = b'{"text":"contract model result"}'
+_CONTRACT_INVOCATION_BLOB_SHA256 = hashlib.sha256(_CONTRACT_INVOCATION_BLOB).hexdigest()
 
 
 class CheckpointStoreFactory(Protocol):
@@ -70,12 +74,15 @@ class ModelIOObserverFactory(Protocol):
 
 
 class FencedRunSinkHarness(Protocol):
-    """Conformance-only host seam that can rotate authoritative writer ownership."""
+    """Conformance-only seam that installs exact authoritative writer coordinates."""
 
     @property
     def sink(self) -> FencedRunSink: ...
 
-    def claim_writer(self, run_id: str, owner_id: str) -> WriterToken: ...
+    def set_current_writer(self, writer_token: WriterToken) -> None:
+        """Arrange test authority without constraining the host's generation allocator."""
+
+        ...
 
 
 class FencedRunSinkHarnessFactory(Protocol):
@@ -245,7 +252,7 @@ def _contract_invocation(
     if dispatch_state == "settled":
         receipt = {"request_digest": request_digest, "retryable": retryable}
         if succeeded:
-            result_ref = "blob:contract-turn"
+            result_ref = f"blob:{_CONTRACT_INVOCATION_BLOB_SHA256}"
         else:
             failure_code = "provider_refused"
     return DurableModelInvocation(
@@ -264,6 +271,30 @@ def _contract_invocation(
     )
 
 
+def _contract_writer(
+    harness: FencedRunSinkHarness,
+    run_id: str,
+    owner_id: str = "owner-a",
+    *,
+    generation: int = 1,
+) -> WriterToken:
+    token = WriterToken(run_id=run_id, owner_id=owner_id, generation=generation)
+    harness.set_current_writer(token)
+    return token
+
+
+def _contract_blob_hex(record: Any | None, sha256: str) -> str | None:
+    if record is None:
+        return None
+    try:
+        blob = record.blob(sha256)
+    except Exception:
+        return "unreadable"
+    if type(blob) is not bytes:
+        return "invalid-type"
+    return blob.hex()
+
+
 def _contract_retry_after_terminal_invocation(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -273,7 +304,7 @@ def _contract_retry_after_terminal_invocation(
     succeeded: bool = False,
 ) -> tuple[tuple[str, ...], str]:
     harness = factory()
-    token = harness.claim_writer(run_id, "owner-a")
+    token = _contract_writer(harness, run_id)
     history = (
         _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
         _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
@@ -311,11 +342,70 @@ def run_fenced_run_sink_contract(
     outcomes: list[ConformanceRuleOutcome] = []
     try:
         harness = factory()
+        capabilities = harness.sink.capabilities
+        required = (
+            "concurrent_writers",
+            "compare_and_set",
+            "lease_fencing",
+            "durable_checkpoints",
+            "durable_events",
+            "durable_invocations",
+            "terminal_first_writer_wins",
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-00-CAPABILITY-DECLARATION",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                tuple(
+                    observation(
+                        f"declares_{field_name}",
+                        expected=True,
+                        actual=getattr(capabilities, field_name),
+                    )
+                    for field_name in required
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-00-CAPABILITY-DECLARATION",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
+
+    try:
+        harness = factory()
         run_id = "contract-checkpoint"
-        token = harness.claim_writer(run_id, "owner-a")
-        checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
-        first = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token)
-        repeated = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token)
+        token = _contract_writer(harness, run_id)
+        missing = harness.sink.latest_checked(run_id)
+        checkpoint = RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            final_text="winner",
+            workspace_delta=[
+                {
+                    "path": "contract.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        checkpoint_blobs = {
+            _CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB,
+        }
+        first = harness.sink.commit_checkpoint(
+            checkpoint,
+            checkpoint_blobs,
+            writer_token=token,
+        )
+        repeated = harness.sink.commit_checkpoint(
+            checkpoint,
+            checkpoint_blobs,
+            writer_token=token,
+        )
         conflict = harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=run_id, seq=1, final_text="challenger"),
             {},
@@ -327,20 +417,44 @@ def run_fenced_run_sink_contract(
                 "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
                 FENCED_RUN_SINK_CONTRACT_PROFILE,
                 (
+                    observation("initial_load", expected="missing", actual=missing.status),
                     observation("first_status", expected="committed", actual=first.status),
                     observation(
                         "repeat_status", expected="already_committed", actual=repeated.status
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
                     observation(
-                        "conflict_names_winner",
-                        expected=first.content_digest,
-                        actual=conflict.winner_digest,
+                        "latest_load",
+                        expected="loaded",
+                        actual=loaded.status,
+                    ),
+                    observation(
+                        "latest_sequence",
+                        expected=1,
+                        actual=loaded.sequence,
+                    ),
+                    observation(
+                        "latest_record_sequence",
+                        expected=1,
+                        actual=(loaded.value.seq if loaded.value else None),
+                    ),
+                    observation(
+                        "latest_run_binding",
+                        expected=run_id,
+                        actual=(loaded.value.checkpoint.run_id if loaded.value else None),
                     ),
                     observation(
                         "winner_remains_latest",
                         expected="winner",
                         actual=(loaded.value.checkpoint.final_text if loaded.value else None),
+                    ),
+                    observation(
+                        "referenced_blob_round_trip",
+                        expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            loaded.value,
+                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                        ),
                     ),
                 ),
             )
@@ -357,7 +471,7 @@ def run_fenced_run_sink_contract(
     try:
         harness = factory()
         run_id = "contract-fence-first"
-        stale = harness.claim_writer(run_id, "owner-a")
+        stale = _contract_writer(harness, run_id)
         checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
         event = _contract_event(run_id, seq=1)
         invocation = _contract_invocation(run_id, revision=1, dispatch_state="reserved")
@@ -370,7 +484,7 @@ def run_fenced_run_sink_contract(
             writer_token=stale,
         )
         initial_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
-        current = harness.claim_writer(run_id, "owner-b")
+        current = _contract_writer(harness, run_id, "owner-b", generation=2)
         stale_checkpoint = harness.sink.commit_checkpoint(
             checkpoint, {}, writer_token=stale
         )
@@ -395,6 +509,60 @@ def run_fenced_run_sink_contract(
             writer_token=current,
         )
         current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
+
+        fresh_harness = factory()
+        fresh_run_id = "contract-stale-new"
+        fresh_stale = _contract_writer(fresh_harness, fresh_run_id)
+        fresh_current = _contract_writer(
+            fresh_harness,
+            fresh_run_id,
+            "owner-b",
+            generation=2,
+        )
+        fresh_checkpoint = RunCheckpoint(run_id=fresh_run_id, seq=1)
+        fresh_event = _contract_event(fresh_run_id, seq=1)
+        fresh_invocation = _contract_invocation(
+            fresh_run_id,
+            revision=1,
+            dispatch_state="reserved",
+        )
+        fresh_terminal = _contract_terminal(fresh_run_id)
+        stale_new_checkpoint = fresh_harness.sink.commit_checkpoint(
+            fresh_checkpoint,
+            {},
+            writer_token=fresh_stale,
+        )
+        stale_new_event = fresh_harness.sink.append_event(
+            fresh_event,
+            writer_token=fresh_stale,
+        )
+        stale_new_invocation = fresh_harness.sink.commit_invocation(
+            fresh_invocation,
+            {},
+            writer_token=fresh_stale,
+        )
+        stale_new_terminal = fresh_harness.sink.settle_terminal(
+            fresh_terminal,
+            writer_token=fresh_stale,
+        )
+        current_after_stale_checkpoint = fresh_harness.sink.commit_checkpoint(
+            fresh_checkpoint,
+            {},
+            writer_token=fresh_current,
+        )
+        current_after_stale_event = fresh_harness.sink.append_event(
+            fresh_event,
+            writer_token=fresh_current,
+        )
+        current_after_stale_invocation = fresh_harness.sink.commit_invocation(
+            fresh_invocation,
+            {},
+            writer_token=fresh_current,
+        )
+        current_after_stale_terminal = fresh_harness.sink.settle_terminal(
+            fresh_terminal,
+            writer_token=fresh_current,
+        )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
@@ -444,6 +612,46 @@ def run_fenced_run_sink_contract(
                         expected="already_committed",
                         actual=current_terminal.status,
                     ),
+                    observation(
+                        "stale_new_checkpoint",
+                        expected="fenced",
+                        actual=stale_new_checkpoint.status,
+                    ),
+                    observation(
+                        "stale_new_event",
+                        expected="fenced",
+                        actual=stale_new_event.status,
+                    ),
+                    observation(
+                        "stale_new_invocation",
+                        expected="fenced",
+                        actual=stale_new_invocation.status,
+                    ),
+                    observation(
+                        "stale_new_terminal",
+                        expected="fenced",
+                        actual=stale_new_terminal.status,
+                    ),
+                    observation(
+                        "current_after_stale_checkpoint",
+                        expected="committed",
+                        actual=current_after_stale_checkpoint.status,
+                    ),
+                    observation(
+                        "current_after_stale_event",
+                        expected="committed",
+                        actual=current_after_stale_event.status,
+                    ),
+                    observation(
+                        "current_after_stale_invocation",
+                        expected="committed",
+                        actual=current_after_stale_invocation.status,
+                    ),
+                    observation(
+                        "current_after_stale_terminal",
+                        expected="committed",
+                        actual=current_after_stale_terminal.status,
+                    ),
                 ),
             )
         )
@@ -459,7 +667,7 @@ def run_fenced_run_sink_contract(
     try:
         harness = factory()
         run_id = "contract-terminal"
-        token = harness.claim_writer(run_id, "owner-a")
+        token = _contract_writer(harness, run_id)
         event = _contract_event(run_id, seq=1)
         first_event = harness.sink.append_event(event, writer_token=token)
         repeated_event = harness.sink.append_event(event, writer_token=token)
@@ -495,11 +703,6 @@ def run_fenced_run_sink_contract(
                     observation(
                         "terminal_conflict", expected="conflict", actual=conflict_terminal.status
                     ),
-                    observation(
-                        "terminal_winner_digest",
-                        expected=first_terminal.content_digest,
-                        actual=conflict_terminal.winner_digest,
-                    ),
                 ),
             )
         )
@@ -515,10 +718,30 @@ def run_fenced_run_sink_contract(
     try:
         harness = factory()
         run_id = "contract-invocation"
-        token = harness.claim_writer(run_id, "owner-a")
+        token = _contract_writer(harness, run_id)
         missing = harness.sink.load_invocation(run_id, "call-1")
+        reserved_invocation = _contract_invocation(
+            run_id,
+            revision=1,
+            dispatch_state="reserved",
+        )
         reserved = harness.sink.commit_invocation(
-            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+            reserved_invocation,
+            {},
+            writer_token=token,
+        )
+        repeated_reserved = harness.sink.commit_invocation(
+            reserved_invocation,
+            {},
+            writer_token=token,
+        )
+        conflicting_reserved = harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=1,
+                dispatch_state="reserved",
+                dispatch_id="dispatch-conflict",
+            ),
             {},
             writer_token=token,
         )
@@ -549,6 +772,39 @@ def run_fenced_run_sink_contract(
             writer_token=token,
         )
         loaded = harness.sink.load_invocation(run_id, "call-1")
+
+        result_call_id = "call-result"
+        result_setup_statuses = tuple(
+            harness.sink.commit_invocation(
+                _contract_invocation(
+                    run_id,
+                    logical_call_id=result_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        settled_result_invocation = _contract_invocation(
+            run_id,
+            logical_call_id=result_call_id,
+            revision=3,
+            dispatch_state="settled",
+            succeeded=True,
+        )
+        settled_result = harness.sink.commit_invocation(
+            settled_result_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB},
+            writer_token=token,
+        )
+        repeated_result = harness.sink.commit_invocation(
+            settled_result_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB},
+            writer_token=token,
+        )
+        loaded_result = harness.sink.load_invocation(run_id, result_call_id)
         outcomes.append(
             outcome_from_observations(
                 "FENCED-04-INVOCATION-LIFECYCLE",
@@ -556,6 +812,16 @@ def run_fenced_run_sink_contract(
                 (
                     observation("initial_load", expected="missing", actual=missing.status),
                     observation("reserve", expected="committed", actual=reserved.status),
+                    observation(
+                        "reserve_repeat",
+                        expected="already_committed",
+                        actual=repeated_reserved.status,
+                    ),
+                    observation(
+                        "reserve_conflict",
+                        expected="conflict",
+                        actual=conflicting_reserved.status,
+                    ),
                     observation("start", expected="committed", actual=started.status),
                     observation(
                         "settled_failure", expected="committed", actual=settled_failure.status
@@ -565,6 +831,56 @@ def run_fenced_run_sink_contract(
                     ),
                     observation("latest_load", expected="loaded", actual=loaded.status),
                     observation("latest_revision", expected=4, actual=loaded.sequence),
+                    observation(
+                        "latest_record_revision",
+                        expected=4,
+                        actual=(loaded.value.revision if loaded.value else None),
+                    ),
+                    observation(
+                        "latest_run_binding",
+                        expected=run_id,
+                        actual=(loaded.value.invocation.run_id if loaded.value else None),
+                    ),
+                    observation(
+                        "latest_call_binding",
+                        expected="call-1",
+                        actual=(
+                            loaded.value.invocation.logical_call_id if loaded.value else None
+                        ),
+                    ),
+                    observation(
+                        "result_setup",
+                        expected=("committed", "committed"),
+                        actual=result_setup_statuses,
+                    ),
+                    observation(
+                        "settled_result", expected="committed", actual=settled_result.status
+                    ),
+                    observation(
+                        "settled_result_repeat",
+                        expected="already_committed",
+                        actual=repeated_result.status,
+                    ),
+                    observation(
+                        "result_load", expected="loaded", actual=loaded_result.status
+                    ),
+                    observation(
+                        "result_ref",
+                        expected=f"blob:{_CONTRACT_INVOCATION_BLOB_SHA256}",
+                        actual=(
+                            loaded_result.value.invocation.result_ref
+                            if loaded_result.value
+                            else None
+                        ),
+                    ),
+                    observation(
+                        "result_blob_round_trip",
+                        expected=_CONTRACT_INVOCATION_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            loaded_result.value,
+                            _CONTRACT_INVOCATION_BLOB_SHA256,
+                        ),
+                    ),
                 ),
             )
         )
@@ -580,7 +896,7 @@ def run_fenced_run_sink_contract(
     try:
         harness = factory()
         run_id = "contract-invocation-refusals"
-        token = harness.claim_writer(run_id, "owner-a")
+        token = _contract_writer(harness, run_id)
         first_wrong = harness.sink.commit_invocation(
             _contract_invocation(run_id, revision=1, dispatch_state="dispatch_started"),
             {},
@@ -676,8 +992,8 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_a_token = harness.claim_writer("contract-run-a", "owner-a")
-        run_b_token = harness.claim_writer("contract-run-b", "owner-a")
+        run_a_token = _contract_writer(harness, "contract-run-a")
+        run_b_token = _contract_writer(harness, "contract-run-b")
         checkpoint = RunCheckpoint(run_id="contract-run-b", seq=1)
         event = _contract_event("contract-run-b", seq=1)
         invocation = _contract_invocation(
@@ -719,16 +1035,6 @@ def run_fenced_run_sink_contract(
                 "FENCED-06-WRITER-TOKEN-RUN-BINDING",
                 FENCED_RUN_SINK_CONTRACT_PROFILE,
                 (
-                    observation(
-                        "setup_equal_owner",
-                        expected=run_b_token.owner_id,
-                        actual=run_a_token.owner_id,
-                    ),
-                    observation(
-                        "setup_equal_generation",
-                        expected=run_b_token.generation,
-                        actual=run_a_token.generation,
-                    ),
                     observation(
                         "cross_run_checkpoint",
                         expected="fenced",

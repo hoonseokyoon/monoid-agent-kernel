@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Literal, Protocol, get_args
+from dataclasses import dataclass, field
+from typing import Callable, Literal, Protocol, get_args
 
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, RunCheckpoint
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
@@ -65,6 +65,30 @@ class CommitResult:
                 )
 
 
+@dataclass(frozen=True)
+class ModelInvocationRecord:
+    """A committed invocation revision with lazy access to its private result blobs."""
+
+    revision: int
+    invocation: DurableModelInvocation
+    _blob_reader: Callable[[str], bytes] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.revision != self.invocation.revision:
+            raise ValueError("model invocation record revision must match its invocation")
+
+    def blob(self, sha256: str) -> bytes:
+        """Read a private result blob by its content digest."""
+
+        if self._blob_reader is None:
+            raise KeyError(sha256)
+        return self._blob_reader(sha256)
+
+
 class FencedCheckpointStore(Protocol):
     """Shared checkpoint store whose mutation rejects stale host writers.
 
@@ -93,7 +117,7 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
         self,
         run_id: str,
         logical_call_id: str,
-    ) -> DurableLoadResult[DurableModelInvocation]: ...
+    ) -> DurableLoadResult[ModelInvocationRecord]: ...
 
     def commit_invocation(
         self,
@@ -121,6 +145,7 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
 __all__ = [
     "WriterToken",
     "CommitResult",
+    "ModelInvocationRecord",
     "StorageCapabilities",
     "FencedCheckpointStore",
     "FencedRunSink",

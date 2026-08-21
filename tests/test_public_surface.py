@@ -181,6 +181,7 @@ EXPECTED_CONTRACTS_ALL = [
 REMOVED_PUBLIC_SURFACE_NAMES = [
     "WriterToken",
     "CommitResult",
+    "ModelInvocationRecord",
     "StorageCapabilities",
     "FencedCheckpointStore",
     "FencedRunSink",
@@ -402,6 +403,7 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
     assert hosting.__all__ == [
         "WriterToken",
         "CommitResult",
+        "ModelInvocationRecord",
         "StorageCapabilities",
         "FencedCheckpointStore",
         "FencedRunSink",

@@ -385,6 +385,13 @@ class CommitResult:
     winner_digest: str = ""
 
 @dataclass(frozen=True)
+class ModelInvocationRecord:
+    revision: int
+    invocation: DurableModelInvocation
+
+    def blob(self, sha256: str) -> bytes: ...
+
+@dataclass(frozen=True)
 class StorageCapabilities:
     single_writer: bool = False
     concurrent_writers: bool = False
@@ -422,7 +429,7 @@ class FencedCheckpointStore(Protocol):
 class FencedRunSink(FencedCheckpointStore, Protocol):
     def load_invocation(
         self, run_id: str, logical_call_id: str
-    ) -> DurableLoadResult[DurableModelInvocation]: ...
+    ) -> DurableLoadResult[ModelInvocationRecord]: ...
 
     def commit_invocation(
         self,
@@ -443,6 +450,13 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
 
 `FencedRunSink`는 run journal 전체를 구현하는 host를 위한 합성 protocol이다.
 `FencedCheckpointStore`는 checkpoint만 공유 저장소에 두는 host가 사용할 수 있다.
+`ModelInvocationRecord`는 committed invocation revision과 private result blob reader를 함께
+운반한다. Crash recovery는 `result_ref`의 digest로 `record.blob()`을 호출하고 metadata와 blob을
+같은 권위 경계에서 복원한다.
+
+Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확한 현재 token을 설치한다.
+이 seam은 host의 실제 generation allocator를 호출하지 않는다. 따라서 per-run counter와 global
+monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 
 ### 6.3 Commit 판정 순서
 
@@ -467,6 +481,9 @@ Resource key는 다음과 같다.
 
 Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `already_committed`, 다른 content는
 `conflict`다.
+
+Checkpoint와 invocation의 canonical content에는 함께 제출된 blob key와 byte digest가 포함된다.
+Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 
 Invocation transition은 다음 순서를 검증한다.
 
@@ -728,7 +745,7 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 | `core/outcome.py` | outcome/cause/retry type, strict codec, conversion helper |
 | `core/model_invocation.py` | durable invocation record와 checked codec |
 | `hosting/__init__.py` | 좁은 hosting export |
-| `hosting/contracts.py` | writer token, capabilities, fenced protocols, commit result |
+| `hosting/contracts.py` | writer token, capabilities, fenced protocols, commit/result record |
 | `tests/test_outcome.py` | outcome invariant와 conversion |
 | `tests/test_model_invocation.py` | lifecycle/codec/result reference |
 | `tests/test_fenced_hosting.py` | protocol과 deterministic fake sink |
@@ -776,12 +793,13 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 ### PR 2 — Hosting contracts
 
-- `WriterToken`, `CommitResult`, `StorageCapabilities`
+- `WriterToken`, `CommitResult`, `ModelInvocationRecord`, `StorageCapabilities`
 - `FencedCheckpointStore`, `FencedRunSink`
 - LocalFS `single_writer` capability
 - deterministic fake adapter와 fencing conformance
 
-종료 조건: stale identical mutation도 `fenced`, same-key conflict와 terminal winner가 검증된다.
+종료 조건: capability 선언, stale identical mutation의 `fenced`, same-key conflict, terminal winner,
+checkpoint/invocation private blob round-trip이 검증된다.
 
 ### PR 3 — ModelCallRunner lifecycle
 

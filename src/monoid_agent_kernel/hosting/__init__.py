@@ -4,6 +4,7 @@ from .contracts import (
     CommitResult,
     FencedCheckpointStore,
     FencedRunSink,
+    ModelInvocationRecord,
     StorageCapabilities,
     WriterToken,
 )
@@ -11,6 +12,7 @@ from .contracts import (
 __all__ = [
     "WriterToken",
     "CommitResult",
+    "ModelInvocationRecord",
     "StorageCapabilities",
     "FencedCheckpointStore",
     "FencedRunSink",

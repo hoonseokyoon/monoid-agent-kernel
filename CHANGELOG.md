@@ -22,9 +22,10 @@ out in commit messages and here.
 ### Added — fenced hosting contracts
 
 - Added the explicit `monoid_agent_kernel.hosting` namespace with writer tokens, fail-closed
-  storage capabilities, fenced commit results, and composite checkpoint/run-sink protocols. These
-  host-facing names stay outside the stable package root and carry no database, queue, lease,
-  Redis, or Temporal dependency.
+  storage capabilities, fenced commit results, private invocation records, and composite
+  checkpoint/run-sink protocols. Loaded invocation records provide lazy result-blob access without
+  exposing an unfenced standalone blob mutation. These host-facing names stay outside the stable
+  package root and carry no database, queue, lease, Redis, or Temporal dependency.
 - Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
   same-resource idempotency and conflict, terminal first-writer-wins, and durable invocation
   transitions. `LocalFsCheckpointStore` now declares its actual single-writer checkpoint

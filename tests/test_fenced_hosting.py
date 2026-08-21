@@ -14,6 +14,7 @@ from monoid_agent_kernel.hosting import (
     CommitResult,
     FencedCheckpointStore,
     FencedRunSink,
+    ModelInvocationRecord,
     StorageCapabilities,
     WriterToken,
 )
@@ -122,6 +123,21 @@ def test_commit_result_accepts_optional_bounded_evidence() -> None:
         CommitResult(status="committed", content_digest="not-a-digest")
     with pytest.raises(ValueError, match="winner_digest"):
         CommitResult(status="conflict", winner_digest="not-a-digest")
+
+
+def test_model_invocation_record_binds_revision_and_private_blobs() -> None:
+    invocation = _invocation("run-record", revision=1, state="reserved")
+    record = ModelInvocationRecord(
+        revision=1,
+        invocation=invocation,
+        _blob_reader=lambda digest: {"a" * 64: b"private"}[digest],
+    )
+
+    assert record.blob("a" * 64) == b"private"
+    with pytest.raises(ValueError, match="revision"):
+        ModelInvocationRecord(revision=2, invocation=invocation)
+    with pytest.raises(KeyError):
+        ModelInvocationRecord(revision=1, invocation=invocation).blob("a" * 64)
 
 
 def test_fake_has_the_composite_protocol_shape_without_legacy_mutations() -> None:
@@ -296,8 +312,10 @@ def test_stale_invocation_retry_is_fenced_before_content_comparison() -> None:
 
 def test_writer_token_cannot_cross_run_boundary() -> None:
     harness = DeterministicFencedRunHarness()
-    run_a_token = harness.claim_writer("run-a", "owner-a")
-    run_b_token = harness.claim_writer("run-b", "owner-a")
+    run_a_token = WriterToken(run_id="run-a", owner_id="owner-a", generation=7)
+    run_b_token = WriterToken(run_id="run-b", owner_id="owner-a", generation=7)
+    harness.set_current_writer(run_a_token)
+    harness.set_current_writer(run_b_token)
 
     assert run_a_token.owner_id == run_b_token.owner_id
     assert run_a_token.generation == run_b_token.generation
