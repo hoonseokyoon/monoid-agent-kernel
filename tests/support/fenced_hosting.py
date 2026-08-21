@@ -289,8 +289,10 @@ class DeterministicFencedRunSink:
         previous = previous_record.invocation
         if invocation.revision != previous.revision + 1:
             return previous_digest
+        invocation_payload = invocation.to_json()
+        previous_payload = previous.to_json()
         if any(
-            getattr(invocation, field_name) != getattr(previous, field_name)
+            invocation_payload[field_name] != previous_payload[field_name]
             for field_name in (
                 "logical_call_id",
                 "idempotency_key",

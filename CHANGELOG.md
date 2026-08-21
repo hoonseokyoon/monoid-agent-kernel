@@ -34,7 +34,8 @@ out in commit messages and here.
   suite repeatable on one persistent test service. Reopened records use complete canonical-payload
   comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
   canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
-  invalid-combination matrices.
+  invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
+  normalize before idempotency and lifecycle comparisons.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

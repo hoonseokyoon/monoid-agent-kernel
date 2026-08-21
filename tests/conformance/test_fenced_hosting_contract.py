@@ -566,7 +566,6 @@ def _invocation_identity_drift_factory(field_name: str):
     [
         "idempotency_key",
         "request_digest",
-        "digest_generation",
         "dispatch_id",
         "dispatch_attempt",
     ],
@@ -587,6 +586,46 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
     assert refusal_rule.status == "failed"
     assert drift_observation.expected == "conflict"
     assert drift_observation.actual == "committed"
+
+
+class _LegacyDigestAliasDriftSink(DeterministicFencedRunSink):
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            previous_digest, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            if invocation.digest_generation != previous_record.invocation.digest_generation:
+                return previous_digest
+        return super()._invocation_transition_winner(invocation)
+
+
+def _legacy_digest_alias_drift_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _LegacyDigestAliasDriftSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_accepts_canonical_digest_alias_transition() -> None:
+    outcomes = run_fenced_run_sink_contract(_legacy_digest_alias_drift_factory)
+    lifecycle_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    alias_observation = next(
+        observation
+        for observation in lifecycle_rule.observations
+        if observation.observation_id
+        == "invocation_canonical_alias_transition_digest_generation"
+    )
+
+    assert lifecycle_rule.status == "failed"
+    assert alias_observation.expected == "committed"
+    assert alias_observation.actual == "conflict"
 
 
 class _ForbiddenInvocationEdgeSink(DeterministicFencedRunSink):

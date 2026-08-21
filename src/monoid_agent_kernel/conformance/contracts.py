@@ -375,7 +375,7 @@ def _contract_event_identity_variants(event: AgentEvent) -> dict[str, AgentEvent
     variants = {
         "event_id": replace(event, event_id="event-alternate"),
         "timestamp": replace(event, timestamp="2026-08-21T00:00:01Z"),
-        "type": replace(event, type="checkpoint.restored"),
+        "type": replace(event, type="run.started"),
         "level": replace(event, level="warning"),
         "data": replace(event, data={"checkpoint_seq": event.seq, "alternate": True}),
         "turn_id": replace(event, turn_id="turn-alternate"),
@@ -829,6 +829,47 @@ def _contract_invocation_canonical_alias_status(
     first = harness.sink.commit_invocation(baseline, {}, writer_token=token)
     if first.status != "committed":
         return f"setup:{first.status}"
+    return harness.sink.commit_invocation(
+        variants[field_name],
+        {},
+        writer_token=token,
+    ).status
+
+
+def _contract_invocation_canonical_alias_transition_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+) -> str:
+    """Carry an accepted legacy tag across a legal revision transition."""
+
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    reserved = _contract_invocation(
+        run_id,
+        revision=1,
+        dispatch_state="reserved",
+    )
+    first = harness.sink.commit_invocation(reserved, {}, writer_token=token)
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    started = _contract_invocation(
+        run_id,
+        revision=2,
+        dispatch_state="dispatch_started",
+    )
+    variants = {
+        "schema_version": replace(
+            started,
+            schema_version=_CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
+        ),
+        "digest_generation": replace(
+            started,
+            digest_generation=_CONTRACT_ALTERNATE_DIGEST_GENERATION,
+        ),
+    }
+    if set(variants) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
+        raise AssertionError("invocation canonical-tag transition matrix is incomplete")
     return harness.sink.commit_invocation(
         variants[field_name],
         {},
@@ -1480,6 +1521,17 @@ def run_fenced_run_sink_contract(
             )
             for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
         }
+        invocation_canonical_alias_transition_statuses = {
+            field_name: _contract_invocation_canonical_alias_transition_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-canonical-alias-transition-{field_name}",
+                ),
+                field_name,
+            )
+            for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
+        }
         harness = factory()
         run_id = _contract_run_id(namespace, "invocation")
         token = _contract_writer(harness, run_id)
@@ -1617,6 +1669,16 @@ def run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for field_name, status in invocation_canonical_alias_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"invocation_canonical_alias_transition_{field_name}",
+                            expected="committed",
+                            actual=status,
+                        )
+                        for field_name, status in (
+                            invocation_canonical_alias_transition_statuses.items()
+                        )
                     ),
                     observation("start", expected="committed", actual=started.status),
                     observation(
@@ -1808,12 +1870,6 @@ def run_fenced_run_sink_contract(
                 _contract_run_id(namespace, "invocation-drift-request-digest"),
                 "request_digest",
                 "b" * 64,
-            ),
-            "digest_generation": _contract_invocation_drift_status(
-                factory,
-                _contract_run_id(namespace, "invocation-drift-digest-generation"),
-                "digest_generation",
-                _CONTRACT_ALTERNATE_DIGEST_GENERATION,
             ),
             "dispatch_id": _contract_invocation_drift_status(
                 factory,

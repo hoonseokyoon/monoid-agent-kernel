@@ -466,7 +466,8 @@ Checkpoint와 invocation은 선택 필드가 아니라 committed canonical paylo
 하나씩 독립적으로 변경해 모두 `conflict`인지 확인한다. Matrix의 field 집합은 각 record의
 canonical JSON field에서 계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
 Invocation의 schema version과 digest generation은 current canonical tag로 고정한다. 허용된 legacy
-alias를 쓴 같은 revision 재시도는 canonical payload가 같으므로 `already_committed`다.
+alias를 쓴 같은 revision 재시도는 canonical payload가 같으므로 `already_committed`다. Legacy alias를
+쓴 다음 legal revision도 canonical stable identity가 같으므로 `committed`다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
