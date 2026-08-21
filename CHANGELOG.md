@@ -43,7 +43,9 @@ out in commit messages and here.
   Checkpoint schema aliases and nested invocation aliases normalize in both retry directions.
   Fresh malformed checkpoint and invocation blob maps are rejected before metadata or head
   publication, and every blob key is verified against its submitted bytes. A corrected retry then
-  commits and round-trips the intended bytes. Reopened event
+  commits and round-trips the intended bytes. Existing records that share the digest retain their
+  original bytes, and stale or cross-run malformed requests remain fenced before validation.
+  Reopened event
   inspection compares the complete canonical payload instead of trusting retry digests. Retry
   reservations reject dispatch IDs used by any earlier attempt in the logical call history.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while

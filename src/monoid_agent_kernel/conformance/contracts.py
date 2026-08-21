@@ -1197,6 +1197,31 @@ def _run_fenced_run_sink_contract(
             for direction in ("current_to_legacy", "legacy_to_current")
         }
         malformed_harness = factory()
+        malformed_seed_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-malformed-blob-seed",
+        )
+        malformed_seed_token = _contract_writer(
+            malformed_harness,
+            malformed_seed_run_id,
+        )
+        malformed_seed_checkpoint = RunCheckpoint(
+            run_id=malformed_seed_run_id,
+            seq=1,
+            workspace_delta=[
+                {
+                    "path": "seed-contract.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        malformed_seed = malformed_harness.sink.commit_checkpoint(
+            malformed_seed_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=malformed_seed_token,
+        )
         malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
         malformed_checkpoint = RunCheckpoint(
@@ -1217,6 +1242,9 @@ def _run_fenced_run_sink_contract(
             writer_token=malformed_token,
         )
         malformed_harness = malformed_harness.reopen()
+        malformed_seed_load = malformed_harness.sink.latest_checked(
+            malformed_seed_run_id
+        )
         malformed_fresh_load = malformed_harness.sink.latest_checked(malformed_run_id)
         malformed_recovery = malformed_harness.sink.commit_checkpoint(
             malformed_checkpoint,
@@ -1326,6 +1354,19 @@ def _run_fenced_run_sink_contract(
                         "malformed_fresh_blob_status",
                         expected="conflict",
                         actual=malformed_fresh_blob.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_seed",
+                        expected="committed",
+                        actual=malformed_seed.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_preserves_existing_bytes",
+                        expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            malformed_seed_load.value,
+                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                        ),
                     ),
                     observation(
                         "malformed_fresh_blob_not_published",
@@ -1463,6 +1504,16 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=stale,
         )
+        stale_malformed_checkpoint = harness.sink.commit_checkpoint(
+            checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=stale,
+        )
+        stale_malformed_invocation = harness.sink.commit_invocation(
+            invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=stale,
+        )
         stale_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
         current_checkpoint = harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=run_id, seq=2, final_text="current"),
@@ -1593,6 +1644,16 @@ def _run_fenced_run_sink_contract(
                     observation("stale_event", expected="fenced", actual=stale_event.status),
                     observation(
                         "stale_invocation", expected="fenced", actual=stale_invocation.status
+                    ),
+                    observation(
+                        "stale_malformed_checkpoint",
+                        expected="fenced",
+                        actual=stale_malformed_checkpoint.status,
+                    ),
+                    observation(
+                        "stale_malformed_invocation",
+                        expected="fenced",
+                        actual=stale_malformed_invocation.status,
                     ),
                     observation(
                         "stale_terminal", expected="fenced", actual=stale_terminal.status
@@ -1858,6 +1919,29 @@ def _run_fenced_run_sink_contract(
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
+        malformed_seed_call_id = "blob-seed-call"
+        malformed_seed_statuses = tuple(
+            malformed_harness.sink.commit_invocation(
+                _contract_invocation(
+                    malformed_run_id,
+                    logical_call_id=malformed_seed_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                    succeeded=revision == 3,
+                ),
+                (
+                    {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB}
+                    if revision == 3
+                    else {}
+                ),
+                writer_token=malformed_token,
+            ).status
+            for revision, dispatch_state in (
+                (1, "reserved"),
+                (2, "dispatch_started"),
+                (3, "settled"),
+            )
+        )
         malformed_setup_statuses = tuple(
             malformed_harness.sink.commit_invocation(
                 _contract_invocation(
@@ -1881,6 +1965,10 @@ def _run_fenced_run_sink_contract(
             writer_token=malformed_token,
         )
         malformed_harness = malformed_harness.reopen()
+        malformed_seed_load = malformed_harness.sink.load_invocation(
+            malformed_run_id,
+            malformed_seed_call_id,
+        )
         malformed_fresh_load = malformed_harness.sink.load_invocation(
             malformed_run_id,
             "call-1",
@@ -2154,6 +2242,11 @@ def _run_fenced_run_sink_contract(
                         actual=malformed_setup_statuses,
                     ),
                     observation(
+                        "malformed_fresh_blob_seed",
+                        expected=("committed", "committed", "committed"),
+                        actual=malformed_seed_statuses,
+                    ),
+                    observation(
                         "malformed_fresh_blob_status",
                         expected="conflict",
                         actual=malformed_fresh_blob.status,
@@ -2162,6 +2255,14 @@ def _run_fenced_run_sink_contract(
                         "malformed_fresh_blob_head_not_published",
                         expected=2,
                         actual=malformed_fresh_load.sequence,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_preserves_existing_bytes",
+                        expected=_CONTRACT_INVOCATION_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            malformed_seed_load.value,
+                            _CONTRACT_INVOCATION_BLOB_SHA256,
+                        ),
                     ),
                     observation(
                         "malformed_fresh_blob_recovery",
@@ -2468,6 +2569,16 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=run_a_token,
         )
+        swapped_malformed_checkpoint = harness.sink.commit_checkpoint(
+            checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=run_a_token,
+        )
+        swapped_malformed_invocation = harness.sink.commit_invocation(
+            invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=run_a_token,
+        )
         swapped_terminal = harness.sink.settle_terminal(
             terminal,
             writer_token=run_a_token,
@@ -2551,6 +2662,16 @@ def _run_fenced_run_sink_contract(
                         "cross_run_invocation",
                         expected="fenced",
                         actual=swapped_invocation.status,
+                    ),
+                    observation(
+                        "cross_run_malformed_checkpoint",
+                        expected="fenced",
+                        actual=swapped_malformed_checkpoint.status,
+                    ),
+                    observation(
+                        "cross_run_malformed_invocation",
+                        expected="fenced",
+                        actual=swapped_malformed_invocation.status,
                     ),
                     observation(
                         "cross_run_terminal",

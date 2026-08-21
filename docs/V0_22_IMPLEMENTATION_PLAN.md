@@ -501,6 +501,8 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 5. 새 mutation을 commit하고 `committed`를 반환한다.
 
 Stale writer의 identical retry도 `fenced`다. Fencing 판정이 idempotency 판정보다 먼저다.
+Stale token과 다른 run token에 malformed checkpoint/invocation blob map을 결합해도 `fenced`다.
+Blob digest 검증은 run binding과 현재 writer 검증 뒤에만 실행한다.
 
 Resource key는 다음과 같다.
 
@@ -526,6 +528,8 @@ Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 `conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
 거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
 `committed`이고 재개방 record가 정확한 bytes를 반환한다.
+Contract는 먼저 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write 직후 repair
+전에 seed record의 blob을 다시 읽어 기존 content-addressed row가 바뀌지 않았음을 검증한다.
 성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에
 제출한다. 참조 무결성을 선검증하는 adapter도 conformance contract를 통과해야 한다.
 Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.
@@ -1005,7 +1009,8 @@ machine, capability gate로 해결할 수 있는지 결정한다. 필요하면 �
 
 PR 2에서는 반복된 durability 지적에 이 gate를 적용했다. 반환 status 중심 검증을 durable
 postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh malformed blob은 거부 뒤 state를
-다시 읽고, event는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전 attempt가 아니라
+다시 읽고 기존 shared blob bytes를 즉시 재검증한다. Malformed map도 stale/cross-run fencing 뒤에만
+검사한다. Event는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전 attempt가 아니라
 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을 실패시키는 mutant
 test가 있다.
 

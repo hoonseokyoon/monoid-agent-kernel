@@ -642,6 +642,134 @@ def test_reusable_contract_rejects_fresh_malformed_content_addressed_blobs() -> 
     )
 
 
+def _corrupting_blob_reader(reader, target_sha256: str, corrupted: bytes):
+    def read(sha256: str) -> bytes:
+        if sha256 == target_sha256:
+            return corrupted
+        return reader(sha256)
+
+    return read
+
+
+class _OverwriteExistingBlobOnMalformedSink(DeterministicFencedRunSink):
+    def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
+        valid = super()._blobs_are_content_addressed(blobs)
+        if valid:
+            return True
+        for sha256, corrupted in blobs.items():
+            for _, record in self._checkpoints.values():
+                try:
+                    record.blob(sha256)
+                except KeyError:
+                    continue
+                assert record._blob_reader is not None
+                record._blob_reader = _corrupting_blob_reader(
+                    record._blob_reader,
+                    sha256,
+                    corrupted,
+                )
+            for key, (digest, record) in list(self._invocations.items()):
+                try:
+                    record.blob(sha256)
+                except KeyError:
+                    continue
+                assert record._blob_reader is not None
+                self._invocations[key] = (
+                    digest,
+                    replace(
+                        record,
+                        _blob_reader=_corrupting_blob_reader(
+                            record._blob_reader,
+                            sha256,
+                            corrupted,
+                        ),
+                    ),
+                )
+        return False
+
+
+def _overwrite_existing_blob_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _OverwriteExistingBlobOnMalformedSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_protects_existing_blobs_from_malformed_writes() -> None:
+    outcomes = run_fenced_run_sink_contract(_overwrite_existing_blob_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+
+    for rule_id in (
+        "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+        "FENCED-04-INVOCATION-LIFECYCLE",
+    ):
+        rule = rules[rule_id]
+        preserved = next(
+            item
+            for item in rule.observations
+            if item.observation_id
+            == "malformed_fresh_blob_preserves_existing_bytes"
+        )
+        assert rule.status == "failed"
+        assert preserved.actual != preserved.expected
+
+
+class _BlobValidationFirstSink(DeterministicFencedRunSink):
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _blob_validation_first_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _BlobValidationFirstSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_checks_fencing_before_malformed_blob_validation() -> None:
+    outcomes = run_fenced_run_sink_contract(_blob_validation_first_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+    observation_ids = {
+        "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY": (
+            "stale_malformed_checkpoint",
+            "stale_malformed_invocation",
+        ),
+        "FENCED-06-WRITER-TOKEN-RUN-BINDING": (
+            "cross_run_malformed_checkpoint",
+            "cross_run_malformed_invocation",
+        ),
+    }
+
+    for rule_id, expected_observation_ids in observation_ids.items():
+        rule = rules[rule_id]
+        selected = {
+            item.observation_id: item
+            for item in rule.observations
+            if item.observation_id in expected_observation_ids
+        }
+        assert rule.status == "failed"
+        assert set(selected) == set(expected_observation_ids)
+        assert all(item.expected == "fenced" for item in selected.values())
+        assert all(item.actual == "conflict" for item in selected.values())
+
+
 class _ReferentialIntegritySink(DeterministicFencedRunSink):
     def commit_invocation(
         self,
