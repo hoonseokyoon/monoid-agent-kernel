@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
 from monoid_agent_kernel.core.wire_validation import parse_int, parse_literal, parse_str
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 MODEL_INVOCATION_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
 ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = accepted_namespaced_ids("model-invocation.v1")
+MODEL_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
+ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS = accepted_namespaced_ids("model-request-digest.v1")
 
 DispatchState = Literal["reserved", "dispatch_started", "settled", "unknown"]
 
@@ -41,19 +46,26 @@ _RECEIPT_FIELDS = {
     "systemfingerprint": "system_fingerprint",
     "usage": "usage",
 }
-_RECEIPT_STRING_FIELDS = frozenset(
+_RECEIPT_OPAQUE_ID_FIELDS = frozenset(
+    {
+        "provider_request_id",
+        "provider_response_id",
+        "request_id",
+        "response_id",
+        "system_fingerprint",
+    }
+)
+_RECEIPT_CODE_FIELDS = frozenset(
     {
         "finish_reason",
         "provider_error_code",
-        "provider_request_id",
-        "provider_response_id",
-        "request_digest",
-        "request_id",
-        "response_id",
+        "stop_reason",
+    }
+)
+_RECEIPT_TIMESTAMP_FIELDS = frozenset(
+    {
         "settled_at",
         "started_at",
-        "stop_reason",
-        "system_fingerprint",
     }
 )
 _RECEIPT_BOOLEAN_FIELDS = frozenset({"provider_retried", "retryable"})
@@ -75,9 +87,30 @@ def _collapsed_receipt_key(key: str) -> str:
     return "".join(character for character in key.casefold() if character.isalnum())
 
 
-def _require_nonempty_string(value: object, field_name: str) -> None:
-    if type(value) is not str or not value.strip():
-        raise ValueError(f"model invocation {field_name} must be a non-empty string")
+_OPAQUE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,255}\Z", re.ASCII)
+_CODE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
+_UTC_TIMESTAMP_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z",
+    re.ASCII,
+)
+
+
+def _is_opaque_id(value: object) -> bool:
+    return type(value) is str and _OPAQUE_ID_PATTERN.fullmatch(value) is not None
+
+
+def _is_code(value: object) -> bool:
+    return type(value) is str and _CODE_PATTERN.fullmatch(value) is not None
+
+
+def _is_utc_timestamp(value: object) -> bool:
+    if type(value) is not str or _UTC_TIMESTAMP_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
 def _require_string(value: object, field_name: str) -> None:
@@ -136,10 +169,28 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                     )
                 usage[canonical_usage_key] = count
             canonical[canonical_key] = usage
-        elif canonical_key in _RECEIPT_STRING_FIELDS:
-            if type(value) is not str or not value.strip():
+        elif canonical_key == "request_digest":
+            if type(value) is not str or not is_recorded_digest(value):
                 raise ValueError(
-                    f"model invocation receipt {canonical_key} must be a non-empty string"
+                    "model invocation receipt request_digest must be a lowercase SHA-256 digest"
+                )
+            canonical[canonical_key] = value
+        elif canonical_key in _RECEIPT_OPAQUE_ID_FIELDS:
+            if not _is_opaque_id(value):
+                raise ValueError(
+                    f"model invocation receipt {canonical_key} must be a bounded opaque id"
+                )
+            canonical[canonical_key] = value
+        elif canonical_key in _RECEIPT_CODE_FIELDS:
+            if not _is_code(value):
+                raise ValueError(
+                    f"model invocation receipt {canonical_key} must be a bounded code"
+                )
+            canonical[canonical_key] = value
+        elif canonical_key in _RECEIPT_TIMESTAMP_FIELDS:
+            if not _is_utc_timestamp(value):
+                raise ValueError(
+                    f"model invocation receipt {canonical_key} must be a UTC RFC3339 timestamp"
                 )
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_BOOLEAN_FIELDS:
@@ -190,19 +241,38 @@ class DurableModelInvocation:
             "run_id",
             "logical_call_id",
             "dispatch_id",
-            "idempotency_key",
-            "request_digest",
-            "digest_generation",
         ):
-            _require_nonempty_string(getattr(self, field_name), field_name)
+            if not _is_opaque_id(getattr(self, field_name)):
+                raise ValueError(f"model invocation {field_name} must be a bounded opaque id")
+        if type(self.idempotency_key) is not str or not is_valid_idempotency_key(
+            self.idempotency_key
+        ):
+            raise ValueError("model invocation idempotency_key is outside the portable vocabulary")
+        if type(self.request_digest) is not str or not is_recorded_digest(self.request_digest):
+            raise ValueError("model invocation request_digest must be a lowercase SHA-256 digest")
+        if (
+            type(self.digest_generation) is not str
+            or self.digest_generation not in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
+        ):
+            raise ValueError("unsupported model invocation digest_generation")
         _require_positive_int(self.revision, "revision")
         _require_positive_int(self.dispatch_attempt, "dispatch_attempt")
         if self.dispatch_state not in get_args(DispatchState):
             raise ValueError("model invocation dispatch_state is outside the durable vocabulary")
         _require_string(self.result_ref, "result_ref")
         _require_string(self.failure_code, "failure_code")
+        if self.result_ref and not _is_opaque_id(self.result_ref):
+            raise ValueError("model invocation result_ref must be empty or a bounded opaque id")
+        if self.failure_code and not _is_code(self.failure_code):
+            raise ValueError("model invocation failure_code must be empty or a bounded code")
         receipt = _normalized_receipt(self.receipt)
         object.__setattr__(self, "receipt", receipt)
+        if receipt is not None and receipt.get("request_digest", self.request_digest) != (
+            self.request_digest
+        ):
+            raise ValueError(
+                "model invocation receipt request_digest must match invocation request_digest"
+            )
 
         if self.dispatch_state in {"reserved", "dispatch_started"}:
             if receipt is not None or self.result_ref or self.failure_code:
@@ -235,7 +305,7 @@ class DurableModelInvocation:
             "idempotency_key": self.idempotency_key,
             "dispatch_state": self.dispatch_state,
             "request_digest": self.request_digest,
-            "digest_generation": self.digest_generation,
+            "digest_generation": MODEL_REQUEST_DIGEST_GENERATION,
             "receipt": _normalized_receipt(self.receipt),
             "result_ref": self.result_ref,
             "failure_code": self.failure_code,
@@ -294,6 +364,8 @@ def decode_model_invocation(payload: object) -> DurableLoadResult[DurableModelIn
 __all__ = [
     "MODEL_INVOCATION_SCHEMA_VERSION",
     "ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS",
+    "MODEL_REQUEST_DIGEST_GENERATION",
+    "ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS",
     "DispatchState",
     "DurableModelInvocation",
     "MODEL_INVOCATION_CODEC",

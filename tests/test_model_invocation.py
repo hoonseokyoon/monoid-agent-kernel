@@ -6,9 +6,12 @@ import pytest
 
 from monoid_agent_kernel.core.model_invocation import (
     MODEL_INVOCATION_SCHEMA_VERSION,
+    MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
     decode_model_invocation,
 )
+
+REQUEST_DIGEST = "a" * 64
 
 
 def _invocation(**changes: object) -> DurableModelInvocation:
@@ -20,8 +23,8 @@ def _invocation(**changes: object) -> DurableModelInvocation:
         "dispatch_attempt": 1,
         "idempotency_key": "idem_1",
         "dispatch_state": "reserved",
-        "request_digest": "request_digest_1",
-        "digest_generation": "request-v1",
+        "request_digest": REQUEST_DIGEST,
+        "digest_generation": MODEL_REQUEST_DIGEST_GENERATION,
     }
     values.update(changes)
     return DurableModelInvocation(**values)  # type: ignore[arg-type]
@@ -35,13 +38,13 @@ def _invocation(**changes: object) -> DurableModelInvocation:
         _invocation(
             revision=3,
             dispatch_state="settled",
-            receipt={"request_digest": "request_digest_1", "attempts": 1},
+            receipt={"request_digest": REQUEST_DIGEST, "attempts": 1},
             result_ref="blob:turn_1",
         ),
         _invocation(
             revision=3,
             dispatch_state="settled",
-            receipt={"request_digest": "request_digest_1", "attempts": 1},
+            receipt={"request_digest": REQUEST_DIGEST, "attempts": 1},
             failure_code="provider_refused",
         ),
         _invocation(revision=3, dispatch_state="unknown", failure_code="dispatch_unknown"),
@@ -60,6 +63,7 @@ def test_model_invocation_round_trips_every_state_shape(
 def test_model_invocation_reads_legacy_namespace_and_writes_canonical_namespace() -> None:
     payload = _invocation().to_json()
     payload["schema_version"] = "native-agent-runner.model-invocation.v1"
+    payload["digest_generation"] = "native-agent-runner.model-request-digest.v1"
 
     checked = decode_model_invocation(payload)
 
@@ -67,6 +71,7 @@ def test_model_invocation_reads_legacy_namespace_and_writes_canonical_namespace(
     assert checked.value is not None
     assert checked.value.schema_version == "native-agent-runner.model-invocation.v1"
     assert checked.value.to_json()["schema_version"] == MODEL_INVOCATION_SCHEMA_VERSION
+    assert checked.value.to_json()["digest_generation"] == MODEL_REQUEST_DIGEST_GENERATION
 
 
 def test_model_invocation_checked_reader_distinguishes_corrupt_and_future() -> None:
@@ -89,11 +94,17 @@ def test_model_invocation_checked_reader_distinguishes_corrupt_and_future() -> N
         {"dispatch_attempt": 0},
         {"dispatch_attempt": True},
         {"idempotency_key": ""},
+        {"idempotency_key": "contains spaces"},
         {"dispatch_state": "sent"},
         {"request_digest": ""},
+        {"request_digest": "A" * 64},
+        {"request_digest": "private prompt"},
         {"digest_generation": ""},
+        {"digest_generation": "request-v1"},
         {"result_ref": 1},
+        {"result_ref": "private result text"},
         {"failure_code": 1},
+        {"failure_code": "private failure text"},
     ),
 )
 def test_model_invocation_rejects_invalid_identity_and_scalar_fields(
@@ -170,7 +181,7 @@ def test_model_invocation_receipt_allows_safe_camel_case_evidence_fields() -> No
     invocation = _invocation(
         dispatch_state="settled",
         receipt={
-            "requestDigest": "digest_1",
+            "requestDigest": REQUEST_DIGEST,
             "providerRequestId": "request_1",
             "responseId": "response_1",
             "providerResponseId": "response_1",
@@ -180,7 +191,7 @@ def test_model_invocation_receipt_allows_safe_camel_case_evidence_fields() -> No
     )
 
     assert invocation.receipt == {
-        "request_digest": "digest_1",
+        "request_digest": REQUEST_DIGEST,
         "provider_request_id": "request_1",
         "response_id": "response_1",
         "provider_response_id": "response_1",
@@ -201,7 +212,7 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
             "providerRequestId": "provider_request_1",
             "providerResponseId": "provider_response_1",
             "providerRetried": True,
-            "requestDigest": "digest_1",
+            "requestDigest": REQUEST_DIGEST,
             "requestId": "request_1",
             "responseId": "response_1",
             "retryable": False,
@@ -272,6 +283,47 @@ def test_model_invocation_receipt_is_detached_on_input_and_output() -> None:
     assert invocation.receipt == {"usage": {"input_tokens": 3}, "attempts": 1}
 
 
+@pytest.mark.parametrize("receipt_digest", ("private prompt", "A" * 64, "b" * 64))
+def test_model_invocation_receipt_requires_the_same_recorded_request_digest(
+    receipt_digest: str,
+) -> None:
+    with pytest.raises(ValueError, match="request_digest"):
+        _invocation(
+            dispatch_state="settled",
+            receipt={"request_digest": receipt_digest, "attempts": 1},
+            result_ref="blob:turn",
+        )
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    (
+        {"requestId": "private prompt"},
+        {"providerErrorCode": "private error"},
+        {"startedAt": "not-a-timestamp"},
+        {"providerRetried": "false"},
+        {"latencyMs": -1},
+        {"durationMs": math.inf},
+        {"attempts": 0},
+        {"httpStatus": 99},
+        {"usage": {"inputTokens": True}},
+        {"usage": {"inputTokens": -1}},
+        {"usage": {"privateCounter": 1}},
+        {"requestDigest": REQUEST_DIGEST, "request_digest": REQUEST_DIGEST},
+        {"usage": {"inputTokens": 1, "input_tokens": 1}},
+    ),
+)
+def test_model_invocation_receipt_rejects_values_outside_safe_evidence_shapes(
+    receipt: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        _invocation(
+            dispatch_state="settled",
+            receipt=receipt,
+            result_ref="blob:turn",
+        )
+
+
 def test_model_invocation_receipt_rejects_nonfinite_numbers_and_cycles() -> None:
     with pytest.raises(ValueError, match="portable JSON"):
         _invocation(
@@ -313,6 +365,6 @@ def test_model_invocation_constructor_is_keyword_only() -> None:
             1,
             "idem_1",
             "reserved",
-            "digest_1",
-            "request-v1",
+            REQUEST_DIGEST,
+            MODEL_REQUEST_DIGEST_GENERATION,
         )

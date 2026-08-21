@@ -28,8 +28,8 @@
           "dispatch_attempt": 1,
           "idempotency_key": "fixture_key",
           "dispatch_state": "unknown",
-          "request_digest": "fixture_request_digest",
-          "digest_generation": "request-v1",
+          "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "digest_generation": "monoid.model-request-digest.v1",
           "receipt": null,
           "result_ref": "",
           "failure_code": "dispatch_unknown"
@@ -89,10 +89,10 @@
         "dispatch_attempt": 1,
         "idempotency_key": "fixture_key",
         "dispatch_state": "settled",
-        "request_digest": "fixture_request_digest",
-        "digest_generation": "request-v1",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "monoid.model-request-digest.v1",
         "receipt": {
-          "request_digest": "fixture_request_digest",
+          "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "attempts": 1
         },
         "result_ref": "blob:fixture_turn",
@@ -112,8 +112,8 @@
         "dispatch_attempt": 1,
         "idempotency_key": "fixture_key",
         "dispatch_state": "reserved",
-        "request_digest": "fixture_request_digest",
-        "digest_generation": "request-v1"
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "monoid.model-request-digest.v1"
       }
     },
     {

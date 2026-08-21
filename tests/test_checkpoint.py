@@ -458,8 +458,8 @@ def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: P
         dispatch_attempt=1,
         idempotency_key="idem_1",
         dispatch_state="reserved",
-        request_digest="request_digest_1",
-        digest_generation="request-v1",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
     )
     invocation_payload = invocation.to_json()
     invocation_payload["schema_version"] = "native-agent-runner.model-invocation.v1"
@@ -577,8 +577,8 @@ def test_v022_additive_checkpoint_fields_round_trip_under_v1_schema(tmp_path: Pa
         dispatch_attempt=1,
         idempotency_key="idem_1",
         dispatch_state="unknown",
-        request_digest="request_digest_1",
-        digest_generation="request-v1",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
         failure_code="dispatch_unknown",
     )
     checkpoint = RunCheckpoint(
@@ -646,8 +646,8 @@ def test_checkpoint_rejects_an_invocation_from_another_run() -> None:
         dispatch_attempt=1,
         idempotency_key="idem_1",
         dispatch_state="reserved",
-        request_digest="request_digest_1",
-        digest_generation="request-v1",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
     )
 
     checked = decode_checkpoint(
