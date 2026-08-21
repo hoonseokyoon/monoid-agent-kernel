@@ -69,6 +69,41 @@ def test_terminal_outcome_accepts_every_declared_retry_eligibility(
     )
 
 
+@pytest.mark.parametrize(
+    "eligibility",
+    (RetryEligibility.AFTER_RECONCILIATION, RetryEligibility.FORBIDDEN),
+)
+def test_dispatch_unknown_accepts_only_nonautomatic_retry_eligibility(
+    eligibility: RetryEligibility,
+) -> None:
+    outcome = TerminalOutcome(
+        run_id="run_1",
+        kind="dispatch_unknown",
+        retry_eligibility=eligibility,
+    )
+
+    assert outcome.retry_eligibility is eligibility
+
+
+@pytest.mark.parametrize(
+    "eligibility",
+    (
+        RetryEligibility.NOT_APPLICABLE,
+        RetryEligibility.SAFE,
+        RetryEligibility.AFTER_CONFIGURATION,
+    ),
+)
+def test_dispatch_unknown_rejects_automatic_retry_eligibility(
+    eligibility: RetryEligibility,
+) -> None:
+    with pytest.raises(ValueError, match="requires reconciliation"):
+        TerminalOutcome(
+            run_id="run_1",
+            kind="dispatch_unknown",
+            retry_eligibility=eligibility,
+        )
+
+
 @pytest.mark.parametrize("cause", tuple(InterruptionCause))
 def test_terminal_outcome_accepts_every_declared_interruption_cause(
     cause: InterruptionCause,
@@ -184,6 +219,28 @@ def test_terminal_outcome_reader_requires_a_versioned_nonempty_identity() -> Non
     for broken in ({**payload, "schema_version": ""}, {**payload, "run_id": ""}):
         with pytest.raises(ValueError):
             TerminalOutcome.from_json(broken)
+
+
+def test_terminal_outcome_rejects_equal_but_non_string_kind() -> None:
+    class EqualToCompleted:
+        def __eq__(self, other: object) -> bool:
+            return other == "completed"
+
+    with pytest.raises(ValueError, match="kind"):
+        TerminalOutcome(
+            run_id="run_1",
+            kind=EqualToCompleted(),  # type: ignore[arg-type]
+            retry_eligibility="not_applicable",
+        )
+
+    payload = TerminalOutcome(
+        run_id="run_1",
+        kind="completed",
+        retry_eligibility="not_applicable",
+    ).to_json()
+    payload["kind"] = EqualToCompleted()
+    with pytest.raises(ValueError, match="kind"):
+        TerminalOutcome.from_json(payload)
 
 
 @pytest.mark.parametrize(

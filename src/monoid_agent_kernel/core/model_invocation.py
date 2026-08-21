@@ -260,7 +260,9 @@ class DurableModelInvocation:
             raise ValueError("unsupported model invocation digest_generation")
         _require_positive_int(self.revision, "revision")
         _require_positive_int(self.dispatch_attempt, "dispatch_attempt")
-        if self.dispatch_state not in get_args(DispatchState):
+        if type(self.dispatch_state) is not str or self.dispatch_state not in get_args(
+            DispatchState
+        ):
             raise ValueError("model invocation dispatch_state is outside the durable vocabulary")
         _require_string(self.result_ref, "result_ref")
         _require_string(self.failure_code, "failure_code")

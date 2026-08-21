@@ -87,3 +87,16 @@ def test_parse_literal_rejects_unknown_values() -> None:
 
     with pytest.raises(WireValidationError):
         parse_literal({"status": "oops"}, "status", ("pending", "done"))
+
+
+def test_parse_literal_rejects_equal_but_non_exact_values() -> None:
+    class EqualToPending:
+        def __eq__(self, other: object) -> bool:
+            return other == "pending"
+
+    class PendingString(str):
+        pass
+
+    for value in (EqualToPending(), PendingString("pending")):
+        with pytest.raises(WireValidationError):
+            parse_literal({"status": value}, "status", ("pending", "done"))

@@ -83,6 +83,19 @@ def test_model_invocation_checked_reader_distinguishes_corrupt_and_future() -> N
     assert decode_model_invocation(future).status == "unsupported_version"
 
 
+def test_model_invocation_rejects_equal_but_non_string_dispatch_state() -> None:
+    class EqualToReserved:
+        def __eq__(self, other: object) -> bool:
+            return other == "reserved"
+
+    with pytest.raises(ValueError, match="dispatch_state"):
+        _invocation(dispatch_state=EqualToReserved())
+
+    payload = _invocation().to_json()
+    payload["dispatch_state"] = EqualToReserved()
+    assert decode_model_invocation(payload).status == "corrupt"
+
+
 @pytest.mark.parametrize(
     "field",
     ("prompt", "requestBody", "raw_response", "unknown_future_field"),

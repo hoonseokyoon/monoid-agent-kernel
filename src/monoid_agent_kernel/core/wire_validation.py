@@ -149,7 +149,7 @@ def parse_literal(
     *,
     default: _T | object = _MISSING,
 ) -> _T:
-    """Parse a field and require membership in ``allowed``."""
+    """Parse a field and require exact type-and-value membership in ``allowed``."""
 
     allowed_tuple = tuple(allowed)
     value = payload.get(key, _MISSING)
@@ -157,10 +157,11 @@ def parse_literal(
         if default is _MISSING:
             raise WireValidationError(f"{key} is required")
         value = default
-    if value not in allowed_tuple:
-        allowed_text = ", ".join(str(item) for item in allowed_tuple)
-        raise WireValidationError(f"{key} must be one of: {allowed_text}")
-    return value  # type: ignore[return-value]
+    for allowed_value in allowed_tuple:
+        if type(value) is type(allowed_value) and value == allowed_value:
+            return allowed_value
+    allowed_text = ", ".join(str(item) for item in allowed_tuple)
+    raise WireValidationError(f"{key} must be one of: {allowed_text}")
 
 
 def _validate(adapter: TypeAdapter[_T], value: Any, field: str, message: str) -> _T:

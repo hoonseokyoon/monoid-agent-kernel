@@ -87,6 +87,8 @@ lists every identifier this release can emit; most artifacts contain only `curre
 retry, and interruption vocabularies plus opaque output/evidence addresses in bounded
 `scheme:locator` form. It never carries a prompt, model response, reasoning item, replay payload,
 or raw provider exception. Its strict reader rejects fields outside the versioned top-level schema.
+A `dispatch_unknown` outcome permits only `after_reconciliation` or `forbidden` retry eligibility,
+so an ambiguous paid call cannot be classified for automatic retry.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The

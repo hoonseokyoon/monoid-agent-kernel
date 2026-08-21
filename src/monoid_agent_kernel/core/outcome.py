@@ -106,7 +106,7 @@ class TerminalOutcome:
             raise ValueError("unsupported terminal outcome schema")
         if not is_safe_opaque_id(self.run_id):
             raise ValueError("terminal outcome run_id must be a bounded opaque id")
-        if self.kind not in get_args(TerminalOutcomeKind):
+        if type(self.kind) is not str or self.kind not in get_args(TerminalOutcomeKind):
             raise ValueError("terminal outcome kind is outside the portable vocabulary")
         try:
             retry_eligibility = RetryEligibility(self.retry_eligibility)
@@ -115,6 +115,13 @@ class TerminalOutcome:
                 "terminal outcome retry_eligibility is outside the portable vocabulary"
             ) from exc
         object.__setattr__(self, "retry_eligibility", retry_eligibility)
+        if self.kind == "dispatch_unknown" and retry_eligibility not in {
+            RetryEligibility.AFTER_RECONCILIATION,
+            RetryEligibility.FORBIDDEN,
+        }:
+            raise ValueError(
+                "terminal outcome dispatch_unknown requires reconciliation or forbids retry"
+            )
         if self.interruption_cause is not None:
             try:
                 interruption_cause = InterruptionCause(self.interruption_cause)
