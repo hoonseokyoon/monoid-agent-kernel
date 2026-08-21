@@ -11,6 +11,7 @@ import pytest
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.core.media import blob_shas_in_messages
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.core.outcome import TerminalOutcome
 from monoid_agent_kernel.hosting import CommitResult, StorageCapabilities, WriterToken
@@ -1633,6 +1634,13 @@ def test_reusable_contract_rejects_malformed_blob_reference_suffixes() -> None:
     assert rules["FENCED-04-INVOCATION-LIFECYCLE"].status == "failed"
     assert checkpoint_observations["malformed_workspace_reference_status"] == ("committed")
     assert checkpoint_observations["malformed_media_reference_status"] == "committed"
+    assert (
+        checkpoint_observations["malformed_queued_media_content_list_reference_status"]
+        == "committed"
+    )
+    assert (
+        checkpoint_observations["malformed_queued_media_envelope_reference_status"] == "committed"
+    )
     assert invocation_observations["malformed_reference_status"] == "committed"
     assert invocation_observations["malformed_reference_head_not_published"] == 3
 
@@ -1665,6 +1673,38 @@ def test_reusable_contract_checks_media_references_inside_checkpoint_messages() 
     assert observations["missing_reference_status"] == "conflict"
     assert observations["missing_media_reference_status"] == "committed"
     assert observations["missing_media_reference_not_published"] == "loaded"
+
+
+class _MessageLogOnlyCheckpointReferenceSink(DeterministicFencedRunSink):
+    def _checkpoint_blob_references(self, checkpoint: RunCheckpoint) -> set[str]:
+        workspace_references = {
+            item["content_sha256"]
+            for item in checkpoint.workspace_delta
+            if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
+        }
+        return workspace_references | blob_shas_in_messages(tuple(checkpoint.messages))
+
+
+def _message_log_only_checkpoint_reference_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _MessageLogOnlyCheckpointReferenceSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_checks_each_queued_checkpoint_media_carrier() -> None:
+    outcomes = run_fenced_run_sink_contract(_message_log_only_checkpoint_reference_factory)
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    observations = {item.observation_id: item.actual for item in checkpoint_rule.observations}
+
+    assert checkpoint_rule.status == "failed"
+    assert observations["missing_media_reference_status"] == "conflict"
+    for carrier in ("content_list", "envelope"):
+        assert observations[f"missing_queued_media_{carrier}_reference_status"] == "committed"
+        assert observations[f"missing_queued_media_{carrier}_not_published"] == "loaded"
 
 
 class _SubmittedMapOnlyReferenceSink(DeterministicFencedRunSink):

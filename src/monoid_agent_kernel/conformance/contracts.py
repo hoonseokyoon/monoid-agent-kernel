@@ -37,6 +37,7 @@ from monoid_agent_kernel.core.checkpoint import (
     load_latest_checked,
 )
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
+from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.model_invocation import (
     ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS,
     ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS,
@@ -113,6 +114,7 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
 )
 _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset({"schema_version", "digest_generation"})
 _CONTRACT_RETRY_STABLE_IDENTITY_FIELDS = frozenset({"idempotency_key", "request_digest"})
+_CONTRACT_QUEUED_MEDIA_CARRIERS = ("content_list", "envelope")
 _CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
     {
         "schema_version",
@@ -707,6 +709,29 @@ def _contract_invocation(
         result_ref=result_ref,
         failure_code=failure_code,
     )
+
+
+def _contract_queued_media_entries(
+    run_id: str,
+    source_ref: str,
+) -> dict[str, Any]:
+    media_part = {
+        "type": "image",
+        "source_ref": source_ref,
+        "mime_type": "image/png",
+    }
+    entries = {
+        "content_list": [dict(media_part)],
+        "envelope": InboxMessage(
+            content=[dict(media_part)],
+            id="contract-queued-media",
+            run_id=run_id,
+            created_at=0.0,
+        ).to_json(),
+    }
+    if tuple(entries) != _CONTRACT_QUEUED_MEDIA_CARRIERS:
+        raise AssertionError("queued media carrier matrix is incomplete")
+    return entries
 
 
 def _contract_writer(
@@ -1742,6 +1767,49 @@ def _run_fenced_run_sink_contract(
             missing_media_recovery_load.value,
             _CONTRACT_UNRESOLVED_BLOB_SHA256,
         )
+        missing_queued_media_evidence: dict[
+            str,
+            tuple[str, str, str, str | None],
+        ] = {}
+        for carrier in _CONTRACT_QUEUED_MEDIA_CARRIERS:
+            queued_harness = factory()
+            queued_run_id = _contract_run_id(
+                namespace,
+                f"checkpoint-missing-queued-media-{carrier.replace('_', '-')}",
+            )
+            queued_entry = _contract_queued_media_entries(
+                queued_run_id,
+                f"blob:{_CONTRACT_UNRESOLVED_BLOB_SHA256}",
+            )[carrier]
+            queued_token = _contract_writer(queued_harness, queued_run_id)
+            queued_checkpoint = RunCheckpoint(
+                run_id=queued_run_id,
+                seq=1,
+                queued_messages=[queued_entry],
+            )
+            rejected = queued_harness.sink.commit_checkpoint(
+                queued_checkpoint,
+                {},
+                writer_token=queued_token,
+            )
+            queued_harness = queued_harness.reopen()
+            rejected_load = queued_harness.sink.latest_checked(queued_run_id)
+            recovered = queued_harness.sink.commit_checkpoint(
+                queued_checkpoint,
+                {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
+                writer_token=queued_token,
+            )
+            queued_harness = queued_harness.reopen()
+            recovered_load = queued_harness.sink.latest_checked(queued_run_id)
+            missing_queued_media_evidence[carrier] = (
+                rejected.status,
+                rejected_load.status,
+                recovered.status,
+                _contract_blob_hex(
+                    recovered_load.value,
+                    _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                ),
+            )
         malformed_workspace_harness = factory()
         malformed_workspace_run_id = _contract_run_id(
             namespace,
@@ -1802,6 +1870,33 @@ def _run_fenced_run_sink_contract(
         )
         malformed_media_harness = malformed_media_harness.reopen()
         malformed_media_load = malformed_media_harness.sink.latest_checked(malformed_media_run_id)
+        malformed_queued_media_evidence: dict[str, tuple[str, str]] = {}
+        for carrier in _CONTRACT_QUEUED_MEDIA_CARRIERS:
+            queued_harness = factory()
+            queued_run_id = _contract_run_id(
+                namespace,
+                f"checkpoint-malformed-queued-media-{carrier.replace('_', '-')}",
+            )
+            queued_entry = _contract_queued_media_entries(
+                queued_run_id,
+                f"blob:{_CONTRACT_MALFORMED_BLOB_SHA256}",
+            )[carrier]
+            queued_token = _contract_writer(queued_harness, queued_run_id)
+            malformed = queued_harness.sink.commit_checkpoint(
+                RunCheckpoint(
+                    run_id=queued_run_id,
+                    seq=1,
+                    queued_messages=[queued_entry],
+                ),
+                {},
+                writer_token=queued_token,
+            )
+            queued_harness = queued_harness.reopen()
+            malformed_load = queued_harness.sink.latest_checked(queued_run_id)
+            malformed_queued_media_evidence[carrier] = (
+                malformed.status,
+                malformed_load.status,
+            )
         backing_harness = factory()
         backing_run_id = _contract_run_id(
             namespace,
@@ -1842,6 +1937,12 @@ def _run_fenced_run_sink_contract(
                     ],
                 }
             ],
+            queued_messages=list(
+                _contract_queued_media_entries(
+                    backing_run_id,
+                    f"blob:{_CONTRACT_CHECKPOINT_BLOB_SHA256}",
+                ).values()
+            ),
             workspace_delta=[
                 {
                     "path": "backing-reuse.txt",
@@ -2197,6 +2298,38 @@ def _run_fenced_run_sink_contract(
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
                         actual=missing_media_recovery_bytes,
                     ),
+                    *(
+                        observation(
+                            f"missing_queued_media_{carrier}_reference_status",
+                            expected="conflict",
+                            actual=evidence[0],
+                        )
+                        for carrier, evidence in missing_queued_media_evidence.items()
+                    ),
+                    *(
+                        observation(
+                            f"missing_queued_media_{carrier}_not_published",
+                            expected="missing",
+                            actual=evidence[1],
+                        )
+                        for carrier, evidence in missing_queued_media_evidence.items()
+                    ),
+                    *(
+                        observation(
+                            f"missing_queued_media_{carrier}_recovery",
+                            expected="committed",
+                            actual=evidence[2],
+                        )
+                        for carrier, evidence in missing_queued_media_evidence.items()
+                    ),
+                    *(
+                        observation(
+                            f"missing_queued_media_{carrier}_recovery_bytes",
+                            expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
+                            actual=evidence[3],
+                        )
+                        for carrier, evidence in missing_queued_media_evidence.items()
+                    ),
                     observation(
                         "malformed_workspace_reference_status",
                         expected="conflict",
@@ -2216,6 +2349,22 @@ def _run_fenced_run_sink_contract(
                         "malformed_media_reference_not_published",
                         expected="missing",
                         actual=malformed_media_load.status,
+                    ),
+                    *(
+                        observation(
+                            f"malformed_queued_media_{carrier}_reference_status",
+                            expected="conflict",
+                            actual=evidence[0],
+                        )
+                        for carrier, evidence in malformed_queued_media_evidence.items()
+                    ),
+                    *(
+                        observation(
+                            f"malformed_queued_media_{carrier}_not_published",
+                            expected="missing",
+                            actual=evidence[1],
+                        )
+                        for carrier, evidence in malformed_queued_media_evidence.items()
                     ),
                     observation(
                         "authoritative_backing_reference_statuses",

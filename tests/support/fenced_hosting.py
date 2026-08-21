@@ -92,7 +92,17 @@ class DeterministicFencedRunSink:
             for item in checkpoint.workspace_delta
             if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
         }
-        return workspace_references | blob_shas_in_messages(tuple(checkpoint.messages))
+        queued_message_carriers: list[dict[str, Any]] = []
+        for message in checkpoint.queued_messages:
+            if isinstance(message, list):
+                queued_message_carriers.append({"content": message})
+            elif isinstance(message, dict):
+                queued_message_carriers.append(message)
+        return (
+            workspace_references
+            | blob_shas_in_messages(tuple(checkpoint.messages))
+            | blob_shas_in_messages(tuple(queued_message_carriers))
+        )
 
     def _reference_is_available(
         self,
