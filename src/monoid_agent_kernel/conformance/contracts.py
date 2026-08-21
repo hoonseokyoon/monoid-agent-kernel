@@ -78,6 +78,10 @@ _CONTRACT_ALTERNATE_BLOB = b"alternate contract blob bytes\n"
 _CONTRACT_ALTERNATE_BLOB_SHA256 = hashlib.sha256(_CONTRACT_ALTERNATE_BLOB).hexdigest()
 _CONTRACT_UNRESOLVED_BLOB = b"contract reference recovery bytes\n"
 _CONTRACT_UNRESOLVED_BLOB_SHA256 = hashlib.sha256(_CONTRACT_UNRESOLVED_BLOB).hexdigest()
+_CONTRACT_STALE_HANDOFF_BLOB = b"stale writer handoff-only blob bytes\n"
+_CONTRACT_STALE_HANDOFF_BLOB_SHA256 = hashlib.sha256(
+    _CONTRACT_STALE_HANDOFF_BLOB
+).hexdigest()
 _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
     generation
     for generation in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
@@ -774,9 +778,17 @@ def _contract_handoff_write(
     writer_token: WriterToken,
     *,
     mutation: str,
-    value: Any,
-    blobs: Mapping[str, bytes],
+    stale_token: WriterToken,
+    stale_value: Any,
+    stale_blobs: Mapping[str, bytes],
+    current_value: Any,
+    current_blobs: Mapping[str, bytes],
 ) -> CommitResult:
+    value, blobs = (
+        (stale_value, stale_blobs)
+        if writer_token == stale_token
+        else (current_value, current_blobs)
+    )
     return _contract_race_write(
         sink,
         mutation=mutation,
@@ -889,18 +901,78 @@ def _contract_race_blob_hex(
     harness: FencedRunSinkHarness,
     mutation: str,
     run_id: str,
+    sha256: str | None = None,
 ) -> str | None:
     if mutation == "checkpoint":
         return _contract_blob_hex(
             harness.sink.latest_checked(run_id).value,
-            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+            sha256 or _CONTRACT_CHECKPOINT_BLOB_SHA256,
         )
     if mutation == "invocation":
         return _contract_blob_hex(
             harness.sink.load_invocation(run_id, "call-1").value,
-            _CONTRACT_INVOCATION_BLOB_SHA256,
+            sha256 or _CONTRACT_INVOCATION_BLOB_SHA256,
         )
     return None
+
+
+def _contract_stale_handoff_blob_probe(
+    harness: FencedRunSinkHarness,
+    mutation: str,
+    run_id: str,
+    writer_token: WriterToken,
+) -> str:
+    if mutation == "checkpoint":
+        checkpoint = RunCheckpoint(
+            run_id=run_id,
+            seq=2,
+            workspace_delta=[
+                {
+                    "path": "stale-handoff-probe.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_STALE_HANDOFF_BLOB_SHA256,
+                }
+            ],
+        )
+        return harness.sink.commit_checkpoint(
+            checkpoint,
+            {},
+            writer_token=writer_token,
+        ).status
+    if mutation == "invocation":
+        logical_call_id = "stale-handoff-probe"
+        setup_statuses = tuple(
+            harness.sink.commit_invocation(
+                _contract_invocation(
+                    run_id,
+                    logical_call_id=logical_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=writer_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        if setup_statuses != ("committed", "committed"):
+            return f"setup:{','.join(setup_statuses)}"
+        settled = replace(
+            _contract_invocation(
+                run_id,
+                logical_call_id=logical_call_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            ),
+            result_ref=f"blob:{_CONTRACT_STALE_HANDOFF_BLOB_SHA256}",
+        )
+        return harness.sink.commit_invocation(
+            settled,
+            {},
+            writer_token=writer_token,
+        ).status
+    return "not_applicable"
 
 
 def _contract_mutation_payload_digest(mutation: str, value: Any) -> str:
@@ -2081,6 +2153,31 @@ def _run_fenced_run_sink_contract(
             {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
             writer_token=stale,
         )
+        partial_authority_malformed_statuses = {}
+        for authority_case, invalid_token in {
+            "stale_generation_current_owner": WriterToken(
+                run_id=run_id,
+                owner_id=current.owner_id,
+                generation=stale.generation,
+            ),
+            "wrong_owner_current_generation": WriterToken(
+                run_id=run_id,
+                owner_id=stale.owner_id,
+                generation=current.generation,
+            ),
+        }.items():
+            partial_authority_malformed_statuses[authority_case] = {
+                "checkpoint": harness.sink.commit_checkpoint(
+                    checkpoint,
+                    {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    writer_token=invalid_token,
+                ).status,
+                "invocation": harness.sink.commit_invocation(
+                    invocation,
+                    {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    writer_token=invalid_token,
+                ).status,
+            }
         stale_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
         current_checkpoint = harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=run_id, seq=2, final_text="current"),
@@ -2179,13 +2276,42 @@ def _run_fenced_run_sink_contract(
                         handoff_run_id,
                         handoff_stale,
                     )
-                handoff_value, _ = _contract_competing_values(mutation, handoff_run_id)
-                handoff_blobs = _contract_mutation_blobs(mutation)
+                current_value, _ = _contract_competing_values(mutation, handoff_run_id)
+                current_blobs = _contract_mutation_blobs(mutation)
+                if mutation == "checkpoint":
+                    stale_value = replace(
+                        current_value,
+                        workspace_delta=[
+                            {
+                                "path": "stale-handoff.txt",
+                                "kind": "file",
+                                "change_kind": "created",
+                                "content_sha256": _CONTRACT_STALE_HANDOFF_BLOB_SHA256,
+                            }
+                        ],
+                    )
+                    stale_blobs = {
+                        _CONTRACT_STALE_HANDOFF_BLOB_SHA256: _CONTRACT_STALE_HANDOFF_BLOB,
+                    }
+                elif mutation == "invocation":
+                    stale_value = replace(
+                        current_value,
+                        result_ref=f"blob:{_CONTRACT_STALE_HANDOFF_BLOB_SHA256}",
+                    )
+                    stale_blobs = {
+                        _CONTRACT_STALE_HANDOFF_BLOB_SHA256: _CONTRACT_STALE_HANDOFF_BLOB,
+                    }
+                else:
+                    stale_value = current_value
+                    stale_blobs = current_blobs
                 handoff_write = partial(
                     _contract_handoff_write,
                     mutation=mutation,
-                    value=handoff_value,
-                    blobs=handoff_blobs,
+                    stale_token=handoff_stale,
+                    stale_value=stale_value,
+                    stale_blobs=stale_blobs,
+                    current_value=current_value,
+                    current_blobs=current_blobs,
                 )
                 stale_result, current_result, rotation_first = (
                     handoff_harness.race_writer_handoff(
@@ -2198,7 +2324,12 @@ def _run_fenced_run_sink_contract(
                 expected_statuses = (
                     ("fenced", "committed")
                     if rotation_first
-                    else ("committed", "already_committed")
+                    else (
+                        "committed",
+                        "conflict"
+                        if mutation in {"checkpoint", "invocation"}
+                        else "already_committed",
+                    )
                 )
                 handoff_observations.append(
                     observation(
@@ -2208,19 +2339,43 @@ def _run_fenced_run_sink_contract(
                     )
                 )
                 if mutation in {"checkpoint", "invocation"}:
+                    winner_blob = (
+                        _CONTRACT_CHECKPOINT_BLOB
+                        if rotation_first and mutation == "checkpoint"
+                        else _CONTRACT_INVOCATION_BLOB
+                        if rotation_first
+                        else _CONTRACT_STALE_HANDOFF_BLOB
+                    )
+                    winner_blob_sha256 = (
+                        _CONTRACT_CHECKPOINT_BLOB_SHA256
+                        if rotation_first and mutation == "checkpoint"
+                        else _CONTRACT_INVOCATION_BLOB_SHA256
+                        if rotation_first
+                        else _CONTRACT_STALE_HANDOFF_BLOB_SHA256
+                    )
                     handoff_observations.append(
                         observation(
                             f"handoff_{handoff_kind}_{mutation}_blob_bytes",
-                            expected=(
-                                _CONTRACT_CHECKPOINT_BLOB.hex()
-                                if mutation == "checkpoint"
-                                else _CONTRACT_INVOCATION_BLOB.hex()
-                            ),
+                            expected=winner_blob.hex(),
                             actual=_contract_race_blob_hex(
                                 handoff_harness.reopen(),
                                 mutation,
                                 handoff_run_id,
+                                winner_blob_sha256,
                             ),
+                        )
+                    )
+                    stale_blob_probe = _contract_stale_handoff_blob_probe(
+                        handoff_harness.reopen(),
+                        mutation,
+                        handoff_run_id,
+                        handoff_current,
+                    )
+                    handoff_observations.append(
+                        observation(
+                            f"handoff_{handoff_kind}_{mutation}_stale_blob_visibility",
+                            expected="conflict" if rotation_first else "committed",
+                            actual=stale_blob_probe,
                         )
                     )
         outcomes.append(
@@ -2258,6 +2413,17 @@ def _run_fenced_run_sink_contract(
                         "stale_malformed_invocation",
                         expected="fenced",
                         actual=stale_malformed_invocation.status,
+                    ),
+                    *(
+                        observation(
+                            f"malformed_{authority_case}_{mutation}",
+                            expected="fenced",
+                            actual=status,
+                        )
+                        for authority_case, mutation_statuses in (
+                            partial_authority_malformed_statuses.items()
+                        )
+                        for mutation, status in mutation_statuses.items()
                     ),
                     observation(
                         "stale_terminal", expected="fenced", actual=stale_terminal.status

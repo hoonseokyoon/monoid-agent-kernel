@@ -948,6 +948,10 @@ def test_reusable_contract_checks_fencing_before_malformed_blob_validation() -> 
         "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY": (
             "stale_malformed_checkpoint",
             "stale_malformed_invocation",
+            "malformed_stale_generation_current_owner_checkpoint",
+            "malformed_stale_generation_current_owner_invocation",
+            "malformed_wrong_owner_current_generation_checkpoint",
+            "malformed_wrong_owner_current_generation_invocation",
         ),
         "FENCED-06-WRITER-TOKEN-RUN-BINDING": (
             "cross_run_malformed_checkpoint",
@@ -2584,9 +2588,6 @@ def test_reusable_contract_rejects_write_published_after_rotation(mutation: str)
     assert handoff_observation.actual == ("committed", "already_committed")
 
 
-_CORRUPTED_HANDOFF_BLOB = b"stale blob publication after writer rotation"
-
-
 class _BlobOutsideWriterHandoffHarness(DeterministicFencedRunHarness):
     broken_mutation = ""
 
@@ -2597,29 +2598,20 @@ class _BlobOutsideWriterHandoffHarness(DeterministicFencedRunHarness):
         current_token: WriterToken,
         write,
     ) -> tuple[CommitResult, CommitResult, bool]:
-        result = super().race_writer_handoff(
-            mutation,
-            stale_token,
-            current_token,
-            write,
-        )
         if mutation != self.broken_mutation:
-            return result
+            return super().race_writer_handoff(
+                mutation,
+                stale_token,
+                current_token,
+                write,
+            )
+        self.set_current_writer(current_token)
+        stale_result = write(self.sink, stale_token)
+        stale_blobs = write.keywords["stale_blobs"]
         with self.sink._lock:
-            if mutation == "checkpoint":
-                record = self.sink._checkpoints[(stale_token.run_id, 1)][1]
-                record._blob_reader = lambda sha256: _CORRUPTED_HANDOFF_BLOB
-            elif mutation == "invocation":
-                key = (stale_token.run_id, "call-1", 3)
-                digest, record = self.sink._invocations[key]
-                self.sink._invocations[key] = (
-                    digest,
-                    replace(
-                        record,
-                        _blob_reader=lambda sha256: _CORRUPTED_HANDOFF_BLOB,
-                    ),
-                )
-        return result
+            self.sink._publish_blobs(stale_token.run_id, stale_blobs)
+        current_result = write(self.sink, current_token)
+        return stale_result, current_result, True
 
 
 def _blob_outside_handoff_factory(mutation: str):
@@ -2644,12 +2636,13 @@ def test_reusable_contract_keeps_blobs_inside_writer_handoff_fencing(
     blob_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id == f"handoff_lease_renewal_{mutation}_blob_bytes"
+        if observation.observation_id
+        == f"handoff_lease_renewal_{mutation}_stale_blob_visibility"
     )
 
     assert fence_rule.status == "failed"
-    assert blob_observation.actual == _CORRUPTED_HANDOFF_BLOB.hex()
-    assert blob_observation.actual != blob_observation.expected
+    assert blob_observation.expected == "conflict"
+    assert blob_observation.actual == "committed"
 
 
 class _CloseTrackingHarness:

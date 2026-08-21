@@ -493,8 +493,13 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 연 facade를 직접 닫는다. Backend CAS를 검증하면서 database session이나 client facade의 cross-thread
 안전성을 요구하지 않는다.
 별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
-직렬화되면 stale write는 `fenced`, write가 먼저 직렬화되면 새 generation retry가
-`already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.
+직렬화되면 stale write는 `fenced`다. Write가 먼저 직렬화되면 stale write가 `committed`다. Event와
+terminal의 새 generation retry는 `already_committed`이고, 서로 다른 blob content를 쓰는 checkpoint와
+invocation retry는 `conflict`다. Blob mutation의 stale callback과 current callback은 서로 다른 digest를
+제출한다. Rotation-first 경로에서는 stale 전용 digest를 빈 map으로 참조할 수 없어야 하며,
+write-first 경로에서는 같은 참조가 authoritative backing에서 해소되어야 한다. Current callback은
+stale 전용 bytes를 제출하지 않는다. 이 probe가 metadata fencing 밖의 stale blob publication을
+검출한다.
 Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
 reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
 generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
@@ -516,8 +521,9 @@ loser payload를 공개하는 adapter는 이 검증을 통과하지 못한다.
 5. 새 mutation을 commit하고 `committed`를 반환한다.
 
 Stale writer의 identical retry도 `fenced`다. Fencing 판정이 idempotency 판정보다 먼저다.
-Stale token과 다른 run token에 malformed checkpoint/invocation blob map을 결합해도 `fenced`다.
-Blob digest 검증은 run binding과 현재 writer 검증 뒤에만 실행한다.
+Stale owner+generation, current owner+stale generation, wrong owner+current generation, 다른 run token에
+malformed checkpoint/invocation blob map을 각각 결합해도 `fenced`다. Blob digest 검증은 run binding과
+owner/generation 검증 뒤에만 실행한다.
 
 Resource key는 다음과 같다.
 
@@ -1066,7 +1072,10 @@ Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mu
 조합의 잘못된 `CommitResult` mutant를 거부한다. Blob 검증은 잘못된 bytes와 대문자 digest를 독립
 축으로 검사하고, workspace·message media·invocation result 참조를 submitted map과 same-run backing
 두 해소 경로에서 확인한다. Terminal invocation 재시도는 unknown의 failure-code 유무, success의
-retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다.
+retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
+owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
+서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
+확인한다.
 
 ### 14.6 최종 통합 PR
 
