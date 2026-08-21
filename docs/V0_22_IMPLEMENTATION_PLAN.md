@@ -597,6 +597,9 @@ blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재
 재개방한 canonical payload에 그대로 남는다.
 Run A에만 존재하는 digest를 run B가 빈 map으로 참조하면 checkpoint와 invocation 모두 `conflict`다.
 Content-addressed blob namespace는 run 권위 경계를 포함한다.
+Run A token으로 run B payload와 valid blob을 제출한 fenced write는 run B backing에 bytes를 공개하지
+않는다. Run B current token의 같은 digest empty-map 참조가 계속 `conflict`인지 checkpoint와 invocation
+각각에서 확인한다.
 Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
 직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
 기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
@@ -618,7 +621,9 @@ attempt N reserved
 state regression, settled success 뒤 새 attempt는 `conflict`다. Successful settlement의 receipt에
 `retryable=true`가 있어도 성공 결과가 우선하며 새 paid dispatch를 열지 않는다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
-유지한다. Contract는 revision 4 뒤 revision 1, 2, 3을 각각 재전송하고 매번 head 4를 확인한다.
+유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
+유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 altered retry를 각각 실행하고
+매번 head 4를 확인한다.
 같은 run 안의 여러 logical call은 `(run_id, logical_call_id)`마다 독립 head를 유지한다. 둘째 call을
 commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 logical call은 `missing`과 빈 value를
 반환한다. Per-run last-invocation pointer 구현은 이 복구 검증에서 실패한다.
@@ -1112,6 +1117,8 @@ Fence precedence는 existing coordinate의 동일 payload·conflicting payload·
 coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
+Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를
+유지한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
 
 ### 14.6 최종 통합 PR
 

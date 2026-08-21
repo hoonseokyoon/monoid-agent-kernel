@@ -3407,6 +3407,7 @@ def _run_fenced_run_sink_contract(
         )
         harness = harness.reopen()
         old_revision_retries: dict[int, tuple[str, int | None]] = {}
+        old_revision_conflicts: dict[int, tuple[str, int | None]] = {}
         for old_invocation in (
             reserved_invocation,
             started_invocation,
@@ -3421,6 +3422,19 @@ def _run_fenced_run_sink_contract(
             old_revision_retries[old_invocation.revision] = (
                 retry.status,
                 reloaded.sequence,
+            )
+            conflicting_retry = harness.sink.commit_invocation(
+                replace(
+                    old_invocation,
+                    dispatch_id=f"dispatch-historical-conflict-{old_invocation.revision}",
+                ),
+                {},
+                writer_token=token,
+            )
+            reloaded_after_conflict = harness.sink.load_invocation(run_id, "call-1")
+            old_revision_conflicts[old_invocation.revision] = (
+                conflicting_retry.status,
+                reloaded_after_conflict.sequence,
             )
         loaded = harness.sink.load_invocation(run_id, "call-1")
 
@@ -3554,6 +3568,14 @@ def _run_fenced_run_sink_contract(
                             actual=status_and_head,
                         )
                         for revision, status_and_head in old_revision_retries.items()
+                    ),
+                    *(
+                        observation(
+                            f"old_revision_{revision}_conflict_and_head",
+                            expected=("conflict", 4),
+                            actual=status_and_head,
+                        )
+                        for revision, status_and_head in old_revision_conflicts.items()
                     ),
                     observation("latest_load", expected="loaded", actual=loaded.status),
                     observation("latest_revision", expected=4, actual=loaded.sequence),
@@ -4121,6 +4143,34 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=run_a_token,
         )
+        swapped_blob_checkpoint_record = RunCheckpoint(
+            run_id=run_b_id,
+            seq=2,
+            workspace_delta=[
+                {
+                    "path": "cross-run-only-checkpoint-blob.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_STALE_HANDOFF_BLOB_SHA256,
+                }
+            ],
+        )
+        swapped_blob_checkpoint = harness.sink.commit_checkpoint(
+            swapped_blob_checkpoint_record,
+            {_CONTRACT_STALE_HANDOFF_BLOB_SHA256: _CONTRACT_STALE_HANDOFF_BLOB},
+            writer_token=run_a_token,
+        )
+        swapped_blob_invocation_record = _contract_invocation(
+            run_b_id,
+            logical_call_id="cross-run-blob-call",
+            revision=1,
+            dispatch_state="reserved",
+        )
+        swapped_blob_invocation = harness.sink.commit_invocation(
+            swapped_blob_invocation_record,
+            {_CONTRACT_ALTERNATE_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=run_a_token,
+        )
         swapped_malformed_checkpoint = harness.sink.commit_checkpoint(
             checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
@@ -4209,6 +4259,38 @@ def _run_fenced_run_sink_contract(
             canonical_sha256(loaded_a_terminal.to_json()) if loaded_a_terminal else None,
             canonical_sha256(loaded_b_terminal.to_json()) if loaded_b_terminal else None,
         )
+        cross_run_checkpoint_blob_leak = harness.sink.commit_checkpoint(
+            swapped_blob_checkpoint_record,
+            {},
+            writer_token=run_b_token,
+        )
+        cross_run_invocation_blob_setup = tuple(
+            harness.sink.commit_invocation(
+                _contract_invocation(
+                    run_b_id,
+                    logical_call_id="cross-run-blob-call",
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=run_b_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        cross_run_invocation_blob_leak = harness.sink.commit_invocation(
+            replace(
+                _contract_invocation(
+                    run_b_id,
+                    logical_call_id="cross-run-blob-call",
+                    revision=3,
+                    dispatch_state="settled",
+                    succeeded=True,
+                ),
+                result_ref=f"blob:{_CONTRACT_ALTERNATE_BLOB_SHA256}",
+            ),
+            {},
+            writer_token=run_b_token,
+        )
 
         cross_blob_harness = factory()
         cross_blob_run_a_id = _contract_run_id(namespace, "blob-run-a")
@@ -4293,6 +4375,31 @@ def _run_fenced_run_sink_contract(
                         "cross_run_invocation",
                         expected="fenced",
                         actual=swapped_invocation.status,
+                    ),
+                    observation(
+                        "cross_run_blob_checkpoint",
+                        expected="fenced",
+                        actual=swapped_blob_checkpoint.status,
+                    ),
+                    observation(
+                        "cross_run_blob_invocation",
+                        expected="fenced",
+                        actual=swapped_blob_invocation.status,
+                    ),
+                    observation(
+                        "cross_run_checkpoint_blob_not_published",
+                        expected="conflict",
+                        actual=cross_run_checkpoint_blob_leak.status,
+                    ),
+                    observation(
+                        "cross_run_invocation_blob_setup",
+                        expected=("committed", "committed"),
+                        actual=cross_run_invocation_blob_setup,
+                    ),
+                    observation(
+                        "cross_run_invocation_blob_not_published",
+                        expected="conflict",
+                        actual=cross_run_invocation_blob_leak.status,
                     ),
                     observation(
                         "cross_run_malformed_checkpoint",

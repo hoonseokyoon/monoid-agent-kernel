@@ -681,6 +681,65 @@ def test_reusable_contract_reads_each_runs_complete_payload(mutation: str) -> No
     assert payload_observation.actual != payload_observation.expected
 
 
+class _CrossRunBlobPublishingSink(DeterministicFencedRunSink):
+    def _publish_valid_cross_run_blobs(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+        writer_token: WriterToken,
+    ) -> None:
+        if writer_token.run_id != run_id and self._blobs_are_content_addressed(blobs):
+            self._publish_blobs(run_id, blobs)
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        self._publish_valid_cross_run_blobs(checkpoint.run_id, blobs, writer_token)
+        return super().commit_checkpoint(
+            checkpoint,
+            blobs,
+            writer_token=writer_token,
+        )
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        self._publish_valid_cross_run_blobs(invocation.run_id, blobs, writer_token)
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+def _cross_run_blob_publishing_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _CrossRunBlobPublishingSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_keeps_cross_run_blobs_inside_the_fence() -> None:
+    outcomes = run_fenced_run_sink_contract(_cross_run_blob_publishing_factory)
+    binding_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
+    )
+    observations = {item.observation_id: item.actual for item in binding_rule.observations}
+
+    assert binding_rule.status == "failed"
+    assert observations["cross_run_blob_checkpoint"] == "fenced"
+    assert observations["cross_run_blob_invocation"] == "fenced"
+    assert observations["cross_run_checkpoint_blob_not_published"] == "committed"
+    assert observations["cross_run_invocation_blob_not_published"] == "committed"
+
+
 def _missing_capability_factory() -> DeterministicFencedRunHarness:
     harness = DeterministicFencedRunHarness()
     harness.sink.capabilities = StorageCapabilities(
@@ -1585,6 +1644,51 @@ def test_reusable_contract_rejects_each_old_invocation_head_regression(
     assert lifecycle_rule.status == "failed"
     assert head_observation.expected == ("already_committed", 4)
     assert head_observation.actual == ("already_committed", revision)
+
+
+class _HistoricalRevisionAlwaysIdempotentSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None and invocation.revision < head:
+            return CommitResult(
+                status="already_committed",
+                sequence=invocation.revision,
+            )
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+def _historical_revision_always_idempotent_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _HistoricalRevisionAlwaysIdempotentSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_compares_every_historical_invocation_payload() -> None:
+    outcomes = run_fenced_run_sink_contract(_historical_revision_always_idempotent_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = {
+        item.observation_id: item.actual
+        for item in lifecycle_rule.observations
+        if item.observation_id.endswith("_conflict_and_head")
+    }
+
+    assert lifecycle_rule.status == "failed"
+    assert observations == {
+        f"old_revision_{revision}_conflict_and_head": ("already_committed", 4)
+        for revision in (1, 2, 3)
+    }
 
 
 class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
