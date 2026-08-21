@@ -400,11 +400,12 @@ class DeterministicFencedRunHarness:
         del mutation
         barrier = Barrier(3)
         linearization: list[str] = []
+        stale_facade = self.reopen()
 
         def stale_write() -> CommitResult:
             barrier.wait(timeout=10)
             with self.sink._lock:
-                result = write(self.sink, stale_token)
+                result = write(stale_facade.sink, stale_token)
                 linearization.append("write")
                 return result
 
@@ -422,5 +423,5 @@ class DeterministicFencedRunHarness:
             rotation_future.result(timeout=10)
 
         rotation_first = linearization[0] == "rotation"
-        current_result = write(self.sink, current_token)
+        current_result = write(self.reopen().sink, current_token)
         return stale_result, current_result, rotation_first

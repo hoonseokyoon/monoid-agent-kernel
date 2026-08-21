@@ -1004,9 +1004,11 @@ def run_fenced_run_sink_contract(
                 value=right_value,
                 writer_token=race_token,
             )
+            left_harness = race_harness.reopen()
+            right_harness = race_harness.reopen()
             left_result, right_result = _contract_race(
-                partial(left_write, race_harness.sink),
-                partial(right_write, race_harness.sink),
+                partial(left_write, left_harness.sink),
+                partial(right_write, right_harness.sink),
             )
             retry_winner, retry_loser = _contract_race_retry_statuses(
                 left_result,
