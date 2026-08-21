@@ -28,6 +28,7 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
 from monoid_agent_kernel.core.model_invocation import (
+    ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
 )
@@ -55,6 +56,13 @@ _CONTRACT_CHECKPOINT_BLOB = b"contract checkpoint workspace bytes\n"
 _CONTRACT_CHECKPOINT_BLOB_SHA256 = hashlib.sha256(_CONTRACT_CHECKPOINT_BLOB).hexdigest()
 _CONTRACT_INVOCATION_BLOB = b'{"text":"contract model result"}'
 _CONTRACT_INVOCATION_BLOB_SHA256 = hashlib.sha256(_CONTRACT_INVOCATION_BLOB).hexdigest()
+_CONTRACT_ALTERNATE_BLOB = b"alternate contract blob bytes\n"
+_CONTRACT_ALTERNATE_BLOB_SHA256 = hashlib.sha256(_CONTRACT_ALTERNATE_BLOB).hexdigest()
+_CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
+    generation
+    for generation in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
+    if generation != MODEL_REQUEST_DIGEST_GENERATION
+)
 
 
 class CheckpointStoreFactory(Protocol):
@@ -242,7 +250,9 @@ def _contract_invocation(
     dispatch_attempt: int = 1,
     dispatch_id: str = "dispatch-1",
     dispatch_state: str,
+    idempotency_key: str = "contract-idempotency-key",
     request_digest: str = "a" * 64,
+    digest_generation: str = MODEL_REQUEST_DIGEST_GENERATION,
     retryable: bool = False,
     succeeded: bool = False,
 ) -> DurableModelInvocation:
@@ -261,10 +271,10 @@ def _contract_invocation(
         revision=revision,
         dispatch_id=dispatch_id,
         dispatch_attempt=dispatch_attempt,
-        idempotency_key="contract-idempotency-key",
+        idempotency_key=idempotency_key,
         dispatch_state=dispatch_state,  # type: ignore[arg-type]
         request_digest=request_digest,
-        digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+        digest_generation=digest_generation,
         receipt=receipt,
         result_ref=result_ref,
         failure_code=failure_code,
@@ -293,6 +303,35 @@ def _contract_blob_hex(record: Any | None, sha256: str) -> str | None:
     if type(blob) is not bytes:
         return "invalid-type"
     return blob.hex()
+
+
+def _contract_invocation_drift_status(
+    factory: FencedRunSinkHarnessFactory,
+    field_name: str,
+    field_value: Any,
+) -> str:
+    run_id = f"contract-invocation-drift-{field_name.replace('_', '-')}"
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    first = harness.sink.commit_invocation(
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        {},
+        writer_token=token,
+    )
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    overrides = {field_name: field_value}
+    drifted = harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=2,
+            dispatch_state="dispatch_started",
+            **overrides,
+        ),
+        {},
+        writer_token=token,
+    )
+    return drifted.status
 
 
 def _contract_retry_after_terminal_invocation(
@@ -406,12 +445,40 @@ def run_fenced_run_sink_contract(
             checkpoint_blobs,
             writer_token=token,
         )
+        blob_key_conflict = harness.sink.commit_checkpoint(
+            checkpoint,
+            {
+                **checkpoint_blobs,
+                _CONTRACT_ALTERNATE_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB,
+            },
+            writer_token=token,
+        )
+        blob_bytes_conflict = harness.sink.commit_checkpoint(
+            checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=token,
+        )
         conflict = harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=run_id, seq=1, final_text="challenger"),
             {},
             writer_token=token,
         )
         loaded = harness.sink.latest_checked(run_id)
+
+        monotonic_harness = factory()
+        monotonic_run_id = "contract-checkpoint-monotonic"
+        monotonic_token = _contract_writer(monotonic_harness, monotonic_run_id)
+        newer = monotonic_harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=monotonic_run_id, seq=2, final_text="newer"),
+            {},
+            writer_token=monotonic_token,
+        )
+        monotonic_harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=monotonic_run_id, seq=1, final_text="delayed"),
+            {},
+            writer_token=monotonic_token,
+        )
+        head_after_delayed = monotonic_harness.sink.latest_checked(monotonic_run_id)
         outcomes.append(
             outcome_from_observations(
                 "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
@@ -421,6 +488,16 @@ def run_fenced_run_sink_contract(
                     observation("first_status", expected="committed", actual=first.status),
                     observation(
                         "repeat_status", expected="already_committed", actual=repeated.status
+                    ),
+                    observation(
+                        "blob_key_conflict",
+                        expected="conflict",
+                        actual=blob_key_conflict.status,
+                    ),
+                    observation(
+                        "blob_bytes_conflict",
+                        expected="conflict",
+                        actual=blob_bytes_conflict.status,
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
                     observation(
@@ -454,6 +531,25 @@ def run_fenced_run_sink_contract(
                         actual=_contract_blob_hex(
                             loaded.value,
                             _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
+                        "newer_checkpoint",
+                        expected="committed",
+                        actual=newer.status,
+                    ),
+                    observation(
+                        "head_after_delayed_sequence",
+                        expected=2,
+                        actual=head_after_delayed.sequence,
+                    ),
+                    observation(
+                        "head_after_delayed_text",
+                        expected="newer",
+                        actual=(
+                            head_after_delayed.value.checkpoint.final_text
+                            if head_after_delayed.value
+                            else None
                         ),
                     ),
                 ),
@@ -804,6 +900,19 @@ def run_fenced_run_sink_contract(
             {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB},
             writer_token=token,
         )
+        result_blob_key_conflict = harness.sink.commit_invocation(
+            settled_result_invocation,
+            {
+                _CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB,
+                _CONTRACT_ALTERNATE_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB,
+            },
+            writer_token=token,
+        )
+        result_blob_bytes_conflict = harness.sink.commit_invocation(
+            settled_result_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=token,
+        )
         loaded_result = harness.sink.load_invocation(run_id, result_call_id)
         outcomes.append(
             outcome_from_observations(
@@ -862,6 +971,16 @@ def run_fenced_run_sink_contract(
                         actual=repeated_result.status,
                     ),
                     observation(
+                        "result_blob_key_conflict",
+                        expected="conflict",
+                        actual=result_blob_key_conflict.status,
+                    ),
+                    observation(
+                        "result_blob_bytes_conflict",
+                        expected="conflict",
+                        actual=result_blob_bytes_conflict.status,
+                    ),
+                    observation(
                         "result_load", expected="loaded", actual=loaded_result.status
                     ),
                     observation(
@@ -917,16 +1036,33 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
-        identity_drift = harness.sink.commit_invocation(
-            _contract_invocation(
-                run_id,
-                revision=2,
-                dispatch_state="dispatch_started",
-                request_digest="b" * 64,
+        identity_drift_statuses = {
+            "idempotency_key": _contract_invocation_drift_status(
+                factory,
+                "idempotency_key",
+                "contract-idempotency-key-drift",
             ),
-            {},
-            writer_token=token,
-        )
+            "request_digest": _contract_invocation_drift_status(
+                factory,
+                "request_digest",
+                "b" * 64,
+            ),
+            "digest_generation": _contract_invocation_drift_status(
+                factory,
+                "digest_generation",
+                _CONTRACT_ALTERNATE_DIGEST_GENERATION,
+            ),
+            "dispatch_id": _contract_invocation_drift_status(
+                factory,
+                "dispatch_id",
+                "dispatch-drift",
+            ),
+            "dispatch_attempt": _contract_invocation_drift_status(
+                factory,
+                "dispatch_attempt",
+                2,
+            ),
+        }
         unknown_history, after_unknown = _contract_retry_after_terminal_invocation(
             factory,
             "contract-invocation-after-unknown",
@@ -951,7 +1087,14 @@ def run_fenced_run_sink_contract(
                     observation("first_must_reserve", expected="conflict", actual=first_wrong.status),
                     observation("revision_gap", expected="conflict", actual=gap.status),
                     observation("state_regression", expected="conflict", actual=regression.status),
-                    observation("identity_drift", expected="conflict", actual=identity_drift.status),
+                    *(
+                        observation(
+                            f"identity_drift_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in identity_drift_statuses.items()
+                    ),
                     observation(
                         "unknown_history",
                         expected=("committed", "committed", "committed"),

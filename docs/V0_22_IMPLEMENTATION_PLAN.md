@@ -333,6 +333,7 @@ class DurableModelInvocation:
 - 실패한 `settled`에는 receipt와 failure code가 있고 result가 없다.
 - `unknown`은 자동 retry를 금지한다.
 - `logical_call_id`, request digest, idempotency key는 lifecycle 중 바뀌지 않는다.
+- 같은 dispatch attempt 안에서 `dispatch_id`와 `dispatch_attempt`도 바뀌지 않는다.
 - 다음 dispatch attempt만 `dispatch_id`와 `dispatch_attempt`를 변경한다.
 - `revision`은 logical call 안에서 1부터 연속 증가하며 load의 권위 순서를 정한다.
 - receipt payload는 endpoint, prompt, response, raw exception message를 포함하지 않는다.
@@ -484,6 +485,8 @@ Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `alre
 
 Checkpoint와 invocation의 canonical content에는 함께 제출된 blob key와 byte digest가 포함된다.
 Checked load record는 committed blob을 정확한 bytes로 돌려준다.
+같은 metadata에 다른 blob key를 추가하거나 같은 key의 bytes를 바꾸면 `conflict`다.
+Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.
 
 Invocation transition은 다음 순서를 검증한다.
 

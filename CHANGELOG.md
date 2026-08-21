@@ -27,9 +27,9 @@ out in commit messages and here.
   exposing an unfenced standalone blob mutation. These host-facing names stay outside the stable
   package root and carry no database, queue, lease, Redis, or Temporal dependency.
 - Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
-  same-resource idempotency and conflict, terminal first-writer-wins, and durable invocation
-  transitions. `LocalFsCheckpointStore` now declares its actual single-writer checkpoint
-  capability while retaining the legacy unfenced store API.
+  blob-inclusive content identity, monotonic checkpoint publication, terminal first-writer-wins,
+  and field-complete durable invocation transitions. `LocalFsCheckpointStore` now declares its
+  actual single-writer checkpoint capability while retaining the legacy unfenced store API.
 
 ## [0.21.0] - 2026-08-12
 

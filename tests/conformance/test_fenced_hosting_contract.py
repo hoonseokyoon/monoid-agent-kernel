@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import pytest
 
@@ -360,3 +361,190 @@ def test_reusable_contract_rejects_discarded_private_blobs(
     blob_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
 
     assert blob_rule.status == "failed"
+
+
+class _MetadataOnlyContentIdentitySink(DeterministicFencedRunSink):
+    broken_mutation = ""
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (checkpoint.run_id, checkpoint.seq)
+        stored = self._checkpoints.get(key)
+        if (
+            self.broken_mutation == "checkpoint"
+            and self._is_current(checkpoint.run_id, writer_token)
+            and stored is not None
+            and stored[1].checkpoint == checkpoint
+        ):
+            return CommitResult(status="already_committed", sequence=checkpoint.seq)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if (
+            self.broken_mutation == "invocation"
+            and self._is_current(invocation.run_id, writer_token)
+            and stored is not None
+            and stored[1].invocation == invocation
+        ):
+            return CommitResult(status="already_committed", sequence=invocation.revision)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _metadata_only_content_identity_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _MetadataOnlyContentIdentitySink(harness._writers)
+        sink.broken_mutation = mutation
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("mutation", "rule_id", "observation_id"),
+    [
+        (
+            "checkpoint",
+            "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+            "blob_bytes_conflict",
+        ),
+        (
+            "invocation",
+            "FENCED-04-INVOCATION-LIFECYCLE",
+            "result_blob_bytes_conflict",
+        ),
+    ],
+)
+def test_reusable_contract_includes_blobs_in_content_identity(
+    mutation: str,
+    rule_id: str,
+    observation_id: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_metadata_only_content_identity_factory(mutation))
+    identity_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    blob_observation = next(
+        observation
+        for observation in identity_rule.observations
+        if observation.observation_id == observation_id
+    )
+
+    assert identity_rule.status == "failed"
+    assert blob_observation.expected == "conflict"
+    assert blob_observation.actual == "already_committed"
+
+
+class _RegressingCheckpointHeadSink(DeterministicFencedRunSink):
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (checkpoint.run_id, checkpoint.seq)
+        current_head = self._checkpoint_heads.get(checkpoint.run_id, -1)
+        if (
+            self._is_current(checkpoint.run_id, writer_token)
+            and key not in self._checkpoints
+            and checkpoint.seq < current_head
+        ):
+            self._checkpoint_heads[checkpoint.run_id] = checkpoint.seq - 1
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+
+def _regressing_checkpoint_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _RegressingCheckpointHeadSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_checkpoint_head_regression() -> None:
+    outcomes = run_fenced_run_sink_contract(_regressing_checkpoint_factory)
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    head_observation = next(
+        observation
+        for observation in checkpoint_rule.observations
+        if observation.observation_id == "head_after_delayed_sequence"
+    )
+
+    assert checkpoint_rule.status == "failed"
+    assert head_observation.expected == 2
+    assert head_observation.actual == 1
+
+
+class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
+    ignored_field = ""
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            if getattr(invocation, self.ignored_field) != getattr(previous, self.ignored_field):
+                invocation = replace(
+                    invocation,
+                    **{self.ignored_field: getattr(previous, self.ignored_field)},
+                )
+        return super()._invocation_transition_winner(invocation)
+
+
+def _invocation_identity_drift_factory(field_name: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _InvocationIdentityDriftSink(harness._writers)
+        sink.ignored_field = field_name
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "idempotency_key",
+        "request_digest",
+        "digest_generation",
+        "dispatch_id",
+        "dispatch_attempt",
+    ],
+)
+def test_reusable_contract_checks_each_stable_invocation_identity(field_name: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_invocation_identity_drift_factory(field_name))
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    drift_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"identity_drift_{field_name}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert drift_observation.expected == "conflict"
+    assert drift_observation.actual == "committed"
