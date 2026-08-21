@@ -118,6 +118,7 @@ def test_terminal_outcome_rejects_values_outside_the_contract(field: str, value:
     (
         ("run_id", "private run text"),
         ("run_id", "r" * 257),
+        ("final_output_ref", "secret"),
         ("final_output_ref", "model output text"),
         ("partial_output_ref", "line\nbreak"),
         ("last_evidence_ref", "évidence"),

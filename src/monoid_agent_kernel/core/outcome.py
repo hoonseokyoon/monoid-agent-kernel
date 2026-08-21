@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, get_args
 
-from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_ref, is_safe_taxonomy_code
+from monoid_agent_kernel.core.safe_evidence import (
+    is_safe_opaque_address,
+    is_safe_opaque_id,
+    is_safe_taxonomy_code,
+)
 from monoid_agent_kernel.core.wire_validation import (
     parse_int,
     parse_literal,
@@ -99,7 +103,7 @@ class TerminalOutcome:
     def __post_init__(self) -> None:
         if self.schema_version not in ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS:
             raise ValueError("unsupported terminal outcome schema")
-        if not is_safe_opaque_ref(self.run_id):
+        if not is_safe_opaque_id(self.run_id):
             raise ValueError("terminal outcome run_id must be a bounded opaque id")
         if self.kind not in get_args(TerminalOutcomeKind):
             raise ValueError("terminal outcome kind is outside the portable vocabulary")
@@ -131,9 +135,9 @@ class TerminalOutcome:
             value = getattr(self, field_name)
             if type(value) is not str:
                 raise ValueError(f"terminal outcome {field_name} must be a string")
-            if value and not is_safe_opaque_ref(value):
+            if value and not is_safe_opaque_address(value):
                 raise ValueError(
-                    f"terminal outcome {field_name} must be empty or a bounded opaque reference"
+                    f"terminal outcome {field_name} must be empty or a bounded opaque address"
                 )
         for field_name in ("error_code", "provider_error_code"):
             value = getattr(self, field_name)

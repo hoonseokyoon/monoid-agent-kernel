@@ -84,9 +84,9 @@ lists every identifier this release can emit; most artifacts contain only `curre
 <!-- compatibility-registry:end -->
 
 `monoid.terminal-outcome.v1` is a content-free final-state envelope. It carries portable outcome,
-retry, and interruption vocabularies plus opaque output/evidence references. It never carries a
-prompt, model response, reasoning item, replay payload, or raw provider exception. Its strict
-reader rejects fields outside the versioned top-level schema.
+retry, and interruption vocabularies plus opaque output/evidence addresses in bounded
+`scheme:locator` form. It never carries a prompt, model response, reasoning item, replay payload,
+or raw provider exception. Its strict reader rejects fields outside the versioned top-level schema.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The
@@ -95,7 +95,8 @@ refused. The top-level record, receipt, and usage object each accept a closed ve
 unknown fields are private by default. Receipt key spellings are canonicalized. Digest, identifier,
 taxonomy, timestamp, numeric, boolean, and usage values each have bounded typed validation; a
 receipt request digest must equal the invocation request digest. Settled success points to a private
-result blob, and ambiguous dispatch has no automatic retry evidence.
+result blob through a bounded `scheme:locator` address, and ambiguous dispatch has no automatic
+retry evidence.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation` and `interruption_cause` fields. A
 v0.21 checkpoint omits both and restores with `None` and the empty cause. The writer keeps the

@@ -118,6 +118,7 @@ def test_model_invocation_checked_reader_rejects_unknown_top_level_fields(
         {"digest_generation": ""},
         {"digest_generation": "request-v1"},
         {"result_ref": 1},
+        {"result_ref": "secret"},
         {"result_ref": "private result text"},
         {"failure_code": 1},
         {"failure_code": "private failure text"},

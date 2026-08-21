@@ -11,7 +11,8 @@ from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResu
 from monoid_agent_kernel.core.json_ingress import is_finite_json_number, normalize_json_ingress
 from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
 from monoid_agent_kernel.core.safe_evidence import (
-    is_safe_opaque_ref,
+    is_safe_opaque_address,
+    is_safe_opaque_id,
     is_safe_taxonomy_code,
     is_safe_utc_timestamp,
 )
@@ -175,7 +176,7 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                 )
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_OPAQUE_ID_FIELDS:
-            if not is_safe_opaque_ref(value):
+            if not is_safe_opaque_id(value):
                 raise ValueError(
                     f"model invocation receipt {canonical_key} must be a bounded opaque id"
                 )
@@ -241,7 +242,7 @@ class DurableModelInvocation:
             "logical_call_id",
             "dispatch_id",
         ):
-            if not is_safe_opaque_ref(getattr(self, field_name)):
+            if not is_safe_opaque_id(getattr(self, field_name)):
                 raise ValueError(f"model invocation {field_name} must be a bounded opaque id")
         if type(self.idempotency_key) is not str or not is_valid_idempotency_key(
             self.idempotency_key
@@ -260,8 +261,10 @@ class DurableModelInvocation:
             raise ValueError("model invocation dispatch_state is outside the durable vocabulary")
         _require_string(self.result_ref, "result_ref")
         _require_string(self.failure_code, "failure_code")
-        if self.result_ref and not is_safe_opaque_ref(self.result_ref):
-            raise ValueError("model invocation result_ref must be empty or a bounded opaque id")
+        if self.result_ref and not is_safe_opaque_address(self.result_ref):
+            raise ValueError(
+                "model invocation result_ref must be empty or a bounded opaque address"
+            )
         if self.failure_code and not is_safe_taxonomy_code(self.failure_code):
             raise ValueError("model invocation failure_code must be empty or a bounded code")
         receipt = _normalized_receipt(self.receipt)
