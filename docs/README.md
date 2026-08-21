@@ -27,7 +27,9 @@ building against, and securing the kernel.
   [SKILLS_DESIGN.md](SKILLS_DESIGN.md), [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md).
 - **I'm contributing** → [CONTRIBUTING.md](../CONTRIBUTING.md), then
   [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) and
-  [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) for how behavior is verified.
+  [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) for how behavior is verified. The
+  [v0.22 implementation plan](V0_22_IMPLEMENTATION_PLAN.md) records the approved production-boundary
+  design, crash windows, file map, and review sequence.
 
 ## All documents
 
@@ -50,6 +52,7 @@ building against, and securing the kernel.
 | [RUNNER_BACKEND_RESPONSIBILITY_MAP.md](RUNNER_BACKEND_RESPONSIBILITY_MAP.md) | RunnerBackend facade/service split, private service responsibilities, and remaining runtime ownership. |
 | [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) | Phase 4 completion criteria, CI status, remaining flake risk, and structural closure position. |
 | [V0_18_RELEASE_AUDIT.md](V0_18_RELEASE_AUDIT.md) | Frozen-range multi-agent release audit, cross-challenges, dispositions, and hardening evidence. |
+| [V0_22_IMPLEMENTATION_PLAN.md](V0_22_IMPLEMENTATION_PLAN.md) | Pre-implementation audit and concrete plan for terminal outcomes, durable model invocation identity, fenced hosting contracts, sink policy, typed interruption, conformance, and release sequencing. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
