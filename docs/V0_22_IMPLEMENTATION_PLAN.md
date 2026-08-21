@@ -1067,7 +1067,8 @@ attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결
 실패시키는 mutant test가 있다. Attempt 3 이상을 일괄 거부하는 구현도 양성 lifecycle observation이
 잡아낸다. Terminal schema alias를 raw tag로 digest하는 구현도 양방향 retry observation이 잡아낸다.
 Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방향 same-revision observation이
-잡아낸다.
+잡아낸다. Event에는 accepted schema alias가 없다. `schema_version`을 포함한 모든 non-key canonical
+field가 content identity에 참여한다.
 Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mutation/status/evidence-field
 조합의 잘못된 `CommitResult` mutant를 거부한다. Blob 검증은 잘못된 bytes와 대문자 digest를 독립
 축으로 검사하고, workspace·message media·invocation result 참조를 submitted map과 same-run backing

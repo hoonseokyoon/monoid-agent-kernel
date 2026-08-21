@@ -593,6 +593,7 @@ def _contract_event_identity_variants(event: AgentEvent) -> dict[str, AgentEvent
     """Vary every canonical non-key event field independently."""
 
     variants = {
+        "schema_version": replace(event, schema_version="monoid.event.v2"),
         "event_id": replace(event, event_id="event-alternate"),
         "timestamp": replace(event, timestamp="2026-08-21T00:00:01Z"),
         "type": replace(event, type="run.started"),
@@ -601,7 +602,7 @@ def _contract_event_identity_variants(event: AgentEvent) -> dict[str, AgentEvent
         "turn_id": replace(event, turn_id="turn-alternate"),
         "parent_id": replace(event, parent_id="event-parent-alternate"),
     }
-    identity_fields = set(event.to_json()) - {"schema_version", "run_id", "seq"}
+    identity_fields = set(event.to_json()) - {"run_id", "seq"}
     if set(variants) != identity_fields:
         raise AssertionError("event identity matrix is incomplete")
     return variants

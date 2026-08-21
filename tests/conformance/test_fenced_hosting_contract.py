@@ -26,6 +26,7 @@ _CHECKPOINT_IDENTITY_FIELDS = tuple(
     )
 )
 _EVENT_IDENTITY_FIELDS = (
+    "schema_version",
     "event_id",
     "timestamp",
     "type",
