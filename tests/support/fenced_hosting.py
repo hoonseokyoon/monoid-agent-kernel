@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.checkpoint import (
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.core.events import AgentEvent
+from monoid_agent_kernel.core.media import blob_shas_in_messages
 from monoid_agent_kernel.core.model_invocation import (
     MODEL_INVOCATION_CODEC,
     DurableModelInvocation,
@@ -68,6 +69,7 @@ class DeterministicFencedRunSink:
     ] = field(default_factory=dict)
     _invocation_heads: dict[tuple[str, str], int] = field(default_factory=dict)
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
+    _blobs: dict[tuple[str, str], bytes] = field(default_factory=dict)
     _lock: Any = field(default_factory=RLock, repr=False)
 
     def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
@@ -79,17 +81,32 @@ class DeterministicFencedRunSink:
             for key, value in blobs.items()
         )
 
+    def _checkpoint_blob_references(self, checkpoint: RunCheckpoint) -> set[str]:
+        workspace_references = {
+            item["content_sha256"]
+            for item in checkpoint.workspace_delta
+            if isinstance(item.get("content_sha256"), str)
+            and item["content_sha256"]
+        }
+        return workspace_references | blob_shas_in_messages(tuple(checkpoint.messages))
+
+    def _reference_is_available(
+        self,
+        run_id: str,
+        sha256: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        return sha256 in blobs or (run_id, sha256) in self._blobs
+
     def _checkpoint_references_resolve(
         self,
         checkpoint: RunCheckpoint,
         blobs: Mapping[str, bytes],
     ) -> bool:
-        references = {
-            item["content_sha256"]
-            for item in checkpoint.workspace_delta
-            if item.get("content_sha256")
-        }
-        return references <= blobs.keys()
+        return all(
+            self._reference_is_available(checkpoint.run_id, sha256, blobs)
+            for sha256 in self._checkpoint_blob_references(checkpoint)
+        )
 
     def _invocation_references_resolve(
         self,
@@ -98,7 +115,39 @@ class DeterministicFencedRunSink:
     ) -> bool:
         if not invocation.result_ref.startswith("blob:"):
             return True
-        return invocation.result_ref.removeprefix("blob:") in blobs
+        return self._reference_is_available(
+            invocation.run_id,
+            invocation.result_ref.removeprefix("blob:"),
+            blobs,
+        )
+
+    def _blobs_preserve_authoritative_backing(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        return all(
+            self._blobs.get((run_id, sha256), value) == value
+            for sha256, value in blobs.items()
+        )
+
+    def _publish_blobs(self, run_id: str, blobs: Mapping[str, bytes]) -> None:
+        for sha256, value in blobs.items():
+            self._blobs.setdefault((run_id, sha256), value)
+
+    def _blob_reader(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+    ) -> Callable[[str], bytes]:
+        detached_blobs = dict(blobs)
+
+        def read(sha256: str) -> bytes:
+            if sha256 in detached_blobs:
+                return detached_blobs[sha256]
+            return self._blobs[(run_id, sha256)]
+
+        return read
 
     @staticmethod
     def _stored_result(
@@ -146,6 +195,8 @@ class DeterministicFencedRunSink:
             return CommitResult(status="fenced")
         if not self._blobs_are_content_addressed(blobs):
             return CommitResult(status="conflict", sequence=checkpoint.seq)
+        if not self._blobs_preserve_authoritative_backing(checkpoint.run_id, blobs):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
         if not self._checkpoint_references_resolve(checkpoint, blobs):
             return CommitResult(status="conflict", sequence=checkpoint.seq)
         digest = _record_digest(checkpoint_payload_for_write(checkpoint), blobs)
@@ -167,11 +218,11 @@ class DeterministicFencedRunSink:
                 content_digest=digest,
                 winner_digest=winner_digest,
             )
-        detached_blobs = dict(blobs)
+        self._publish_blobs(checkpoint.run_id, blobs)
         record = CheckpointRecord(
             seq=checkpoint.seq,
             checkpoint=checkpoint,
-            _blob_reader=lambda sha256: detached_blobs[sha256],
+            _blob_reader=self._blob_reader(checkpoint.run_id, blobs),
         )
         self._checkpoints[key] = (digest, record)
         self._checkpoint_heads[checkpoint.run_id] = max(previous_head, checkpoint.seq)
@@ -271,6 +322,8 @@ class DeterministicFencedRunSink:
             return CommitResult(status="fenced")
         if not self._blobs_are_content_addressed(blobs):
             return CommitResult(status="conflict", sequence=invocation.revision)
+        if not self._blobs_preserve_authoritative_backing(invocation.run_id, blobs):
+            return CommitResult(status="conflict", sequence=invocation.revision)
         if not self._invocation_references_resolve(invocation, blobs):
             return CommitResult(status="conflict", sequence=invocation.revision)
         digest = _record_digest(invocation.to_json(), blobs)
@@ -291,11 +344,11 @@ class DeterministicFencedRunSink:
                 content_digest=digest,
                 winner_digest=transition_winner,
             )
-        detached_blobs = dict(blobs)
+        self._publish_blobs(invocation.run_id, blobs)
         record = ModelInvocationRecord(
             revision=invocation.revision,
             invocation=invocation,
-            _blob_reader=lambda sha256: detached_blobs[sha256],
+            _blob_reader=self._blob_reader(invocation.run_id, blobs),
         )
         self._invocations[key] = (digest, record)
         self._invocation_heads[(invocation.run_id, invocation.logical_call_id)] = invocation.revision

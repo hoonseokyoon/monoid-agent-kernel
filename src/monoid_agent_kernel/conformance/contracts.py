@@ -1464,6 +1464,105 @@ def _run_fenced_run_sink_contract(
         missing_reference_recovery_load = (
             missing_reference_harness.sink.latest_checked(missing_reference_run_id)
         )
+        missing_media_harness = factory()
+        missing_media_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-missing-media-reference",
+        )
+        missing_media_token = _contract_writer(
+            missing_media_harness,
+            missing_media_run_id,
+        )
+        missing_media_checkpoint = RunCheckpoint(
+            run_id=missing_media_run_id,
+            seq=1,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source_ref": f"blob:{_CONTRACT_UNRESOLVED_BLOB_SHA256}",
+                            "mime_type": "image/png",
+                        }
+                    ],
+                }
+            ],
+        )
+        missing_media = missing_media_harness.sink.commit_checkpoint(
+            missing_media_checkpoint,
+            {},
+            writer_token=missing_media_token,
+        )
+        missing_media_harness = missing_media_harness.reopen()
+        missing_media_load = missing_media_harness.sink.latest_checked(
+            missing_media_run_id
+        )
+        missing_media_recovery = missing_media_harness.sink.commit_checkpoint(
+            missing_media_checkpoint,
+            {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
+            writer_token=missing_media_token,
+        )
+        missing_media_harness = missing_media_harness.reopen()
+        missing_media_recovery_load = missing_media_harness.sink.latest_checked(
+            missing_media_run_id
+        )
+        backing_harness = factory()
+        backing_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-authoritative-backing-reference",
+        )
+        backing_token = _contract_writer(backing_harness, backing_run_id)
+        backing_seed_checkpoint = RunCheckpoint(
+            run_id=backing_run_id,
+            seq=1,
+            workspace_delta=[
+                {
+                    "path": "backing-seed.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        backing_seed = backing_harness.sink.commit_checkpoint(
+            backing_seed_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=backing_token,
+        )
+        backing_harness = backing_harness.reopen()
+        backing_checkpoint = RunCheckpoint(
+            run_id=backing_run_id,
+            seq=2,
+            messages=[
+                {
+                    "role": "tool",
+                    "content": "media from authoritative backing",
+                    "media": [
+                        {
+                            "type": "image",
+                            "source_ref": f"blob:{_CONTRACT_CHECKPOINT_BLOB_SHA256}",
+                            "mime_type": "image/png",
+                        }
+                    ],
+                }
+            ],
+            workspace_delta=[
+                {
+                    "path": "backing-reuse.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        backing_reference = backing_harness.sink.commit_checkpoint(
+            backing_checkpoint,
+            {},
+            writer_token=backing_token,
+        )
+        backing_harness = backing_harness.reopen()
+        backing_load = backing_harness.sink.latest_checked(backing_run_id)
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -1647,6 +1746,47 @@ def _run_fenced_run_sink_contract(
                         actual=_contract_blob_hex(
                             missing_reference_recovery_load.value,
                             _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
+                        "missing_media_reference_status",
+                        expected="conflict",
+                        actual=missing_media.status,
+                    ),
+                    observation(
+                        "missing_media_reference_not_published",
+                        expected="missing",
+                        actual=missing_media_load.status,
+                    ),
+                    observation(
+                        "missing_media_reference_recovery",
+                        expected="committed",
+                        actual=missing_media_recovery.status,
+                    ),
+                    observation(
+                        "missing_media_reference_recovery_bytes",
+                        expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            missing_media_recovery_load.value,
+                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
+                        "authoritative_backing_reference_statuses",
+                        expected=("committed", "committed"),
+                        actual=(backing_seed.status, backing_reference.status),
+                    ),
+                    observation(
+                        "authoritative_backing_reference_head",
+                        expected=2,
+                        actual=backing_load.sequence,
+                    ),
+                    observation(
+                        "authoritative_backing_reference_bytes",
+                        expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            backing_load.value,
+                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
                         ),
                     ),
                     observation(
@@ -2474,6 +2614,67 @@ def _run_fenced_run_sink_contract(
                 "call-1",
             )
         )
+        backing_harness = factory()
+        backing_run_id = _contract_run_id(
+            namespace,
+            "invocation-authoritative-backing-reference",
+        )
+        backing_token = _contract_writer(backing_harness, backing_run_id)
+        backing_seed_call_id = "backing-seed-call"
+        backing_seed_statuses = tuple(
+            backing_harness.sink.commit_invocation(
+                _contract_invocation(
+                    backing_run_id,
+                    logical_call_id=backing_seed_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                    succeeded=revision == 3,
+                ),
+                (
+                    {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB}
+                    if revision == 3
+                    else {}
+                ),
+                writer_token=backing_token,
+            ).status
+            for revision, dispatch_state in (
+                (1, "reserved"),
+                (2, "dispatch_started"),
+                (3, "settled"),
+            )
+        )
+        backing_harness = backing_harness.reopen()
+        backing_call_id = "backing-reference-call"
+        backing_setup_statuses = tuple(
+            backing_harness.sink.commit_invocation(
+                _contract_invocation(
+                    backing_run_id,
+                    logical_call_id=backing_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=backing_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        backing_invocation = _contract_invocation(
+            backing_run_id,
+            logical_call_id=backing_call_id,
+            revision=3,
+            dispatch_state="settled",
+            succeeded=True,
+        )
+        backing_reference = backing_harness.sink.commit_invocation(
+            backing_invocation,
+            {},
+            writer_token=backing_token,
+        )
+        backing_harness = backing_harness.reopen()
+        backing_load = backing_harness.sink.load_invocation(
+            backing_run_id,
+            backing_call_id,
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -2857,6 +3058,32 @@ def _run_fenced_run_sink_contract(
                         actual=_contract_blob_hex(
                             missing_reference_recovery_load.value,
                             _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
+                        "authoritative_backing_reference_setup",
+                        expected=(
+                            ("committed", "committed", "committed"),
+                            ("committed", "committed"),
+                        ),
+                        actual=(backing_seed_statuses, backing_setup_statuses),
+                    ),
+                    observation(
+                        "authoritative_backing_reference_status",
+                        expected="committed",
+                        actual=backing_reference.status,
+                    ),
+                    observation(
+                        "authoritative_backing_reference_head",
+                        expected=3,
+                        actual=backing_load.sequence,
+                    ),
+                    observation(
+                        "authoritative_backing_reference_bytes",
+                        expected=_CONTRACT_INVOCATION_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            backing_load.value,
+                            _CONTRACT_INVOCATION_BLOB_SHA256,
                         ),
                     ),
                     observation(

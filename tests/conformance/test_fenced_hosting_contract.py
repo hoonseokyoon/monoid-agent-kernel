@@ -731,6 +731,14 @@ class _UncheckedBlobDigestSink(DeterministicFencedRunSink):
         del blobs
         return True
 
+    def _blobs_preserve_authoritative_backing(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        del run_id, blobs
+        return True
+
 
 def _unchecked_blob_digest_factory() -> DeterministicFencedRunHarness:
     harness = DeterministicFencedRunHarness()
@@ -1051,6 +1059,8 @@ class _ReferentialIntegritySink(DeterministicFencedRunSink):
         if invocation.result_ref.startswith("blob:"):
             result_sha256 = invocation.result_ref.removeprefix("blob:")
             result_blob = blobs.get(result_sha256)
+            if result_blob is None:
+                result_blob = self._blobs.get((invocation.run_id, result_sha256))
             if (
                 result_blob is None
                 or hashlib.sha256(result_blob).hexdigest() != result_sha256
@@ -1065,7 +1075,7 @@ def _referential_integrity_factory() -> DeterministicFencedRunHarness:
     return harness
 
 
-def test_reusable_contract_supplies_every_referenced_invocation_blob() -> None:
+def test_reusable_contract_resolves_every_referenced_invocation_blob() -> None:
     outcomes = run_fenced_run_sink_contract(_referential_integrity_factory)
 
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes
@@ -1116,6 +1126,77 @@ def test_reusable_contract_rejects_unresolved_authoritative_blob_references() ->
     assert invocation_rule.status == "failed"
     assert checkpoint_status == "committed"
     assert invocation_status == "committed"
+
+
+class _WorkspaceOnlyCheckpointReferenceSink(DeterministicFencedRunSink):
+    def _checkpoint_blob_references(self, checkpoint: RunCheckpoint) -> set[str]:
+        return {
+            item["content_sha256"]
+            for item in checkpoint.workspace_delta
+            if isinstance(item.get("content_sha256"), str)
+            and item["content_sha256"]
+        }
+
+
+def _workspace_only_checkpoint_reference_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _WorkspaceOnlyCheckpointReferenceSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_checks_media_references_inside_checkpoint_messages() -> None:
+    outcomes = run_fenced_run_sink_contract(_workspace_only_checkpoint_reference_factory)
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    observations = {
+        item.observation_id: item.actual for item in checkpoint_rule.observations
+    }
+
+    assert checkpoint_rule.status == "failed"
+    assert observations["missing_reference_status"] == "conflict"
+    assert observations["missing_media_reference_status"] == "committed"
+    assert observations["missing_media_reference_not_published"] == "loaded"
+
+
+class _SubmittedMapOnlyReferenceSink(DeterministicFencedRunSink):
+    def _reference_is_available(
+        self,
+        run_id: str,
+        sha256: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        del run_id
+        return sha256 in blobs
+
+
+def _submitted_map_only_reference_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _SubmittedMapOnlyReferenceSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_accepts_references_from_same_run_authoritative_backing() -> None:
+    outcomes = run_fenced_run_sink_contract(_submitted_map_only_reference_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+    checkpoint_rule = rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"]
+    invocation_rule = rules["FENCED-04-INVOCATION-LIFECYCLE"]
+    checkpoint_observations = {
+        item.observation_id: item.actual for item in checkpoint_rule.observations
+    }
+    invocation_observations = {
+        item.observation_id: item.actual for item in invocation_rule.observations
+    }
+
+    assert checkpoint_rule.status == "failed"
+    assert invocation_rule.status == "failed"
+    assert checkpoint_observations["authoritative_backing_reference_statuses"] == (
+        "committed",
+        "conflict",
+    )
+    assert invocation_observations["authoritative_backing_reference_status"] == "conflict"
 
 
 class _RegressingCheckpointHeadSink(DeterministicFencedRunSink):
