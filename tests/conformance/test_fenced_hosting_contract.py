@@ -150,6 +150,93 @@ def test_reusable_contract_rejects_idempotency_before_fencing(mutation: str) -> 
     )
 
 
+class _ConflictBeforeFencingSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._checkpoints.get((checkpoint.run_id, checkpoint.seq))
+        if (
+            self.broken_mutation == "checkpoint"
+            and stored is not None
+            and stored[1].checkpoint != checkpoint
+        ):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._events.get((event.run_id, event.seq))
+        if self.broken_mutation == "event" and stored is not None and stored[1] != event:
+            return CommitResult(status="conflict", sequence=event.seq)
+        return super().append_event(event, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if (
+            self.broken_mutation == "invocation"
+            and stored is not None
+            and stored[1].invocation != invocation
+        ):
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._terminals.get(outcome.run_id)
+        if self.broken_mutation == "terminal" and stored is not None and stored[1] != outcome:
+            return CommitResult(status="conflict")
+        return super().settle_terminal(outcome, writer_token=writer_token)
+
+
+def _conflict_before_fencing_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _ConflictBeforeFencingSink(harness._writers)
+        sink.broken_mutation = mutation
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
+def test_reusable_contract_rejects_conflict_before_fencing(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_conflict_before_fencing_factory(mutation))
+    fence_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    conflicting_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id == f"stale_conflicting_{mutation}"
+    )
+
+    assert fence_rule.status == "failed"
+    assert conflicting_observation.expected == "fenced"
+    assert conflicting_observation.actual == "conflict"
+
+
 class _PartialWriterAuthoritySink(DeterministicFencedRunSink):
     compared_field = ""
 

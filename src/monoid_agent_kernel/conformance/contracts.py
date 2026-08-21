@@ -2245,6 +2245,26 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=stale,
         )
+        stale_conflicting_statuses = {
+            "checkpoint": harness.sink.commit_checkpoint(
+                replace(checkpoint, final_text="stale-challenger"),
+                {},
+                writer_token=stale,
+            ).status,
+            "event": harness.sink.append_event(
+                replace(event, level="warning"),
+                writer_token=stale,
+            ).status,
+            "invocation": harness.sink.commit_invocation(
+                replace(invocation, dispatch_id="dispatch-stale"),
+                {},
+                writer_token=stale,
+            ).status,
+            "terminal": harness.sink.settle_terminal(
+                _contract_terminal(run_id, failed=True),
+                writer_token=stale,
+            ).status,
+        }
         stale_malformed_checkpoint = harness.sink.commit_checkpoint(
             checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
@@ -2515,6 +2535,14 @@ def _run_fenced_run_sink_contract(
                     observation("stale_event", expected="fenced", actual=stale_event.status),
                     observation(
                         "stale_invocation", expected="fenced", actual=stale_invocation.status
+                    ),
+                    *(
+                        observation(
+                            f"stale_conflicting_{mutation}",
+                            expected="fenced",
+                            actual=status,
+                        )
+                        for mutation, status in stale_conflicting_statuses.items()
                     ),
                     observation(
                         "stale_malformed_checkpoint",

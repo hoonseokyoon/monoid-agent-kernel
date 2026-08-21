@@ -512,7 +512,9 @@ stale 전용 bytes를 제출하지 않는다. 이 probe가 metadata fencing 밖�
 Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
 reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
 generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
-fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다.
+fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다. Existing
+resource는 stale token으로 같은 payload, 다른 payload, malformed blob map을 각각 제출한다. 세 경우
+모두 content equality, conflict, blob validation보다 fence 판정이 먼저 실행되어 `fenced`다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
 bytes를 읽는다. CAS race는 `committed` 결과를 낸 좌·우 값에서 winner를 결정하고 네 mutation의
@@ -1100,6 +1102,8 @@ blob-bearing mutation에서
 전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
 낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는
 workspace·media·invocation의 malformed digest를 거부하고 external invocation result address를 허용한다.
+Existing-coordinate fence precedence는 동일 payload, conflicting payload, malformed blob map을 독립
+축으로 검증한다.
 
 ### 14.6 최종 통합 PR
 
