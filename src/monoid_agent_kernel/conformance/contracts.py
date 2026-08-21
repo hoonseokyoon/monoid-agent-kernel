@@ -1718,7 +1718,7 @@ def _run_fenced_run_sink_contract(
         )
         initial_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
         current = _contract_writer(harness, run_id, "owner-b", generation=2)
-        authority_probe_statuses = {
+        existing_authority_probe_statuses = {
             "stale_generation_current_owner": _contract_authority_probe_statuses(
                 harness.sink,
                 checkpoint=checkpoint,
@@ -1779,59 +1779,65 @@ def _run_fenced_run_sink_contract(
         )
         current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
 
-        fresh_harness = factory()
-        fresh_run_id = _contract_run_id(namespace, "stale-new")
-        fresh_stale = _contract_writer(fresh_harness, fresh_run_id)
-        fresh_current = _contract_writer(
-            fresh_harness,
-            fresh_run_id,
-            "owner-b",
-            generation=2,
-        )
-        fresh_checkpoint = RunCheckpoint(run_id=fresh_run_id, seq=1)
-        fresh_event = _contract_event(fresh_run_id, seq=1)
-        fresh_invocation = _contract_invocation(
-            fresh_run_id,
-            revision=1,
-            dispatch_state="reserved",
-        )
-        fresh_terminal = _contract_terminal(fresh_run_id)
-        stale_new_checkpoint = fresh_harness.sink.commit_checkpoint(
-            fresh_checkpoint,
-            {},
-            writer_token=fresh_stale,
-        )
-        stale_new_event = fresh_harness.sink.append_event(
-            fresh_event,
-            writer_token=fresh_stale,
-        )
-        stale_new_invocation = fresh_harness.sink.commit_invocation(
-            fresh_invocation,
-            {},
-            writer_token=fresh_stale,
-        )
-        stale_new_terminal = fresh_harness.sink.settle_terminal(
-            fresh_terminal,
-            writer_token=fresh_stale,
-        )
-        current_after_stale_checkpoint = fresh_harness.sink.commit_checkpoint(
-            fresh_checkpoint,
-            {},
-            writer_token=fresh_current,
-        )
-        current_after_stale_event = fresh_harness.sink.append_event(
-            fresh_event,
-            writer_token=fresh_current,
-        )
-        current_after_stale_invocation = fresh_harness.sink.commit_invocation(
-            fresh_invocation,
-            {},
-            writer_token=fresh_current,
-        )
-        current_after_stale_terminal = fresh_harness.sink.settle_terminal(
-            fresh_terminal,
-            writer_token=fresh_current,
-        )
+        fresh_authority_probe_statuses = {}
+        fresh_authority_recovery_statuses = {}
+        for authority_case in (
+            "stale_owner_and_generation",
+            "stale_generation_current_owner",
+            "wrong_owner_current_generation",
+        ):
+            fresh_harness = factory()
+            fresh_run_id = _contract_run_id(namespace, f"fresh-{authority_case}")
+            fresh_stale = _contract_writer(fresh_harness, fresh_run_id)
+            fresh_current = _contract_writer(
+                fresh_harness,
+                fresh_run_id,
+                "owner-b",
+                generation=2,
+            )
+            owner_id, generation = {
+                "stale_owner_and_generation": (
+                    fresh_stale.owner_id,
+                    fresh_stale.generation,
+                ),
+                "stale_generation_current_owner": (
+                    fresh_current.owner_id,
+                    fresh_stale.generation,
+                ),
+                "wrong_owner_current_generation": (
+                    fresh_stale.owner_id,
+                    fresh_current.generation,
+                ),
+            }[authority_case]
+            invalid_token = WriterToken(
+                run_id=fresh_run_id,
+                owner_id=owner_id,
+                generation=generation,
+            )
+            fresh_records = {
+                "checkpoint": RunCheckpoint(run_id=fresh_run_id, seq=1),
+                "event": _contract_event(fresh_run_id, seq=1),
+                "invocation": _contract_invocation(
+                    fresh_run_id,
+                    revision=1,
+                    dispatch_state="reserved",
+                ),
+                "terminal": _contract_terminal(fresh_run_id),
+            }
+            fresh_authority_probe_statuses[authority_case] = (
+                _contract_authority_probe_statuses(
+                    fresh_harness.sink,
+                    **fresh_records,
+                    writer_token=invalid_token,
+                )
+            )
+            fresh_authority_recovery_statuses[authority_case] = (
+                _contract_authority_probe_statuses(
+                    fresh_harness.sink,
+                    **fresh_records,
+                    writer_token=fresh_current,
+                )
+            )
         handoff_observations = []
         for handoff_kind, current_owner in (
             ("lease_renewal", "owner-a"),
@@ -1940,11 +1946,13 @@ def _run_fenced_run_sink_contract(
                     ),
                     *(
                         observation(
-                            f"{authority_case}_{mutation}",
+                            f"existing_{authority_case}_{mutation}",
                             expected="fenced",
                             actual=status,
                         )
-                        for authority_case, mutation_statuses in authority_probe_statuses.items()
+                        for authority_case, mutation_statuses in (
+                            existing_authority_probe_statuses.items()
+                        )
                         for mutation, status in mutation_statuses.items()
                     ),
                     observation(
@@ -1967,45 +1975,27 @@ def _run_fenced_run_sink_contract(
                         expected="already_committed",
                         actual=current_terminal.status,
                     ),
-                    observation(
-                        "stale_new_checkpoint",
-                        expected="fenced",
-                        actual=stale_new_checkpoint.status,
+                    *(
+                        observation(
+                            f"fresh_{authority_case}_{mutation}",
+                            expected="fenced",
+                            actual=status,
+                        )
+                        for authority_case, mutation_statuses in (
+                            fresh_authority_probe_statuses.items()
+                        )
+                        for mutation, status in mutation_statuses.items()
                     ),
-                    observation(
-                        "stale_new_event",
-                        expected="fenced",
-                        actual=stale_new_event.status,
-                    ),
-                    observation(
-                        "stale_new_invocation",
-                        expected="fenced",
-                        actual=stale_new_invocation.status,
-                    ),
-                    observation(
-                        "stale_new_terminal",
-                        expected="fenced",
-                        actual=stale_new_terminal.status,
-                    ),
-                    observation(
-                        "current_after_stale_checkpoint",
-                        expected="committed",
-                        actual=current_after_stale_checkpoint.status,
-                    ),
-                    observation(
-                        "current_after_stale_event",
-                        expected="committed",
-                        actual=current_after_stale_event.status,
-                    ),
-                    observation(
-                        "current_after_stale_invocation",
-                        expected="committed",
-                        actual=current_after_stale_invocation.status,
-                    ),
-                    observation(
-                        "current_after_stale_terminal",
-                        expected="committed",
-                        actual=current_after_stale_terminal.status,
+                    *(
+                        observation(
+                            f"fresh_{authority_case}_{mutation}_recovery",
+                            expected="committed",
+                            actual=status,
+                        )
+                        for authority_case, mutation_statuses in (
+                            fresh_authority_recovery_statuses.items()
+                        )
+                        for mutation, status in mutation_statuses.items()
                     ),
                     *handoff_observations,
                 ),

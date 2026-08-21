@@ -497,7 +497,8 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 `already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.
 Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
 reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
-generation과 현재 generation의 잘못된 owner를 독립적으로 제출해 모두 `fenced`인지 확인한다.
+generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
+fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
 bytes를 읽는다. Metadata fencing 밖에서 stale blob을 공개하는 adapter는 이 검증을 통과하지 못한다.
