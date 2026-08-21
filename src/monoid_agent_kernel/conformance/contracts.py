@@ -1079,8 +1079,10 @@ def _contract_invocation_canonical_alias_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
     field_name: str,
+    *,
+    legacy_first: bool,
 ) -> str:
-    """Prove accepted legacy tags normalize to the same current canonical record."""
+    """Prove same-revision aliases normalize in either retry direction."""
 
     harness = factory()
     token = _contract_writer(harness, run_id)
@@ -1101,11 +1103,15 @@ def _contract_invocation_canonical_alias_status(
     }
     if set(variants) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
         raise AssertionError("invocation canonical-tag matrix is incomplete")
-    first = harness.sink.commit_invocation(baseline, {}, writer_token=token)
+    legacy = variants[field_name]
+    first_value, retry_value = (
+        (legacy, baseline) if legacy_first else (baseline, legacy)
+    )
+    first = harness.sink.commit_invocation(first_value, {}, writer_token=token)
     if first.status != "committed":
         return f"setup:{first.status}"
     return harness.sink.commit_invocation(
-        variants[field_name],
+        retry_value,
         {},
         writer_token=token,
     ).status
@@ -1968,12 +1974,17 @@ def _run_fenced_run_sink_contract(
             for field_name in sorted(_CONTRACT_INVOCATION_IDENTITY_FIELDS)
         }
         invocation_canonical_alias_statuses = {
-            field_name: _contract_invocation_canonical_alias_status(
+            (field_name, direction): _contract_invocation_canonical_alias_status(
                 factory,
-                _contract_run_id(namespace, f"invocation-canonical-alias-{field_name}"),
+                _contract_run_id(
+                    namespace,
+                    f"invocation-canonical-alias-{field_name}-{direction}",
+                ),
                 field_name,
+                legacy_first=direction == "legacy_to_current",
             )
             for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
+            for direction in ("current_to_legacy", "legacy_to_current")
         }
         invocation_canonical_alias_transition_statuses = {
             field_name: _contract_invocation_canonical_alias_transition_status(
@@ -2227,11 +2238,13 @@ def _run_fenced_run_sink_contract(
                     ),
                     *(
                         observation(
-                            f"invocation_canonical_alias_{field_name}",
+                            f"invocation_canonical_alias_{field_name}_{direction}",
                             expected="already_committed",
                             actual=status,
                         )
-                        for field_name, status in invocation_canonical_alias_statuses.items()
+                        for (field_name, direction), status in (
+                            invocation_canonical_alias_statuses.items()
+                        )
                     ),
                     *(
                         observation(

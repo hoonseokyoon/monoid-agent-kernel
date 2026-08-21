@@ -472,9 +472,9 @@ Checkpoint와 invocation은 선택 필드가 아니라 committed canonical paylo
 하나씩 독립적으로 변경해 모두 `conflict`인지 확인한다. Matrix의 field 집합은 각 record의
 canonical JSON field에서 계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
 Invocation의 schema version과 digest generation은 current canonical tag로 고정한다. 허용된 legacy
-alias를 쓴 같은 revision 재시도는 canonical payload가 같으므로 `already_committed`다. Legacy alias를
-쓴 다음 current-tagged legal revision과 current tag 뒤 legacy-tagged legal revision은 canonical stable
-identity가 같으므로 모두 `committed`다.
+alias와 current tag 사이의 같은 revision 재시도는 양방향 모두 canonical payload가 같으므로
+`already_committed`다. Legacy alias를 쓴 다음 current-tagged legal revision과 current tag 뒤
+legacy-tagged legal revision은 canonical stable identity가 같으므로 모두 `committed`다.
 Checkpoint의 schema version과 `last_model_invocation` 안의 schema version/digest generation도 current
 writer shape로 정규화한다. 세 alias 위치의 current→legacy·legacy→current 같은-sequence 재시도는 모두
 `already_committed`다.
@@ -1020,6 +1020,8 @@ postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh ma
 attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을
 실패시키는 mutant test가 있다. Attempt 3 이상을 일괄 거부하는 구현도 양성 lifecycle observation이
 잡아낸다. Terminal schema alias를 raw tag로 digest하는 구현도 양방향 retry observation이 잡아낸다.
+Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방향 same-revision observation이
+잡아낸다.
 
 ### 14.6 최종 통합 PR
 

@@ -954,6 +954,80 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
     assert drift_observation.actual == "committed"
 
 
+class _RawInvocationAliasDigestSink(DeterministicFencedRunSink):
+    field_name = ""
+    broken_direction = ""
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if stored is not None and self._is_current(invocation.run_id, writer_token):
+            previous_value = getattr(stored[1].invocation, self.field_name)
+            incoming_value = getattr(invocation, self.field_name)
+            previous_is_legacy = previous_value.startswith("native-agent-runner.")
+            incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
+            direction = (
+                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
+            )
+            if (
+                previous_value != incoming_value
+                and previous_is_legacy != incoming_is_legacy
+                and direction == self.broken_direction
+            ):
+                return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _raw_invocation_alias_digest_factory(field_name: str, direction: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _RawInvocationAliasDigestSink(harness._writers)
+        sink.field_name = field_name
+        sink.broken_direction = direction
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("field_name", "direction"),
+    [
+        (field_name, direction)
+        for field_name in ("schema_version", "digest_generation")
+        for direction in ("current_to_legacy", "legacy_to_current")
+    ],
+)
+def test_reusable_contract_normalizes_invocation_alias_retries_both_directions(
+    field_name: str,
+    direction: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _raw_invocation_alias_digest_factory(field_name, direction)
+    )
+    lifecycle_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    alias_observation = next(
+        observation
+        for observation in lifecycle_rule.observations
+        if observation.observation_id
+        == f"invocation_canonical_alias_{field_name}_{direction}"
+    )
+
+    assert lifecycle_rule.status == "failed"
+    assert alias_observation.expected == "already_committed"
+    assert alias_observation.actual == "conflict"
+
+
 class _CanonicalAliasTransitionDriftSink(DeterministicFencedRunSink):
     field_name = ""
     broken_direction = ""
