@@ -179,6 +179,11 @@ EXPECTED_CONTRACTS_ALL = [
 ]
 
 REMOVED_PUBLIC_SURFACE_NAMES = [
+    "WriterToken",
+    "CommitResult",
+    "StorageCapabilities",
+    "FencedCheckpointStore",
+    "FencedRunSink",
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
@@ -391,6 +396,18 @@ def test_package_root_mirrors_contracts_surface() -> None:
     assert root.__all__ == contracts.__all__
 
 
+def test_hosting_surface_is_narrow_and_explicit() -> None:
+    import monoid_agent_kernel.hosting as hosting
+
+    assert hosting.__all__ == [
+        "WriterToken",
+        "CommitResult",
+        "StorageCapabilities",
+        "FencedCheckpointStore",
+        "FencedRunSink",
+    ]
+
+
 def test_helpers_and_conveniences_are_not_root_or_contract_exports() -> None:
     import monoid_agent_kernel as root
     import monoid_agent_kernel.contracts as contracts
@@ -598,11 +615,46 @@ import monoid_agent_kernel
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
+    or name.startswith('monoid_agent_kernel.hosting')
     or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
     or name.startswith('dbos.')
+]
+if blocked:
+    raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_hosting_import_keeps_platform_implementations_out() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code = """
+import sys
+import monoid_agent_kernel.hosting
+blocked = [
+    name for name in sys.modules
+    if name.startswith('monoid_agent_kernel.reference')
+    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'temporalio'}
+    or name.startswith('dbos.')
+    or name.startswith('psycopg.')
+    or name.startswith('psycopg2.')
+    or name.startswith('redis.')
+    or name.startswith('temporalio.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))

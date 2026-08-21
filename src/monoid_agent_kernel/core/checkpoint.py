@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
@@ -33,6 +33,9 @@ from monoid_agent_kernel.core.json_ingress import (
 from monoid_agent_kernel.core.model_invocation import decode_model_invocation
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
+
+if TYPE_CHECKING:
+    from monoid_agent_kernel.hosting import StorageCapabilities
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
 ACCEPTED_SCHEMA_VERSIONS = accepted_namespaced_ids("checkpoint.v1")
@@ -692,6 +695,18 @@ class LocalFsCheckpointStore:
     # live peer before stealing anyway (so a stuck holder can never deadlock a put).
     lock_timeout_s: float = 10.0
     lock_stale_s: float = 30.0
+
+    @property
+    def capabilities(self) -> StorageCapabilities:
+        """Declare only guarantees this legacy local store can actually provide.
+
+        The import stays lazy so importing the stable kernel root does not load the host-only
+        namespace. LocalFS remains a legacy ``CheckpointStore`` and exposes no fenced mutation.
+        """
+
+        from monoid_agent_kernel.hosting import StorageCapabilities
+
+        return StorageCapabilities(single_writer=True, durable_checkpoints=True)
 
     def _dir(self, run_id: str) -> Path:
         return self.run_root / run_id / "checkpoints"

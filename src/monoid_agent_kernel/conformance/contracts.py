@@ -26,6 +26,11 @@ from monoid_agent_kernel.core.capability import (
     scope_within,
 )
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
+from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
+from monoid_agent_kernel.core.model_invocation import (
+    MODEL_REQUEST_DIGEST_GENERATION,
+    DurableModelInvocation,
+)
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
@@ -38,11 +43,14 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
     redacted_or_none,
 )
+from monoid_agent_kernel.core.outcome import RetryEligibility, TerminalOutcome
+from monoid_agent_kernel.hosting import FencedRunSink, WriterToken
 
 STORE_CONTRACT_PROFILE = "checkpoint-store-contract"
 BROKER_CONTRACT_PROFILE = "capability-broker-contract"
 REDACTOR_CONTRACT_PROFILE = "redactor-contract"
 MODEL_IO_CONTRACT_PROFILE = "model-io-observer-contract"
+FENCED_RUN_SINK_CONTRACT_PROFILE = "fenced-run-sink-contract"
 
 
 class CheckpointStoreFactory(Protocol):
@@ -59,6 +67,19 @@ class RedactorFactory(Protocol):
 
 class ModelIOObserverFactory(Protocol):
     def __call__(self) -> ModelIOObserver: ...
+
+
+class FencedRunSinkHarness(Protocol):
+    """Conformance-only host seam that can rotate authoritative writer ownership."""
+
+    @property
+    def sink(self) -> FencedRunSink: ...
+
+    def claim_writer(self, run_id: str, owner_id: str) -> WriterToken: ...
+
+
+class FencedRunSinkHarnessFactory(Protocol):
+    def __call__(self) -> FencedRunSinkHarness: ...
 
 
 @contextmanager
@@ -174,6 +195,373 @@ def run_checkpoint_store_contract(
         )
     except Exception as exc:
         outcomes.append(_error("STORE-03-RUN-ISOLATION", STORE_CONTRACT_PROFILE, exc))
+    return tuple(outcomes)
+
+
+def _contract_event(run_id: str, *, seq: int, level: str = "info") -> AgentEvent:
+    return AgentEvent(
+        schema_version=EVENT_SCHEMA_VERSION,
+        event_id=f"event-{seq}",
+        seq=seq,
+        run_id=run_id,
+        timestamp="2026-08-21T00:00:00Z",
+        type="checkpoint.committed",
+        level=level,  # type: ignore[arg-type]
+        data={"checkpoint_seq": seq},
+    )
+
+
+def _contract_terminal(run_id: str, *, failed: bool = False) -> TerminalOutcome:
+    if failed:
+        return TerminalOutcome(
+            run_id=run_id,
+            kind="failed_terminal",
+            retry_eligibility=RetryEligibility.FORBIDDEN,
+            error_code="contract_failed",
+        )
+    return TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+        final_output_ref="blob:contract-final",
+    )
+
+
+def _contract_invocation(
+    run_id: str,
+    *,
+    logical_call_id: str = "call-1",
+    revision: int,
+    dispatch_attempt: int = 1,
+    dispatch_id: str = "dispatch-1",
+    dispatch_state: str,
+    request_digest: str = "a" * 64,
+    retryable: bool = False,
+    succeeded: bool = False,
+) -> DurableModelInvocation:
+    receipt = None
+    result_ref = ""
+    failure_code = ""
+    if dispatch_state == "settled":
+        receipt = {"request_digest": request_digest, "retryable": retryable}
+        if succeeded:
+            result_ref = "blob:contract-turn"
+        else:
+            failure_code = "provider_refused"
+    return DurableModelInvocation(
+        run_id=run_id,
+        logical_call_id=logical_call_id,
+        revision=revision,
+        dispatch_id=dispatch_id,
+        dispatch_attempt=dispatch_attempt,
+        idempotency_key="contract-idempotency-key",
+        dispatch_state=dispatch_state,  # type: ignore[arg-type]
+        request_digest=request_digest,
+        digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+        receipt=receipt,
+        result_ref=result_ref,
+        failure_code=failure_code,
+    )
+
+
+def run_fenced_run_sink_contract(
+    factory: FencedRunSinkHarnessFactory,
+) -> tuple[ConformanceRuleOutcome, ...]:
+    """Execute backend-neutral fencing, conflict, terminal, and invocation invariants."""
+
+    outcomes: list[ConformanceRuleOutcome] = []
+    try:
+        harness = factory()
+        run_id = "contract-checkpoint"
+        token = harness.claim_writer(run_id, "owner-a")
+        checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
+        first = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token)
+        repeated = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token)
+        conflict = harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=run_id, seq=1, final_text="challenger"),
+            {},
+            writer_token=token,
+        )
+        loaded = harness.sink.latest_checked(run_id)
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation("first_status", expected="committed", actual=first.status),
+                    observation(
+                        "repeat_status", expected="already_committed", actual=repeated.status
+                    ),
+                    observation("conflict_status", expected="conflict", actual=conflict.status),
+                    observation(
+                        "conflict_names_winner",
+                        expected=first.content_digest,
+                        actual=conflict.winner_digest,
+                    ),
+                    observation(
+                        "winner_remains_latest",
+                        expected="winner",
+                        actual=(loaded.value.checkpoint.final_text if loaded.value else None),
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
+
+    try:
+        harness = factory()
+        run_id = "contract-fence-first"
+        stale = harness.claim_writer(run_id, "owner-a")
+        checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
+        harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
+        current = harness.claim_writer(run_id, "owner-b")
+        stale_identical = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
+        event = _contract_event(run_id, seq=1)
+        stale_event = harness.sink.append_event(event, writer_token=stale)
+        invocation = _contract_invocation(run_id, revision=1, dispatch_state="reserved")
+        stale_invocation = harness.sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=stale,
+        )
+        stale_terminal = harness.sink.settle_terminal(
+            _contract_terminal(run_id), writer_token=stale
+        )
+        current_checkpoint = harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=run_id, seq=2, final_text="current"),
+            {},
+            writer_token=current,
+        )
+        current_event = harness.sink.append_event(event, writer_token=current)
+        current_invocation = harness.sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=current,
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation(
+                        "stale_identical", expected="fenced", actual=stale_identical.status
+                    ),
+                    observation("stale_event", expected="fenced", actual=stale_event.status),
+                    observation(
+                        "stale_invocation", expected="fenced", actual=stale_invocation.status
+                    ),
+                    observation(
+                        "stale_terminal", expected="fenced", actual=stale_terminal.status
+                    ),
+                    observation(
+                        "new_generation_writes",
+                        expected="committed",
+                        actual=current_checkpoint.status,
+                    ),
+                    observation(
+                        "new_generation_appends_event",
+                        expected="committed",
+                        actual=current_event.status,
+                    ),
+                    observation(
+                        "new_generation_commits_invocation",
+                        expected="committed",
+                        actual=current_invocation.status,
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
+
+    try:
+        harness = factory()
+        run_id = "contract-terminal"
+        token = harness.claim_writer(run_id, "owner-a")
+        event = _contract_event(run_id, seq=1)
+        first_event = harness.sink.append_event(event, writer_token=token)
+        repeated_event = harness.sink.append_event(event, writer_token=token)
+        conflict_event = harness.sink.append_event(
+            _contract_event(run_id, seq=1, level="warning"), writer_token=token
+        )
+        terminal = _contract_terminal(run_id)
+        first_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
+        repeated_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
+        conflict_terminal = harness.sink.settle_terminal(
+            _contract_terminal(run_id, failed=True), writer_token=token
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation("event_first", expected="committed", actual=first_event.status),
+                    observation(
+                        "event_repeat", expected="already_committed", actual=repeated_event.status
+                    ),
+                    observation(
+                        "event_conflict", expected="conflict", actual=conflict_event.status
+                    ),
+                    observation(
+                        "terminal_first", expected="committed", actual=first_terminal.status
+                    ),
+                    observation(
+                        "terminal_repeat",
+                        expected="already_committed",
+                        actual=repeated_terminal.status,
+                    ),
+                    observation(
+                        "terminal_conflict", expected="conflict", actual=conflict_terminal.status
+                    ),
+                    observation(
+                        "terminal_winner_digest",
+                        expected=first_terminal.content_digest,
+                        actual=conflict_terminal.winner_digest,
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
+
+    try:
+        harness = factory()
+        run_id = "contract-invocation"
+        token = harness.claim_writer(run_id, "owner-a")
+        missing = harness.sink.load_invocation(run_id, "call-1")
+        reserved = harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+            {},
+            writer_token=token,
+        )
+        started = harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+            {},
+            writer_token=token,
+        )
+        settled_failure = harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=3,
+                dispatch_state="settled",
+                retryable=True,
+            ),
+            {},
+            writer_token=token,
+        )
+        next_attempt = harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=4,
+                dispatch_attempt=2,
+                dispatch_id="dispatch-2",
+                dispatch_state="reserved",
+            ),
+            {},
+            writer_token=token,
+        )
+        loaded = harness.sink.load_invocation(run_id, "call-1")
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-04-INVOCATION-LIFECYCLE",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation("initial_load", expected="missing", actual=missing.status),
+                    observation("reserve", expected="committed", actual=reserved.status),
+                    observation("start", expected="committed", actual=started.status),
+                    observation(
+                        "settled_failure", expected="committed", actual=settled_failure.status
+                    ),
+                    observation(
+                        "proven_retry", expected="committed", actual=next_attempt.status
+                    ),
+                    observation("latest_load", expected="loaded", actual=loaded.status),
+                    observation("latest_revision", expected=4, actual=loaded.sequence),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-04-INVOCATION-LIFECYCLE",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
+
+    try:
+        harness = factory()
+        run_id = "contract-invocation-refusals"
+        token = harness.claim_writer(run_id, "owner-a")
+        first_wrong = harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=1, dispatch_state="dispatch_started"),
+            {},
+            writer_token=token,
+        )
+        harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+            {},
+            writer_token=token,
+        )
+        gap = harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=3, dispatch_state="dispatch_started"),
+            {},
+            writer_token=token,
+        )
+        regression = harness.sink.commit_invocation(
+            _contract_invocation(run_id, revision=2, dispatch_state="reserved"),
+            {},
+            writer_token=token,
+        )
+        identity_drift = harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=2,
+                dispatch_state="dispatch_started",
+                request_digest="b" * 64,
+            ),
+            {},
+            writer_token=token,
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation("first_must_reserve", expected="conflict", actual=first_wrong.status),
+                    observation("revision_gap", expected="conflict", actual=gap.status),
+                    observation("state_regression", expected="conflict", actual=regression.status),
+                    observation("identity_drift", expected="conflict", actual=identity_drift.status),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
     return tuple(outcomes)
 
 
