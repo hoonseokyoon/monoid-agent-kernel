@@ -100,9 +100,11 @@ class FencedCheckpointStore(Protocol):
     """Shared checkpoint store whose mutation rejects stale host writers.
 
     Every mutation validates the token's run binding before owner, generation, idempotency, or
-    content. A token issued for another run always returns ``fenced``. Every submitted blob key is
-    the lowercase SHA-256 digest of its bytes. A malformed blob map returns ``conflict`` without
-    publishing metadata or blob content.
+    content. Owner and generation are independent equality checks against current authority. A
+    token issued for another run, a stale generation from the current owner, or a wrong owner at
+    the current generation always returns ``fenced``. Every submitted blob key is the lowercase
+    SHA-256 digest of its bytes. A malformed blob map returns ``conflict`` without publishing
+    metadata or blob content.
     """
 
     @property

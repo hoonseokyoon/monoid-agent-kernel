@@ -149,6 +149,62 @@ def test_reusable_contract_rejects_idempotency_before_fencing(mutation: str) -> 
     )
 
 
+class _PartialWriterAuthoritySink(DeterministicFencedRunSink):
+    compared_field = ""
+
+    def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
+        current = self.current_writers.get(run_id)
+        return (
+            writer_token.run_id == run_id
+            and current is not None
+            and getattr(writer_token, self.compared_field)
+            == getattr(current, self.compared_field)
+        )
+
+
+def _partial_writer_authority_factory(compared_field: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _PartialWriterAuthoritySink(harness._writers)
+        sink.compared_field = compared_field
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("compared_field", "accepted_authority_case"),
+    [
+        ("owner_id", "stale_generation_current_owner"),
+        ("generation", "wrong_owner_current_generation"),
+    ],
+)
+def test_reusable_contract_checks_owner_and_generation_independently(
+    compared_field: str,
+    accepted_authority_case: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _partial_writer_authority_factory(compared_field)
+    )
+    fence_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    actual = {
+        observation.observation_id: observation.actual
+        for observation in fence_rule.observations
+        if observation.observation_id.startswith(f"{accepted_authority_case}_")
+    }
+
+    assert fence_rule.status == "failed"
+    assert actual == {
+        f"{accepted_authority_case}_{mutation}": "already_committed"
+        for mutation in ("checkpoint", "event", "invocation", "terminal")
+    }
+
+
 class _MissingResourceFenceBypassSink(DeterministicFencedRunSink):
     broken_mutation = ""
     _bypass_current_writer = False
@@ -2162,7 +2218,8 @@ def test_reusable_contract_rejects_write_published_after_rotation(mutation: str)
     handoff_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id == f"handoff_{mutation}_linearization"
+        if observation.observation_id
+        == f"handoff_lease_renewal_{mutation}_linearization"
     )
 
     assert fence_rule.status == "failed"
@@ -2230,7 +2287,7 @@ def test_reusable_contract_keeps_blobs_inside_writer_handoff_fencing(
     blob_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id == f"handoff_{mutation}_blob_bytes"
+        if observation.observation_id == f"handoff_lease_renewal_{mutation}_blob_bytes"
     )
 
     assert fence_rule.status == "failed"

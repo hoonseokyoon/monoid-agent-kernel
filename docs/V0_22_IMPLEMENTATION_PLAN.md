@@ -408,7 +408,9 @@ class StorageCapabilities:
 
 `WriterToken`은 credential이 아니다. Run ID, host owner ID, monotonic lease epoch를 함께
 운반한다. Run binding은 같은 owner와 generation으로 발급된 다른 run의 token 교환을 막는다.
-만료와 현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다.
+만료와 현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다. Adapter는 run ID,
+owner ID, generation을 현재 authority와 각각 비교하며 세 값이 모두 정확히 일치할 때만 mutation을
+허용한다.
 
 ### 6.2 Protocol shape
 
@@ -493,6 +495,9 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
 직렬화되면 stale write는 `fenced`, write가 먼저 직렬화되면 새 generation retry가
 `already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.
+Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
+reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
+generation과 현재 generation의 잘못된 owner를 독립적으로 제출해 모두 `fenced`인지 확인한다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
 bytes를 읽는다. Metadata fencing 밖에서 stale blob을 공개하는 adapter는 이 검증을 통과하지 못한다.

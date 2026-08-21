@@ -52,7 +52,9 @@ out in commit messages and here.
   terminal schema aliases normalize in both same-winner retry directions.
   Checkpoint and settled-invocation CAS/writer-handoff races carry referenced blobs and verify their
   post-race bytes. Populated commit-result sequence, submitted digest, and winner digest evidence is
-  checked for every mutation family across committed, idempotent, and conflict statuses.
+  checked for every mutation family across committed, idempotent, and conflict statuses. Writer
+  authority probes vary owner and generation independently, and handoff races cover same-owner
+  lease renewal plus owner reassignment.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

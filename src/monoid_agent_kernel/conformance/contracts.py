@@ -784,6 +784,33 @@ def _contract_handoff_write(
     )
 
 
+def _contract_authority_probe_statuses(
+    sink: FencedRunSink,
+    *,
+    checkpoint: RunCheckpoint,
+    event: AgentEvent,
+    invocation: DurableModelInvocation,
+    terminal: TerminalOutcome,
+    writer_token: WriterToken,
+) -> dict[str, str]:
+    """Exercise every authoritative mutation with one deliberately invalid token."""
+
+    return {
+        "checkpoint": sink.commit_checkpoint(
+            checkpoint,
+            {},
+            writer_token=writer_token,
+        ).status,
+        "event": sink.append_event(event, writer_token=writer_token).status,
+        "invocation": sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=writer_token,
+        ).status,
+        "terminal": sink.settle_terminal(terminal, writer_token=writer_token).status,
+    }
+
+
 def _contract_competing_values(mutation: str, run_id: str) -> tuple[Any, Any]:
     if mutation == "checkpoint":
         workspace_delta = [
@@ -1691,6 +1718,32 @@ def _run_fenced_run_sink_contract(
         )
         initial_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
         current = _contract_writer(harness, run_id, "owner-b", generation=2)
+        authority_probe_statuses = {
+            "stale_generation_current_owner": _contract_authority_probe_statuses(
+                harness.sink,
+                checkpoint=checkpoint,
+                event=event,
+                invocation=invocation,
+                terminal=terminal,
+                writer_token=WriterToken(
+                    run_id=run_id,
+                    owner_id=current.owner_id,
+                    generation=stale.generation,
+                ),
+            ),
+            "wrong_owner_current_generation": _contract_authority_probe_statuses(
+                harness.sink,
+                checkpoint=checkpoint,
+                event=event,
+                invocation=invocation,
+                terminal=terminal,
+                writer_token=WriterToken(
+                    run_id=run_id,
+                    owner_id=stale.owner_id,
+                    generation=current.generation,
+                ),
+            ),
+        }
         stale_checkpoint = harness.sink.commit_checkpoint(
             checkpoint, {}, writer_token=stale
         )
@@ -1780,65 +1833,72 @@ def _run_fenced_run_sink_contract(
             writer_token=fresh_current,
         )
         handoff_observations = []
-        for mutation in ("checkpoint", "event", "invocation", "terminal"):
-            handoff_harness = factory()
-            handoff_run_id = _contract_run_id(namespace, f"handoff-{mutation}")
-            handoff_stale = _contract_writer(handoff_harness, handoff_run_id)
-            handoff_current = WriterToken(
-                run_id=handoff_run_id,
-                owner_id="owner-b",
-                generation=2,
-            )
-            if mutation == "invocation":
-                _contract_prepare_invocation_race(
-                    handoff_harness,
-                    handoff_run_id,
-                    handoff_stale,
+        for handoff_kind, current_owner in (
+            ("lease_renewal", "owner-a"),
+            ("owner_reassignment", "owner-b"),
+        ):
+            for mutation in ("checkpoint", "event", "invocation", "terminal"):
+                handoff_harness = factory()
+                handoff_run_id = _contract_run_id(
+                    namespace,
+                    f"handoff-{handoff_kind}-{mutation}",
                 )
-            handoff_value, _ = _contract_competing_values(mutation, handoff_run_id)
-            handoff_blobs = _contract_mutation_blobs(mutation)
-            handoff_write = partial(
-                _contract_handoff_write,
-                mutation=mutation,
-                value=handoff_value,
-                blobs=handoff_blobs,
-            )
-            stale_result, current_result, rotation_first = (
-                handoff_harness.race_writer_handoff(
-                    mutation,
-                    handoff_stale,
-                    handoff_current,
-                    handoff_write,
+                handoff_stale = _contract_writer(handoff_harness, handoff_run_id)
+                handoff_current = WriterToken(
+                    run_id=handoff_run_id,
+                    owner_id=current_owner,
+                    generation=2,
                 )
-            )
-            expected_statuses = (
-                ("fenced", "committed")
-                if rotation_first
-                else ("committed", "already_committed")
-            )
-            handoff_observations.append(
-                observation(
-                    f"handoff_{mutation}_linearization",
-                    expected=expected_statuses,
-                    actual=(stale_result.status, current_result.status),
+                if mutation == "invocation":
+                    _contract_prepare_invocation_race(
+                        handoff_harness,
+                        handoff_run_id,
+                        handoff_stale,
+                    )
+                handoff_value, _ = _contract_competing_values(mutation, handoff_run_id)
+                handoff_blobs = _contract_mutation_blobs(mutation)
+                handoff_write = partial(
+                    _contract_handoff_write,
+                    mutation=mutation,
+                    value=handoff_value,
+                    blobs=handoff_blobs,
                 )
-            )
-            if mutation in {"checkpoint", "invocation"}:
-                handoff_observations.append(
-                    observation(
-                        f"handoff_{mutation}_blob_bytes",
-                        expected=(
-                            _CONTRACT_CHECKPOINT_BLOB.hex()
-                            if mutation == "checkpoint"
-                            else _CONTRACT_INVOCATION_BLOB.hex()
-                        ),
-                        actual=_contract_race_blob_hex(
-                            handoff_harness.reopen(),
-                            mutation,
-                            handoff_run_id,
-                        ),
+                stale_result, current_result, rotation_first = (
+                    handoff_harness.race_writer_handoff(
+                        mutation,
+                        handoff_stale,
+                        handoff_current,
+                        handoff_write,
                     )
                 )
+                expected_statuses = (
+                    ("fenced", "committed")
+                    if rotation_first
+                    else ("committed", "already_committed")
+                )
+                handoff_observations.append(
+                    observation(
+                        f"handoff_{handoff_kind}_{mutation}_linearization",
+                        expected=expected_statuses,
+                        actual=(stale_result.status, current_result.status),
+                    )
+                )
+                if mutation in {"checkpoint", "invocation"}:
+                    handoff_observations.append(
+                        observation(
+                            f"handoff_{handoff_kind}_{mutation}_blob_bytes",
+                            expected=(
+                                _CONTRACT_CHECKPOINT_BLOB.hex()
+                                if mutation == "checkpoint"
+                                else _CONTRACT_INVOCATION_BLOB.hex()
+                            ),
+                            actual=_contract_race_blob_hex(
+                                handoff_harness.reopen(),
+                                mutation,
+                                handoff_run_id,
+                            ),
+                        )
+                    )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
@@ -1877,6 +1937,15 @@ def _run_fenced_run_sink_contract(
                     ),
                     observation(
                         "stale_terminal", expected="fenced", actual=stale_terminal.status
+                    ),
+                    *(
+                        observation(
+                            f"{authority_case}_{mutation}",
+                            expected="fenced",
+                            actual=status,
+                        )
+                        for authority_case, mutation_statuses in authority_probe_statuses.items()
+                        for mutation, status in mutation_statuses.items()
                     ),
                     observation(
                         "new_generation_writes",
