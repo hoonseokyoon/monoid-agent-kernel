@@ -18,64 +18,61 @@ ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = accepted_namespaced_ids("model-invoc
 
 DispatchState = Literal["reserved", "dispatch_started", "settled", "unknown"]
 
-# A receipt is normalized metadata. These names disclose model content, transport topology, or a raw
-# failure rather than evidence about the call. The check walks the whole receipt so nesting a
-# forbidden value under a provider-specific wrapper cannot bypass the boundary.
-_FORBIDDEN_RECEIPT_KEYS = frozenset(
+# Receipt v1 is a closed evidence vocabulary. Unknown provider metadata is private by default;
+# expanding the public durable record requires an explicit contract change rather than another
+# spelling-specific deny rule. Keys are matched without case or separators and emitted canonically.
+_RECEIPT_FIELDS = {
+    "attempts": "attempts",
+    "durationms": "duration_ms",
+    "finishreason": "finish_reason",
+    "httpstatus": "http_status",
+    "latencyms": "latency_ms",
+    "providererrorcode": "provider_error_code",
+    "providerrequestid": "provider_request_id",
+    "providerresponseid": "provider_response_id",
+    "providerretried": "provider_retried",
+    "requestdigest": "request_digest",
+    "requestid": "request_id",
+    "responseid": "response_id",
+    "retryable": "retryable",
+    "settledat": "settled_at",
+    "startedat": "started_at",
+    "stopreason": "stop_reason",
+    "systemfingerprint": "system_fingerprint",
+    "usage": "usage",
+}
+_RECEIPT_STRING_FIELDS = frozenset(
     {
-        "content",
-        "endpoint",
-        "error",
-        "exception",
-        "exception_message",
-        "instruction",
-        "messages",
-        "prompt",
-        "raw",
-        "raw_exception",
-        "raw_exception_message",
-        "request",
-        "request_body",
-        "response",
-        "system_prompt",
+        "finish_reason",
+        "provider_error_code",
+        "provider_request_id",
+        "provider_response_id",
+        "request_digest",
+        "request_id",
+        "response_id",
+        "settled_at",
+        "started_at",
+        "stop_reason",
+        "system_fingerprint",
     }
 )
-_FORBIDDEN_RECEIPT_KEY_PARTS = frozenset(
-    {
-        "authorization",
-        "body",
-        "content",
-        "cookie",
-        "endpoint",
-        "exception",
-        "header",
-        "headers",
-        "instruction",
-        "message",
-        "messages",
-        "prompt",
-        "reasoning",
-        "replay",
-    }
-)
-_FORBIDDEN_RECEIPT_COLLAPSED_KEYS = frozenset(
-    "".join(character for character in value if character.isalnum())
-    for value in _FORBIDDEN_RECEIPT_KEYS
-)
-_FORBIDDEN_RECEIPT_COLLAPSED_PARTS = frozenset(
-    "".join(character for character in value if character.isalnum())
-    for value in _FORBIDDEN_RECEIPT_KEY_PARTS
-)
+_RECEIPT_BOOLEAN_FIELDS = frozenset({"provider_retried", "retryable"})
+_RECEIPT_DURATION_FIELDS = frozenset({"duration_ms", "latency_ms"})
+_USAGE_FIELDS = {
+    "audioinputtokens": "audio_input_tokens",
+    "audiooutputtokens": "audio_output_tokens",
+    "cachedinputtokens": "cached_input_tokens",
+    "cachereadtokens": "cache_read_tokens",
+    "cachewritetokens": "cache_write_tokens",
+    "inputtokens": "input_tokens",
+    "outputtokens": "output_tokens",
+    "reasoningtokens": "reasoning_tokens",
+    "totaltokens": "total_tokens",
+}
 
 
-def _is_private_receipt_key(key: str) -> bool:
-    # Compare a separator- and case-independent spelling. Provider adapters commonly mix
-    # snake_case, kebab-case, camelCase, and PascalCase; a privacy boundary cannot let the chosen
-    # spelling decide whether prompt/response material enters the durable journal.
-    collapsed_key = "".join(character for character in key.casefold() if character.isalnum())
-    if collapsed_key in _FORBIDDEN_RECEIPT_COLLAPSED_KEYS or collapsed_key.startswith("raw"):
-        return True
-    return any(part in collapsed_key for part in _FORBIDDEN_RECEIPT_COLLAPSED_PARTS)
+def _collapsed_receipt_key(key: str) -> str:
+    return "".join(character for character in key.casefold() if character.isalnum())
 
 
 def _require_nonempty_string(value: object, field_name: str) -> None:
@@ -108,21 +105,64 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
         json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise ValueError("model invocation receipt must be portable JSON") from exc
-    pending: list[object] = [normalized]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if _is_private_receipt_key(key):
+    canonical: dict[str, Any] = {}
+    for key, value in normalized.items():
+        canonical_key = _RECEIPT_FIELDS.get(_collapsed_receipt_key(key))
+        if canonical_key is None:
+            raise ValueError(
+                f"model invocation receipt cannot contain private field {key!r}; "
+                "the field is outside the safe evidence vocabulary"
+            )
+        if canonical_key in canonical:
+            raise ValueError("model invocation receipt fields collide after canonicalization")
+        if canonical_key == "usage":
+            if not isinstance(value, dict):
+                raise ValueError("model invocation receipt usage must be an object")
+            usage: dict[str, int] = {}
+            for usage_key, count in value.items():
+                canonical_usage_key = _USAGE_FIELDS.get(_collapsed_receipt_key(usage_key))
+                if canonical_usage_key is None:
                     raise ValueError(
-                        f"model invocation receipt cannot contain private field {key!r}"
+                        "model invocation receipt usage contains a private field outside the "
+                        "safe evidence vocabulary"
                     )
-                pending.append(child)
-        elif isinstance(value, list):
-            pending.extend(value)
-        elif isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("model invocation receipt numbers must be finite")
-    return normalized
+                if canonical_usage_key in usage:
+                    raise ValueError(
+                        "model invocation receipt usage fields collide after canonicalization"
+                    )
+                if type(count) is not int or count < 0:
+                    raise ValueError(
+                        "model invocation receipt usage values must be non-negative integers"
+                    )
+                usage[canonical_usage_key] = count
+            canonical[canonical_key] = usage
+        elif canonical_key in _RECEIPT_STRING_FIELDS:
+            if type(value) is not str or not value.strip():
+                raise ValueError(
+                    f"model invocation receipt {canonical_key} must be a non-empty string"
+                )
+            canonical[canonical_key] = value
+        elif canonical_key in _RECEIPT_BOOLEAN_FIELDS:
+            if type(value) is not bool:
+                raise ValueError(f"model invocation receipt {canonical_key} must be a boolean")
+            canonical[canonical_key] = value
+        elif canonical_key in _RECEIPT_DURATION_FIELDS:
+            if type(value) not in {int, float} or value < 0 or not math.isfinite(float(value)):
+                raise ValueError(
+                    f"model invocation receipt {canonical_key} must be a non-negative number"
+                )
+            canonical[canonical_key] = value
+        elif canonical_key == "attempts":
+            if type(value) is not int or value < 1:
+                raise ValueError("model invocation receipt attempts must be a positive integer")
+            canonical[canonical_key] = value
+        elif canonical_key == "http_status":
+            if type(value) is not int or not 100 <= value <= 599:
+                raise ValueError("model invocation receipt http_status must be between 100 and 599")
+            canonical[canonical_key] = value
+        else:  # pragma: no cover - every canonical field belongs to one group above
+            raise AssertionError(f"unclassified receipt field {canonical_key}")
+    return canonical
 
 
 @dataclass(frozen=True, kw_only=True)

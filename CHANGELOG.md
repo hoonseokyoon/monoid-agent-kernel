@@ -11,8 +11,9 @@ out in commit messages and here.
 
 - Added the content-free `TerminalOutcome` contract with typed retry eligibility and interruption
   causes, plus the checked `DurableModelInvocation` record for reserved, dispatch-started, settled,
-  and unknown model-call revisions. Both artifacts use versioned canonical writers, retained
-  namespace readers, compatibility-ledger rows, and packaged fixtures.
+  and unknown model-call revisions. Invocation receipts use a closed, canonical safe-evidence
+  vocabulary. Both artifacts use versioned canonical writers, retained namespace readers,
+  compatibility-ledger rows, and packaged fixtures.
 - Added optional latest-invocation and interruption-cause carriage to `monoid.checkpoint.v1` while
   preserving v0.21 readers and positional construction. `RunCheckpoint.to_json()` now uses an
   explicit field projection and the iterative portable JSON copier, removing the recursive

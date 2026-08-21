@@ -90,8 +90,9 @@ prompt, model response, reasoning item, replay payload, or raw provider exceptio
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The
 receipt is normalized metadata; model content, request bodies, endpoints, and raw exceptions are
-refused. Settled success points to a private result blob, and ambiguous dispatch has no automatic
-retry evidence.
+refused. Receipt v1 accepts a closed safe-evidence vocabulary and canonicalizes key spellings;
+unknown fields are private by default. Settled success points to a private result blob, and
+ambiguous dispatch has no automatic retry evidence.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation` and `interruption_cause` fields. A
 v0.21 checkpoint omits both and restores with `None` and the empty cause. The writer keeps the

@@ -6634,6 +6634,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # fact, so a ledger carrying only the first would show a gateway's three internal
             # retries as one clean call.
             "core/model_calls.py",
+            # v0.22's durable invocation receipt preserves this per-call evidence through crash
+            # recovery without carrying the provider response itself.
+            "core/model_invocation.py",
             "core/model_io.py",
             # Joined in W6-2: the replay corpus's response body carries the flag because a
             # replayed turn must answer with what the original turn declared -- a corpus that
@@ -6703,6 +6706,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     ),
     "reasoning_tokens": frozenset(
         {
+            # v0.22's safe receipt usage vocabulary can preserve the billed sub-count while the
+            # private reasoning payload stays in the result blob.
+            "core/model_invocation.py",
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",

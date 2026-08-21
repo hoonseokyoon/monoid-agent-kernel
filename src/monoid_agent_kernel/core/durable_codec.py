@@ -149,7 +149,15 @@ class DurableCodec(Generic[T]):
     def decode(self, payload: object, loader: Callable[[dict[str, Any]], T]) -> DurableLoadResult[T]:
         if not isinstance(payload, Mapping):
             return self.corrupt(f"{self.family} payload must be an object")
-        source = copy.deepcopy(dict(payload))
+        try:
+            # Defensive copying is part of the checked-reader boundary: loaders and migrations may
+            # mutate their input, while callers retain ownership of the supplied object. Deep or
+            # otherwise uncopyable mappings are malformed durable data, not process-level errors.
+            source = copy.deepcopy(dict(payload))
+        except Exception as exc:
+            return self.corrupt(
+                f"{self.family} payload defensive copy failed ({portable_type_name(exc)})"
+            )
         version = parse_artifact_version(source.get("schema_version"))
         if version is None:
             return self.corrupt(f"{self.family} schema_version is missing or malformed")

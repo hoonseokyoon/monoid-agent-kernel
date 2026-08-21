@@ -140,6 +140,11 @@ def test_model_invocation_rejects_illegal_state_local_shapes(
         {"provider": {"response_body": {"output": "private"}}},
         {"provider": {"responseBody": {"output": "private"}}},
         {"requestBody": {"input": "private"}},
+        {"requestPayload": {"input": "private"}},
+        {"responsePayload": {"output": "private"}},
+        {"requestData": {"input": "private"}},
+        {"responseData": {"output": "private"}},
+        {"payload": {"output": "private"}},
         {"raw_provider_response": {"output": "private"}},
         {"rawProviderResponse": {"output": "private"}},
         {"raw_exception_message": "secret failure"},
@@ -166,16 +171,90 @@ def test_model_invocation_receipt_allows_safe_camel_case_evidence_fields() -> No
         dispatch_state="settled",
         receipt={
             "requestDigest": "digest_1",
+            "providerRequestId": "request_1",
             "responseId": "response_1",
-            "inputTokens": 3,
+            "providerResponseId": "response_1",
+            "usage": {"inputTokens": 3},
         },
         result_ref="blob:turn",
     )
 
     assert invocation.receipt == {
-        "requestDigest": "digest_1",
-        "responseId": "response_1",
-        "inputTokens": 3,
+        "request_digest": "digest_1",
+        "provider_request_id": "request_1",
+        "response_id": "response_1",
+        "provider_response_id": "response_1",
+        "usage": {"input_tokens": 3},
+    }
+
+
+def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabulary() -> None:
+    invocation = _invocation(
+        dispatch_state="settled",
+        receipt={
+            "attempts": 2,
+            "durationMs": 12.5,
+            "finishReason": "stop",
+            "httpStatus": 200,
+            "latencyMs": 10,
+            "providerErrorCode": "none",
+            "providerRequestId": "provider_request_1",
+            "providerResponseId": "provider_response_1",
+            "providerRetried": True,
+            "requestDigest": "digest_1",
+            "requestId": "request_1",
+            "responseId": "response_1",
+            "retryable": False,
+            "settledAt": "2026-08-21T10:00:01Z",
+            "startedAt": "2026-08-21T10:00:00Z",
+            "stopReason": "stop",
+            "systemFingerprint": "fingerprint_1",
+            "usage": {
+                "audioInputTokens": 1,
+                "audioOutputTokens": 2,
+                "cachedInputTokens": 3,
+                "cacheReadTokens": 4,
+                "cacheWriteTokens": 5,
+                "inputTokens": 6,
+                "outputTokens": 7,
+                "reasoningTokens": 8,
+                "totalTokens": 9,
+            },
+        },
+        result_ref="blob:turn",
+    )
+
+    assert set(invocation.receipt or ()) == {
+        "attempts",
+        "duration_ms",
+        "finish_reason",
+        "http_status",
+        "latency_ms",
+        "provider_error_code",
+        "provider_request_id",
+        "provider_response_id",
+        "provider_retried",
+        "request_digest",
+        "request_id",
+        "response_id",
+        "retryable",
+        "settled_at",
+        "started_at",
+        "stop_reason",
+        "system_fingerprint",
+        "usage",
+    }
+    assert invocation.receipt is not None
+    assert set(invocation.receipt["usage"]) == {
+        "audio_input_tokens",
+        "audio_output_tokens",
+        "cached_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
     }
 
 
@@ -209,6 +288,19 @@ def test_model_invocation_receipt_rejects_nonfinite_numbers_and_cycles() -> None
             receipt=cyclic,
             result_ref="blob:turn",
         )
+
+
+def test_model_invocation_checked_reader_classifies_a_recursively_uncopyable_payload() -> None:
+    nested: dict[str, object] = {"leaf": True}
+    for _ in range(700):
+        nested = {"nested": nested}
+    payload = _invocation().to_json()
+    payload["unknown_future_field"] = nested
+
+    checked = decode_model_invocation(payload)
+
+    assert checked.status == "corrupt"
+    assert checked.error_code == "model_invocation_corrupt"
 
 
 def test_model_invocation_constructor_is_keyword_only() -> None:
