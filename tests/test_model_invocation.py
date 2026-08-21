@@ -134,9 +134,14 @@ def test_model_invocation_rejects_illegal_state_local_shapes(
     (
         {"prompt": "private"},
         {"provider_prompt": "private"},
+        {"providerPrompt": "private"},
+        {"SystemPrompt": "private"},
         {"provider": {"endpoint": "https://internal.invalid"}},
         {"provider": {"response_body": {"output": "private"}}},
+        {"provider": {"responseBody": {"output": "private"}}},
+        {"requestBody": {"input": "private"}},
         {"raw_provider_response": {"output": "private"}},
+        {"rawProviderResponse": {"output": "private"}},
         {"raw_exception_message": "secret failure"},
         {"error_message": "secret failure"},
         {"request_headers": {"authorization": "secret"}},
@@ -154,6 +159,24 @@ def test_model_invocation_receipt_refuses_private_payload_channels(
             receipt=receipt,
             result_ref="blob:turn",
         )
+
+
+def test_model_invocation_receipt_allows_safe_camel_case_evidence_fields() -> None:
+    invocation = _invocation(
+        dispatch_state="settled",
+        receipt={
+            "requestDigest": "digest_1",
+            "responseId": "response_1",
+            "inputTokens": 3,
+        },
+        result_ref="blob:turn",
+    )
+
+    assert invocation.receipt == {
+        "requestDigest": "digest_1",
+        "responseId": "response_1",
+        "inputTokens": 3,
+    }
 
 
 def test_model_invocation_receipt_is_detached_on_input_and_output() -> None:

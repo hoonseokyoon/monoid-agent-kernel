@@ -58,13 +58,24 @@ _FORBIDDEN_RECEIPT_KEY_PARTS = frozenset(
         "replay",
     }
 )
+_FORBIDDEN_RECEIPT_COLLAPSED_KEYS = frozenset(
+    "".join(character for character in value if character.isalnum())
+    for value in _FORBIDDEN_RECEIPT_KEYS
+)
+_FORBIDDEN_RECEIPT_COLLAPSED_PARTS = frozenset(
+    "".join(character for character in value if character.isalnum())
+    for value in _FORBIDDEN_RECEIPT_KEY_PARTS
+)
 
 
 def _is_private_receipt_key(key: str) -> bool:
-    normalized_key = key.strip().lower().replace("-", "_")
-    if normalized_key in _FORBIDDEN_RECEIPT_KEYS or normalized_key.startswith("raw"):
+    # Compare a separator- and case-independent spelling. Provider adapters commonly mix
+    # snake_case, kebab-case, camelCase, and PascalCase; a privacy boundary cannot let the chosen
+    # spelling decide whether prompt/response material enters the durable journal.
+    collapsed_key = "".join(character for character in key.casefold() if character.isalnum())
+    if collapsed_key in _FORBIDDEN_RECEIPT_COLLAPSED_KEYS or collapsed_key.startswith("raw"):
         return True
-    return bool(_FORBIDDEN_RECEIPT_KEY_PARTS.intersection(normalized_key.split("_")))
+    return any(part in collapsed_key for part in _FORBIDDEN_RECEIPT_COLLAPSED_PARTS)
 
 
 def _require_nonempty_string(value: object, field_name: str) -> None:
