@@ -79,9 +79,7 @@ _CONTRACT_ALTERNATE_BLOB_SHA256 = hashlib.sha256(_CONTRACT_ALTERNATE_BLOB).hexdi
 _CONTRACT_UNRESOLVED_BLOB = b"contract reference recovery bytes\n"
 _CONTRACT_UNRESOLVED_BLOB_SHA256 = hashlib.sha256(_CONTRACT_UNRESOLVED_BLOB).hexdigest()
 _CONTRACT_STALE_HANDOFF_BLOB = b"stale writer handoff-only blob bytes\n"
-_CONTRACT_STALE_HANDOFF_BLOB_SHA256 = hashlib.sha256(
-    _CONTRACT_STALE_HANDOFF_BLOB
-).hexdigest()
+_CONTRACT_STALE_HANDOFF_BLOB_SHA256 = hashlib.sha256(_CONTRACT_STALE_HANDOFF_BLOB).hexdigest()
 _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
     generation
     for generation in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
@@ -93,9 +91,7 @@ _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION = next(
     if schema != MODEL_INVOCATION_SCHEMA_VERSION
 )
 _CONTRACT_ALTERNATE_CHECKPOINT_SCHEMA_VERSION = next(
-    schema
-    for schema in ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS
-    if schema != CHECKPOINT_SCHEMA_VERSION
+    schema for schema in ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS if schema != CHECKPOINT_SCHEMA_VERSION
 )
 _CONTRACT_ALTERNATE_TERMINAL_SCHEMA_VERSION = next(
     schema
@@ -114,9 +110,7 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
         "failure_code",
     }
 )
-_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset(
-    {"schema_version", "digest_generation"}
-)
+_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset({"schema_version", "digest_generation"})
 _CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
     {
         "schema_version",
@@ -458,9 +452,7 @@ def _contract_terminal_canonical_alias_status(
         baseline,
         schema_version=_CONTRACT_ALTERNATE_TERMINAL_SCHEMA_VERSION,
     )
-    first_value, retry_value = (
-        (legacy, baseline) if legacy_first else (baseline, legacy)
-    )
+    first_value, retry_value = (legacy, baseline) if legacy_first else (baseline, legacy)
     harness = factory()
     token = _contract_writer(harness, run_id)
     first = harness.sink.settle_terminal(first_value, writer_token=token)
@@ -501,9 +493,7 @@ def _contract_checkpoint_identity_variants(
             "phase": "running",
             "source_seq": 1,
         },
-        "applied_input_receipts": {
-            "input-alternate": {"checkpoint_seq": checkpoint.seq}
-        },
+        "applied_input_receipts": {"input-alternate": {"checkpoint_seq": checkpoint.seq}},
         "last_model_invocation": _contract_invocation(
             checkpoint.run_id,
             revision=1,
@@ -582,9 +572,7 @@ def _contract_checkpoint_canonical_alias_status(
             raise AssertionError("checkpoint nested invocation alias matrix is incomplete")
         legacy_invocation[nested_field] = alias_values[nested_field]
         legacy = replace(baseline, last_model_invocation=legacy_invocation)
-    first_value, retry_value = (
-        (legacy, baseline) if legacy_first else (baseline, legacy)
-    )
+    first_value, retry_value = (legacy, baseline) if legacy_first else (baseline, legacy)
     harness = factory()
     token = _contract_writer(harness, run_id)
     first = harness.sink.commit_checkpoint(first_value, {}, writer_token=token)
@@ -722,8 +710,7 @@ def _contract_record_digest(
         {
             "record": payload,
             "blobs": {
-                key: hashlib.sha256(value).hexdigest()
-                for key, value in sorted(blobs.items())
+                key: hashlib.sha256(value).hexdigest() for key, value in sorted(blobs.items())
             },
         }
     )
@@ -982,11 +969,7 @@ def _contract_stale_handoff_blob_probe(
 
 
 def _contract_mutation_payload_digest(mutation: str, value: Any) -> str:
-    payload = (
-        checkpoint_payload_for_write(value)
-        if mutation == "checkpoint"
-        else value.to_json()
-    )
+    payload = checkpoint_payload_for_write(value) if mutation == "checkpoint" else value.to_json()
     return canonical_sha256(payload)
 
 
@@ -1233,11 +1216,15 @@ def _contract_invocation_identity_status(
             dispatch_state="reserved",
         ).to_json()
     )
-    identity_fields = canonical_fields - {
-        "run_id",
-        "logical_call_id",
-        "revision",
-    } - _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS
+    identity_fields = (
+        canonical_fields
+        - {
+            "run_id",
+            "logical_call_id",
+            "revision",
+        }
+        - _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS
+    )
     if identity_fields != _CONTRACT_INVOCATION_IDENTITY_FIELDS:
         raise AssertionError("invocation identity matrix is incomplete")
     harness = factory()
@@ -1348,9 +1335,7 @@ def _contract_invocation_canonical_alias_status(
     if set(variants) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
         raise AssertionError("invocation canonical-tag matrix is incomplete")
     legacy = variants[field_name]
-    first_value, retry_value = (
-        (legacy, baseline) if legacy_first else (baseline, legacy)
-    )
+    first_value, retry_value = (legacy, baseline) if legacy_first else (baseline, legacy)
     first = harness.sink.commit_invocation(first_value, {}, writer_token=token)
     if first.status != "committed":
         return f"setup:{first.status}"
@@ -1546,8 +1531,8 @@ def _run_fenced_run_sink_contract(
             writer_token=missing_reference_token,
         )
         missing_reference_harness = missing_reference_harness.reopen()
-        missing_reference_recovery_load = (
-            missing_reference_harness.sink.latest_checked(missing_reference_run_id)
+        missing_reference_recovery_load = missing_reference_harness.sink.latest_checked(
+            missing_reference_run_id
         )
         missing_reference_recovery_bytes = _contract_blob_hex(
             missing_reference_recovery_load.value,
@@ -1584,9 +1569,7 @@ def _run_fenced_run_sink_contract(
             writer_token=missing_media_token,
         )
         missing_media_harness = missing_media_harness.reopen()
-        missing_media_load = missing_media_harness.sink.latest_checked(
-            missing_media_run_id
-        )
+        missing_media_load = missing_media_harness.sink.latest_checked(missing_media_run_id)
         missing_media_recovery = missing_media_harness.sink.commit_checkpoint(
             missing_media_checkpoint,
             {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
@@ -1680,9 +1663,7 @@ def _run_fenced_run_sink_contract(
             writer_token=uppercase_key_token,
         )
         uppercase_key_harness = uppercase_key_harness.reopen()
-        uppercase_key_load = uppercase_key_harness.sink.latest_checked(
-            uppercase_key_run_id
-        )
+        uppercase_key_load = uppercase_key_harness.sink.latest_checked(uppercase_key_run_id)
         uppercase_reference_checkpoint = RunCheckpoint(
             run_id=uppercase_key_run_id,
             seq=1,
@@ -1828,9 +1809,7 @@ def _run_fenced_run_sink_contract(
                 checkpoint_blobs,
                 writer_token=token,
             ).status
-            for field_name, variant in _contract_checkpoint_identity_variants(
-                checkpoint
-            ).items()
+            for field_name, variant in _contract_checkpoint_identity_variants(checkpoint).items()
         }
         loaded = harness.sink.latest_checked(run_id)
         referenced_blob_bytes = _contract_blob_hex(
@@ -2178,9 +2157,7 @@ def _run_fenced_run_sink_contract(
                 ),
             ),
         }
-        stale_checkpoint = harness.sink.commit_checkpoint(
-            checkpoint, {}, writer_token=stale
-        )
+        stale_checkpoint = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
         stale_event = harness.sink.append_event(event, writer_token=stale)
         stale_invocation = harness.sink.commit_invocation(
             invocation,
@@ -2283,19 +2260,15 @@ def _run_fenced_run_sink_contract(
                 ),
                 "terminal": _contract_terminal(fresh_run_id),
             }
-            fresh_authority_probe_statuses[authority_case] = (
-                _contract_authority_probe_statuses(
-                    fresh_harness.sink,
-                    **fresh_records,
-                    writer_token=invalid_token,
-                )
+            fresh_authority_probe_statuses[authority_case] = _contract_authority_probe_statuses(
+                fresh_harness.sink,
+                **fresh_records,
+                writer_token=invalid_token,
             )
-            fresh_authority_recovery_statuses[authority_case] = (
-                _contract_authority_probe_statuses(
-                    fresh_harness.sink,
-                    **fresh_records,
-                    writer_token=fresh_current,
-                )
+            fresh_authority_recovery_statuses[authority_case] = _contract_authority_probe_statuses(
+                fresh_harness.sink,
+                **fresh_records,
+                writer_token=fresh_current,
             )
         handoff_observations = []
         for handoff_kind, current_owner in (
@@ -2357,13 +2330,11 @@ def _run_fenced_run_sink_contract(
                     current_value=current_value,
                     current_blobs=current_blobs,
                 )
-                stale_result, current_result, rotation_first = (
-                    handoff_harness.race_writer_handoff(
-                        mutation,
-                        handoff_stale,
-                        handoff_current,
-                        handoff_write,
-                    )
+                stale_result, current_result, rotation_first = handoff_harness.race_writer_handoff(
+                    mutation,
+                    handoff_stale,
+                    handoff_current,
+                    handoff_write,
                 )
                 expected_statuses = (
                     ("fenced", "committed")
@@ -2383,6 +2354,13 @@ def _run_fenced_run_sink_contract(
                     )
                 )
                 if mutation in {"checkpoint", "invocation"}:
+                    handoff_read_harness = handoff_harness.reopen()
+                    winner_value = current_value if rotation_first else stale_value
+                    winner_payload_digest = _contract_race_payload_digest(
+                        handoff_read_harness,
+                        mutation,
+                        handoff_run_id,
+                    )
                     winner_blob = (
                         _CONTRACT_CHECKPOINT_BLOB
                         if rotation_first and mutation == "checkpoint"
@@ -2402,11 +2380,21 @@ def _run_fenced_run_sink_contract(
                             f"handoff_{handoff_kind}_{mutation}_blob_bytes",
                             expected=winner_blob.hex(),
                             actual=_contract_race_blob_hex(
-                                handoff_harness.reopen(),
+                                handoff_read_harness,
                                 mutation,
                                 handoff_run_id,
                                 winner_blob_sha256,
                             ),
+                        )
+                    )
+                    handoff_observations.append(
+                        observation(
+                            f"handoff_{handoff_kind}_{mutation}_winner_payload",
+                            expected=_contract_mutation_payload_digest(
+                                mutation,
+                                winner_value,
+                            ),
+                            actual=winner_payload_digest,
                         )
                     )
                     stale_blob_probe = _contract_stale_handoff_blob_probe(
@@ -2430,9 +2418,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "initial_checkpoint", expected="committed", actual=initial_checkpoint.status
                     ),
-                    observation(
-                        "initial_event", expected="committed", actual=initial_event.status
-                    ),
+                    observation("initial_event", expected="committed", actual=initial_event.status),
                     observation(
                         "initial_invocation",
                         expected="committed",
@@ -2469,9 +2455,7 @@ def _run_fenced_run_sink_contract(
                         )
                         for mutation, status in mutation_statuses.items()
                     ),
-                    observation(
-                        "stale_terminal", expected="fenced", actual=stale_terminal.status
-                    ),
+                    observation("stale_terminal", expected="fenced", actual=stale_terminal.status),
                     *(
                         observation(
                             f"existing_{authority_case}_{mutation}",
@@ -2658,7 +2642,9 @@ def _run_fenced_run_sink_contract(
             winning_value = (
                 left_value
                 if left_result.status == "committed"
-                else right_value if right_result.status == "committed" else None
+                else right_value
+                if right_result.status == "committed"
+                else None
             )
             reopened_race_harness = race_harness.reopen()
             retry_winner, retry_loser = _contract_race_retry_statuses(
@@ -2902,11 +2888,9 @@ def _run_fenced_run_sink_contract(
             writer_token=missing_reference_token,
         )
         missing_reference_harness = missing_reference_harness.reopen()
-        missing_reference_recovery_load = (
-            missing_reference_harness.sink.load_invocation(
-                missing_reference_run_id,
-                "call-1",
-            )
+        missing_reference_recovery_load = missing_reference_harness.sink.load_invocation(
+            missing_reference_run_id,
+            "call-1",
         )
         missing_reference_recovery_bytes = _contract_blob_hex(
             missing_reference_recovery_load.value,
@@ -3170,9 +3154,7 @@ def _run_fenced_run_sink_contract(
             "conflict": _contract_commit_evidence(
                 conflicting_reserved,
                 sequence=conflicting_reserved_invocation.revision,
-                content_digest=_contract_record_digest(
-                    conflicting_reserved_invocation.to_json()
-                ),
+                content_digest=_contract_record_digest(conflicting_reserved_invocation.to_json()),
                 winner_digest=reserved_digest,
             ),
         }
@@ -3345,9 +3327,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "settled_failure", expected="committed", actual=settled_failure.status
                     ),
-                    observation(
-                        "proven_retry", expected="committed", actual=next_attempt.status
-                    ),
+                    observation("proven_retry", expected="committed", actual=next_attempt.status),
                     *(
                         observation(
                             f"old_revision_{revision}_retry_and_head",
@@ -3371,9 +3351,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "latest_call_binding",
                         expected="call-1",
-                        actual=(
-                            loaded.value.invocation.logical_call_id if loaded.value else None
-                        ),
+                        actual=(loaded.value.invocation.logical_call_id if loaded.value else None),
                     ),
                     observation(
                         "latest_invocation_digest",
@@ -3536,9 +3514,7 @@ def _run_fenced_run_sink_contract(
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
                         actual=malformed_recovery_bytes,
                     ),
-                    observation(
-                        "result_load", expected="loaded", actual=loaded_result.status
-                    ),
+                    observation("result_load", expected="loaded", actual=loaded_result.status),
                     observation(
                         "result_ref",
                         expected=f"blob:{_CONTRACT_INVOCATION_BLOB_SHA256}",
@@ -3591,7 +3567,7 @@ def _run_fenced_run_sink_contract(
         initial_refusal_statuses = {
             state: _contract_first_invocation_state_status(
                 factory,
-                _contract_run_id(namespace, f"invocation-first-{state.replace('_', '-') }"),
+                _contract_run_id(namespace, f"invocation-first-{state.replace('_', '-')}"),
                 state,
             )
             for state in ("dispatch_started", "settled", "unknown")
@@ -3828,9 +3804,7 @@ def _run_fenced_run_sink_contract(
         run_b_records = (
             RunCheckpoint(run_id=run_b_id, seq=1),
             _contract_event(run_b_id, seq=1),
-            _contract_invocation(
-            run_b_id, revision=1, dispatch_state="reserved"
-            ),
+            _contract_invocation(run_b_id, revision=1, dispatch_state="reserved"),
             _contract_terminal(run_b_id),
         )
         checkpoint, event, invocation, terminal = run_b_records
@@ -3921,6 +3895,87 @@ def _run_fenced_run_sink_contract(
         loaded_b_checkpoint = harness.sink.latest_checked(run_b_id)
         loaded_a_invocation = harness.sink.load_invocation(run_a_id, "call-1")
         loaded_b_invocation = harness.sink.load_invocation(run_b_id, "call-1")
+        loaded_a_event = harness.read_event(run_a_id, 1)
+        loaded_b_event = harness.read_event(run_b_id, 1)
+        loaded_a_terminal = harness.read_terminal(run_a_id)
+        loaded_b_terminal = harness.read_terminal(run_b_id)
+        loaded_event_payloads = (
+            canonical_sha256(loaded_a_event.to_json()) if loaded_a_event else None,
+            canonical_sha256(loaded_b_event.to_json()) if loaded_b_event else None,
+        )
+        loaded_terminal_payloads = (
+            canonical_sha256(loaded_a_terminal.to_json()) if loaded_a_terminal else None,
+            canonical_sha256(loaded_b_terminal.to_json()) if loaded_b_terminal else None,
+        )
+
+        cross_blob_harness = factory()
+        cross_blob_run_a_id = _contract_run_id(namespace, "blob-run-a")
+        cross_blob_run_b_id = _contract_run_id(namespace, "blob-run-b")
+        cross_blob_run_a_token = _contract_writer(
+            cross_blob_harness,
+            cross_blob_run_a_id,
+        )
+        cross_blob_run_b_token = _contract_writer(
+            cross_blob_harness,
+            cross_blob_run_b_id,
+        )
+        cross_blob_seed = cross_blob_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=cross_blob_run_a_id,
+                seq=1,
+                workspace_delta=[
+                    {
+                        "path": "run-private-blob.txt",
+                        "kind": "file",
+                        "change_kind": "created",
+                        "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                    }
+                ],
+            ),
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=cross_blob_run_a_token,
+        )
+        cross_blob_checkpoint = cross_blob_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=cross_blob_run_b_id,
+                seq=1,
+                workspace_delta=[
+                    {
+                        "path": "foreign-run-reference.txt",
+                        "kind": "file",
+                        "change_kind": "created",
+                        "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                    }
+                ],
+            ),
+            {},
+            writer_token=cross_blob_run_b_token,
+        )
+        cross_blob_invocation_setup = tuple(
+            cross_blob_harness.sink.commit_invocation(
+                _contract_invocation(
+                    cross_blob_run_b_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=cross_blob_run_b_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        cross_blob_invocation = cross_blob_harness.sink.commit_invocation(
+            replace(
+                _contract_invocation(
+                    cross_blob_run_b_id,
+                    revision=3,
+                    dispatch_state="settled",
+                    succeeded=True,
+                ),
+                result_ref=f"blob:{_CONTRACT_CHECKPOINT_BLOB_SHA256}",
+            ),
+            {},
+            writer_token=cross_blob_run_b_token,
+        )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-06-WRITER-TOKEN-RUN-BINDING",
@@ -3931,9 +3986,7 @@ def _run_fenced_run_sink_contract(
                         expected="fenced",
                         actual=swapped_checkpoint.status,
                     ),
-                    observation(
-                        "cross_run_event", expected="fenced", actual=swapped_event.status
-                    ),
+                    observation("cross_run_event", expected="fenced", actual=swapped_event.status),
                     observation(
                         "cross_run_invocation",
                         expected="fenced",
@@ -4019,6 +4072,46 @@ def _run_fenced_run_sink_contract(
                                 else None
                             ),
                         ),
+                    ),
+                    observation(
+                        "run_a_event_payload",
+                        expected=canonical_sha256(run_a_event.to_json()),
+                        actual=loaded_event_payloads[0],
+                    ),
+                    observation(
+                        "run_b_event_payload",
+                        expected=canonical_sha256(event.to_json()),
+                        actual=loaded_event_payloads[1],
+                    ),
+                    observation(
+                        "run_a_terminal_payload",
+                        expected=canonical_sha256(run_a_terminal.to_json()),
+                        actual=loaded_terminal_payloads[0],
+                    ),
+                    observation(
+                        "run_b_terminal_payload",
+                        expected=canonical_sha256(terminal.to_json()),
+                        actual=loaded_terminal_payloads[1],
+                    ),
+                    observation(
+                        "cross_run_blob_seed",
+                        expected="committed",
+                        actual=cross_blob_seed.status,
+                    ),
+                    observation(
+                        "cross_run_blob_checkpoint_reference",
+                        expected="conflict",
+                        actual=cross_blob_checkpoint.status,
+                    ),
+                    observation(
+                        "cross_run_blob_invocation_setup",
+                        expected=("committed", "committed"),
+                        actual=cross_blob_invocation_setup,
+                    ),
+                    observation(
+                        "cross_run_blob_invocation_reference",
+                        expected="conflict",
+                        actual=cross_blob_invocation.status,
                     ),
                 ),
             )
@@ -4176,15 +4269,25 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
                 REDACTOR_CONTRACT_PROFILE,
                 (
                     # A secret-named key must not survive at any depth, in a mapping or inside a list.
-                    observation("top_level_secret_key", expected=False, actual="sk-live-must-not-survive" in rendered),
-                    observation("nested_secret_key", expected=False, actual="Bearer must-not-survive" in rendered),
+                    observation(
+                        "top_level_secret_key",
+                        expected=False,
+                        actual="sk-live-must-not-survive" in rendered,
+                    ),
+                    observation(
+                        "nested_secret_key",
+                        expected=False,
+                        actual="Bearer must-not-survive" in rendered,
+                    ),
                     # Non-secret data must survive, or "redact everything" would pass every rule.
                     observation("non_secret_value_survives", expected=True, actual="7" in rendered),
                 ),
             )
         )
     except Exception as exc:
-        outcomes.append(_error("REDACTOR-02-NO-DEFAULT-SECRET-LEAK", REDACTOR_CONTRACT_PROFILE, exc))
+        outcomes.append(
+            _error("REDACTOR-02-NO-DEFAULT-SECRET-LEAK", REDACTOR_CONTRACT_PROFILE, exc)
+        )
 
     try:
         raised = redacted_or_none(payload, policy=policy, redactor=_FailingRedactor())
@@ -4200,13 +4303,14 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
                     observation("failure_does_not_propagate", expected=True, actual=True),
                     # ``None`` has to mean failure, not "redacted to empty", or the caller cannot
                     # tell a downgrade from empty content.
-                    observation("success_is_distinguishable", expected=True, actual=survived is not None),
+                    observation(
+                        "success_is_distinguishable", expected=True, actual=survived is not None
+                    ),
                 ),
             )
         )
     except Exception as exc:
         outcomes.append(_error("REDACTOR-03-FAILURE-IS-CONTAINED", REDACTOR_CONTRACT_PROFILE, exc))
-
 
     try:
         mapping_result = factory().redact(payload, policy=policy)
@@ -4220,18 +4324,28 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
                     # and then hands the pipeline a scalar where it needs fields. The pipeline itself
                     # fails closed on this, but a redactor that trips it silently loses its consumer's
                     # content, so the contract names it rather than leaving it to be discovered.
-                    observation("mapping_stays_a_mapping", expected=True, actual=isinstance(mapping_result, Mapping)),
-                    observation("text_stays_text", expected=True, actual=isinstance(text_result, str)),
+                    observation(
+                        "mapping_stays_a_mapping",
+                        expected=True,
+                        actual=isinstance(mapping_result, Mapping),
+                    ),
+                    observation(
+                        "text_stays_text", expected=True, actual=isinstance(text_result, str)
+                    ),
                     observation(
                         "mapping_keys_are_preserved",
                         expected=sorted(payload),
-                        actual=sorted(mapping_result) if isinstance(mapping_result, Mapping) else None,
+                        actual=sorted(mapping_result)
+                        if isinstance(mapping_result, Mapping)
+                        else None,
                     ),
                 ),
             )
         )
     except Exception as exc:
-        outcomes.append(_error("REDACTOR-04-PRESERVES-THE-VALUE-SHAPE", REDACTOR_CONTRACT_PROFILE, exc))
+        outcomes.append(
+            _error("REDACTOR-04-PRESERVES-THE-VALUE-SHAPE", REDACTOR_CONTRACT_PROFILE, exc)
+        )
 
     try:
         redacted = factory().redact(payload, policy=policy)
@@ -4245,13 +4359,23 @@ def run_redactor_contract(factory: RedactorFactory) -> tuple[ConformanceRuleOutc
                     # The other axes of a RedactionPolicy. Key names are no help in a paragraph, and
                     # model *output* is all paragraph, so a redactor that masks only secret-named keys
                     # protects the request side and leaks the response side entirely.
-                    observation("pattern_in_a_mapping_value", expected=False, actual="sk-abc123" in rendered),
-                    observation("literal_in_a_mapping_value", expected=False, actual="hunter2" in rendered),
+                    observation(
+                        "pattern_in_a_mapping_value", expected=False, actual="sk-abc123" in rendered
+                    ),
+                    observation(
+                        "literal_in_a_mapping_value", expected=False, actual="hunter2" in rendered
+                    ),
                     # Inside a list, where a recursive implementation can easily stop descending.
-                    observation("pattern_inside_a_list", expected=False, actual="sk-xyz789" in rendered),
+                    observation(
+                        "pattern_inside_a_list", expected=False, actual="sk-xyz789" in rendered
+                    ),
                     # And on a bare string, the shape a final_text capture actually has.
-                    observation("pattern_in_free_text", expected=False, actual="sk-abc123" in str(free_text)),
-                    observation("literal_in_free_text", expected=False, actual="hunter2" in str(free_text)),
+                    observation(
+                        "pattern_in_free_text", expected=False, actual="sk-abc123" in str(free_text)
+                    ),
+                    observation(
+                        "literal_in_free_text", expected=False, actual="hunter2" in str(free_text)
+                    ),
                 ),
             )
         )
@@ -4303,15 +4427,23 @@ def run_model_io_observer_contract(
                 MODEL_IO_CONTRACT_PROFILE,
                 (
                     # An observer that declares only ``on_model_call`` is a complete implementation.
-                    observation("declares_on_model_call", expected=True, actual=callable(getattr(subject, "on_model_call", None))),
+                    observation(
+                        "declares_on_model_call",
+                        expected=True,
+                        actual=callable(getattr(subject, "on_model_call", None)),
+                    ),
                     observation("close_is_optional", expected=True, actual=True),
-                    observation("delivery_reached_a_peer_observer", expected=1, actual=len(witness.captures)),
+                    observation(
+                        "delivery_reached_a_peer_observer", expected=1, actual=len(witness.captures)
+                    ),
                     observation("receipt_returned", expected=True, actual=returned is not None),
                 ),
             )
         )
     except Exception as exc:
-        outcomes.append(_error("MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL", MODEL_IO_CONTRACT_PROFILE, exc))
+        outcomes.append(
+            _error("MODELIO-01-PARTIAL-IMPLEMENTATION-LEGAL", MODEL_IO_CONTRACT_PROFILE, exc)
+        )
 
     try:
         witness = _RecordingObserver()
@@ -4332,13 +4464,19 @@ def run_model_io_observer_contract(
                     # The call already happened and the provider has already been paid; a broken
                     # exporter does not get to undo that, nor to starve the observers behind it.
                     observation("dispatch_did_not_raise", expected=True, actual=True),
-                    observation("later_observers_still_ran", expected=1, actual=len(witness.captures)),
-                    observation("receipt_still_returned", expected=True, actual=returned is not None),
+                    observation(
+                        "later_observers_still_ran", expected=1, actual=len(witness.captures)
+                    ),
+                    observation(
+                        "receipt_still_returned", expected=True, actual=returned is not None
+                    ),
                 ),
             )
         )
     except Exception as exc:
-        outcomes.append(_error("MODELIO-02-OBSERVER-FAILURE-CONTAINED", MODEL_IO_CONTRACT_PROFILE, exc))
+        outcomes.append(
+            _error("MODELIO-02-OBSERVER-FAILURE-CONTAINED", MODEL_IO_CONTRACT_PROFILE, exc)
+        )
 
     try:
         witness = _RecordingObserver()
@@ -4351,7 +4489,9 @@ def run_model_io_observer_contract(
             ),
         )
         captured = witness.captures[0]
-        rendered = json.dumps(_jsonish({"content": captured.content, "digests": dict(captured.digests)}))
+        rendered = json.dumps(
+            _jsonish({"content": captured.content, "digests": dict(captured.digests)})
+        )
         outcomes.append(
             outcome_from_observations(
                 "MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT",
@@ -4363,14 +4503,22 @@ def run_model_io_observer_contract(
                     # and a digest of a short prompt is a guessable one.
                     observation("digests_absent", expected=0, actual=len(captured.digests)),
                     observation("lengths_absent", expected=0, actual=len(captured.lengths)),
-                    observation("nothing_leaked", expected=False, actual="sk-must-not-survive" in rendered),
+                    observation(
+                        "nothing_leaked", expected=False, actual="sk-must-not-survive" in rendered
+                    ),
                     # The receipt still arrives: it is metadata only, so it is safe at every mode.
-                    observation("receipt_still_delivered", expected=True, actual=captured.receipt is not None),
+                    observation(
+                        "receipt_still_delivered",
+                        expected=True,
+                        actual=captured.receipt is not None,
+                    ),
                 ),
             )
         )
     except Exception as exc:
-        outcomes.append(_error("MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT", MODEL_IO_CONTRACT_PROFILE, exc))
+        outcomes.append(
+            _error("MODELIO-03-NONE-POLICY-RECEIVES-NO-CONTENT", MODEL_IO_CONTRACT_PROFILE, exc)
+        )
 
     # ``close_model_io_subscriptions`` de-duplicates by identity and swallows failures, so a factory
     # returning one shared instance is closed once and a raising ``close`` cannot lose the outcomes.

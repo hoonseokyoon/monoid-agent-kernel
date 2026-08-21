@@ -466,6 +466,8 @@ Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전
 Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
 `read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
 구현을 거부한다.
+Run-isolation probe는 같은 local key를 가진 두 run의 event와 terminal 전체 payload를 모두 읽는다.
+Run별 digest만 보존하고 실제 payload를 전역 singleton에 덮어쓰는 adapter도 이 비교에서 실패한다.
 각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
 factory instance와 명시적으로 reopened된 모든 facade를 추적한다. 다음 독립 probe를 열기 전에 직전
 probe의 facade group을 역순으로 닫고, `finally`에서 마지막 group을 닫는다. 이 수명 규칙이 database
@@ -504,6 +506,9 @@ invocation retry는 `conflict`다. Blob mutation의 stale callback과 current ca
 write-first 경로에서는 같은 참조가 authoritative backing에서 해소되어야 한다. Current callback은
 stale 전용 bytes를 제출하지 않는다. 이 probe가 metadata fencing 밖의 stale blob publication을
 검출한다.
+Checkpoint와 invocation handoff는 재개방한 record의 전체 canonical payload도 linearization이 선택한
+값과 비교한다. 올바른 status와 blob을 반환한 뒤 metadata만 stale·loser 값으로 덮어쓰는 adapter도
+실패한다.
 Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
 reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
 generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
@@ -581,6 +586,8 @@ reference는 제출 map이나 같은 run의 authoritative backing으로 해소�
 경로의 fresh missing-reference commit은 `conflict`이고 head를 유지한다. 같은 run에서 먼저 저장한
 blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재개방 record가 그 bytes를
 반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
+Run A에만 존재하는 digest를 run B가 빈 map으로 참조하면 checkpoint와 invocation 모두 `conflict`다.
+Content-addressed blob namespace는 run 권위 경계를 포함한다.
 Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
 직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
 기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
@@ -1082,9 +1089,11 @@ Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mu
 retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
 owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
 서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
-확인한다. Contract harness registry는 probe 전환 때 직전 facade group을 닫고 최대 동시 facade 수를
-회귀 검증한다. Delayed checkpoint는 fresh 낮은 좌표의 commit·idempotent retry와 높은 latest head를
-동시에 요구한다.
+확인한다. 같은 handoff에서 재개방한 checkpoint·invocation 전체 payload가 linearization winner와
+일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두 blob-bearing mutation에서
+거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract harness registry는 probe
+전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
+낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다.
 
 ### 14.6 최종 통합 PR
 

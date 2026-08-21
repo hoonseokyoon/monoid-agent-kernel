@@ -124,6 +124,7 @@ class _IdempotencyFirstSink(DeterministicFencedRunSink):
             return CommitResult(status="already_committed")
         return super().settle_terminal(outcome, writer_token=writer_token)
 
+
 def _idempotency_first_factory(mutation: str):
     def factory() -> DeterministicFencedRunHarness:
         harness = DeterministicFencedRunHarness()
@@ -139,9 +140,7 @@ def _idempotency_first_factory(mutation: str):
 def test_reusable_contract_rejects_idempotency_before_fencing(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_idempotency_first_factory(mutation))
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
 
     assert fence_rule.status == "failed"
@@ -159,8 +158,7 @@ class _PartialWriterAuthoritySink(DeterministicFencedRunSink):
         return (
             writer_token.run_id == run_id
             and current is not None
-            and getattr(writer_token, self.compared_field)
-            == getattr(current, self.compared_field)
+            and getattr(writer_token, self.compared_field) == getattr(current, self.compared_field)
         )
 
 
@@ -186,20 +184,14 @@ def test_reusable_contract_checks_owner_and_generation_independently(
     compared_field: str,
     accepted_authority_case: str,
 ) -> None:
-    outcomes = run_fenced_run_sink_contract(
-        _partial_writer_authority_factory(compared_field)
-    )
+    outcomes = run_fenced_run_sink_contract(_partial_writer_authority_factory(compared_field))
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
     actual = {
         observation.observation_id: observation.actual
         for observation in fence_rule.observations
-        if observation.observation_id.startswith(
-            f"existing_{accepted_authority_case}_"
-        )
+        if observation.observation_id.startswith(f"existing_{accepted_authority_case}_")
     }
 
     assert fence_rule.status == "failed"
@@ -308,17 +300,14 @@ def _missing_resource_fence_bypass_factory(mutation: str):
 def test_reusable_contract_rejects_stale_writes_to_missing_resources(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_missing_resource_fence_bypass_factory(mutation))
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
 
     assert fence_rule.status == "failed"
     stale_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id
-        == f"fresh_stale_owner_and_generation_{mutation}"
+        if observation.observation_id == f"fresh_stale_owner_and_generation_{mutation}"
     )
     assert stale_observation.expected == "fenced"
     assert stale_observation.actual == "committed"
@@ -334,8 +323,7 @@ class _PartialFreshResourceAuthoritySink(_MissingResourceFenceBypassSink):
         return (
             writer_token.run_id == run_id
             and current is not None
-            and getattr(writer_token, self.compared_field)
-            == getattr(current, self.compared_field)
+            and getattr(writer_token, self.compared_field) == getattr(current, self.compared_field)
         )
 
 
@@ -371,15 +359,12 @@ def test_reusable_contract_checks_fresh_resource_authority_dimensions(
         _partial_fresh_resource_authority_factory(mutation, compared_field)
     )
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
     observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id
-        == f"fresh_{accepted_authority_case}_{mutation}"
+        if observation.observation_id == f"fresh_{accepted_authority_case}_{mutation}"
     )
 
     assert fence_rule.status == "failed"
@@ -553,9 +538,7 @@ def _unscoped_resource_key_factory(mutation: str):
 def test_reusable_contract_scopes_each_resource_key_by_run(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_unscoped_resource_key_factory(mutation))
     binding_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
     )
     run_b_observation = next(
         observation
@@ -566,6 +549,49 @@ def test_reusable_contract_scopes_each_resource_key_by_run(mutation: str) -> Non
     assert binding_rule.status == "failed"
     assert run_b_observation.expected == "committed"
     assert run_b_observation.actual == "conflict"
+
+
+class _CrossRunPayloadAliasHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    @staticmethod
+    def _run_b_id(run_id: str) -> str:
+        return f"{run_id.removesuffix('run-a')}run-b"
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        if self.broken_mutation == "event" and run_id.endswith("run-a"):
+            return super().read_event(self._run_b_id(run_id), seq)
+        return super().read_event(run_id, seq)
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        if self.broken_mutation == "terminal" and run_id.endswith("run-a"):
+            return super().read_terminal(self._run_b_id(run_id))
+        return super().read_terminal(run_id)
+
+
+def _cross_run_payload_alias_factory(mutation: str):
+    def factory() -> _CrossRunPayloadAliasHarness:
+        harness = _CrossRunPayloadAliasHarness()
+        harness.broken_mutation = mutation
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["event", "terminal"])
+def test_reusable_contract_reads_each_runs_complete_payload(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_cross_run_payload_alias_factory(mutation))
+    binding_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
+    )
+    payload_observation = next(
+        observation
+        for observation in binding_rule.observations
+        if observation.observation_id == f"run_a_{mutation}_payload"
+    )
+
+    assert binding_rule.status == "failed"
+    assert payload_observation.actual != payload_observation.expected
 
 
 def _missing_capability_factory() -> DeterministicFencedRunHarness:
@@ -585,9 +611,7 @@ def _missing_capability_factory() -> DeterministicFencedRunHarness:
 def test_reusable_contract_rejects_missing_required_capability_declaration() -> None:
     outcomes = run_fenced_run_sink_contract(_missing_capability_factory)
     capability_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-00-CAPABILITY-DECLARATION"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-00-CAPABILITY-DECLARATION"
     )
 
     assert capability_rule.status == "failed"
@@ -757,28 +781,21 @@ def test_reusable_contract_rejects_fresh_malformed_content_addressed_blobs() -> 
 
     checkpoint_rule = rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"]
     invocation_rule = rules["FENCED-04-INVOCATION-LIFECYCLE"]
-    checkpoint_observations = {
-        item.observation_id: item for item in checkpoint_rule.observations
-    }
-    invocation_observations = {
-        item.observation_id: item for item in invocation_rule.observations
-    }
+    checkpoint_observations = {item.observation_id: item for item in checkpoint_rule.observations}
+    invocation_observations = {item.observation_id: item for item in invocation_rule.observations}
 
     assert checkpoint_rule.status == "failed"
     assert invocation_rule.status == "failed"
     assert checkpoint_observations["malformed_fresh_blob_status"].actual == "committed"
     assert checkpoint_observations["malformed_fresh_blob_head_not_published"].actual == 2
     assert invocation_observations["malformed_fresh_blob_status"].actual == "committed"
-    assert (
-        invocation_observations["malformed_fresh_blob_head_not_published"].actual == 3
-    )
+    assert invocation_observations["malformed_fresh_blob_head_not_published"].actual == 3
 
 
 class _CaseFoldingBlobDigestSink(DeterministicFencedRunSink):
     def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
         return all(
-            type(value) is bytes
-            and hashlib.sha256(value).hexdigest() == key.lower()
+            type(value) is bytes and hashlib.sha256(value).hexdigest() == key.lower()
             for key, value in blobs.items()
         )
 
@@ -906,8 +923,7 @@ def test_reusable_contract_protects_same_run_blobs_from_malformed_writes() -> No
         preserved = next(
             item
             for item in rule.observations
-            if item.observation_id
-            == "malformed_fresh_blob_preserves_existing_bytes"
+            if item.observation_id == "malformed_fresh_blob_preserves_existing_bytes"
         )
         assert rule.status == "failed"
         assert preserved.actual != preserved.expected
@@ -1105,10 +1121,7 @@ class _ReferentialIntegritySink(DeterministicFencedRunSink):
             result_blob = blobs.get(result_sha256)
             if result_blob is None:
                 result_blob = self._blobs.get((invocation.run_id, result_sha256))
-            if (
-                result_blob is None
-                or hashlib.sha256(result_blob).hexdigest() != result_sha256
-            ):
+            if result_blob is None or hashlib.sha256(result_blob).hexdigest() != result_sha256:
                 return CommitResult(status="conflict", sequence=invocation.revision)
         return super().commit_invocation(invocation, blobs, writer_token=writer_token)
 
@@ -1177,8 +1190,7 @@ class _WorkspaceOnlyCheckpointReferenceSink(DeterministicFencedRunSink):
         return {
             item["content_sha256"]
             for item in checkpoint.workspace_delta
-            if isinstance(item.get("content_sha256"), str)
-            and item["content_sha256"]
+            if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
         }
 
 
@@ -1195,9 +1207,7 @@ def test_reusable_contract_checks_media_references_inside_checkpoint_messages() 
         for outcome in outcomes
         if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
     )
-    observations = {
-        item.observation_id: item.actual for item in checkpoint_rule.observations
-    }
+    observations = {item.observation_id: item.actual for item in checkpoint_rule.observations}
 
     assert checkpoint_rule.status == "failed"
     assert observations["missing_reference_status"] == "conflict"
@@ -1241,6 +1251,36 @@ def test_reusable_contract_accepts_references_from_same_run_authoritative_backin
         "conflict",
     )
     assert invocation_observations["authoritative_backing_reference_status"] == "conflict"
+
+
+class _GlobalBackingReferenceSink(DeterministicFencedRunSink):
+    def _reference_is_available(
+        self,
+        run_id: str,
+        sha256: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        return super()._reference_is_available(run_id, sha256, blobs) or any(
+            stored_sha256 == sha256 for _, stored_sha256 in self._blobs
+        )
+
+
+def _global_backing_reference_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _GlobalBackingReferenceSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_references_backed_only_by_another_run() -> None:
+    outcomes = run_fenced_run_sink_contract(_global_backing_reference_factory)
+    binding_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
+    )
+    observations = {item.observation_id: item.actual for item in binding_rule.observations}
+
+    assert binding_rule.status == "failed"
+    assert observations["cross_run_blob_checkpoint_reference"] == "committed"
+    assert observations["cross_run_blob_invocation_reference"] == "committed"
 
 
 class _RegressingCheckpointHeadSink(DeterministicFencedRunSink):
@@ -1317,9 +1357,7 @@ def test_reusable_contract_commits_fresh_delayed_checkpoint_coordinates() -> Non
         for outcome in outcomes
         if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
     )
-    observations = {
-        item.observation_id: item.actual for item in checkpoint_rule.observations
-    }
+    observations = {item.observation_id: item.actual for item in checkpoint_rule.observations}
 
     assert checkpoint_rule.status == "failed"
     assert observations["delayed_checkpoint"] == "conflict"
@@ -1339,9 +1377,9 @@ class _RegressingInvocationHeadSink(DeterministicFencedRunSink):
         result = super().commit_invocation(invocation, blobs, writer_token=writer_token)
         if result.status == "already_committed" and invocation.revision == self.broken_revision:
             with self._lock:
-                self._invocation_heads[
-                    (invocation.run_id, invocation.logical_call_id)
-                ] = invocation.revision
+                self._invocation_heads[(invocation.run_id, invocation.logical_call_id)] = (
+                    invocation.revision
+                )
         return result
 
 
@@ -1362,9 +1400,7 @@ def test_reusable_contract_rejects_each_old_invocation_head_regression(
 ) -> None:
     outcomes = run_fenced_run_sink_contract(_regressing_invocation_head_factory(revision))
     lifecycle_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
     )
     head_observation = next(
         observation
@@ -1454,9 +1490,7 @@ class _RawInvocationAliasDigestSink(DeterministicFencedRunSink):
             incoming_value = getattr(invocation, self.field_name)
             previous_is_legacy = previous_value.startswith("native-agent-runner.")
             incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
-            direction = (
-                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
-            )
+            direction = "legacy_to_current" if previous_is_legacy else "current_to_legacy"
             if (
                 previous_value != incoming_value
                 and previous_is_legacy != incoming_is_legacy
@@ -1494,15 +1528,12 @@ def test_reusable_contract_normalizes_invocation_alias_retries_both_directions(
         _raw_invocation_alias_digest_factory(field_name, direction)
     )
     lifecycle_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
     )
     alias_observation = next(
         observation
         for observation in lifecycle_rule.observations
-        if observation.observation_id
-        == f"invocation_canonical_alias_{field_name}_{direction}"
+        if observation.observation_id == f"invocation_canonical_alias_{field_name}_{direction}"
     )
 
     assert lifecycle_rule.status == "failed"
@@ -1527,9 +1558,7 @@ class _CanonicalAliasTransitionDriftSink(DeterministicFencedRunSink):
             incoming_value = getattr(invocation, self.field_name)
             previous_is_legacy = previous_value.startswith("native-agent-runner.")
             incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
-            direction = (
-                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
-            )
+            direction = "legacy_to_current" if previous_is_legacy else "current_to_legacy"
             if (
                 previous_value != incoming_value
                 and previous_is_legacy != incoming_is_legacy
@@ -1569,9 +1598,7 @@ def test_reusable_contract_accepts_both_canonical_alias_transition_directions(
         _canonical_alias_transition_drift_factory(field_name, direction)
     )
     lifecycle_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
     )
     alias_observation = next(
         observation
@@ -1609,9 +1636,7 @@ class _RawCheckpointAliasDigestSink(DeterministicFencedRunSink):
             incoming_value = self._raw_alias(checkpoint)
             previous_is_legacy = previous_value.startswith("native-agent-runner.")
             incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
-            direction = (
-                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
-            )
+            direction = "legacy_to_current" if previous_is_legacy else "current_to_legacy"
             if (
                 previous_value != incoming_value
                 and previous_is_legacy != incoming_is_legacy
@@ -1660,8 +1685,7 @@ def test_reusable_contract_normalizes_every_checkpoint_alias_location(
     alias_observation = next(
         observation
         for observation in checkpoint_rule.observations
-        if observation.observation_id
-        == f"checkpoint_canonical_alias_{field_name}_{direction}"
+        if observation.observation_id == f"checkpoint_canonical_alias_{field_name}_{direction}"
     )
 
     assert checkpoint_rule.status == "failed"
@@ -1684,9 +1708,7 @@ class _RawTerminalAliasDigestSink(DeterministicFencedRunSink):
             incoming_schema = outcome.schema_version
             previous_is_legacy = previous_schema.startswith("native-agent-runner.")
             incoming_is_legacy = incoming_schema.startswith("native-agent-runner.")
-            direction = (
-                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
-            )
+            direction = "legacy_to_current" if previous_is_legacy else "current_to_legacy"
             if (
                 previous_schema != incoming_schema
                 and previous_is_legacy != incoming_is_legacy
@@ -1711,13 +1733,9 @@ def _raw_terminal_alias_digest_factory(direction: str):
 def test_reusable_contract_normalizes_terminal_schema_aliases(
     direction: str,
 ) -> None:
-    outcomes = run_fenced_run_sink_contract(
-        _raw_terminal_alias_digest_factory(direction)
-    )
+    outcomes = run_fenced_run_sink_contract(_raw_terminal_alias_digest_factory(direction))
     terminal_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
     )
     alias_observation = next(
         observation
@@ -2142,8 +2160,7 @@ class _InvalidRetryCoordinateSink(DeterministicFencedRunSink):
             if (
                 retryable_failure
                 and invocation.dispatch_state == "reserved"
-                and (invocation.dispatch_attempt, invocation.dispatch_id)
-                == self.allowed_coordinate
+                and (invocation.dispatch_attempt, invocation.dispatch_id) == self.allowed_coordinate
             ):
                 return None
         return super()._invocation_transition_winner(invocation)
@@ -2174,9 +2191,7 @@ def test_reusable_contract_rejects_each_invalid_retry_coordinate(
     attempt: int,
     dispatch_id: str,
 ) -> None:
-    outcomes = run_fenced_run_sink_contract(
-        _invalid_retry_coordinate_factory(attempt, dispatch_id)
-    )
+    outcomes = run_fenced_run_sink_contract(_invalid_retry_coordinate_factory(attempt, dispatch_id))
     refusal_rule = next(
         outcome
         for outcome in outcomes
@@ -2232,9 +2247,7 @@ def test_reusable_contract_never_retries_a_retryable_tagged_success() -> None:
         for outcome in outcomes
         if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
     )
-    observations = {
-        item.observation_id: item.actual for item in refusal_rule.observations
-    }
+    observations = {item.observation_id: item.actual for item in refusal_rule.observations}
 
     assert refusal_rule.status == "failed"
     assert observations["retryable_tagged_success_history"] == (
@@ -2286,13 +2299,9 @@ class _RejectThirdAttemptSink(DeterministicFencedRunSink):
         invocation: DurableModelInvocation,
     ) -> str | None:
         if invocation.dispatch_attempt > 2:
-            head = self._invocation_heads.get(
-                (invocation.run_id, invocation.logical_call_id)
-            )
+            head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
             if head is not None:
-                return self._invocations[
-                    (invocation.run_id, invocation.logical_call_id, head)
-                ][0]
+                return self._invocations[(invocation.run_id, invocation.logical_call_id, head)][0]
         return super()._invocation_transition_winner(invocation)
 
 
@@ -2488,9 +2497,7 @@ def _non_atomic_race_factory(mutation: str):
 def test_reusable_contract_rejects_non_atomic_competing_writers(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_non_atomic_race_factory(mutation))
     winner_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
     )
     race_observation = next(
         observation
@@ -2562,9 +2569,7 @@ def _loser_payload_overwrite_factory(mutation: str):
 def test_reusable_contract_reads_the_cas_winner_payload(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_loser_payload_overwrite_factory(mutation))
     winner_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
     )
     payload_observation = next(
         observation
@@ -2614,15 +2619,12 @@ def _unsafe_writer_handoff_factory(mutation: str):
 def test_reusable_contract_rejects_write_published_after_rotation(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_unsafe_writer_handoff_factory(mutation))
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
     handoff_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id
-        == f"handoff_lease_renewal_{mutation}_linearization"
+        if observation.observation_id == f"handoff_lease_renewal_{mutation}_linearization"
     )
 
     assert fence_rule.status == "failed"
@@ -2671,20 +2673,84 @@ def test_reusable_contract_keeps_blobs_inside_writer_handoff_fencing(
 ) -> None:
     outcomes = run_fenced_run_sink_contract(_blob_outside_handoff_factory(mutation))
     fence_rule = next(
-        outcome
-        for outcome in outcomes
-        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
     )
     blob_observation = next(
         observation
         for observation in fence_rule.observations
-        if observation.observation_id
-        == f"handoff_lease_renewal_{mutation}_stale_blob_visibility"
+        if observation.observation_id == f"handoff_lease_renewal_{mutation}_stale_blob_visibility"
     )
 
     assert fence_rule.status == "failed"
     assert blob_observation.expected == "conflict"
     assert blob_observation.actual == "committed"
+
+
+class _HandoffLoserPayloadOverwriteHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write,
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        results = super().race_writer_handoff(
+            mutation,
+            stale_token,
+            current_token,
+            write,
+        )
+        if mutation != self.broken_mutation:
+            return results
+        stale_result, current_result, rotation_first = results
+        loser_value = (
+            write.keywords["stale_value"] if rotation_first else write.keywords["current_value"]
+        )
+        with self.sink._lock:
+            if mutation == "checkpoint":
+                key = (stale_token.run_id, 1)
+                digest, record = self.sink._checkpoints[key]
+                self.sink._checkpoints[key] = (
+                    digest,
+                    replace(record, checkpoint=loser_value),
+                )
+            elif mutation == "invocation":
+                key = (stale_token.run_id, "call-1", 3)
+                digest, record = self.sink._invocations[key]
+                self.sink._invocations[key] = (
+                    digest,
+                    replace(record, invocation=loser_value),
+                )
+        return stale_result, current_result, rotation_first
+
+
+def _handoff_loser_payload_overwrite_factory(mutation: str):
+    def factory() -> _HandoffLoserPayloadOverwriteHarness:
+        harness = _HandoffLoserPayloadOverwriteHarness()
+        harness.broken_mutation = mutation
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "invocation"])
+def test_reusable_contract_reads_the_writer_handoff_winner_payload(
+    mutation: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_handoff_loser_payload_overwrite_factory(mutation))
+    fence_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    payload_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id == f"handoff_lease_renewal_{mutation}_winner_payload"
+    )
+
+    assert fence_rule.status == "failed"
+    assert payload_observation.actual != payload_observation.expected
 
 
 class _CloseTrackingHarness:
