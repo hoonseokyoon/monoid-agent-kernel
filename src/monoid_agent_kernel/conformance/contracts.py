@@ -1331,19 +1331,26 @@ def _contract_retry_after_terminal_invocation(
     terminal_state: str,
     retryable: bool = False,
     succeeded: bool = False,
+    unknown_failure_code: str = "",
 ) -> tuple[tuple[str, ...], str]:
     harness = factory()
     token = _contract_writer(harness, run_id)
+    terminal_invocation = _contract_invocation(
+        run_id,
+        revision=3,
+        dispatch_state=terminal_state,
+        retryable=retryable,
+        succeeded=succeeded,
+    )
+    if unknown_failure_code:
+        terminal_invocation = replace(
+            terminal_invocation,
+            failure_code=unknown_failure_code,
+        )
     history = (
         _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
         _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
-        _contract_invocation(
-            run_id,
-            revision=3,
-            dispatch_state=terminal_state,
-            retryable=retryable,
-            succeeded=succeeded,
-        ),
+        terminal_invocation,
     )
     history_statuses = tuple(
         harness.sink.commit_invocation(
@@ -1563,6 +1570,55 @@ def _run_fenced_run_sink_contract(
         )
         backing_harness = backing_harness.reopen()
         backing_load = backing_harness.sink.latest_checked(backing_run_id)
+        uppercase_key_harness = factory()
+        uppercase_key_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-uppercase-blob-key",
+        )
+        uppercase_key_token = _contract_writer(
+            uppercase_key_harness,
+            uppercase_key_run_id,
+        )
+        uppercase_key_checkpoint = RunCheckpoint(
+            run_id=uppercase_key_run_id,
+            seq=1,
+            final_text="uppercase blob key must be rejected",
+        )
+        uppercase_key = uppercase_key_harness.sink.commit_checkpoint(
+            uppercase_key_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256.upper(): _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_harness = uppercase_key_harness.reopen()
+        uppercase_key_load = uppercase_key_harness.sink.latest_checked(
+            uppercase_key_run_id
+        )
+        uppercase_reference_checkpoint = RunCheckpoint(
+            run_id=uppercase_key_run_id,
+            seq=1,
+            workspace_delta=[
+                {
+                    "path": "uppercase-key-recovery.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        uppercase_key_blob_leak = uppercase_key_harness.sink.commit_checkpoint(
+            uppercase_reference_checkpoint,
+            {},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_recovery = uppercase_key_harness.sink.commit_checkpoint(
+            uppercase_reference_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_harness = uppercase_key_harness.reopen()
+        uppercase_key_recovery_load = uppercase_key_harness.sink.latest_checked(
+            uppercase_key_run_id
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -1786,6 +1842,34 @@ def _run_fenced_run_sink_contract(
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
                         actual=_contract_blob_hex(
                             backing_load.value,
+                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
+                        "uppercase_blob_key_status",
+                        expected="conflict",
+                        actual=uppercase_key.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_not_published",
+                        expected="missing",
+                        actual=uppercase_key_load.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_bytes_not_published",
+                        expected="conflict",
+                        actual=uppercase_key_blob_leak.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_recovery",
+                        expected="committed",
+                        actual=uppercase_key_recovery.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_recovery_bytes",
+                        expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            uppercase_key_recovery_load.value,
                             _CONTRACT_CHECKPOINT_BLOB_SHA256,
                         ),
                     ),
@@ -2675,6 +2759,68 @@ def _run_fenced_run_sink_contract(
             backing_run_id,
             backing_call_id,
         )
+        uppercase_key_harness = factory()
+        uppercase_key_run_id = _contract_run_id(
+            namespace,
+            "invocation-uppercase-blob-key",
+        )
+        uppercase_key_token = _contract_writer(
+            uppercase_key_harness,
+            uppercase_key_run_id,
+        )
+        uppercase_key_invocation = _contract_invocation(
+            uppercase_key_run_id,
+            revision=1,
+            dispatch_state="reserved",
+        )
+        uppercase_key = uppercase_key_harness.sink.commit_invocation(
+            uppercase_key_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256.upper(): _CONTRACT_INVOCATION_BLOB},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_harness = uppercase_key_harness.reopen()
+        uppercase_key_load = uppercase_key_harness.sink.load_invocation(
+            uppercase_key_run_id,
+            "call-1",
+        )
+        uppercase_key_setup_statuses = tuple(
+            uppercase_key_harness.sink.commit_invocation(
+                _contract_invocation(
+                    uppercase_key_run_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=uppercase_key_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        uppercase_key_settled_invocation = _contract_invocation(
+            uppercase_key_run_id,
+            revision=3,
+            dispatch_state="settled",
+            succeeded=True,
+        )
+        uppercase_key_blob_leak = uppercase_key_harness.sink.commit_invocation(
+            uppercase_key_settled_invocation,
+            {},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_harness = uppercase_key_harness.reopen()
+        uppercase_key_blob_leak_load = uppercase_key_harness.sink.load_invocation(
+            uppercase_key_run_id,
+            "call-1",
+        )
+        uppercase_key_recovery = uppercase_key_harness.sink.commit_invocation(
+            uppercase_key_settled_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB},
+            writer_token=uppercase_key_token,
+        )
+        uppercase_key_harness = uppercase_key_harness.reopen()
+        uppercase_key_recovery_load = uppercase_key_harness.sink.load_invocation(
+            uppercase_key_run_id,
+            "call-1",
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -3087,6 +3233,45 @@ def _run_fenced_run_sink_contract(
                         ),
                     ),
                     observation(
+                        "uppercase_blob_key_status",
+                        expected="conflict",
+                        actual=uppercase_key.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_not_published",
+                        expected="missing",
+                        actual=uppercase_key_load.status,
+                    ),
+                    observation(
+                        "uppercase_blob_key_setup",
+                        expected=("committed", "committed"),
+                        actual=uppercase_key_setup_statuses,
+                    ),
+                    observation(
+                        "uppercase_blob_key_bytes_not_published",
+                        expected=("conflict", 2),
+                        actual=(
+                            uppercase_key_blob_leak.status,
+                            uppercase_key_blob_leak_load.sequence,
+                        ),
+                    ),
+                    observation(
+                        "uppercase_blob_key_recovery",
+                        expected=("committed", 3),
+                        actual=(
+                            uppercase_key_recovery.status,
+                            uppercase_key_recovery_load.sequence,
+                        ),
+                    ),
+                    observation(
+                        "uppercase_blob_key_recovery_bytes",
+                        expected=_CONTRACT_INVOCATION_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            uppercase_key_recovery_load.value,
+                            _CONTRACT_INVOCATION_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
                         "malformed_fresh_blob_setup",
                         expected=("committed", "committed"),
                         actual=malformed_setup_statuses,
@@ -3285,22 +3470,49 @@ def _run_fenced_run_sink_contract(
                 2,
             ),
         }
-        unknown_history, after_unknown = _contract_retry_after_terminal_invocation(
-            factory,
-            _contract_run_id(namespace, "invocation-after-unknown"),
-            terminal_state="unknown",
-        )
-        success_history, after_success = _contract_retry_after_terminal_invocation(
-            factory,
-            _contract_run_id(namespace, "invocation-after-success"),
-            terminal_state="settled",
-            succeeded=True,
-        )
-        nonretry_history, after_nonretry_failure = _contract_retry_after_terminal_invocation(
-            factory,
-            _contract_run_id(namespace, "invocation-after-nonretry-failure"),
-            terminal_state="settled",
-        )
+        terminal_retry_cases = {
+            "unknown": {
+                "terminal_state": "unknown",
+            },
+            "unknown_with_failure_code": {
+                "terminal_state": "unknown",
+                "unknown_failure_code": "transport_uncertain",
+            },
+            "success": {
+                "terminal_state": "settled",
+                "succeeded": True,
+            },
+            "retryable_tagged_success": {
+                "terminal_state": "settled",
+                "retryable": True,
+                "succeeded": True,
+            },
+            "nonretry_failure": {
+                "terminal_state": "settled",
+            },
+            "retryable_failure": {
+                "terminal_state": "settled",
+                "retryable": True,
+            },
+        }
+        terminal_retry_expectations = {
+            "unknown": "conflict",
+            "unknown_with_failure_code": "conflict",
+            "success": "conflict",
+            "retryable_tagged_success": "conflict",
+            "nonretry_failure": "conflict",
+            "retryable_failure": "committed",
+        }
+        if terminal_retry_cases.keys() != terminal_retry_expectations.keys():
+            raise AssertionError("terminal retry policy matrix is incomplete")
+        terminal_retry_results = {
+            label: _contract_retry_after_terminal_invocation(
+                factory,
+                _contract_run_id(namespace, f"invocation-after-{label.replace('_', '-')}"),
+                **case,
+            )
+            for label, case in terminal_retry_cases.items()
+        }
         outcomes.append(
             outcome_from_observations(
                 "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
@@ -3357,31 +3569,21 @@ def _run_fenced_run_sink_contract(
                         )
                         for field_name, status in identity_drift_statuses.items()
                     ),
-                    observation(
-                        "unknown_history",
-                        expected=("committed", "committed", "committed"),
-                        actual=unknown_history,
+                    *(
+                        observation(
+                            f"{label}_history",
+                            expected=("committed", "committed", "committed"),
+                            actual=history_and_retry[0],
+                        )
+                        for label, history_and_retry in terminal_retry_results.items()
                     ),
-                    observation(
-                        "retry_after_unknown", expected="conflict", actual=after_unknown
-                    ),
-                    observation(
-                        "success_history",
-                        expected=("committed", "committed", "committed"),
-                        actual=success_history,
-                    ),
-                    observation(
-                        "retry_after_success", expected="conflict", actual=after_success
-                    ),
-                    observation(
-                        "nonretry_failure_history",
-                        expected=("committed", "committed", "committed"),
-                        actual=nonretry_history,
-                    ),
-                    observation(
-                        "retry_after_nonretry_failure",
-                        expected="conflict",
-                        actual=after_nonretry_failure,
+                    *(
+                        observation(
+                            f"retry_after_{label}",
+                            expected=terminal_retry_expectations[label],
+                            actual=history_and_retry[1],
+                        )
+                        for label, history_and_retry in terminal_retry_results.items()
                     ),
                 ),
             )

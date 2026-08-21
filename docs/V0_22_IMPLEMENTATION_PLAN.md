@@ -564,10 +564,13 @@ Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 `conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
 거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
 `committed`이고 재개방 record가 정확한 bytes를 반환한다.
-Checkpoint workspace delta와 invocation `blob:` result reference는 제출 map이나 authoritative backing의
-blob으로 해소된 뒤에만 commit할 수 있다. 둘 모두 fresh missing-reference commit을 `conflict`로
-거부하고 head를 유지해야 한다. 올바른 bytes를 제출한 재시도는 commit되고 재개방 record가 그 bytes를
-반환한다.
+대문자 digest key에 올바른 bytes를 넣은 경우도 `conflict`다. Contract는 이 case-folding 결함을 별도
+mutant로 검증하며, 거부된 map의 bytes가 backing에 남지 않았음을 빈-map 참조 재시도로 확인한다.
+Checkpoint workspace delta, checkpoint message의 media `blob:` reference, invocation `blob:` result
+reference는 제출 map이나 같은 run의 authoritative backing으로 해소된 뒤에만 commit할 수 있다. 세
+경로의 fresh missing-reference commit은 `conflict`이고 head를 유지한다. 같은 run에서 먼저 저장한
+blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재개방 record가 그 bytes를
+반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
 Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
 직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
 기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
@@ -583,8 +586,9 @@ attempt N reserved
   → attempt N+1 reserved       # settled failure가 retry policy를 허용한 경우만
 ```
 
-`unknown`은 해당 logical call의 최종 journal 상태다. Revision gap, state regression, settled success
-뒤 새 attempt는 `conflict`다.
+`unknown`은 failure code 유무와 관계없이 해당 logical call의 최종 journal 상태다. Revision gap,
+state regression, settled success 뒤 새 attempt는 `conflict`다. Successful settlement의 receipt에
+`retryable=true`가 있어도 성공 결과가 우선하며 새 paid dispatch를 열지 않는다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. Contract는 revision 4 뒤 revision 1, 2, 3을 각각 재전송하고 매번 head 4를 확인한다.
 첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
@@ -1059,7 +1063,10 @@ attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결
 Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방향 same-revision observation이
 잡아낸다.
 Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mutation/status/evidence-field
-조합의 잘못된 `CommitResult` mutant를 거부한다.
+조합의 잘못된 `CommitResult` mutant를 거부한다. Blob 검증은 잘못된 bytes와 대문자 digest를 독립
+축으로 검사하고, workspace·message media·invocation result 참조를 submitted map과 same-run backing
+두 해소 경로에서 확인한다. Terminal invocation 재시도는 unknown의 failure-code 유무, success의
+retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다.
 
 ### 14.6 최종 통합 PR
 

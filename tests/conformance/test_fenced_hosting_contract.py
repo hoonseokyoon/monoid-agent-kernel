@@ -429,8 +429,11 @@ def test_reusable_contract_rejects_retry_after_terminal_invocation_states() -> N
     }
     assert terminal_retry_observations == {
         "retry_after_unknown": "committed",
+        "retry_after_unknown_with_failure_code": "committed",
         "retry_after_success": "committed",
+        "retry_after_retryable_tagged_success": "committed",
         "retry_after_nonretry_failure": "committed",
+        "retry_after_retryable_failure": "committed",
     }
 
 
@@ -767,6 +770,41 @@ def test_reusable_contract_rejects_fresh_malformed_content_addressed_blobs() -> 
     assert (
         invocation_observations["malformed_fresh_blob_head_not_published"].actual == 3
     )
+
+
+class _CaseFoldingBlobDigestSink(DeterministicFencedRunSink):
+    def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
+        return all(
+            type(value) is bytes
+            and hashlib.sha256(value).hexdigest() == key.lower()
+            for key, value in blobs.items()
+        )
+
+
+def _case_folding_blob_digest_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _CaseFoldingBlobDigestSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_uppercase_content_digest_keys() -> None:
+    outcomes = run_fenced_run_sink_contract(_case_folding_blob_digest_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+    checkpoint_rule = rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"]
+    invocation_rule = rules["FENCED-04-INVOCATION-LIFECYCLE"]
+    checkpoint_observations = {
+        item.observation_id: item.actual for item in checkpoint_rule.observations
+    }
+    invocation_observations = {
+        item.observation_id: item.actual for item in invocation_rule.observations
+    }
+
+    assert checkpoint_rule.status == "failed"
+    assert invocation_rule.status == "failed"
+    assert checkpoint_observations["uppercase_blob_key_status"] == "committed"
+    assert checkpoint_observations["uppercase_blob_key_not_published"] == "loaded"
+    assert invocation_observations["uppercase_blob_key_status"] == "committed"
+    assert invocation_observations["uppercase_blob_key_not_published"] == "loaded"
 
 
 def _corrupting_blob_reader(reader, target_sha256: str, corrupted: bytes):
@@ -2107,6 +2145,58 @@ def test_reusable_contract_rejects_each_invalid_retry_coordinate(
     assert refusal_rule.status == "failed"
     assert coordinate_observation.expected == "conflict"
     assert coordinate_observation.actual == "committed"
+
+
+class _ReceiptFlagOnlyRetrySink(DeterministicFencedRunSink):
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            receipt_allows_retry = (
+                previous.dispatch_state == "settled"
+                and previous.receipt is not None
+                and previous.receipt.get("retryable") is True
+            )
+            legal_retry_coordinate = (
+                invocation.dispatch_state == "reserved"
+                and invocation.dispatch_attempt == previous.dispatch_attempt + 1
+                and not self._dispatch_id_was_used(invocation)
+            )
+            if receipt_allows_retry and legal_retry_coordinate:
+                return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _receipt_flag_only_retry_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _ReceiptFlagOnlyRetrySink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_never_retries_a_retryable_tagged_success() -> None:
+    outcomes = run_fenced_run_sink_contract(_receipt_flag_only_retry_factory)
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    observations = {
+        item.observation_id: item.actual for item in refusal_rule.observations
+    }
+
+    assert refusal_rule.status == "failed"
+    assert observations["retryable_tagged_success_history"] == (
+        "committed",
+        "committed",
+        "committed",
+    )
+    assert observations["retry_after_retryable_tagged_success"] == "committed"
 
 
 class _ImmediatePreviousDispatchOnlySink(DeterministicFencedRunSink):
