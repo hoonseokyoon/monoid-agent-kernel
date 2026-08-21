@@ -33,6 +33,7 @@ from monoid_agent_kernel.core.checkpoint import (
     SCHEMA_VERSION as CHECKPOINT_SCHEMA_VERSION,
     CheckpointStore,
     RunCheckpoint,
+    checkpoint_payload_for_write,
     load_latest_checked,
 )
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
@@ -701,6 +702,40 @@ def _contract_blob_hex(record: Any | None, sha256: str) -> str | None:
     return blob.hex()
 
 
+def _contract_record_digest(
+    payload: dict[str, Any],
+    blobs: Mapping[str, bytes] = {},
+) -> str:
+    return canonical_sha256(
+        {
+            "record": payload,
+            "blobs": {
+                key: hashlib.sha256(value).hexdigest()
+                for key, value in sorted(blobs.items())
+            },
+        }
+    )
+
+
+def _contract_commit_evidence(
+    result: CommitResult,
+    *,
+    sequence: int | None,
+    content_digest: str,
+    winner_digest: str = "",
+) -> tuple[bool, bool, bool]:
+    """Validate each optional result field when the adapter chooses to populate it."""
+
+    sequence_ok = result.sequence is None or result.sequence == sequence
+    content_ok = not result.content_digest or result.content_digest == content_digest
+    winner_ok = (
+        (not result.winner_digest or result.winner_digest == winner_digest)
+        if winner_digest
+        else not result.winner_digest
+    )
+    return sequence_ok, content_ok, winner_ok
+
+
 def _contract_race_retry_statuses(
     left_result: CommitResult,
     right_result: CommitResult,
@@ -720,14 +755,15 @@ def _contract_race_write(
     *,
     mutation: str,
     value: Any,
+    blobs: Mapping[str, bytes],
     writer_token: WriterToken,
 ) -> CommitResult:
     if mutation == "checkpoint":
-        return sink.commit_checkpoint(value, {}, writer_token=writer_token)
+        return sink.commit_checkpoint(value, blobs, writer_token=writer_token)
     if mutation == "event":
         return sink.append_event(value, writer_token=writer_token)
     if mutation == "invocation":
-        return sink.commit_invocation(value, {}, writer_token=writer_token)
+        return sink.commit_invocation(value, blobs, writer_token=writer_token)
     return sink.settle_terminal(value, writer_token=writer_token)
 
 
@@ -737,34 +773,105 @@ def _contract_handoff_write(
     *,
     mutation: str,
     value: Any,
+    blobs: Mapping[str, bytes],
 ) -> CommitResult:
     return _contract_race_write(
         sink,
         mutation=mutation,
         value=value,
+        blobs=blobs,
         writer_token=writer_token,
     )
 
 
 def _contract_competing_values(mutation: str, run_id: str) -> tuple[Any, Any]:
     if mutation == "checkpoint":
+        workspace_delta = [
+            {
+                "path": "race-contract.txt",
+                "kind": "file",
+                "change_kind": "created",
+                "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+            }
+        ]
         return (
-            RunCheckpoint(run_id=run_id, seq=1, final_text="left"),
-            RunCheckpoint(run_id=run_id, seq=1, final_text="right"),
+            RunCheckpoint(
+                run_id=run_id,
+                seq=1,
+                final_text="left",
+                workspace_delta=workspace_delta,
+            ),
+            RunCheckpoint(
+                run_id=run_id,
+                seq=1,
+                final_text="right",
+                workspace_delta=workspace_delta,
+            ),
         )
     if mutation == "event":
         return _contract_event(run_id, seq=1), _contract_event(run_id, seq=1, level="warning")
     if mutation == "invocation":
-        return (
-            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
-            _contract_invocation(
-                run_id,
-                revision=1,
-                dispatch_state="reserved",
-                dispatch_id="dispatch-racer",
-            ),
+        left = _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            succeeded=True,
+        )
+        return left, replace(
+            left,
+            receipt={
+                **dict(left.receipt or {}),
+                "provider_request_id": "provider-racer",
+            },
         )
     return _contract_terminal(run_id), _contract_terminal(run_id, failed=True)
+
+
+def _contract_mutation_blobs(mutation: str) -> Mapping[str, bytes]:
+    if mutation == "checkpoint":
+        return {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB}
+    if mutation == "invocation":
+        return {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB}
+    return {}
+
+
+def _contract_prepare_invocation_race(
+    harness: FencedRunSinkHarness,
+    run_id: str,
+    writer_token: WriterToken,
+) -> None:
+    statuses = tuple(
+        harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=revision,
+                dispatch_state=dispatch_state,
+            ),
+            {},
+            writer_token=writer_token,
+        ).status
+        for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+    )
+    if statuses != ("committed", "committed"):
+        raise AssertionError(f"invocation race setup failed: {statuses!r}")
+
+
+def _contract_race_blob_hex(
+    harness: FencedRunSinkHarness,
+    mutation: str,
+    run_id: str,
+) -> str | None:
+    if mutation == "checkpoint":
+        return _contract_blob_hex(
+            harness.sink.latest_checked(run_id).value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
+    if mutation == "invocation":
+        return _contract_blob_hex(
+            harness.sink.load_invocation(run_id, "call-1").value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
+        )
+    return None
 
 
 def _contract_invocation_drift_status(
@@ -1361,8 +1468,13 @@ def _run_fenced_run_sink_contract(
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
             writer_token=token,
         )
+        conflicting_checkpoint = RunCheckpoint(
+            run_id=run_id,
+            seq=1,
+            final_text="challenger",
+        )
         conflict = harness.sink.commit_checkpoint(
-            RunCheckpoint(run_id=run_id, seq=1, final_text="challenger"),
+            conflicting_checkpoint,
             {},
             writer_token=token,
         )
@@ -1377,6 +1489,30 @@ def _run_fenced_run_sink_contract(
             ).items()
         }
         loaded = harness.sink.latest_checked(run_id)
+        checkpoint_digest = _contract_record_digest(
+            checkpoint_payload_for_write(checkpoint),
+            checkpoint_blobs,
+        )
+        checkpoint_commit_evidence = {
+            "committed": _contract_commit_evidence(
+                first,
+                sequence=checkpoint.seq,
+                content_digest=checkpoint_digest,
+            ),
+            "already_committed": _contract_commit_evidence(
+                repeated,
+                sequence=checkpoint.seq,
+                content_digest=checkpoint_digest,
+            ),
+            "conflict": _contract_commit_evidence(
+                conflict,
+                sequence=conflicting_checkpoint.seq,
+                content_digest=_contract_record_digest(
+                    checkpoint_payload_for_write(conflicting_checkpoint)
+                ),
+                winner_digest=checkpoint_digest,
+            ),
+        }
 
         monotonic_harness = factory()
         monotonic_run_id = _contract_run_id(namespace, "checkpoint-monotonic")
@@ -1450,6 +1586,14 @@ def _run_fenced_run_sink_contract(
                         ),
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
+                    *(
+                        observation(
+                            f"checkpoint_{status}_evidence",
+                            expected=(True, True, True),
+                            actual=evidence,
+                        )
+                        for status, evidence in checkpoint_commit_evidence.items()
+                    ),
                     *(
                         observation(
                             f"checkpoint_canonical_alias_{field_name}_{direction}",
@@ -1656,11 +1800,19 @@ def _run_fenced_run_sink_contract(
                 owner_id="owner-b",
                 generation=2,
             )
+            if mutation == "invocation":
+                _contract_prepare_invocation_race(
+                    handoff_harness,
+                    handoff_run_id,
+                    handoff_stale,
+                )
             handoff_value, _ = _contract_competing_values(mutation, handoff_run_id)
+            handoff_blobs = _contract_mutation_blobs(mutation)
             handoff_write = partial(
                 _contract_handoff_write,
                 mutation=mutation,
                 value=handoff_value,
+                blobs=handoff_blobs,
             )
             stale_result, current_result, rotation_first = (
                 handoff_harness.race_writer_handoff(
@@ -1682,6 +1834,22 @@ def _run_fenced_run_sink_contract(
                     actual=(stale_result.status, current_result.status),
                 )
             )
+            if mutation in {"checkpoint", "invocation"}:
+                handoff_observations.append(
+                    observation(
+                        f"handoff_{mutation}_blob_bytes",
+                        expected=(
+                            _CONTRACT_CHECKPOINT_BLOB.hex()
+                            if mutation == "checkpoint"
+                            else _CONTRACT_INVOCATION_BLOB.hex()
+                        ),
+                        actual=_contract_race_blob_hex(
+                            handoff_harness.reopen(),
+                            mutation,
+                            handoff_run_id,
+                        ),
+                    )
+                )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
@@ -1814,8 +1982,10 @@ def _run_fenced_run_sink_contract(
         reopened_event = harness.read_event(run_id, event.seq)
         reopened_terminal = harness.read_terminal(run_id)
         repeated_event = harness.sink.append_event(event, writer_token=token)
+        conflicting_event = _contract_event(run_id, seq=1, level="warning")
         conflict_event = harness.sink.append_event(
-            _contract_event(run_id, seq=1, level="warning"), writer_token=token
+            conflicting_event,
+            writer_token=token,
         )
         event_identity_statuses = {
             field_name: harness.sink.append_event(
@@ -1825,8 +1995,10 @@ def _run_fenced_run_sink_contract(
             for field_name, variant in _contract_event_identity_variants(event).items()
         }
         repeated_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
+        conflicting_terminal = _contract_terminal(run_id, failed=True)
         conflict_terminal = harness.sink.settle_terminal(
-            _contract_terminal(run_id, failed=True), writer_token=token
+            conflicting_terminal,
+            writer_token=token,
         )
         terminal_identity_statuses = {
             field_name: harness.sink.settle_terminal(
@@ -1835,23 +2007,70 @@ def _run_fenced_run_sink_contract(
             ).status
             for field_name, variant in _contract_terminal_identity_variants(terminal).items()
         }
+        event_digest = _contract_record_digest(event.to_json())
+        event_commit_evidence = {
+            "committed": _contract_commit_evidence(
+                first_event,
+                sequence=event.seq,
+                content_digest=event_digest,
+            ),
+            "already_committed": _contract_commit_evidence(
+                repeated_event,
+                sequence=event.seq,
+                content_digest=event_digest,
+            ),
+            "conflict": _contract_commit_evidence(
+                conflict_event,
+                sequence=conflicting_event.seq,
+                content_digest=_contract_record_digest(conflicting_event.to_json()),
+                winner_digest=event_digest,
+            ),
+        }
+        terminal_digest = _contract_record_digest(terminal.to_json())
+        terminal_commit_evidence = {
+            "committed": _contract_commit_evidence(
+                first_terminal,
+                sequence=None,
+                content_digest=terminal_digest,
+            ),
+            "already_committed": _contract_commit_evidence(
+                repeated_terminal,
+                sequence=None,
+                content_digest=terminal_digest,
+            ),
+            "conflict": _contract_commit_evidence(
+                conflict_terminal,
+                sequence=None,
+                content_digest=_contract_record_digest(conflicting_terminal.to_json()),
+                winner_digest=terminal_digest,
+            ),
+        }
 
         race_observations = []
         for mutation in ("checkpoint", "event", "invocation", "terminal"):
             race_harness = factory()
             race_run_id = _contract_run_id(namespace, f"race-{mutation}")
             race_token = _contract_writer(race_harness, race_run_id)
+            if mutation == "invocation":
+                _contract_prepare_invocation_race(
+                    race_harness,
+                    race_run_id,
+                    race_token,
+                )
             left_value, right_value = _contract_competing_values(mutation, race_run_id)
+            race_blobs = _contract_mutation_blobs(mutation)
             left_write = partial(
                 _contract_race_write,
                 mutation=mutation,
                 value=left_value,
+                blobs=race_blobs,
                 writer_token=race_token,
             )
             right_write = partial(
                 _contract_race_write,
                 mutation=mutation,
                 value=right_value,
+                blobs=race_blobs,
                 writer_token=race_token,
             )
             left_result, right_result = race_harness.race_conflicting_writes(
@@ -1886,6 +2105,22 @@ def _run_fenced_run_sink_contract(
                     ),
                 )
             )
+            if mutation in {"checkpoint", "invocation"}:
+                race_observations.append(
+                    observation(
+                        f"{mutation}_race_blob_bytes",
+                        expected=(
+                            _CONTRACT_CHECKPOINT_BLOB.hex()
+                            if mutation == "checkpoint"
+                            else _CONTRACT_INVOCATION_BLOB.hex()
+                        ),
+                        actual=_contract_race_blob_hex(
+                            race_harness.reopen(),
+                            mutation,
+                            race_run_id,
+                        ),
+                    )
+                )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
@@ -1897,6 +2132,14 @@ def _run_fenced_run_sink_contract(
                     ),
                     observation(
                         "event_conflict", expected="conflict", actual=conflict_event.status
+                    ),
+                    *(
+                        observation(
+                            f"event_{status}_evidence",
+                            expected=(True, True, True),
+                            actual=evidence,
+                        )
+                        for status, evidence in event_commit_evidence.items()
                     ),
                     observation(
                         "event_reopened_payload_digest",
@@ -1942,6 +2185,14 @@ def _run_fenced_run_sink_contract(
                     ),
                     observation(
                         "terminal_conflict", expected="conflict", actual=conflict_terminal.status
+                    ),
+                    *(
+                        observation(
+                            f"terminal_{status}_evidence",
+                            expected=(True, True, True),
+                            actual=evidence,
+                        )
+                        for status, evidence in terminal_commit_evidence.items()
                     ),
                     *(
                         observation(
@@ -2103,16 +2354,38 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
+        conflicting_reserved_invocation = _contract_invocation(
+            run_id,
+            revision=1,
+            dispatch_state="reserved",
+            dispatch_id="dispatch-conflict",
+        )
         conflicting_reserved = harness.sink.commit_invocation(
-            _contract_invocation(
-                run_id,
-                revision=1,
-                dispatch_state="reserved",
-                dispatch_id="dispatch-conflict",
-            ),
+            conflicting_reserved_invocation,
             {},
             writer_token=token,
         )
+        reserved_digest = _contract_record_digest(reserved_invocation.to_json())
+        invocation_commit_evidence = {
+            "committed": _contract_commit_evidence(
+                reserved,
+                sequence=reserved_invocation.revision,
+                content_digest=reserved_digest,
+            ),
+            "already_committed": _contract_commit_evidence(
+                repeated_reserved,
+                sequence=reserved_invocation.revision,
+                content_digest=reserved_digest,
+            ),
+            "conflict": _contract_commit_evidence(
+                conflicting_reserved,
+                sequence=conflicting_reserved_invocation.revision,
+                content_digest=_contract_record_digest(
+                    conflicting_reserved_invocation.to_json()
+                ),
+                winner_digest=reserved_digest,
+            ),
+        }
         started_invocation = _contract_invocation(
             run_id,
             revision=2,
@@ -2227,6 +2500,14 @@ def _run_fenced_run_sink_contract(
                         "reserve_conflict",
                         expected="conflict",
                         actual=conflicting_reserved.status,
+                    ),
+                    *(
+                        observation(
+                            f"invocation_{status}_evidence",
+                            expected=(True, True, True),
+                            actual=evidence,
+                        )
+                        for status, evidence in invocation_commit_evidence.items()
                     ),
                     *(
                         observation(

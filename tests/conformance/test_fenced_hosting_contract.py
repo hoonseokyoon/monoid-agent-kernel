@@ -770,6 +770,124 @@ def test_reusable_contract_checks_fencing_before_malformed_blob_validation() -> 
         assert all(item.actual == "conflict" for item in selected.values())
 
 
+class _InvalidCommitEvidenceSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+    broken_status = ""
+    evidence_field = ""
+
+    def _corrupt_evidence(self, mutation: str, result: CommitResult) -> CommitResult:
+        if mutation != self.broken_mutation or result.status != self.broken_status:
+            return result
+        value: int | str
+        if self.evidence_field == "sequence":
+            value = (result.sequence or 0) + 100
+        else:
+            value = "f" * 64
+        return replace(result, **{self.evidence_field: value})
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        return self._corrupt_evidence(
+            "checkpoint",
+            super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token),
+        )
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        return self._corrupt_evidence(
+            "event",
+            super().append_event(event, writer_token=writer_token),
+        )
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        return self._corrupt_evidence(
+            "invocation",
+            super().commit_invocation(invocation, blobs, writer_token=writer_token),
+        )
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        return self._corrupt_evidence(
+            "terminal",
+            super().settle_terminal(outcome, writer_token=writer_token),
+        )
+
+
+def _invalid_commit_evidence_factory(
+    mutation: str,
+    status: str,
+    evidence_field: str,
+):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _InvalidCommitEvidenceSink(harness._writers)
+        sink.broken_mutation = mutation
+        sink.broken_status = status
+        sink.evidence_field = evidence_field
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("mutation", "rule_id"),
+    [
+        ("checkpoint", "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"),
+        ("event", "FENCED-03-EVENT-AND-TERMINAL-WINNERS"),
+        ("invocation", "FENCED-04-INVOCATION-LIFECYCLE"),
+        ("terminal", "FENCED-03-EVENT-AND-TERMINAL-WINNERS"),
+    ],
+)
+@pytest.mark.parametrize(
+    "status",
+    ["committed", "already_committed", "conflict"],
+)
+@pytest.mark.parametrize(
+    ("evidence_field", "evidence_index"),
+    [("sequence", 0), ("content_digest", 1), ("winner_digest", 2)],
+)
+def test_reusable_contract_validates_every_populated_commit_result_field(
+    mutation: str,
+    rule_id: str,
+    status: str,
+    evidence_field: str,
+    evidence_index: int,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _invalid_commit_evidence_factory(mutation, status, evidence_field)
+    )
+    rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    evidence_observation = next(
+        observation
+        for observation in rule.observations
+        if observation.observation_id == f"{mutation}_{status}_evidence"
+    )
+
+    assert rule.status == "failed"
+    assert evidence_observation.expected == (True, True, True)
+    assert evidence_observation.actual[evidence_index] is False
+
+
 class _ReferentialIntegritySink(DeterministicFencedRunSink):
     def commit_invocation(
         self,
@@ -1818,6 +1936,7 @@ def test_reusable_contract_rejects_process_local_only_storage() -> None:
 class _NonAtomicRaceSink(DeterministicFencedRunSink):
     broken_mutation = ""
     _cas_gap: Callable[[], None]
+    _race_active = False
 
     def commit_checkpoint(
         self,
@@ -1829,6 +1948,7 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
         key = (checkpoint.run_id, checkpoint.seq)
         if (
             self.broken_mutation == "checkpoint"
+            and self._race_active
             and self._is_current(checkpoint.run_id, writer_token)
             and key not in self._checkpoints
         ):
@@ -1847,6 +1967,7 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
         key = (event.run_id, event.seq)
         if (
             self.broken_mutation == "event"
+            and self._race_active
             and self._is_current(event.run_id, writer_token)
             and key not in self._events
         ):
@@ -1865,15 +1986,20 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
     ) -> CommitResult:
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
         head_key = (invocation.run_id, invocation.logical_call_id)
+        previous_head = self._invocation_heads.get(head_key)
         if (
             self.broken_mutation == "invocation"
+            and self._race_active
             and self._is_current(invocation.run_id, writer_token)
             and key not in self._invocations
         ):
             self._cas_gap()
             with self._lock:
                 self._invocations.pop(key, None)
-                self._invocation_heads.pop(head_key, None)
+                if previous_head is None:
+                    self._invocation_heads.pop(head_key, None)
+                else:
+                    self._invocation_heads[head_key] = previous_head
                 return self._commit_invocation(invocation, blobs, writer_token=writer_token)
         return super().commit_invocation(invocation, blobs, writer_token=writer_token)
 
@@ -1885,6 +2011,7 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
     ) -> CommitResult:
         if (
             self.broken_mutation == "terminal"
+            and self._race_active
             and self._is_current(outcome.run_id, writer_token)
             and outcome.run_id not in self._terminals
         ):
@@ -1918,6 +2045,7 @@ class _NonAtomicRaceHarness(DeterministicFencedRunHarness):
             )
         barrier = Barrier(2)
         self.sink._cas_gap = lambda: barrier.wait(timeout=10)
+        self.sink._race_active = True
         try:
             return super().race_conflicting_writes(
                 mutation,
@@ -1926,6 +2054,7 @@ class _NonAtomicRaceHarness(DeterministicFencedRunHarness):
                 right,
             )
         finally:
+            self.sink._race_active = False
             self.sink._cas_gap = lambda: None
 
 
@@ -2009,6 +2138,74 @@ def test_reusable_contract_rejects_write_published_after_rotation(mutation: str)
     assert fence_rule.status == "failed"
     assert handoff_observation.expected == ("fenced", "committed")
     assert handoff_observation.actual == ("committed", "already_committed")
+
+
+_CORRUPTED_HANDOFF_BLOB = b"stale blob publication after writer rotation"
+
+
+class _BlobOutsideWriterHandoffHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write,
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        result = super().race_writer_handoff(
+            mutation,
+            stale_token,
+            current_token,
+            write,
+        )
+        if mutation != self.broken_mutation:
+            return result
+        with self.sink._lock:
+            if mutation == "checkpoint":
+                record = self.sink._checkpoints[(stale_token.run_id, 1)][1]
+                record._blob_reader = lambda sha256: _CORRUPTED_HANDOFF_BLOB
+            elif mutation == "invocation":
+                key = (stale_token.run_id, "call-1", 3)
+                digest, record = self.sink._invocations[key]
+                self.sink._invocations[key] = (
+                    digest,
+                    replace(
+                        record,
+                        _blob_reader=lambda sha256: _CORRUPTED_HANDOFF_BLOB,
+                    ),
+                )
+        return result
+
+
+def _blob_outside_handoff_factory(mutation: str):
+    def factory() -> _BlobOutsideWriterHandoffHarness:
+        harness = _BlobOutsideWriterHandoffHarness()
+        harness.broken_mutation = mutation
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "invocation"])
+def test_reusable_contract_keeps_blobs_inside_writer_handoff_fencing(
+    mutation: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_blob_outside_handoff_factory(mutation))
+    fence_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    blob_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id == f"handoff_{mutation}_blob_bytes"
+    )
+
+    assert fence_rule.status == "failed"
+    assert blob_observation.actual == _CORRUPTED_HANDOFF_BLOB.hex()
+    assert blob_observation.actual != blob_observation.expected
 
 
 class _CloseTrackingHarness:

@@ -49,6 +49,9 @@ out in commit messages and here.
   trusting retry digests. Retry reservations reject dispatch IDs used by any earlier attempt in
   the logical call history, while a complete third attempt with a fresh ID remains legal. Accepted
   terminal schema aliases normalize in both same-winner retry directions.
+  Checkpoint and settled-invocation CAS/writer-handoff races carry referenced blobs and verify their
+  post-race bytes. Populated commit-result sequence, submitted digest, and winner digest evidence is
+  checked for every mutation family across committed, idempotent, and conflict statuses.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

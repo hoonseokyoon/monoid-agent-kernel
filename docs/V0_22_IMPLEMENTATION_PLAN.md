@@ -493,6 +493,9 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
 직렬화되면 stale write는 `fenced`, write가 먼저 직렬화되면 새 generation retry가
 `already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.
+Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
+settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
+bytes를 읽는다. Metadata fencing 밖에서 stale blob을 공개하는 adapter는 이 검증을 통과하지 못한다.
 
 ### 6.3 Commit 판정 순서
 
@@ -524,6 +527,27 @@ record를 반환한다. 이 검증은 네 resource key에서 `run_id`가 빠지�
 
 Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `already_committed`, 다른 content는
 `conflict`다.
+
+`CommitResult.sequence`, `content_digest`, `winner_digest`는 선택 evidence다. Adapter가 값을 채우면
+resource coordinate, canonical submitted digest, canonical winner digest와 정확히 일치해야 한다.
+Contract는 네 mutation family의 `committed`, `already_committed`, `conflict` 대표 결과에서 세 필드를
+각각 검증한다. Winner가 없는 status의 `winner_digest`는 비어 있어야 한다.
+
+Canonical commit digest는 아래 값을 `canonical_sha256`으로 계산한다.
+
+```python
+{
+    "record": canonical_payload,
+    "blobs": {
+        key: sha256(blob_bytes)
+        for key, blob_bytes in sorted(submitted_blobs.items())
+    },
+}
+```
+
+Checkpoint의 `canonical_payload`는 current writer shape로 정규화한 payload다. Event, invocation,
+terminal은 각각 current canonical `to_json()` payload를 사용한다. `winner_digest`도 winner가 commit될
+때의 record와 blob 집합에 같은 계산을 적용한다.
 
 Checkpoint와 invocation의 canonical content에는 함께 제출된 blob key와 byte digest가 포함된다.
 Checked load record는 committed blob을 정확한 bytes로 돌려준다.
@@ -1022,6 +1046,8 @@ attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결
 잡아낸다. Terminal schema alias를 raw tag로 digest하는 구현도 양방향 retry observation이 잡아낸다.
 Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방향 same-revision observation이
 잡아낸다.
+Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mutation/status/evidence-field
+조합의 잘못된 `CommitResult` mutant를 거부한다.
 
 ### 14.6 최종 통합 PR
 

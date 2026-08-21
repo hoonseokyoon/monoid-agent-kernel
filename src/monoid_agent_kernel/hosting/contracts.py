@@ -43,7 +43,14 @@ class WriterToken:
 
 @dataclass(frozen=True, kw_only=True)
 class CommitResult:
-    """Portable outcome of one fenced, content-addressed mutation."""
+    """Portable outcome of one fenced, content-addressed mutation.
+
+    Evidence fields are optional. When present, ``sequence`` is the submitted resource
+    coordinate. ``content_digest`` is the canonical SHA-256 of
+    ``{"record": <canonical payload>, "blobs": {<key>: sha256(<bytes>)}}``.
+    ``winner_digest`` uses the same encoding for the previously committed winner and stays empty
+    when no competing winner exists.
+    """
 
     status: _CommitStatus
     sequence: int | None = None
