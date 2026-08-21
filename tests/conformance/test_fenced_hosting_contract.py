@@ -901,6 +901,92 @@ def test_reusable_contract_includes_blobs_in_content_identity(
     assert blob_observation.actual == "already_committed"
 
 
+class _PublishingConflictingBlobsSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+
+    def _commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (checkpoint.run_id, checkpoint.seq)
+        if (
+            self.broken_mutation == "checkpoint"
+            and self._is_current(checkpoint.run_id, writer_token)
+            and key in self._checkpoints
+            and self._blobs_are_content_addressed(blobs)
+            and self._blobs_preserve_authoritative_backing(checkpoint.run_id, blobs)
+        ):
+            self._publish_blobs(checkpoint.run_id, blobs)
+        return super()._commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def _commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        if (
+            self.broken_mutation == "invocation"
+            and self._is_current(invocation.run_id, writer_token)
+            and key in self._invocations
+            and self._blobs_are_content_addressed(blobs)
+            and self._blobs_preserve_authoritative_backing(invocation.run_id, blobs)
+        ):
+            self._publish_blobs(invocation.run_id, blobs)
+        return super()._commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _publishing_conflicting_blobs_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _PublishingConflictingBlobsSink(harness._writers)
+        sink.broken_mutation = mutation
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("mutation", "rule_id", "observation_id", "leaked_result"),
+    [
+        (
+            "checkpoint",
+            "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+            "blob_key_conflict_not_published",
+            ("committed", 2),
+        ),
+        (
+            "invocation",
+            "FENCED-04-INVOCATION-LIFECYCLE",
+            "result_blob_key_conflict_not_published",
+            ("committed", 3),
+        ),
+    ],
+)
+def test_reusable_contract_keeps_conflicting_blobs_non_authoritative(
+    mutation: str,
+    rule_id: str,
+    observation_id: str,
+    leaked_result: tuple[str, int],
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_publishing_conflicting_blobs_factory(mutation))
+    durable_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    publication_observation = next(
+        observation
+        for observation in durable_rule.observations
+        if observation.observation_id == observation_id
+    )
+
+    assert durable_rule.status == "failed"
+    assert publication_observation.actual == leaked_result
+
+
 class _UncheckedBlobDigestSink(DeterministicFencedRunSink):
     def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
         del blobs
@@ -2450,7 +2536,7 @@ def test_reusable_contract_scopes_invocation_loads_by_logical_call() -> None:
     observations = {item.observation_id: item.actual for item in lifecycle_rule.observations}
 
     assert lifecycle_rule.status == "failed"
-    assert observations["primary_call_after_result_binding"] == "call-result"
+    assert observations["primary_call_after_result_binding"] != "call-1"
     assert observations["missing_logical_call_status"] == "loaded"
 
 

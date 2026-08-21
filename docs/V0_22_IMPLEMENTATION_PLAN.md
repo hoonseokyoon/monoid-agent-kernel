@@ -481,6 +481,9 @@ session과 pooled connection의 최대 동시 보유량을 제한한다. Lazy re
 사용하는 회귀를 거부한다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
 재개방 record와 비교한다.
+같은 key에 다른 well-formed blob map을 제출한 CAS loser는 `conflict`이며 blob도 공개하지 않는다.
+Contract는 재개방 뒤 loser 전용 digest를 빈 map으로 참조하는 새 checkpoint와 invocation lifecycle을
+시도해 둘 다 `conflict`인지 확인한다. Metadata CAS 전에 blob을 게시하는 adapter는 이 probe에서 실패한다.
 같은 key의 checkpoint, event, terminal, invocation 재시도는 mutable canonical non-key field를
 하나씩 독립적으로 변경해 모두 `conflict`인지 확인한다. Matrix의 field 집합은 각 record의
 canonical JSON field에서 계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
@@ -1126,6 +1129,8 @@ Blob reference matrix는 workspace·media·invocation의 malformed digest를 거
 result address를 허용한다.
 Fence precedence는 existing coordinate의 동일 payload·conflicting payload·malformed blob map과 fresh
 coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
+Checkpoint·invocation의 same-key blob-map conflict 뒤 loser digest를 empty-map record로 재참조해
+conflicting blob 비공개도 확인한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
 Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를

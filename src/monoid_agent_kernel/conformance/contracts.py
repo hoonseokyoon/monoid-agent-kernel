@@ -1958,6 +1958,25 @@ def _run_fenced_run_sink_contract(
             },
             writer_token=token,
         )
+        harness = harness.reopen()
+        blob_key_conflict_reference = harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=run_id,
+                seq=2,
+                final_text="conflicting-blob-reference",
+                workspace_delta=[
+                    {
+                        "path": "conflicting-blob-reference.txt",
+                        "kind": "file",
+                        "change_kind": "created",
+                        "content_sha256": _CONTRACT_ALTERNATE_BLOB_SHA256,
+                    }
+                ],
+            ),
+            {},
+            writer_token=token,
+        )
+        blob_key_conflict_reference_load = harness.sink.latest_checked(run_id)
         blob_bytes_conflict = harness.sink.commit_checkpoint(
             checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
@@ -2193,6 +2212,14 @@ def _run_fenced_run_sink_contract(
                         "blob_key_conflict",
                         expected="conflict",
                         actual=blob_key_conflict.status,
+                    ),
+                    observation(
+                        "blob_key_conflict_not_published",
+                        expected=("conflict", 1),
+                        actual=(
+                            blob_key_conflict_reference.status,
+                            blob_key_conflict_reference_load.sequence,
+                        ),
                     ),
                     observation(
                         "blob_bytes_conflict",
@@ -3642,6 +3669,39 @@ def _run_fenced_run_sink_contract(
             },
             writer_token=token,
         )
+        harness = harness.reopen()
+        conflicting_blob_call_id = "call-conflicting-blob-reference"
+        conflicting_blob_reference_setup = tuple(
+            harness.sink.commit_invocation(
+                _contract_invocation(
+                    run_id,
+                    logical_call_id=conflicting_blob_call_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        conflicting_blob_reference = harness.sink.commit_invocation(
+            replace(
+                _contract_invocation(
+                    run_id,
+                    logical_call_id=conflicting_blob_call_id,
+                    revision=3,
+                    dispatch_state="settled",
+                    succeeded=True,
+                ),
+                result_ref=f"blob:{_CONTRACT_ALTERNATE_BLOB_SHA256}",
+            ),
+            {},
+            writer_token=token,
+        )
+        conflicting_blob_reference_load = harness.sink.load_invocation(
+            run_id,
+            conflicting_blob_call_id,
+        )
         result_blob_bytes_conflict = harness.sink.commit_invocation(
             settled_result_invocation,
             {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
@@ -3793,6 +3853,19 @@ def _run_fenced_run_sink_contract(
                         "result_blob_key_conflict",
                         expected="conflict",
                         actual=result_blob_key_conflict.status,
+                    ),
+                    observation(
+                        "result_blob_key_conflict_reference_setup",
+                        expected=("committed", "committed"),
+                        actual=conflicting_blob_reference_setup,
+                    ),
+                    observation(
+                        "result_blob_key_conflict_not_published",
+                        expected=("conflict", 2),
+                        actual=(
+                            conflicting_blob_reference.status,
+                            conflicting_blob_reference_load.sequence,
+                        ),
                     ),
                     observation(
                         "result_blob_bytes_conflict",
