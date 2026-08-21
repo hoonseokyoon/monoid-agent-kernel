@@ -76,6 +76,8 @@ _CONTRACT_INVOCATION_BLOB = b'{"text":"contract model result"}'
 _CONTRACT_INVOCATION_BLOB_SHA256 = hashlib.sha256(_CONTRACT_INVOCATION_BLOB).hexdigest()
 _CONTRACT_ALTERNATE_BLOB = b"alternate contract blob bytes\n"
 _CONTRACT_ALTERNATE_BLOB_SHA256 = hashlib.sha256(_CONTRACT_ALTERNATE_BLOB).hexdigest()
+_CONTRACT_UNRESOLVED_BLOB = b"contract reference recovery bytes\n"
+_CONTRACT_UNRESOLVED_BLOB_SHA256 = hashlib.sha256(_CONTRACT_UNRESOLVED_BLOB).hexdigest()
 _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
     generation
     for generation in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
@@ -901,6 +903,36 @@ def _contract_race_blob_hex(
     return None
 
 
+def _contract_mutation_payload_digest(mutation: str, value: Any) -> str:
+    payload = (
+        checkpoint_payload_for_write(value)
+        if mutation == "checkpoint"
+        else value.to_json()
+    )
+    return canonical_sha256(payload)
+
+
+def _contract_race_payload_digest(
+    harness: FencedRunSinkHarness,
+    mutation: str,
+    run_id: str,
+) -> str | None:
+    value: Any | None
+    if mutation == "checkpoint":
+        record = harness.sink.latest_checked(run_id).value
+        value = record.checkpoint if record else None
+    elif mutation == "event":
+        value = harness.read_event(run_id, 1)
+    elif mutation == "invocation":
+        record = harness.sink.load_invocation(run_id, "call-1").value
+        value = record.invocation if record else None
+    else:
+        value = harness.read_terminal(run_id)
+    if value is None:
+        return None
+    return _contract_mutation_payload_digest(mutation, value)
+
+
 def _contract_invocation_drift_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -1393,6 +1425,45 @@ def _run_fenced_run_sink_contract(
             for field_name in sorted(_CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS)
             for direction in ("current_to_legacy", "legacy_to_current")
         }
+        missing_reference_harness = factory()
+        missing_reference_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-missing-reference",
+        )
+        missing_reference_token = _contract_writer(
+            missing_reference_harness,
+            missing_reference_run_id,
+        )
+        missing_reference_checkpoint = RunCheckpoint(
+            run_id=missing_reference_run_id,
+            seq=1,
+            workspace_delta=[
+                {
+                    "path": "missing-reference.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                }
+            ],
+        )
+        missing_reference = missing_reference_harness.sink.commit_checkpoint(
+            missing_reference_checkpoint,
+            {},
+            writer_token=missing_reference_token,
+        )
+        missing_reference_harness = missing_reference_harness.reopen()
+        missing_reference_load = missing_reference_harness.sink.latest_checked(
+            missing_reference_run_id
+        )
+        missing_reference_recovery = missing_reference_harness.sink.commit_checkpoint(
+            missing_reference_checkpoint,
+            {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
+            writer_token=missing_reference_token,
+        )
+        missing_reference_harness = missing_reference_harness.reopen()
+        missing_reference_recovery_load = (
+            missing_reference_harness.sink.latest_checked(missing_reference_run_id)
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -1554,6 +1625,29 @@ def _run_fenced_run_sink_contract(
                     observation("first_status", expected="committed", actual=first.status),
                     observation(
                         "repeat_status", expected="already_committed", actual=repeated.status
+                    ),
+                    observation(
+                        "missing_reference_status",
+                        expected="conflict",
+                        actual=missing_reference.status,
+                    ),
+                    observation(
+                        "missing_reference_not_published",
+                        expected="missing",
+                        actual=missing_reference_load.status,
+                    ),
+                    observation(
+                        "missing_reference_recovery",
+                        expected="committed",
+                        actual=missing_reference_recovery.status,
+                    ),
+                    observation(
+                        "missing_reference_recovery_bytes",
+                        expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            missing_reference_recovery_load.value,
+                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                        ),
                     ),
                     observation(
                         "blob_key_conflict",
@@ -2127,10 +2221,16 @@ def _run_fenced_run_sink_contract(
                 left_write,
                 right_write,
             )
+            winning_value = (
+                left_value
+                if left_result.status == "committed"
+                else right_value if right_result.status == "committed" else None
+            )
+            reopened_race_harness = race_harness.reopen()
             retry_winner, retry_loser = _contract_race_retry_statuses(
                 left_result,
                 right_result,
-                race_harness.reopen(),
+                reopened_race_harness,
                 left_write,
                 right_write,
             )
@@ -2151,6 +2251,19 @@ def _run_fenced_run_sink_contract(
                         expected="conflict",
                         actual=retry_loser,
                     ),
+                    observation(
+                        f"{mutation}_race_winner_payload",
+                        expected=(
+                            _contract_mutation_payload_digest(mutation, winning_value)
+                            if winning_value is not None
+                            else None
+                        ),
+                        actual=_contract_race_payload_digest(
+                            reopened_race_harness,
+                            mutation,
+                            race_run_id,
+                        ),
+                    ),
                 )
             )
             if mutation in {"checkpoint", "invocation"}:
@@ -2163,7 +2276,7 @@ def _run_fenced_run_sink_contract(
                             else _CONTRACT_INVOCATION_BLOB.hex()
                         ),
                         actual=_contract_race_blob_hex(
-                            race_harness.reopen(),
+                            reopened_race_harness,
                             mutation,
                             race_run_id,
                         ),
@@ -2309,6 +2422,58 @@ def _run_fenced_run_sink_contract(
             )
             for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
         }
+        missing_reference_harness = factory()
+        missing_reference_run_id = _contract_run_id(
+            namespace,
+            "invocation-missing-reference",
+        )
+        missing_reference_token = _contract_writer(
+            missing_reference_harness,
+            missing_reference_run_id,
+        )
+        missing_reference_setup_statuses = tuple(
+            missing_reference_harness.sink.commit_invocation(
+                _contract_invocation(
+                    missing_reference_run_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=missing_reference_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        missing_reference_invocation = replace(
+            _contract_invocation(
+                missing_reference_run_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            ),
+            result_ref=f"blob:{_CONTRACT_UNRESOLVED_BLOB_SHA256}",
+        )
+        missing_reference = missing_reference_harness.sink.commit_invocation(
+            missing_reference_invocation,
+            {},
+            writer_token=missing_reference_token,
+        )
+        missing_reference_harness = missing_reference_harness.reopen()
+        missing_reference_load = missing_reference_harness.sink.load_invocation(
+            missing_reference_run_id,
+            "call-1",
+        )
+        missing_reference_recovery = missing_reference_harness.sink.commit_invocation(
+            missing_reference_invocation,
+            {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
+            writer_token=missing_reference_token,
+        )
+        missing_reference_harness = missing_reference_harness.reopen()
+        missing_reference_recovery_load = (
+            missing_reference_harness.sink.load_invocation(
+                missing_reference_run_id,
+                "call-1",
+            )
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -2660,6 +2825,39 @@ def _run_fenced_run_sink_contract(
                         "result_blob_bytes_conflict",
                         expected="conflict",
                         actual=result_blob_bytes_conflict.status,
+                    ),
+                    observation(
+                        "missing_reference_setup",
+                        expected=("committed", "committed"),
+                        actual=missing_reference_setup_statuses,
+                    ),
+                    observation(
+                        "missing_reference_status",
+                        expected="conflict",
+                        actual=missing_reference.status,
+                    ),
+                    observation(
+                        "missing_reference_head_not_published",
+                        expected=2,
+                        actual=missing_reference_load.sequence,
+                    ),
+                    observation(
+                        "missing_reference_recovery",
+                        expected="committed",
+                        actual=missing_reference_recovery.status,
+                    ),
+                    observation(
+                        "missing_reference_recovery_head",
+                        expected=3,
+                        actual=missing_reference_recovery_load.sequence,
+                    ),
+                    observation(
+                        "missing_reference_recovery_bytes",
+                        expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            missing_reference_recovery_load.value,
+                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+                        ),
                     ),
                     observation(
                         "malformed_fresh_blob_setup",

@@ -22,6 +22,10 @@ from monoid_agent_kernel.hosting import (
 from support.fenced_hosting import DeterministicFencedRunHarness
 
 
+_RESULT_BLOB = b'{"text":"settled result"}'
+_RESULT_BLOB_SHA256 = hashlib.sha256(_RESULT_BLOB).hexdigest()
+
+
 def _invocation(
     run_id: str,
     *,
@@ -38,7 +42,7 @@ def _invocation(
     if state == "settled":
         receipt = {"request_digest": "a" * 64, "retryable": retryable}
         if succeeded:
-            result_ref = "blob:turn"
+            result_ref = f"blob:{_RESULT_BLOB_SHA256}"
         else:
             failure_code = "provider_refused"
     return DurableModelInvocation(
@@ -191,7 +195,19 @@ def _commit_through_settled(
             succeeded=succeeded,
         ),
     ):
-        assert harness.sink.commit_invocation(invocation, {}, writer_token=token).status == "committed"
+        blobs = (
+            {_RESULT_BLOB_SHA256: _RESULT_BLOB}
+            if invocation.result_ref
+            else {}
+        )
+        assert (
+            harness.sink.commit_invocation(
+                invocation,
+                blobs,
+                writer_token=token,
+            ).status
+            == "committed"
+        )
     return token
 
 

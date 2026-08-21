@@ -79,6 +79,27 @@ class DeterministicFencedRunSink:
             for key, value in blobs.items()
         )
 
+    def _checkpoint_references_resolve(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        references = {
+            item["content_sha256"]
+            for item in checkpoint.workspace_delta
+            if item.get("content_sha256")
+        }
+        return references <= blobs.keys()
+
+    def _invocation_references_resolve(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        if not invocation.result_ref.startswith("blob:"):
+            return True
+        return invocation.result_ref.removeprefix("blob:") in blobs
+
     @staticmethod
     def _stored_result(
         records: dict[Any, tuple[str, Any]],
@@ -124,6 +145,8 @@ class DeterministicFencedRunSink:
         if not self._is_current(checkpoint.run_id, writer_token):
             return CommitResult(status="fenced")
         if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
+        if not self._checkpoint_references_resolve(checkpoint, blobs):
             return CommitResult(status="conflict", sequence=checkpoint.seq)
         digest = _record_digest(checkpoint_payload_for_write(checkpoint), blobs)
         key = (checkpoint.run_id, checkpoint.seq)
@@ -247,6 +270,8 @@ class DeterministicFencedRunSink:
         if not self._is_current(invocation.run_id, writer_token):
             return CommitResult(status="fenced")
         if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        if not self._invocation_references_resolve(invocation, blobs):
             return CommitResult(status="conflict", sequence=invocation.revision)
         digest = _record_digest(invocation.to_json(), blobs)
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)

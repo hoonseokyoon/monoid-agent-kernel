@@ -501,7 +501,9 @@ generation과 현재 generation의 잘못된 owner를 독립적으로 제출한�
 fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
-bytes를 읽는다. Metadata fencing 밖에서 stale blob을 공개하는 adapter는 이 검증을 통과하지 못한다.
+bytes를 읽는다. CAS race는 `committed` 결과를 낸 좌·우 값에서 winner를 결정하고 네 mutation의
+재개방 canonical payload 전체가 그 winner인지 비교한다. Metadata fencing 밖에서 stale blob 또는
+loser payload를 공개하는 adapter는 이 검증을 통과하지 못한다.
 
 ### 6.3 Commit 판정 순서
 
@@ -562,11 +564,14 @@ Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 `conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
 거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
 `committed`이고 재개방 record가 정확한 bytes를 반환한다.
+Checkpoint workspace delta와 invocation `blob:` result reference는 제출 map이나 authoritative backing의
+blob으로 해소된 뒤에만 commit할 수 있다. 둘 모두 fresh missing-reference commit을 `conflict`로
+거부하고 head를 유지해야 한다. 올바른 bytes를 제출한 재시도는 commit되고 재개방 record가 그 bytes를
+반환한다.
 Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
 직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
 기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
-성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에
-제출한다. 참조 무결성을 선검증하는 adapter도 conformance contract를 통과해야 한다.
+성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에 제출한다.
 Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.
 
 Invocation transition은 다음 순서를 검증한다.

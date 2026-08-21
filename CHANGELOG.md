@@ -54,7 +54,9 @@ out in commit messages and here.
   post-race bytes. Populated commit-result sequence, submitted digest, and winner digest evidence is
   checked for every mutation family across committed, idempotent, and conflict statuses. Writer
   authority probes vary owner and generation independently across existing and fresh resources,
-  and handoff races cover same-owner lease renewal plus owner reassignment.
+  and handoff races cover same-owner lease renewal plus owner reassignment. Every CAS race reloads
+  the complete winning payload. Fresh checkpoint and invocation records with unresolved blob
+  references are rejected without head publication and recover with the referenced bytes.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

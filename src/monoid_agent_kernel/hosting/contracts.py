@@ -104,7 +104,8 @@ class FencedCheckpointStore(Protocol):
     token issued for another run, a stale generation from the current owner, or a wrong owner at
     the current generation always returns ``fenced``. Every submitted blob key is the lowercase
     SHA-256 digest of its bytes. A malformed blob map returns ``conflict`` without publishing
-    metadata or blob content.
+    metadata or blob content. Every checkpoint blob reference must resolve from the submitted map
+    or authoritative backing before metadata and head publication.
     """
 
     @property
@@ -124,7 +125,8 @@ class FencedCheckpointStore(Protocol):
 class FencedRunSink(FencedCheckpointStore, Protocol):
     """Composite authoritative journal protected by the inherited run-bound fence.
 
-    Invocation blob maps follow the inherited content-addressed blob rule.
+    Invocation blob maps follow the inherited content-addressed blob rule. Every ``blob:`` result
+    reference must resolve before the invocation revision becomes authoritative.
     """
 
     def load_invocation(

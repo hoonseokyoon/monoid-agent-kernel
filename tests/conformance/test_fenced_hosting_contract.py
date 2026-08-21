@@ -1071,6 +1071,53 @@ def test_reusable_contract_supplies_every_referenced_invocation_blob() -> None:
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes
 
 
+class _MissingReferenceAcceptingSink(DeterministicFencedRunSink):
+    def _checkpoint_references_resolve(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        del checkpoint, blobs
+        return True
+
+    def _invocation_references_resolve(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        del invocation, blobs
+        return True
+
+
+def _missing_reference_accepting_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _MissingReferenceAcceptingSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_unresolved_authoritative_blob_references() -> None:
+    outcomes = run_fenced_run_sink_contract(_missing_reference_accepting_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+
+    checkpoint_rule = rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"]
+    invocation_rule = rules["FENCED-04-INVOCATION-LIFECYCLE"]
+    checkpoint_status = next(
+        observation.actual
+        for observation in checkpoint_rule.observations
+        if observation.observation_id == "missing_reference_status"
+    )
+    invocation_status = next(
+        observation.actual
+        for observation in invocation_rule.observations
+        if observation.observation_id == "missing_reference_status"
+    )
+
+    assert checkpoint_rule.status == "failed"
+    assert invocation_rule.status == "failed"
+    assert checkpoint_status == "committed"
+    assert invocation_status == "committed"
+
+
 class _RegressingCheckpointHeadSink(DeterministicFencedRunSink):
     def commit_checkpoint(
         self,
@@ -2237,6 +2284,79 @@ def test_reusable_contract_rejects_non_atomic_competing_writers(mutation: str) -
     assert winner_rule.status == "failed"
     assert race_observation.expected == ("committed", "conflict")
     assert race_observation.actual == ("committed", "committed")
+
+
+class _LoserPayloadOverwriteHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left,
+        right,
+    ) -> tuple[CommitResult, CommitResult]:
+        results = super().race_conflicting_writes(
+            mutation,
+            writer_token,
+            left,
+            right,
+        )
+        if mutation != self.broken_mutation:
+            return results
+        left_result, right_result = results
+        loser_write = right if left_result.status == "committed" else left
+        loser_value = loser_write.keywords["value"]
+        with self.sink._lock:
+            if mutation == "checkpoint":
+                key = (writer_token.run_id, 1)
+                digest, record = self.sink._checkpoints[key]
+                self.sink._checkpoints[key] = (
+                    digest,
+                    replace(record, checkpoint=loser_value),
+                )
+            elif mutation == "event":
+                key = (writer_token.run_id, 1)
+                digest, _ = self.sink._events[key]
+                self.sink._events[key] = (digest, loser_value)
+            elif mutation == "invocation":
+                key = (writer_token.run_id, "call-1", 3)
+                digest, record = self.sink._invocations[key]
+                self.sink._invocations[key] = (
+                    digest,
+                    replace(record, invocation=loser_value),
+                )
+            else:
+                digest, _ = self.sink._terminals[writer_token.run_id]
+                self.sink._terminals[writer_token.run_id] = (digest, loser_value)
+        return left_result, right_result
+
+
+def _loser_payload_overwrite_factory(mutation: str):
+    def factory() -> _LoserPayloadOverwriteHarness:
+        harness = _LoserPayloadOverwriteHarness()
+        harness.broken_mutation = mutation
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
+def test_reusable_contract_reads_the_cas_winner_payload(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_loser_payload_overwrite_factory(mutation))
+    winner_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+    )
+    payload_observation = next(
+        observation
+        for observation in winner_rule.observations
+        if observation.observation_id == f"{mutation}_race_winner_payload"
+    )
+
+    assert winner_rule.status == "failed"
+    assert payload_observation.actual != payload_observation.expected
 
 
 class _UnsafeWriterHandoffHarness(DeterministicFencedRunHarness):
