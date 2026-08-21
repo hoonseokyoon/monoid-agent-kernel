@@ -640,8 +640,9 @@ Settled failure receipt에서 `retryable` 필드가 생략되면 재시도 근�
 dispatch reservation을 허용한다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
-유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 altered retry를 각각 실행하고
-매번 head 4를 확인한다.
+유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 dispatch identity가 다른 retry를
+각각 실행한다. Revision 3에는 stable identity와 legal settled transition을 유지한 채 receipt와
+failure code만 각각 바꾸는 conflict도 추가한다. 모든 경우에 head 4가 유지되어야 한다.
 같은 run 안의 여러 logical call은 `(run_id, logical_call_id)`마다 독립 head를 유지한다. 둘째 call을
 commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 logical call은 `missing`과 빈 value를
 반환한다. Per-run last-invocation pointer 구현은 이 복구 검증에서 실패한다.
@@ -1147,7 +1148,8 @@ Fresh partial-authority 세 조합은 checkpoint·invocation의 고유 stale-onl
 검증해 malformed pre-fence publication을 거부한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
-Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를
+Historical invocation revision 1·2·3은 exact retry와 dispatch-identity conflict를 모두 비교한다.
+Historical settled revision은 receipt-only·failure-code-only conflict도 비교하고 latest head 4를
 유지한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
 Invocation terminal edge identity는 settled·unknown과 네 stable identity field를 완전 교차한다.
 Terminal retry 행렬은 settled failure의 `retryable=false`·필드 생략·`retryable=true`를 구분하고,

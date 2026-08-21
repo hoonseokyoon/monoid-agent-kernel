@@ -3728,7 +3728,6 @@ def _run_fenced_run_sink_contract(
         )
         harness = harness.reopen()
         old_revision_retries: dict[int, tuple[str, int | None]] = {}
-        old_revision_conflicts: dict[int, tuple[str, int | None]] = {}
         for old_invocation in (
             reserved_invocation,
             started_invocation,
@@ -3744,16 +3743,40 @@ def _run_fenced_run_sink_contract(
                 retry.status,
                 reloaded.sequence,
             )
+        historical_conflict_cases = {
+            "revision_1": replace(
+                reserved_invocation,
+                dispatch_id="dispatch-historical-conflict-1",
+            ),
+            "revision_2": replace(
+                started_invocation,
+                dispatch_id="dispatch-historical-conflict-2",
+            ),
+            "revision_3": replace(
+                settled_failure_invocation,
+                dispatch_id="dispatch-historical-conflict-3",
+            ),
+            "revision_3_receipt": replace(
+                settled_failure_invocation,
+                receipt={
+                    **dict(settled_failure_invocation.receipt or {}),
+                    "provider_request_id": "historical-provider-request",
+                },
+            ),
+            "revision_3_failure_code": replace(
+                settled_failure_invocation,
+                failure_code="historical_provider_refused",
+            ),
+        }
+        old_revision_conflicts: dict[str, tuple[str, int | None]] = {}
+        for label, conflicting_invocation in historical_conflict_cases.items():
             conflicting_retry = harness.sink.commit_invocation(
-                replace(
-                    old_invocation,
-                    dispatch_id=f"dispatch-historical-conflict-{old_invocation.revision}",
-                ),
+                conflicting_invocation,
                 {},
                 writer_token=token,
             )
             reloaded_after_conflict = harness.sink.load_invocation(run_id, "call-1")
-            old_revision_conflicts[old_invocation.revision] = (
+            old_revision_conflicts[label] = (
                 conflicting_retry.status,
                 reloaded_after_conflict.sequence,
             )
@@ -3934,11 +3957,11 @@ def _run_fenced_run_sink_contract(
                     ),
                     *(
                         observation(
-                            f"old_revision_{revision}_conflict_and_head",
+                            f"old_{label}_conflict_and_head",
                             expected=("conflict", 4),
                             actual=status_and_head,
                         )
-                        for revision, status_and_head in old_revision_conflicts.items()
+                        for label, status_and_head in old_revision_conflicts.items()
                     ),
                     observation("latest_load", expected="loaded", actual=loaded.status),
                     observation("latest_revision", expected=4, actual=loaded.sequence),

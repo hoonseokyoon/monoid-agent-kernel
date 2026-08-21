@@ -1953,8 +1953,69 @@ def test_reusable_contract_compares_every_historical_invocation_payload() -> Non
 
     assert lifecycle_rule.status == "failed"
     assert observations == {
-        f"old_revision_{revision}_conflict_and_head": ("already_committed", 4)
-        for revision in (1, 2, 3)
+        **{
+            f"old_revision_{revision}_conflict_and_head": ("already_committed", 4)
+            for revision in (1, 2, 3)
+        },
+        "old_revision_3_receipt_conflict_and_head": ("already_committed", 4),
+        "old_revision_3_failure_code_conflict_and_head": ("already_committed", 4),
+    }
+
+
+class _HistoricalSettlementEvidenceBlindSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if head is not None and invocation.revision < head and stored is not None:
+            winner_payload = stored[1].invocation.to_json()
+            candidate_payload = invocation.to_json()
+            for field_name in ("receipt", "result_ref", "failure_code"):
+                winner_payload.pop(field_name)
+                candidate_payload.pop(field_name)
+            if winner_payload == candidate_payload:
+                return CommitResult(
+                    status="already_committed",
+                    sequence=invocation.revision,
+                )
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+def _historical_settlement_evidence_blind_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _HistoricalSettlementEvidenceBlindSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_compares_valid_historical_settlement_evidence() -> None:
+    outcomes = run_fenced_run_sink_contract(_historical_settlement_evidence_blind_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = {
+        item.observation_id: item.actual
+        for item in lifecycle_rule.observations
+        if item.observation_id
+        in {
+            "old_revision_3_receipt_conflict_and_head",
+            "old_revision_3_failure_code_conflict_and_head",
+        }
+    }
+
+    assert lifecycle_rule.status == "failed"
+    assert observations == {
+        "old_revision_3_receipt_conflict_and_head": ("already_committed", 4),
+        "old_revision_3_failure_code_conflict_and_head": ("already_committed", 4),
     }
 
 
