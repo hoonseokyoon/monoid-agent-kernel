@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, get_args
 
+from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_ref, is_safe_taxonomy_code
 from monoid_agent_kernel.core.wire_validation import parse_int, parse_literal, parse_str, require_object
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
@@ -43,16 +44,6 @@ class InterruptionCause(StrEnum):
     UNKNOWN = "unknown"
 
 
-def _require_nonempty_string(value: object, field_name: str) -> None:
-    if type(value) is not str or not value.strip():
-        raise ValueError(f"terminal outcome {field_name} must be a non-empty string")
-
-
-def _require_string(value: object, field_name: str) -> None:
-    if type(value) is not str:
-        raise ValueError(f"terminal outcome {field_name} must be a string")
-
-
 def _require_optional_nonnegative_int(value: object, field_name: str) -> None:
     if value is None:
         return
@@ -84,7 +75,8 @@ class TerminalOutcome:
     def __post_init__(self) -> None:
         if self.schema_version not in ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS:
             raise ValueError("unsupported terminal outcome schema")
-        _require_nonempty_string(self.run_id, "run_id")
+        if not is_safe_opaque_ref(self.run_id):
+            raise ValueError("terminal outcome run_id must be a bounded opaque id")
         if self.kind not in get_args(TerminalOutcomeKind):
             raise ValueError("terminal outcome kind is outside the portable vocabulary")
         try:
@@ -103,15 +95,30 @@ class TerminalOutcome:
                 ) from exc
             object.__setattr__(self, "interruption_cause", interruption_cause)
         _require_optional_nonnegative_int(self.checkpoint_seq, "checkpoint_seq")
-        _require_optional_nonnegative_int(self.http_status, "http_status")
+        if self.http_status is not None and (
+            type(self.http_status) is not int or not 100 <= self.http_status <= 599
+        ):
+            raise ValueError("terminal outcome http_status must be between 100 and 599 or null")
         for field_name in (
             "final_output_ref",
             "partial_output_ref",
             "last_evidence_ref",
-            "error_code",
-            "provider_error_code",
         ):
-            _require_string(getattr(self, field_name), field_name)
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise ValueError(f"terminal outcome {field_name} must be a string")
+            if value and not is_safe_opaque_ref(value):
+                raise ValueError(
+                    f"terminal outcome {field_name} must be empty or a bounded opaque reference"
+                )
+        for field_name in ("error_code", "provider_error_code"):
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise ValueError(f"terminal outcome {field_name} must be a string")
+            if value and not is_safe_taxonomy_code(value):
+                raise ValueError(
+                    f"terminal outcome {field_name} must be empty or a bounded taxonomy code"
+                )
 
     def to_json(self) -> dict[str, Any]:
         """Return the one canonical writer spelling of the outcome."""

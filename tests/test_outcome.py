@@ -96,6 +96,8 @@ def test_terminal_outcome_accepts_every_declared_interruption_cause(
         ("checkpoint_seq", -1),
         ("http_status", True),
         ("http_status", -1),
+        ("http_status", 99),
+        ("http_status", 600),
         ("error_code", 500),
     ),
 )
@@ -108,6 +110,56 @@ def test_terminal_outcome_rejects_values_outside_the_contract(field: str, value:
     kwargs[field] = value
 
     with pytest.raises((TypeError, ValueError)):
+        TerminalOutcome(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("run_id", "private run text"),
+        ("run_id", "r" * 257),
+        ("final_output_ref", "model output text"),
+        ("partial_output_ref", "line\nbreak"),
+        ("last_evidence_ref", "évidence"),
+        ("final_output_ref", "r" * 257),
+    ),
+)
+def test_terminal_outcome_rejects_free_text_and_unbounded_references(
+    field: str,
+    value: str,
+) -> None:
+    kwargs = {
+        "run_id": "run_1",
+        "kind": "failed_terminal",
+        "retry_eligibility": "forbidden",
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="bounded opaque"):
+        TerminalOutcome(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("error_code", "raw exception message"),
+        ("provider_error_code", "bad/code"),
+        ("error_code", "line\nbreak"),
+        ("provider_error_code", "c" * 129),
+    ),
+)
+def test_terminal_outcome_rejects_free_text_and_unbounded_error_codes(
+    field: str,
+    value: str,
+) -> None:
+    kwargs = {
+        "run_id": "run_1",
+        "kind": "failed_terminal",
+        "retry_eligibility": "forbidden",
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match="bounded taxonomy code"):
         TerminalOutcome(**kwargs)  # type: ignore[arg-type]
 
 

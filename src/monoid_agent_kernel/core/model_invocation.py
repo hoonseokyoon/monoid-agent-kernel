@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
+from monoid_agent_kernel.core.safe_evidence import (
+    is_safe_opaque_ref,
+    is_safe_taxonomy_code,
+    is_safe_utc_timestamp,
+)
 from monoid_agent_kernel.core.wire_validation import parse_int, parse_literal, parse_str
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
@@ -87,32 +90,6 @@ def _collapsed_receipt_key(key: str) -> str:
     return "".join(character for character in key.casefold() if character.isalnum())
 
 
-_OPAQUE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,255}\Z", re.ASCII)
-_CODE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
-_UTC_TIMESTAMP_PATTERN = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z",
-    re.ASCII,
-)
-
-
-def _is_opaque_id(value: object) -> bool:
-    return type(value) is str and _OPAQUE_ID_PATTERN.fullmatch(value) is not None
-
-
-def _is_code(value: object) -> bool:
-    return type(value) is str and _CODE_PATTERN.fullmatch(value) is not None
-
-
-def _is_utc_timestamp(value: object) -> bool:
-    if type(value) is not str or _UTC_TIMESTAMP_PATTERN.fullmatch(value) is None:
-        return False
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None
-
-
 def _require_string(value: object, field_name: str) -> None:
     if type(value) is not str:
         raise ValueError(f"model invocation {field_name} must be a string")
@@ -176,19 +153,19 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                 )
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_OPAQUE_ID_FIELDS:
-            if not _is_opaque_id(value):
+            if not is_safe_opaque_ref(value):
                 raise ValueError(
                     f"model invocation receipt {canonical_key} must be a bounded opaque id"
                 )
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_CODE_FIELDS:
-            if not _is_code(value):
+            if not is_safe_taxonomy_code(value):
                 raise ValueError(
                     f"model invocation receipt {canonical_key} must be a bounded code"
                 )
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_TIMESTAMP_FIELDS:
-            if not _is_utc_timestamp(value):
+            if not is_safe_utc_timestamp(value):
                 raise ValueError(
                     f"model invocation receipt {canonical_key} must be a UTC RFC3339 timestamp"
                 )
@@ -242,7 +219,7 @@ class DurableModelInvocation:
             "logical_call_id",
             "dispatch_id",
         ):
-            if not _is_opaque_id(getattr(self, field_name)):
+            if not is_safe_opaque_ref(getattr(self, field_name)):
                 raise ValueError(f"model invocation {field_name} must be a bounded opaque id")
         if type(self.idempotency_key) is not str or not is_valid_idempotency_key(
             self.idempotency_key
@@ -261,9 +238,9 @@ class DurableModelInvocation:
             raise ValueError("model invocation dispatch_state is outside the durable vocabulary")
         _require_string(self.result_ref, "result_ref")
         _require_string(self.failure_code, "failure_code")
-        if self.result_ref and not _is_opaque_id(self.result_ref):
+        if self.result_ref and not is_safe_opaque_ref(self.result_ref):
             raise ValueError("model invocation result_ref must be empty or a bounded opaque id")
-        if self.failure_code and not _is_code(self.failure_code):
+        if self.failure_code and not is_safe_taxonomy_code(self.failure_code):
             raise ValueError("model invocation failure_code must be empty or a bounded code")
         receipt = _normalized_receipt(self.receipt)
         object.__setattr__(self, "receipt", receipt)
