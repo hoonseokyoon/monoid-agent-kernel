@@ -633,6 +633,9 @@ commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 lo
 둘 다 2인 초기 좌표는 독립 history에서 각각 `conflict`다.
 Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
 attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
+Stable invocation identity는 `reserved → dispatch_started`, `dispatch_started → settled`,
+`dispatch_started → unknown`의 모든 legal edge에서 유지된다. Terminal 두 edge는 idempotency key,
+request digest, dispatch ID, dispatch attempt를 각각 변형한 8칸 행렬로 `conflict`를 검증한다.
 새 dispatch ID는 해당 logical call의 모든 이전 attempt와 달라야 한다. Contract는 두 번의 retryable
 failure를 만든 뒤 attempt 3에서 attempt 1의 ID를 재사용하는 history를 `conflict`로 검증한다. 같은
 history에서 fresh ID를 쓴 attempt 3의 reserved, dispatch_started, settled lifecycle은 모두
@@ -1119,6 +1122,7 @@ Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함�
 검증한다.
 Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를
 유지한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
+Invocation terminal edge identity는 settled·unknown과 네 stable identity field를 완전 교차한다.
 
 ### 14.6 최종 통합 PR
 

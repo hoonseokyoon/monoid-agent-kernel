@@ -1705,10 +1705,13 @@ class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
             ]
             previous = previous_record.invocation
             if getattr(invocation, self.ignored_field) != getattr(previous, self.ignored_field):
-                invocation = replace(
-                    invocation,
-                    **{self.ignored_field: getattr(previous, self.ignored_field)},
-                )
+                replacements = {self.ignored_field: getattr(previous, self.ignored_field)}
+                if self.ignored_field == "request_digest" and invocation.receipt:
+                    replacements["receipt"] = {
+                        **dict(invocation.receipt),
+                        "request_digest": previous.request_digest,
+                    }
+                invocation = replace(invocation, **replacements)
         return super()._invocation_transition_winner(invocation)
 
 
@@ -1743,6 +1746,77 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
         observation
         for observation in refusal_rule.observations
         if observation.observation_id == f"identity_drift_{field_name}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert drift_observation.expected == "conflict"
+    assert drift_observation.actual == "committed"
+
+
+class _TerminalInvocationIdentityDriftSink(DeterministicFencedRunSink):
+    ignored_field = ""
+    terminal_state = ""
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None and invocation.dispatch_state == self.terminal_state:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            if getattr(invocation, self.ignored_field) != getattr(
+                previous,
+                self.ignored_field,
+            ):
+                replacements = {self.ignored_field: getattr(previous, self.ignored_field)}
+                if self.ignored_field == "request_digest" and invocation.receipt:
+                    replacements["receipt"] = {
+                        **dict(invocation.receipt),
+                        "request_digest": previous.request_digest,
+                    }
+                invocation = replace(invocation, **replacements)
+        return super()._invocation_transition_winner(invocation)
+
+
+def _terminal_invocation_identity_drift_factory(
+    terminal_state: str,
+    field_name: str,
+):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _TerminalInvocationIdentityDriftSink(harness._writers)
+        sink.terminal_state = terminal_state
+        sink.ignored_field = field_name
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("terminal_state", ["settled", "unknown"])
+@pytest.mark.parametrize(
+    "field_name",
+    ["idempotency_key", "request_digest", "dispatch_id", "dispatch_attempt"],
+)
+def test_reusable_contract_checks_identity_on_terminal_invocation_edges(
+    terminal_state: str,
+    field_name: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _terminal_invocation_identity_drift_factory(terminal_state, field_name)
+    )
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    drift_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"terminal_identity_drift_{terminal_state}_{field_name}"
     )
 
     assert refusal_rule.status == "failed"

@@ -1024,6 +1024,41 @@ def _contract_invocation_drift_status(
     return drifted.status
 
 
+def _contract_terminal_invocation_drift_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    terminal_state: str,
+    field_name: str,
+    field_value: Any,
+) -> str:
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=revision,
+                dispatch_state=dispatch_state,
+            ),
+            {},
+            writer_token=token,
+        ).status
+        for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+    )
+    if setup_statuses != ("committed", "committed"):
+        return f"setup:{','.join(setup_statuses)}"
+    return harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state=terminal_state,
+            **{field_name: field_value},
+        ),
+        {},
+        writer_token=token,
+    ).status
+
+
 def _contract_first_invocation_state_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -3986,6 +4021,29 @@ def _run_fenced_run_sink_contract(
                 2,
             ),
         }
+        terminal_identity_drift_values = {
+            "idempotency_key": "contract-terminal-idempotency-drift",
+            "request_digest": "b" * 64,
+            "dispatch_id": "dispatch-terminal-drift",
+            "dispatch_attempt": 2,
+        }
+        terminal_identity_drift_statuses = {
+            (terminal_state, field_name): _contract_terminal_invocation_drift_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    (
+                        f"invocation-terminal-drift-{terminal_state.replace('_', '-')}"
+                        f"-{field_name.replace('_', '-')}"
+                    ),
+                ),
+                terminal_state,
+                field_name,
+                field_value,
+            )
+            for terminal_state in ("settled", "unknown")
+            for field_name, field_value in terminal_identity_drift_values.items()
+        }
         terminal_retry_cases = {
             "unknown": {
                 "terminal_state": "unknown",
@@ -4084,6 +4142,16 @@ def _run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for field_name, status in identity_drift_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"terminal_identity_drift_{terminal_state}_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for (terminal_state, field_name), status in (
+                            terminal_identity_drift_statuses.items()
+                        )
                     ),
                     *(
                         observation(
