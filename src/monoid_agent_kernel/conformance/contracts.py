@@ -676,16 +676,18 @@ def _contract_invocation(
     idempotency_key: str | None = None,
     request_digest: str = "a" * 64,
     digest_generation: str = MODEL_REQUEST_DIGEST_GENERATION,
-    retryable: bool = False,
+    retryable: bool | None = False,
     succeeded: bool = False,
 ) -> DurableModelInvocation:
     if idempotency_key is None:
         idempotency_key = f"contract-{hashlib.sha256(run_id.encode()).hexdigest()}"
-    receipt = None
+    receipt: dict[str, Any] | None = None
     result_ref = ""
     failure_code = ""
     if dispatch_state == "settled":
-        receipt = {"request_digest": request_digest, "retryable": retryable}
+        receipt = {"request_digest": request_digest}
+        if retryable is not None:
+            receipt["retryable"] = retryable
         if succeeded:
             result_ref = f"blob:{_CONTRACT_INVOCATION_BLOB_SHA256}"
         else:
@@ -1502,7 +1504,7 @@ def _contract_retry_after_terminal_invocation(
     run_id: str,
     *,
     terminal_state: str,
-    retryable: bool = False,
+    retryable: bool | None = False,
     succeeded: bool = False,
     unknown_failure_code: str = "",
 ) -> tuple[tuple[str, ...], str]:
@@ -4411,6 +4413,10 @@ def _run_fenced_run_sink_contract(
             "nonretry_failure": {
                 "terminal_state": "settled",
             },
+            "omitted_retryable_failure": {
+                "terminal_state": "settled",
+                "retryable": None,
+            },
             "retryable_failure": {
                 "terminal_state": "settled",
                 "retryable": True,
@@ -4422,6 +4428,7 @@ def _run_fenced_run_sink_contract(
             "success": "conflict",
             "retryable_tagged_success": "conflict",
             "nonretry_failure": "conflict",
+            "omitted_retryable_failure": "conflict",
             "retryable_failure": "committed",
         }
         if terminal_retry_cases.keys() != terminal_retry_expectations.keys():
@@ -4535,15 +4542,27 @@ def _run_fenced_run_sink_contract(
         run_a_token = _contract_writer(harness, run_a_id)
         run_b_token = _contract_writer(harness, run_b_id)
         run_a_records = (
-            RunCheckpoint(run_id=run_a_id, seq=1),
+            RunCheckpoint(run_id=run_a_id, seq=1, final_text="run-a-checkpoint"),
             _contract_event(run_a_id, seq=1),
-            _contract_invocation(run_a_id, revision=1, dispatch_state="reserved"),
+            _contract_invocation(
+                run_a_id,
+                revision=1,
+                dispatch_id="dispatch-run-a",
+                dispatch_state="reserved",
+                request_digest="a" * 64,
+            ),
             _contract_terminal(run_a_id),
         )
         run_b_records = (
-            RunCheckpoint(run_id=run_b_id, seq=1),
+            RunCheckpoint(run_id=run_b_id, seq=1, final_text="run-b-checkpoint"),
             _contract_event(run_b_id, seq=1),
-            _contract_invocation(run_b_id, revision=1, dispatch_state="reserved"),
+            _contract_invocation(
+                run_b_id,
+                revision=1,
+                dispatch_id="dispatch-run-b",
+                dispatch_state="reserved",
+                request_digest="b" * 64,
+            ),
             _contract_terminal(run_b_id),
         )
         checkpoint, event, invocation, terminal = run_b_records
@@ -4666,6 +4685,30 @@ def _run_fenced_run_sink_contract(
         loaded_b_event = harness.read_event(run_b_id, 1)
         loaded_a_terminal = harness.read_terminal(run_a_id)
         loaded_b_terminal = harness.read_terminal(run_b_id)
+        loaded_checkpoint_payloads = (
+            (
+                canonical_sha256(loaded_a_checkpoint.value.checkpoint.to_json())
+                if loaded_a_checkpoint.value
+                else None
+            ),
+            (
+                canonical_sha256(loaded_b_checkpoint.value.checkpoint.to_json())
+                if loaded_b_checkpoint.value
+                else None
+            ),
+        )
+        loaded_invocation_payloads = (
+            (
+                canonical_sha256(loaded_a_invocation.value.invocation.to_json())
+                if loaded_a_invocation.value
+                else None
+            ),
+            (
+                canonical_sha256(loaded_b_invocation.value.invocation.to_json())
+                if loaded_b_invocation.value
+                else None
+            ),
+        )
         loaded_event_payloads = (
             canonical_sha256(loaded_a_event.to_json()) if loaded_a_event else None,
             canonical_sha256(loaded_b_event.to_json()) if loaded_b_event else None,
@@ -4896,6 +4939,26 @@ def _run_fenced_run_sink_contract(
                                 else None
                             ),
                         ),
+                    ),
+                    observation(
+                        "run_a_checkpoint_payload",
+                        expected=canonical_sha256(run_a_checkpoint.to_json()),
+                        actual=loaded_checkpoint_payloads[0],
+                    ),
+                    observation(
+                        "run_b_checkpoint_payload",
+                        expected=canonical_sha256(checkpoint.to_json()),
+                        actual=loaded_checkpoint_payloads[1],
+                    ),
+                    observation(
+                        "run_a_invocation_payload",
+                        expected=canonical_sha256(run_a_invocation.to_json()),
+                        actual=loaded_invocation_payloads[0],
+                    ),
+                    observation(
+                        "run_b_invocation_payload",
+                        expected=canonical_sha256(invocation.to_json()),
+                        actual=loaded_invocation_payloads[1],
                     ),
                     observation(
                         "run_a_event_payload",

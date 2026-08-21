@@ -507,6 +507,7 @@ def test_reusable_contract_rejects_retry_after_terminal_invocation_states() -> N
         "retry_after_success": "committed",
         "retry_after_retryable_tagged_success": "committed",
         "retry_after_nonretry_failure": "committed",
+        "retry_after_omitted_retryable_failure": "committed",
         "retry_after_retryable_failure": "committed",
     }
 
@@ -638,6 +639,34 @@ def test_reusable_contract_scopes_each_resource_key_by_run(mutation: str) -> Non
     assert run_b_observation.actual == "conflict"
 
 
+class _CrossRunPayloadAliasSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+
+    @staticmethod
+    def _run_b_id(run_id: str) -> str:
+        return f"{run_id.removesuffix('run-a')}run-b"
+
+    def latest_checked(self, run_id: str):
+        loaded = super().latest_checked(run_id)
+        if self.broken_mutation != "checkpoint" or not run_id.endswith("run-a"):
+            return loaded
+        aliased = super().latest_checked(self._run_b_id(run_id))
+        if loaded.value is None or aliased.value is None:
+            return loaded
+        aliased_checkpoint = replace(aliased.value.checkpoint, run_id=run_id)
+        return loaded.map(lambda record: replace(record, checkpoint=aliased_checkpoint))
+
+    def load_invocation(self, run_id: str, logical_call_id: str):
+        loaded = super().load_invocation(run_id, logical_call_id)
+        if self.broken_mutation != "invocation" or not run_id.endswith("run-a"):
+            return loaded
+        aliased = super().load_invocation(self._run_b_id(run_id), logical_call_id)
+        if loaded.value is None or aliased.value is None:
+            return loaded
+        aliased_invocation = replace(aliased.value.invocation, run_id=run_id)
+        return loaded.map(lambda record: replace(record, invocation=aliased_invocation))
+
+
 class _CrossRunPayloadAliasHarness(DeterministicFencedRunHarness):
     broken_mutation = ""
 
@@ -660,12 +689,16 @@ def _cross_run_payload_alias_factory(mutation: str):
     def factory() -> _CrossRunPayloadAliasHarness:
         harness = _CrossRunPayloadAliasHarness()
         harness.broken_mutation = mutation
+        if mutation in {"checkpoint", "invocation"}:
+            sink = _CrossRunPayloadAliasSink(harness._writers)
+            sink.broken_mutation = mutation
+            harness.sink = sink
         return harness
 
     return factory
 
 
-@pytest.mark.parametrize("mutation", ["event", "terminal"])
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
 def test_reusable_contract_reads_each_runs_complete_payload(mutation: str) -> None:
     outcomes = run_fenced_run_sink_contract(_cross_run_payload_alias_factory(mutation))
     binding_rule = next(
@@ -2933,6 +2966,57 @@ def test_reusable_contract_never_retries_a_retryable_tagged_success() -> None:
         "committed",
     )
     assert observations["retry_after_retryable_tagged_success"] == "committed"
+
+
+class _MissingRetryableAllowsRetrySink(DeterministicFencedRunSink):
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            missing_retryable_evidence = (
+                previous.dispatch_state == "settled"
+                and bool(previous.failure_code)
+                and previous.receipt is not None
+                and "retryable" not in previous.receipt
+            )
+            legal_retry_coordinate = (
+                invocation.dispatch_state == "reserved"
+                and invocation.dispatch_attempt == previous.dispatch_attempt + 1
+                and not self._dispatch_id_was_used(invocation)
+            )
+            if missing_retryable_evidence and legal_retry_coordinate:
+                return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _missing_retryable_allows_retry_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _MissingRetryableAllowsRetrySink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_requires_affirmative_retryable_failure_evidence() -> None:
+    outcomes = run_fenced_run_sink_contract(_missing_retryable_allows_retry_factory)
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    observation = next(
+        item
+        for item in refusal_rule.observations
+        if item.observation_id == "retry_after_omitted_retryable_failure"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert observation.expected == "conflict"
+    assert observation.actual == "committed"
 
 
 class _ImmediatePreviousDispatchOnlySink(DeterministicFencedRunSink):

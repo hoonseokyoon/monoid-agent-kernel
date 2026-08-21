@@ -474,8 +474,10 @@ Writer generation 전환 run에서는 `seq=1`과 `seq=2`를 모두 재개방 후
 거부한다.
 `read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
 구현을 거부한다.
-Run-isolation probe는 같은 local key를 가진 두 run의 event와 terminal 전체 payload를 모두 읽는다.
-Run별 digest만 보존하고 실제 payload를 전역 singleton에 덮어쓰는 adapter도 이 비교에서 실패한다.
+Run-isolation probe는 같은 local key를 가진 두 run의 checkpoint, event, invocation, terminal 전체
+canonical payload를 모두 읽는다. Checkpoint의 `final_text`와 invocation의 dispatch ID·request digest를
+run마다 다르게 제출한다. Run binding과 CAS digest만 분리하고 나머지 payload를 전역 최신값으로
+덮어쓰는 adapter도 이 비교에서 실패한다.
 각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
 factory instance와 명시적으로 reopened된 모든 facade를 추적한다. 다음 독립 probe를 열기 전에 직전
 probe의 facade group을 역순으로 닫고, `finally`에서 마지막 group을 닫는다. 이 수명 규칙이 database
@@ -633,6 +635,9 @@ attempt N reserved
 `unknown`은 failure code 유무와 관계없이 해당 logical call의 최종 journal 상태다. Revision gap,
 state regression, settled success 뒤 새 attempt는 `conflict`다. Successful settlement의 receipt에
 `retryable=true`가 있어도 성공 결과가 우선하며 새 paid dispatch를 열지 않는다.
+Settled failure receipt에서 `retryable` 필드가 생략되면 재시도 근거가 없다. Contract는 명시적인
+`retryable=false`, 필드 생략, `retryable=true`를 별도 상태로 검증하며 마지막 경우만 다음 paid
+dispatch reservation을 허용한다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
 유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 altered retry를 각각 실행하고
@@ -1145,6 +1150,9 @@ Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함�
 Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를
 유지한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
 Invocation terminal edge identity는 settled·unknown과 네 stable identity field를 완전 교차한다.
+Terminal retry 행렬은 settled failure의 `retryable=false`·필드 생략·`retryable=true`를 구분하고,
+명시적인 true만 새 reservation을 허용한다. Run 격리 행렬은 checkpoint·event·invocation·terminal
+네 family의 서로 다른 non-key payload를 재개방 후 각각 완전 비교한다.
 
 ### 14.6 최종 통합 PR
 
