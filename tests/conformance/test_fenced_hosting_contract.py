@@ -663,6 +663,149 @@ def test_reusable_contract_checks_each_invalid_initial_invocation_state(state: s
     assert state_observation.actual == "committed"
 
 
+class _CorruptingLoadedRecordSink(DeterministicFencedRunSink):
+    corruption = ""
+
+    def latest_checked(self, run_id: str):
+        loaded = super().latest_checked(run_id)
+        if self.corruption != "checkpoint" or loaded.value is None:
+            return loaded
+        corrupted_checkpoint = replace(loaded.value.checkpoint, workspace_delta=[])
+        return replace(
+            loaded,
+            value=replace(loaded.value, checkpoint=corrupted_checkpoint),
+        )
+
+    def load_invocation(self, run_id: str, logical_call_id: str):
+        loaded = super().load_invocation(run_id, logical_call_id)
+        if self.corruption != "invocation" or loaded.value is None:
+            return loaded
+        corrupted_invocation = replace(
+            loaded.value.invocation,
+            dispatch_id="dispatch-corrupted",
+        )
+        return replace(
+            loaded,
+            value=replace(loaded.value, invocation=corrupted_invocation),
+        )
+
+
+def _corrupting_loaded_record_factory(corruption: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _CorruptingLoadedRecordSink(harness._writers)
+        sink.corruption = corruption
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("corruption", "rule_id", "observation_id"),
+    [
+        (
+            "checkpoint",
+            "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+            "checkpoint_manifest_digest",
+        ),
+        (
+            "invocation",
+            "FENCED-04-INVOCATION-LIFECYCLE",
+            "latest_invocation_digest",
+        ),
+    ],
+)
+def test_reusable_contract_compares_complete_reopened_records(
+    corruption: str,
+    rule_id: str,
+    observation_id: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_corrupting_loaded_record_factory(corruption))
+    durable_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    record_observation = next(
+        observation
+        for observation in durable_rule.observations
+        if observation.observation_id == observation_id
+    )
+
+    assert durable_rule.status == "failed"
+    assert record_observation.actual != record_observation.expected
+
+
+class _InvalidRetryCoordinateSink(DeterministicFencedRunSink):
+    allowed_coordinate: tuple[int, str] = (0, "")
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            retryable_failure = (
+                previous.dispatch_state == "settled"
+                and bool(previous.failure_code)
+                and previous.receipt is not None
+                and previous.receipt.get("retryable") is True
+            )
+            if (
+                retryable_failure
+                and invocation.dispatch_state == "reserved"
+                and (invocation.dispatch_attempt, invocation.dispatch_id)
+                == self.allowed_coordinate
+            ):
+                return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _invalid_retry_coordinate_factory(attempt: int, dispatch_id: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _InvalidRetryCoordinateSink(harness._writers)
+        sink.allowed_coordinate = (attempt, dispatch_id)
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("label", "attempt", "dispatch_id"),
+    [
+        ("same_attempt", 1, "dispatch-2"),
+        ("same_dispatch_id", 2, "dispatch-1"),
+        ("same_attempt_and_dispatch_id", 1, "dispatch-1"),
+        ("skipped_attempt", 3, "dispatch-3"),
+    ],
+)
+def test_reusable_contract_rejects_each_invalid_retry_coordinate(
+    label: str,
+    attempt: int,
+    dispatch_id: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _invalid_retry_coordinate_factory(attempt, dispatch_id)
+    )
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    coordinate_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"retry_coordinate_{label}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert coordinate_observation.expected == "conflict"
+    assert coordinate_observation.actual == "committed"
+
+
 class _VolatileReopenHarness(DeterministicFencedRunHarness):
     def reopen(self) -> DeterministicFencedRunHarness:
         return _VolatileReopenHarness()

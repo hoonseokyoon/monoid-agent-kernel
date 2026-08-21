@@ -502,6 +502,44 @@ def _contract_forbidden_state_edge_status(
     ).status
 
 
+def _contract_retry_coordinate_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    *,
+    dispatch_attempt: int,
+    dispatch_id: str,
+) -> str:
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    history = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            retryable=True,
+        ),
+    )
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in history
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return f"setup:{','.join(setup_statuses)}"
+    return harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=4,
+            dispatch_attempt=dispatch_attempt,
+            dispatch_id=dispatch_id,
+            dispatch_state="reserved",
+        ),
+        {},
+        writer_token=token,
+    ).status
+
+
 def _contract_retry_after_terminal_invocation(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -695,6 +733,15 @@ def run_fenced_run_sink_contract(
                         "winner_remains_latest",
                         expected="winner",
                         actual=(loaded.value.checkpoint.final_text if loaded.value else None),
+                    ),
+                    observation(
+                        "checkpoint_manifest_digest",
+                        expected=canonical_sha256(checkpoint.to_json()),
+                        actual=(
+                            canonical_sha256(loaded.value.checkpoint.to_json())
+                            if loaded.value
+                            else None
+                        ),
                     ),
                     observation(
                         "referenced_blob_round_trip",
@@ -1117,14 +1164,15 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
+        next_attempt_invocation = _contract_invocation(
+            run_id,
+            revision=4,
+            dispatch_attempt=2,
+            dispatch_id="dispatch-2",
+            dispatch_state="reserved",
+        )
         next_attempt = harness.sink.commit_invocation(
-            _contract_invocation(
-                run_id,
-                revision=4,
-                dispatch_attempt=2,
-                dispatch_id="dispatch-2",
-                dispatch_state="reserved",
-            ),
+            next_attempt_invocation,
             {},
             writer_token=token,
         )
@@ -1221,6 +1269,15 @@ def run_fenced_run_sink_contract(
                         ),
                     ),
                     observation(
+                        "latest_invocation_digest",
+                        expected=canonical_sha256(next_attempt_invocation.to_json()),
+                        actual=(
+                            canonical_sha256(loaded.value.invocation.to_json())
+                            if loaded.value
+                            else None
+                        ),
+                    ),
+                    observation(
                         "result_setup",
                         expected=("committed", "committed"),
                         actual=result_setup_statuses,
@@ -1251,6 +1308,15 @@ def run_fenced_run_sink_contract(
                         expected=f"blob:{_CONTRACT_INVOCATION_BLOB_SHA256}",
                         actual=(
                             loaded_result.value.invocation.result_ref
+                            if loaded_result.value
+                            else None
+                        ),
+                    ),
+                    observation(
+                        "result_invocation_digest",
+                        expected=canonical_sha256(settled_result_invocation.to_json()),
+                        actual=(
+                            canonical_sha256(loaded_result.value.invocation.to_json())
                             if loaded_result.value
                             else None
                         ),
@@ -1324,6 +1390,21 @@ def run_fenced_run_sink_contract(
             )
             for source, target in forbidden_edges
         }
+        invalid_retry_coordinates = {
+            "same_attempt": (1, "dispatch-2"),
+            "same_dispatch_id": (2, "dispatch-1"),
+            "same_attempt_and_dispatch_id": (1, "dispatch-1"),
+            "skipped_attempt": (3, "dispatch-3"),
+        }
+        invalid_retry_coordinate_statuses = {
+            label: _contract_retry_coordinate_status(
+                factory,
+                _contract_run_id(namespace, f"invocation-retry-coordinate-{label}"),
+                dispatch_attempt=attempt,
+                dispatch_id=dispatch_id,
+            )
+            for label, (attempt, dispatch_id) in invalid_retry_coordinates.items()
+        }
         identity_drift_statuses = {
             "idempotency_key": _contract_invocation_drift_status(
                 factory,
@@ -1393,6 +1474,14 @@ def run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for (source, target), status in forbidden_edge_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"retry_coordinate_{label}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for label, status in invalid_retry_coordinate_statuses.items()
                     ),
                     *(
                         observation(

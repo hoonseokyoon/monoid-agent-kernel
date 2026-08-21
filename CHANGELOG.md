@@ -31,7 +31,8 @@ out in commit messages and here.
   field- and edge-complete durable invocation transitions, fresh-facade durability, and
   barrier-coordinated CAS and writer-handoff races for every authoritative mutation.
   Concurrent writers use separate facades over shared backing. Per-execution namespaces make the
-  suite repeatable on one persistent test service.
+  suite repeatable on one persistent test service. Reopened records use complete canonical-payload
+  comparisons, and retry-attempt coordinates have an exhaustive invalid-combination matrix.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

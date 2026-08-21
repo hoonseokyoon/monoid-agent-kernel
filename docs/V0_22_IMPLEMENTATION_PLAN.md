@@ -460,6 +460,8 @@ Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확�
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 `reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
+재개방 record와 비교한다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
@@ -514,6 +516,8 @@ attempt N reserved
 뒤 새 attempt는 `conflict`다.
 첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
 문서화되지 않은 13개 인접 edge는 각각 독립 history에서 `conflict`로 검증한다.
+Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
+attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
 
 ### 6.4 LocalFS capability
 
