@@ -44,6 +44,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `external-agent-envelope` | wire | `monoid.external-agent-envelope.v1` | strict | `monoid.external-agent-envelope.v1`<br>`native-agent-runner.external-agent-envelope.v1` |
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
+| `terminal-outcome` | wire | `monoid.terminal-outcome.v1` | strict | `monoid.terminal-outcome.v1`<br>`native-agent-runner.terminal-outcome.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
@@ -52,6 +53,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `web-context` | wire | `monoid.web-context.v1` | permissive; missing id accepted | `monoid.web-context.v1`<br>`native-agent-runner.web-context.v1` |
 | `web-context-result` | wire | `monoid.web-context-result.v1` | permissive; missing id accepted | `monoid.web-context-result.v1`<br>`native-agent-runner.web-context-result.v1` |
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
+| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
@@ -80,6 +82,21 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `studio-trace-export-compact` | reference | `studio.trace-export.compact.v1` | writer-only | None (writer-only) |
 | `studio-model-content` | reference | `studio.model-content.v1` | strict | `studio.model-content.v1` |
 <!-- compatibility-registry:end -->
+
+`monoid.terminal-outcome.v1` is a content-free final-state envelope. It carries portable outcome,
+retry, and interruption vocabularies plus opaque output/evidence references. It never carries a
+prompt, model response, reasoning item, replay payload, or raw provider exception.
+
+`monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
+call. Current and retained namespace readers distinguish malformed data from future versions. The
+receipt is normalized metadata; model content, request bodies, endpoints, and raw exceptions are
+refused. Settled success points to a private result blob, and ambiguous dispatch has no automatic
+retry evidence.
+
+`monoid.checkpoint.v1` adds optional `last_model_invocation` and `interruption_cause` fields. A
+v0.21 checkpoint omits both and restores with `None` and the empty cause. The writer keeps the
+checkpoint version and emits an explicit field projection copied through the iterative portable
+JSON normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed

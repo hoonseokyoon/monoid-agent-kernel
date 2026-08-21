@@ -961,10 +961,10 @@ def test_the_refusing_ingress_boundaries_are_exactly_the_python_object_routes() 
 
     Every other caller keeps the default. For scalars the reason is that they hand the normalizer
     values that came off a bounded JSON parse, so the decoders already refused what these
-    boundaries refuse. That reason does **not** extend to shape: the model-JSON decoders admit 512
-    levels of nesting and ``dataclasses.asdict`` dies at 492, so the depth bound had to be carried
-    by these boundaries rather than inherited from the parsers — which is why the route a model's
-    own tool-call arguments take is now one of them.
+    boundaries refuse. The shape cap also remains an ingress contract after the v0.22 checkpoint
+    writer became iterative: widening it would change what model/tool routes accept, and recursive
+    JSON writers around those routes still need the margin. The route a model's own tool-call
+    arguments take is therefore one of these boundaries.
 
     The ``==`` fails in both directions. A new ``True`` site means a new Python-object ingress was
     opened, and it belongs here only together with the conversion the others carry. A missing

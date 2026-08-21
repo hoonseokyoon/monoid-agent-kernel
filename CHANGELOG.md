@@ -7,6 +7,17 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — portable production-boundary records
+
+- Added the content-free `TerminalOutcome` contract with typed retry eligibility and interruption
+  causes, plus the checked `DurableModelInvocation` record for reserved, dispatch-started, settled,
+  and unknown model-call revisions. Both artifacts use versioned canonical writers, retained
+  namespace readers, compatibility-ledger rows, and packaged fixtures.
+- Added optional latest-invocation and interruption-cause carriage to `monoid.checkpoint.v1` while
+  preserving v0.21 readers and positional construction. `RunCheckpoint.to_json()` now uses an
+  explicit field projection and the iterative portable JSON copier, removing the recursive
+  `dataclasses.asdict` boundary and its redundant deep copy.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path

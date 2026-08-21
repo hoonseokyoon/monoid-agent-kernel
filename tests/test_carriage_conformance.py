@@ -4261,6 +4261,8 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
         "pending_user_input",
         "previous_runtime_config",
         "workspace_base",
+        "last_model_invocation",
+        "interruption_cause",
         # No longer "an object or null": the park payload has a schema of its own now
         # (``_validate_suspension_payload``), shared with the receipt copy below.
         "last_suspension",

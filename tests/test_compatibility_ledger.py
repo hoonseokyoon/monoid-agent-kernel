@@ -29,10 +29,12 @@ from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.external_agent_envelope import EXTERNAL_AGENT_ENVELOPE_VERSION
 from monoid_agent_kernel.core.inbox import INBOX_PROTOCOL_VERSION
 from monoid_agent_kernel.core.manifest import MANIFEST_SCHEMA_VERSION
+from monoid_agent_kernel.core.model_invocation import MODEL_INVOCATION_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_calls import MODEL_CALLS_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_payloads import MODEL_PAYLOADS_SCHEMA_VERSION
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_SCHEMA_VERSION
 from monoid_agent_kernel.core.outbox import OUTBOX_REQUEST_VERSION
+from monoid_agent_kernel.core.outcome import TERMINAL_OUTCOME_SCHEMA_VERSION
 from monoid_agent_kernel.core.packages import (
     APPLY_RESULT_SCHEMA_VERSION,
     APPROVAL_SCHEMA_VERSION,
@@ -94,7 +96,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 43
+    assert len(artifacts) == 45
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -126,8 +128,10 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "outbox-request": OUTBOX_REQUEST_VERSION,
         "external-agent-envelope": EXTERNAL_AGENT_ENVELOPE_VERSION,
         "llm-turn": LLM_TURN_PROTOCOL_VERSION,
+        "terminal-outcome": TERMINAL_OUTCOME_SCHEMA_VERSION,
         "model-stream-live": MODEL_STREAM_LIVE_SCHEMA_VERSION,
         "checkpoint": CHECKPOINT_SCHEMA_VERSION,
+        "model-invocation": MODEL_INVOCATION_SCHEMA_VERSION,
         "backend-run": RUN_METADATA_SCHEMA_VERSION,
         "event": EVENT_SCHEMA_VERSION,
         "model-content": MODEL_CONTENT_SCHEMA_VERSION,

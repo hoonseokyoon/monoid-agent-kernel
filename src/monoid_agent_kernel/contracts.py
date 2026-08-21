@@ -29,6 +29,12 @@ from monoid_agent_kernel.core.result import (
     AgentTurnResult,
     Suspension,
 )
+from monoid_agent_kernel.core.outcome import (
+    InterruptionCause,
+    RetryEligibility,
+    TerminalOutcome,
+)
+from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.core.checkpoint import (
     CheckedCheckpointStore,
     CheckpointRecord,
@@ -301,6 +307,10 @@ __all__ = [
     "AgentRunResult",
     "AgentTurnResult",
     "Suspension",
+    "TerminalOutcome",
+    "InterruptionCause",
+    "RetryEligibility",
+    "DurableModelInvocation",
     "RunCheckpoint",
     "CheckpointStore",
     "CheckedCheckpointStore",

@@ -151,6 +151,13 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         accepts_missing_version=True,
         notes="The current client parses the response shape without enforcing protocol.",
     ),
+    _monoid_artifact(
+        "terminal-outcome.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("core/outcome.py:TerminalOutcome.from_json",),
+        legacy_reader=True,
+    ),
     CompatibilityArtifact(
         key="model-stream-live",
         kind="wire",
@@ -218,6 +225,13 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         kind="durable",
         reader_policy="checked",
         source=("core/checkpoint.py:CHECKPOINT_CODEC",),
+        legacy_reader=True,
+    ),
+    _monoid_artifact(
+        "model-invocation.v1",
+        kind="durable",
+        reader_policy="checked",
+        source=("core/model_invocation.py:MODEL_INVOCATION_CODEC",),
         legacy_reader=True,
     ),
     _monoid_artifact(

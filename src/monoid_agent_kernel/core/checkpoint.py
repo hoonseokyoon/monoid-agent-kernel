@@ -19,13 +19,19 @@ from __future__ import annotations
 import shutil
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
-from monoid_agent_kernel.core.json_ingress import is_finite_json_number, loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    loads_json_ingress,
+    normalize_json_ingress,
+)
+from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
@@ -159,8 +165,80 @@ class RunCheckpoint:
     skill_activation_count: int = 0
     skills_activated: list[str] = field(default_factory=list)
 
+    # --- additive v0.22 (kept at the tail for positional compatibility) ---
+    # A compact copy of the latest durable model-call journal revision at the next safe checkpoint.
+    # The fenced run sink remains crash-window authority; this is recovery context and inspection.
+    last_model_invocation: dict[str, Any] | None = None
+    # Empty until a typed interruption is observed. PR 6 connects the cancellation token and host
+    # lifecycle to this already-versioned checkpoint carriage.
+    interruption_cause: str = ""
+
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        # Explicit rather than dataclasses.asdict: the latter recursively descends and deep-copies,
+        # failing before the portable JSON depth accepted by this package. The existing iterative
+        # normalizer makes one detached JSON graph and keeps legitimate sharing. Field validators
+        # and the JSON writer retain their existing refusal rules; applying the tool-argument
+        # 64-container cap to this whole outer record would narrow that accepted input by charging
+        # checkpoint/message wrappers a second time.
+        payload = {
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "seq": self.seq,
+            "status": self.status,
+            "error": self.error,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "provider_http_status": self.provider_http_status,
+            "final_text": self.final_text,
+            "previous_turn_handle": self.previous_turn_handle,
+            "pending_user_input": self.pending_user_input,
+            "pending_observations": self.pending_observations,
+            "pending_binding_loads": self.pending_binding_loads,
+            "tool_call_counts": self.tool_call_counts,
+            "previous_runtime_config": self.previous_runtime_config,
+            "total_tool_calls": self.total_tool_calls,
+            "output_retries": self.output_retries,
+            "total_usage": self.total_usage,
+            "messages": self.messages,
+            "session_step": self.session_step,
+            "submit_local_step": self.submit_local_step,
+            "terminal": self.terminal,
+            "hosted_tasks": self.hosted_tasks,
+            "reentry_queue": self.reentry_queue,
+            "delivered_reentry_jobs": self.delivered_reentry_jobs,
+            "workspace_delta": self.workspace_delta,
+            "workspace_base": self.workspace_base,
+            "capability_leases": self.capability_leases,
+            "pending_capability_replays": self.pending_capability_replays,
+            "pending_tool_approval_replays": self.pending_tool_approval_replays,
+            "revoked_lease_ids": self.revoked_lease_ids,
+            "revoked_capabilities": self.revoked_capabilities,
+            "revoked_before": self.revoked_before,
+            "revoked_all": self.revoked_all,
+            "remaining_duration_s": self.remaining_duration_s,
+            "cancellation_requested": self.cancellation_requested,
+            "queued_messages": self.queued_messages,
+            "inbox_seen_ids": self.inbox_seen_ids,
+            "outbox_requests": self.outbox_requests,
+            "last_suspension": self.last_suspension,
+            "applied_input_ids": self.applied_input_ids,
+            "active_input": self.active_input,
+            "applied_input_receipts": self.applied_input_receipts,
+            "output_failure_history": self.output_failure_history,
+            "subagent_count": self.subagent_count,
+            "subagent_usage": self.subagent_usage,
+            "skill_activation_count": self.skill_activation_count,
+            "skills_activated": self.skills_activated,
+            "last_model_invocation": self.last_model_invocation,
+            "interruption_cause": self.interruption_cause,
+        }
+        normalized = normalize_json_ingress(
+            payload,
+            substitute_nonfinite=False,
+        )
+        if not isinstance(normalized, dict):  # pragma: no cover - literal root is always a dict
+            raise ValueError("checkpoint projection must be an object")
+        return normalized
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> RunCheckpoint | None:
@@ -360,7 +438,7 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             _require_list_of(payload[field_name], str, field_name)
     if "pending_user_input" in payload and payload["pending_user_input"] is not None:
         _require_list_of(payload["pending_user_input"], dict, "pending_user_input")
-    for field_name in ("previous_runtime_config", "workspace_base"):
+    for field_name in ("previous_runtime_config", "workspace_base", "last_model_invocation"):
         if (
             field_name in payload
             and payload[field_name] is not None
@@ -369,6 +447,23 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             raise ValueError(f"checkpoint {field_name} must be an object or null")
     if "last_suspension" in payload:
         _validate_suspension_payload(payload["last_suspension"], "last_suspension")
+    if payload.get("last_model_invocation") is not None:
+        invocation = decode_model_invocation(payload["last_model_invocation"])
+        if not invocation.ok:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        if invocation.value is None or invocation.value.run_id != payload.get("run_id"):
+            raise ValueError("checkpoint last_model_invocation run_id must match checkpoint run_id")
+    if "interruption_cause" in payload:
+        interruption_cause = payload["interruption_cause"]
+        if not isinstance(interruption_cause, str):
+            raise ValueError("checkpoint interruption_cause is outside the portable vocabulary")
+        if interruption_cause:
+            try:
+                InterruptionCause(interruption_cause)
+            except ValueError as exc:
+                raise ValueError(
+                    "checkpoint interruption_cause is outside the portable vocabulary"
+                ) from exc
     for field_name in ("tool_call_counts", "total_usage", "subagent_usage"):
         if field_name in payload:
             _validate_counter_mapping(payload[field_name], field_name)
@@ -413,6 +508,11 @@ def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
     """Return the canonical current writer shape regardless of a restored alias."""
     payload = checkpoint.to_json()
     payload["schema_version"] = SCHEMA_VERSION
+    if payload.get("last_model_invocation") is not None:
+        invocation = decode_model_invocation(payload["last_model_invocation"])
+        if not invocation.ok or invocation.value is None:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        payload["last_model_invocation"] = invocation.value.to_json()
     _validate_checkpoint_payload(payload)
     return payload
 
