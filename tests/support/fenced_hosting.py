@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Barrier, RLock
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.checkpoint import (
@@ -45,10 +45,7 @@ _FENCED_CAPABILITIES = StorageCapabilities(
 
 
 def _blob_projection(blobs: Mapping[str, bytes]) -> dict[str, str]:
-    return {
-        key: hashlib.sha256(value).hexdigest()
-        for key, value in sorted(blobs.items())
-    }
+    return {key: hashlib.sha256(value).hexdigest() for key, value in sorted(blobs.items())}
 
 
 def _record_digest(payload: dict[str, Any], blobs: Mapping[str, bytes] = {}) -> str:
@@ -64,12 +61,20 @@ class DeterministicFencedRunSink:
     _checkpoints: dict[tuple[str, int], tuple[str, CheckpointRecord]] = field(default_factory=dict)
     _checkpoint_heads: dict[str, int] = field(default_factory=dict)
     _events: dict[tuple[str, int], tuple[str, AgentEvent]] = field(default_factory=dict)
-    _invocations: dict[
-        tuple[str, str, int], tuple[str, ModelInvocationRecord]
-    ] = field(default_factory=dict)
+    _invocations: dict[tuple[str, str, int], tuple[str, ModelInvocationRecord]] = field(
+        default_factory=dict
+    )
     _invocation_heads: dict[tuple[str, str], int] = field(default_factory=dict)
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
     _blobs: dict[tuple[str, str], bytes] = field(default_factory=dict)
+    _checkpoint_load_faults: dict[
+        str,
+        Literal["corrupt", "unsupported_version"],
+    ] = field(default_factory=dict)
+    _invocation_load_faults: dict[
+        tuple[str, str],
+        Literal["corrupt", "unsupported_version"],
+    ] = field(default_factory=dict)
     _lock: Any = field(default_factory=RLock, repr=False)
 
     def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
@@ -85,8 +90,7 @@ class DeterministicFencedRunSink:
         workspace_references = {
             item["content_sha256"]
             for item in checkpoint.workspace_delta
-            if isinstance(item.get("content_sha256"), str)
-            and item["content_sha256"]
+            if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
         }
         return workspace_references | blob_shas_in_messages(tuple(checkpoint.messages))
 
@@ -127,8 +131,7 @@ class DeterministicFencedRunSink:
         blobs: Mapping[str, bytes],
     ) -> bool:
         return all(
-            self._blobs.get((run_id, sha256), value) == value
-            for sha256, value in blobs.items()
+            self._blobs.get((run_id, sha256), value) == value for sha256, value in blobs.items()
         )
 
     def _publish_blobs(self, run_id: str, blobs: Mapping[str, bytes]) -> None:
@@ -234,6 +237,18 @@ class DeterministicFencedRunSink:
             return CHECKPOINT_CODEC.missing().map(
                 lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
             )
+        fault = self._checkpoint_load_faults.get(run_id)
+        if fault == "corrupt":
+            return CHECKPOINT_CODEC.corrupt(
+                "injected authoritative checkpoint corruption",
+                observed_schema=CHECKPOINT_CODEC.current_schema,
+                sequence=head,
+            ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
+        if fault == "unsupported_version":
+            return CHECKPOINT_CODEC.unsupported(
+                f"monoid.{CHECKPOINT_CODEC.family}.v{CHECKPOINT_CODEC.current_version + 1}",
+                sequence=head,
+            ).map(lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint))
         record = self._checkpoints[(run_id, head)][1]
         return DurableLoadResult(
             status="loaded",
@@ -343,7 +358,9 @@ class DeterministicFencedRunSink:
             _blob_reader=self._blob_reader(invocation.run_id, blobs),
         )
         self._invocations[key] = (digest, record)
-        self._invocation_heads[(invocation.run_id, invocation.logical_call_id)] = invocation.revision
+        self._invocation_heads[(invocation.run_id, invocation.logical_call_id)] = (
+            invocation.revision
+        )
         return CommitResult(
             status="committed",
             sequence=invocation.revision,
@@ -414,8 +431,7 @@ class DeterministicFencedRunSink:
         return any(
             record.invocation.dispatch_id == invocation.dispatch_id
             for (run_id, logical_call_id, _), (_, record) in self._invocations.items()
-            if run_id == invocation.run_id
-            and logical_call_id == invocation.logical_call_id
+            if run_id == invocation.run_id and logical_call_id == invocation.logical_call_id
         )
 
     def load_invocation(
@@ -434,6 +450,21 @@ class DeterministicFencedRunSink:
         head = self._invocation_heads.get((run_id, logical_call_id))
         if head is None:
             return MODEL_INVOCATION_CODEC.missing()
+        fault = self._invocation_load_faults.get((run_id, logical_call_id))
+        if fault == "corrupt":
+            return MODEL_INVOCATION_CODEC.corrupt(
+                "injected authoritative model invocation corruption",
+                observed_schema=MODEL_INVOCATION_CODEC.current_schema,
+                sequence=head,
+            )
+        if fault == "unsupported_version":
+            return MODEL_INVOCATION_CODEC.unsupported(
+                (
+                    f"monoid.{MODEL_INVOCATION_CODEC.family}.v"
+                    f"{MODEL_INVOCATION_CODEC.current_version + 1}"
+                ),
+                sequence=head,
+            )
         record = self._invocations[(run_id, logical_call_id, head)][1]
         return DurableLoadResult(
             status="loaded",
@@ -478,6 +509,33 @@ class DeterministicFencedRunHarness:
         reopened = copy(self)
         reopened.sink = copy(self.sink)
         return reopened
+
+    def inject_authoritative_load_fault(
+        self,
+        record_family: Literal["checkpoint", "invocation"],
+        run_id: str,
+        status: Literal["corrupt", "unsupported_version"],
+        *,
+        logical_call_id: str = "",
+    ) -> None:
+        """Install a persistent decoder fault at an existing authoritative head."""
+
+        with self.sink._lock:
+            if status not in {"corrupt", "unsupported_version"}:
+                raise ValueError("load fault status is outside the conformance vocabulary")
+            if record_family == "checkpoint":
+                if run_id not in self.sink._checkpoint_heads:
+                    raise ValueError("checkpoint load fault requires an authoritative head")
+                self.sink._checkpoint_load_faults[run_id] = status
+                return
+            if record_family != "invocation":
+                raise ValueError("load fault record family is outside the conformance vocabulary")
+            if not logical_call_id:
+                raise ValueError("invocation load fault requires logical_call_id")
+            key = (run_id, logical_call_id)
+            if key not in self.sink._invocation_heads:
+                raise ValueError("invocation load fault requires an authoritative head")
+            self.sink._invocation_load_faults[key] = status
 
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         """Read a complete event through the shared durable backing."""

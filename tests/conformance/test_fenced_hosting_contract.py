@@ -1597,6 +1597,54 @@ def test_reusable_contract_commits_fresh_delayed_checkpoint_coordinates() -> Non
     assert observations["head_after_delayed_sequence"] == 2
 
 
+class _DiscardingDelayedCheckpointBlobsSink(DeterministicFencedRunSink):
+    _discard_delayed_blobs = False
+
+    def _publish_blobs(self, run_id: str, blobs: Mapping[str, bytes]) -> None:
+        if self._discard_delayed_blobs:
+            return
+        super()._publish_blobs(run_id, blobs)
+
+    def _commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        current_head = self._checkpoint_heads.get(checkpoint.run_id, -1)
+        self._discard_delayed_blobs = bool(blobs) and checkpoint.seq < current_head
+        try:
+            return super()._commit_checkpoint(
+                checkpoint,
+                blobs,
+                writer_token=writer_token,
+            )
+        finally:
+            self._discard_delayed_blobs = False
+
+
+def _discarding_delayed_checkpoint_blobs_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _DiscardingDelayedCheckpointBlobsSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_preserves_delayed_checkpoint_blobs() -> None:
+    outcomes = run_fenced_run_sink_contract(_discarding_delayed_checkpoint_blobs_factory)
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    observations = {item.observation_id: item.actual for item in checkpoint_rule.observations}
+
+    assert checkpoint_rule.status == "failed"
+    assert observations["delayed_checkpoint"] == "committed"
+    assert observations["delayed_checkpoint_retry"] == "already_committed"
+    assert observations["delayed_blob_reference_status"] == "conflict"
+
+
 class _RegressingInvocationHeadSink(DeterministicFencedRunSink):
     broken_revision = 0
 
@@ -2270,6 +2318,71 @@ def test_reusable_contract_checks_each_invalid_initial_invocation_coordinate(
     assert refusal_rule.status == "failed"
     assert coordinate_observation.expected == "conflict"
     assert coordinate_observation.actual == "committed"
+
+
+class _CollapsingAuthoritativeLoadFaultSink(DeterministicFencedRunSink):
+    collapsed_family = ""
+    collapsed_status = ""
+
+    def _collapse_target(self, loaded, record_family: str):
+        if self.collapsed_family == record_family and loaded.status == self.collapsed_status:
+            return replace(
+                loaded,
+                status="missing",
+                value=None,
+                observed_schema=None,
+                error_code="",
+                message="",
+                sequence=None,
+            )
+        return loaded
+
+    def latest_checked(self, run_id: str):
+        return self._collapse_target(super().latest_checked(run_id), "checkpoint")
+
+    def load_invocation(self, run_id: str, logical_call_id: str):
+        return self._collapse_target(
+            super().load_invocation(run_id, logical_call_id),
+            "invocation",
+        )
+
+
+def _collapsing_authoritative_load_fault_factory(record_family: str, status: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _CollapsingAuthoritativeLoadFaultSink(harness._writers)
+        sink.collapsed_family = record_family
+        sink.collapsed_status = status
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("record_family", ["checkpoint", "invocation"])
+@pytest.mark.parametrize("status", ["corrupt", "unsupported_version"])
+def test_reusable_contract_preserves_authoritative_load_failures(
+    record_family: str,
+    status: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _collapsing_authoritative_load_fault_factory(record_family, status)
+    )
+    rule_id = (
+        "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+        if record_family == "checkpoint"
+        else "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    durable_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    load_observation = next(
+        observation
+        for observation in durable_rule.observations
+        if observation.observation_id == f"authoritative_load_{status}"
+    )
+
+    assert durable_rule.status == "failed"
+    assert load_observation.expected == (status, True)
+    assert load_observation.actual == ("missing", True)
 
 
 class _CorruptingLoadedRecordSink(DeterministicFencedRunSink):
@@ -3160,6 +3273,21 @@ class _CloseTrackingHarness:
 
     def reopen(self):
         return _CloseTrackingHarness(self._tracker, self._inner.reopen())
+
+    def inject_authoritative_load_fault(
+        self,
+        record_family,
+        run_id,
+        status,
+        *,
+        logical_call_id="",
+    ) -> None:
+        self._inner.inject_authoritative_load_fault(
+            record_family,
+            run_id,
+            status,
+            logical_call_id=logical_call_id,
+        )
 
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         return self._inner.read_event(run_id, seq)

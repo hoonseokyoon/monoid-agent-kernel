@@ -462,6 +462,11 @@ Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확�
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 `reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+`inject_authoritative_load_fault(record_family, run_id, status, logical_call_id=...)`는 정상 commit으로
+만든 권위 head를 backend raw mutation 또는 동등한 decoder hook으로 `corrupt`나
+`unsupported_version` 상태로 바꾼다. Fault는 `reopen()` 뒤에도 유지된다. Contract는 checkpoint와
+invocation 두 family에서 두 상태와 value 부재를 모두 확인해 `missing`으로 축약하거나 손상된 값을
+노출하는 adapter를 거부한다.
 Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전체 canonical payload를 읽는다.
 Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
 `read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
@@ -1113,9 +1118,12 @@ owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff
 linearization winner와 일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두
 blob-bearing mutation에서 거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract
 harness registry는 probe
-전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
-낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는
-workspace·media·invocation의 malformed digest를 거부하고 external invocation result address를 허용한다.
+전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Checked load fault matrix는
+checkpoint·invocation과 corrupt·unsupported_version을 완전 교차한다. Delayed checkpoint는 fresh
+낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. 더 높은 checkpoint가
+빈 blob map으로 delayed digest를 재참조하고 재개방 뒤 bytes를 읽어 blob 권위 보존도 확인한다.
+Blob reference matrix는 workspace·media·invocation의 malformed digest를 거부하고 external invocation
+result address를 허용한다.
 Fence precedence는 existing coordinate의 동일 payload·conflicting payload·malformed blob map과 fresh
 coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를

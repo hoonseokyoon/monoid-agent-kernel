@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 from monoid_agent_kernel.conformance.report import (
@@ -153,6 +153,22 @@ class FencedRunSinkHarness(Protocol):
 
         ...
 
+    def inject_authoritative_load_fault(
+        self,
+        record_family: Literal["checkpoint", "invocation"],
+        run_id: str,
+        status: Literal["corrupt", "unsupported_version"],
+        *,
+        logical_call_id: str = "",
+    ) -> None:
+        """Replace an existing authoritative head with the requested durable read fault.
+
+        The injected fault survives ``reopen()``. Backend harnesses use a raw storage mutation or
+        an equivalent decoder hook so the sink's checked load path performs the classification.
+        """
+
+        ...
+
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         """Read one complete durable event through this facade's backing store."""
 
@@ -224,6 +240,21 @@ class _TrackedFencedRunSinkHarness:
 
     def reopen(self) -> FencedRunSinkHarness:
         return self._registry.track(self._inner.reopen())
+
+    def inject_authoritative_load_fault(
+        self,
+        record_family: Literal["checkpoint", "invocation"],
+        run_id: str,
+        status: Literal["corrupt", "unsupported_version"],
+        *,
+        logical_call_id: str = "",
+    ) -> None:
+        self._inner.inject_authoritative_load_fault(
+            record_family,
+            run_id,
+            status,
+            logical_call_id=logical_call_id,
+        )
 
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         return self._inner.read_event(run_id, seq)
@@ -1057,6 +1088,49 @@ def _contract_terminal_invocation_drift_status(
         {},
         writer_token=token,
     ).status
+
+
+def _contract_authoritative_load_fault_evidence(
+    factory: FencedRunSinkHarnessFactory,
+    namespace: str,
+    record_family: Literal["checkpoint", "invocation"],
+    status: Literal["corrupt", "unsupported_version"],
+) -> tuple[str, bool]:
+    harness = factory()
+    run_id = _contract_run_id(namespace, f"{record_family}-load-{status.replace('_', '-')}")
+    token = _contract_writer(harness, run_id)
+    logical_call_id = "call-1"
+    if record_family == "checkpoint":
+        setup = harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=run_id, seq=1, final_text="load-fault-seed"),
+            {},
+            writer_token=token,
+        )
+    else:
+        setup = harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                logical_call_id=logical_call_id,
+                revision=1,
+                dispatch_state="reserved",
+            ),
+            {},
+            writer_token=token,
+        )
+    if setup.status != "committed":
+        return f"setup:{setup.status}", False
+    harness.inject_authoritative_load_fault(
+        record_family,
+        run_id,
+        status,
+        logical_call_id=logical_call_id,
+    )
+    reopened = harness.reopen()
+    if record_family == "checkpoint":
+        loaded = reopened.sink.latest_checked(run_id)
+    else:
+        loaded = reopened.sink.load_invocation(run_id, logical_call_id)
+    return loaded.status, loaded.value is None
 
 
 def _contract_first_invocation_state_status(
@@ -1973,6 +2047,38 @@ def _run_fenced_run_sink_contract(
             writer_token=monotonic_token,
         )
         head_after_delayed = monotonic_harness.sink.latest_checked(monotonic_run_id)
+        delayed_blob_reference = monotonic_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=monotonic_run_id,
+                seq=3,
+                final_text="delayed-blob-reference",
+                workspace_delta=[
+                    {
+                        "path": "reused-delayed-checkpoint.txt",
+                        "kind": "file",
+                        "change_kind": "created",
+                        "content_sha256": _CONTRACT_ALTERNATE_BLOB_SHA256,
+                    }
+                ],
+            ),
+            {},
+            writer_token=monotonic_token,
+        )
+        monotonic_harness = monotonic_harness.reopen()
+        delayed_blob_reference_load = monotonic_harness.sink.latest_checked(monotonic_run_id)
+        delayed_blob_reference_bytes = _contract_blob_hex(
+            delayed_blob_reference_load.value,
+            _CONTRACT_ALTERNATE_BLOB_SHA256,
+        )
+        checkpoint_load_fault_evidence = {
+            status: _contract_authoritative_load_fault_evidence(
+                factory,
+                namespace,
+                "checkpoint",
+                status,
+            )
+            for status in ("corrupt", "unsupported_version")
+        }
         outcomes.append(
             outcome_from_observations(
                 "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
@@ -2217,6 +2323,29 @@ def _run_fenced_run_sink_contract(
                             if head_after_delayed.value
                             else None
                         ),
+                    ),
+                    observation(
+                        "delayed_blob_reference_status",
+                        expected="committed",
+                        actual=delayed_blob_reference.status,
+                    ),
+                    observation(
+                        "delayed_blob_reference_head",
+                        expected=3,
+                        actual=delayed_blob_reference_load.sequence,
+                    ),
+                    observation(
+                        "delayed_blob_reference_bytes",
+                        expected=_CONTRACT_ALTERNATE_BLOB.hex(),
+                        actual=delayed_blob_reference_bytes,
+                    ),
+                    *(
+                        observation(
+                            f"authoritative_load_{status}",
+                            expected=(status, True),
+                            actual=actual,
+                        )
+                        for status, actual in checkpoint_load_fault_evidence.items()
                     ),
                 ),
             )
@@ -3528,6 +3657,15 @@ def _run_fenced_run_sink_contract(
             run_id,
             "call-missing",
         )
+        invocation_load_fault_evidence = {
+            status: _contract_authoritative_load_fault_evidence(
+                factory,
+                namespace,
+                "invocation",
+                status,
+            )
+            for status in ("corrupt", "unsupported_version")
+        }
         outcomes.append(
             outcome_from_observations(
                 "FENCED-04-INVOCATION-LIFECYCLE",
@@ -3896,6 +4034,14 @@ def _run_fenced_run_sink_contract(
                         "missing_logical_call_value_absent",
                         expected=True,
                         actual=missing_logical_call.value is None,
+                    ),
+                    *(
+                        observation(
+                            f"authoritative_load_{status}",
+                            expected=(status, True),
+                            actual=actual,
+                        )
+                        for status, actual in invocation_load_fault_evidence.items()
                     ),
                 ),
             )
