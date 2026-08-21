@@ -115,6 +115,7 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
 _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset({"schema_version", "digest_generation"})
 _CONTRACT_RETRY_STABLE_IDENTITY_FIELDS = frozenset({"idempotency_key", "request_digest"})
 _CONTRACT_QUEUED_MEDIA_CARRIERS = ("content_list", "envelope")
+_CONTRACT_RECEIPT_RETRYABILITY_STATES = ("true", "false", "omitted")
 _CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
     {
         "schema_version",
@@ -1488,6 +1489,56 @@ def _contract_invocation_identity_status(
         blobs,
         writer_token=token,
     ).status
+
+
+def _contract_receipt_retryability_identity_evidence(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    *,
+    winner_state: str,
+    candidate_state: str,
+) -> tuple[str, tuple[str, str | None]]:
+    retryability_values = {
+        "true": True,
+        "false": False,
+        "omitted": None,
+    }
+    if tuple(retryability_values) != _CONTRACT_RECEIPT_RETRYABILITY_STATES:
+        raise AssertionError("receipt retryability state matrix is incomplete")
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    setup = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+    )
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in setup
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return "", (f"setup:{','.join(setup_statuses)}", None)
+    winner = _contract_invocation(
+        run_id,
+        revision=3,
+        dispatch_state="settled",
+        retryable=retryability_values[winner_state],
+    )
+    first = harness.sink.commit_invocation(winner, {}, writer_token=token)
+    if first.status != "committed":
+        return "", (f"setup:{first.status}", None)
+    harness = harness.reopen()
+    candidate = _contract_invocation(
+        run_id,
+        revision=3,
+        dispatch_state="settled",
+        retryable=retryability_values[candidate_state],
+    )
+    conflict = harness.sink.commit_invocation(candidate, {}, writer_token=token)
+    harness = harness.reopen()
+    loaded = harness.sink.load_invocation(run_id, "call-1")
+    winner_digest = canonical_sha256(winner.to_json())
+    loaded_digest = canonical_sha256(loaded.value.invocation.to_json()) if loaded.value else None
+    return winner_digest, (conflict.status, loaded_digest)
 
 
 def _contract_invocation_canonical_alias_status(
@@ -3456,6 +3507,22 @@ def _run_fenced_run_sink_contract(
             )
             for field_name in sorted(_CONTRACT_INVOCATION_IDENTITY_FIELDS)
         }
+        receipt_retryability_identity_results = {
+            (winner_state, candidate_state): (
+                _contract_receipt_retryability_identity_evidence(
+                    factory,
+                    _contract_run_id(
+                        namespace,
+                        (f"invocation-receipt-retryability-{winner_state}-to-{candidate_state}"),
+                    ),
+                    winner_state=winner_state,
+                    candidate_state=candidate_state,
+                )
+            )
+            for winner_state in _CONTRACT_RECEIPT_RETRYABILITY_STATES
+            for candidate_state in _CONTRACT_RECEIPT_RETRYABILITY_STATES
+            if winner_state != candidate_state
+        }
         invocation_canonical_alias_statuses = {
             (field_name, direction): _contract_invocation_canonical_alias_status(
                 factory,
@@ -3959,6 +4026,21 @@ def _run_fenced_run_sink_contract(
                     "provider_request_id": "historical-provider-request",
                 },
             ),
+            "revision_3_retryable_false": replace(
+                settled_failure_invocation,
+                receipt={
+                    **dict(settled_failure_invocation.receipt or {}),
+                    "retryable": False,
+                },
+            ),
+            "revision_3_retryable_omitted": replace(
+                settled_failure_invocation,
+                receipt={
+                    key: value
+                    for key, value in dict(settled_failure_invocation.receipt or {}).items()
+                    if key != "retryable"
+                },
+            ),
             "revision_3_failure_code": replace(
                 settled_failure_invocation,
                 failure_code="historical_provider_refused",
@@ -4107,6 +4189,16 @@ def _run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for field_name, status in invocation_identity_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            (f"receipt_retryability_identity_{winner_state}_to_{candidate_state}"),
+                            expected=("conflict", evidence[0]),
+                            actual=evidence[1],
+                        )
+                        for (winner_state, candidate_state), evidence in (
+                            receipt_retryability_identity_results.items()
+                        )
                     ),
                     *(
                         observation(

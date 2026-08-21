@@ -638,6 +638,8 @@ state regression, settled success 뒤 새 attempt는 `conflict`다. Successful s
 Settled failure receipt에서 `retryable` 필드가 생략되면 재시도 근거가 없다. Contract는 명시적인
 `retryable=false`, 필드 생략, `retryable=true`를 별도 상태로 검증하며 마지막 경우만 다음 paid
 dispatch reservation을 허용한다.
+세 retryability 상태는 receipt content identity에서도 서로 다르다. 같은 revision의 세 상태를 모든
+6개 방향으로 비교해 `conflict`를 요구하고, 재개방한 canonical payload가 원래 winner인지 확인한다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
 유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 dispatch identity가 다른 retry를
@@ -1153,13 +1155,16 @@ Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함�
 검증한다.
 Historical invocation revision 1·2·3은 exact retry와 dispatch-identity conflict를 모두 비교한다.
 Historical settled revision은 receipt-only·failure-code-only conflict도 비교하고 latest head 4를
-유지한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
+유지한다. Historical receipt conflict에는 `retryable=true` winner에 대한 false·필드 생략 후보도
+포함한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
 Invocation terminal edge identity는 settled·unknown과 네 stable identity field를 완전 교차한다.
 Terminal retry 행렬은 settled failure의 `retryable=false`·필드 생략·`retryable=true`를 구분하고,
 명시적인 true만 새 reservation을 허용한다. Run 격리 행렬은 checkpoint·event·invocation·terminal
 네 family의 서로 다른 non-key payload를 재개방 후 각각 완전 비교한다.
 Retry reservation identity 행렬은 새 dispatch coordinate에서 `idempotency_key`와 `request_digest`
 drift를 각각 거부한다.
+Receipt identity 행렬은 `retryable=true | false | omitted`의 모든 directed pair를 conflict로 거부하고
+각 conflict 뒤 원래 winner payload를 재로딩한다.
 
 ### 14.6 최종 통합 PR
 

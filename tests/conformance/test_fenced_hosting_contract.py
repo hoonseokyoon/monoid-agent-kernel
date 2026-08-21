@@ -1998,6 +1998,8 @@ def test_reusable_contract_compares_every_historical_invocation_payload() -> Non
             for revision in (1, 2, 3)
         },
         "old_revision_3_receipt_conflict_and_head": ("already_committed", 4),
+        "old_revision_3_retryable_false_conflict_and_head": ("already_committed", 4),
+        "old_revision_3_retryable_omitted_conflict_and_head": ("already_committed", 4),
         "old_revision_3_failure_code_conflict_and_head": ("already_committed", 4),
     }
 
@@ -2057,6 +2059,124 @@ def test_reusable_contract_compares_valid_historical_settlement_evidence() -> No
         "old_revision_3_receipt_conflict_and_head": ("already_committed", 4),
         "old_revision_3_failure_code_conflict_and_head": ("already_committed", 4),
     }
+
+
+def _differs_only_in_receipt_retryability(
+    winner: DurableModelInvocation,
+    candidate: DurableModelInvocation,
+) -> bool:
+    winner_payload = winner.to_json()
+    candidate_payload = candidate.to_json()
+    winner_receipt = dict(winner_payload.pop("receipt") or {})
+    candidate_receipt = dict(candidate_payload.pop("receipt") or {})
+    winner_state = winner_receipt.pop("retryable", None)
+    candidate_state = candidate_receipt.pop("retryable", None)
+    winner_present = "retryable" in (winner.receipt or {})
+    candidate_present = "retryable" in (candidate.receipt or {})
+    return (
+        winner_payload == candidate_payload
+        and winner_receipt == candidate_receipt
+        and (winner_present, winner_state) != (candidate_present, candidate_state)
+    )
+
+
+class _IgnoringReceiptRetryabilitySink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if stored is not None:
+            winner = stored[1].invocation
+            if _differs_only_in_receipt_retryability(winner, invocation):
+                receipt = dict(invocation.receipt or {})
+                if winner.receipt is not None and "retryable" in winner.receipt:
+                    receipt["retryable"] = winner.receipt["retryable"]
+                else:
+                    receipt.pop("retryable", None)
+                invocation = replace(invocation, receipt=receipt)
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+class _OverwritingReceiptRetryabilityConflictSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        overwrites_winner = stored is not None and _differs_only_in_receipt_retryability(
+            stored[1].invocation,
+            invocation,
+        )
+        result = super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+        if result.status == "conflict" and overwrites_winner:
+            winner_digest, record = self._invocations[key]
+            self._invocations[key] = (
+                winner_digest,
+                replace(record, invocation=invocation),
+            )
+        return result
+
+
+def _ignoring_receipt_retryability_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _IgnoringReceiptRetryabilitySink(harness._writers)
+    return harness
+
+
+def _overwriting_receipt_retryability_conflict_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _OverwritingReceiptRetryabilityConflictSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_includes_retryability_in_receipt_identity() -> None:
+    outcomes = run_fenced_run_sink_contract(_ignoring_receipt_retryability_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = [
+        item
+        for item in lifecycle_rule.observations
+        if item.observation_id.startswith("receipt_retryability_identity_")
+    ]
+
+    assert lifecycle_rule.status == "failed"
+    assert len(observations) == 6
+    assert all(item.actual[0] == "already_committed" for item in observations)
+
+
+def test_reusable_contract_preserves_receipt_winner_after_conflict() -> None:
+    outcomes = run_fenced_run_sink_contract(_overwriting_receipt_retryability_conflict_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = [
+        item
+        for item in lifecycle_rule.observations
+        if item.observation_id.startswith("receipt_retryability_identity_")
+    ]
+
+    assert lifecycle_rule.status == "failed"
+    assert len(observations) == 6
+    assert all(item.actual[0] == "conflict" for item in observations)
+    assert all(item.actual[1] != item.expected[1] for item in observations)
 
 
 class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
