@@ -66,7 +66,11 @@ class CommitResult:
 
 
 class FencedCheckpointStore(Protocol):
-    """Shared checkpoint store whose mutation rejects stale host writers."""
+    """Shared checkpoint store whose mutation rejects stale host writers.
+
+    Every mutation validates the token's run binding before owner, generation, idempotency, or
+    content. A token issued for another run always returns ``fenced``.
+    """
 
     @property
     def capabilities(self) -> StorageCapabilities: ...
@@ -83,7 +87,7 @@ class FencedCheckpointStore(Protocol):
 
 
 class FencedRunSink(FencedCheckpointStore, Protocol):
-    """Composite authoritative journal for checkpoints, invocations, events, and terminal state."""
+    """Composite authoritative journal protected by the inherited run-bound fence."""
 
     def load_invocation(
         self,

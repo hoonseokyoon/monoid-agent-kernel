@@ -567,14 +567,40 @@ def run_fenced_run_sink_contract(
         harness = factory()
         run_a_token = harness.claim_writer("contract-run-a", "owner-a")
         run_b_token = harness.claim_writer("contract-run-b", "owner-a")
-        swapped = harness.sink.commit_checkpoint(
-            RunCheckpoint(run_id="contract-run-b", seq=1),
+        checkpoint = RunCheckpoint(run_id="contract-run-b", seq=1)
+        event = _contract_event("contract-run-b", seq=1)
+        invocation = _contract_invocation(
+            "contract-run-b", revision=1, dispatch_state="reserved"
+        )
+        terminal = _contract_terminal("contract-run-b")
+        swapped_checkpoint = harness.sink.commit_checkpoint(
+            checkpoint,
             {},
             writer_token=run_a_token,
         )
-        authorized = harness.sink.commit_checkpoint(
-            RunCheckpoint(run_id="contract-run-b", seq=1),
+        swapped_event = harness.sink.append_event(event, writer_token=run_a_token)
+        swapped_invocation = harness.sink.commit_invocation(
+            invocation,
             {},
+            writer_token=run_a_token,
+        )
+        swapped_terminal = harness.sink.settle_terminal(
+            terminal,
+            writer_token=run_a_token,
+        )
+        authorized_checkpoint = harness.sink.commit_checkpoint(
+            checkpoint,
+            {},
+            writer_token=run_b_token,
+        )
+        authorized_event = harness.sink.append_event(event, writer_token=run_b_token)
+        authorized_invocation = harness.sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=run_b_token,
+        )
+        authorized_terminal = harness.sink.settle_terminal(
+            terminal,
             writer_token=run_b_token,
         )
         outcomes.append(
@@ -593,10 +619,42 @@ def run_fenced_run_sink_contract(
                         actual=run_a_token.generation,
                     ),
                     observation(
-                        "cross_run_token", expected="fenced", actual=swapped.status
+                        "cross_run_checkpoint",
+                        expected="fenced",
+                        actual=swapped_checkpoint.status,
                     ),
                     observation(
-                        "run_bound_token", expected="committed", actual=authorized.status
+                        "cross_run_event", expected="fenced", actual=swapped_event.status
+                    ),
+                    observation(
+                        "cross_run_invocation",
+                        expected="fenced",
+                        actual=swapped_invocation.status,
+                    ),
+                    observation(
+                        "cross_run_terminal",
+                        expected="fenced",
+                        actual=swapped_terminal.status,
+                    ),
+                    observation(
+                        "run_bound_checkpoint",
+                        expected="committed",
+                        actual=authorized_checkpoint.status,
+                    ),
+                    observation(
+                        "run_bound_event",
+                        expected="committed",
+                        actual=authorized_event.status,
+                    ),
+                    observation(
+                        "run_bound_invocation",
+                        expected="committed",
+                        actual=authorized_invocation.status,
+                    ),
+                    observation(
+                        "run_bound_terminal",
+                        expected="committed",
+                        actual=authorized_terminal.status,
                     ),
                 ),
             )

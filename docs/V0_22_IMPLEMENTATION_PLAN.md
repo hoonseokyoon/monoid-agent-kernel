@@ -448,7 +448,7 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
 
 모든 mutation은 다음 순서로 판정한다.
 
-1. writer token을 현재 owner/generation과 비교한다.
+1. writer token의 run binding을 target run과 비교한 뒤 현재 owner/generation과 비교한다.
 2. stale token이면 `fenced`를 반환하고 아무 mutation도 수행하지 않는다.
 3. 같은 resource key와 같은 canonical content면 `already_committed`를 반환한다.
 4. 같은 resource key와 다른 content면 `conflict`를 반환한다.
