@@ -373,6 +373,7 @@ Package root와 `monoid_agent_kernel.contracts`는 hosting type을 re-export하�
 ```python
 @dataclass(frozen=True)
 class WriterToken:
+    run_id: str
     owner_id: str
     generation: int
 
@@ -397,8 +398,9 @@ class StorageCapabilities:
     cross_process_notify: bool = False
 ```
 
-`WriterToken`은 credential이 아니다. Host의 owner ID와 monotonic lease epoch를 운반한다. 만료와
-현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다.
+`WriterToken`은 credential이 아니다. Run ID, host owner ID, monotonic lease epoch를 함께
+운반한다. Run binding은 같은 owner와 generation으로 발급된 다른 run의 token 교환을 막는다.
+만료와 현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다.
 
 ### 6.2 Protocol shape
 

@@ -5,6 +5,7 @@ from typing import get_type_hints
 
 import pytest
 
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.model_invocation import (
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
@@ -57,7 +58,13 @@ def _invocation(
 @pytest.mark.parametrize("owner_id", ["", "owner id", "owner?secret", "x" * 257, 7])
 def test_writer_token_rejects_nonportable_owner(owner_id: object) -> None:
     with pytest.raises(ValueError, match="owner_id"):
-        WriterToken(owner_id=owner_id, generation=1)  # type: ignore[arg-type]
+        WriterToken(run_id="run-1", owner_id=owner_id, generation=1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("run_id", ["", "run id", "run?secret", "x" * 257, 7])
+def test_writer_token_rejects_nonportable_run_id(run_id: object) -> None:
+    with pytest.raises(ValueError, match="run_id"):
+        WriterToken(run_id=run_id, owner_id="owner-a", generation=1)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -66,7 +73,7 @@ def test_writer_token_rejects_nonportable_owner(owner_id: object) -> None:
 )
 def test_writer_token_requires_positive_portable_generation(generation: object) -> None:
     with pytest.raises(ValueError, match="generation"):
-        WriterToken(owner_id="owner-a", generation=generation)  # type: ignore[arg-type]
+        WriterToken(run_id="run-1", owner_id="owner-a", generation=generation)  # type: ignore[arg-type]
 
 
 def test_storage_capabilities_are_closed_exact_booleans() -> None:
@@ -138,6 +145,14 @@ def test_public_protocol_annotations_resolve_at_runtime() -> None:
     assert checkpoint_hints["return"] is CommitResult
     assert invocation_hints["writer_token"] is WriterToken
     assert invocation_hints["return"] is CommitResult
+
+
+def test_local_fs_capability_annotation_resolves_at_runtime() -> None:
+    from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+    hints = get_type_hints(LocalFsCheckpointStore.capabilities.fget)  # type: ignore[arg-type]
+
+    assert hints["return"] is StorageCapabilities
 
 
 def _commit_through_settled(
@@ -277,3 +292,21 @@ def test_stale_invocation_retry_is_fenced_before_content_comparison() -> None:
     assert first.status == "committed"
     assert fenced == CommitResult(status="fenced")
     assert current_repeat.status == "already_committed"
+
+
+def test_writer_token_cannot_cross_run_boundary() -> None:
+    harness = DeterministicFencedRunHarness()
+    run_a_token = harness.claim_writer("run-a", "owner-a")
+    run_b_token = harness.claim_writer("run-b", "owner-a")
+
+    assert run_a_token.owner_id == run_b_token.owner_id
+    assert run_a_token.generation == run_b_token.generation
+    assert run_a_token.run_id != run_b_token.run_id
+    assert (
+        harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id="run-b", seq=1),
+            {},
+            writer_token=run_a_token,
+        ).status
+        == "fenced"
+    )

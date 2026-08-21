@@ -562,6 +562,53 @@ def run_fenced_run_sink_contract(
                 exc,
             )
         )
+
+    try:
+        harness = factory()
+        run_a_token = harness.claim_writer("contract-run-a", "owner-a")
+        run_b_token = harness.claim_writer("contract-run-b", "owner-a")
+        swapped = harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id="contract-run-b", seq=1),
+            {},
+            writer_token=run_a_token,
+        )
+        authorized = harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id="contract-run-b", seq=1),
+            {},
+            writer_token=run_b_token,
+        )
+        outcomes.append(
+            outcome_from_observations(
+                "FENCED-06-WRITER-TOKEN-RUN-BINDING",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                (
+                    observation(
+                        "setup_equal_owner",
+                        expected=run_b_token.owner_id,
+                        actual=run_a_token.owner_id,
+                    ),
+                    observation(
+                        "setup_equal_generation",
+                        expected=run_b_token.generation,
+                        actual=run_a_token.generation,
+                    ),
+                    observation(
+                        "cross_run_token", expected="fenced", actual=swapped.status
+                    ),
+                    observation(
+                        "run_bound_token", expected="committed", actual=authorized.status
+                    ),
+                ),
+            )
+        )
+    except Exception as exc:
+        outcomes.append(
+            _error(
+                "FENCED-06-WRITER-TOKEN-RUN-BINDING",
+                FENCED_RUN_SINK_CONTRACT_PROFILE,
+                exc,
+            )
+        )
     return tuple(outcomes)
 
 

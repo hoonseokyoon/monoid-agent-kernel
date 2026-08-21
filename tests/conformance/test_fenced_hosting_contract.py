@@ -13,5 +13,6 @@ def test_deterministic_fenced_sink_passes_reusable_contract() -> None:
         "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
         "FENCED-04-INVOCATION-LIFECYCLE",
         "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
+        "FENCED-06-WRITER-TOKEN-RUN-BINDING",
     ]
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes

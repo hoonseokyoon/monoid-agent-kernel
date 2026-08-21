@@ -61,7 +61,7 @@ class DeterministicFencedRunSink:
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
 
     def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
-        return self.current_writers.get(run_id) == writer_token
+        return writer_token.run_id == run_id and self.current_writers.get(run_id) == writer_token
 
     @staticmethod
     def _stored_result(
@@ -302,6 +302,6 @@ class DeterministicFencedRunHarness:
     def claim_writer(self, run_id: str, owner_id: str) -> WriterToken:
         generation = self._generations.get(run_id, 0) + 1
         self._generations[run_id] = generation
-        token = WriterToken(owner_id=owner_id, generation=generation)
+        token = WriterToken(run_id=run_id, owner_id=owner_id, generation=generation)
         self._writers[run_id] = token
         return token

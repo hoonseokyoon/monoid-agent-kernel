@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Literal, Protocol, get_args
 
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, RunCheckpoint
@@ -14,6 +14,7 @@ from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.core.model_io import is_recorded_digest
 from monoid_agent_kernel.core.outcome import TerminalOutcome
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
+from monoid_agent_kernel.core._storage_capabilities import StorageCapabilities
 
 
 _CommitStatus = Literal["committed", "already_committed", "conflict", "fenced"]
@@ -27,10 +28,13 @@ class WriterToken:
     state inside each mutation.
     """
 
+    run_id: str
     owner_id: str
     generation: int
 
     def __post_init__(self) -> None:
+        if not is_safe_opaque_id(self.run_id):
+            raise ValueError("writer token run_id must be a bounded opaque id")
         if not is_safe_opaque_id(self.owner_id):
             raise ValueError("writer token owner_id must be a bounded opaque id")
         if not is_portable_json_integer(self.generation) or self.generation < 1:
@@ -59,27 +63,6 @@ class CommitResult:
                 raise ValueError(
                     f"commit result {field_name} must be empty or a lowercase SHA-256 digest"
                 )
-
-
-@dataclass(frozen=True, kw_only=True)
-class StorageCapabilities:
-    """Fail-closed declaration of the guarantees a storage adapter actually provides."""
-
-    single_writer: bool = False
-    concurrent_writers: bool = False
-    compare_and_set: bool = False
-    lease_fencing: bool = False
-    durable_checkpoints: bool = False
-    durable_events: bool = False
-    durable_invocations: bool = False
-    terminal_first_writer_wins: bool = False
-    transactional_outbox: bool = False
-    cross_process_notify: bool = False
-
-    def __post_init__(self) -> None:
-        for declared_field in fields(self):
-            if type(getattr(self, declared_field.name)) is not bool:
-                raise ValueError(f"storage capability {declared_field.name} must be a boolean")
 
 
 class FencedCheckpointStore(Protocol):

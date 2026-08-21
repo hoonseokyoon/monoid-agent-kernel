@@ -611,7 +611,11 @@ def test_root_import_keeps_reference_and_optional_providers_lazy() -> None:
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     code = """
 import sys
+import typing
 import monoid_agent_kernel
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+typing.get_type_hints(LocalFsCheckpointStore.capabilities.fget)
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
