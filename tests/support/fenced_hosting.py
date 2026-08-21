@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from dataclasses import dataclass, field
-from threading import RLock
-from typing import Any
+from threading import Barrier, RLock
+from typing import Any, Callable
 
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.checkpoint import (
@@ -373,11 +374,12 @@ class DeterministicFencedRunHarness:
     def set_current_writer(self, writer_token: WriterToken) -> None:
         """Install an exact authoritative token for deterministic contract setup."""
 
-        current = self._writers.get(writer_token.run_id)
-        if current is not None and writer_token.generation <= current.generation:
-            raise ValueError("writer generation must advance within a run")
-        self._generations[writer_token.run_id] = writer_token.generation
-        self._writers[writer_token.run_id] = writer_token
+        with self.sink._lock:
+            current = self._writers.get(writer_token.run_id)
+            if current is not None and writer_token.generation <= current.generation:
+                raise ValueError("writer generation must advance within a run")
+            self._generations[writer_token.run_id] = writer_token.generation
+            self._writers[writer_token.run_id] = writer_token
 
     def reopen(self) -> DeterministicFencedRunHarness:
         """Return fresh host and sink facades sharing the same simulated durable backing."""
@@ -385,3 +387,40 @@ class DeterministicFencedRunHarness:
         reopened = copy(self)
         reopened.sink = copy(self.sink)
         return reopened
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write: Callable[[DeterministicFencedRunSink, WriterToken], CommitResult],
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        """Race one stale write against rotation through the fake's shared atomic lock."""
+
+        del mutation
+        barrier = Barrier(3)
+        linearization: list[str] = []
+
+        def stale_write() -> CommitResult:
+            barrier.wait(timeout=10)
+            with self.sink._lock:
+                result = write(self.sink, stale_token)
+                linearization.append("write")
+                return result
+
+        def rotate() -> None:
+            barrier.wait(timeout=10)
+            with self.sink._lock:
+                self.set_current_writer(current_token)
+                linearization.append("rotation")
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fenced-handoff") as executor:
+            stale_future = executor.submit(stale_write)
+            rotation_future = executor.submit(rotate)
+            barrier.wait(timeout=10)
+            stale_result = stale_future.result(timeout=10)
+            rotation_future.result(timeout=10)
+
+        rotation_first = linearization[0] == "rotation"
+        current_result = write(self.sink, current_token)
+        return stale_result, current_result, rotation_first

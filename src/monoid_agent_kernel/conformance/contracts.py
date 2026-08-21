@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from threading import Barrier
 from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 from monoid_agent_kernel.conformance.report import (
     ConformanceRuleOutcome,
@@ -97,6 +98,22 @@ class FencedRunSinkHarness(Protocol):
 
     def reopen(self) -> FencedRunSinkHarness:
         """Open a fresh sink facade over the same durable backing store and host authority."""
+
+        ...
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write: Callable[[FencedRunSink, WriterToken], CommitResult],
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        """Race a real mutation against authority rotation on one backing store.
+
+        The boolean is true exactly when rotation becomes authoritative before the stale mutation's
+        publication point. Implementations coordinate the adapter and lease store with barriers or
+        test hooks; they do not infer this ordering from the returned commit status.
+        """
 
         ...
 
@@ -258,12 +275,14 @@ def _contract_invocation(
     dispatch_attempt: int = 1,
     dispatch_id: str = "dispatch-1",
     dispatch_state: str,
-    idempotency_key: str = "contract-idempotency-key",
+    idempotency_key: str | None = None,
     request_digest: str = "a" * 64,
     digest_generation: str = MODEL_REQUEST_DIGEST_GENERATION,
     retryable: bool = False,
     succeeded: bool = False,
 ) -> DurableModelInvocation:
+    if idempotency_key is None:
+        idempotency_key = f"contract-{hashlib.sha256(run_id.encode()).hexdigest()}"
     receipt = None
     result_ref = ""
     failure_code = ""
@@ -299,6 +318,10 @@ def _contract_writer(
     token = WriterToken(run_id=run_id, owner_id=owner_id, generation=generation)
     harness.set_current_writer(token)
     return token
+
+
+def _contract_run_id(namespace: str, suffix: str) -> str:
+    return f"{namespace}-{suffix}"
 
 
 def _contract_blob_hex(record: Any | None, sha256: str) -> str | None:
@@ -360,12 +383,48 @@ def _contract_race_write(
     return sink.settle_terminal(value, writer_token=writer_token)
 
 
+def _contract_handoff_write(
+    sink: FencedRunSink,
+    writer_token: WriterToken,
+    *,
+    mutation: str,
+    value: Any,
+) -> CommitResult:
+    return _contract_race_write(
+        sink,
+        mutation=mutation,
+        value=value,
+        writer_token=writer_token,
+    )
+
+
+def _contract_competing_values(mutation: str, run_id: str) -> tuple[Any, Any]:
+    if mutation == "checkpoint":
+        return (
+            RunCheckpoint(run_id=run_id, seq=1, final_text="left"),
+            RunCheckpoint(run_id=run_id, seq=1, final_text="right"),
+        )
+    if mutation == "event":
+        return _contract_event(run_id, seq=1), _contract_event(run_id, seq=1, level="warning")
+    if mutation == "invocation":
+        return (
+            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+            _contract_invocation(
+                run_id,
+                revision=1,
+                dispatch_state="reserved",
+                dispatch_id="dispatch-racer",
+            ),
+        )
+    return _contract_terminal(run_id), _contract_terminal(run_id, failed=True)
+
+
 def _contract_invocation_drift_status(
     factory: FencedRunSinkHarnessFactory,
+    run_id: str,
     field_name: str,
     field_value: Any,
 ) -> str:
-    run_id = f"contract-invocation-drift-{field_name.replace('_', '-')}"
     harness = factory()
     token = _contract_writer(harness, run_id)
     first = harness.sink.commit_invocation(
@@ -434,6 +493,7 @@ def run_fenced_run_sink_contract(
     """Execute backend-neutral fencing, conflict, terminal, and invocation invariants."""
 
     outcomes: list[ConformanceRuleOutcome] = []
+    namespace = f"contract-{uuid4().hex}"
     try:
         harness = factory()
         capabilities = harness.sink.capabilities
@@ -471,7 +531,7 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_id = "contract-checkpoint"
+        run_id = _contract_run_id(namespace, "checkpoint")
         token = _contract_writer(harness, run_id)
         missing = harness.sink.latest_checked(run_id)
         checkpoint = RunCheckpoint(
@@ -522,7 +582,7 @@ def run_fenced_run_sink_contract(
         loaded = harness.sink.latest_checked(run_id)
 
         monotonic_harness = factory()
-        monotonic_run_id = "contract-checkpoint-monotonic"
+        monotonic_run_id = _contract_run_id(namespace, "checkpoint-monotonic")
         monotonic_token = _contract_writer(monotonic_harness, monotonic_run_id)
         newer = monotonic_harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=monotonic_run_id, seq=2, final_text="newer"),
@@ -623,7 +683,7 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_id = "contract-fence-first"
+        run_id = _contract_run_id(namespace, "fence-first")
         stale = _contract_writer(harness, run_id)
         checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
         event = _contract_event(run_id, seq=1)
@@ -664,7 +724,7 @@ def run_fenced_run_sink_contract(
         current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
 
         fresh_harness = factory()
-        fresh_run_id = "contract-stale-new"
+        fresh_run_id = _contract_run_id(namespace, "stale-new")
         fresh_stale = _contract_writer(fresh_harness, fresh_run_id)
         fresh_current = _contract_writer(
             fresh_harness,
@@ -716,6 +776,42 @@ def run_fenced_run_sink_contract(
             fresh_terminal,
             writer_token=fresh_current,
         )
+        handoff_observations = []
+        for mutation in ("checkpoint", "event", "invocation", "terminal"):
+            handoff_harness = factory()
+            handoff_run_id = _contract_run_id(namespace, f"handoff-{mutation}")
+            handoff_stale = _contract_writer(handoff_harness, handoff_run_id)
+            handoff_current = WriterToken(
+                run_id=handoff_run_id,
+                owner_id="owner-b",
+                generation=2,
+            )
+            handoff_value, _ = _contract_competing_values(mutation, handoff_run_id)
+            handoff_write = partial(
+                _contract_handoff_write,
+                mutation=mutation,
+                value=handoff_value,
+            )
+            stale_result, current_result, rotation_first = (
+                handoff_harness.race_writer_handoff(
+                    mutation,
+                    handoff_stale,
+                    handoff_current,
+                    handoff_write,
+                )
+            )
+            expected_statuses = (
+                ("fenced", "committed")
+                if rotation_first
+                else ("committed", "already_committed")
+            )
+            handoff_observations.append(
+                observation(
+                    f"handoff_{mutation}_linearization",
+                    expected=expected_statuses,
+                    actual=(stale_result.status, current_result.status),
+                )
+            )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
@@ -805,6 +901,7 @@ def run_fenced_run_sink_contract(
                         expected="committed",
                         actual=current_after_stale_terminal.status,
                     ),
+                    *handoff_observations,
                 ),
             )
         )
@@ -819,7 +916,7 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_id = "contract-terminal"
+        run_id = _contract_run_id(namespace, "terminal")
         token = _contract_writer(harness, run_id)
         event = _contract_event(run_id, seq=1)
         first_event = harness.sink.append_event(event, writer_token=token)
@@ -838,27 +935,9 @@ def run_fenced_run_sink_contract(
         race_observations = []
         for mutation in ("checkpoint", "event", "invocation", "terminal"):
             race_harness = factory()
-            race_run_id = f"contract-race-{mutation}"
+            race_run_id = _contract_run_id(namespace, f"race-{mutation}")
             race_token = _contract_writer(race_harness, race_run_id)
-            if mutation == "checkpoint":
-                left_value = RunCheckpoint(run_id=race_run_id, seq=1, final_text="left")
-                right_value = RunCheckpoint(run_id=race_run_id, seq=1, final_text="right")
-            elif mutation == "event":
-                left_value = _contract_event(race_run_id, seq=1)
-                right_value = _contract_event(race_run_id, seq=1, level="warning")
-            elif mutation == "invocation":
-                left_value = _contract_invocation(
-                    race_run_id, revision=1, dispatch_state="reserved"
-                )
-                right_value = _contract_invocation(
-                    race_run_id,
-                    revision=1,
-                    dispatch_state="reserved",
-                    dispatch_id="dispatch-racer",
-                )
-            else:
-                left_value = _contract_terminal(race_run_id)
-                right_value = _contract_terminal(race_run_id, failed=True)
+            left_value, right_value = _contract_competing_values(mutation, race_run_id)
             left_write = partial(
                 _contract_race_write,
                 mutation=mutation,
@@ -939,7 +1018,7 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_id = "contract-invocation"
+        run_id = _contract_run_id(namespace, "invocation")
         token = _contract_writer(harness, run_id)
         missing = harness.sink.load_invocation(run_id, "call-1")
         reserved_invocation = _contract_invocation(
@@ -1142,7 +1221,7 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_id = "contract-invocation-refusals"
+        run_id = _contract_run_id(namespace, "invocation-refusals")
         token = _contract_writer(harness, run_id)
         first_wrong = harness.sink.commit_invocation(
             _contract_invocation(run_id, revision=1, dispatch_state="dispatch_started"),
@@ -1167,44 +1246,49 @@ def run_fenced_run_sink_contract(
         identity_drift_statuses = {
             "idempotency_key": _contract_invocation_drift_status(
                 factory,
+                _contract_run_id(namespace, "invocation-drift-idempotency-key"),
                 "idempotency_key",
                 "contract-idempotency-key-drift",
             ),
             "request_digest": _contract_invocation_drift_status(
                 factory,
+                _contract_run_id(namespace, "invocation-drift-request-digest"),
                 "request_digest",
                 "b" * 64,
             ),
             "digest_generation": _contract_invocation_drift_status(
                 factory,
+                _contract_run_id(namespace, "invocation-drift-digest-generation"),
                 "digest_generation",
                 _CONTRACT_ALTERNATE_DIGEST_GENERATION,
             ),
             "dispatch_id": _contract_invocation_drift_status(
                 factory,
+                _contract_run_id(namespace, "invocation-drift-dispatch-id"),
                 "dispatch_id",
                 "dispatch-drift",
             ),
             "dispatch_attempt": _contract_invocation_drift_status(
                 factory,
+                _contract_run_id(namespace, "invocation-drift-dispatch-attempt"),
                 "dispatch_attempt",
                 2,
             ),
         }
         unknown_history, after_unknown = _contract_retry_after_terminal_invocation(
             factory,
-            "contract-invocation-after-unknown",
+            _contract_run_id(namespace, "invocation-after-unknown"),
             terminal_state="unknown",
         )
         success_history, after_success = _contract_retry_after_terminal_invocation(
             factory,
-            "contract-invocation-after-success",
+            _contract_run_id(namespace, "invocation-after-success"),
             terminal_state="settled",
             succeeded=True,
         )
         nonretry_history, after_nonretry_failure = _contract_retry_after_terminal_invocation(
             factory,
-            "contract-invocation-after-nonretry-failure",
+            _contract_run_id(namespace, "invocation-after-nonretry-failure"),
             terminal_state="settled",
         )
         outcomes.append(
@@ -1263,14 +1347,16 @@ def run_fenced_run_sink_contract(
 
     try:
         harness = factory()
-        run_a_token = _contract_writer(harness, "contract-run-a")
-        run_b_token = _contract_writer(harness, "contract-run-b")
-        checkpoint = RunCheckpoint(run_id="contract-run-b", seq=1)
-        event = _contract_event("contract-run-b", seq=1)
+        run_a_id = _contract_run_id(namespace, "run-a")
+        run_b_id = _contract_run_id(namespace, "run-b")
+        run_a_token = _contract_writer(harness, run_a_id)
+        run_b_token = _contract_writer(harness, run_b_id)
+        checkpoint = RunCheckpoint(run_id=run_b_id, seq=1)
+        event = _contract_event(run_b_id, seq=1)
         invocation = _contract_invocation(
-            "contract-run-b", revision=1, dispatch_state="reserved"
+            run_b_id, revision=1, dispatch_state="reserved"
         )
-        terminal = _contract_terminal("contract-run-b")
+        terminal = _contract_terminal(run_b_id)
         swapped_checkpoint = harness.sink.commit_checkpoint(
             checkpoint,
             {},

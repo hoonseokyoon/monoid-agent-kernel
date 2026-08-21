@@ -692,3 +692,74 @@ def test_reusable_contract_rejects_non_atomic_competing_writers(mutation: str) -
     assert winner_rule.status == "failed"
     assert race_observation.expected == ("committed", "conflict")
     assert race_observation.actual == ("committed", "committed")
+
+
+class _UnsafeWriterHandoffHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write,
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        if mutation == self.broken_mutation:
+            del stale_token, current_token, write
+            return (
+                CommitResult(status="committed"),
+                CommitResult(status="already_committed"),
+                True,
+            )
+        return super().race_writer_handoff(
+            mutation,
+            stale_token,
+            current_token,
+            write,
+        )
+
+
+def _unsafe_writer_handoff_factory(mutation: str):
+    def factory() -> _UnsafeWriterHandoffHarness:
+        harness = _UnsafeWriterHandoffHarness()
+        harness.broken_mutation = mutation
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
+def test_reusable_contract_rejects_write_published_after_rotation(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_unsafe_writer_handoff_factory(mutation))
+    fence_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    handoff_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id == f"handoff_{mutation}_linearization"
+    )
+
+    assert fence_rule.status == "failed"
+    assert handoff_observation.expected == ("fenced", "committed")
+    assert handoff_observation.actual == ("committed", "already_committed")
+
+
+class _PersistentHarnessFactory:
+    def __init__(self) -> None:
+        self.root = DeterministicFencedRunHarness()
+
+    def __call__(self) -> DeterministicFencedRunHarness:
+        return self.root.reopen()
+
+
+def test_reusable_contract_namespaces_repeated_runs_on_one_backing_store() -> None:
+    factory = _PersistentHarnessFactory()
+
+    first = run_fenced_run_sink_contract(factory)
+    second = run_fenced_run_sink_contract(factory)
+
+    assert all(outcome.status == "passed" for outcome in first), first
+    assert all(outcome.status == "passed" for outcome in second), second

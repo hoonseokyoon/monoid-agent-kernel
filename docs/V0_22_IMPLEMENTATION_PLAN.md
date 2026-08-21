@@ -460,10 +460,15 @@ Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확�
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 `reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
+적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
 Contract는 `Barrier`로 두 worker의 동일-key write 시작점을 맞추고 checkpoint, event, invocation,
 terminal의 conflicting content를 각각 경쟁시킨다. 각 경쟁은 정확히 하나의 `committed`와 하나의
 `conflict`를 만들며, 재개방 뒤 winner retry는 `already_committed`, loser retry는 `conflict`다.
+별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
+직렬화되면 stale write는 `fenced`, write가 먼저 직렬화되면 새 generation retry가
+`already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.
 
 ### 6.3 Commit 판정 순서
 
@@ -807,8 +812,9 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 - LocalFS `single_writer` capability
 - deterministic fake adapter와 fencing conformance
 
-종료 조건: capability 선언, stale identical mutation의 `fenced`, concurrent same-key CAS, 재개방
-durability, terminal winner, checkpoint/invocation private blob round-trip이 검증된다.
+종료 조건: capability 선언, stale identical mutation의 `fenced`, in-flight writer handoff,
+concurrent same-key CAS, 재개방 durability, 반복 실행 격리, terminal winner,
+checkpoint/invocation private blob round-trip이 검증된다.
 
 ### PR 3 — ModelCallRunner lifecycle
 
