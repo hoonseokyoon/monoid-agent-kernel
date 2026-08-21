@@ -556,8 +556,9 @@ Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 `conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
 거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
 `committed`이고 재개방 record가 정확한 bytes를 반환한다.
-Contract는 먼저 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write 직후 repair
-전에 seed record의 blob을 다시 읽어 기존 content-addressed row가 바뀌지 않았음을 검증한다.
+Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
+직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
+기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
 성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에
 제출한다. 참조 무결성을 선검증하는 adapter도 conformance contract를 통과해야 한다.
 Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.

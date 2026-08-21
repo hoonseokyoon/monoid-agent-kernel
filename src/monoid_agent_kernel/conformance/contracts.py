@@ -1367,16 +1367,10 @@ def _run_fenced_run_sink_contract(
             for direction in ("current_to_legacy", "legacy_to_current")
         }
         malformed_harness = factory()
-        malformed_seed_run_id = _contract_run_id(
-            namespace,
-            "checkpoint-malformed-blob-seed",
-        )
-        malformed_seed_token = _contract_writer(
-            malformed_harness,
-            malformed_seed_run_id,
-        )
+        malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
+        malformed_token = _contract_writer(malformed_harness, malformed_run_id)
         malformed_seed_checkpoint = RunCheckpoint(
-            run_id=malformed_seed_run_id,
+            run_id=malformed_run_id,
             seq=1,
             workspace_delta=[
                 {
@@ -1390,13 +1384,11 @@ def _run_fenced_run_sink_contract(
         malformed_seed = malformed_harness.sink.commit_checkpoint(
             malformed_seed_checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
-            writer_token=malformed_seed_token,
+            writer_token=malformed_token,
         )
-        malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
-        malformed_token = _contract_writer(malformed_harness, malformed_run_id)
         malformed_checkpoint = RunCheckpoint(
             run_id=malformed_run_id,
-            seq=1,
+            seq=2,
             workspace_delta=[
                 {
                     "path": "malformed-contract.txt",
@@ -1412,10 +1404,7 @@ def _run_fenced_run_sink_contract(
             writer_token=malformed_token,
         )
         malformed_harness = malformed_harness.reopen()
-        malformed_seed_load = malformed_harness.sink.latest_checked(
-            malformed_seed_run_id
-        )
-        malformed_fresh_load = malformed_harness.sink.latest_checked(malformed_run_id)
+        malformed_after_rejection = malformed_harness.sink.latest_checked(malformed_run_id)
         malformed_recovery = malformed_harness.sink.commit_checkpoint(
             malformed_checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
@@ -1563,14 +1552,14 @@ def _run_fenced_run_sink_contract(
                         "malformed_fresh_blob_preserves_existing_bytes",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
                         actual=_contract_blob_hex(
-                            malformed_seed_load.value,
+                            malformed_after_rejection.value,
                             _CONTRACT_CHECKPOINT_BLOB_SHA256,
                         ),
                     ),
                     observation(
-                        "malformed_fresh_blob_not_published",
-                        expected="missing",
-                        actual=malformed_fresh_load.status,
+                        "malformed_fresh_blob_head_not_published",
+                        expected=malformed_seed_checkpoint.seq,
+                        actual=malformed_after_rejection.sequence,
                     ),
                     observation(
                         "malformed_fresh_blob_recovery",

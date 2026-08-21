@@ -632,10 +632,7 @@ def test_reusable_contract_rejects_fresh_malformed_content_addressed_blobs() -> 
     assert checkpoint_rule.status == "failed"
     assert invocation_rule.status == "failed"
     assert checkpoint_observations["malformed_fresh_blob_status"].actual == "committed"
-    assert (
-        checkpoint_observations["malformed_fresh_blob_not_published"].actual
-        == "loaded"
-    )
+    assert checkpoint_observations["malformed_fresh_blob_head_not_published"].actual == 2
     assert invocation_observations["malformed_fresh_blob_status"].actual == "committed"
     assert (
         invocation_observations["malformed_fresh_blob_head_not_published"].actual == 3
@@ -651,13 +648,16 @@ def _corrupting_blob_reader(reader, target_sha256: str, corrupted: bytes):
     return read
 
 
-class _OverwriteExistingBlobOnMalformedSink(DeterministicFencedRunSink):
-    def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
-        valid = super()._blobs_are_content_addressed(blobs)
-        if valid:
-            return True
+class _OverwriteSameRunBlobOnMalformedSink(DeterministicFencedRunSink):
+    def _overwrite_checkpoint_blobs(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+    ) -> None:
         for sha256, corrupted in blobs.items():
-            for _, record in self._checkpoints.values():
+            for (record_run_id, _), (_, record) in self._checkpoints.items():
+                if record_run_id != run_id:
+                    continue
                 try:
                     record.blob(sha256)
                 except KeyError:
@@ -668,7 +668,16 @@ class _OverwriteExistingBlobOnMalformedSink(DeterministicFencedRunSink):
                     sha256,
                     corrupted,
                 )
+
+    def _overwrite_invocation_blobs(
+        self,
+        run_id: str,
+        blobs: Mapping[str, bytes],
+    ) -> None:
+        for sha256, corrupted in blobs.items():
             for key, (digest, record) in list(self._invocations.items()):
+                if key[0] != run_id:
+                    continue
                 try:
                     record.blob(sha256)
                 except KeyError:
@@ -685,16 +694,37 @@ class _OverwriteExistingBlobOnMalformedSink(DeterministicFencedRunSink):
                         ),
                     ),
                 )
-        return False
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if not self._blobs_are_content_addressed(blobs):
+            self._overwrite_checkpoint_blobs(checkpoint.run_id, blobs)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if not self._blobs_are_content_addressed(blobs):
+            self._overwrite_invocation_blobs(invocation.run_id, blobs)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
 
 
 def _overwrite_existing_blob_factory() -> DeterministicFencedRunHarness:
     harness = DeterministicFencedRunHarness()
-    harness.sink = _OverwriteExistingBlobOnMalformedSink(harness._writers)
+    harness.sink = _OverwriteSameRunBlobOnMalformedSink(harness._writers)
     return harness
 
 
-def test_reusable_contract_protects_existing_blobs_from_malformed_writes() -> None:
+def test_reusable_contract_protects_same_run_blobs_from_malformed_writes() -> None:
     outcomes = run_fenced_run_sink_contract(_overwrite_existing_blob_factory)
     rules = {outcome.rule_id: outcome for outcome in outcomes}
 
