@@ -460,6 +460,8 @@ Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확�
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 `reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
+factory instance와 명시적으로 reopened된 모든 facade를 추적하고 `finally`에서 역순으로 닫는다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
 재개방 record와 비교한다.
 같은 key의 checkpoint, event, terminal, invocation 재시도는 mutable canonical non-key field를
@@ -472,11 +474,13 @@ identity가 같으므로 모두 `committed`다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
-Contract는 `Barrier`로 두 worker의 동일-key write 시작점을 맞추고 checkpoint, event, invocation,
-terminal의 conflicting content를 각각 경쟁시킨다. 각 경쟁은 정확히 하나의 `committed`와 하나의
-`conflict`를 만들며, 재개방 뒤 winner retry는 `already_committed`, loser retry는 `conflict`다.
-두 worker는 같은 backing store를 가리키는 별도 reopened sink facade를 사용한다. Backend CAS를
-검증하면서 database session이나 client facade의 cross-thread 안전성을 요구하지 않는다.
+Contract는 `race_conflicting_writes` harness hook으로 두 worker를 backend의 CAS read/publication
+gap에서 조정하고 checkpoint, event, invocation, terminal의 conflicting content를 각각 경쟁시킨다.
+Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다. 각 경쟁은 정확히 하나의
+`committed`와 하나의 `conflict`를 만들며, 재개방 뒤 winner retry는 `already_committed`, loser retry는
+`conflict`다. 두 worker는 같은 backing store를 가리키는 별도 sink facade를 사용한다. Hook은 내부에서
+연 facade를 직접 닫는다. Backend CAS를 검증하면서 database session이나 client facade의 cross-thread
+안전성을 요구하지 않는다.
 별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
 직렬화되면 stale write는 `fenced`, write가 먼저 직렬화되면 새 generation retry가
 `already_committed`다. Rotation 완료 뒤 stale publication이 나타나는 결과는 contract 위반이다.

@@ -6,12 +6,10 @@ import hashlib
 import json
 import time
 from collections.abc import Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from threading import Barrier
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
@@ -128,6 +126,27 @@ class FencedRunSinkHarness(Protocol):
 
         ...
 
+    def close(self) -> None:
+        """Release the sink facade and every session or client owned by this harness."""
+
+        ...
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left: Callable[[FencedRunSink], CommitResult],
+        right: Callable[[FencedRunSink], CommitResult],
+    ) -> tuple[CommitResult, CommitResult]:
+        """Coordinate competing writes at the backend's CAS read/publication gap.
+
+        Implementations use a backend test hook or an equivalent transaction interlock. Entry-only
+        synchronization is insufficient for a backend whose compare and publish steps are separate.
+        The hook owns and closes any additional sink facades it opens.
+        """
+
+        ...
+
     def race_writer_handoff(
         self,
         mutation: str,
@@ -147,6 +166,87 @@ class FencedRunSinkHarness(Protocol):
 
 class FencedRunSinkHarnessFactory(Protocol):
     def __call__(self) -> FencedRunSinkHarness: ...
+
+
+class _TrackedFencedRunSinkHarness:
+    def __init__(
+        self,
+        inner: FencedRunSinkHarness,
+        registry: _FencedHarnessRegistry,
+    ) -> None:
+        self._inner = inner
+        self._registry = registry
+        self._closed = False
+
+    @property
+    def sink(self) -> FencedRunSink:
+        return self._inner.sink
+
+    def set_current_writer(self, writer_token: WriterToken) -> None:
+        self._inner.set_current_writer(writer_token)
+
+    def reopen(self) -> FencedRunSinkHarness:
+        return self._registry.track(self._inner.reopen())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._inner.close()
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left: Callable[[FencedRunSink], CommitResult],
+        right: Callable[[FencedRunSink], CommitResult],
+    ) -> tuple[CommitResult, CommitResult]:
+        return self._inner.race_conflicting_writes(
+            mutation,
+            writer_token,
+            left,
+            right,
+        )
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write: Callable[[FencedRunSink, WriterToken], CommitResult],
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        return self._inner.race_writer_handoff(
+            mutation,
+            stale_token,
+            current_token,
+            write,
+        )
+
+
+class _FencedHarnessRegistry:
+    def __init__(self) -> None:
+        self._opened: list[_TrackedFencedRunSinkHarness] = []
+
+    def track(self, harness: FencedRunSinkHarness) -> _TrackedFencedRunSinkHarness:
+        tracked = _TrackedFencedRunSinkHarness(harness, self)
+        self._opened.append(tracked)
+        return tracked
+
+    def wrap_factory(
+        self,
+        factory: FencedRunSinkHarnessFactory,
+    ) -> FencedRunSinkHarnessFactory:
+        return lambda: self.track(factory())
+
+    def close_all(self) -> None:
+        errors: list[BaseException] = []
+        for harness in reversed(self._opened):
+            try:
+                harness.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
 @contextmanager
@@ -486,23 +586,6 @@ def _contract_blob_hex(record: Any | None, sha256: str) -> str | None:
     if type(blob) is not bytes:
         return "invalid-type"
     return blob.hex()
-
-
-def _contract_race(
-    left: Callable[[], CommitResult],
-    right: Callable[[], CommitResult],
-) -> tuple[CommitResult, CommitResult]:
-    barrier = Barrier(3)
-
-    def invoke(operation: Callable[[], CommitResult]) -> CommitResult:
-        barrier.wait(timeout=10)
-        return operation()
-
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fenced-contract") as executor:
-        left_future = executor.submit(invoke, left)
-        right_future = executor.submit(invoke, right)
-        barrier.wait(timeout=10)
-        return left_future.result(timeout=10), right_future.result(timeout=10)
 
 
 def _contract_race_retry_statuses(
@@ -924,11 +1007,9 @@ def _contract_retry_after_terminal_invocation(
     return history_statuses, retry.status
 
 
-def run_fenced_run_sink_contract(
+def _run_fenced_run_sink_contract(
     factory: FencedRunSinkHarnessFactory,
 ) -> tuple[ConformanceRuleOutcome, ...]:
-    """Execute backend-neutral fencing, conflict, terminal, and invocation invariants."""
-
     outcomes: list[ConformanceRuleOutcome] = []
     namespace = f"contract-{uuid4().hex}"
     try:
@@ -1428,11 +1509,11 @@ def run_fenced_run_sink_contract(
                 value=right_value,
                 writer_token=race_token,
             )
-            left_harness = race_harness.reopen()
-            right_harness = race_harness.reopen()
-            left_result, right_result = _contract_race(
-                partial(left_write, left_harness.sink),
-                partial(right_write, right_harness.sink),
+            left_result, right_result = race_harness.race_conflicting_writes(
+                mutation,
+                race_token,
+                left_write,
+                right_write,
             )
             retry_winner, retry_loser = _contract_race_retry_statuses(
                 left_result,
@@ -2142,6 +2223,18 @@ def run_fenced_run_sink_contract(
             )
         )
     return tuple(outcomes)
+
+
+def run_fenced_run_sink_contract(
+    factory: FencedRunSinkHarnessFactory,
+) -> tuple[ConformanceRuleOutcome, ...]:
+    """Execute backend-neutral fencing, conflict, terminal, and invocation invariants."""
+
+    registry = _FencedHarnessRegistry()
+    try:
+        return _run_fenced_run_sink_contract(registry.wrap_factory(factory))
+    finally:
+        registry.close_all()
 
 
 def run_capability_broker_contract(

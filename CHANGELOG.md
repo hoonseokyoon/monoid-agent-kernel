@@ -29,7 +29,7 @@ out in commit messages and here.
 - Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
   blob-inclusive content identity, monotonic checkpoint publication, terminal first-writer-wins,
   field- and edge-complete durable invocation transitions, fresh-facade durability, and
-  barrier-coordinated CAS and writer-handoff races for every authoritative mutation.
+  backend-hook-coordinated CAS and writer-handoff races for every authoritative mutation.
   Concurrent writers use separate facades over shared backing. Per-execution namespaces make the
   suite repeatable on one persistent test service. Reopened records use complete canonical-payload
   comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
@@ -37,7 +37,8 @@ out in commit messages and here.
   invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
   normalize in both lifecycle-transition directions. Exact retries of every older invocation
   revision cannot republish an obsolete journal head. Every successful invocation fixture commits
-  the result blob referenced by its durable metadata.
+  the result blob referenced by its durable metadata. The harness lifecycle closes every factory
+  instance and reopened sink facade after each complete contract execution.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

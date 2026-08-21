@@ -390,6 +390,43 @@ class DeterministicFencedRunHarness:
         reopened.sink = copy(self.sink)
         return reopened
 
+    def close(self) -> None:
+        """Release this in-memory facade; external harnesses close real client resources here."""
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left: Callable[[DeterministicFencedRunSink], CommitResult],
+        right: Callable[[DeterministicFencedRunSink], CommitResult],
+    ) -> tuple[CommitResult, CommitResult]:
+        """Run the backend-specific CAS race hook through separate sink facades."""
+
+        del mutation, writer_token
+        barrier = Barrier(3)
+        left_facade = self.reopen()
+        right_facade = self.reopen()
+
+        def invoke(
+            operation: Callable[[DeterministicFencedRunSink], CommitResult],
+            facade: DeterministicFencedRunHarness,
+        ) -> CommitResult:
+            barrier.wait(timeout=10)
+            return operation(facade.sink)
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="fenced-contract",
+            ) as executor:
+                left_future = executor.submit(invoke, left, left_facade)
+                right_future = executor.submit(invoke, right, right_facade)
+                barrier.wait(timeout=10)
+                return left_future.result(timeout=10), right_future.result(timeout=10)
+        finally:
+            right_facade.close()
+            left_facade.close()
+
     def race_writer_handoff(
         self,
         mutation: str,
@@ -403,6 +440,7 @@ class DeterministicFencedRunHarness:
         barrier = Barrier(3)
         linearization: list[str] = []
         stale_facade = self.reopen()
+        current_facade: DeterministicFencedRunHarness | None = None
 
         def stale_write() -> CommitResult:
             barrier.wait(timeout=10)
@@ -417,13 +455,22 @@ class DeterministicFencedRunHarness:
                 self.set_current_writer(current_token)
                 linearization.append("rotation")
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fenced-handoff") as executor:
-            stale_future = executor.submit(stale_write)
-            rotation_future = executor.submit(rotate)
-            barrier.wait(timeout=10)
-            stale_result = stale_future.result(timeout=10)
-            rotation_future.result(timeout=10)
+        try:
+            with ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="fenced-handoff",
+            ) as executor:
+                stale_future = executor.submit(stale_write)
+                rotation_future = executor.submit(rotate)
+                barrier.wait(timeout=10)
+                stale_result = stale_future.result(timeout=10)
+                rotation_future.result(timeout=10)
 
-        rotation_first = linearization[0] == "rotation"
-        current_result = write(self.reopen().sink, current_token)
-        return stale_result, current_result, rotation_first
+            rotation_first = linearization[0] == "rotation"
+            current_facade = self.reopen()
+            current_result = write(current_facade.sink, current_token)
+            return stale_result, current_result, rotation_first
+        finally:
+            if current_facade is not None:
+                current_facade.close()
+            stale_facade.close()

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
-from threading import Barrier, current_thread
+from threading import Barrier
 
 import pytest
 
@@ -1209,10 +1209,7 @@ def test_reusable_contract_rejects_process_local_only_storage() -> None:
 
 class _NonAtomicRaceSink(DeterministicFencedRunSink):
     broken_mutation = ""
-    _race_barrier: Barrier
-
-    def _is_contract_racer(self) -> bool:
-        return current_thread().name.startswith("fenced-contract")
+    _cas_gap: Callable[[], None]
 
     def commit_checkpoint(
         self,
@@ -1224,11 +1221,10 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
         key = (checkpoint.run_id, checkpoint.seq)
         if (
             self.broken_mutation == "checkpoint"
-            and self._is_contract_racer()
             and self._is_current(checkpoint.run_id, writer_token)
             and key not in self._checkpoints
         ):
-            self._race_barrier.wait(timeout=10)
+            self._cas_gap()
             with self._lock:
                 self._checkpoints.pop(key, None)
                 return self._commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
@@ -1243,11 +1239,10 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
         key = (event.run_id, event.seq)
         if (
             self.broken_mutation == "event"
-            and self._is_contract_racer()
             and self._is_current(event.run_id, writer_token)
             and key not in self._events
         ):
-            self._race_barrier.wait(timeout=10)
+            self._cas_gap()
             with self._lock:
                 self._events.pop(key, None)
                 return self._append_event(event, writer_token=writer_token)
@@ -1264,11 +1259,10 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
         head_key = (invocation.run_id, invocation.logical_call_id)
         if (
             self.broken_mutation == "invocation"
-            and self._is_contract_racer()
             and self._is_current(invocation.run_id, writer_token)
             and key not in self._invocations
         ):
-            self._race_barrier.wait(timeout=10)
+            self._cas_gap()
             with self._lock:
                 self._invocations.pop(key, None)
                 self._invocation_heads.pop(head_key, None)
@@ -1283,24 +1277,55 @@ class _NonAtomicRaceSink(DeterministicFencedRunSink):
     ) -> CommitResult:
         if (
             self.broken_mutation == "terminal"
-            and self._is_contract_racer()
             and self._is_current(outcome.run_id, writer_token)
             and outcome.run_id not in self._terminals
         ):
-            self._race_barrier.wait(timeout=10)
+            self._cas_gap()
             with self._lock:
                 self._terminals.pop(outcome.run_id, None)
                 return self._settle_terminal(outcome, writer_token=writer_token)
         return super().settle_terminal(outcome, writer_token=writer_token)
 
 
+class _NonAtomicRaceHarness(DeterministicFencedRunHarness):
+    broken_mutation = ""
+
+    def __post_init__(self) -> None:
+        self.sink = _NonAtomicRaceSink(self._writers)
+        self.sink._cas_gap = lambda: None
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left,
+        right,
+    ) -> tuple[CommitResult, CommitResult]:
+        if mutation != self.broken_mutation:
+            return super().race_conflicting_writes(
+                mutation,
+                writer_token,
+                left,
+                right,
+            )
+        barrier = Barrier(2)
+        self.sink._cas_gap = lambda: barrier.wait(timeout=10)
+        try:
+            return super().race_conflicting_writes(
+                mutation,
+                writer_token,
+                left,
+                right,
+            )
+        finally:
+            self.sink._cas_gap = lambda: None
+
+
 def _non_atomic_race_factory(mutation: str):
-    def factory() -> DeterministicFencedRunHarness:
-        harness = DeterministicFencedRunHarness()
-        sink = _NonAtomicRaceSink(harness._writers)
-        sink.broken_mutation = mutation
-        sink._race_barrier = Barrier(2)
-        harness.sink = sink
+    def factory() -> _NonAtomicRaceHarness:
+        harness = _NonAtomicRaceHarness()
+        harness.broken_mutation = mutation
+        harness.sink.broken_mutation = mutation
         return harness
 
     return factory
@@ -1376,6 +1401,70 @@ def test_reusable_contract_rejects_write_published_after_rotation(mutation: str)
     assert fence_rule.status == "failed"
     assert handoff_observation.expected == ("fenced", "committed")
     assert handoff_observation.actual == ("committed", "already_committed")
+
+
+class _CloseTrackingHarness:
+    def __init__(
+        self,
+        tracker: dict[str, int],
+        inner: DeterministicFencedRunHarness | None = None,
+    ) -> None:
+        self._tracker = tracker
+        self._inner = inner or DeterministicFencedRunHarness()
+        self._closed = False
+        tracker["opened"] += 1
+
+    @property
+    def sink(self):
+        return self._inner.sink
+
+    def set_current_writer(self, writer_token: WriterToken) -> None:
+        self._inner.set_current_writer(writer_token)
+
+    def reopen(self):
+        return _CloseTrackingHarness(self._tracker, self._inner.reopen())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._inner.close()
+        self._tracker["closed"] += 1
+
+    def race_conflicting_writes(self, mutation, writer_token, left, right):
+        return self._inner.race_conflicting_writes(
+            mutation,
+            writer_token,
+            left,
+            right,
+        )
+
+    def race_writer_handoff(
+        self,
+        mutation,
+        stale_token,
+        current_token,
+        write,
+    ):
+        return self._inner.race_writer_handoff(
+            mutation,
+            stale_token,
+            current_token,
+            write,
+        )
+
+
+def test_reusable_contract_closes_every_exposed_harness_facade() -> None:
+    tracker = {"opened": 0, "closed": 0}
+
+    def factory() -> _CloseTrackingHarness:
+        return _CloseTrackingHarness(tracker)
+
+    outcomes = run_fenced_run_sink_contract(factory)
+
+    assert all(outcome.status == "passed" for outcome in outcomes), outcomes
+    assert tracker["opened"] > 1
+    assert tracker["closed"] == tracker["opened"]
 
 
 class _PersistentHarnessFactory:
