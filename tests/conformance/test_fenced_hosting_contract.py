@@ -1113,6 +1113,67 @@ def test_reusable_contract_normalizes_every_checkpoint_alias_location(
     assert alias_observation.actual == "conflict"
 
 
+class _RawTerminalAliasDigestSink(DeterministicFencedRunSink):
+    broken_direction = ""
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._terminals.get(outcome.run_id)
+        if stored is not None and self._is_current(outcome.run_id, writer_token):
+            previous_schema = stored[1].schema_version
+            incoming_schema = outcome.schema_version
+            previous_is_legacy = previous_schema.startswith("native-agent-runner.")
+            incoming_is_legacy = incoming_schema.startswith("native-agent-runner.")
+            direction = (
+                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
+            )
+            if (
+                previous_schema != incoming_schema
+                and previous_is_legacy != incoming_is_legacy
+                and direction == self.broken_direction
+            ):
+                return CommitResult(status="conflict")
+        return super().settle_terminal(outcome, writer_token=writer_token)
+
+
+def _raw_terminal_alias_digest_factory(direction: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _RawTerminalAliasDigestSink(harness._writers)
+        sink.broken_direction = direction
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("direction", ["current_to_legacy", "legacy_to_current"])
+def test_reusable_contract_normalizes_terminal_schema_aliases(
+    direction: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _raw_terminal_alias_digest_factory(direction)
+    )
+    terminal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+    )
+    alias_observation = next(
+        observation
+        for observation in terminal_rule.observations
+        if observation.observation_id == f"terminal_canonical_alias_{direction}"
+    )
+
+    assert terminal_rule.status == "failed"
+    assert alias_observation.expected == "already_committed"
+    assert alias_observation.actual == "conflict"
+
+
 class _ForbiddenInvocationEdgeSink(DeterministicFencedRunSink):
     allowed_edge: tuple[str, str] = ("", "")
 

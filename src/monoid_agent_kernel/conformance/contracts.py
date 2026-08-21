@@ -56,6 +56,8 @@ from monoid_agent_kernel.core.model_io import (
     redacted_or_none,
 )
 from monoid_agent_kernel.core.outcome import (
+    ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS,
+    TERMINAL_OUTCOME_SCHEMA_VERSION,
     InterruptionCause,
     RetryEligibility,
     TerminalOutcome,
@@ -87,6 +89,11 @@ _CONTRACT_ALTERNATE_CHECKPOINT_SCHEMA_VERSION = next(
     schema
     for schema in ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS
     if schema != CHECKPOINT_SCHEMA_VERSION
+)
+_CONTRACT_ALTERNATE_TERMINAL_SCHEMA_VERSION = next(
+    schema
+    for schema in ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS
+    if schema != TERMINAL_OUTCOME_SCHEMA_VERSION
 )
 _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
     {
@@ -426,6 +433,29 @@ def _contract_terminal(run_id: str, *, failed: bool = False) -> TerminalOutcome:
         retry_eligibility=RetryEligibility.NOT_APPLICABLE,
         final_output_ref="blob:contract-final",
     )
+
+
+def _contract_terminal_canonical_alias_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    *,
+    legacy_first: bool,
+) -> str:
+    baseline = _contract_terminal(run_id)
+    legacy = replace(
+        baseline,
+        schema_version=_CONTRACT_ALTERNATE_TERMINAL_SCHEMA_VERSION,
+    )
+    first_value, retry_value = (
+        (legacy, baseline) if legacy_first else (baseline, legacy)
+    )
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    first = harness.sink.settle_terminal(first_value, writer_token=token)
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    harness = harness.reopen()
+    return harness.sink.settle_terminal(retry_value, writer_token=token).status
 
 
 def _contract_checkpoint_identity_variants(
@@ -1759,6 +1789,14 @@ def _run_fenced_run_sink_contract(
         )
 
     try:
+        terminal_canonical_alias_statuses = {
+            direction: _contract_terminal_canonical_alias_status(
+                factory,
+                _contract_run_id(namespace, f"terminal-canonical-alias-{direction}"),
+                legacy_first=direction == "legacy_to_current",
+            )
+            for direction in ("current_to_legacy", "legacy_to_current")
+        }
         harness = factory()
         run_id = _contract_run_id(namespace, "terminal")
         token = _contract_writer(harness, run_id)
@@ -1887,6 +1925,14 @@ def _run_fenced_run_sink_contract(
                             if reopened_terminal is not None
                             else None
                         ),
+                    ),
+                    *(
+                        observation(
+                            f"terminal_canonical_alias_{direction}",
+                            expected="already_committed",
+                            actual=status,
+                        )
+                        for direction, status in terminal_canonical_alias_statuses.items()
                     ),
                     observation(
                         "terminal_conflict", expected="conflict", actual=conflict_terminal.status

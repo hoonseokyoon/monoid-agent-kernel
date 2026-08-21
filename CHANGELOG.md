@@ -47,7 +47,8 @@ out in commit messages and here.
   original bytes, and stale or cross-run malformed requests remain fenced before validation.
   Reopened event and terminal-winner inspection compare complete canonical payloads instead of
   trusting retry digests. Retry reservations reject dispatch IDs used by any earlier attempt in
-  the logical call history, while a complete third attempt with a fresh ID remains legal.
+  the logical call history, while a complete third attempt with a fresh ID remains legal. Accepted
+  terminal schema aliases normalize in both same-winner retry directions.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

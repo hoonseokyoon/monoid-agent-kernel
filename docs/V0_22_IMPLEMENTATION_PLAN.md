@@ -478,6 +478,8 @@ identity가 같으므로 모두 `committed`다.
 Checkpoint의 schema version과 `last_model_invocation` 안의 schema version/digest generation도 current
 writer shape로 정규화한다. 세 alias 위치의 current→legacy·legacy→current 같은-sequence 재시도는 모두
 `already_committed`다.
+TerminalOutcome의 허용된 legacy schema도 current writer shape로 정규화한다. Current→legacy와
+legacy→current의 같은 winner 재시도는 모두 `already_committed`다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
@@ -1017,7 +1019,7 @@ postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh ma
 검사한다. Event와 terminal winner는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전
 attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을
 실패시키는 mutant test가 있다. Attempt 3 이상을 일괄 거부하는 구현도 양성 lifecycle observation이
-잡아낸다.
+잡아낸다. Terminal schema alias를 raw tag로 digest하는 구현도 양방향 retry observation이 잡아낸다.
 
 ### 14.6 최종 통합 PR
 
