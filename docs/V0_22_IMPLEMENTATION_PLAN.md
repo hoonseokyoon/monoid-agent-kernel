@@ -510,6 +510,8 @@ attempt N reserved
 
 `unknown`은 해당 logical call의 최종 journal 상태다. Revision gap, state regression, settled success
 뒤 새 attempt는 `conflict`다.
+첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
+문서화되지 않은 13개 인접 edge는 각각 독립 history에서 `conflict`로 검증한다.
 
 ### 6.4 LocalFS capability
 

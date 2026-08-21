@@ -551,6 +551,118 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
     assert drift_observation.actual == "committed"
 
 
+class _ForbiddenInvocationEdgeSink(DeterministicFencedRunSink):
+    allowed_edge: tuple[str, str] = ("", "")
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            if (previous_record.invocation.dispatch_state, invocation.dispatch_state) == (
+                self.allowed_edge
+            ):
+                return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _forbidden_invocation_edge_factory(source: str, target: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _ForbiddenInvocationEdgeSink(harness._writers)
+        sink.allowed_edge = (source, target)
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+_FORBIDDEN_INVOCATION_EDGES = (
+    ("reserved", "reserved"),
+    ("reserved", "settled"),
+    ("reserved", "unknown"),
+    ("dispatch_started", "reserved"),
+    ("dispatch_started", "dispatch_started"),
+    ("settled", "reserved"),
+    ("settled", "dispatch_started"),
+    ("settled", "settled"),
+    ("settled", "unknown"),
+    ("unknown", "reserved"),
+    ("unknown", "dispatch_started"),
+    ("unknown", "settled"),
+    ("unknown", "unknown"),
+)
+
+
+@pytest.mark.parametrize(("source", "target"), _FORBIDDEN_INVOCATION_EDGES)
+def test_reusable_contract_checks_each_forbidden_invocation_edge(
+    source: str,
+    target: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_forbidden_invocation_edge_factory(source, target))
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    edge_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"state_edge_{source}_to_{target}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert edge_observation.expected == "conflict"
+    assert edge_observation.actual == "committed"
+
+
+class _InvalidInitialInvocationStateSink(DeterministicFencedRunSink):
+    allowed_state = ""
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is None and invocation.dispatch_state == self.allowed_state:
+            return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _invalid_initial_invocation_state_factory(state: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _InvalidInitialInvocationStateSink(harness._writers)
+        sink.allowed_state = state
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("state", ["dispatch_started", "settled", "unknown"])
+def test_reusable_contract_checks_each_invalid_initial_invocation_state(state: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_invalid_initial_invocation_state_factory(state))
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    state_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"first_state_{state}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert state_observation.expected == "conflict"
+    assert state_observation.actual == "committed"
+
+
 class _VolatileReopenHarness(DeterministicFencedRunHarness):
     def reopen(self) -> DeterministicFencedRunHarness:
         return _VolatileReopenHarness()

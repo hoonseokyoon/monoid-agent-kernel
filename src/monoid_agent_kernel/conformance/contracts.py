@@ -448,6 +448,60 @@ def _contract_invocation_drift_status(
     return drifted.status
 
 
+def _contract_first_invocation_state_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    dispatch_state: str,
+) -> str:
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    return harness.sink.commit_invocation(
+        _contract_invocation(run_id, revision=1, dispatch_state=dispatch_state),
+        {},
+        writer_token=token,
+    ).status
+
+
+def _contract_forbidden_state_edge_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    source_state: str,
+    target_state: str,
+) -> str:
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    histories = {
+        "reserved": ("reserved",),
+        "dispatch_started": ("reserved", "dispatch_started"),
+        "settled": ("reserved", "dispatch_started", "settled"),
+        "unknown": ("reserved", "dispatch_started", "unknown"),
+    }
+    history = histories[source_state]
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=revision,
+                dispatch_state=state,
+            ),
+            {},
+            writer_token=token,
+        ).status
+        for revision, state in enumerate(history, start=1)
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return f"setup:{','.join(setup_statuses)}"
+    return harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=len(history) + 1,
+            dispatch_state=target_state,
+        ),
+        {},
+        writer_token=token,
+    ).status
+
+
 def _contract_retry_after_terminal_invocation(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -1223,11 +1277,6 @@ def run_fenced_run_sink_contract(
         harness = factory()
         run_id = _contract_run_id(namespace, "invocation-refusals")
         token = _contract_writer(harness, run_id)
-        first_wrong = harness.sink.commit_invocation(
-            _contract_invocation(run_id, revision=1, dispatch_state="dispatch_started"),
-            {},
-            writer_token=token,
-        )
         harness.sink.commit_invocation(
             _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
             {},
@@ -1238,11 +1287,41 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
-        regression = harness.sink.commit_invocation(
-            _contract_invocation(run_id, revision=2, dispatch_state="reserved"),
-            {},
-            writer_token=token,
+        initial_refusal_statuses = {
+            state: _contract_first_invocation_state_status(
+                factory,
+                _contract_run_id(namespace, f"invocation-first-{state.replace('_', '-') }"),
+                state,
+            )
+            for state in ("dispatch_started", "settled", "unknown")
+        }
+        forbidden_edges = (
+            ("reserved", "reserved"),
+            ("reserved", "settled"),
+            ("reserved", "unknown"),
+            ("dispatch_started", "reserved"),
+            ("dispatch_started", "dispatch_started"),
+            ("settled", "reserved"),
+            ("settled", "dispatch_started"),
+            ("settled", "settled"),
+            ("settled", "unknown"),
+            ("unknown", "reserved"),
+            ("unknown", "dispatch_started"),
+            ("unknown", "settled"),
+            ("unknown", "unknown"),
         )
+        forbidden_edge_statuses = {
+            (source, target): _contract_forbidden_state_edge_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-edge-{source.replace('_', '-')}-{target.replace('_', '-')}",
+                ),
+                source,
+                target,
+            )
+            for source, target in forbidden_edges
+        }
         identity_drift_statuses = {
             "idempotency_key": _contract_invocation_drift_status(
                 factory,
@@ -1296,9 +1375,23 @@ def run_fenced_run_sink_contract(
                 "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
                 FENCED_RUN_SINK_CONTRACT_PROFILE,
                 (
-                    observation("first_must_reserve", expected="conflict", actual=first_wrong.status),
+                    *(
+                        observation(
+                            f"first_state_{state}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for state, status in initial_refusal_statuses.items()
+                    ),
                     observation("revision_gap", expected="conflict", actual=gap.status),
-                    observation("state_regression", expected="conflict", actual=regression.status),
+                    *(
+                        observation(
+                            f"state_edge_{source}_to_{target}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for (source, target), status in forbidden_edge_statuses.items()
+                    ),
                     *(
                         observation(
                             f"identity_drift_{field_name}",
