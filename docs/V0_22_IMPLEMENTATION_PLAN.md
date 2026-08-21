@@ -781,17 +781,25 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 종료 조건: stale identical mutation도 `fenced`, same-key conflict와 terminal winner가 검증된다.
 
-### PR 3 — Durable model invocation
+### PR 3 — ModelCallRunner lifecycle
 
 - runner lifecycle hook
 - reserve 전 key 발급과 저장된 key reuse
+- reserve, dispatch_started, settled, unknown transition
+- dispatch evidence와 standalone failpoint test
+
+종료 조건: Runner 단독 crash window에서 durable transition과 provider call 수가 기대값과 일치한다.
+
+### PR 4 — AgentLoop recovery
+
 - AgentLoop logical call lookup
 - settled result blob과 replay
+- request digest mismatch 차단
 - before/after dispatch crash test
 
 종료 조건: 모든 crash matrix에서 provider call 수가 기대값과 일치한다.
 
-### PR 4 — Sink policy
+### PR 5 — Sink policy
 
 - passive 기존 동작 고정
 - required delivery 결과
@@ -800,7 +808,7 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 종료 조건: evidence failure가 provider 호출을 반복하지 않는다.
 
-### PR 5 — Typed interruption
+### PR 6 — Typed interruption
 
 - cancellation cause round-trip
 - user cancel, graceful drain, lease loss 분기
@@ -809,7 +817,7 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 종료 조건: lease-lost worker가 checkpoint/event/terminal mutation을 만들지 않는다.
 
-### PR 6 — Conformance와 release closure
+### PR 7 — Conformance와 release closure
 
 - public conformance exports
 - embedding/contract/compatibility 문서
@@ -818,10 +826,121 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 종료 조건: v0.22 완료 조건과 release checklist가 모두 증거를 가진다.
 
-각 PR은 독립적으로 green 상태를 유지한다. PR 3부터 기능은 opt-in이다. Default in-process 경로는
-마지막 PR까지 기존 동작을 유지한다.
+실행 순서는 `PR 1 → PR 2 → PR 3 → PR 4 → PR 5 → PR 6 → PR 7`이다. 모든 PR을
+순차 진행한다. 특히 PR 5와 PR 6은 겹치지 않는다. PR 5가 리뷰 수렴, 병합, 동기화까지
+끝난 뒤 PR 6 브랜치를 만든다. 각 PR은 독립적으로 green 상태를 유지한다. PR 3부터 기능은
+opt-in이다. Default in-process 경로는 마지막 PR까지 기존 동작을 유지한다.
 
-## 14. 주요 위험과 대응
+## 14. 개발 브랜치와 PR 운영
+
+### 14.1 브랜치 구조
+
+`codex/v0.22-production-boundaries`가 v0.22 통합 브랜치다. 최초 구현 PR을 시작하기 전에 이
+브랜치를 `origin`에 게시한다. 각 구현 브랜치는 최신 통합 브랜치에서 생성한다.
+
+| 순서 | 개발 브랜치 | 대상 브랜치 |
+|---|---|---|
+| PR 1 | `codex/v0.22-pr1-serialization` | `codex/v0.22-production-boundaries` |
+| PR 2 | `codex/v0.22-pr2-hosting-contracts` | `codex/v0.22-production-boundaries` |
+| PR 3 | `codex/v0.22-pr3-model-call-lifecycle` | `codex/v0.22-production-boundaries` |
+| PR 4 | `codex/v0.22-pr4-loop-recovery` | `codex/v0.22-production-boundaries` |
+| PR 5 | `codex/v0.22-pr5-sink-policy` | `codex/v0.22-production-boundaries` |
+| PR 6 | `codex/v0.22-pr6-typed-interruption` | `codex/v0.22-production-boundaries` |
+| PR 7 | `codex/v0.22-pr7-release-closure` | `codex/v0.22-production-boundaries` |
+
+리뷰된 이력을 보존하기 위해 통합 브랜치와 구현 브랜치를 rebase하거나 force-push하지 않는다.
+각 구현 PR은 merge commit으로 통합하고 원격 개발 브랜치를 삭제한다.
+
+### 14.2 PR별 사전조사 gate
+
+개발 브랜치를 만든 직후 구현 전에 다음 조사를 끝낸다.
+
+1. 통합 브랜치의 최신 커밋, working tree 청결 상태, `origin/develop` 진행 여부를 확인한다.
+2. 해당 PR이 변경할 계약, 호출 경로, 저장 형식, 기존 test와 compatibility fixture를 읽는다.
+3. 정상 경로와 crash, retry, conflict, stale writer 경로를 상태 전이 단위로 적는다.
+4. 변경 파일, 추가 test, 회귀 gate, 종료 조건을 확정한다.
+5. 조사 결과를 `docs/dx-notes/YYYY-MM-DD-v0.22-prN-<slug>.md`에 남긴다.
+6. 조사에서 장기 계약이 바뀌면 이 계획을 먼저 갱신하고 별도 문서 커밋으로 고정한다.
+
+사전조사 기록에는 최소한 `현재 동작`, `발견한 gap`, `구조 결정`, `수정 파일`, `test matrix`,
+`범위 밖`, `종료 조건`이 들어간다. 이 gate가 끝난 뒤 기능 코드를 수정한다.
+
+### 14.3 한 PR의 실행 루프
+
+각 PR은 다음 순서를 한 번에 하나씩 수행한다.
+
+1. 통합 브랜치로 이동해 `origin`을 fetch하고 원격 통합 브랜치를 fast-forward로 반영한다.
+2. `origin/develop`이 전진했으면 통합 브랜치에 merge하고 기본 회귀 test를 통과시킨 뒤 push한다.
+3. 표에 정한 개발 브랜치를 생성하고 체크아웃한다.
+4. 14.2의 사전조사를 완료한다.
+5. 구현, targeted test, compatibility test, 문서 갱신을 완료한다.
+6. 변경 범위만 commit하고 개발 브랜치를 push한다.
+7. 통합 브랜치를 base로 PR을 생성한다.
+8. 14.4의 리뷰 사이클을 수렴시킨다.
+9. 필수 check가 green인지 확인하고 merge commit으로 통합한다.
+10. 통합 브랜치를 다시 체크아웃해 fetch와 fast-forward pull을 수행하고 merge 결과를 검증한다.
+11. `origin/develop` 전진분을 통합하고 필요한 회귀 test를 실행한 뒤 다음 PR을 시작한다.
+
+PR 5 브랜치는 PR 4의 11단계가 끝난 뒤 생성한다. PR 6 브랜치는 PR 5의 11단계가 끝난 뒤
+생성한다. 아직 병합되지 않은 앞 PR의 commit을 다음 PR 브랜치에 쌓지 않는다.
+
+### 14.4 Codex 리뷰 사이클
+
+모든 구현 PR과 최종 통합 PR은 `$gh-pr-review-cycle` 절차를 사용한다.
+
+1. PR URL, base/head 브랜치, 인증 상태, local checkout, working tree를 확인한다.
+2. helper의 `--snapshot-only`를 한 번 실행해 review, unresolved review thread, issue comment,
+   request-comment reaction을 함께 읽는다.
+3. 각 지적을 현재 코드와 계약에 대조한다. 필요한 수정만 적용하고 나머지는 원래 thread에
+   근거를 답한다.
+4. 수정하면 관련 test를 실행하고 commit과 push를 마친 뒤 각 thread에 변경 위치와 결과를
+   답한다. 수정이 없으면 commit 없이 판단 근거를 답한다.
+5. 별도 PR comment로 정확히 `@codex review carefully`를 남긴다.
+6. helper로 `EYES` 인식을 최대 1분 확인한다. 인식이 없으면 같은 요청을 한 번만 다시 남긴다.
+7. 인식 뒤 5분 동안 기다린다. 그 뒤 1분 간격으로 최대 10분 동안만 새 결과를 확인한다.
+8. 새 review, thread comment, issue comment, changes-requested, approved/no-issues 신호가 나타나면
+   즉시 polling을 멈추고 snapshot 단계로 돌아간다.
+9. 인식 후 15분까지 결과가 없으면 마지막 snapshot을 한 번 수행하고 timeout을 보고한다.
+
+helper가 대기하는 동안 별도 수동 polling을 실행하지 않는다. `EYES`는 요청 인식이며 승인
+신호가 아니다. Timeout과 unrecognized 상태도 리뷰 수렴이 아니다. 다음 조건을 모두 만족해야
+수렴으로 판정한다.
+
+- 최신 commit 기준 actionable unresolved feedback가 없다.
+- 최신 리뷰 요청 뒤 approved 또는 명확한 no-issues 결과가 있다.
+- 필수 check와 해당 PR의 test gate가 green이다.
+- 모든 처리한 지적에 원 thread 답변이 남아 있다.
+
+### 14.5 구조적 재검토 gate
+
+다음 신호가 나타나면 새 리뷰 요청과 polling을 멈추고 내부 구조 리뷰로 전환한다.
+
+- 같은 불변식에 대한 지적이나 수정이 두 리뷰 라운드에서 반복된다.
+- 하나의 예외를 막기 위한 조건문이 core, runner, loop, hosting 여러 층으로 퍼진다.
+- 한 crash window 수정이 다른 crash window의 호출 수나 fencing 의미를 깨뜨린다.
+- public contract, capability, failure precedence가 실제 소유권 경계와 맞지 않는다.
+- test를 통과시키는 수정이 문서화된 상태 전이로 설명되지 않는다.
+
+내부 구조 리뷰에서는 열린 지적을 보존하고 상태 전이, crash window, 소유권, failure
+precedence, compatibility 영향을 다시 조사한다. 근본 원인을 하나의 type, protocol, state
+machine, capability gate로 해결할 수 있는지 결정한다. 필요하면 이 계획과 해당 PR의 dx-note를
+먼저 갱신한다. 구조 개선과 회귀 test를 완료한 뒤 같은 PR에서 리뷰 사이클을 새로 시작한다.
+
+### 14.6 최종 통합 PR
+
+PR 7까지 통합한 뒤 다음 순서로 v0.22 캠페인을 닫는다.
+
+1. 통합 브랜치에 최신 `origin/develop`을 merge한다.
+2. 전체 test, import, wheel, cold-start, compatibility, 문서와 release gate를 실행한다.
+3. 통합 브랜치를 push하고 base `develop`, head `codex/v0.22-production-boundaries`로 최종 PR을
+   생성한다.
+4. 최종 PR에도 14.4의 리뷰 사이클을 적용해 merge-ready 상태로 수렴시킨다.
+5. PR URL, 최종 commit, test 증거, 남은 범위 밖 작업을 완료 보고에 남긴다.
+
+최종 도달점은 review가 수렴하고 필수 check가 green인 `v0.22 → develop` PR이다. `develop`
+병합과 배포는 별도 승인 뒤 수행한다.
+
+## 15. 주요 위험과 대응
 
 | 위험 | 대응 |
 |---|---|
@@ -840,7 +959,7 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 | LocalFS를 multi-process durable store로 오인 | capability gate에서 시작 전에 거부한다. |
 | Terminal과 local JSONL projection이 다름 | FencedRunSink terminal을 host authority로 문서화한다. |
 
-## 15. 구현 시작 전 고정한 결정
+## 16. 구현 시작 전 고정한 결정
 
 다음 항목은 구현 중 다시 넓히지 않는다.
 
