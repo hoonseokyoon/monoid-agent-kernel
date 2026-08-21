@@ -144,6 +144,11 @@ class FencedRunSinkHarness(Protocol):
 
         ...
 
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        """Read one complete durable event through this facade's backing store."""
+
+        ...
+
     def close(self) -> None:
         """Release the sink facade and every session or client owned by this harness."""
 
@@ -205,6 +210,9 @@ class _TrackedFencedRunSinkHarness:
 
     def reopen(self) -> FencedRunSinkHarness:
         return self._registry.track(self._inner.reopen())
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        return self._inner.read_event(run_id, seq)
 
     def close(self) -> None:
         if self._closed:
@@ -850,6 +858,66 @@ def _contract_retry_coordinate_status(
     ).status
 
 
+def _contract_historical_dispatch_id_reuse_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+) -> str:
+    """Build two failed attempts, then reuse attempt one's dispatch ID for attempt three."""
+
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    history = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            retryable=True,
+        ),
+        _contract_invocation(
+            run_id,
+            revision=4,
+            dispatch_attempt=2,
+            dispatch_id="dispatch-2",
+            dispatch_state="reserved",
+        ),
+        _contract_invocation(
+            run_id,
+            revision=5,
+            dispatch_attempt=2,
+            dispatch_id="dispatch-2",
+            dispatch_state="dispatch_started",
+        ),
+        _contract_invocation(
+            run_id,
+            revision=6,
+            dispatch_attempt=2,
+            dispatch_id="dispatch-2",
+            dispatch_state="settled",
+            retryable=True,
+        ),
+    )
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in history
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return f"setup:{','.join(setup_statuses)}"
+    harness = harness.reopen()
+    return harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=7,
+            dispatch_attempt=3,
+            dispatch_id="dispatch-1",
+            dispatch_state="reserved",
+        ),
+        {},
+        writer_token=token,
+    ).status
+
+
 def _contract_invocation_identity_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
@@ -1128,6 +1196,36 @@ def _run_fenced_run_sink_contract(
             for field_name in sorted(_CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS)
             for direction in ("current_to_legacy", "legacy_to_current")
         }
+        malformed_harness = factory()
+        malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
+        malformed_token = _contract_writer(malformed_harness, malformed_run_id)
+        malformed_checkpoint = RunCheckpoint(
+            run_id=malformed_run_id,
+            seq=1,
+            workspace_delta=[
+                {
+                    "path": "malformed-contract.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                }
+            ],
+        )
+        malformed_fresh_blob = malformed_harness.sink.commit_checkpoint(
+            malformed_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=malformed_token,
+        )
+        malformed_harness = malformed_harness.reopen()
+        malformed_fresh_load = malformed_harness.sink.latest_checked(malformed_run_id)
+        malformed_recovery = malformed_harness.sink.commit_checkpoint(
+            malformed_checkpoint,
+            {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
+            writer_token=malformed_token,
+        )
+        malformed_harness = malformed_harness.reopen()
+        malformed_recovery_load = malformed_harness.sink.latest_checked(malformed_run_id)
+
         harness = factory()
         run_id = _contract_run_id(namespace, "checkpoint")
         token = _contract_writer(harness, run_id)
@@ -1223,6 +1321,29 @@ def _run_fenced_run_sink_contract(
                         "blob_bytes_conflict",
                         expected="conflict",
                         actual=blob_bytes_conflict.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_status",
+                        expected="conflict",
+                        actual=malformed_fresh_blob.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_not_published",
+                        expected="missing",
+                        actual=malformed_fresh_load.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_recovery",
+                        expected="committed",
+                        actual=malformed_recovery.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_recovery_bytes",
+                        expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            malformed_recovery_load.value,
+                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+                        ),
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
                     *(
@@ -1558,6 +1679,7 @@ def _run_fenced_run_sink_contract(
         terminal = _contract_terminal(run_id)
         first_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
         harness = harness.reopen()
+        reopened_event = harness.read_event(run_id, event.seq)
         repeated_event = harness.sink.append_event(event, writer_token=token)
         conflict_event = harness.sink.append_event(
             _contract_event(run_id, seq=1, level="warning"), writer_token=token
@@ -1643,6 +1765,15 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "event_conflict", expected="conflict", actual=conflict_event.status
                     ),
+                    observation(
+                        "event_reopened_payload_digest",
+                        expected=canonical_sha256(event.to_json()),
+                        actual=(
+                            canonical_sha256(reopened_event.to_json())
+                            if reopened_event is not None
+                            else None
+                        ),
+                    ),
                     *(
                         observation(
                             f"event_identity_{field_name}",
@@ -1724,6 +1855,53 @@ def _run_fenced_run_sink_contract(
             )
             for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
         }
+        malformed_harness = factory()
+        malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
+        malformed_token = _contract_writer(malformed_harness, malformed_run_id)
+        malformed_setup_statuses = tuple(
+            malformed_harness.sink.commit_invocation(
+                _contract_invocation(
+                    malformed_run_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=malformed_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        malformed_fresh_blob = malformed_harness.sink.commit_invocation(
+            _contract_invocation(
+                malformed_run_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            ),
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+            writer_token=malformed_token,
+        )
+        malformed_harness = malformed_harness.reopen()
+        malformed_fresh_load = malformed_harness.sink.load_invocation(
+            malformed_run_id,
+            "call-1",
+        )
+        malformed_recovery_invocation = _contract_invocation(
+            malformed_run_id,
+            revision=3,
+            dispatch_state="settled",
+            succeeded=True,
+        )
+        malformed_recovery = malformed_harness.sink.commit_invocation(
+            malformed_recovery_invocation,
+            {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB},
+            writer_token=malformed_token,
+        )
+        malformed_harness = malformed_harness.reopen()
+        malformed_recovery_load = malformed_harness.sink.load_invocation(
+            malformed_run_id,
+            "call-1",
+        )
+
         harness = factory()
         run_id = _contract_run_id(namespace, "invocation")
         token = _contract_writer(harness, run_id)
@@ -1971,6 +2149,39 @@ def _run_fenced_run_sink_contract(
                         actual=result_blob_bytes_conflict.status,
                     ),
                     observation(
+                        "malformed_fresh_blob_setup",
+                        expected=("committed", "committed"),
+                        actual=malformed_setup_statuses,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_status",
+                        expected="conflict",
+                        actual=malformed_fresh_blob.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_head_not_published",
+                        expected=2,
+                        actual=malformed_fresh_load.sequence,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_recovery",
+                        expected="committed",
+                        actual=malformed_recovery.status,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_recovery_head",
+                        expected=3,
+                        actual=malformed_recovery_load.sequence,
+                    ),
+                    observation(
+                        "malformed_fresh_blob_recovery_bytes",
+                        expected=_CONTRACT_INVOCATION_BLOB.hex(),
+                        actual=_contract_blob_hex(
+                            malformed_recovery_load.value,
+                            _CONTRACT_INVOCATION_BLOB_SHA256,
+                        ),
+                    ),
+                    observation(
                         "result_load", expected="loaded", actual=loaded_result.status
                     ),
                     observation(
@@ -2090,6 +2301,10 @@ def _run_fenced_run_sink_contract(
             )
             for label, (attempt, dispatch_id) in invalid_retry_coordinates.items()
         }
+        historical_dispatch_id_status = _contract_historical_dispatch_id_reuse_status(
+            factory,
+            _contract_run_id(namespace, "invocation-retry-historical-dispatch-id"),
+        )
         identity_drift_statuses = {
             "idempotency_key": _contract_invocation_drift_status(
                 factory,
@@ -2169,6 +2384,11 @@ def _run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for label, status in invalid_retry_coordinate_statuses.items()
+                    ),
+                    observation(
+                        "retry_coordinate_historical_dispatch_id",
+                        expected="conflict",
+                        actual=historical_dispatch_id_status,
                     ),
                     *(
                         observation(

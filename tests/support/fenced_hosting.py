@@ -73,6 +73,12 @@ class DeterministicFencedRunSink:
     def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
         return writer_token.run_id == run_id and self.current_writers.get(run_id) == writer_token
 
+    def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
+        return all(
+            type(value) is bytes and hashlib.sha256(value).hexdigest() == key
+            for key, value in blobs.items()
+        )
+
     @staticmethod
     def _stored_result(
         records: dict[Any, tuple[str, Any]],
@@ -117,6 +123,8 @@ class DeterministicFencedRunSink:
     ) -> CommitResult:
         if not self._is_current(checkpoint.run_id, writer_token):
             return CommitResult(status="fenced")
+        if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
         digest = _record_digest(checkpoint_payload_for_write(checkpoint), blobs)
         key = (checkpoint.run_id, checkpoint.seq)
         existing = self._stored_result(
@@ -238,6 +246,8 @@ class DeterministicFencedRunSink:
     ) -> CommitResult:
         if not self._is_current(invocation.run_id, writer_token):
             return CommitResult(status="fenced")
+        if not self._blobs_are_content_addressed(blobs):
+            return CommitResult(status="conflict", sequence=invocation.revision)
         digest = _record_digest(invocation.to_json(), blobs)
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
         existing = self._stored_result(
@@ -314,7 +324,7 @@ class DeterministicFencedRunSink:
             if not (
                 invocation.dispatch_state == "reserved"
                 and invocation.dispatch_attempt == previous.dispatch_attempt + 1
-                and invocation.dispatch_id != previous.dispatch_id
+                and not self._dispatch_id_was_used(invocation)
             ):
                 return previous_digest
             return None
@@ -329,6 +339,14 @@ class DeterministicFencedRunSink:
         if invocation.dispatch_state not in allowed_next[previous.dispatch_state]:
             return previous_digest
         return None
+
+    def _dispatch_id_was_used(self, invocation: DurableModelInvocation) -> bool:
+        return any(
+            record.invocation.dispatch_id == invocation.dispatch_id
+            for (run_id, logical_call_id, _), (_, record) in self._invocations.items()
+            if run_id == invocation.run_id
+            and logical_call_id == invocation.logical_call_id
+        )
 
     def load_invocation(
         self,
@@ -390,6 +408,13 @@ class DeterministicFencedRunHarness:
         reopened = copy(self)
         reopened.sink = copy(self.sink)
         return reopened
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        """Read a complete event through the shared durable backing."""
+
+        with self.sink._lock:
+            stored = self.sink._events.get((run_id, seq))
+            return stored[1] if stored is not None else None
 
     def close(self) -> None:
         """Release this in-memory facade; external harnesses close real client resources here."""

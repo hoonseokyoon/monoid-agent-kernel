@@ -460,6 +460,8 @@ Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확�
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
 `reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전체 canonical payload를 읽는다.
+Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
 각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
 factory instance와 명시적으로 reopened된 모든 facade를 추적하고 `finally`에서 역순으로 닫는다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
@@ -520,6 +522,10 @@ Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `alre
 Checkpoint와 invocation의 canonical content에는 함께 제출된 blob key와 byte digest가 포함된다.
 Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 같은 metadata에 다른 blob key를 추가하거나 같은 key의 bytes를 바꾸면 `conflict`다.
+모든 blob key는 제출 bytes의 lowercase SHA-256이다. 새 resource에 잘못된 key/bytes 조합을 제출하면
+`conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
+거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
+`committed`이고 재개방 record가 정확한 bytes를 반환한다.
 성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에
 제출한다. 참조 무결성을 선검증하는 adapter도 conformance contract를 통과해야 한다.
 Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.
@@ -543,6 +549,8 @@ attempt N reserved
 둘 다 2인 초기 좌표는 독립 history에서 각각 `conflict`다.
 Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
 attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
+새 dispatch ID는 해당 logical call의 모든 이전 attempt와 달라야 한다. Contract는 두 번의 retryable
+failure를 만든 뒤 attempt 3에서 attempt 1의 ID를 재사용하는 history를 `conflict`로 검증한다.
 
 ### 6.4 LocalFS capability
 
@@ -847,7 +855,8 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 종료 조건: capability 선언, stale identical mutation의 `fenced`, in-flight writer handoff,
 concurrent same-key CAS, 재개방 durability, 반복 실행 격리, terminal winner,
-checkpoint/invocation private blob round-trip이 검증된다.
+checkpoint/invocation private blob round-trip, malformed fresh blob 비공개, event 전체 payload 보존,
+전체 attempt history의 dispatch ID 유일성이 검증된다.
 
 ### PR 3 — ModelCallRunner lifecycle
 
@@ -993,6 +1002,12 @@ helper가 대기하는 동안 별도 수동 polling을 실행하지 않는다. `
 precedence, compatibility 영향을 다시 조사한다. 근본 원인을 하나의 type, protocol, state
 machine, capability gate로 해결할 수 있는지 결정한다. 필요하면 이 계획과 해당 PR의 dx-note를
 먼저 갱신한다. 구조 개선과 회귀 test를 완료한 뒤 같은 PR에서 리뷰 사이클을 새로 시작한다.
+
+PR 2에서는 반복된 durability 지적에 이 gate를 적용했다. 반환 status 중심 검증을 durable
+postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh malformed blob은 거부 뒤 state를
+다시 읽고, event는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전 attempt가 아니라
+모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을 실패시키는 mutant
+test가 있다.
 
 ### 14.6 최종 통합 PR
 

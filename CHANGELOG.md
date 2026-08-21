@@ -41,6 +41,11 @@ out in commit messages and here.
   instance and reopened sink facade after each complete contract execution. All four resource-key
   families prove independent same-coordinate commits and retries across two authorized runs.
   Checkpoint schema aliases and nested invocation aliases normalize in both retry directions.
+  Fresh malformed checkpoint and invocation blob maps are rejected before metadata or head
+  publication, and every blob key is verified against its submitted bytes. A corrected retry then
+  commits and round-trips the intended bytes. Reopened event
+  inspection compares the complete canonical payload instead of trusting retry digests. Retry
+  reservations reject dispatch IDs used by any earlier attempt in the logical call history.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

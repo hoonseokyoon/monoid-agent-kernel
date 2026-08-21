@@ -604,6 +604,44 @@ def test_reusable_contract_includes_blobs_in_content_identity(
     assert blob_observation.actual == "already_committed"
 
 
+class _UncheckedBlobDigestSink(DeterministicFencedRunSink):
+    def _blobs_are_content_addressed(self, blobs: Mapping[str, bytes]) -> bool:
+        del blobs
+        return True
+
+
+def _unchecked_blob_digest_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _UncheckedBlobDigestSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_fresh_malformed_content_addressed_blobs() -> None:
+    outcomes = run_fenced_run_sink_contract(_unchecked_blob_digest_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+
+    checkpoint_rule = rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"]
+    invocation_rule = rules["FENCED-04-INVOCATION-LIFECYCLE"]
+    checkpoint_observations = {
+        item.observation_id: item for item in checkpoint_rule.observations
+    }
+    invocation_observations = {
+        item.observation_id: item for item in invocation_rule.observations
+    }
+
+    assert checkpoint_rule.status == "failed"
+    assert invocation_rule.status == "failed"
+    assert checkpoint_observations["malformed_fresh_blob_status"].actual == "committed"
+    assert (
+        checkpoint_observations["malformed_fresh_blob_not_published"].actual
+        == "loaded"
+    )
+    assert invocation_observations["malformed_fresh_blob_status"].actual == "committed"
+    assert (
+        invocation_observations["malformed_fresh_blob_head_not_published"].actual == 3
+    )
+
+
 class _ReferentialIntegritySink(DeterministicFencedRunSink):
     def commit_invocation(
         self,
@@ -1146,9 +1184,20 @@ class _CorruptingLoadedRecordSink(DeterministicFencedRunSink):
         )
 
 
+class _CorruptingLoadedRecordHarness(DeterministicFencedRunHarness):
+    corruption = ""
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        event = super().read_event(run_id, seq)
+        if self.corruption != "event" or event is None:
+            return event
+        return replace(event, data={"discarded": True})
+
+
 def _corrupting_loaded_record_factory(corruption: str):
-    def factory() -> DeterministicFencedRunHarness:
-        harness = DeterministicFencedRunHarness()
+    def factory() -> _CorruptingLoadedRecordHarness:
+        harness = _CorruptingLoadedRecordHarness()
+        harness.corruption = corruption
         sink = _CorruptingLoadedRecordSink(harness._writers)
         sink.corruption = corruption
         harness.sink = sink
@@ -1169,6 +1218,11 @@ def _corrupting_loaded_record_factory(corruption: str):
             "invocation",
             "FENCED-04-INVOCATION-LIFECYCLE",
             "latest_invocation_digest",
+        ),
+        (
+            "event",
+            "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+            "event_reopened_payload_digest",
         ),
     ],
 )
@@ -1381,6 +1435,41 @@ def test_reusable_contract_rejects_each_invalid_retry_coordinate(
     assert refusal_rule.status == "failed"
     assert coordinate_observation.expected == "conflict"
     assert coordinate_observation.actual == "committed"
+
+
+class _ImmediatePreviousDispatchOnlySink(DeterministicFencedRunSink):
+    def _dispatch_id_was_used(self, invocation: DurableModelInvocation) -> bool:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is None:
+            return False
+        _, previous_record = self._invocations[
+            (invocation.run_id, invocation.logical_call_id, head)
+        ]
+        return previous_record.invocation.dispatch_id == invocation.dispatch_id
+
+
+def _immediate_previous_dispatch_only_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _ImmediatePreviousDispatchOnlySink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_dispatch_id_reuse_from_any_older_attempt() -> None:
+    outcomes = run_fenced_run_sink_contract(_immediate_previous_dispatch_only_factory)
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    historical_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == "retry_coordinate_historical_dispatch_id"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert historical_observation.expected == "conflict"
+    assert historical_observation.actual == "committed"
 
 
 class _VolatileReopenHarness(DeterministicFencedRunHarness):
@@ -1624,6 +1713,9 @@ class _CloseTrackingHarness:
 
     def reopen(self):
         return _CloseTrackingHarness(self._tracker, self._inner.reopen())
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        return self._inner.read_event(run_id, seq)
 
     def close(self) -> None:
         if self._closed:

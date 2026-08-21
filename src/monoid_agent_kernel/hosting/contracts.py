@@ -93,7 +93,9 @@ class FencedCheckpointStore(Protocol):
     """Shared checkpoint store whose mutation rejects stale host writers.
 
     Every mutation validates the token's run binding before owner, generation, idempotency, or
-    content. A token issued for another run always returns ``fenced``.
+    content. A token issued for another run always returns ``fenced``. Every submitted blob key is
+    the lowercase SHA-256 digest of its bytes. A malformed blob map returns ``conflict`` without
+    publishing metadata or blob content.
     """
 
     @property
@@ -111,7 +113,10 @@ class FencedCheckpointStore(Protocol):
 
 
 class FencedRunSink(FencedCheckpointStore, Protocol):
-    """Composite authoritative journal protected by the inherited run-bound fence."""
+    """Composite authoritative journal protected by the inherited run-bound fence.
+
+    Invocation blob maps follow the inherited content-addressed blob rule.
+    """
 
     def load_invocation(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from typing import get_type_hints
 
@@ -333,10 +334,12 @@ def test_writer_token_cannot_cross_run_boundary() -> None:
 def test_deterministic_harness_reopens_fresh_facades_over_shared_backing() -> None:
     harness = DeterministicFencedRunHarness()
     token = harness.claim_writer("run-reopen", "owner-a")
+    blob = b"durable"
+    blob_sha256 = hashlib.sha256(blob).hexdigest()
     assert (
         harness.sink.commit_checkpoint(
             RunCheckpoint(run_id="run-reopen", seq=1),
-            {"a" * 64: b"durable"},
+            {blob_sha256: blob},
             writer_token=token,
         ).status
         == "committed"
@@ -349,4 +352,4 @@ def test_deterministic_harness_reopens_fresh_facades_over_shared_backing() -> No
     loaded = reopened.sink.latest_checked("run-reopen")
     assert loaded.status == "loaded"
     assert loaded.value is not None
-    assert loaded.value.blob("a" * 64) == b"durable"
+    assert loaded.value.blob(blob_sha256) == blob
