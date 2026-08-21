@@ -2797,6 +2797,10 @@ class _HandoffLoserPayloadOverwriteHarness(DeterministicFencedRunHarness):
                     digest,
                     replace(record, checkpoint=loser_value),
                 )
+            elif mutation == "event":
+                key = (stale_token.run_id, 1)
+                digest, _ = self.sink._events[key]
+                self.sink._events[key] = (digest, loser_value)
             elif mutation == "invocation":
                 key = (stale_token.run_id, "call-1", 3)
                 digest, record = self.sink._invocations[key]
@@ -2804,6 +2808,9 @@ class _HandoffLoserPayloadOverwriteHarness(DeterministicFencedRunHarness):
                     digest,
                     replace(record, invocation=loser_value),
                 )
+            else:
+                digest, _ = self.sink._terminals[stale_token.run_id]
+                self.sink._terminals[stale_token.run_id] = (digest, loser_value)
         return stale_result, current_result, rotation_first
 
 
@@ -2816,7 +2823,7 @@ def _handoff_loser_payload_overwrite_factory(mutation: str):
     return factory
 
 
-@pytest.mark.parametrize("mutation", ["checkpoint", "invocation"])
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
 def test_reusable_contract_reads_the_writer_handoff_winner_payload(
     mutation: str,
 ) -> None:

@@ -499,16 +499,16 @@ Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다.
 연 facade를 직접 닫는다. Backend CAS를 검증하면서 database session이나 client facade의 cross-thread
 안전성을 요구하지 않는다.
 별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
-직렬화되면 stale write는 `fenced`다. Write가 먼저 직렬화되면 stale write가 `committed`다. Event와
-terminal의 새 generation retry는 `already_committed`이고, 서로 다른 blob content를 쓰는 checkpoint와
-invocation retry는 `conflict`다. Blob mutation의 stale callback과 current callback은 서로 다른 digest를
-제출한다. Rotation-first 경로에서는 stale 전용 digest를 빈 map으로 참조할 수 없어야 하며,
+직렬화되면 stale write는 `fenced`다. Write가 먼저 직렬화되면 stale write가 `committed`다. 네 mutation
+모두 stale/current payload가 다르므로 write-first의 current retry는 `conflict`다. Blob mutation의
+stale callback과 current callback은 서로 다른 digest를 제출한다. Rotation-first 경로에서는 stale
+전용 digest를 빈 map으로 참조할 수 없어야 하며,
 write-first 경로에서는 같은 참조가 authoritative backing에서 해소되어야 한다. Current callback은
 stale 전용 bytes를 제출하지 않는다. 이 probe가 metadata fencing 밖의 stale blob publication을
 검출한다.
-Checkpoint와 invocation handoff는 재개방한 record의 전체 canonical payload도 linearization이 선택한
-값과 비교한다. 올바른 status와 blob을 반환한 뒤 metadata만 stale·loser 값으로 덮어쓰는 adapter도
-실패한다.
+네 mutation의 handoff는 stale/current canonical payload를 서로 다르게 제출하고, 재개방한 record
+전체를 linearization이 선택한 값과 비교한다. 올바른 status를 반환한 뒤 metadata만 stale·loser
+값으로 덮어쓰는 adapter도 실패한다. Checkpoint와 invocation은 winner blob bytes까지 함께 비교한다.
 Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
 reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
 generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
@@ -1093,8 +1093,9 @@ Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mu
 retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
 owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
 서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
-확인한다. 같은 handoff에서 재개방한 checkpoint·invocation 전체 payload가 linearization winner와
-일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두 blob-bearing mutation에서
+확인한다. 같은 handoff에서 재개방한 checkpoint·event·invocation·terminal 전체 payload가
+linearization winner와 일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두
+blob-bearing mutation에서
 거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract harness registry는 probe
 전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
 낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는

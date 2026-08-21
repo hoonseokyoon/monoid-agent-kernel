@@ -2374,7 +2374,10 @@ def _run_fenced_run_sink_contract(
                         handoff_run_id,
                         handoff_stale,
                     )
-                current_value, _ = _contract_competing_values(mutation, handoff_run_id)
+                current_value, competing_value = _contract_competing_values(
+                    mutation,
+                    handoff_run_id,
+                )
                 current_blobs = _contract_mutation_blobs(mutation)
                 if mutation == "checkpoint":
                     stale_value = replace(
@@ -2400,7 +2403,7 @@ def _run_fenced_run_sink_contract(
                         _CONTRACT_STALE_HANDOFF_BLOB_SHA256: _CONTRACT_STALE_HANDOFF_BLOB,
                     }
                 else:
-                    stale_value = current_value
+                    stale_value = competing_value
                     stale_blobs = current_blobs
                 handoff_write = partial(
                     _contract_handoff_write,
@@ -2422,9 +2425,7 @@ def _run_fenced_run_sink_contract(
                     if rotation_first
                     else (
                         "committed",
-                        "conflict"
-                        if mutation in {"checkpoint", "invocation"}
-                        else "already_committed",
+                        "conflict",
                     )
                 )
                 handoff_observations.append(
@@ -2434,14 +2435,24 @@ def _run_fenced_run_sink_contract(
                         actual=(stale_result.status, current_result.status),
                     )
                 )
-                if mutation in {"checkpoint", "invocation"}:
-                    handoff_read_harness = handoff_harness.reopen()
-                    winner_value = current_value if rotation_first else stale_value
-                    winner_payload_digest = _contract_race_payload_digest(
-                        handoff_read_harness,
-                        mutation,
-                        handoff_run_id,
+                handoff_read_harness = handoff_harness.reopen()
+                winner_value = current_value if rotation_first else stale_value
+                winner_payload_digest = _contract_race_payload_digest(
+                    handoff_read_harness,
+                    mutation,
+                    handoff_run_id,
+                )
+                handoff_observations.append(
+                    observation(
+                        f"handoff_{handoff_kind}_{mutation}_winner_payload",
+                        expected=_contract_mutation_payload_digest(
+                            mutation,
+                            winner_value,
+                        ),
+                        actual=winner_payload_digest,
                     )
+                )
+                if mutation in {"checkpoint", "invocation"}:
                     winner_blob = (
                         _CONTRACT_CHECKPOINT_BLOB
                         if rotation_first and mutation == "checkpoint"
@@ -2466,16 +2477,6 @@ def _run_fenced_run_sink_contract(
                                 handoff_run_id,
                                 winner_blob_sha256,
                             ),
-                        )
-                    )
-                    handoff_observations.append(
-                        observation(
-                            f"handoff_{handoff_kind}_{mutation}_winner_payload",
-                            expected=_contract_mutation_payload_digest(
-                                mutation,
-                                winner_value,
-                            ),
-                            actual=winner_payload_digest,
                         )
                     )
                     stale_blob_probe = _contract_stale_handoff_blob_probe(
