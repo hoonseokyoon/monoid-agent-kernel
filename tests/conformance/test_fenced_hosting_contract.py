@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from threading import Barrier, current_thread
 
 import pytest
 
@@ -548,3 +549,146 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
     assert refusal_rule.status == "failed"
     assert drift_observation.expected == "conflict"
     assert drift_observation.actual == "committed"
+
+
+class _VolatileReopenHarness(DeterministicFencedRunHarness):
+    def reopen(self) -> DeterministicFencedRunHarness:
+        return _VolatileReopenHarness()
+
+
+def test_reusable_contract_rejects_process_local_only_storage() -> None:
+    outcomes = run_fenced_run_sink_contract(_VolatileReopenHarness)
+    durable_rules = {
+        outcome.rule_id: outcome.status
+        for outcome in outcomes
+        if outcome.rule_id
+        in {
+            "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+            "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+            "FENCED-04-INVOCATION-LIFECYCLE",
+        }
+    }
+
+    assert durable_rules == {
+        "FENCED-01-CHECKPOINT-CONTENT-IDENTITY": "failed",
+        "FENCED-03-EVENT-AND-TERMINAL-WINNERS": "failed",
+        "FENCED-04-INVOCATION-LIFECYCLE": "failed",
+    }
+
+
+class _NonAtomicRaceSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+    _race_barrier: Barrier
+
+    def _is_contract_racer(self) -> bool:
+        return current_thread().name.startswith("fenced-contract")
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (checkpoint.run_id, checkpoint.seq)
+        if (
+            self.broken_mutation == "checkpoint"
+            and self._is_contract_racer()
+            and self._is_current(checkpoint.run_id, writer_token)
+            and key not in self._checkpoints
+        ):
+            self._race_barrier.wait(timeout=10)
+            with self._lock:
+                self._checkpoints.pop(key, None)
+                return self._commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (event.run_id, event.seq)
+        if (
+            self.broken_mutation == "event"
+            and self._is_contract_racer()
+            and self._is_current(event.run_id, writer_token)
+            and key not in self._events
+        ):
+            self._race_barrier.wait(timeout=10)
+            with self._lock:
+                self._events.pop(key, None)
+                return self._append_event(event, writer_token=writer_token)
+        return super().append_event(event, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        head_key = (invocation.run_id, invocation.logical_call_id)
+        if (
+            self.broken_mutation == "invocation"
+            and self._is_contract_racer()
+            and self._is_current(invocation.run_id, writer_token)
+            and key not in self._invocations
+        ):
+            self._race_barrier.wait(timeout=10)
+            with self._lock:
+                self._invocations.pop(key, None)
+                self._invocation_heads.pop(head_key, None)
+                return self._commit_invocation(invocation, blobs, writer_token=writer_token)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if (
+            self.broken_mutation == "terminal"
+            and self._is_contract_racer()
+            and self._is_current(outcome.run_id, writer_token)
+            and outcome.run_id not in self._terminals
+        ):
+            self._race_barrier.wait(timeout=10)
+            with self._lock:
+                self._terminals.pop(outcome.run_id, None)
+                return self._settle_terminal(outcome, writer_token=writer_token)
+        return super().settle_terminal(outcome, writer_token=writer_token)
+
+
+def _non_atomic_race_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _NonAtomicRaceSink(harness._writers)
+        sink.broken_mutation = mutation
+        sink._race_barrier = Barrier(2)
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
+def test_reusable_contract_rejects_non_atomic_competing_writers(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_non_atomic_race_factory(mutation))
+    winner_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-03-EVENT-AND-TERMINAL-WINNERS"
+    )
+    race_observation = next(
+        observation
+        for observation in winner_rule.observations
+        if observation.observation_id == f"{mutation}_race_statuses"
+    )
+
+    assert winner_rule.status == "failed"
+    assert race_observation.expected == ("committed", "conflict")
+    assert race_observation.actual == ("committed", "committed")

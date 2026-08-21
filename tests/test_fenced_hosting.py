@@ -328,3 +328,25 @@ def test_writer_token_cannot_cross_run_boundary() -> None:
         ).status
         == "fenced"
     )
+
+
+def test_deterministic_harness_reopens_fresh_facades_over_shared_backing() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = harness.claim_writer("run-reopen", "owner-a")
+    assert (
+        harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id="run-reopen", seq=1),
+            {"a" * 64: b"durable"},
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+
+    reopened = harness.reopen()
+
+    assert reopened is not harness
+    assert reopened.sink is not harness.sink
+    loaded = reopened.sink.latest_checked("run-reopen")
+    assert loaded.status == "loaded"
+    assert loaded.value is not None
+    assert loaded.value.blob("a" * 64) == b"durable"

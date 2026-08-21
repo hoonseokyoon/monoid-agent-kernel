@@ -28,8 +28,9 @@ out in commit messages and here.
   package root and carry no database, queue, lease, Redis, or Temporal dependency.
 - Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
   blob-inclusive content identity, monotonic checkpoint publication, terminal first-writer-wins,
-  and field-complete durable invocation transitions. `LocalFsCheckpointStore` now declares its
-  actual single-writer checkpoint capability while retaining the legacy unfenced store API.
+  field-complete durable invocation transitions, fresh-facade durability, and barrier-coordinated
+  CAS races for every authoritative mutation. `LocalFsCheckpointStore` now declares its actual
+  single-writer checkpoint capability while retaining the legacy unfenced store API.
 
 ## [0.21.0] - 2026-08-12
 

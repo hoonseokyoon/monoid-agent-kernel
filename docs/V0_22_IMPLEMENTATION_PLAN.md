@@ -458,6 +458,12 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
 Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확한 현재 token을 설치한다.
 이 seam은 host의 실제 generation allocator를 호출하지 않는다. 따라서 per-run counter와 global
 monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
+`reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
+checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+
+Contract는 `Barrier`로 두 worker의 동일-key write 시작점을 맞추고 checkpoint, event, invocation,
+terminal의 conflicting content를 각각 경쟁시킨다. 각 경쟁은 정확히 하나의 `committed`와 하나의
+`conflict`를 만들며, 재개방 뒤 winner retry는 `already_committed`, loser retry는 `conflict`다.
 
 ### 6.3 Commit 판정 순서
 
@@ -801,8 +807,8 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 - LocalFS `single_writer` capability
 - deterministic fake adapter와 fencing conformance
 
-종료 조건: capability 선언, stale identical mutation의 `fenced`, same-key conflict, terminal winner,
-checkpoint/invocation private blob round-trip이 검증된다.
+종료 조건: capability 선언, stale identical mutation의 `fenced`, concurrent same-key CAS, 재개방
+durability, terminal winner, checkpoint/invocation private blob round-trip이 검증된다.
 
 ### PR 3 — ModelCallRunner lifecycle
 

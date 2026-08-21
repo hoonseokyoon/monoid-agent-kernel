@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from copy import copy
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 from monoid_agent_kernel.core._util import canonical_sha256
@@ -52,7 +54,7 @@ def _record_digest(payload: dict[str, Any], blobs: Mapping[str, bytes] = {}) -> 
 
 @dataclass
 class DeterministicFencedRunSink:
-    """A lock-free fake: callers advance ownership explicitly, so every race is reproducible."""
+    """A shared-backing fake with explicit ownership and atomic mutation critical sections."""
 
     current_writers: dict[str, WriterToken]
     capabilities: StorageCapabilities = _FENCED_CAPABILITIES
@@ -64,6 +66,7 @@ class DeterministicFencedRunSink:
     ] = field(default_factory=dict)
     _invocation_heads: dict[tuple[str, str], int] = field(default_factory=dict)
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
+    _lock: Any = field(default_factory=RLock, repr=False)
 
     def _is_current(self, run_id: str, writer_token: WriterToken) -> bool:
         return writer_token.run_id == run_id and self.current_writers.get(run_id) == writer_token
@@ -94,6 +97,16 @@ class DeterministicFencedRunSink:
         )
 
     def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        with self._lock:
+            return self._commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def _commit_checkpoint(
         self,
         checkpoint: RunCheckpoint,
         blobs: Mapping[str, bytes],
@@ -136,6 +149,10 @@ class DeterministicFencedRunSink:
         )
 
     def latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
+        with self._lock:
+            return self._latest_checked(run_id)
+
+    def _latest_checked(self, run_id: str) -> DurableLoadResult[CheckpointRecord]:
         head = self._checkpoint_heads.get(run_id)
         if head is None:
             return CHECKPOINT_CODEC.missing().map(
@@ -157,6 +174,15 @@ class DeterministicFencedRunSink:
         *,
         writer_token: WriterToken,
     ) -> CommitResult:
+        with self._lock:
+            return self._append_event(event, writer_token=writer_token)
+
+    def _append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
         if not self._is_current(event.run_id, writer_token):
             return CommitResult(status="fenced")
         digest = _record_digest(event.to_json())
@@ -173,6 +199,15 @@ class DeterministicFencedRunSink:
         *,
         writer_token: WriterToken,
     ) -> CommitResult:
+        with self._lock:
+            return self._settle_terminal(outcome, writer_token=writer_token)
+
+    def _settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
         if not self._is_current(outcome.run_id, writer_token):
             return CommitResult(status="fenced")
         digest = _record_digest(outcome.to_json())
@@ -183,6 +218,16 @@ class DeterministicFencedRunSink:
         return CommitResult(status="committed", content_digest=digest)
 
     def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        with self._lock:
+            return self._commit_invocation(invocation, blobs, writer_token=writer_token)
+
+    def _commit_invocation(
         self,
         invocation: DurableModelInvocation,
         blobs: Mapping[str, bytes],
@@ -286,6 +331,14 @@ class DeterministicFencedRunSink:
         run_id: str,
         logical_call_id: str,
     ) -> DurableLoadResult[ModelInvocationRecord]:
+        with self._lock:
+            return self._load_invocation(run_id, logical_call_id)
+
+    def _load_invocation(
+        self,
+        run_id: str,
+        logical_call_id: str,
+    ) -> DurableLoadResult[ModelInvocationRecord]:
         head = self._invocation_heads.get((run_id, logical_call_id))
         if head is None:
             return MODEL_INVOCATION_CODEC.missing()
@@ -325,3 +378,10 @@ class DeterministicFencedRunHarness:
             raise ValueError("writer generation must advance within a run")
         self._generations[writer_token.run_id] = writer_token.generation
         self._writers[writer_token.run_id] = writer_token
+
+    def reopen(self) -> DeterministicFencedRunHarness:
+        """Return fresh host and sink facades sharing the same simulated durable backing."""
+
+        reopened = copy(self)
+        reopened.sink = copy(self.sink)
+        return reopened
