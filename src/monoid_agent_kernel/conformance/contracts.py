@@ -112,6 +112,7 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
     }
 )
 _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset({"schema_version", "digest_generation"})
+_CONTRACT_RETRY_STABLE_IDENTITY_FIELDS = frozenset({"idempotency_key", "request_digest"})
 _CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
     {
         "schema_version",
@@ -1230,6 +1231,52 @@ def _contract_retry_coordinate_status(
             dispatch_id=dispatch_id,
             dispatch_state="reserved",
         ),
+        {},
+        writer_token=token,
+    ).status
+
+
+def _contract_retry_identity_drift_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+) -> str:
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    history = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            retryable=True,
+        ),
+    )
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in history
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return f"setup:{','.join(setup_statuses)}"
+    baseline = _contract_invocation(
+        run_id,
+        revision=4,
+        dispatch_attempt=2,
+        dispatch_id="dispatch-2",
+        dispatch_state="reserved",
+    )
+    variants = {
+        "idempotency_key": replace(
+            baseline,
+            idempotency_key="contract-retry-idempotency-drift",
+        ),
+        "request_digest": replace(baseline, request_digest="b" * 64),
+    }
+    if set(variants) != _CONTRACT_RETRY_STABLE_IDENTITY_FIELDS:
+        raise AssertionError("retry stable identity matrix is incomplete")
+    return harness.sink.commit_invocation(
+        variants[field_name],
         {},
         writer_token=token,
     ).status
@@ -4360,6 +4407,17 @@ def _run_fenced_run_sink_contract(
             )
             for label, (attempt, dispatch_id) in invalid_retry_coordinates.items()
         }
+        retry_identity_drift_statuses = {
+            field_name: _contract_retry_identity_drift_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-retry-identity-{field_name.replace('_', '-')}",
+                ),
+                field_name,
+            )
+            for field_name in sorted(_CONTRACT_RETRY_STABLE_IDENTITY_FIELDS)
+        }
         (
             historical_dispatch_id_status,
             valid_third_attempt_statuses,
@@ -4501,6 +4559,14 @@ def _run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for label, status in invalid_retry_coordinate_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"retry_identity_drift_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in retry_identity_drift_statuses.items()
                     ),
                     observation(
                         "retry_coordinate_historical_dispatch_id",

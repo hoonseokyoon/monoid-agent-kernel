@@ -2979,6 +2979,70 @@ def test_reusable_contract_rejects_each_invalid_retry_coordinate(
     assert coordinate_observation.actual == "committed"
 
 
+class _RetryInvocationIdentityDriftSink(DeterministicFencedRunSink):
+    ignored_field = ""
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head is not None:
+            _, previous_record = self._invocations[
+                (invocation.run_id, invocation.logical_call_id, head)
+            ]
+            previous = previous_record.invocation
+            retry_reservation = (
+                previous.dispatch_state == "settled"
+                and bool(previous.failure_code)
+                and previous.receipt is not None
+                and previous.receipt.get("retryable") is True
+                and invocation.dispatch_state == "reserved"
+                and invocation.dispatch_attempt == previous.dispatch_attempt + 1
+            )
+            if retry_reservation and getattr(invocation, self.ignored_field) != getattr(
+                previous,
+                self.ignored_field,
+            ):
+                invocation = replace(
+                    invocation,
+                    **{self.ignored_field: getattr(previous, self.ignored_field)},
+                )
+        return super()._invocation_transition_winner(invocation)
+
+
+def _retry_invocation_identity_drift_factory(field_name: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _RetryInvocationIdentityDriftSink(harness._writers)
+        sink.ignored_field = field_name
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("field_name", ["idempotency_key", "request_digest"])
+def test_reusable_contract_checks_stable_identity_when_reserving_retry(
+    field_name: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_retry_invocation_identity_drift_factory(field_name))
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    observation = next(
+        item
+        for item in refusal_rule.observations
+        if item.observation_id == f"retry_identity_drift_{field_name}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert observation.expected == "conflict"
+    assert observation.actual == "committed"
+
+
 class _ReceiptFlagOnlyRetrySink(DeterministicFencedRunSink):
     def _invocation_transition_winner(
         self,

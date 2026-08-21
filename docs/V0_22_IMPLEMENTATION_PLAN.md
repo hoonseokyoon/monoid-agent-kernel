@@ -652,6 +652,8 @@ commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 lo
 둘 다 2인 초기 좌표는 독립 history에서 각각 `conflict`다.
 Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
 attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
+다음 attempt의 reservation은 logical call의 `idempotency_key`와 `request_digest`를 그대로 유지한다.
+Contract는 두 필드를 각각 단독 변형한 후보를 `conflict`로 거부한다.
 Stable invocation identity는 `reserved → dispatch_started`, `dispatch_started → settled`,
 `dispatch_started → unknown`의 모든 legal edge에서 유지된다. Terminal 두 edge는 idempotency key,
 request digest, dispatch ID, dispatch attempt를 각각 변형한 8칸 행렬로 `conflict`를 검증한다.
@@ -1155,6 +1157,8 @@ Invocation terminal edge identity는 settled·unknown과 네 stable identity fie
 Terminal retry 행렬은 settled failure의 `retryable=false`·필드 생략·`retryable=true`를 구분하고,
 명시적인 true만 새 reservation을 허용한다. Run 격리 행렬은 checkpoint·event·invocation·terminal
 네 family의 서로 다른 non-key payload를 재개방 후 각각 완전 비교한다.
+Retry reservation identity 행렬은 새 dispatch coordinate에서 `idempotency_key`와 `request_digest`
+drift를 각각 거부한다.
 
 ### 14.6 최종 통합 PR
 
