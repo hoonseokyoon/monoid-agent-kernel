@@ -528,7 +528,9 @@ resource는 stale token으로 같은 payload, 다른 payload, malformed blob map
 모두 content equality, conflict, blob validation보다 fence 판정이 먼저 실행되어 `fenced`다.
 Fresh resource도 stale owner+generation, current owner+stale generation, wrong owner+current generation의
 세 token에 malformed checkpoint·invocation map을 각각 교차한다. Insert 경로도 blob validation보다
-fence 판정을 먼저 실행한다.
+fence 판정을 먼저 실행한다. 각 malformed map은 mutation별 고유한 valid stale-only blob도 함께
+제출한다. 재개방 뒤 current token의 checkpoint와 invocation empty-map 참조가 모두 `conflict`여야 한다.
+따라서 `fenced`를 반환하면서 blob을 먼저 게시하는 adapter도 실패한다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
 bytes를 읽는다. CAS race는 `committed` 결과를 낸 좌·우 값에서 winner를 결정하고 네 mutation의
@@ -1136,6 +1138,8 @@ Checkpoint·invocation의 same-key blob-map conflict 뒤 loser digest를 empty-m
 conflicting blob 비공개도 확인한다.
 Writer generation 전환 run의 event `seq=1`·`seq=2`를 모두 재로딩해 같은 run 안의 payload 보존을
 검증한다.
+Fresh partial-authority 세 조합은 checkpoint·invocation의 고유 stale-only blob visibility를 모두
+검증해 malformed pre-fence publication을 거부한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
 Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를

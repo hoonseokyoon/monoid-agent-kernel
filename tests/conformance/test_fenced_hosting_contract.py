@@ -1256,6 +1256,78 @@ def test_reusable_contract_checks_fencing_before_malformed_blob_validation() -> 
         assert all(item.actual == "conflict" for item in selected.values())
 
 
+class _PublishingFreshStaleBlobsSink(DeterministicFencedRunSink):
+    broken_mutation = ""
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if (
+            self.broken_mutation == "checkpoint"
+            and (checkpoint.run_id, checkpoint.seq) not in self._checkpoints
+            and not self._is_current(checkpoint.run_id, writer_token)
+        ):
+            self._publish_blobs(checkpoint.run_id, blobs)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        if (
+            self.broken_mutation == "invocation"
+            and key not in self._invocations
+            and not self._is_current(invocation.run_id, writer_token)
+        ):
+            self._publish_blobs(invocation.run_id, blobs)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _publishing_fresh_stale_blobs_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _PublishingFreshStaleBlobsSink(harness._writers)
+        sink.broken_mutation = mutation
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("mutation", "leaked_result"),
+    [
+        ("checkpoint", ("committed", "loaded")),
+        ("invocation", ("committed", 3)),
+    ],
+)
+def test_reusable_contract_keeps_fresh_stale_blobs_non_authoritative(
+    mutation: str,
+    leaked_result: tuple[str, str | int],
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_publishing_fresh_stale_blobs_factory(mutation))
+    fence_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    visibility_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id
+        == f"fresh_malformed_stale_generation_current_owner_{mutation}_blob_visibility"
+    )
+
+    assert fence_rule.status == "failed"
+    assert visibility_observation.actual == leaked_result
+
+
 class _InvalidCommitEvidenceSink(DeterministicFencedRunSink):
     broken_mutation = ""
     broken_status = ""

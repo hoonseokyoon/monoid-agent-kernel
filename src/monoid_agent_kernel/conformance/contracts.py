@@ -2524,6 +2524,8 @@ def _run_fenced_run_sink_contract(
 
         fresh_authority_probe_statuses = {}
         fresh_authority_malformed_statuses = {}
+        fresh_authority_blob_visibility = {}
+        fresh_authority_blob_visibility_setup = {}
         fresh_authority_recovery_statuses = {}
         for authority_case in (
             "stale_owner_and_generation",
@@ -2568,15 +2570,33 @@ def _run_fenced_run_sink_contract(
                 ),
                 "terminal": _contract_terminal(fresh_run_id),
             }
+            stale_only_blobs = {
+                mutation: f"{authority_case}:{mutation}:stale-only\n".encode()
+                for mutation in ("checkpoint", "invocation")
+            }
+            stale_only_digests = {
+                mutation: hashlib.sha256(blob).hexdigest()
+                for mutation, blob in stale_only_blobs.items()
+            }
+            malformed_blob_maps = {
+                "checkpoint": {
+                    _CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB,
+                    stale_only_digests["checkpoint"]: stale_only_blobs["checkpoint"],
+                },
+                "invocation": {
+                    _CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB,
+                    stale_only_digests["invocation"]: stale_only_blobs["invocation"],
+                },
+            }
             fresh_authority_malformed_statuses[authority_case] = {
                 "checkpoint": fresh_harness.sink.commit_checkpoint(
                     fresh_records["checkpoint"],
-                    {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    malformed_blob_maps["checkpoint"],
                     writer_token=invalid_token,
                 ).status,
                 "invocation": fresh_harness.sink.commit_invocation(
                     fresh_records["invocation"],
-                    {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    malformed_blob_maps["invocation"],
                     writer_token=invalid_token,
                 ).status,
             }
@@ -2585,6 +2605,67 @@ def _run_fenced_run_sink_contract(
                 **fresh_records,
                 writer_token=invalid_token,
             )
+            fresh_harness = fresh_harness.reopen()
+            checkpoint_blob_visibility = fresh_harness.sink.commit_checkpoint(
+                RunCheckpoint(
+                    run_id=fresh_run_id,
+                    seq=2,
+                    workspace_delta=[
+                        {
+                            "path": "stale-only-checkpoint-blob.txt",
+                            "kind": "file",
+                            "change_kind": "created",
+                            "content_sha256": stale_only_digests["checkpoint"],
+                        }
+                    ],
+                ),
+                {},
+                writer_token=fresh_current,
+            )
+            checkpoint_blob_visibility_load = fresh_harness.sink.latest_checked(fresh_run_id)
+            visibility_call_id = "call-stale-only-blob"
+            invocation_blob_visibility_setup = tuple(
+                fresh_harness.sink.commit_invocation(
+                    _contract_invocation(
+                        fresh_run_id,
+                        logical_call_id=visibility_call_id,
+                        revision=revision,
+                        dispatch_state=dispatch_state,
+                    ),
+                    {},
+                    writer_token=fresh_current,
+                ).status
+                for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+            )
+            invocation_blob_visibility = fresh_harness.sink.commit_invocation(
+                replace(
+                    _contract_invocation(
+                        fresh_run_id,
+                        logical_call_id=visibility_call_id,
+                        revision=3,
+                        dispatch_state="settled",
+                        succeeded=True,
+                    ),
+                    result_ref=f"blob:{stale_only_digests['invocation']}",
+                ),
+                {},
+                writer_token=fresh_current,
+            )
+            invocation_blob_visibility_load = fresh_harness.sink.load_invocation(
+                fresh_run_id,
+                visibility_call_id,
+            )
+            fresh_authority_blob_visibility[authority_case] = {
+                "checkpoint": (
+                    checkpoint_blob_visibility.status,
+                    checkpoint_blob_visibility_load.status,
+                ),
+                "invocation": (
+                    invocation_blob_visibility.status,
+                    invocation_blob_visibility_load.sequence,
+                ),
+            }
+            fresh_authority_blob_visibility_setup[authority_case] = invocation_blob_visibility_setup
             fresh_authority_recovery_statuses[authority_case] = _contract_authority_probe_statuses(
                 fresh_harness.sink,
                 **fresh_records,
@@ -2845,6 +2926,30 @@ def _run_fenced_run_sink_contract(
                             fresh_authority_malformed_statuses.items()
                         )
                         for mutation, status in mutation_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"fresh_malformed_{authority_case}_{mutation}_blob_visibility",
+                            expected={
+                                "checkpoint": ("conflict", "missing"),
+                                "invocation": ("conflict", 2),
+                            }[mutation],
+                            actual=actual,
+                        )
+                        for authority_case, mutation_visibility in (
+                            fresh_authority_blob_visibility.items()
+                        )
+                        for mutation, actual in mutation_visibility.items()
+                    ),
+                    *(
+                        observation(
+                            f"fresh_malformed_{authority_case}_invocation_blob_visibility_setup",
+                            expected=("committed", "committed"),
+                            actual=actual,
+                        )
+                        for authority_case, actual in (
+                            fresh_authority_blob_visibility_setup.items()
+                        )
                     ),
                     *(
                         observation(
