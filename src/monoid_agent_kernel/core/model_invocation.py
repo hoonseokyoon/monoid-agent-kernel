@@ -112,6 +112,12 @@ _USAGE_FIELDS = {
     "totaltokens": "total_tokens",
 }
 
+MODEL_INVOCATION_RECEIPT_FIELDS = frozenset(_RECEIPT_FIELDS.values())
+"""Canonical public fields accepted by the durable model-invocation receipt."""
+
+MODEL_INVOCATION_RECEIPT_USAGE_FIELDS = frozenset(_USAGE_FIELDS.values())
+"""Canonical token counters accepted inside ``receipt.usage``."""
+
 
 def _collapsed_receipt_key(key: str) -> str:
     return "".join(character for character in key.casefold() if character.isalnum())
@@ -187,9 +193,7 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_CODE_FIELDS:
             if not is_safe_taxonomy_code(value):
-                raise ValueError(
-                    f"model invocation receipt {canonical_key} must be a bounded code"
-                )
+                raise ValueError(f"model invocation receipt {canonical_key} must be a bounded code")
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_TIMESTAMP_FIELDS:
             if not is_safe_utc_timestamp(value):

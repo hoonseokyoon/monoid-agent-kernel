@@ -640,6 +640,9 @@ Settled failure receipt에서 `retryable` 필드가 생략되면 재시도 근�
 dispatch reservation을 허용한다.
 세 retryability 상태는 receipt content identity에서도 서로 다르다. 같은 revision의 세 상태를 모든
 6개 방향으로 비교해 `conflict`를 요구하고, 재개방한 canonical payload가 원래 winner인지 확인한다.
+Core는 accepted top-level receipt field와 nested usage counter 집합을 공개한다. Contract fixture는 이
+두 집합에서 자동 파생된다. 각 필드는 fresh settled failure로 정상 commit·reopen된 뒤 같은 revision의
+alternate evidence와 `conflict`하고, 두 번째 reopen에서도 처음 winner payload를 유지해야 한다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
 유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 dispatch identity가 다른 retry를
@@ -1165,6 +1168,8 @@ Retry reservation identity 행렬은 새 dispatch coordinate에서 `idempotency_
 drift를 각각 거부한다.
 Receipt identity 행렬은 `retryable=true | false | omitted`의 모든 directed pair를 conflict로 거부하고
 각 conflict 뒤 원래 winner payload를 재로딩한다.
+전체 receipt identity 행렬은 공개된 top-level field와 nested usage counter를 빠짐없이 순회한다.
+정상 settlement 수용, same-revision conflict, conflict 뒤 winner 보존을 독립 mutant로 검증한다.
 
 ### 14.6 최종 통합 PR
 

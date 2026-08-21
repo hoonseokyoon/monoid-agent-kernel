@@ -41,6 +41,8 @@ from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.model_invocation import (
     ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS,
     ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS,
+    MODEL_INVOCATION_RECEIPT_FIELDS,
+    MODEL_INVOCATION_RECEIPT_USAGE_FIELDS,
     MODEL_INVOCATION_SCHEMA_VERSION,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
@@ -1539,6 +1541,91 @@ def _contract_receipt_retryability_identity_evidence(
     winner_digest = canonical_sha256(winner.to_json())
     loaded_digest = canonical_sha256(loaded.value.invocation.to_json()) if loaded.value else None
     return winner_digest, (conflict.status, loaded_digest)
+
+
+def _contract_receipt_field_identity_evidence(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+    *,
+    usage_field_name: str = "",
+) -> tuple[str, tuple[str, str | None, str, str | None]]:
+    receipt_values: dict[str, tuple[Any, Any]] = {
+        "attempts": (1, 2),
+        "duration_ms": (1.0, 2.0),
+        "finish_reason": ("stop", "length"),
+        "http_status": (200, 503),
+        "latency_ms": (3.0, 4.0),
+        "provider_error_code": ("provider_refused", "provider_timeout"),
+        "provider_request_id": ("provider_request_1", "provider_request_2"),
+        "provider_response_id": ("provider_response_1", "provider_response_2"),
+        "provider_retried": (False, True),
+        "request_digest": ("a" * 64, None),
+        "request_id": ("request_1", "request_2"),
+        "response_id": ("response_1", "response_2"),
+        "retryable": (False, True),
+        "settled_at": ("2026-08-21T00:00:00Z", "2026-08-21T00:00:01Z"),
+        "started_at": ("2026-08-21T00:00:00Z", "2026-08-21T00:00:01Z"),
+        "stop_reason": ("end_turn", "max_tokens"),
+        "system_fingerprint": ("fingerprint_1", "fingerprint_2"),
+        "usage": ({"input_tokens": 1}, {"input_tokens": 2}),
+    }
+    if set(receipt_values) != MODEL_INVOCATION_RECEIPT_FIELDS:
+        raise AssertionError("receipt field identity matrix is incomplete")
+    if usage_field_name:
+        if field_name != "usage":
+            raise AssertionError("nested receipt identity field must belong to usage")
+        if usage_field_name not in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS:
+            raise AssertionError("unknown receipt usage identity field")
+        winner_receipt = {"usage": {usage_field_name: 1}}
+        candidate_receipt = {"usage": {usage_field_name: 2}}
+    else:
+        winner_value, candidate_value = receipt_values[field_name]
+        winner_receipt = {field_name: winner_value}
+        candidate_receipt = {} if field_name == "request_digest" else {field_name: candidate_value}
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    setup = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+    )
+    setup_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in setup
+    )
+    if any(status != "committed" for status in setup_statuses):
+        return "", (f"setup:{','.join(setup_statuses)}", None, "not_run", None)
+    winner = replace(
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            retryable=None,
+        ),
+        receipt=winner_receipt,
+    )
+    first = harness.sink.commit_invocation(winner, {}, writer_token=token)
+    harness = harness.reopen()
+    loaded_winner = harness.sink.load_invocation(run_id, "call-1")
+    candidate = replace(winner, receipt=candidate_receipt)
+    conflict = harness.sink.commit_invocation(candidate, {}, writer_token=token)
+    harness = harness.reopen()
+    loaded_after_conflict = harness.sink.load_invocation(run_id, "call-1")
+    winner_digest = canonical_sha256(winner.to_json())
+    return winner_digest, (
+        first.status,
+        (
+            canonical_sha256(loaded_winner.value.invocation.to_json())
+            if loaded_winner.value
+            else None
+        ),
+        conflict.status,
+        (
+            canonical_sha256(loaded_after_conflict.value.invocation.to_json())
+            if loaded_after_conflict.value
+            else None
+        ),
+    )
 
 
 def _contract_invocation_canonical_alias_status(
@@ -3523,6 +3610,29 @@ def _run_fenced_run_sink_contract(
             for candidate_state in _CONTRACT_RECEIPT_RETRYABILITY_STATES
             if winner_state != candidate_state
         }
+        receipt_field_identity_results = {
+            field_name: _contract_receipt_field_identity_evidence(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-receipt-field-{field_name.replace('_', '-')}",
+                ),
+                field_name,
+            )
+            for field_name in sorted(MODEL_INVOCATION_RECEIPT_FIELDS)
+        }
+        receipt_usage_identity_results = {
+            field_name: _contract_receipt_field_identity_evidence(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-receipt-usage-{field_name.replace('_', '-')}",
+                ),
+                "usage",
+                usage_field_name=field_name,
+            )
+            for field_name in sorted(MODEL_INVOCATION_RECEIPT_USAGE_FIELDS)
+        }
         invocation_canonical_alias_statuses = {
             (field_name, direction): _contract_invocation_canonical_alias_status(
                 factory,
@@ -4199,6 +4309,32 @@ def _run_fenced_run_sink_contract(
                         for (winner_state, candidate_state), evidence in (
                             receipt_retryability_identity_results.items()
                         )
+                    ),
+                    *(
+                        observation(
+                            f"receipt_field_identity_{field_name}",
+                            expected=(
+                                "committed",
+                                evidence[0],
+                                "conflict",
+                                evidence[0],
+                            ),
+                            actual=evidence[1],
+                        )
+                        for field_name, evidence in receipt_field_identity_results.items()
+                    ),
+                    *(
+                        observation(
+                            f"receipt_usage_identity_{field_name}",
+                            expected=(
+                                "committed",
+                                evidence[0],
+                                "conflict",
+                                evidence[0],
+                            ),
+                            actual=evidence[1],
+                        )
+                        for field_name, evidence in receipt_usage_identity_results.items()
                     ),
                     *(
                         observation(

@@ -12,7 +12,11 @@ from monoid_agent_kernel.conformance import run_fenced_run_sink_contract
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.media import blob_shas_in_messages
-from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.model_invocation import (
+    MODEL_INVOCATION_RECEIPT_FIELDS,
+    MODEL_INVOCATION_RECEIPT_USAGE_FIELDS,
+    DurableModelInvocation,
+)
 from monoid_agent_kernel.core.outcome import TerminalOutcome
 from monoid_agent_kernel.hosting import CommitResult, StorageCapabilities, WriterToken
 from support.fenced_hosting import (
@@ -2080,6 +2084,17 @@ def _differs_only_in_receipt_retryability(
     )
 
 
+def _differs_only_in_receipt(
+    winner: DurableModelInvocation,
+    candidate: DurableModelInvocation,
+) -> bool:
+    winner_payload = winner.to_json()
+    candidate_payload = candidate.to_json()
+    winner_receipt = winner_payload.pop("receipt")
+    candidate_receipt = candidate_payload.pop("receipt")
+    return winner_payload == candidate_payload and winner_receipt != candidate_receipt
+
+
 class _IgnoringReceiptRetryabilitySink(DeterministicFencedRunSink):
     def commit_invocation(
         self,
@@ -2106,7 +2121,7 @@ class _IgnoringReceiptRetryabilitySink(DeterministicFencedRunSink):
         )
 
 
-class _OverwritingReceiptRetryabilityConflictSink(DeterministicFencedRunSink):
+class _IgnoringReceiptFieldIdentitySink(DeterministicFencedRunSink):
     def commit_invocation(
         self,
         invocation: DurableModelInvocation,
@@ -2116,7 +2131,43 @@ class _OverwritingReceiptRetryabilityConflictSink(DeterministicFencedRunSink):
     ) -> CommitResult:
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
         stored = self._invocations.get(key)
-        overwrites_winner = stored is not None and _differs_only_in_receipt_retryability(
+        if stored is not None and _differs_only_in_receipt(stored[1].invocation, invocation):
+            invocation = replace(invocation, receipt=stored[1].invocation.receipt)
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+class _RejectingReceiptFieldsSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if invocation.dispatch_state == "settled" and invocation.receipt is not None:
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+class _OverwritingReceiptFieldConflictSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        overwrites_winner = stored is not None and _differs_only_in_receipt(
             stored[1].invocation,
             invocation,
         )
@@ -2140,9 +2191,21 @@ def _ignoring_receipt_retryability_factory() -> DeterministicFencedRunHarness:
     return harness
 
 
-def _overwriting_receipt_retryability_conflict_factory() -> DeterministicFencedRunHarness:
+def _ignoring_receipt_field_identity_factory() -> DeterministicFencedRunHarness:
     harness = DeterministicFencedRunHarness()
-    harness.sink = _OverwritingReceiptRetryabilityConflictSink(harness._writers)
+    harness.sink = _IgnoringReceiptFieldIdentitySink(harness._writers)
+    return harness
+
+
+def _rejecting_receipt_fields_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _RejectingReceiptFieldsSink(harness._writers)
+    return harness
+
+
+def _overwriting_receipt_field_conflict_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _OverwritingReceiptFieldConflictSink(harness._writers)
     return harness
 
 
@@ -2163,7 +2226,7 @@ def test_reusable_contract_includes_retryability_in_receipt_identity() -> None:
 
 
 def test_reusable_contract_preserves_receipt_winner_after_conflict() -> None:
-    outcomes = run_fenced_run_sink_contract(_overwriting_receipt_retryability_conflict_factory)
+    outcomes = run_fenced_run_sink_contract(_overwriting_receipt_field_conflict_factory)
     lifecycle_rule = next(
         outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
     )
@@ -2177,6 +2240,60 @@ def test_reusable_contract_preserves_receipt_winner_after_conflict() -> None:
     assert len(observations) == 6
     assert all(item.actual[0] == "conflict" for item in observations)
     assert all(item.actual[1] != item.expected[1] for item in observations)
+
+
+def _receipt_field_observations(lifecycle_rule):
+    return [
+        item
+        for item in lifecycle_rule.observations
+        if item.observation_id.startswith("receipt_field_identity_")
+        or item.observation_id.startswith("receipt_usage_identity_")
+    ]
+
+
+def test_reusable_contract_accepts_every_canonical_receipt_field() -> None:
+    outcomes = run_fenced_run_sink_contract(_rejecting_receipt_fields_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = _receipt_field_observations(lifecycle_rule)
+
+    assert lifecycle_rule.status == "failed"
+    assert len(observations) == len(MODEL_INVOCATION_RECEIPT_FIELDS) + len(
+        MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+    )
+    assert all(item.actual[0] == "conflict" for item in observations)
+
+
+def test_reusable_contract_compares_every_canonical_receipt_field() -> None:
+    outcomes = run_fenced_run_sink_contract(_ignoring_receipt_field_identity_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = _receipt_field_observations(lifecycle_rule)
+
+    assert lifecycle_rule.status == "failed"
+    assert len(observations) == len(MODEL_INVOCATION_RECEIPT_FIELDS) + len(
+        MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+    )
+    assert all(item.actual[0] == "committed" for item in observations)
+    assert all(item.actual[2] == "already_committed" for item in observations)
+
+
+def test_reusable_contract_preserves_every_canonical_receipt_winner() -> None:
+    outcomes = run_fenced_run_sink_contract(_overwriting_receipt_field_conflict_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = _receipt_field_observations(lifecycle_rule)
+
+    assert lifecycle_rule.status == "failed"
+    assert len(observations) == len(MODEL_INVOCATION_RECEIPT_FIELDS) + len(
+        MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+    )
+    assert all(item.actual[0] == "committed" for item in observations)
+    assert all(item.actual[2] == "conflict" for item in observations)
+    assert all(item.actual[3] != item.expected[3] for item in observations)
 
 
 class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
