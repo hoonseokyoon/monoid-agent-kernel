@@ -8,6 +8,7 @@ import time
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from threading import Barrier
@@ -48,7 +49,11 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
     redacted_or_none,
 )
-from monoid_agent_kernel.core.outcome import RetryEligibility, TerminalOutcome
+from monoid_agent_kernel.core.outcome import (
+    InterruptionCause,
+    RetryEligibility,
+    TerminalOutcome,
+)
 from monoid_agent_kernel.hosting import CommitResult, FencedRunSink, WriterToken
 
 STORE_CONTRACT_PROFILE = "checkpoint-store-contract"
@@ -265,6 +270,131 @@ def _contract_terminal(run_id: str, *, failed: bool = False) -> TerminalOutcome:
         retry_eligibility=RetryEligibility.NOT_APPLICABLE,
         final_output_ref="blob:contract-final",
     )
+
+
+def _contract_checkpoint_identity_variants(
+    checkpoint: RunCheckpoint,
+) -> dict[str, RunCheckpoint]:
+    """Vary every canonical non-key field independently for same-sequence retries."""
+
+    payload = checkpoint.to_json()
+    identity_fields = set(payload) - {"schema_version", "run_id", "seq"}
+    list_of_string_fields = {
+        "pending_binding_loads",
+        "reentry_queue",
+        "delivered_reentry_jobs",
+        "revoked_lease_ids",
+        "revoked_capabilities",
+        "inbox_seen_ids",
+        "applied_input_ids",
+        "skills_activated",
+    }
+    special_values: dict[str, Any] = {
+        "provider_http_status": 200,
+        "previous_turn_handle": "turn-alternate",
+        "pending_user_input": [{"kind": "contract-alternate"}],
+        "previous_runtime_config": {"contract": "alternate"},
+        "workspace_base": {"contract": "alternate"},
+        "remaining_duration_s": 1.0,
+        "queued_messages": ["contract-alternate"],
+        "last_suspension": {"reason": "paused", "status": "completed"},
+        "active_input": {
+            "input_id": "input-alternate",
+            "phase": "running",
+            "source_seq": 1,
+        },
+        "applied_input_receipts": {
+            "input-alternate": {"checkpoint_seq": checkpoint.seq}
+        },
+        "last_model_invocation": _contract_invocation(
+            checkpoint.run_id,
+            revision=1,
+            dispatch_state="reserved",
+        ).to_json(),
+        "interruption_cause": InterruptionCause.USER_CANCEL.value,
+    }
+    variants: dict[str, RunCheckpoint] = {}
+    for field_name in sorted(identity_fields):
+        value = payload[field_name]
+        if field_name in special_values:
+            alternate = special_values[field_name]
+        elif type(value) is bool:
+            alternate = not value
+        elif type(value) is int:
+            alternate = value + 1
+        elif type(value) is float:
+            alternate = value + 1.0
+        elif isinstance(value, str):
+            alternate = f"{value}-alternate" if value else "contract-alternate"
+        elif isinstance(value, list):
+            alternate = (
+                ["contract-alternate"]
+                if field_name in list_of_string_fields
+                else [{"contract": "alternate"}]
+            )
+        elif isinstance(value, dict):
+            alternate = {"contract": 1}
+        else:  # pragma: no cover - every current optional field is classified above
+            raise AssertionError(f"unclassified checkpoint identity field: {field_name}")
+        variant_payload = dict(payload)
+        variant_payload[field_name] = alternate
+        variant = RunCheckpoint.from_json(variant_payload)
+        if variant is None:  # pragma: no cover - current-schema variants must decode
+            raise AssertionError(f"invalid checkpoint identity variant: {field_name}")
+        variants[field_name] = variant
+    if set(variants) != identity_fields:  # pragma: no cover - loop is intentionally exhaustive
+        raise AssertionError("checkpoint identity matrix is incomplete")
+    return variants
+
+
+def _contract_event_identity_variants(event: AgentEvent) -> dict[str, AgentEvent]:
+    """Vary every canonical non-key event field independently."""
+
+    variants = {
+        "event_id": replace(event, event_id="event-alternate"),
+        "timestamp": replace(event, timestamp="2026-08-21T00:00:01Z"),
+        "type": replace(event, type="checkpoint.restored"),
+        "level": replace(event, level="warning"),
+        "data": replace(event, data={"checkpoint_seq": event.seq, "alternate": True}),
+        "turn_id": replace(event, turn_id="turn-alternate"),
+        "parent_id": replace(event, parent_id="event-parent-alternate"),
+    }
+    identity_fields = set(event.to_json()) - {"schema_version", "run_id", "seq"}
+    if set(variants) != identity_fields:
+        raise AssertionError("event identity matrix is incomplete")
+    return variants
+
+
+def _contract_terminal_identity_variants(
+    outcome: TerminalOutcome,
+) -> dict[str, TerminalOutcome]:
+    """Vary every canonical non-key terminal field independently."""
+
+    variants = {
+        "kind": replace(outcome, kind="failed_terminal"),
+        "retry_eligibility": replace(
+            outcome,
+            retry_eligibility=RetryEligibility.FORBIDDEN,
+        ),
+        "interruption_cause": replace(
+            outcome,
+            interruption_cause=InterruptionCause.USER_CANCEL,
+        ),
+        "checkpoint_seq": replace(outcome, checkpoint_seq=1),
+        "final_output_ref": replace(outcome, final_output_ref="blob:contract-alternate"),
+        "partial_output_ref": replace(outcome, partial_output_ref="blob:contract-partial"),
+        "last_evidence_ref": replace(outcome, last_evidence_ref="blob:contract-evidence"),
+        "error_code": replace(outcome, error_code="contract_alternate"),
+        "provider_error_code": replace(
+            outcome,
+            provider_error_code="provider_alternate",
+        ),
+        "http_status": replace(outcome, http_status=503),
+    }
+    identity_fields = set(outcome.to_json()) - {"schema_version", "run_id"}
+    if set(variants) != identity_fields:
+        raise AssertionError("terminal identity matrix is incomplete")
+    return variants
 
 
 def _contract_invocation(
@@ -671,6 +801,16 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
+        checkpoint_identity_statuses = {
+            field_name: harness.sink.commit_checkpoint(
+                variant,
+                checkpoint_blobs,
+                writer_token=token,
+            ).status
+            for field_name, variant in _contract_checkpoint_identity_variants(
+                checkpoint
+            ).items()
+        }
         loaded = harness.sink.latest_checked(run_id)
 
         monotonic_harness = factory()
@@ -709,6 +849,14 @@ def run_fenced_run_sink_contract(
                         actual=blob_bytes_conflict.status,
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
+                    *(
+                        observation(
+                            f"checkpoint_identity_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in checkpoint_identity_statuses.items()
+                    ),
                     observation(
                         "latest_load",
                         expected="loaded",
@@ -1028,10 +1176,24 @@ def run_fenced_run_sink_contract(
         conflict_event = harness.sink.append_event(
             _contract_event(run_id, seq=1, level="warning"), writer_token=token
         )
+        event_identity_statuses = {
+            field_name: harness.sink.append_event(
+                variant,
+                writer_token=token,
+            ).status
+            for field_name, variant in _contract_event_identity_variants(event).items()
+        }
         repeated_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
         conflict_terminal = harness.sink.settle_terminal(
             _contract_terminal(run_id, failed=True), writer_token=token
         )
+        terminal_identity_statuses = {
+            field_name: harness.sink.settle_terminal(
+                variant,
+                writer_token=token,
+            ).status
+            for field_name, variant in _contract_terminal_identity_variants(terminal).items()
+        }
 
         race_observations = []
         for mutation in ("checkpoint", "event", "invocation", "terminal"):
@@ -1095,6 +1257,14 @@ def run_fenced_run_sink_contract(
                     observation(
                         "event_conflict", expected="conflict", actual=conflict_event.status
                     ),
+                    *(
+                        observation(
+                            f"event_identity_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in event_identity_statuses.items()
+                    ),
                     observation(
                         "terminal_first", expected="committed", actual=first_terminal.status
                     ),
@@ -1105,6 +1275,14 @@ def run_fenced_run_sink_contract(
                     ),
                     observation(
                         "terminal_conflict", expected="conflict", actual=conflict_terminal.status
+                    ),
+                    *(
+                        observation(
+                            f"terminal_identity_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in terminal_identity_statuses.items()
                     ),
                     *race_observations,
                 ),

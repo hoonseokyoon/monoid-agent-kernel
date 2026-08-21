@@ -18,6 +18,35 @@ from support.fenced_hosting import (
 )
 
 
+_CHECKPOINT_IDENTITY_FIELDS = tuple(
+    sorted(
+        set(RunCheckpoint(run_id="identity-contract").to_json())
+        - {"schema_version", "run_id", "seq"}
+    )
+)
+_EVENT_IDENTITY_FIELDS = (
+    "event_id",
+    "timestamp",
+    "type",
+    "level",
+    "data",
+    "turn_id",
+    "parent_id",
+)
+_TERMINAL_IDENTITY_FIELDS = (
+    "kind",
+    "retry_eligibility",
+    "interruption_cause",
+    "checkpoint_seq",
+    "final_output_ref",
+    "partial_output_ref",
+    "last_evidence_ref",
+    "error_code",
+    "provider_error_code",
+    "http_status",
+)
+
+
 def test_deterministic_fenced_sink_passes_reusable_contract() -> None:
     outcomes = run_fenced_run_sink_contract(DeterministicFencedRunHarness)
 
@@ -731,6 +760,106 @@ def test_reusable_contract_compares_complete_reopened_records(
 
     assert durable_rule.status == "failed"
     assert record_observation.actual != record_observation.expected
+
+
+class _IgnoringIdentityFieldSink(DeterministicFencedRunSink):
+    record_family = ""
+    ignored_field = ""
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._checkpoints.get((checkpoint.run_id, checkpoint.seq))
+        if self.record_family == "checkpoint" and stored is not None:
+            winner = stored[1].checkpoint
+            checkpoint = replace(
+                checkpoint,
+                **{self.ignored_field: getattr(winner, self.ignored_field)},
+            )
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._events.get((event.run_id, event.seq))
+        if self.record_family == "event" and stored is not None:
+            winner = stored[1]
+            event = replace(
+                event,
+                **{self.ignored_field: getattr(winner, self.ignored_field)},
+            )
+        return super().append_event(event, writer_token=writer_token)
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._terminals.get(outcome.run_id)
+        if self.record_family == "terminal" and stored is not None:
+            winner = stored[1]
+            outcome = replace(
+                outcome,
+                **{self.ignored_field: getattr(winner, self.ignored_field)},
+            )
+        return super().settle_terminal(outcome, writer_token=writer_token)
+
+
+def _ignoring_identity_field_factory(record_family: str, field_name: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _IgnoringIdentityFieldSink(harness._writers)
+        sink.record_family = record_family
+        sink.ignored_field = field_name
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("record_family", "rule_id", "field_name"),
+    [
+        *(
+            ("checkpoint", "FENCED-01-CHECKPOINT-CONTENT-IDENTITY", field_name)
+            for field_name in _CHECKPOINT_IDENTITY_FIELDS
+        ),
+        *(
+            ("event", "FENCED-03-EVENT-AND-TERMINAL-WINNERS", field_name)
+            for field_name in _EVENT_IDENTITY_FIELDS
+        ),
+        *(
+            ("terminal", "FENCED-03-EVENT-AND-TERMINAL-WINNERS", field_name)
+            for field_name in _TERMINAL_IDENTITY_FIELDS
+        ),
+    ],
+)
+def test_reusable_contract_checks_each_canonical_identity_field(
+    record_family: str,
+    rule_id: str,
+    field_name: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _ignoring_identity_field_factory(record_family, field_name)
+    )
+    identity_rule = next(outcome for outcome in outcomes if outcome.rule_id == rule_id)
+    field_observation = next(
+        observation
+        for observation in identity_rule.observations
+        if observation.observation_id == f"{record_family}_identity_{field_name}"
+    )
+
+    assert identity_rule.status == "failed"
+    assert field_observation.expected == "conflict"
+    assert field_observation.actual == "already_committed"
 
 
 class _InvalidRetryCoordinateSink(DeterministicFencedRunSink):

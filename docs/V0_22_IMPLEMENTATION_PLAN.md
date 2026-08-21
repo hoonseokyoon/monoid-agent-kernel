@@ -462,6 +462,9 @@ monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run b
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
 재개방 record와 비교한다.
+같은 key의 checkpoint, event, terminal 재시도는 canonical non-key field를 하나씩 독립적으로
+변경해 모두 `conflict`인지 확인한다. Matrix의 field 집합은 각 record의 canonical JSON field에서
+계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
