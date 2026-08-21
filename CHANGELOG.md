@@ -35,7 +35,8 @@ out in commit messages and here.
   comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
   canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
   invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
-  normalize before idempotency and lifecycle comparisons.
+  normalize in both lifecycle-transition directions. Exact retries of every older invocation
+  revision cannot republish an obsolete journal head.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

@@ -467,7 +467,8 @@ Checkpoint와 invocation은 선택 필드가 아니라 committed canonical paylo
 canonical JSON field에서 계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
 Invocation의 schema version과 digest generation은 current canonical tag로 고정한다. 허용된 legacy
 alias를 쓴 같은 revision 재시도는 canonical payload가 같으므로 `already_committed`다. Legacy alias를
-쓴 다음 legal revision도 canonical stable identity가 같으므로 `committed`다.
+쓴 다음 current-tagged legal revision과 current tag 뒤 legacy-tagged legal revision은 canonical stable
+identity가 같으므로 모두 `committed`다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 
@@ -520,6 +521,8 @@ attempt N reserved
 
 `unknown`은 해당 logical call의 최종 journal 상태다. Revision gap, state regression, settled success
 뒤 새 attempt는 `conflict`다.
+최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
+유지한다. Contract는 revision 4 뒤 revision 1, 2, 3을 각각 재전송하고 매번 head 4를 확인한다.
 첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
 문서화되지 않은 13개 인접 edge는 각각 독립 history에서 `conflict`로 검증한다.
 첫 record는 `(revision=1, dispatch_attempt=1, state=reserved)`만 허용한다. revision 2, attempt 2,

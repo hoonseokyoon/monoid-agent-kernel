@@ -529,6 +529,57 @@ def test_reusable_contract_rejects_checkpoint_head_regression() -> None:
     assert head_observation.actual == 1
 
 
+class _RegressingInvocationHeadSink(DeterministicFencedRunSink):
+    broken_revision = 0
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        result = super().commit_invocation(invocation, blobs, writer_token=writer_token)
+        if result.status == "already_committed" and invocation.revision == self.broken_revision:
+            with self._lock:
+                self._invocation_heads[
+                    (invocation.run_id, invocation.logical_call_id)
+                ] = invocation.revision
+        return result
+
+
+def _regressing_invocation_head_factory(revision: int):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _RegressingInvocationHeadSink(harness._writers)
+        sink.broken_revision = revision
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("revision", [1, 2, 3])
+def test_reusable_contract_rejects_each_old_invocation_head_regression(
+    revision: int,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(_regressing_invocation_head_factory(revision))
+    lifecycle_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    head_observation = next(
+        observation
+        for observation in lifecycle_rule.observations
+        if observation.observation_id == f"old_revision_{revision}_retry_and_head"
+    )
+
+    assert lifecycle_rule.status == "failed"
+    assert head_observation.expected == ("already_committed", 4)
+    assert head_observation.actual == ("already_committed", revision)
+
+
 class _InvocationIdentityDriftSink(DeterministicFencedRunSink):
     ignored_field = ""
 
@@ -588,7 +639,10 @@ def test_reusable_contract_checks_each_stable_invocation_identity(field_name: st
     assert drift_observation.actual == "committed"
 
 
-class _LegacyDigestAliasDriftSink(DeterministicFencedRunSink):
+class _CanonicalAliasTransitionDriftSink(DeterministicFencedRunSink):
+    field_name = ""
+    broken_direction = ""
+
     def _invocation_transition_winner(
         self,
         invocation: DurableModelInvocation,
@@ -598,19 +652,51 @@ class _LegacyDigestAliasDriftSink(DeterministicFencedRunSink):
             previous_digest, previous_record = self._invocations[
                 (invocation.run_id, invocation.logical_call_id, head)
             ]
-            if invocation.digest_generation != previous_record.invocation.digest_generation:
+            previous_value = getattr(previous_record.invocation, self.field_name)
+            incoming_value = getattr(invocation, self.field_name)
+            previous_is_legacy = previous_value.startswith("native-agent-runner.")
+            incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
+            direction = (
+                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
+            )
+            if (
+                previous_value != incoming_value
+                and previous_is_legacy != incoming_is_legacy
+                and direction == self.broken_direction
+            ):
                 return previous_digest
         return super()._invocation_transition_winner(invocation)
 
 
-def _legacy_digest_alias_drift_factory() -> DeterministicFencedRunHarness:
-    harness = DeterministicFencedRunHarness()
-    harness.sink = _LegacyDigestAliasDriftSink(harness._writers)
-    return harness
+def _canonical_alias_transition_drift_factory(field_name: str, direction: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _CanonicalAliasTransitionDriftSink(harness._writers)
+        sink.field_name = field_name
+        sink.broken_direction = direction
+        harness.sink = sink
+        return harness
+
+    return factory
 
 
-def test_reusable_contract_accepts_canonical_digest_alias_transition() -> None:
-    outcomes = run_fenced_run_sink_contract(_legacy_digest_alias_drift_factory)
+@pytest.mark.parametrize(
+    ("field_name", "direction", "observation_prefix"),
+    [
+        ("schema_version", "current_to_legacy", "transition"),
+        ("schema_version", "legacy_to_current", "recovery"),
+        ("digest_generation", "current_to_legacy", "transition"),
+        ("digest_generation", "legacy_to_current", "recovery"),
+    ],
+)
+def test_reusable_contract_accepts_both_canonical_alias_transition_directions(
+    field_name: str,
+    direction: str,
+    observation_prefix: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _canonical_alias_transition_drift_factory(field_name, direction)
+    )
     lifecycle_rule = next(
         outcome
         for outcome in outcomes
@@ -620,7 +706,7 @@ def test_reusable_contract_accepts_canonical_digest_alias_transition() -> None:
         observation
         for observation in lifecycle_rule.observations
         if observation.observation_id
-        == "invocation_canonical_alias_transition_digest_generation"
+        == f"invocation_canonical_alias_{observation_prefix}_{field_name}"
     )
 
     assert lifecycle_rule.status == "failed"

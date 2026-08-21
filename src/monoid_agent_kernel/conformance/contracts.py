@@ -840,8 +840,10 @@ def _contract_invocation_canonical_alias_transition_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
     field_name: str,
+    *,
+    legacy_first: bool,
 ) -> str:
-    """Carry an accepted legacy tag across a legal revision transition."""
+    """Carry an accepted legacy tag across either direction of a legal transition."""
 
     harness = factory()
     token = _contract_writer(harness, run_id)
@@ -850,6 +852,14 @@ def _contract_invocation_canonical_alias_transition_status(
         revision=1,
         dispatch_state="reserved",
     )
+    alias_values = {
+        "schema_version": _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
+        "digest_generation": _CONTRACT_ALTERNATE_DIGEST_GENERATION,
+    }
+    if set(alias_values) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
+        raise AssertionError("invocation canonical-tag transition matrix is incomplete")
+    if legacy_first:
+        reserved = replace(reserved, **{field_name: alias_values[field_name]})
     first = harness.sink.commit_invocation(reserved, {}, writer_token=token)
     if first.status != "committed":
         return f"setup:{first.status}"
@@ -858,20 +868,10 @@ def _contract_invocation_canonical_alias_transition_status(
         revision=2,
         dispatch_state="dispatch_started",
     )
-    variants = {
-        "schema_version": replace(
-            started,
-            schema_version=_CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
-        ),
-        "digest_generation": replace(
-            started,
-            digest_generation=_CONTRACT_ALTERNATE_DIGEST_GENERATION,
-        ),
-    }
-    if set(variants) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
-        raise AssertionError("invocation canonical-tag transition matrix is incomplete")
+    if not legacy_first:
+        started = replace(started, **{field_name: alias_values[field_name]})
     return harness.sink.commit_invocation(
-        variants[field_name],
+        started,
         {},
         writer_token=token,
     ).status
@@ -1529,6 +1529,19 @@ def run_fenced_run_sink_contract(
                     f"invocation-canonical-alias-transition-{field_name}",
                 ),
                 field_name,
+                legacy_first=False,
+            )
+            for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
+        }
+        invocation_canonical_alias_recovery_statuses = {
+            field_name: _contract_invocation_canonical_alias_transition_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"invocation-canonical-alias-recovery-{field_name}",
+                ),
+                field_name,
+                legacy_first=True,
             )
             for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
         }
@@ -1561,18 +1574,24 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
+        started_invocation = _contract_invocation(
+            run_id,
+            revision=2,
+            dispatch_state="dispatch_started",
+        )
         started = harness.sink.commit_invocation(
-            _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+            started_invocation,
             {},
             writer_token=token,
         )
+        settled_failure_invocation = _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state="settled",
+            retryable=True,
+        )
         settled_failure = harness.sink.commit_invocation(
-            _contract_invocation(
-                run_id,
-                revision=3,
-                dispatch_state="settled",
-                retryable=True,
-            ),
+            settled_failure_invocation,
             {},
             writer_token=token,
         )
@@ -1589,6 +1608,22 @@ def run_fenced_run_sink_contract(
             writer_token=token,
         )
         harness = harness.reopen()
+        old_revision_retries: dict[int, tuple[str, int | None]] = {}
+        for old_invocation in (
+            reserved_invocation,
+            started_invocation,
+            settled_failure_invocation,
+        ):
+            retry = harness.sink.commit_invocation(
+                old_invocation,
+                {},
+                writer_token=token,
+            )
+            reloaded = harness.sink.load_invocation(run_id, "call-1")
+            old_revision_retries[old_invocation.revision] = (
+                retry.status,
+                reloaded.sequence,
+            )
         loaded = harness.sink.load_invocation(run_id, "call-1")
 
         result_call_id = "call-result"
@@ -1680,12 +1715,30 @@ def run_fenced_run_sink_contract(
                             invocation_canonical_alias_transition_statuses.items()
                         )
                     ),
+                    *(
+                        observation(
+                            f"invocation_canonical_alias_recovery_{field_name}",
+                            expected="committed",
+                            actual=status,
+                        )
+                        for field_name, status in (
+                            invocation_canonical_alias_recovery_statuses.items()
+                        )
+                    ),
                     observation("start", expected="committed", actual=started.status),
                     observation(
                         "settled_failure", expected="committed", actual=settled_failure.status
                     ),
                     observation(
                         "proven_retry", expected="committed", actual=next_attempt.status
+                    ),
+                    *(
+                        observation(
+                            f"old_revision_{revision}_retry_and_head",
+                            expected=("already_committed", 4),
+                            actual=status_and_head,
+                        )
+                        for revision, status_and_head in old_revision_retries.items()
                     ),
                     observation("latest_load", expected="loaded", actual=loaded.status),
                     observation("latest_revision", expected=4, actual=loaded.sequence),
