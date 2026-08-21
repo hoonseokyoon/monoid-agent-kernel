@@ -863,6 +863,90 @@ def test_reusable_contract_accepts_both_canonical_alias_transition_directions(
     assert alias_observation.actual == "conflict"
 
 
+class _RawCheckpointAliasDigestSink(DeterministicFencedRunSink):
+    field_name = ""
+    broken_direction = ""
+
+    def _raw_alias(self, checkpoint: RunCheckpoint) -> str:
+        if self.field_name == "schema_version":
+            return checkpoint.schema_version
+        invocation = checkpoint.last_model_invocation or {}
+        nested_field = self.field_name.removeprefix("last_model_invocation_")
+        return str(invocation.get(nested_field, ""))
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        stored = self._checkpoints.get((checkpoint.run_id, checkpoint.seq))
+        if stored is not None and self._is_current(checkpoint.run_id, writer_token):
+            previous_value = self._raw_alias(stored[1].checkpoint)
+            incoming_value = self._raw_alias(checkpoint)
+            previous_is_legacy = previous_value.startswith("native-agent-runner.")
+            incoming_is_legacy = incoming_value.startswith("native-agent-runner.")
+            direction = (
+                "legacy_to_current" if previous_is_legacy else "current_to_legacy"
+            )
+            if (
+                previous_value != incoming_value
+                and previous_is_legacy != incoming_is_legacy
+                and direction == self.broken_direction
+            ):
+                return CommitResult(status="conflict", sequence=checkpoint.seq)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+
+def _raw_checkpoint_alias_digest_factory(field_name: str, direction: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _RawCheckpointAliasDigestSink(harness._writers)
+        sink.field_name = field_name
+        sink.broken_direction = direction
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("field_name", "direction"),
+    [
+        (field_name, direction)
+        for field_name in (
+            "schema_version",
+            "last_model_invocation_schema_version",
+            "last_model_invocation_digest_generation",
+        )
+        for direction in ("current_to_legacy", "legacy_to_current")
+    ],
+)
+def test_reusable_contract_normalizes_every_checkpoint_alias_location(
+    field_name: str,
+    direction: str,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _raw_checkpoint_alias_digest_factory(field_name, direction)
+    )
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    alias_observation = next(
+        observation
+        for observation in checkpoint_rule.observations
+        if observation.observation_id
+        == f"checkpoint_canonical_alias_{field_name}_{direction}"
+    )
+
+    assert checkpoint_rule.status == "failed"
+    assert alias_observation.expected == "already_committed"
+    assert alias_observation.actual == "conflict"
+
+
 class _ForbiddenInvocationEdgeSink(DeterministicFencedRunSink):
     allowed_edge: tuple[str, str] = ("", "")
 

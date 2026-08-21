@@ -471,6 +471,9 @@ Invocation의 schema version과 digest generation은 current canonical tag로 �
 alias를 쓴 같은 revision 재시도는 canonical payload가 같으므로 `already_committed`다. Legacy alias를
 쓴 다음 current-tagged legal revision과 current tag 뒤 legacy-tagged legal revision은 canonical stable
 identity가 같으므로 모두 `committed`다.
+Checkpoint의 schema version과 `last_model_invocation` 안의 schema version/digest generation도 current
+writer shape로 정규화한다. 세 alias 위치의 current→legacy·legacy→current 같은-sequence 재시도는 모두
+`already_committed`다.
 Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
 적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
 

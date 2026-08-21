@@ -40,6 +40,7 @@ out in commit messages and here.
   the result blob referenced by its durable metadata. The harness lifecycle closes every factory
   instance and reopened sink facade after each complete contract execution. All four resource-key
   families prove independent same-coordinate commits and retries across two authorized runs.
+  Checkpoint schema aliases and nested invocation aliases normalize in both retry directions.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

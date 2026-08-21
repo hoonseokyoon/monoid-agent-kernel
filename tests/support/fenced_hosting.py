@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.checkpoint import (
     CHECKPOINT_CODEC,
     CheckpointRecord,
     RunCheckpoint,
+    checkpoint_payload_for_write,
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.core.events import AgentEvent
@@ -116,7 +117,7 @@ class DeterministicFencedRunSink:
     ) -> CommitResult:
         if not self._is_current(checkpoint.run_id, writer_token):
             return CommitResult(status="fenced")
-        digest = _record_digest(checkpoint.to_json(), blobs)
+        digest = _record_digest(checkpoint_payload_for_write(checkpoint), blobs)
         key = (checkpoint.run_id, checkpoint.seq)
         existing = self._stored_result(
             self._checkpoints,

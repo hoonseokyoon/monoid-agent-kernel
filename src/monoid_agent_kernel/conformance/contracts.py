@@ -28,7 +28,13 @@ from monoid_agent_kernel.core.capability import (
     CapabilityRequest,
     scope_within,
 )
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
+from monoid_agent_kernel.core.checkpoint import (
+    ACCEPTED_SCHEMA_VERSIONS as ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS,
+    SCHEMA_VERSION as CHECKPOINT_SCHEMA_VERSION,
+    CheckpointStore,
+    RunCheckpoint,
+    load_latest_checked,
+)
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
 from monoid_agent_kernel.core.model_invocation import (
     ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS,
@@ -77,6 +83,11 @@ _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION = next(
     for schema in ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS
     if schema != MODEL_INVOCATION_SCHEMA_VERSION
 )
+_CONTRACT_ALTERNATE_CHECKPOINT_SCHEMA_VERSION = next(
+    schema
+    for schema in ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS
+    if schema != CHECKPOINT_SCHEMA_VERSION
+)
 _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
     {
         "dispatch_id",
@@ -91,6 +102,13 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
 )
 _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset(
     {"schema_version", "digest_generation"}
+)
+_CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "last_model_invocation_schema_version",
+        "last_model_invocation_digest_generation",
+    }
 )
 
 
@@ -467,6 +485,55 @@ def _contract_checkpoint_identity_variants(
     if set(variants) != identity_fields:  # pragma: no cover - loop is intentionally exhaustive
         raise AssertionError("checkpoint identity matrix is incomplete")
     return variants
+
+
+def _contract_checkpoint_canonical_alias_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+    *,
+    legacy_first: bool,
+) -> str:
+    """Retry one checkpoint across either direction of every accepted alias location."""
+
+    invocation_payload = _contract_invocation(
+        run_id,
+        revision=1,
+        dispatch_state="reserved",
+    ).to_json()
+    baseline = RunCheckpoint(
+        run_id=run_id,
+        seq=1,
+        last_model_invocation=(
+            invocation_payload if field_name.startswith("last_model_invocation_") else None
+        ),
+    )
+    if field_name == "schema_version":
+        legacy = replace(
+            baseline,
+            schema_version=_CONTRACT_ALTERNATE_CHECKPOINT_SCHEMA_VERSION,
+        )
+    else:
+        legacy_invocation = dict(invocation_payload)
+        nested_field = field_name.removeprefix("last_model_invocation_")
+        alias_values = {
+            "schema_version": _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
+            "digest_generation": _CONTRACT_ALTERNATE_DIGEST_GENERATION,
+        }
+        if set(alias_values) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
+            raise AssertionError("checkpoint nested invocation alias matrix is incomplete")
+        legacy_invocation[nested_field] = alias_values[nested_field]
+        legacy = replace(baseline, last_model_invocation=legacy_invocation)
+    first_value, retry_value = (
+        (legacy, baseline) if legacy_first else (baseline, legacy)
+    )
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    first = harness.sink.commit_checkpoint(first_value, {}, writer_token=token)
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    harness = harness.reopen()
+    return harness.sink.commit_checkpoint(retry_value, {}, writer_token=token).status
 
 
 def _contract_event_identity_variants(event: AgentEvent) -> dict[str, AgentEvent]:
@@ -1048,6 +1115,19 @@ def _run_fenced_run_sink_contract(
         )
 
     try:
+        checkpoint_canonical_alias_statuses = {
+            (field_name, direction): _contract_checkpoint_canonical_alias_status(
+                factory,
+                _contract_run_id(
+                    namespace,
+                    f"checkpoint-canonical-alias-{field_name}-{direction}",
+                ),
+                field_name,
+                legacy_first=direction == "legacy_to_current",
+            )
+            for field_name in sorted(_CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS)
+            for direction in ("current_to_legacy", "legacy_to_current")
+        }
         harness = factory()
         run_id = _contract_run_id(namespace, "checkpoint")
         token = _contract_writer(harness, run_id)
@@ -1145,6 +1225,16 @@ def _run_fenced_run_sink_contract(
                         actual=blob_bytes_conflict.status,
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
+                    *(
+                        observation(
+                            f"checkpoint_canonical_alias_{field_name}_{direction}",
+                            expected="already_committed",
+                            actual=status,
+                        )
+                        for (field_name, direction), status in (
+                            checkpoint_canonical_alias_statuses.items()
+                        )
+                    ),
                     *(
                         observation(
                             f"checkpoint_identity_{field_name}",
