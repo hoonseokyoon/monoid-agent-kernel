@@ -616,6 +616,9 @@ state regression, settled success 뒤 새 attempt는 `conflict`다. Successful s
 `retryable=true`가 있어도 성공 결과가 우선하며 새 paid dispatch를 열지 않는다.
 최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
 유지한다. Contract는 revision 4 뒤 revision 1, 2, 3을 각각 재전송하고 매번 head 4를 확인한다.
+같은 run 안의 여러 logical call은 `(run_id, logical_call_id)`마다 독립 head를 유지한다. 둘째 call을
+commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 logical call은 `missing`과 빈 value를
+반환한다. Per-run last-invocation pointer 구현은 이 복구 검증에서 실패한다.
 첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
 문서화되지 않은 13개 인접 edge는 각각 독립 history에서 `conflict`로 검증한다.
 첫 record는 `(revision=1, dispatch_attempt=1, state=reserved)`만 허용한다. revision 2, attempt 2,
@@ -1097,13 +1100,15 @@ owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff
 서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
 확인한다. 같은 handoff에서 재개방한 checkpoint·event·invocation·terminal 전체 payload가
 linearization winner와 일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두
-blob-bearing mutation에서
-거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract harness registry는 probe
+blob-bearing mutation에서 거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract
+harness registry는 probe
 전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
 낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는
 workspace·media·invocation의 malformed digest를 거부하고 external invocation result address를 허용한다.
 Existing-coordinate fence precedence는 동일 payload, conflicting payload, malformed blob map을 독립
 축으로 검증한다.
+Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
+검증한다.
 
 ### 14.6 최종 통합 PR
 

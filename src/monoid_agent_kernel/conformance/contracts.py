@@ -3450,6 +3450,11 @@ def _run_fenced_run_sink_contract(
             loaded_result.value,
             _CONTRACT_INVOCATION_BLOB_SHA256,
         )
+        reloaded_primary_after_result = harness.sink.load_invocation(run_id, "call-1")
+        missing_logical_call = harness.sink.load_invocation(
+            run_id,
+            "call-missing",
+        )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-04-INVOCATION-LIFECYCLE",
@@ -3775,6 +3780,41 @@ def _run_fenced_run_sink_contract(
                         "result_blob_round_trip",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
                         actual=result_blob_bytes,
+                    ),
+                    observation(
+                        "primary_call_after_result_head",
+                        expected=4,
+                        actual=reloaded_primary_after_result.sequence,
+                    ),
+                    observation(
+                        "primary_call_after_result_binding",
+                        expected="call-1",
+                        actual=(
+                            reloaded_primary_after_result.value.invocation.logical_call_id
+                            if reloaded_primary_after_result.value
+                            else None
+                        ),
+                    ),
+                    observation(
+                        "primary_call_after_result_payload",
+                        expected=canonical_sha256(next_attempt_invocation.to_json()),
+                        actual=(
+                            canonical_sha256(
+                                reloaded_primary_after_result.value.invocation.to_json()
+                            )
+                            if reloaded_primary_after_result.value
+                            else None
+                        ),
+                    ),
+                    observation(
+                        "missing_logical_call_status",
+                        expected="missing",
+                        actual=missing_logical_call.status,
+                    ),
+                    observation(
+                        "missing_logical_call_value_absent",
+                        expected=True,
+                        actual=missing_logical_call.value is None,
                     ),
                 ),
             )

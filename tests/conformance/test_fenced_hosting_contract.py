@@ -2131,6 +2131,32 @@ class _CorruptingLoadedRecordHarness(DeterministicFencedRunHarness):
         return replace(terminal, final_output_ref="blob:discarded")
 
 
+class _PerRunLatestInvocationSink(DeterministicFencedRunSink):
+    def load_invocation(self, run_id: str, logical_call_id: str):
+        call_keys = [key for key in self._invocation_heads if key[0] == run_id]
+        if call_keys:
+            logical_call_id = call_keys[-1][1]
+        return super().load_invocation(run_id, logical_call_id)
+
+
+def _per_run_latest_invocation_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _PerRunLatestInvocationSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_scopes_invocation_loads_by_logical_call() -> None:
+    outcomes = run_fenced_run_sink_contract(_per_run_latest_invocation_factory)
+    lifecycle_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observations = {item.observation_id: item.actual for item in lifecycle_rule.observations}
+
+    assert lifecycle_rule.status == "failed"
+    assert observations["primary_call_after_result_binding"] == "call-result"
+    assert observations["missing_logical_call_status"] == "loaded"
+
+
 def _corrupting_loaded_record_factory(corruption: str):
     def factory() -> _CorruptingLoadedRecordHarness:
         harness = _CorruptingLoadedRecordHarness()
