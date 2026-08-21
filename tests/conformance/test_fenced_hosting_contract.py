@@ -45,6 +45,16 @@ _TERMINAL_IDENTITY_FIELDS = (
     "provider_error_code",
     "http_status",
 )
+_INVOCATION_IDENTITY_FIELDS = (
+    "dispatch_id",
+    "dispatch_attempt",
+    "idempotency_key",
+    "dispatch_state",
+    "request_digest",
+    "receipt",
+    "result_ref",
+    "failure_code",
+)
 
 
 def test_deterministic_fenced_sink_passes_reusable_contract() -> None:
@@ -110,7 +120,6 @@ class _IdempotencyFirstSink(DeterministicFencedRunSink):
         if self.broken_mutation == "terminal" and outcome.run_id in self._terminals:
             return CommitResult(status="already_committed")
         return super().settle_terminal(outcome, writer_token=writer_token)
-
 
 def _idempotency_first_factory(mutation: str):
     def factory() -> DeterministicFencedRunHarness:
@@ -692,6 +701,66 @@ def test_reusable_contract_checks_each_invalid_initial_invocation_state(state: s
     assert state_observation.actual == "committed"
 
 
+class _InvalidInitialInvocationCoordinateSink(DeterministicFencedRunSink):
+    allowed_coordinate: tuple[int, int] = (0, 0)
+
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if (
+            head is None
+            and invocation.dispatch_state == "reserved"
+            and (invocation.revision, invocation.dispatch_attempt) == self.allowed_coordinate
+        ):
+            return None
+        return super()._invocation_transition_winner(invocation)
+
+
+def _invalid_initial_invocation_coordinate_factory(revision: int, dispatch_attempt: int):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _InvalidInitialInvocationCoordinateSink(harness._writers)
+        sink.allowed_coordinate = (revision, dispatch_attempt)
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize(
+    ("label", "revision", "dispatch_attempt"),
+    [
+        ("revision_2", 2, 1),
+        ("attempt_2", 1, 2),
+        ("revision_2_attempt_2", 2, 2),
+    ],
+)
+def test_reusable_contract_checks_each_invalid_initial_invocation_coordinate(
+    label: str,
+    revision: int,
+    dispatch_attempt: int,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _invalid_initial_invocation_coordinate_factory(revision, dispatch_attempt)
+    )
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    coordinate_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == f"first_coordinate_{label}"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert coordinate_observation.expected == "conflict"
+    assert coordinate_observation.actual == "committed"
+
+
 class _CorruptingLoadedRecordSink(DeterministicFencedRunSink):
     corruption = ""
 
@@ -812,6 +881,23 @@ class _IgnoringIdentityFieldSink(DeterministicFencedRunSink):
             )
         return super().settle_terminal(outcome, writer_token=writer_token)
 
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        stored = self._invocations.get(key)
+        if self.record_family == "invocation" and stored is not None:
+            winner = stored[1].invocation
+            invocation = replace(
+                invocation,
+                **{self.ignored_field: getattr(winner, self.ignored_field)},
+            )
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
 
 def _ignoring_identity_field_factory(record_family: str, field_name: str):
     def factory() -> DeterministicFencedRunHarness:
@@ -839,6 +925,10 @@ def _ignoring_identity_field_factory(record_family: str, field_name: str):
         *(
             ("terminal", "FENCED-03-EVENT-AND-TERMINAL-WINNERS", field_name)
             for field_name in _TERMINAL_IDENTITY_FIELDS
+        ),
+        *(
+            ("invocation", "FENCED-04-INVOCATION-LIFECYCLE", field_name)
+            for field_name in _INVOCATION_IDENTITY_FIELDS
         ),
     ],
 )

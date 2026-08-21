@@ -33,7 +33,9 @@ from monoid_agent_kernel.core.capability import (
 from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint, load_latest_checked
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
 from monoid_agent_kernel.core.model_invocation import (
+    ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS,
     ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS,
+    MODEL_INVOCATION_SCHEMA_VERSION,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
 )
@@ -71,6 +73,26 @@ _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
     generation
     for generation in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
     if generation != MODEL_REQUEST_DIGEST_GENERATION
+)
+_CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION = next(
+    schema
+    for schema in ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS
+    if schema != MODEL_INVOCATION_SCHEMA_VERSION
+)
+_CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
+    {
+        "dispatch_id",
+        "dispatch_attempt",
+        "idempotency_key",
+        "dispatch_state",
+        "request_digest",
+        "receipt",
+        "result_ref",
+        "failure_code",
+    }
+)
+_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset(
+    {"schema_version", "digest_generation"}
 )
 
 
@@ -582,11 +604,19 @@ def _contract_first_invocation_state_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
     dispatch_state: str,
+    *,
+    revision: int = 1,
+    dispatch_attempt: int = 1,
 ) -> str:
     harness = factory()
     token = _contract_writer(harness, run_id)
     return harness.sink.commit_invocation(
-        _contract_invocation(run_id, revision=1, dispatch_state=dispatch_state),
+        _contract_invocation(
+            run_id,
+            revision=revision,
+            dispatch_attempt=dispatch_attempt,
+            dispatch_state=dispatch_state,
+        ),
         {},
         writer_token=token,
     ).status
@@ -665,6 +695,142 @@ def _contract_retry_coordinate_status(
             dispatch_id=dispatch_id,
             dispatch_state="reserved",
         ),
+        {},
+        writer_token=token,
+    ).status
+
+
+def _contract_invocation_identity_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+) -> str:
+    """Retry one invocation revision with exactly one canonical non-key field changed."""
+
+    canonical_fields = set(
+        _contract_invocation(
+            run_id,
+            revision=1,
+            dispatch_state="reserved",
+        ).to_json()
+    )
+    identity_fields = canonical_fields - {
+        "run_id",
+        "logical_call_id",
+        "revision",
+    } - _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS
+    if identity_fields != _CONTRACT_INVOCATION_IDENTITY_FIELDS:
+        raise AssertionError("invocation identity matrix is incomplete")
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    blobs: Mapping[str, bytes] = {}
+    if field_name in {"receipt", "result_ref", "failure_code"}:
+        setup = (
+            _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+            _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+        )
+        setup_statuses = tuple(
+            harness.sink.commit_invocation(
+                invocation,
+                {},
+                writer_token=token,
+            ).status
+            for invocation in setup
+        )
+        if any(status != "committed" for status in setup_statuses):
+            return f"setup:{','.join(setup_statuses)}"
+        if field_name == "failure_code":
+            baseline = _contract_invocation(
+                run_id,
+                revision=3,
+                dispatch_state="settled",
+            )
+            variant = replace(baseline, failure_code="provider_timeout")
+        else:
+            baseline = _contract_invocation(
+                run_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            )
+            blobs = {
+                _CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB,
+            }
+            if field_name == "receipt":
+                variant = replace(
+                    baseline,
+                    receipt={
+                        **dict(baseline.receipt or {}),
+                        "provider_request_id": "provider-alternate",
+                    },
+                )
+            else:
+                variant = replace(
+                    baseline,
+                    result_ref="object:contract-alternate",
+                )
+    else:
+        baseline = _contract_invocation(
+            run_id,
+            revision=1,
+            dispatch_state="reserved",
+        )
+        variants = {
+            "dispatch_id": replace(baseline, dispatch_id="dispatch-alternate"),
+            "dispatch_attempt": replace(baseline, dispatch_attempt=2),
+            "idempotency_key": replace(
+                baseline,
+                idempotency_key="contract-idempotency-alternate",
+            ),
+            "dispatch_state": replace(baseline, dispatch_state="dispatch_started"),
+            "request_digest": replace(baseline, request_digest="b" * 64),
+        }
+        variant = variants[field_name]
+    first = harness.sink.commit_invocation(
+        baseline,
+        blobs,
+        writer_token=token,
+    )
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    return harness.sink.commit_invocation(
+        variant,
+        blobs,
+        writer_token=token,
+    ).status
+
+
+def _contract_invocation_canonical_alias_status(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    field_name: str,
+) -> str:
+    """Prove accepted legacy tags normalize to the same current canonical record."""
+
+    harness = factory()
+    token = _contract_writer(harness, run_id)
+    baseline = _contract_invocation(
+        run_id,
+        revision=1,
+        dispatch_state="reserved",
+    )
+    variants = {
+        "schema_version": replace(
+            baseline,
+            schema_version=_CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
+        ),
+        "digest_generation": replace(
+            baseline,
+            digest_generation=_CONTRACT_ALTERNATE_DIGEST_GENERATION,
+        ),
+    }
+    if set(variants) != _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS:
+        raise AssertionError("invocation canonical-tag matrix is incomplete")
+    first = harness.sink.commit_invocation(baseline, {}, writer_token=token)
+    if first.status != "committed":
+        return f"setup:{first.status}"
+    return harness.sink.commit_invocation(
+        variants[field_name],
         {},
         writer_token=token,
     ).status
@@ -1298,6 +1464,22 @@ def run_fenced_run_sink_contract(
         )
 
     try:
+        invocation_identity_statuses = {
+            field_name: _contract_invocation_identity_status(
+                factory,
+                _contract_run_id(namespace, f"invocation-identity-{field_name}"),
+                field_name,
+            )
+            for field_name in sorted(_CONTRACT_INVOCATION_IDENTITY_FIELDS)
+        }
+        invocation_canonical_alias_statuses = {
+            field_name: _contract_invocation_canonical_alias_status(
+                factory,
+                _contract_run_id(namespace, f"invocation-canonical-alias-{field_name}"),
+                field_name,
+            )
+            for field_name in sorted(_CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS)
+        }
         harness = factory()
         run_id = _contract_run_id(namespace, "invocation")
         token = _contract_writer(harness, run_id)
@@ -1420,6 +1602,22 @@ def run_fenced_run_sink_contract(
                         expected="conflict",
                         actual=conflicting_reserved.status,
                     ),
+                    *(
+                        observation(
+                            f"invocation_identity_{field_name}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for field_name, status in invocation_identity_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"invocation_canonical_alias_{field_name}",
+                            expected="already_committed",
+                            actual=status,
+                        )
+                        for field_name, status in invocation_canonical_alias_statuses.items()
+                    ),
                     observation("start", expected="committed", actual=started.status),
                     observation(
                         "settled_failure", expected="committed", actual=settled_failure.status
@@ -1541,6 +1739,21 @@ def run_fenced_run_sink_contract(
             )
             for state in ("dispatch_started", "settled", "unknown")
         }
+        invalid_initial_coordinates = {
+            "revision_2": (2, 1),
+            "attempt_2": (1, 2),
+            "revision_2_attempt_2": (2, 2),
+        }
+        initial_coordinate_statuses = {
+            label: _contract_first_invocation_state_status(
+                factory,
+                _contract_run_id(namespace, f"invocation-first-coordinate-{label}"),
+                "reserved",
+                revision=revision,
+                dispatch_attempt=dispatch_attempt,
+            )
+            for label, (revision, dispatch_attempt) in invalid_initial_coordinates.items()
+        }
         forbidden_edges = (
             ("reserved", "reserved"),
             ("reserved", "settled"),
@@ -1643,6 +1856,14 @@ def run_fenced_run_sink_contract(
                             actual=status,
                         )
                         for state, status in initial_refusal_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"first_coordinate_{label}",
+                            expected="conflict",
+                            actual=status,
+                        )
+                        for label, status in initial_coordinate_statuses.items()
                     ),
                     observation("revision_gap", expected="conflict", actual=gap.status),
                     *(

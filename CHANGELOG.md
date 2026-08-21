@@ -32,8 +32,9 @@ out in commit messages and here.
   barrier-coordinated CAS and writer-handoff races for every authoritative mutation.
   Concurrent writers use separate facades over shared backing. Per-execution namespaces make the
   suite repeatable on one persistent test service. Reopened records use complete canonical-payload
-  comparisons. Same-key checkpoint, event, and terminal retries vary every canonical non-key field
-  independently, and retry-attempt coordinates have an exhaustive invalid-combination matrix.
+  comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
+  canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
+  invalid-combination matrices.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 
