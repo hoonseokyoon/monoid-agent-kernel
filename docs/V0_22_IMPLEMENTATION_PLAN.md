@@ -556,7 +556,9 @@ attempt N reserved
 Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
 attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
 새 dispatch ID는 해당 logical call의 모든 이전 attempt와 달라야 한다. Contract는 두 번의 retryable
-failure를 만든 뒤 attempt 3에서 attempt 1의 ID를 재사용하는 history를 `conflict`로 검증한다.
+failure를 만든 뒤 attempt 3에서 attempt 1의 ID를 재사용하는 history를 `conflict`로 검증한다. 같은
+history에서 fresh ID를 쓴 attempt 3의 reserved, dispatch_started, settled lifecycle은 모두
+`committed`다.
 
 ### 6.4 LocalFS capability
 
@@ -1014,7 +1016,8 @@ postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh ma
 다시 읽고 기존 shared blob bytes를 즉시 재검증한다. Malformed map도 stale/cross-run fencing 뒤에만
 검사한다. Event와 terminal winner는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전
 attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을
-실패시키는 mutant test가 있다.
+실패시키는 mutant test가 있다. Attempt 3 이상을 일괄 거부하는 구현도 양성 lifecycle observation이
+잡아낸다.
 
 ### 14.6 최종 통합 PR
 

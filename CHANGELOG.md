@@ -46,8 +46,8 @@ out in commit messages and here.
   commits and round-trips the intended bytes. Existing records that share the digest retain their
   original bytes, and stale or cross-run malformed requests remain fenced before validation.
   Reopened event and terminal-winner inspection compare complete canonical payloads instead of
-  trusting retry digests. Retry
-  reservations reject dispatch IDs used by any earlier attempt in the logical call history.
+  trusting retry digests. Retry reservations reject dispatch IDs used by any earlier attempt in
+  the logical call history, while a complete third attempt with a fresh ID remains legal.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

@@ -1611,6 +1611,50 @@ def test_reusable_contract_rejects_dispatch_id_reuse_from_any_older_attempt() ->
     assert historical_observation.actual == "committed"
 
 
+class _RejectThirdAttemptSink(DeterministicFencedRunSink):
+    def _invocation_transition_winner(
+        self,
+        invocation: DurableModelInvocation,
+    ) -> str | None:
+        if invocation.dispatch_attempt > 2:
+            head = self._invocation_heads.get(
+                (invocation.run_id, invocation.logical_call_id)
+            )
+            if head is not None:
+                return self._invocations[
+                    (invocation.run_id, invocation.logical_call_id, head)
+                ][0]
+        return super()._invocation_transition_winner(invocation)
+
+
+def _reject_third_attempt_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _RejectThirdAttemptSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_accepts_a_complete_valid_third_attempt() -> None:
+    outcomes = run_fenced_run_sink_contract(_reject_third_attempt_factory)
+    refusal_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS"
+    )
+    third_attempt_observation = next(
+        observation
+        for observation in refusal_rule.observations
+        if observation.observation_id == "valid_third_attempt_lifecycle"
+    )
+
+    assert refusal_rule.status == "failed"
+    assert third_attempt_observation.expected == (
+        "committed",
+        "committed",
+        "committed",
+    )
+    assert third_attempt_observation.actual == ("conflict", "conflict", "conflict")
+
+
 class _VolatileReopenHarness(DeterministicFencedRunHarness):
     def reopen(self) -> DeterministicFencedRunHarness:
         return _VolatileReopenHarness()

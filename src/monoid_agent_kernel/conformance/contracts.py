@@ -869,8 +869,8 @@ def _contract_retry_coordinate_status(
 def _contract_historical_dispatch_id_reuse_status(
     factory: FencedRunSinkHarnessFactory,
     run_id: str,
-) -> str:
-    """Build two failed attempts, then reuse attempt one's dispatch ID for attempt three."""
+) -> tuple[str, tuple[str, ...]]:
+    """Reject historical ID reuse, then complete attempt three with a fresh identity."""
 
     harness = factory()
     token = _contract_writer(harness, run_id)
@@ -911,9 +911,9 @@ def _contract_historical_dispatch_id_reuse_status(
         for invocation in history
     )
     if any(status != "committed" for status in setup_statuses):
-        return f"setup:{','.join(setup_statuses)}"
+        return f"setup:{','.join(setup_statuses)}", ()
     harness = harness.reopen()
-    return harness.sink.commit_invocation(
+    historical_reuse = harness.sink.commit_invocation(
         _contract_invocation(
             run_id,
             revision=7,
@@ -923,7 +923,26 @@ def _contract_historical_dispatch_id_reuse_status(
         ),
         {},
         writer_token=token,
-    ).status
+    )
+    valid_third_attempt = tuple(
+        harness.sink.commit_invocation(
+            _contract_invocation(
+                run_id,
+                revision=revision,
+                dispatch_attempt=3,
+                dispatch_id="dispatch-3",
+                dispatch_state=dispatch_state,
+            ),
+            {},
+            writer_token=token,
+        ).status
+        for revision, dispatch_state in (
+            (7, "reserved"),
+            (8, "dispatch_started"),
+            (9, "settled"),
+        )
+    )
+    return historical_reuse.status, valid_third_attempt
 
 
 def _contract_invocation_identity_status(
@@ -2420,7 +2439,10 @@ def _run_fenced_run_sink_contract(
             )
             for label, (attempt, dispatch_id) in invalid_retry_coordinates.items()
         }
-        historical_dispatch_id_status = _contract_historical_dispatch_id_reuse_status(
+        (
+            historical_dispatch_id_status,
+            valid_third_attempt_statuses,
+        ) = _contract_historical_dispatch_id_reuse_status(
             factory,
             _contract_run_id(namespace, "invocation-retry-historical-dispatch-id"),
         )
@@ -2508,6 +2530,11 @@ def _run_fenced_run_sink_contract(
                         "retry_coordinate_historical_dispatch_id",
                         expected="conflict",
                         actual=historical_dispatch_id_status,
+                    ),
+                    observation(
+                        "valid_third_attempt_lifecycle",
+                        expected=("committed", "committed", "committed"),
+                        actual=valid_third_attempt_statuses,
                     ),
                     *(
                         observation(
