@@ -175,6 +175,22 @@ def test_terminal_outcome_reader_requires_a_versioned_nonempty_identity() -> Non
             TerminalOutcome.from_json(broken)
 
 
+@pytest.mark.parametrize(
+    "field",
+    ("prompt", "request_body", "rawResponse", "unknown_future_field"),
+)
+def test_terminal_outcome_strict_reader_rejects_unknown_top_level_fields(field: str) -> None:
+    payload = TerminalOutcome(
+        run_id="run_1",
+        kind="completed",
+        retry_eligibility="not_applicable",
+    ).to_json()
+    payload[field] = "private content"
+
+    with pytest.raises(ValueError, match="outside its closed schema"):
+        TerminalOutcome.from_json(payload)
+
+
 def test_terminal_outcome_has_no_content_or_raw_exception_channel() -> None:
     fields = TerminalOutcome.__dataclass_fields__
 

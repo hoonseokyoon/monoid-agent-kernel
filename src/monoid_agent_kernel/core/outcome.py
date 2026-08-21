@@ -7,7 +7,13 @@ from enum import StrEnum
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_ref, is_safe_taxonomy_code
-from monoid_agent_kernel.core.wire_validation import parse_int, parse_literal, parse_str, require_object
+from monoid_agent_kernel.core.wire_validation import (
+    parse_int,
+    parse_literal,
+    parse_str,
+    require_object,
+    require_only_fields,
+)
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 TERMINAL_OUTCOME_SCHEMA_VERSION = namespaced_id("terminal-outcome.v1")
@@ -24,6 +30,24 @@ TerminalOutcomeKind = Literal[
     "dispatch_unknown",
     "evidence_uncommitted",
 ]
+
+_TERMINAL_OUTCOME_FIELDS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "kind",
+        "retry_eligibility",
+        "interruption_cause",
+        "checkpoint_seq",
+        "final_output_ref",
+        "partial_output_ref",
+        "last_evidence_ref",
+        "error_code",
+        "provider_error_code",
+        "http_status",
+    }
+)
+
 
 class RetryEligibility(StrEnum):
     NOT_APPLICABLE = "not_applicable"
@@ -143,6 +167,7 @@ class TerminalOutcome:
     @classmethod
     def from_json(cls, payload: object) -> TerminalOutcome:
         payload = require_object(payload, "terminal outcome")
+        require_only_fields(payload, _TERMINAL_OUTCOME_FIELDS, "terminal outcome")
         schema_version = parse_str(payload, "schema_version")
         if schema_version not in ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS:
             raise ValueError("unsupported terminal outcome schema")

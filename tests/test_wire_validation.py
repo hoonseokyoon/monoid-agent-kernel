@@ -13,12 +13,26 @@ from monoid_agent_kernel.core.wire_validation import (
     parse_str,
     require_list,
     require_object,
+    require_only_fields,
 )
 
 
 def test_require_object_rejects_non_objects() -> None:
     with pytest.raises(WireValidationError):
         require_object([], "payload")
+
+
+def test_require_only_fields_rejects_unknown_fields_without_echoing_their_names() -> None:
+    require_only_fields({"kind": "safe"}, {"kind"}, "record")
+
+    with pytest.raises(WireValidationError) as raised:
+        require_only_fields(
+            {"kind": "safe", "private prompt used as a field": "secret"},
+            {"kind"},
+            "record",
+        )
+
+    assert "private prompt" not in str(raised.value)
 
 
 def test_optional_object_preserves_missing_default_and_rejects_wrong_type() -> None:

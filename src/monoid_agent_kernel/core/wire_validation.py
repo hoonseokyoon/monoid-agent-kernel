@@ -29,6 +29,18 @@ def require_object(value: Any, name: str = "payload") -> dict[str, Any]:
     return _validate(_OBJECT_ADAPTER, value, name, "must be an object")
 
 
+def require_only_fields(
+    payload: Mapping[str, Any],
+    allowed: Iterable[str],
+    name: str = "payload",
+) -> None:
+    """Reject fields outside a versioned closed schema without echoing their names."""
+
+    allowed_fields = frozenset(allowed)
+    if any(key not in allowed_fields for key in payload):
+        raise WireValidationError(f"{name} contains fields outside its closed schema")
+
+
 def optional_object(
     payload: Mapping[str, Any],
     key: str,

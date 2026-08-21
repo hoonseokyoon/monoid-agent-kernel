@@ -84,6 +84,22 @@ def test_model_invocation_checked_reader_distinguishes_corrupt_and_future() -> N
 
 
 @pytest.mark.parametrize(
+    "field",
+    ("prompt", "requestBody", "raw_response", "unknown_future_field"),
+)
+def test_model_invocation_checked_reader_rejects_unknown_top_level_fields(
+    field: str,
+) -> None:
+    payload = _invocation().to_json()
+    payload[field] = "private content"
+
+    checked = decode_model_invocation(payload)
+
+    assert checked.status == "corrupt"
+    assert checked.value is None
+
+
+@pytest.mark.parametrize(
     "changes",
     (
         {"run_id": ""},
@@ -303,7 +319,9 @@ def test_model_invocation_receipt_requires_the_same_recorded_request_digest(
         {"startedAt": "not-a-timestamp"},
         {"providerRetried": "false"},
         {"latencyMs": -1},
+        {"latencyMs": 10**400},
         {"durationMs": math.inf},
+        {"durationMs": 10**400},
         {"attempts": 0},
         {"httpStatus": 99},
         {"usage": {"inputTokens": True}},

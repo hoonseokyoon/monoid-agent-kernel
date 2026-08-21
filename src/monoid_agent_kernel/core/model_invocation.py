@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
-from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+from monoid_agent_kernel.core.json_ingress import is_finite_json_number, normalize_json_ingress
 from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_ref,
     is_safe_taxonomy_code,
     is_safe_utc_timestamp,
 )
-from monoid_agent_kernel.core.wire_validation import parse_int, parse_literal, parse_str
+from monoid_agent_kernel.core.wire_validation import (
+    parse_int,
+    parse_literal,
+    parse_str,
+    require_only_fields,
+)
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 MODEL_INVOCATION_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
@@ -25,6 +29,24 @@ MODEL_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
 ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS = accepted_namespaced_ids("model-request-digest.v1")
 
 DispatchState = Literal["reserved", "dispatch_started", "settled", "unknown"]
+
+_MODEL_INVOCATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "logical_call_id",
+        "revision",
+        "dispatch_id",
+        "dispatch_attempt",
+        "idempotency_key",
+        "dispatch_state",
+        "request_digest",
+        "digest_generation",
+        "receipt",
+        "result_ref",
+        "failure_code",
+    }
+)
 
 # Receipt v1 is a closed evidence vocabulary. Unknown provider metadata is private by default;
 # expanding the public durable record requires an explicit contract change rather than another
@@ -175,7 +197,7 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                 raise ValueError(f"model invocation receipt {canonical_key} must be a boolean")
             canonical[canonical_key] = value
         elif canonical_key in _RECEIPT_DURATION_FIELDS:
-            if type(value) not in {int, float} or value < 0 or not math.isfinite(float(value)):
+            if not is_finite_json_number(value) or value < 0:
                 raise ValueError(
                     f"model invocation receipt {canonical_key} must be a non-negative number"
                 )
@@ -296,6 +318,7 @@ class DurableModelInvocation:
 
 
 def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvocation:
+    require_only_fields(payload, _MODEL_INVOCATION_FIELDS, "model invocation")
     raw_receipt = payload.get("receipt")
     if raw_receipt is not None and not isinstance(raw_receipt, Mapping):
         raise ValueError("model invocation receipt must be an object or null")
