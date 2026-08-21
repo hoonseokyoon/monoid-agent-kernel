@@ -1138,6 +1138,49 @@ def test_reusable_contract_resolves_every_referenced_invocation_blob() -> None:
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes
 
 
+class _BlobOnlySuccessfulResultSink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if (
+            invocation.dispatch_state == "settled"
+            and invocation.result_ref
+            and not invocation.result_ref.startswith("blob:")
+        ):
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+
+def _blob_only_successful_result_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _BlobOnlySuccessfulResultSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_accepts_external_successful_result_references() -> None:
+    outcomes = run_fenced_run_sink_contract(_blob_only_successful_result_factory)
+    invocation_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-04-INVOCATION-LIFECYCLE"
+    )
+    observation = next(
+        item
+        for item in invocation_rule.observations
+        if item.observation_id == "external_reference_status"
+    )
+
+    assert invocation_rule.status == "failed"
+    assert observation.expected == "committed"
+    assert observation.actual == "conflict"
+
+
 class _MissingReferenceAcceptingSink(DeterministicFencedRunSink):
     def _checkpoint_references_resolve(
         self,
@@ -1183,6 +1226,44 @@ def test_reusable_contract_rejects_unresolved_authoritative_blob_references() ->
     assert invocation_rule.status == "failed"
     assert checkpoint_status == "committed"
     assert invocation_status == "committed"
+
+
+class _MalformedReferenceAcceptingSink(DeterministicFencedRunSink):
+    def _reference_is_available(
+        self,
+        run_id: str,
+        sha256: str,
+        blobs: Mapping[str, bytes],
+    ) -> bool:
+        if sha256 == "not-a-digest":
+            return True
+        return super()._reference_is_available(run_id, sha256, blobs)
+
+
+def _malformed_reference_accepting_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _MalformedReferenceAcceptingSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_rejects_malformed_blob_reference_suffixes() -> None:
+    outcomes = run_fenced_run_sink_contract(_malformed_reference_accepting_factory)
+    rules = {outcome.rule_id: outcome for outcome in outcomes}
+    checkpoint_observations = {
+        item.observation_id: item.actual
+        for item in rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"].observations
+    }
+    invocation_observations = {
+        item.observation_id: item.actual
+        for item in rules["FENCED-04-INVOCATION-LIFECYCLE"].observations
+    }
+
+    assert rules["FENCED-01-CHECKPOINT-CONTENT-IDENTITY"].status == "failed"
+    assert rules["FENCED-04-INVOCATION-LIFECYCLE"].status == "failed"
+    assert checkpoint_observations["malformed_workspace_reference_status"] == ("committed")
+    assert checkpoint_observations["malformed_media_reference_status"] == "committed"
+    assert invocation_observations["malformed_reference_status"] == "committed"
+    assert invocation_observations["malformed_reference_head_not_published"] == 3
 
 
 class _WorkspaceOnlyCheckpointReferenceSink(DeterministicFencedRunSink):

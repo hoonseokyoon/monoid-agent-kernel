@@ -78,6 +78,7 @@ _CONTRACT_ALTERNATE_BLOB = b"alternate contract blob bytes\n"
 _CONTRACT_ALTERNATE_BLOB_SHA256 = hashlib.sha256(_CONTRACT_ALTERNATE_BLOB).hexdigest()
 _CONTRACT_UNRESOLVED_BLOB = b"contract reference recovery bytes\n"
 _CONTRACT_UNRESOLVED_BLOB_SHA256 = hashlib.sha256(_CONTRACT_UNRESOLVED_BLOB).hexdigest()
+_CONTRACT_MALFORMED_BLOB_SHA256 = "not-a-digest"
 _CONTRACT_STALE_HANDOFF_BLOB = b"stale writer handoff-only blob bytes\n"
 _CONTRACT_STALE_HANDOFF_BLOB_SHA256 = hashlib.sha256(_CONTRACT_STALE_HANDOFF_BLOB).hexdigest()
 _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
@@ -1583,6 +1584,66 @@ def _run_fenced_run_sink_contract(
             missing_media_recovery_load.value,
             _CONTRACT_UNRESOLVED_BLOB_SHA256,
         )
+        malformed_workspace_harness = factory()
+        malformed_workspace_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-malformed-workspace-reference",
+        )
+        malformed_workspace_token = _contract_writer(
+            malformed_workspace_harness,
+            malformed_workspace_run_id,
+        )
+        malformed_workspace_reference = malformed_workspace_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=malformed_workspace_run_id,
+                seq=1,
+                workspace_delta=[
+                    {
+                        "path": "malformed-workspace-reference.txt",
+                        "kind": "file",
+                        "change_kind": "created",
+                        "content_sha256": _CONTRACT_MALFORMED_BLOB_SHA256,
+                    }
+                ],
+            ),
+            {},
+            writer_token=malformed_workspace_token,
+        )
+        malformed_workspace_harness = malformed_workspace_harness.reopen()
+        malformed_workspace_load = malformed_workspace_harness.sink.latest_checked(
+            malformed_workspace_run_id
+        )
+        malformed_media_harness = factory()
+        malformed_media_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-malformed-media-reference",
+        )
+        malformed_media_token = _contract_writer(
+            malformed_media_harness,
+            malformed_media_run_id,
+        )
+        malformed_media_reference = malformed_media_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=malformed_media_run_id,
+                seq=1,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source_ref": (f"blob:{_CONTRACT_MALFORMED_BLOB_SHA256}"),
+                                "mime_type": "image/png",
+                            }
+                        ],
+                    }
+                ],
+            ),
+            {},
+            writer_token=malformed_media_token,
+        )
+        malformed_media_harness = malformed_media_harness.reopen()
+        malformed_media_load = malformed_media_harness.sink.latest_checked(malformed_media_run_id)
         backing_harness = factory()
         backing_run_id = _contract_run_id(
             namespace,
@@ -1926,6 +1987,26 @@ def _run_fenced_run_sink_contract(
                         "missing_media_reference_recovery_bytes",
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
                         actual=missing_media_recovery_bytes,
+                    ),
+                    observation(
+                        "malformed_workspace_reference_status",
+                        expected="conflict",
+                        actual=malformed_workspace_reference.status,
+                    ),
+                    observation(
+                        "malformed_workspace_reference_not_published",
+                        expected="missing",
+                        actual=malformed_workspace_load.status,
+                    ),
+                    observation(
+                        "malformed_media_reference_status",
+                        expected="conflict",
+                        actual=malformed_media_reference.status,
+                    ),
+                    observation(
+                        "malformed_media_reference_not_published",
+                        expected="missing",
+                        actual=malformed_media_load.status,
                     ),
                     observation(
                         "authoritative_backing_reference_statuses",
@@ -2896,6 +2977,86 @@ def _run_fenced_run_sink_contract(
             missing_reference_recovery_load.value,
             _CONTRACT_UNRESOLVED_BLOB_SHA256,
         )
+        malformed_reference_harness = factory()
+        malformed_reference_run_id = _contract_run_id(
+            namespace,
+            "invocation-malformed-reference",
+        )
+        malformed_reference_token = _contract_writer(
+            malformed_reference_harness,
+            malformed_reference_run_id,
+        )
+        malformed_reference_setup = tuple(
+            malformed_reference_harness.sink.commit_invocation(
+                _contract_invocation(
+                    malformed_reference_run_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=malformed_reference_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        malformed_reference_invocation = replace(
+            _contract_invocation(
+                malformed_reference_run_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            ),
+            result_ref=f"blob:{_CONTRACT_MALFORMED_BLOB_SHA256}",
+        )
+        malformed_reference = malformed_reference_harness.sink.commit_invocation(
+            malformed_reference_invocation,
+            {},
+            writer_token=malformed_reference_token,
+        )
+        malformed_reference_harness = malformed_reference_harness.reopen()
+        malformed_reference_load = malformed_reference_harness.sink.load_invocation(
+            malformed_reference_run_id,
+            "call-1",
+        )
+        external_reference_harness = factory()
+        external_reference_run_id = _contract_run_id(
+            namespace,
+            "invocation-external-reference",
+        )
+        external_reference_token = _contract_writer(
+            external_reference_harness,
+            external_reference_run_id,
+        )
+        external_reference_setup = tuple(
+            external_reference_harness.sink.commit_invocation(
+                _contract_invocation(
+                    external_reference_run_id,
+                    revision=revision,
+                    dispatch_state=dispatch_state,
+                ),
+                {},
+                writer_token=external_reference_token,
+            ).status
+            for revision, dispatch_state in ((1, "reserved"), (2, "dispatch_started"))
+        )
+        external_reference_invocation = replace(
+            _contract_invocation(
+                external_reference_run_id,
+                revision=3,
+                dispatch_state="settled",
+                succeeded=True,
+            ),
+            result_ref="object:contract-result",
+        )
+        external_reference = external_reference_harness.sink.commit_invocation(
+            external_reference_invocation,
+            {},
+            writer_token=external_reference_token,
+        )
+        external_reference_harness = external_reference_harness.reopen()
+        external_reference_load = external_reference_harness.sink.load_invocation(
+            external_reference_run_id,
+            "call-1",
+        )
         backing_harness = factory()
         backing_run_id = _contract_run_id(
             namespace,
@@ -3414,6 +3575,54 @@ def _run_fenced_run_sink_contract(
                         "missing_reference_recovery_bytes",
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
                         actual=missing_reference_recovery_bytes,
+                    ),
+                    observation(
+                        "malformed_reference_setup",
+                        expected=("committed", "committed"),
+                        actual=malformed_reference_setup,
+                    ),
+                    observation(
+                        "malformed_reference_status",
+                        expected="conflict",
+                        actual=malformed_reference.status,
+                    ),
+                    observation(
+                        "malformed_reference_head_not_published",
+                        expected=2,
+                        actual=malformed_reference_load.sequence,
+                    ),
+                    observation(
+                        "external_reference_setup",
+                        expected=("committed", "committed"),
+                        actual=external_reference_setup,
+                    ),
+                    observation(
+                        "external_reference_status",
+                        expected="committed",
+                        actual=external_reference.status,
+                    ),
+                    observation(
+                        "external_reference_head",
+                        expected=3,
+                        actual=external_reference_load.sequence,
+                    ),
+                    observation(
+                        "external_reference_result_ref",
+                        expected="object:contract-result",
+                        actual=(
+                            external_reference_load.value.invocation.result_ref
+                            if external_reference_load.value
+                            else None
+                        ),
+                    ),
+                    observation(
+                        "external_reference_payload",
+                        expected=canonical_sha256(external_reference_invocation.to_json()),
+                        actual=(
+                            canonical_sha256(external_reference_load.value.invocation.to_json())
+                            if external_reference_load.value
+                            else None
+                        ),
                     ),
                     observation(
                         "authoritative_backing_reference_setup",

@@ -586,6 +586,10 @@ reference는 제출 map이나 같은 run의 authoritative backing으로 해소�
 경로의 fresh missing-reference commit은 `conflict`이고 head를 유지한다. 같은 run에서 먼저 저장한
 blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재개방 record가 그 bytes를
 반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
+`blob:` suffix는 정확한 lowercase SHA-256 digest다. Workspace `content_sha256`, message media
+`source_ref`, invocation `result_ref`의 malformed suffix는 모두 `conflict`이고 metadata와 head를
+공개하지 않는다. `object:` 같은 bounded external invocation result address는 blob map 없이 commit되며
+재개방한 canonical payload에 그대로 남는다.
 Run A에만 존재하는 digest를 run B가 빈 map으로 참조하면 checkpoint와 invocation 모두 `conflict`다.
 Content-addressed blob namespace는 run 권위 경계를 포함한다.
 Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
@@ -1093,7 +1097,8 @@ owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff
 일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두 blob-bearing mutation에서
 거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract harness registry는 probe
 전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
-낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다.
+낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는
+workspace·media·invocation의 malformed digest를 거부하고 external invocation result address를 허용한다.
 
 ### 14.6 최종 통합 PR
 
