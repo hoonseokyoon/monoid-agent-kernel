@@ -38,7 +38,8 @@ out in commit messages and here.
   normalize in both lifecycle-transition directions. Exact retries of every older invocation
   revision cannot republish an obsolete journal head. Every successful invocation fixture commits
   the result blob referenced by its durable metadata. The harness lifecycle closes every factory
-  instance and reopened sink facade after each complete contract execution.
+  instance and reopened sink facade after each complete contract execution. All four resource-key
+  families prove independent same-coordinate commits and retries across two authorized runs.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

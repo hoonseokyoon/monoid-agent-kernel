@@ -324,6 +324,123 @@ def test_reusable_contract_does_not_call_the_host_generation_allocator() -> None
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes
 
 
+class _UnscopedResourceKeySink(DeterministicFencedRunSink):
+    broken_mutation = ""
+    _unscoped_winners: dict[tuple[str, object], str]
+
+    def _unscoped_collision(
+        self,
+        mutation: str,
+        local_key: object,
+        run_id: str,
+        writer_token: WriterToken,
+    ) -> CommitResult | None:
+        if self.broken_mutation != mutation or not self._is_current(run_id, writer_token):
+            return None
+        resource_key = (mutation, local_key)
+        winner_run = self._unscoped_winners.setdefault(resource_key, run_id)
+        if winner_run != run_id:
+            return CommitResult(status="conflict")
+        return None
+
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        collision = self._unscoped_collision(
+            "checkpoint",
+            checkpoint.seq,
+            checkpoint.run_id,
+            writer_token,
+        )
+        return collision or super().commit_checkpoint(
+            checkpoint,
+            blobs,
+            writer_token=writer_token,
+        )
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        collision = self._unscoped_collision(
+            "event",
+            event.seq,
+            event.run_id,
+            writer_token,
+        )
+        return collision or super().append_event(event, writer_token=writer_token)
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        collision = self._unscoped_collision(
+            "invocation",
+            (invocation.logical_call_id, invocation.revision),
+            invocation.run_id,
+            writer_token,
+        )
+        return collision or super().commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        collision = self._unscoped_collision(
+            "terminal",
+            "terminal",
+            outcome.run_id,
+            writer_token,
+        )
+        return collision or super().settle_terminal(outcome, writer_token=writer_token)
+
+
+def _unscoped_resource_key_factory(mutation: str):
+    def factory() -> DeterministicFencedRunHarness:
+        harness = DeterministicFencedRunHarness()
+        sink = _UnscopedResourceKeySink(harness._writers)
+        sink.broken_mutation = mutation
+        sink._unscoped_winners = {}
+        harness.sink = sink
+        return harness
+
+    return factory
+
+
+@pytest.mark.parametrize("mutation", ["checkpoint", "event", "invocation", "terminal"])
+def test_reusable_contract_scopes_each_resource_key_by_run(mutation: str) -> None:
+    outcomes = run_fenced_run_sink_contract(_unscoped_resource_key_factory(mutation))
+    binding_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-06-WRITER-TOKEN-RUN-BINDING"
+    )
+    run_b_observation = next(
+        observation
+        for observation in binding_rule.observations
+        if observation.observation_id == f"run_b_bound_{mutation}"
+    )
+
+    assert binding_rule.status == "failed"
+    assert run_b_observation.expected == "committed"
+    assert run_b_observation.actual == "conflict"
+
+
 def _missing_capability_factory() -> DeterministicFencedRunHarness:
     harness = DeterministicFencedRunHarness()
     harness.sink.capabilities = StorageCapabilities(

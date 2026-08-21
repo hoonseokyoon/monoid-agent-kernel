@@ -506,6 +506,11 @@ Resource key는 다음과 같다.
 | invocation | `(run_id, logical_call_id, revision)` |
 | terminal | `(run_id, "terminal")` |
 
+Contract는 같은 harness에서 run A와 run B를 모두 authorize한 뒤 동일한 local coordinate를 각 run에
+독립 commit한다. 두 run의 checkpoint/event `seq=1`, invocation `call-1/revision=1`, terminal은 모두
+`committed`이고 재개방 뒤 각각 `already_committed`다. Checkpoint와 invocation load도 요청한 run의
+record를 반환한다. 이 검증은 네 resource key에서 `run_id`가 빠지는 adapter를 거부한다.
+
 Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `already_committed`, 다른 content는
 `conflict`다.
 

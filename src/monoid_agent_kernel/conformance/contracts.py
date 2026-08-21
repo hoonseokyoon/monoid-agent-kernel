@@ -2132,12 +2132,21 @@ def _run_fenced_run_sink_contract(
         run_b_id = _contract_run_id(namespace, "run-b")
         run_a_token = _contract_writer(harness, run_a_id)
         run_b_token = _contract_writer(harness, run_b_id)
-        checkpoint = RunCheckpoint(run_id=run_b_id, seq=1)
-        event = _contract_event(run_b_id, seq=1)
-        invocation = _contract_invocation(
-            run_b_id, revision=1, dispatch_state="reserved"
+        run_a_records = (
+            RunCheckpoint(run_id=run_a_id, seq=1),
+            _contract_event(run_a_id, seq=1),
+            _contract_invocation(run_a_id, revision=1, dispatch_state="reserved"),
+            _contract_terminal(run_a_id),
         )
-        terminal = _contract_terminal(run_b_id)
+        run_b_records = (
+            RunCheckpoint(run_id=run_b_id, seq=1),
+            _contract_event(run_b_id, seq=1),
+            _contract_invocation(
+            run_b_id, revision=1, dispatch_state="reserved"
+            ),
+            _contract_terminal(run_b_id),
+        )
+        checkpoint, event, invocation, terminal = run_b_records
         swapped_checkpoint = harness.sink.commit_checkpoint(
             checkpoint,
             {},
@@ -2153,21 +2162,68 @@ def _run_fenced_run_sink_contract(
             terminal,
             writer_token=run_a_token,
         )
-        authorized_checkpoint = harness.sink.commit_checkpoint(
-            checkpoint,
-            {},
-            writer_token=run_b_token,
+        run_a_checkpoint, run_a_event, run_a_invocation, run_a_terminal = run_a_records
+        authorized_a = (
+            harness.sink.commit_checkpoint(
+                run_a_checkpoint,
+                {},
+                writer_token=run_a_token,
+            ),
+            harness.sink.append_event(run_a_event, writer_token=run_a_token),
+            harness.sink.commit_invocation(
+                run_a_invocation,
+                {},
+                writer_token=run_a_token,
+            ),
+            harness.sink.settle_terminal(run_a_terminal, writer_token=run_a_token),
         )
-        authorized_event = harness.sink.append_event(event, writer_token=run_b_token)
-        authorized_invocation = harness.sink.commit_invocation(
-            invocation,
-            {},
-            writer_token=run_b_token,
+        authorized_b = (
+            harness.sink.commit_checkpoint(
+                checkpoint,
+                {},
+                writer_token=run_b_token,
+            ),
+            harness.sink.append_event(event, writer_token=run_b_token),
+            harness.sink.commit_invocation(
+                invocation,
+                {},
+                writer_token=run_b_token,
+            ),
+            harness.sink.settle_terminal(terminal, writer_token=run_b_token),
         )
-        authorized_terminal = harness.sink.settle_terminal(
-            terminal,
-            writer_token=run_b_token,
+        harness = harness.reopen()
+        repeated_a = (
+            harness.sink.commit_checkpoint(
+                run_a_checkpoint,
+                {},
+                writer_token=run_a_token,
+            ),
+            harness.sink.append_event(run_a_event, writer_token=run_a_token),
+            harness.sink.commit_invocation(
+                run_a_invocation,
+                {},
+                writer_token=run_a_token,
+            ),
+            harness.sink.settle_terminal(run_a_terminal, writer_token=run_a_token),
         )
+        repeated_b = (
+            harness.sink.commit_checkpoint(
+                checkpoint,
+                {},
+                writer_token=run_b_token,
+            ),
+            harness.sink.append_event(event, writer_token=run_b_token),
+            harness.sink.commit_invocation(
+                invocation,
+                {},
+                writer_token=run_b_token,
+            ),
+            harness.sink.settle_terminal(terminal, writer_token=run_b_token),
+        )
+        loaded_a_checkpoint = harness.sink.latest_checked(run_a_id)
+        loaded_b_checkpoint = harness.sink.latest_checked(run_b_id)
+        loaded_a_invocation = harness.sink.load_invocation(run_a_id, "call-1")
+        loaded_b_invocation = harness.sink.load_invocation(run_b_id, "call-1")
         outcomes.append(
             outcome_from_observations(
                 "FENCED-06-WRITER-TOKEN-RUN-BINDING",
@@ -2191,25 +2247,71 @@ def _run_fenced_run_sink_contract(
                         expected="fenced",
                         actual=swapped_terminal.status,
                     ),
-                    observation(
-                        "run_bound_checkpoint",
-                        expected="committed",
-                        actual=authorized_checkpoint.status,
+                    *(
+                        observation(
+                            f"run_a_bound_{mutation}",
+                            expected="committed",
+                            actual=result.status,
+                        )
+                        for mutation, result in zip(
+                            ("checkpoint", "event", "invocation", "terminal"),
+                            authorized_a,
+                            strict=True,
+                        )
+                    ),
+                    *(
+                        observation(
+                            f"run_b_bound_{mutation}",
+                            expected="committed",
+                            actual=result.status,
+                        )
+                        for mutation, result in zip(
+                            ("checkpoint", "event", "invocation", "terminal"),
+                            authorized_b,
+                            strict=True,
+                        )
                     ),
                     observation(
-                        "run_bound_event",
-                        expected="committed",
-                        actual=authorized_event.status,
+                        "run_a_idempotent_retries",
+                        expected=("already_committed",) * 4,
+                        actual=tuple(result.status for result in repeated_a),
                     ),
                     observation(
-                        "run_bound_invocation",
-                        expected="committed",
-                        actual=authorized_invocation.status,
+                        "run_b_idempotent_retries",
+                        expected=("already_committed",) * 4,
+                        actual=tuple(result.status for result in repeated_b),
                     ),
                     observation(
-                        "run_bound_terminal",
-                        expected="committed",
-                        actual=authorized_terminal.status,
+                        "run_a_loaded_bindings",
+                        expected=(run_a_id, run_a_id),
+                        actual=(
+                            (
+                                loaded_a_checkpoint.value.checkpoint.run_id
+                                if loaded_a_checkpoint.value
+                                else None
+                            ),
+                            (
+                                loaded_a_invocation.value.invocation.run_id
+                                if loaded_a_invocation.value
+                                else None
+                            ),
+                        ),
+                    ),
+                    observation(
+                        "run_b_loaded_bindings",
+                        expected=(run_b_id, run_b_id),
+                        actual=(
+                            (
+                                loaded_b_checkpoint.value.checkpoint.run_id
+                                if loaded_b_checkpoint.value
+                                else None
+                            ),
+                            (
+                                loaded_b_invocation.value.invocation.run_id
+                                if loaded_b_invocation.value
+                                else None
+                            ),
+                        ),
                     ),
                 ),
             )
