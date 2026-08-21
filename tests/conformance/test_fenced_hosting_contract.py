@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import replace
 from threading import Barrier
 
@@ -1283,6 +1284,46 @@ def test_reusable_contract_rejects_checkpoint_head_regression() -> None:
     assert checkpoint_rule.status == "failed"
     assert head_observation.expected == 2
     assert head_observation.actual == 1
+
+
+class _RejectingDelayedCheckpointSink(DeterministicFencedRunSink):
+    def commit_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        current_head = self._checkpoint_heads.get(checkpoint.run_id, -1)
+        if (
+            self._is_current(checkpoint.run_id, writer_token)
+            and (checkpoint.run_id, checkpoint.seq) not in self._checkpoints
+            and checkpoint.seq < current_head
+        ):
+            return CommitResult(status="conflict", sequence=checkpoint.seq)
+        return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
+
+
+def _rejecting_delayed_checkpoint_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _RejectingDelayedCheckpointSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_commits_fresh_delayed_checkpoint_coordinates() -> None:
+    outcomes = run_fenced_run_sink_contract(_rejecting_delayed_checkpoint_factory)
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    observations = {
+        item.observation_id: item.actual for item in checkpoint_rule.observations
+    }
+
+    assert checkpoint_rule.status == "failed"
+    assert observations["delayed_checkpoint"] == "conflict"
+    assert observations["head_after_delayed_sequence"] == 2
 
 
 class _RegressingInvocationHeadSink(DeterministicFencedRunSink):
@@ -2656,6 +2697,8 @@ class _CloseTrackingHarness:
         self._inner = inner or DeterministicFencedRunHarness()
         self._closed = False
         tracker["opened"] += 1
+        tracker["active"] += 1
+        tracker["max_active"] = max(tracker["max_active"], tracker["active"])
 
     @property
     def sink(self):
@@ -2679,6 +2722,7 @@ class _CloseTrackingHarness:
         self._closed = True
         self._inner.close()
         self._tracker["closed"] += 1
+        self._tracker["active"] -= 1
 
     def race_conflicting_writes(self, mutation, writer_token, left, right):
         return self._inner.race_conflicting_writes(
@@ -2704,7 +2748,7 @@ class _CloseTrackingHarness:
 
 
 def test_reusable_contract_closes_every_exposed_harness_facade() -> None:
-    tracker = {"opened": 0, "closed": 0}
+    tracker = {"opened": 0, "closed": 0, "active": 0, "max_active": 0}
 
     def factory() -> _CloseTrackingHarness:
         return _CloseTrackingHarness(tracker)
@@ -2714,6 +2758,60 @@ def test_reusable_contract_closes_every_exposed_harness_facade() -> None:
     assert all(outcome.status == "passed" for outcome in outcomes), outcomes
     assert tracker["opened"] > 1
     assert tracker["closed"] == tracker["opened"]
+    assert tracker["active"] == 0
+    assert tracker["max_active"] <= 4
+
+
+class _CloseSensitiveSink(DeterministicFencedRunSink):
+    _open_state: dict[str, bool]
+
+    def _guard_blob_reader(self, record):
+        reader = record._blob_reader
+        if reader is None:
+            return record
+        open_state = self._open_state
+
+        def read(sha256: str) -> bytes:
+            if not open_state["open"]:
+                raise RuntimeError("blob reader used after its facade closed")
+            return reader(sha256)
+
+        return replace(record, _blob_reader=read)
+
+    def latest_checked(self, run_id: str):
+        loaded = super().latest_checked(run_id)
+        if loaded.value is None:
+            return loaded
+        return replace(loaded, value=self._guard_blob_reader(loaded.value))
+
+    def load_invocation(self, run_id: str, logical_call_id: str):
+        loaded = super().load_invocation(run_id, logical_call_id)
+        if loaded.value is None:
+            return loaded
+        return replace(loaded, value=self._guard_blob_reader(loaded.value))
+
+
+class _CloseSensitiveHarness(DeterministicFencedRunHarness):
+    def __post_init__(self) -> None:
+        self._open_state = {"open": True}
+        self.sink = _CloseSensitiveSink(self._writers)
+        self.sink._open_state = self._open_state
+
+    def reopen(self):
+        reopened = copy(self)
+        reopened._open_state = {"open": True}
+        reopened.sink = copy(self.sink)
+        reopened.sink._open_state = reopened._open_state
+        return reopened
+
+    def close(self) -> None:
+        self._open_state["open"] = False
+
+
+def test_reusable_contract_materializes_blob_observations_before_close() -> None:
+    outcomes = run_fenced_run_sink_contract(_CloseSensitiveHarness)
+
+    assert all(outcome.status == "passed" for outcome in outcomes), outcomes
 
 
 class _PersistentHarnessFactory:

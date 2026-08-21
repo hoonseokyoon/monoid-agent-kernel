@@ -284,11 +284,16 @@ class _FencedHarnessRegistry:
         self,
         factory: FencedRunSinkHarnessFactory,
     ) -> FencedRunSinkHarnessFactory:
-        return lambda: self.track(factory())
+        def open_probe() -> FencedRunSinkHarness:
+            self.close_all()
+            return self.track(factory())
+
+        return open_probe
 
     def close_all(self) -> None:
         errors: list[BaseException] = []
-        for harness in reversed(self._opened):
+        opened, self._opened = self._opened, []
+        for harness in reversed(opened):
             try:
                 harness.close()
             except BaseException as exc:
@@ -1544,6 +1549,10 @@ def _run_fenced_run_sink_contract(
         missing_reference_recovery_load = (
             missing_reference_harness.sink.latest_checked(missing_reference_run_id)
         )
+        missing_reference_recovery_bytes = _contract_blob_hex(
+            missing_reference_recovery_load.value,
+            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+        )
         missing_media_harness = factory()
         missing_media_run_id = _contract_run_id(
             namespace,
@@ -1586,6 +1595,10 @@ def _run_fenced_run_sink_contract(
         missing_media_harness = missing_media_harness.reopen()
         missing_media_recovery_load = missing_media_harness.sink.latest_checked(
             missing_media_run_id
+        )
+        missing_media_recovery_bytes = _contract_blob_hex(
+            missing_media_recovery_load.value,
+            _CONTRACT_UNRESOLVED_BLOB_SHA256,
         )
         backing_harness = factory()
         backing_run_id = _contract_run_id(
@@ -1643,6 +1656,10 @@ def _run_fenced_run_sink_contract(
         )
         backing_harness = backing_harness.reopen()
         backing_load = backing_harness.sink.latest_checked(backing_run_id)
+        backing_reference_bytes = _contract_blob_hex(
+            backing_load.value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
         uppercase_key_harness = factory()
         uppercase_key_run_id = _contract_run_id(
             namespace,
@@ -1692,6 +1709,10 @@ def _run_fenced_run_sink_contract(
         uppercase_key_recovery_load = uppercase_key_harness.sink.latest_checked(
             uppercase_key_run_id
         )
+        uppercase_key_recovery_bytes = _contract_blob_hex(
+            uppercase_key_recovery_load.value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "checkpoint-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -1731,6 +1752,10 @@ def _run_fenced_run_sink_contract(
         )
         malformed_harness = malformed_harness.reopen()
         malformed_after_rejection = malformed_harness.sink.latest_checked(malformed_run_id)
+        malformed_preserved_bytes = _contract_blob_hex(
+            malformed_after_rejection.value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
         malformed_recovery = malformed_harness.sink.commit_checkpoint(
             malformed_checkpoint,
             {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_CHECKPOINT_BLOB},
@@ -1738,6 +1763,10 @@ def _run_fenced_run_sink_contract(
         )
         malformed_harness = malformed_harness.reopen()
         malformed_recovery_load = malformed_harness.sink.latest_checked(malformed_run_id)
+        malformed_recovery_bytes = _contract_blob_hex(
+            malformed_recovery_load.value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
 
         harness = factory()
         run_id = _contract_run_id(namespace, "checkpoint")
@@ -1804,6 +1833,10 @@ def _run_fenced_run_sink_contract(
             ).items()
         }
         loaded = harness.sink.latest_checked(run_id)
+        referenced_blob_bytes = _contract_blob_hex(
+            loaded.value,
+            _CONTRACT_CHECKPOINT_BLOB_SHA256,
+        )
         checkpoint_digest = _contract_record_digest(
             checkpoint_payload_for_write(checkpoint),
             checkpoint_blobs,
@@ -1837,12 +1870,33 @@ def _run_fenced_run_sink_contract(
             {},
             writer_token=monotonic_token,
         )
-        monotonic_harness.sink.commit_checkpoint(
-            RunCheckpoint(run_id=monotonic_run_id, seq=1, final_text="delayed"),
-            {},
+        delayed_checkpoint = RunCheckpoint(
+            run_id=monotonic_run_id,
+            seq=1,
+            final_text="delayed",
+            workspace_delta=[
+                {
+                    "path": "delayed-checkpoint.txt",
+                    "kind": "file",
+                    "change_kind": "created",
+                    "content_sha256": _CONTRACT_ALTERNATE_BLOB_SHA256,
+                }
+            ],
+        )
+        delayed_blobs = {
+            _CONTRACT_ALTERNATE_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB,
+        }
+        delayed = monotonic_harness.sink.commit_checkpoint(
+            delayed_checkpoint,
+            delayed_blobs,
             writer_token=monotonic_token,
         )
         monotonic_harness = monotonic_harness.reopen()
+        delayed_retry = monotonic_harness.sink.commit_checkpoint(
+            delayed_checkpoint,
+            delayed_blobs,
+            writer_token=monotonic_token,
+        )
         head_after_delayed = monotonic_harness.sink.latest_checked(monotonic_run_id)
         outcomes.append(
             outcome_from_observations(
@@ -1872,10 +1926,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "missing_reference_recovery_bytes",
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            missing_reference_recovery_load.value,
-                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
-                        ),
+                        actual=missing_reference_recovery_bytes,
                     ),
                     observation(
                         "missing_media_reference_status",
@@ -1895,10 +1946,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "missing_media_reference_recovery_bytes",
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            missing_media_recovery_load.value,
-                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
-                        ),
+                        actual=missing_media_recovery_bytes,
                     ),
                     observation(
                         "authoritative_backing_reference_statuses",
@@ -1913,10 +1961,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "authoritative_backing_reference_bytes",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            backing_load.value,
-                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
-                        ),
+                        actual=backing_reference_bytes,
                     ),
                     observation(
                         "uppercase_blob_key_status",
@@ -1941,10 +1986,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "uppercase_blob_key_recovery_bytes",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            uppercase_key_recovery_load.value,
-                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
-                        ),
+                        actual=uppercase_key_recovery_bytes,
                     ),
                     observation(
                         "blob_key_conflict",
@@ -1969,10 +2011,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "malformed_fresh_blob_preserves_existing_bytes",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            malformed_after_rejection.value,
-                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
-                        ),
+                        actual=malformed_preserved_bytes,
                     ),
                     observation(
                         "malformed_fresh_blob_head_not_published",
@@ -1987,10 +2026,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "malformed_fresh_blob_recovery_bytes",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            malformed_recovery_load.value,
-                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
-                        ),
+                        actual=malformed_recovery_bytes,
                     ),
                     observation("conflict_status", expected="conflict", actual=conflict.status),
                     *(
@@ -2056,15 +2092,22 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "referenced_blob_round_trip",
                         expected=_CONTRACT_CHECKPOINT_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            loaded.value,
-                            _CONTRACT_CHECKPOINT_BLOB_SHA256,
-                        ),
+                        actual=referenced_blob_bytes,
                     ),
                     observation(
                         "newer_checkpoint",
                         expected="committed",
                         actual=newer.status,
+                    ),
+                    observation(
+                        "delayed_checkpoint",
+                        expected="committed",
+                        actual=delayed.status,
+                    ),
+                    observation(
+                        "delayed_checkpoint_retry",
+                        expected="already_committed",
+                        actual=delayed_retry.status,
                     ),
                     observation(
                         "head_after_delayed_sequence",
@@ -2865,6 +2908,10 @@ def _run_fenced_run_sink_contract(
                 "call-1",
             )
         )
+        missing_reference_recovery_bytes = _contract_blob_hex(
+            missing_reference_recovery_load.value,
+            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+        )
         backing_harness = factory()
         backing_run_id = _contract_run_id(
             namespace,
@@ -2925,6 +2972,10 @@ def _run_fenced_run_sink_contract(
         backing_load = backing_harness.sink.load_invocation(
             backing_run_id,
             backing_call_id,
+        )
+        backing_reference_bytes = _contract_blob_hex(
+            backing_load.value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
         )
         uppercase_key_harness = factory()
         uppercase_key_run_id = _contract_run_id(
@@ -2988,6 +3039,10 @@ def _run_fenced_run_sink_contract(
             uppercase_key_run_id,
             "call-1",
         )
+        uppercase_key_recovery_bytes = _contract_blob_hex(
+            uppercase_key_recovery_load.value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
+        )
         malformed_harness = factory()
         malformed_run_id = _contract_run_id(namespace, "invocation-malformed-fresh-blob")
         malformed_token = _contract_writer(malformed_harness, malformed_run_id)
@@ -3041,6 +3096,10 @@ def _run_fenced_run_sink_contract(
             malformed_run_id,
             malformed_seed_call_id,
         )
+        malformed_preserved_bytes = _contract_blob_hex(
+            malformed_seed_load.value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
+        )
         malformed_fresh_load = malformed_harness.sink.load_invocation(
             malformed_run_id,
             "call-1",
@@ -3060,6 +3119,10 @@ def _run_fenced_run_sink_contract(
         malformed_recovery_load = malformed_harness.sink.load_invocation(
             malformed_run_id,
             "call-1",
+        )
+        malformed_recovery_bytes = _contract_blob_hex(
+            malformed_recovery_load.value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
         )
 
         harness = factory()
@@ -3211,6 +3274,10 @@ def _run_fenced_run_sink_contract(
             writer_token=token,
         )
         loaded_result = harness.sink.load_invocation(run_id, result_call_id)
+        result_blob_bytes = _contract_blob_hex(
+            loaded_result.value,
+            _CONTRACT_INVOCATION_BLOB_SHA256,
+        )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-04-INVOCATION-LIFECYCLE",
@@ -3368,10 +3435,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "missing_reference_recovery_bytes",
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            missing_reference_recovery_load.value,
-                            _CONTRACT_UNRESOLVED_BLOB_SHA256,
-                        ),
+                        actual=missing_reference_recovery_bytes,
                     ),
                     observation(
                         "authoritative_backing_reference_setup",
@@ -3394,10 +3458,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "authoritative_backing_reference_bytes",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            backing_load.value,
-                            _CONTRACT_INVOCATION_BLOB_SHA256,
-                        ),
+                        actual=backing_reference_bytes,
                     ),
                     observation(
                         "uppercase_blob_key_status",
@@ -3433,10 +3494,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "uppercase_blob_key_recovery_bytes",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            uppercase_key_recovery_load.value,
-                            _CONTRACT_INVOCATION_BLOB_SHA256,
-                        ),
+                        actual=uppercase_key_recovery_bytes,
                     ),
                     observation(
                         "malformed_fresh_blob_setup",
@@ -3461,10 +3519,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "malformed_fresh_blob_preserves_existing_bytes",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            malformed_seed_load.value,
-                            _CONTRACT_INVOCATION_BLOB_SHA256,
-                        ),
+                        actual=malformed_preserved_bytes,
                     ),
                     observation(
                         "malformed_fresh_blob_recovery",
@@ -3479,10 +3534,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "malformed_fresh_blob_recovery_bytes",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            malformed_recovery_load.value,
-                            _CONTRACT_INVOCATION_BLOB_SHA256,
-                        ),
+                        actual=malformed_recovery_bytes,
                     ),
                     observation(
                         "result_load", expected="loaded", actual=loaded_result.status
@@ -3508,10 +3560,7 @@ def _run_fenced_run_sink_contract(
                     observation(
                         "result_blob_round_trip",
                         expected=_CONTRACT_INVOCATION_BLOB.hex(),
-                        actual=_contract_blob_hex(
-                            loaded_result.value,
-                            _CONTRACT_INVOCATION_BLOB_SHA256,
-                        ),
+                        actual=result_blob_bytes,
                     ),
                 ),
             )

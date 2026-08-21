@@ -467,7 +467,11 @@ Digest만 남기고 event payload를 버리는 adapter는 durable event capabili
 `read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
 구현을 거부한다.
 각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
-factory instance와 명시적으로 reopened된 모든 facade를 추적하고 `finally`에서 역순으로 닫는다.
+factory instance와 명시적으로 reopened된 모든 facade를 추적한다. 다음 독립 probe를 열기 전에 직전
+probe의 facade group을 역순으로 닫고, `finally`에서 마지막 group을 닫는다. 이 수명 규칙이 database
+session과 pooled connection의 최대 동시 보유량을 제한한다. Lazy record blob reader는 해당 probe가
+열려 있을 때 bytes 관찰로 materialize한다. Close-sensitive reference harness가 닫힌 facade의 reader를
+사용하는 회귀를 거부한다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
 재개방 record와 비교한다.
 같은 key의 checkpoint, event, terminal, invocation 재시도는 mutable canonical non-key field를
@@ -581,7 +585,9 @@ Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid r
 직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
 기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
 성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에 제출한다.
-Checkpoint head는 지연 도착한 낮은 sequence를 받아도 높은 committed sequence를 유지한다.
+Checkpoint는 높은 sequence가 먼저 도착해도 아직 비어 있는 낮은 `(run_id, seq)` 좌표를 blob과 함께
+commit한다. 같은 지연 write의 재시도는 `already_committed`이고, latest head는 높은 committed
+sequence를 유지한다.
 
 Invocation transition은 다음 순서를 검증한다.
 
@@ -1076,7 +1082,9 @@ Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mu
 retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
 owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
 서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
-확인한다.
+확인한다. Contract harness registry는 probe 전환 때 직전 facade group을 닫고 최대 동시 facade 수를
+회귀 검증한다. Delayed checkpoint는 fresh 낮은 좌표의 commit·idempotent retry와 높은 latest head를
+동시에 요구한다.
 
 ### 14.6 최종 통합 PR
 

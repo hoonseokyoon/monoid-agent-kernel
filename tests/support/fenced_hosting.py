@@ -210,14 +210,6 @@ class DeterministicFencedRunSink:
         if existing is not None:
             return existing
         previous_head = self._checkpoint_heads.get(checkpoint.run_id, -1)
-        if checkpoint.seq < previous_head:
-            winner_digest = self._checkpoints[(checkpoint.run_id, previous_head)][0]
-            return CommitResult(
-                status="conflict",
-                sequence=checkpoint.seq,
-                content_digest=digest,
-                winner_digest=winner_digest,
-            )
         self._publish_blobs(checkpoint.run_id, blobs)
         record = CheckpointRecord(
             seq=checkpoint.seq,
