@@ -681,6 +681,34 @@ def test_reusable_contract_reads_each_runs_complete_payload(mutation: str) -> No
     assert payload_observation.actual != payload_observation.expected
 
 
+class _LatestEventPayloadPerRunHarness(DeterministicFencedRunHarness):
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        del seq
+        with self.sink._lock:
+            sequences = [
+                event_seq for event_run_id, event_seq in self.sink._events if event_run_id == run_id
+            ]
+            if not sequences:
+                return None
+            return self.sink._events[(run_id, max(sequences))][1]
+
+
+def test_reusable_contract_reads_every_event_sequence_in_one_run() -> None:
+    outcomes = run_fenced_run_sink_contract(_LatestEventPayloadPerRunHarness)
+    fence_rule = next(
+        outcome for outcome in outcomes if outcome.rule_id == "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY"
+    )
+    payload_observation = next(
+        observation
+        for observation in fence_rule.observations
+        if observation.observation_id == "same_run_event_sequence_payloads"
+    )
+
+    assert fence_rule.status == "failed"
+    assert payload_observation.actual[0] == payload_observation.actual[1]
+    assert payload_observation.actual != payload_observation.expected
+
+
 class _CrossRunBlobPublishingSink(DeterministicFencedRunSink):
     def _publish_valid_cross_run_blobs(
         self,

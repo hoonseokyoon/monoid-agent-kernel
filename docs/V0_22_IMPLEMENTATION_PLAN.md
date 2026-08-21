@@ -469,6 +469,9 @@ invocation 두 family에서 두 상태와 value 부재를 모두 확인해 `miss
 노출하는 adapter를 거부한다.
 Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전체 canonical payload를 읽는다.
 Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
+Writer generation 전환 run에서는 `seq=1`과 `seq=2`를 모두 재개방 후 읽어 두 canonical payload를
+각각 비교한다. Sequence별 CAS digest만 남기고 run별 최신 event payload 하나로 덮어쓰는 adapter를
+거부한다.
 `read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
 구현을 거부한다.
 Run-isolation probe는 같은 local key를 가진 두 run의 event와 terminal 전체 payload를 모두 읽는다.
@@ -1131,6 +1134,8 @@ Fence precedence는 existing coordinate의 동일 payload·conflicting payload·
 coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
 Checkpoint·invocation의 same-key blob-map conflict 뒤 loser digest를 empty-map record로 재참조해
 conflicting blob 비공개도 확인한다.
+Writer generation 전환 run의 event `seq=1`·`seq=2`를 모두 재로딩해 같은 run 안의 payload 보존을
+검증한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
 Historical invocation revision 1·2·3은 exact retry와 altered retry를 모두 비교하고 latest head 4를

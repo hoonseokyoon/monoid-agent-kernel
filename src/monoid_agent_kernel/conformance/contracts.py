@@ -2506,6 +2506,21 @@ def _run_fenced_run_sink_contract(
             writer_token=current,
         )
         current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
+        harness = harness.reopen()
+        reopened_initial_event = harness.read_event(run_id, 1)
+        reopened_current_event = harness.read_event(run_id, 2)
+        same_run_event_payloads = (
+            (
+                canonical_sha256(reopened_initial_event.to_json())
+                if reopened_initial_event
+                else None
+            ),
+            (
+                canonical_sha256(reopened_current_event.to_json())
+                if reopened_current_event
+                else None
+            ),
+        )
 
         fresh_authority_probe_statuses = {}
         fresh_authority_malformed_statuses = {}
@@ -2800,6 +2815,14 @@ def _run_fenced_run_sink_contract(
                         "new_generation_reads_terminal_winner",
                         expected="already_committed",
                         actual=current_terminal.status,
+                    ),
+                    observation(
+                        "same_run_event_sequence_payloads",
+                        expected=(
+                            canonical_sha256(event.to_json()),
+                            canonical_sha256(_contract_event(run_id, seq=2).to_json()),
+                        ),
+                        actual=same_run_event_payloads,
                     ),
                     *(
                         observation(
