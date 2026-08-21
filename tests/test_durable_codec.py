@@ -47,6 +47,19 @@ def test_codec_distinguishes_loaded_corrupt_and_unsupported() -> None:
     assert oversized_version.status == "corrupt" and oversized_version.error_code == "demo_corrupt"
 
 
+def test_codec_classifies_a_recursive_defensive_copy_failure_as_corrupt() -> None:
+    codec = DurableCodec[dict](family="demo", current_schema="monoid.demo.v1")
+    nested: dict[str, object] = {"leaf": True}
+    for _ in range(700):
+        nested = {"nested": nested}
+
+    result = codec.decode({"schema_version": "monoid.demo.v1", "value": nested}, dict)
+
+    assert result.status == "corrupt"
+    assert result.error_code == "demo_corrupt"
+    assert "RecursionError" in result.message
+
+
 def test_ordered_migrations_are_pure_deterministic_and_preserve_unknown_fields() -> None:
     def v1_to_v2(payload: dict) -> dict:
         payload["second"] = payload.pop("first")

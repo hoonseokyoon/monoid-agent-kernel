@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from monoid_agent_kernel.core.result import (
     suspension_checkpoint_payload,
     suspension_from_checkpoint_payload,
 )
+from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import NativeAgentError
@@ -412,6 +414,65 @@ def test_additive_checkpoint_fields_preserve_existing_positional_order() -> None
     assert checkpoint.status == "failed"
     assert checkpoint.last_suspension is None
     assert checkpoint.applied_input_ids == []
+    assert checkpoint.last_model_invocation is None
+    assert checkpoint.interruption_cause == ""
+
+
+def test_checkpoint_explicit_projection_covers_every_dataclass_field() -> None:
+    checkpoint = RunCheckpoint(run_id="run_1")
+
+    assert set(checkpoint.to_json()) == {field.name for field in dataclass_fields(RunCheckpoint)}
+
+
+def test_checkpoint_projection_detaches_nested_state_and_preserves_sharing() -> None:
+    shared = {"value": [1, 2]}
+    checkpoint = RunCheckpoint(
+        run_id="run_1",
+        messages=[shared],
+        pending_observations=[shared],
+    )
+
+    payload = checkpoint.to_json()
+    shared["value"].append(3)
+    payload["messages"][0]["value"].append(4)
+
+    assert checkpoint.messages[0]["value"] == [1, 2, 3]
+    assert payload["messages"][0]["value"] == [1, 2, 4]
+    assert payload["messages"][0] is payload["pending_observations"][0]
+
+
+def test_checkpoint_writer_refuses_a_cyclic_container_at_its_boundary(tmp_path: Path) -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1", messages=[cyclic]))
+
+
+def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: Path) -> None:
+    invocation = DurableModelInvocation(
+        run_id="run_1",
+        logical_call_id="call_1",
+        revision=1,
+        dispatch_id="dispatch_1",
+        dispatch_attempt=1,
+        idempotency_key="idem_1",
+        dispatch_state="reserved",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
+    )
+    invocation_payload = invocation.to_json()
+    invocation_payload["schema_version"] = "native-agent-runner.model-invocation.v1"
+
+    write_checkpoint(
+        tmp_path,
+        RunCheckpoint(run_id="run_1", last_model_invocation=invocation_payload),
+    )
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+
+    assert payload["last_model_invocation"]["schema_version"] == (
+        "monoid.model-invocation.v1"
+    )
 
 
 def test_hosted_task_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -507,6 +568,33 @@ def test_run_checkpoint_round_trip_via_disk(tmp_path: Path) -> None:
     assert restored.schema_version == SCHEMA_VERSION
 
 
+def test_v022_additive_checkpoint_fields_round_trip_under_v1_schema(tmp_path: Path) -> None:
+    invocation = DurableModelInvocation(
+        run_id="run_1",
+        logical_call_id="call_1",
+        revision=3,
+        dispatch_id="dispatch_1",
+        dispatch_attempt=1,
+        idempotency_key="idem_1",
+        dispatch_state="unknown",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
+        failure_code="dispatch_unknown",
+    )
+    checkpoint = RunCheckpoint(
+        run_id="run_1",
+        seq=2,
+        last_model_invocation=invocation.to_json(),
+        interruption_cause="lease_lost",
+    )
+
+    write_checkpoint(tmp_path, checkpoint)
+    restored = read_checkpoint(tmp_path)
+
+    assert restored == checkpoint
+    assert restored is not None and restored.schema_version == SCHEMA_VERSION
+
+
 @pytest.mark.parametrize("field", ("revoked_before", "remaining_duration_s"))
 def test_checkpoint_writer_rejects_overflowing_float_fields(tmp_path: Path, field: str) -> None:
     checkpoint = RunCheckpoint(run_id="run_1")
@@ -533,6 +621,8 @@ def test_checkpoint_writer_rejects_overflowing_float_fields(tmp_path: Path, fiel
         ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
         ("applied_input_receipts", {"input": {"terminal": "false"}}),
         ("remaining_duration_s", 10**400),
+        ("last_model_invocation", {"schema_version": "monoid.model-invocation.v1"}),
+        ("interruption_cause", "worker_stop"),
     ),
 )
 def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value: object) -> None:
@@ -545,6 +635,29 @@ def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value:
     payload[field] = value
 
     assert decode_checkpoint(payload).status == "corrupt"
+
+
+def test_checkpoint_rejects_an_invocation_from_another_run() -> None:
+    invocation = DurableModelInvocation(
+        run_id="run_other",
+        logical_call_id="call_1",
+        revision=1,
+        dispatch_id="dispatch_1",
+        dispatch_attempt=1,
+        idempotency_key="idem_1",
+        dispatch_state="reserved",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
+    )
+
+    checked = decode_checkpoint(
+        RunCheckpoint(
+            run_id="run_1",
+            last_model_invocation=invocation.to_json(),
+        ).to_json()
+    )
+
+    assert checked.status == "corrupt"
 
 
 def test_checkpoint_decoder_allows_unknown_additive_fields() -> None:

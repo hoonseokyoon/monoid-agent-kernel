@@ -117,6 +117,18 @@ def _refuse_unportable_scalar(value: Any) -> None:
     raise UnportableScalarError(f"value of type {portable_type_name(value)} is not portable JSON")
 
 
+def is_portable_json_integer(value: Any) -> bool:
+    """Return whether ``value`` is an exact integer every configured JSON boundary can spell."""
+
+    if type(value) is not int:
+        return False
+    try:
+        _refuse_unportable_scalar(value)
+    except UnportableScalarError:
+        return False
+    return True
+
+
 def exact_text(value: Any) -> str:
     """The base ``str``'s own value, so a subclass cannot answer questions about itself.
 
@@ -405,11 +417,12 @@ marker. That difference is load-bearing rather than an inconsistency to tidy awa
 sibling branches keep expanding on a cyclic input, which is how a fast ``RecursionError`` there
 once became a hang, and it is why the shape refusal here raises.
 
-64 rather than the parsers' 512: the writer that fails first is ``dataclasses.asdict`` at
-``RunCheckpoint.to_json``, measured dead at 492 containers under the default recursion limit, so a
-value in [492, 512] cleared every gate it met and killed the run at the checkpoint. 64 leaves an
-enormous margin over anything real -- the deepest structure this repository defines anywhere is 10,
-and ``PREVIEW_MAX_DEPTH`` is 8 -- while sitting far below the first writer that dies.
+64 is the stable admission bound introduced after the old checkpoint writer's
+``dataclasses.asdict`` failed around 492 containers while the parser admitted 512. The checkpoint
+writer is iterative from v0.22, while widening this boundary would still change the accepted
+model/tool contract and leave less margin for the recursive JSON writers around it. 64 remains far
+above real payloads -- the deepest structure this repository defines is 10 and
+``PREVIEW_MAX_DEPTH`` is 8.
 """
 
 
