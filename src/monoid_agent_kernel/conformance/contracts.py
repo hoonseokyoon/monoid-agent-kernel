@@ -149,6 +149,11 @@ class FencedRunSinkHarness(Protocol):
 
         ...
 
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        """Read the complete winning terminal outcome through the durable backing store."""
+
+        ...
+
     def close(self) -> None:
         """Release the sink facade and every session or client owned by this harness."""
 
@@ -213,6 +218,9 @@ class _TrackedFencedRunSinkHarness:
 
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         return self._inner.read_event(run_id, seq)
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        return self._inner.read_terminal(run_id)
 
     def close(self) -> None:
         if self._closed:
@@ -1741,6 +1749,7 @@ def _run_fenced_run_sink_contract(
         first_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
         harness = harness.reopen()
         reopened_event = harness.read_event(run_id, event.seq)
+        reopened_terminal = harness.read_terminal(run_id)
         repeated_event = harness.sink.append_event(event, writer_token=token)
         conflict_event = harness.sink.append_event(
             _contract_event(run_id, seq=1, level="warning"), writer_token=token
@@ -1850,6 +1859,15 @@ def _run_fenced_run_sink_contract(
                         "terminal_repeat",
                         expected="already_committed",
                         actual=repeated_terminal.status,
+                    ),
+                    observation(
+                        "terminal_reopened_payload_digest",
+                        expected=canonical_sha256(terminal.to_json()),
+                        actual=(
+                            canonical_sha256(reopened_terminal.to_json())
+                            if reopened_terminal is not None
+                            else None
+                        ),
                     ),
                     observation(
                         "terminal_conflict", expected="conflict", actual=conflict_terminal.status

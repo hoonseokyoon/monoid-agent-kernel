@@ -462,6 +462,8 @@ monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run b
 checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
 Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전체 canonical payload를 읽는다.
 Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
+`read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
+구현을 거부한다.
 각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
 factory instance와 명시적으로 reopened된 모든 facade를 추적하고 `finally`에서 역순으로 닫는다.
 Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
@@ -1010,9 +1012,9 @@ machine, capability gate로 해결할 수 있는지 결정한다. 필요하면 �
 PR 2에서는 반복된 durability 지적에 이 gate를 적용했다. 반환 status 중심 검증을 durable
 postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh malformed blob은 거부 뒤 state를
 다시 읽고 기존 shared blob bytes를 즉시 재검증한다. Malformed map도 stale/cross-run fencing 뒤에만
-검사한다. Event는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전 attempt가 아니라
-모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을 실패시키는 mutant
-test가 있다.
+검사한다. Event와 terminal winner는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전
+attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을
+실패시키는 mutant test가 있다.
 
 ### 14.6 최종 통합 PR
 

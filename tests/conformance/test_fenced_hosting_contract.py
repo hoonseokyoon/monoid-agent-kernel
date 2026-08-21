@@ -1321,6 +1321,12 @@ class _CorruptingLoadedRecordHarness(DeterministicFencedRunHarness):
             return event
         return replace(event, data={"discarded": True})
 
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        terminal = super().read_terminal(run_id)
+        if self.corruption != "terminal" or terminal is None:
+            return terminal
+        return replace(terminal, final_output_ref="blob:discarded")
+
 
 def _corrupting_loaded_record_factory(corruption: str):
     def factory() -> _CorruptingLoadedRecordHarness:
@@ -1351,6 +1357,11 @@ def _corrupting_loaded_record_factory(corruption: str):
             "event",
             "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
             "event_reopened_payload_digest",
+        ),
+        (
+            "terminal",
+            "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+            "terminal_reopened_payload_digest",
         ),
     ],
 )
@@ -1844,6 +1855,9 @@ class _CloseTrackingHarness:
 
     def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
         return self._inner.read_event(run_id, seq)
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        return self._inner.read_terminal(run_id)
 
     def close(self) -> None:
         if self._closed:

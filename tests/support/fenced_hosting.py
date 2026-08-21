@@ -416,6 +416,13 @@ class DeterministicFencedRunHarness:
             stored = self.sink._events.get((run_id, seq))
             return stored[1] if stored is not None else None
 
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        """Read the complete terminal winner through the shared durable backing."""
+
+        with self.sink._lock:
+            stored = self.sink._terminals.get(run_id)
+            return stored[1] if stored is not None else None
+
     def close(self) -> None:
         """Release this in-memory facade; external harnesses close real client resources here."""
 

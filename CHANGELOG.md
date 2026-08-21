@@ -45,8 +45,8 @@ out in commit messages and here.
   publication, and every blob key is verified against its submitted bytes. A corrected retry then
   commits and round-trips the intended bytes. Existing records that share the digest retain their
   original bytes, and stale or cross-run malformed requests remain fenced before validation.
-  Reopened event
-  inspection compares the complete canonical payload instead of trusting retry digests. Retry
+  Reopened event and terminal-winner inspection compare complete canonical payloads instead of
+  trusting retry digests. Retry
   reservations reject dispatch IDs used by any earlier attempt in the logical call history.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
