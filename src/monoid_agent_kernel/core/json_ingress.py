@@ -117,6 +117,18 @@ def _refuse_unportable_scalar(value: Any) -> None:
     raise UnportableScalarError(f"value of type {portable_type_name(value)} is not portable JSON")
 
 
+def is_portable_json_integer(value: Any) -> bool:
+    """Return whether ``value`` is an exact integer every configured JSON boundary can spell."""
+
+    if type(value) is not int:
+        return False
+    try:
+        _refuse_unportable_scalar(value)
+    except UnportableScalarError:
+        return False
+    return True
+
+
 def exact_text(value: Any) -> str:
     """The base ``str``'s own value, so a subclass cannot answer questions about itself.
 

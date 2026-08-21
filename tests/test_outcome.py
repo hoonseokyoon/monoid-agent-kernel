@@ -113,6 +113,16 @@ def test_terminal_outcome_rejects_values_outside_the_contract(field: str, value:
         TerminalOutcome(**kwargs)  # type: ignore[arg-type]
 
 
+def test_terminal_outcome_rejects_an_unserializable_checkpoint_sequence() -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        TerminalOutcome(
+            run_id="run_1",
+            kind="completed",
+            retry_eligibility="not_applicable",
+            checkpoint_seq=10**5000,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (

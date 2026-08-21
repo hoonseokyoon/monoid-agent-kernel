@@ -131,6 +131,26 @@ def test_model_invocation_rejects_invalid_identity_and_scalar_fields(
         _invocation(**changes)
 
 
+def test_model_invocation_rejects_unserializable_counter_magnitudes() -> None:
+    oversized = 10**5000
+
+    for field in ("revision", "dispatch_attempt"):
+        with pytest.raises(ValueError, match="positive integer"):
+            _invocation(**{field: oversized})
+
+
+def test_model_invocation_receipt_rejects_unserializable_integer_magnitudes() -> None:
+    oversized = 10**5000
+
+    for receipt in ({"attempts": oversized}, {"usage": {"input_tokens": oversized}}):
+        with pytest.raises(ValueError):
+            _invocation(
+                dispatch_state="settled",
+                receipt=receipt,
+                result_ref="blob:turn",
+            )
+
+
 @pytest.mark.parametrize(
     "changes",
     (

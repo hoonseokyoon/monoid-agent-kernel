@@ -31,6 +31,7 @@ from monoid_agent_kernel.core.json_ingress import (
     UnportableContainerError,
     UnportableScalarError,
     is_finite_json_number,
+    is_portable_json_integer,
     loads_json_ingress,
     loads_model_envelope_json_ingress,
     loads_model_json_ingress,
@@ -72,6 +73,18 @@ def test_finite_json_number_check_is_total_for_arbitrarily_large_integers() -> N
     assert not is_finite_json_number(float("inf"))
     assert not is_finite_json_number(True)
     assert not is_finite_json_number(IntegerSubclass(1))
+
+
+def test_portable_json_integer_uses_the_writer_and_reader_digit_bound() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    assert is_portable_json_integer(0)
+    assert is_portable_json_integer(-1)
+    assert not is_portable_json_integer(10**5000)
+    assert not is_portable_json_integer(True)
+    assert not is_portable_json_integer(1.0)
+    assert not is_portable_json_integer(IntegerSubclass(1))
 
 
 def test_json_ingress_normalizes_nested_keys_values_and_nonfinite_numbers() -> None:

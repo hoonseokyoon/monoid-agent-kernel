@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
-from monoid_agent_kernel.core.json_ingress import is_finite_json_number, normalize_json_ingress
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    is_portable_json_integer,
+    normalize_json_ingress,
+)
 from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_address,
@@ -119,7 +123,7 @@ def _require_string(value: object, field_name: str) -> None:
 
 
 def _require_positive_int(value: object, field_name: str) -> None:
-    if type(value) is not int or value < 1:
+    if not is_portable_json_integer(value) or value < 1:
         raise ValueError(f"model invocation {field_name} must be a positive integer")
 
 
@@ -163,7 +167,7 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                     raise ValueError(
                         "model invocation receipt usage fields collide after canonicalization"
                     )
-                if type(count) is not int or count < 0:
+                if not is_portable_json_integer(count) or count < 0:
                     raise ValueError(
                         "model invocation receipt usage values must be non-negative integers"
                     )
@@ -204,8 +208,7 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
                 )
             canonical[canonical_key] = value
         elif canonical_key == "attempts":
-            if type(value) is not int or value < 1:
-                raise ValueError("model invocation receipt attempts must be a positive integer")
+            _require_positive_int(value, "receipt attempts")
             canonical[canonical_key] = value
         elif canonical_key == "http_status":
             if type(value) is not int or not 100 <= value <= 599:

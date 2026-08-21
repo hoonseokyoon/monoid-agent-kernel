@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, get_args
 
+from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_address,
     is_safe_opaque_id,
@@ -75,7 +76,7 @@ class InterruptionCause(StrEnum):
 def _require_optional_nonnegative_int(value: object, field_name: str) -> None:
     if value is None:
         return
-    if type(value) is not int or value < 0:
+    if not is_portable_json_integer(value) or value < 0:
         raise ValueError(f"terminal outcome {field_name} must be a non-negative integer or null")
 
 
