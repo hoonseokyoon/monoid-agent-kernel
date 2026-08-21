@@ -264,6 +264,45 @@ def _contract_invocation(
     )
 
 
+def _contract_retry_after_terminal_invocation(
+    factory: FencedRunSinkHarnessFactory,
+    run_id: str,
+    *,
+    terminal_state: str,
+    retryable: bool = False,
+    succeeded: bool = False,
+) -> tuple[tuple[str, ...], str]:
+    harness = factory()
+    token = harness.claim_writer(run_id, "owner-a")
+    history = (
+        _contract_invocation(run_id, revision=1, dispatch_state="reserved"),
+        _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
+        _contract_invocation(
+            run_id,
+            revision=3,
+            dispatch_state=terminal_state,
+            retryable=retryable,
+            succeeded=succeeded,
+        ),
+    )
+    history_statuses = tuple(
+        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        for invocation in history
+    )
+    retry = harness.sink.commit_invocation(
+        _contract_invocation(
+            run_id,
+            revision=4,
+            dispatch_attempt=2,
+            dispatch_id="dispatch-2",
+            dispatch_state="reserved",
+        ),
+        {},
+        writer_token=token,
+    )
+    return history_statuses, retry.status
+
+
 def run_fenced_run_sink_contract(
     factory: FencedRunSinkHarnessFactory,
 ) -> tuple[ConformanceRuleOutcome, ...]:
@@ -320,38 +359,63 @@ def run_fenced_run_sink_contract(
         run_id = "contract-fence-first"
         stale = harness.claim_writer(run_id, "owner-a")
         checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="winner")
-        harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
-        current = harness.claim_writer(run_id, "owner-b")
-        stale_identical = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
         event = _contract_event(run_id, seq=1)
-        stale_event = harness.sink.append_event(event, writer_token=stale)
         invocation = _contract_invocation(run_id, revision=1, dispatch_state="reserved")
+        terminal = _contract_terminal(run_id)
+        initial_checkpoint = harness.sink.commit_checkpoint(checkpoint, {}, writer_token=stale)
+        initial_event = harness.sink.append_event(event, writer_token=stale)
+        initial_invocation = harness.sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=stale,
+        )
+        initial_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
+        current = harness.claim_writer(run_id, "owner-b")
+        stale_checkpoint = harness.sink.commit_checkpoint(
+            checkpoint, {}, writer_token=stale
+        )
+        stale_event = harness.sink.append_event(event, writer_token=stale)
         stale_invocation = harness.sink.commit_invocation(
             invocation,
             {},
             writer_token=stale,
         )
-        stale_terminal = harness.sink.settle_terminal(
-            _contract_terminal(run_id), writer_token=stale
-        )
+        stale_terminal = harness.sink.settle_terminal(terminal, writer_token=stale)
         current_checkpoint = harness.sink.commit_checkpoint(
             RunCheckpoint(run_id=run_id, seq=2, final_text="current"),
             {},
             writer_token=current,
         )
-        current_event = harness.sink.append_event(event, writer_token=current)
+        current_event = harness.sink.append_event(
+            _contract_event(run_id, seq=2), writer_token=current
+        )
         current_invocation = harness.sink.commit_invocation(
-            invocation,
+            _contract_invocation(run_id, revision=2, dispatch_state="dispatch_started"),
             {},
             writer_token=current,
         )
+        current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
         outcomes.append(
             outcome_from_observations(
                 "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
                 FENCED_RUN_SINK_CONTRACT_PROFILE,
                 (
                     observation(
-                        "stale_identical", expected="fenced", actual=stale_identical.status
+                        "initial_checkpoint", expected="committed", actual=initial_checkpoint.status
+                    ),
+                    observation(
+                        "initial_event", expected="committed", actual=initial_event.status
+                    ),
+                    observation(
+                        "initial_invocation",
+                        expected="committed",
+                        actual=initial_invocation.status,
+                    ),
+                    observation(
+                        "initial_terminal", expected="committed", actual=initial_terminal.status
+                    ),
+                    observation(
+                        "stale_checkpoint", expected="fenced", actual=stale_checkpoint.status
                     ),
                     observation("stale_event", expected="fenced", actual=stale_event.status),
                     observation(
@@ -374,6 +438,11 @@ def run_fenced_run_sink_contract(
                         "new_generation_commits_invocation",
                         expected="committed",
                         actual=current_invocation.status,
+                    ),
+                    observation(
+                        "new_generation_reads_terminal_winner",
+                        expected="already_committed",
+                        actual=current_terminal.status,
                     ),
                 ),
             )
@@ -542,6 +611,22 @@ def run_fenced_run_sink_contract(
             {},
             writer_token=token,
         )
+        unknown_history, after_unknown = _contract_retry_after_terminal_invocation(
+            factory,
+            "contract-invocation-after-unknown",
+            terminal_state="unknown",
+        )
+        success_history, after_success = _contract_retry_after_terminal_invocation(
+            factory,
+            "contract-invocation-after-success",
+            terminal_state="settled",
+            succeeded=True,
+        )
+        nonretry_history, after_nonretry_failure = _contract_retry_after_terminal_invocation(
+            factory,
+            "contract-invocation-after-nonretry-failure",
+            terminal_state="settled",
+        )
         outcomes.append(
             outcome_from_observations(
                 "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
@@ -551,6 +636,32 @@ def run_fenced_run_sink_contract(
                     observation("revision_gap", expected="conflict", actual=gap.status),
                     observation("state_regression", expected="conflict", actual=regression.status),
                     observation("identity_drift", expected="conflict", actual=identity_drift.status),
+                    observation(
+                        "unknown_history",
+                        expected=("committed", "committed", "committed"),
+                        actual=unknown_history,
+                    ),
+                    observation(
+                        "retry_after_unknown", expected="conflict", actual=after_unknown
+                    ),
+                    observation(
+                        "success_history",
+                        expected=("committed", "committed", "committed"),
+                        actual=success_history,
+                    ),
+                    observation(
+                        "retry_after_success", expected="conflict", actual=after_success
+                    ),
+                    observation(
+                        "nonretry_failure_history",
+                        expected=("committed", "committed", "committed"),
+                        actual=nonretry_history,
+                    ),
+                    observation(
+                        "retry_after_nonretry_failure",
+                        expected="conflict",
+                        actual=after_nonretry_failure,
+                    ),
                 ),
             )
         )
