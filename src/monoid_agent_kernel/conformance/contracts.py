@@ -899,7 +899,15 @@ def _contract_retry_after_terminal_invocation(
         ),
     )
     history_statuses = tuple(
-        harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        harness.sink.commit_invocation(
+            invocation,
+            (
+                {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_INVOCATION_BLOB}
+                if invocation.result_ref
+                else {}
+            ),
+            writer_token=token,
+        ).status
         for invocation in history
     )
     retry = harness.sink.commit_invocation(

@@ -36,7 +36,8 @@ out in commit messages and here.
   canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
   invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
   normalize in both lifecycle-transition directions. Exact retries of every older invocation
-  revision cannot republish an obsolete journal head.
+  revision cannot republish an obsolete journal head. Every successful invocation fixture commits
+  the result blob referenced by its durable metadata.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 

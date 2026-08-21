@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import replace
 from threading import Barrier, current_thread
@@ -484,6 +485,37 @@ def test_reusable_contract_includes_blobs_in_content_identity(
     assert identity_rule.status == "failed"
     assert blob_observation.expected == "conflict"
     assert blob_observation.actual == "already_committed"
+
+
+class _ReferentialIntegritySink(DeterministicFencedRunSink):
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        if invocation.result_ref.startswith("blob:"):
+            result_sha256 = invocation.result_ref.removeprefix("blob:")
+            result_blob = blobs.get(result_sha256)
+            if (
+                result_blob is None
+                or hashlib.sha256(result_blob).hexdigest() != result_sha256
+            ):
+                return CommitResult(status="conflict", sequence=invocation.revision)
+        return super().commit_invocation(invocation, blobs, writer_token=writer_token)
+
+
+def _referential_integrity_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _ReferentialIntegritySink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_supplies_every_referenced_invocation_blob() -> None:
+    outcomes = run_fenced_run_sink_contract(_referential_integrity_factory)
+
+    assert all(outcome.status == "passed" for outcome in outcomes), outcomes
 
 
 class _RegressingCheckpointHeadSink(DeterministicFencedRunSink):
