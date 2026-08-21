@@ -1057,6 +1057,12 @@ def test_reusable_contract_checks_fencing_before_malformed_blob_validation() -> 
             "malformed_stale_generation_current_owner_invocation",
             "malformed_wrong_owner_current_generation_checkpoint",
             "malformed_wrong_owner_current_generation_invocation",
+            "fresh_malformed_stale_owner_and_generation_checkpoint",
+            "fresh_malformed_stale_owner_and_generation_invocation",
+            "fresh_malformed_stale_generation_current_owner_checkpoint",
+            "fresh_malformed_stale_generation_current_owner_invocation",
+            "fresh_malformed_wrong_owner_current_generation_checkpoint",
+            "fresh_malformed_wrong_owner_current_generation_invocation",
         ),
         "FENCED-06-WRITER-TOKEN-RUN-BINDING": (
             "cross_run_malformed_checkpoint",

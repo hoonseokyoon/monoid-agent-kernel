@@ -515,6 +515,9 @@ generation과 현재 generation의 잘못된 owner를 독립적으로 제출한�
 fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다. Existing
 resource는 stale token으로 같은 payload, 다른 payload, malformed blob map을 각각 제출한다. 세 경우
 모두 content equality, conflict, blob validation보다 fence 판정이 먼저 실행되어 `fenced`다.
+Fresh resource도 stale owner+generation, current owner+stale generation, wrong owner+current generation의
+세 token에 malformed checkpoint·invocation map을 각각 교차한다. Insert 경로도 blob validation보다
+fence 판정을 먼저 실행한다.
 Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
 settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
 bytes를 읽는다. CAS race는 `committed` 결과를 낸 좌·우 값에서 winner를 결정하고 네 mutation의
@@ -1105,8 +1108,8 @@ harness registry는 probe
 전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Delayed checkpoint는 fresh
 낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. Blob reference matrix는
 workspace·media·invocation의 malformed digest를 거부하고 external invocation result address를 허용한다.
-Existing-coordinate fence precedence는 동일 payload, conflicting payload, malformed blob map을 독립
-축으로 검증한다.
+Fence precedence는 existing coordinate의 동일 payload·conflicting payload·malformed blob map과 fresh
+coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
 Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
 검증한다.
 

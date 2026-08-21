@@ -2317,6 +2317,7 @@ def _run_fenced_run_sink_contract(
         current_terminal = harness.sink.settle_terminal(terminal, writer_token=current)
 
         fresh_authority_probe_statuses = {}
+        fresh_authority_malformed_statuses = {}
         fresh_authority_recovery_statuses = {}
         for authority_case in (
             "stale_owner_and_generation",
@@ -2360,6 +2361,18 @@ def _run_fenced_run_sink_contract(
                     dispatch_state="reserved",
                 ),
                 "terminal": _contract_terminal(fresh_run_id),
+            }
+            fresh_authority_malformed_statuses[authority_case] = {
+                "checkpoint": fresh_harness.sink.commit_checkpoint(
+                    fresh_records["checkpoint"],
+                    {_CONTRACT_CHECKPOINT_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    writer_token=invalid_token,
+                ).status,
+                "invocation": fresh_harness.sink.commit_invocation(
+                    fresh_records["invocation"],
+                    {_CONTRACT_INVOCATION_BLOB_SHA256: _CONTRACT_ALTERNATE_BLOB},
+                    writer_token=invalid_token,
+                ).status,
             }
             fresh_authority_probe_statuses[authority_case] = _contract_authority_probe_statuses(
                 fresh_harness.sink,
@@ -2605,6 +2618,17 @@ def _run_fenced_run_sink_contract(
                         )
                         for authority_case, mutation_statuses in (
                             fresh_authority_probe_statuses.items()
+                        )
+                        for mutation, status in mutation_statuses.items()
+                    ),
+                    *(
+                        observation(
+                            f"fresh_malformed_{authority_case}_{mutation}",
+                            expected="fenced",
+                            actual=status,
+                        )
+                        for authority_case, mutation_statuses in (
+                            fresh_authority_malformed_statuses.items()
                         )
                         for mutation, status in mutation_statuses.items()
                     ),
