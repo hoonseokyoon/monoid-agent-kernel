@@ -2642,10 +2642,20 @@ backend = RunnerBackend(
 )
 ```
 
+`LocalFsCheckpointStore` and `SqliteCheckpointStore` declare `single_writer=True`. Their
+transaction and file-lock boundaries protect atomic publication and a monotonic latest pointer.
+The Reference host also serializes an in-process checkpoint commit with
+`ActivationWriteAuthority.revoke()`, so revocation waits for an entered local commit and prevents
+the next one from starting. These stores carry no owner/generation identity in `put()` and declare
+`lease_fencing=False`, `concurrent_writers=False`, and `compare_and_set=False`. A deployment with
+overlapping or partitioned writers uses `FencedRunSink.commit_checkpoint(...,
+writer_token=WriterToken(...))`; that adapter validates owner and generation atomically with every
+canonical mutation.
+
 **Legacy profile limitation / follow-up:** SQLite is single-host. A legacy cross-host deployment
-can supply a networked `CheckpointStore` / `LeaseStore` behind these seams. This capability is a
-Reference implementation option; the Core contract and the initial DBOS profile do not promise
-automatic host takeover.
+requires a fenced adapter and the hosting conformance suite. The legacy `CheckpointStore` /
+`LeaseStore` pair supports recovery after the previous writer has stopped. The Core contract and
+the initial DBOS profile do not promise automatic host takeover.
 
 ### HTTP hardening & request bounds
 

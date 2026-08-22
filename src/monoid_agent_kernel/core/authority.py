@@ -38,18 +38,23 @@ class ActivationWriteAuthority:
     """
 
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _revoke_requested: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
     _revoked: bool = field(default=False, init=False, repr=False)
     _callbacks: dict[int, Callable[[], None]] = field(default_factory=dict, init=False, repr=False)
     _next_callback_id: int = field(default=0, init=False, repr=False)
 
     @property
     def revoked(self) -> bool:
-        with self._lock:
-            return self._revoked
+        return self._revoke_requested.is_set()
 
     def revoke(self) -> bool:
         """Revoke once and notify registered execution-control bridges outside the lock."""
 
+        # Publish the loss before waiting for an entered local critical section. The operation
+        # may finish, while its guard observes this sticky request and suppresses publication.
+        self._revoke_requested.set()
         with self._lock:
             if self._revoked:
                 return False
@@ -65,14 +70,14 @@ class ActivationWriteAuthority:
 
     def assert_active(self) -> None:
         with self._lock:
-            if self._revoked:
+            if self._revoke_requested.is_set():
                 raise WriteAuthorityRevoked()
 
     def add_revoke_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a one-shot callback and return an idempotent unsubscribe function."""
 
         with self._lock:
-            if self._revoked:
+            if self._revoke_requested.is_set():
                 callback_id = None
             else:
                 callback_id = self._next_callback_id
@@ -96,15 +101,15 @@ class ActivationWriteAuthority:
         """Linearize one short process-local mutation with revocation."""
 
         with self._lock:
-            if self._revoked:
+            if self._revoke_requested.is_set():
                 raise WriteAuthorityRevoked()
             try:
                 result = operation()
             except BaseException as exc:
-                if self._revoked:
+                if self._revoke_requested.is_set():
                     raise WriteAuthorityRevoked() from exc
                 raise
-            if self._revoked:
+            if self._revoke_requested.is_set():
                 raise WriteAuthorityRevoked()
             return result
 

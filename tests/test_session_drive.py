@@ -64,10 +64,19 @@ def _service(
         if drain_calls is not None:
             drain_calls.append((record, loop))
 
+    def commit_checkpoint(
+        record: Any,
+        checkpoint: RunCheckpoint,
+        blobs: dict[str, bytes],
+    ) -> None:
+        record.write_authority.guard_local_mutation(
+            lambda: checkpoint_store.put(checkpoint, blobs)
+        )
+
     return SessionDriveService(
         SessionDriveContext(
             limits_provider=limits_provider or (lambda: _limits()),
-            checkpoint_store_provider=lambda: checkpoint_store,
+            commit_checkpoint=commit_checkpoint,
             drain_outbox=drain_outbox,
             close_signal=close,
             resume_signal=resume,
@@ -128,14 +137,16 @@ def test_session_drive_persist_uses_context_store_and_drain_callback(tmp_path: P
 def test_session_drive_stops_before_outbox_when_lease_is_lost_during_store(
     tmp_path: Path,
 ) -> None:
-    entered, release = Event(), Event()
+    entered, release, revoke_returned = Event(), Event(), Event()
     drain_calls: list[tuple[Any, Any]] = []
+    committed: list[int] = []
 
     class _BlockingStore:
         def put(self, checkpoint: RunCheckpoint, blobs: dict[str, bytes]) -> None:
-            del checkpoint, blobs
+            del blobs
             entered.set()
             assert release.wait(5)
+            committed.append(checkpoint.seq)
 
     service = _service(tmp_path, store=_BlockingStore(), drain_calls=drain_calls)
     record = _Record("run_checkpoint_lease_loss")
@@ -159,14 +170,29 @@ def test_session_drive_stops_before_outbox_when_lease_is_lost_during_store(
     thread = Thread(target=persist)
     thread.start()
     assert entered.wait(5)
-    record.write_authority.revoke()
+
+    def revoke() -> None:
+        record.write_authority.revoke()
+        revoke_returned.set()
+
+    revoke_thread = Thread(target=revoke)
+    revoke_thread.start()
+    assert not revoke_returned.wait(0.05)
     release.set()
     thread.join(5)
+    revoke_thread.join(5)
 
     assert not thread.is_alive()
+    assert not revoke_thread.is_alive()
+    assert revoke_returned.is_set()
     assert len(caught) == 1
     assert isinstance(caught[0], WriteAuthorityRevoked)
+    assert committed == [1]
     assert drain_calls == []
+
+    with pytest.raises(WriteAuthorityRevoked):
+        service.persist_run_checkpoint(record)
+    assert committed == [1]
 
 
 def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:

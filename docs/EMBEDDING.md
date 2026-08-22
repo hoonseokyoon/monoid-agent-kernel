@@ -138,6 +138,12 @@ mount and filesystem semantics that support atomic replace and locking. Read che
 `unsupported_version` outcomes. The executable example asserts a checked `loaded` outcome.
 It also returns `runtime_profile="embedded-local"` so test output names the selected topology.
 
+The bundled LocalFS and SQLite checkpoint stores are single-writer adapters. Their atomic commit
+protects checkpoint integrity, and the Reference host serializes each in-process commit with its
+activation write authority. A topology where an old writer can resume after another writer takes
+over uses a `FencedRunSink` and passes a `WriterToken` into every canonical mutation. The storage
+adapter validates owner and generation in the same transaction as the write.
+
 Reconstruct the loop with the same run ID, compatible runtime definition, workspace mapping, and
 blob store. Restore the checked checkpoint before accepting a new input. Stop recovery and surface
 an actionable failure for corrupt or unsupported state.
@@ -327,8 +333,9 @@ Every hosted assembly follows these portable rules:
 
 For the Reference inbox assembly, every instance shares durable checkpoint and lease stores plus
 one transactional command store. A fresh backend can call `recover_runs()` and start its watchdog
-after an atomic stale-owner claim. Queue limits and claim TTLs bound durable command admission and
-recovery. The bundled SQLite composition remains a single-host Reference fixture.
+after an atomic stale-owner claim once the previous writer has stopped. Queue limits and claim TTLs
+bound durable command admission and recovery. The bundled SQLite composition remains a
+single-host, single-writer Reference fixture.
 
 For the experimental DBOS profile, the private host is the sole DBOS lifecycle authority in one
 process. A supervisor fences the previous process and restarts the same stable executor slot with

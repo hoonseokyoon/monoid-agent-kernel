@@ -63,13 +63,20 @@ def test_local_mutation_linearizes_before_revoke_returns() -> None:
     entered = threading.Event()
     release = threading.Event()
     mutated: list[str] = []
+    caught: list[BaseException] = []
 
     def operation() -> None:
         entered.set()
         assert release.wait(5)
         mutated.append("done")
 
-    worker = threading.Thread(target=lambda: authority.guard_local_mutation(operation))
+    def guarded_operation() -> None:
+        try:
+            authority.guard_local_mutation(operation)
+        except BaseException as exc:
+            caught.append(exc)
+
+    worker = threading.Thread(target=guarded_operation)
     worker.start()
     assert entered.wait(5)
     revoke_finished = threading.Event()
@@ -81,6 +88,8 @@ def test_local_mutation_linearizes_before_revoke_returns() -> None:
     revoker.join(5)
 
     assert mutated == ["done"]
+    assert len(caught) == 1
+    assert isinstance(caught[0], WriteAuthorityRevoked)
     assert revoke_finished.is_set()
     with pytest.raises(WriteAuthorityRevoked):
         authority.guard_local_mutation(lambda: mutated.append("late"))

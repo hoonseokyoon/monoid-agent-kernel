@@ -19,6 +19,7 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     SubagentDefinition,
 )
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
@@ -110,6 +111,7 @@ from monoid_agent_kernel.reference.backend.projection import (
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
+from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort
 from monoid_agent_kernel.reference.backend.recovery import (
     RecoveryContext,
     RecoveryService,
@@ -777,7 +779,7 @@ class RunnerBackend:
         return SessionDriveService(
             SessionDriveContext(
                 limits_provider=self._session_drive_limits,
-                checkpoint_store_provider=self._checkpoint_store,
+                commit_checkpoint=self._commit_reference_checkpoint,
                 drain_outbox=self._drain_outbox,
                 close_signal=_CLOSE_SESSION,
                 resume_signal=_RESUME_SESSION,
@@ -858,6 +860,21 @@ class RunnerBackend:
     def _checkpoint_store(self) -> CheckpointStore:
         assert self.checkpoint_store is not None
         return self.checkpoint_store
+
+    def _commit_reference_checkpoint(
+        self,
+        record: MutableRunRecordPort,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> None:
+        """Linearize a legacy Reference-store commit with local authority revocation.
+
+        ``CheckpointStore`` is a single-writer compatibility seam. Shared canonical stores use
+        ``FencedRunSink`` so owner/generation validation occurs atomically with the mutation.
+        """
+
+        authority = cast(ActivationWriteAuthority, record.write_authority)
+        authority.guard_local_mutation(lambda: self._checkpoint_store().put(checkpoint, blobs))
 
     def _with_record_lock(self, fn: Callable[[], Any]) -> Any:
         with self._lock:

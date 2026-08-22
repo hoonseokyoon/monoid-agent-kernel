@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.content import ContentPart, content_part_from_json
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspension
@@ -35,7 +35,9 @@ class SessionDriveLimits:
 @dataclass(frozen=True)
 class SessionDriveContext:
     limits_provider: Callable[[], SessionDriveLimits]
-    checkpoint_store_provider: Callable[[], CheckpointStore]
+    commit_checkpoint: Callable[
+        [MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None
+    ]
     drain_outbox: Callable[[MutableRunRecordPort, LoopPort], None]
     close_signal: object
     resume_signal: object
@@ -298,10 +300,9 @@ class SessionDriveService:
             return
         checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        record.write_authority.assert_active()
-        self._context.checkpoint_store_provider().put(checkpoint, blobs)
-        # The store can block while recovery moves ownership. Outbox dispatch is the next external
-        # boundary, so stale authority must stop here before any send is attempted.
+        self._context.commit_checkpoint(record, checkpoint, blobs)
+        # The host commit seam linearizes the Reference store write with process-local revocation.
+        # Outbox dispatch is the next external boundary, so stale authority must stop here too.
         record.write_authority.assert_active()
         self._context.drain_outbox(record, loop)
         record.write_authority.assert_active()

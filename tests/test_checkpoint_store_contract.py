@@ -73,8 +73,11 @@ def test_put_latest_seq_isolation_and_delete(store: CheckpointStore) -> None:
     assert store.latest("run_2") is not None
 
 
-def test_local_fs_declares_only_single_writer_checkpoint_capabilities(tmp_path: Path) -> None:
-    store = LocalFsCheckpointStore(tmp_path)
+@pytest.mark.parametrize("factory", STORE_FACTORIES)
+def test_legacy_stores_declare_only_single_writer_checkpoint_capabilities(
+    factory: StoreFactory, tmp_path: Path
+) -> None:
+    store = factory(tmp_path)
 
     assert store.capabilities.single_writer is True
     assert store.capabilities.durable_checkpoints is True
