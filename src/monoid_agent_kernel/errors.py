@@ -56,6 +56,16 @@ class ModelAdapterError(NativeAgentError):
         self.provider_retried = provider_retried
 
 
+class ModelDispatchRefused(ModelAdapterError):
+    """A provider/adapter path proved a definite terminal refusal for this dispatch."""
+
+
+class DurableModelCallError(NativeAgentError):
+    """A durable runner boundary stopped before it could return a reusable model outcome."""
+
+    error_code = "durable_model_call_error"
+
+
 class TurnNotSettled(NativeAgentError):
     """A blocking submit facade parked without a settled turn to return.
 

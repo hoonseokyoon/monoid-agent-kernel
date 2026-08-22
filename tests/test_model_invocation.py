@@ -5,13 +5,97 @@ import math
 import pytest
 
 from monoid_agent_kernel.core.model_invocation import (
+    LOGICAL_MODEL_CALL_GENERATION,
     MODEL_INVOCATION_SCHEMA_VERSION,
+    MODEL_DISPATCH_GENERATION,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
     decode_model_invocation,
+    logical_model_call_id,
+    model_dispatch_id,
+    model_invocation_receipt,
 )
+from monoid_agent_kernel.core.model_io import ModelCallReceipt
 
 REQUEST_DIGEST = "a" * 64
+
+
+def test_durable_model_call_ids_are_deterministic_addresses_without_raw_coordinates() -> None:
+    logical = logical_model_call_id("run_private", "turn_0007")
+
+    assert logical == logical_model_call_id("run_private", "turn_0007")
+    assert logical != logical_model_call_id("run_private", "turn_0008")
+    assert logical.startswith("mcall_")
+    assert "run_private" not in logical
+    assert "turn_0007" not in logical
+
+    first = model_dispatch_id(logical, 1)
+    second = model_dispatch_id(logical, 2)
+    assert first == model_dispatch_id(logical, 1)
+    assert first != second
+    assert first.startswith("mdispatch_")
+    assert logical not in first
+    assert LOGICAL_MODEL_CALL_GENERATION == "monoid.logical-model-call.v1"
+    assert MODEL_DISPATCH_GENERATION == "monoid.model-dispatch.v1"
+
+
+@pytest.mark.parametrize(
+    ("factory", "args"),
+    (
+        (logical_model_call_id, ("", "step_1")),
+        (logical_model_call_id, ("run_1", "private step")),
+        (model_dispatch_id, ("", 1)),
+        (model_dispatch_id, ("call_1", 0)),
+        (model_dispatch_id, ("call_1", True)),
+    ),
+)
+def test_durable_model_call_id_helpers_reject_unportable_coordinates(
+    factory: object,
+    args: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        factory(*args)  # type: ignore[operator]
+
+
+def test_runner_receipt_projection_keeps_only_public_safe_invocation_evidence() -> None:
+    receipt = ModelCallReceipt(
+        provider_name="private-provider-route",
+        prompt_digest="b" * 64,
+        request_digest=REQUEST_DIGEST,
+        stop_reason="stop",
+        usage={"input_tokens": 3, "private_counter": 99},
+        latency_ms=12,
+        attempts=2,
+        provider_retried=True,
+        error_code="model_error",
+        provider_error_code="rate_limited",
+        retryable=True,
+        http_status=429,
+        destination_status="resolved",
+        destination_digest="c" * 64,
+        idempotency_key="idem_private",
+    )
+
+    projected = model_invocation_receipt(receipt)
+
+    assert projected == {
+        "attempts": 2,
+        "latency_ms": 12,
+        "provider_retried": True,
+        "retryable": True,
+        "request_digest": REQUEST_DIGEST,
+        "usage": {"input_tokens": 3},
+        "stop_reason": "stop",
+        "provider_error_code": "rate_limited",
+        "http_status": 429,
+    }
+    assert not {
+        "provider_name",
+        "prompt_digest",
+        "destination_digest",
+        "idempotency_key",
+        "error_code",
+    } & projected.keys()
 
 
 def _invocation(**changes: object) -> DurableModelInvocation:

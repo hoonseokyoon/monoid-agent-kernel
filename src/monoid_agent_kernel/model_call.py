@@ -68,12 +68,24 @@ from monoid_agent_kernel.core.model_io import (
     destination_digest,
     dispatch_model_call,
 )
+from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.errors import (
+    DurableModelCallError,
     ModelAdapterError,
     ModelCallAborted,
     RunCancelled,
     RunTimeout,
+)
+from monoid_agent_kernel.model_lifecycle import (
+    ModelCallLifecycleHook,
+    ModelDispatchReservation,
+    dispatch_evidence,
+    durable_model_result_blob,
+    raise_model_dispatch_unknown,
+    reserve_model_dispatch,
+    safe_failure_code,
+    settle_model_dispatch,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -457,6 +469,15 @@ class ModelCallRunner:
     the payload corpus) should not pay for bytes it never reads. The wiring that enables the
     payload recorder sets this; the digests themselves are computed either way."""
 
+    lifecycle_hook: ModelCallLifecycleHook | None = None
+    """Optional authoritative lifecycle writer for durable paid-call execution.
+
+    The hook is synchronous because the hosting contracts it adapts are synchronous fenced
+    mutations. It is opt-in and independent of ``settled_sink``: lifecycle writes control whether
+    adapter work may begin or be retried, while the existing sink remains passive evidence
+    delivery. Durable mode requires an explicit ``logical_call_id`` on :meth:`acall`.
+    """
+
     def _effective_model(
         self,
         request: ModelRequest,
@@ -546,6 +567,7 @@ class ModelCallRunner:
         deadline: float | None = None,
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
+        logical_call_id: str = "",
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one call and return the turn with the receipt that describes it.
 
@@ -561,9 +583,14 @@ class ModelCallRunner:
         A receipt is produced whether the call succeeded or failed -- a failed call is exactly the
         one an audit trail needs -- and is delivered to every subscription before the exception is
         re-raised.
+
+        ``logical_call_id`` is required only when ``lifecycle_hook`` is configured. It is the
+        caller-owned durable address of this call; standalone anonymous calls cannot invent a
+        stable address across process restore.
         """
 
         started = time.monotonic()
+        lifecycle_hook = self.lifecycle_hook
         adapter = self._current_adapter()
         # Same tolerance as the other two adapter probes, and for the same reason. Undefended, a
         # `provider_name` property that raised -- or whose `str()` did -- lost the call before the
@@ -617,15 +644,20 @@ class ModelCallRunner:
             # site so the wait lands on the entry it delayed, not the one that caused it.
             pending_backoff_ms = 0
             try:
+                if lifecycle_hook is not None and not is_safe_opaque_id(logical_call_id):
+                    raise DurableModelCallError(
+                        "durable model calls require an explicit bounded logical_call_id",
+                        error_code="durable_invocation_identity_required",
+                    )
                 # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
                 # already been crossed, but by then the adapter has been invoked and the provider has
                 # been paid for work the run had already decided not to do. Checking here also covers
                 # the interval the caller cannot: building the receipt digests above happens between
                 # the caller's own boundary check and this line, so a deadline can expire in between.
                 #
-                # Nothing awaits between here and the dispatch, so the check cannot go stale within
-                # this task. A boundary crossed *after* dispatch is the race's business, which is why
-                # this is an addition to it rather than a replacement.
+                # Durable mode performs synchronous reserve/start commits between this check and
+                # adapter entry. A boundary crossed during those commits is caught by the race once
+                # provider work starts; the host must keep those mutations bounded.
                 #
                 # Lifted out of `_adrive` so that refusing the call and dispatching it are
                 # distinguishable here; `_adrive` is called from nowhere else, so the check still
@@ -714,6 +746,11 @@ class ModelCallRunner:
                     destination_digest=destination_digest(where),
                     idempotency_key=request.idempotency_key,
                 )
+                if lifecycle_hook is not None and digest_result.status != "ok":
+                    raise DurableModelCallError(
+                        "durable model call request could not be keyed",
+                        error_code="durable_invocation_unkeyable",
+                    )
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is
@@ -735,14 +772,42 @@ class ModelCallRunner:
                         inner_consumer(chunk)
 
                     consumer = _marking_consumer
+                reservation: ModelDispatchReservation | None = None
                 while True:
-                    attempts_made += 1
+                    next_attempt = attempts_made + 1
+                    if lifecycle_hook is not None:
+                        reservation = reserve_model_dispatch(
+                            lifecycle_hook,
+                            logical_call_id=logical_call_id,
+                            dispatch_attempt=next_attempt,
+                            request_digest=receipt.request_digest,
+                            idempotency_key=request.idempotency_key,
+                        )
+                        # A restored reservation owns the key. The request digest excludes this
+                        # carriage field, so replacing it does not invalidate the identity already
+                        # checked above.
+                        object.__setattr__(
+                            request, "idempotency_key", reservation.idempotency_key
+                        )
+                        receipt = replace(
+                            receipt,
+                            idempotency_key=reservation.idempotency_key,
+                        )
+                        # The commit sits immediately before adapter entry. A hook failure leaves
+                        # attempts_made unchanged, so the receipt does not claim provider work.
+                        lifecycle_hook.dispatch_started(reservation)
+                    attempts_made = next_attempt
                     reports_before = progress.count
                     attempt_started = time.monotonic()
                     try:
                         turn = await self._adrive(
                             request, deadline, should_abort, consumer, adapter
                         )
+                        if lifecycle_hook is not None:
+                            # Durable mode classifies a malformed terminal inside the started
+                            # dispatch. The default path keeps its historical settle accounting
+                            # below unchanged.
+                            turn = normalize_model_turn(turn)
                         break
                     except BaseException as exc:
                         # Every fact the entry needs, read through `with_error` on a throwaway
@@ -765,6 +830,47 @@ class ModelCallRunner:
                             stream_committed=delivered,
                             backoff_ms=pending_backoff_ms,
                         )
+                        if (
+                            lifecycle_hook is not None
+                            and reservation is not None
+                            and isinstance(exc, Exception)
+                        ):
+                            if dispatch_evidence(exc) != "refused":
+                                raise_model_dispatch_unknown(
+                                    lifecycle_hook,
+                                    reservation,
+                                    exc,
+                                    failure_code=safe_failure_code(
+                                        probe.error_code,
+                                        default="dispatch_unknown",
+                                    ),
+                                    usage=(
+                                        _merged_usage(spent_usage, probe.usage)
+                                        if spent_usage
+                                        else probe.usage
+                                    ),
+                                )
+                            current_failure = receipt.with_error(exc)
+                            durable_failure = replace(
+                                current_failure,
+                                attempts=attempts_made,
+                                latency_ms=self._ms_since(started),
+                                provider_retried=(
+                                    current_failure.provider_retried or progress.retried
+                                ),
+                                attempt_log=(*attempt_log, last_attempt_entry),
+                                usage=(
+                                    _merged_usage(spent_usage, current_failure.usage)
+                                    if spent_usage
+                                    else current_failure.usage
+                                ),
+                            )
+                            settle_model_dispatch(
+                                lifecycle_hook,
+                                reservation,
+                                durable_failure,
+                                failure_code=durable_failure.error_code,
+                            )
                         if (
                             retry_plan is None
                             or attempts_made >= retry_plan.max_attempts
@@ -808,7 +914,8 @@ class ModelCallRunner:
                         pending_backoff_ms = (
                             self._ms_since(backoff_started) if delay > 0 else 0
                         )
-                turn = normalize_model_turn(turn)
+                if lifecycle_hook is None:
+                    turn = normalize_model_turn(turn)
             except BaseException as exc:
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
@@ -922,6 +1029,29 @@ class ModelCallRunner:
                     _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
                 ),
             )
+            if lifecycle_hook is not None:
+                if reservation is None:  # pragma: no cover - a started durable call reserves first
+                    raise AssertionError("durable model call completed without a reservation")
+                durable_completed = replace(
+                    completed,
+                    latency_ms=self._ms_since(started),
+                )
+                try:
+                    result_blob = durable_model_result_blob(turn)
+                except DurableModelCallError as result_error:
+                    raise_model_dispatch_unknown(
+                        lifecycle_hook,
+                        reservation,
+                        result_error,
+                        failure_code=result_error.error_code,
+                        usage=durable_completed.usage,
+                    )
+                settle_model_dispatch(
+                    lifecycle_hook,
+                    reservation,
+                    durable_completed,
+                    result_blob=result_blob,
+                )
             settled = self._publish(
                 request,
                 turn,
@@ -1042,10 +1172,10 @@ class ModelCallRunner:
         delta_consumer: DeltaConsumer | None,
         adapter: Any,
     ) -> ModelTurn:
-        # The pre-dispatch boundary check that used to open this method now sits in `acall`, one
-        # statement above the call to this one, so that a call refused before the adapter is reached
-        # can be told apart from one that failed after -- `attempts=0` versus 1. Nothing awaits
-        # between there and here.
+        # The pre-dispatch boundary check that used to open this method now sits in `acall`, before
+        # the optional synchronous lifecycle reserve/start commits. This method is called only after
+        # those commits, so reaching it is the runner's adapter-entry boundary and increments the
+        # receipt's attempt count exactly once.
         astream_turn = getattr(adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(
