@@ -36,6 +36,7 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
     normalize_json_ingress,
 )
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
@@ -222,9 +223,9 @@ class StatusJsonSink:
                     "error_code": data.get("error_code", ""),
                 }
             )
-            cause = data.get("interruption_cause")
-            if isinstance(cause, str) and cause:
-                self.state["interruption_cause"] = cause
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
             else:
                 self.state.pop("interruption_cause", None)
             # The terminal heal: ASSIGNED error/error_code above, and a non-failed terminal
@@ -260,15 +261,15 @@ class StatusJsonSink:
             # interruption cause carried by the preceding park.
             self.state.pop("interruption_cause", None)
         elif event.type == "turn.settled":
-            cause = data.get("interruption_cause")
-            if isinstance(cause, str) and cause:
-                self.state["interruption_cause"] = cause
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
             else:
                 self.state.pop("interruption_cause", None)
         elif event.type == "turn.interrupted":
-            cause = data.get("interruption_cause")
-            if isinstance(cause, str) and cause:
-                self.state["interruption_cause"] = cause
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
             else:
                 # Legacy producers emit only the reason. The newest park is still authoritative,
                 # so absence or malformed input clears an older typed cause instead of inheriting it.

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from threading import Event, Thread
+from typing import Any
 
 import pytest
 
@@ -11,8 +13,10 @@ from support.runtime import runtime_config, runtime_provider
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import NativeAgentError, RunCancelled
+from monoid_agent_kernel.hosting.contracts import CommitResult, WriterToken
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn, mark_provider_usage
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -371,6 +375,105 @@ def test_tool_await_rechecks_sticky_lease_before_returning_a_result(tmp_path: Pa
         asyncio.run(loop._await_native_tool_handler(result_after_lease_loss(), None))
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+
+
+@pytest.mark.parametrize("surface", ("run_sink", "callback", "store"))
+def test_every_checkpoint_surface_rechecks_lease_after_blocking_persistence(
+    tmp_path: Path,
+    surface: str,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    assert loop._session is not None
+    entered, release = Event(), Event()
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(5)
+
+    class _Sink:
+        def commit_checkpoint(self, *args: Any, **kwargs: Any) -> CommitResult:
+            del args, kwargs
+            block()
+            return CommitResult(status="committed")
+
+    class _Store:
+        def put(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            block()
+
+    if surface == "run_sink":
+        loop.run_sink = _Sink()  # type: ignore[assignment]
+        loop.writer_token = WriterToken(
+            run_id=loop.spec.run_id,
+            owner_id="worker-a",
+            generation=1,
+        )
+    elif surface == "callback":
+        loop.checkpoint_persist_callback = lambda _checkpoint, _blobs: (block(), True)[1]
+    else:
+        loop.checkpoint_store = _Store()  # type: ignore[assignment]
+
+    caught: list[BaseException] = []
+
+    def persist() -> None:
+        try:
+            loop._persist_checkpoint(
+                loop._session,  # type: ignore[arg-type]
+                Suspension(reason="settled", status="completed"),
+            )
+        except BaseException as exc:
+            caught.append(exc)
+
+    thread = Thread(target=persist)
+    thread.start()
+    assert entered.wait(5)
+    token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+    token.cancel(InterruptionCause.LEASE_LOST)
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(caught) == 1
+    assert isinstance(caught[0], RunCancelled)
+    assert caught[0].interruption_cause is InterruptionCause.LEASE_LOST
+    assert loop._session.last_suspension is None
+    loop.discard_uncommitted()
+
+
+def test_public_pump_converts_lease_loss_during_checkpoint_into_activation_park(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    entered, release = Event(), Event()
+
+    def persist(_checkpoint: RunCheckpoint, _blobs: dict[str, bytes]) -> bool:
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    loop.checkpoint_persist_callback = persist
+    suspensions: list[Suspension] = []
+
+    thread = Thread(target=lambda: suspensions.append(loop.run_until_suspended("go")))
+    thread.start()
+    assert entered.wait(5)
+    token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+    token.cancel(InterruptionCause.LEASE_LOST)
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    [suspension] = suspensions
+    assert suspension.reason == "interrupted"
+    assert suspension.turn is None
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    loop.discard_uncommitted()
 
 
 def test_token_deadline_uses_the_canonical_timeout_terminal(tmp_path: Path) -> None:

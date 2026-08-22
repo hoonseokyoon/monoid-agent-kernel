@@ -11,7 +11,7 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
-from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import public_path
 from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
@@ -108,13 +108,8 @@ def _event_http_status(data: dict[str, Any]) -> int | None:
 
 
 def _event_interruption_cause(data: dict[str, Any]) -> str | None:
-    value = data.get("interruption_cause")
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return InterruptionCause(value).value
-    except ValueError:
-        return None
+    cause = parse_interruption_cause(data.get("interruption_cause"))
+    return cause.value if cause is not None else None
 
 
 def _assign_failure_classification(projection: dict[str, Any], data: dict[str, Any]) -> None:

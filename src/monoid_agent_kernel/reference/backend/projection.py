@@ -23,11 +23,11 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
     normalize_unicode_scalars,
 )
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
 )
-from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.projections import status_artifact_records_close
 from monoid_agent_kernel.core.subagent_runtime import (
     subagent_diagnostics_from_events,
@@ -135,11 +135,8 @@ def _status_payload_classification(status_payload: Mapping[str, Any] | None) -> 
         return value if type(value) is bool else False
 
     http_status = payload.get("http_status")
-    raw_cause = _text("interruption_cause")
-    try:
-        interruption_cause = InterruptionCause(raw_cause).value if raw_cause else None
-    except ValueError:
-        interruption_cause = None
+    parsed_cause = parse_interruption_cause(payload.get("interruption_cause"))
+    interruption_cause = parsed_cause.value if parsed_cause is not None else None
     return {
         "error": _text("error"),
         "error_code": _text("error_code"),

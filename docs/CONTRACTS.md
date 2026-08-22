@@ -2890,7 +2890,9 @@ open. The cause travels through `Suspension`, `AgentTurnResult`, `AgentRunResult
 `RunCheckpoint`, `turn.interrupted`, `run.finished`, `turn.settled`, cumulative metrics, status
 projection, and the Reference backend record/result surfaces. An absent cause remains compatible
 with older checkpoints and events and projects as no current cause rather than inheriting an older
-park's value.
+park's value. Event v1 keeps the cause field string-compatible for retained and rolling-version
+producers. Live status, offline replay, and backend projection all pass that string through the
+shared portable-cause parser; an unknown non-empty value also projects as no current cause.
 
 Lease loss can race with a model settlement. A `settled` invocation committed before the lease-loss
 signal remains authoritative paid-call evidence. The runner rechecks lease authority immediately
@@ -2922,6 +2924,16 @@ result application. Model, usage, settle, and tool projection gateways also asse
 authority. The outer pump gives sticky lease loss precedence over every exception and returned park
 before it emits or checkpoints. A slow validator or handler therefore cannot reopen mutation after
 an earlier fence passed.
+
+Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
+`FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop
+checks authority after snapshot/blob collection, immediately after the external commit returns,
+and before accepting the suspension into activation-local projection state. Lease loss during the
+commit restores the prior local park observation and the public pump returns only the in-memory
+`lease_lost` disposition. The Reference host repeats the fence around its queue/inbox augmentation
+and stops before outbox draining when ownership changed. Outbox dispatch checks authority before
+and after each send; a send overlapping lease loss retains its durable idempotency identity and
+stays unprojected for replacement-owner reconciliation or redrive.
 
 The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
 the authoritative reservation and blocks `dispatch_started`. Lease loss observed by

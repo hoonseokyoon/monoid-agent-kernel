@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.checkpoint import CheckpointStore
 from monoid_agent_kernel.core.event_sequencing import RunEventSequencer
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress, portable_type_name
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.core.lifecycle import (
     TERMINAL_STATES,
     SessionState,
@@ -157,13 +158,7 @@ def _event_http_status(data: Mapping[str, Any]) -> int | None:
 
 
 def _event_interruption_cause(data: Mapping[str, Any]) -> InterruptionCause | None:
-    value = data.get("interruption_cause")
-    if not isinstance(value, str):
-        return None
-    try:
-        return InterruptionCause(value)
-    except ValueError:
-        return None
+    return parse_interruption_cause(data.get("interruption_cause"))
 
 
 def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:

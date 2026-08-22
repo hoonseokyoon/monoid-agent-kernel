@@ -17,6 +17,8 @@ from support.waiting import eventually
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
@@ -32,6 +34,7 @@ from monoid_agent_kernel.reference.backend.outbox_dispatch import (
     OutboxDispatchService,
     OutboxRetryPolicy,
 )
+from monoid_agent_kernel.reference.backend.activation import ActivationLeaseLost
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
@@ -699,6 +702,58 @@ def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -
     # the writer the drain hands it to.
     carried = OutboxRequest(destination="email", id="o1", next_attempt_at=next_attempt_at)
     assert OutboxRequest.from_json(carried.to_json()).next_attempt_at == next_attempt_at
+
+
+def test_outbox_send_overlap_with_lease_loss_keeps_request_unprojected() -> None:
+    token = CancellationToken()
+    request = OutboxRequest(destination="email", id="o-lease", idempotency_key="idem-lease")
+    recorded: list[str] = []
+
+    class _Sender:
+        def send(self, req: OutboxRequest) -> OutboxReceipt:
+            assert req.idempotency_key == "idem-lease"
+            token.cancel(InterruptionCause.LEASE_LOST)
+            return OutboxReceipt(ok=True, reference="possibly-delivered")
+
+    class _Loop:
+        def due_outbox(self, now: float) -> list[OutboxRequest]:
+            del now
+            return [request]
+
+        def record_outbox_result(self, request_id: str, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            recorded.append(request_id)
+            return "dispatched"
+
+        def snapshot(self) -> None:
+            return None
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    service = OutboxDispatchService(
+        OutboxDispatchContext(
+            retry_policy_provider=lambda: OutboxRetryPolicy(
+                max_attempts=5,
+                base_s=1.0,
+                factor=2.0,
+                cap_s=10.0,
+            ),
+            max_message_queue_depth_provider=lambda: 100,
+            checkpoint_store_provider=lambda: None,
+            rng_provider=lambda: random.Random(7),
+            live_outbox_runs=lambda: [],
+            call_soon=lambda *_a, **_k: None,
+            record_terminal=lambda _record: False,
+        )
+    )
+    record = SimpleNamespace(outbox_sender=_Sender(), cancellation_token=token)
+
+    with pytest.raises(ActivationLeaseLost):
+        service.drain_outbox(record, _Loop())
+
+    assert recorded == []
+    assert request.status == "pending"
 
 
 def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_happened() -> None:

@@ -1812,6 +1812,21 @@ class AgentLoop:
     ) -> Suspension:
         """Async form of :meth:`run_until_suspended` — the engine's source of truth."""
         session = self._require_open()
+        try:
+            return await self._arun_until_suspended_impl(user_input)
+        except RunCancelled:
+            # Persistence happens at the return boundary, including inside the exception-settle
+            # arms below. A lease can be lost while that synchronous host/store call is blocked,
+            # after the inner pump's exception handlers have already run. Keep one outer authority
+            # guard so every such path becomes the same mutation-free activation disposition.
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
+            raise
+
+    async def _arun_until_suspended_impl(
+        self, user_input: str | tuple[ContentPart, ...] | None = None
+    ) -> Suspension:
+        session = self._require_open()
         if self._lease_authority_lost():
             return self._lease_loss_suspension(session)
         if session.terminal:
@@ -3253,24 +3268,21 @@ class AgentLoop:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
         refuses (a live shell job is parked-on) — that park is simply not durable yet.
         Advances the per-run sequence so the store commits a new last-good checkpoint."""
-        if (
-            self.cancellation_token is not None
-            and self._lease_authority_lost()
-        ):
-            raise NativeAgentError(
-                "lease-lost activation cannot persist a checkpoint",
-                error_code="lease_lost",
-            )
+        self._check_lease_authority()
         prior_suspension = session.last_suspension
         if suspension is not None:
             session.last_suspension = suspension_checkpoint_payload(suspension)
         checkpoint = self.snapshot()
         if checkpoint is None:
             session.last_suspension = prior_suspension
+            self._check_lease_authority()
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
         blobs = self.collect_checkpoint_blobs()
+        if self._lease_authority_lost():
+            session.last_suspension = prior_suspension
+            self._check_lease_authority()
         try:
             committed = True
             if self.run_sink is not None and self.writer_token is not None:
@@ -3292,7 +3304,16 @@ class AgentLoop:
                 self._checkpoint_store().put(checkpoint, blobs)
         except Exception as exc:
             session.last_suspension = prior_suspension
+            # Sticky writer-authority loss outranks a storage exception. The stale activation is
+            # retired; exposing a generic checkpoint failure could instead terminalize/retry it.
+            self._check_lease_authority()
             raise _CheckpointPersistError("checkpoint persistence failed") from exc
+        if self._lease_authority_lost():
+            # The external commit may have returned after ownership moved. Do not accept this
+            # boundary into activation-local projection state or hand its ordinary Suspension to
+            # a host; the outer pump guard converts this into the lease-loss disposition.
+            session.last_suspension = prior_suspension
+            self._check_lease_authority()
         if not committed:
             return
         session.applied_input_ids = set(checkpoint.applied_input_ids)

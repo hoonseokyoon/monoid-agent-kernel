@@ -11,6 +11,13 @@ class ActivationLeaseLost(Exception):
     """Unwind a stale hosted activation without projecting a run outcome."""
 
 
+def raise_if_activation_lease_lost(cancellation_token: object) -> None:
+    """Fence a hosted mutation or external boundary with the sticky lease-loss fact."""
+
+    if getattr(cancellation_token, "lease_lost", False) is True:
+        raise ActivationLeaseLost("hosted activation lost writer authority")
+
+
 def raise_on_lease_loss(suspension: Suspension | None) -> None:
     """Reject a lease-loss observation before a host mutates run projections."""
 
@@ -32,5 +39,6 @@ def is_activation_lease_loss(exc: BaseException) -> bool:
 __all__ = [
     "ActivationLeaseLost",
     "is_activation_lease_loss",
+    "raise_if_activation_lease_lost",
     "raise_on_lease_loss",
 ]

@@ -1057,6 +1057,7 @@ def test_a_legacy_interruption_clears_an_older_typed_cause_on_both_readers(
         {"reason": "user_stop"},
         {"reason": "user_stop", "interruption_cause": ""},
         {"reason": "user_stop", "interruption_cause": 1},
+        {"reason": "user_stop", "interruption_cause": "cancel"},
     )
     for index, legacy_payload in enumerate(legacy_payloads):
         events = (

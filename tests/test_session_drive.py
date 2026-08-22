@@ -5,6 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -49,7 +50,7 @@ def _service(
     close_signal: object | None = None,
     resume_signal: object | None = None,
     limits_provider: Any | None = None,
-    store: LocalFsCheckpointStore | None = None,
+    store: Any | None = None,
     drain_calls: list[tuple[Any, Any]] | None = None,
 ) -> SessionDriveService:
     checkpoint_store = store or LocalFsCheckpointStore(tmp_path / "runs")
@@ -118,6 +119,50 @@ def test_session_drive_persist_uses_context_store_and_drain_callback(tmp_path: P
     assert stored.checkpoint.queued_messages == ["plain", envelope]
     assert stored.checkpoint.inbox_seen_ids == ["msg_1", "msg_2"]
     assert drain_calls == [(record, loop)]
+
+
+def test_session_drive_stops_before_outbox_when_lease_is_lost_during_store(
+    tmp_path: Path,
+) -> None:
+    entered, release = Event(), Event()
+    drain_calls: list[tuple[Any, Any]] = []
+
+    class _BlockingStore:
+        def put(self, checkpoint: RunCheckpoint, blobs: dict[str, bytes]) -> None:
+            del checkpoint, blobs
+            entered.set()
+            assert release.wait(5)
+
+    service = _service(tmp_path, store=_BlockingStore(), drain_calls=drain_calls)
+    record = _Record("run_checkpoint_lease_loss")
+
+    class _Loop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=record.run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    record.loop = _Loop()
+    caught: list[BaseException] = []
+
+    def persist() -> None:
+        try:
+            service.persist_run_checkpoint(record)
+        except BaseException as exc:
+            caught.append(exc)
+
+    thread = Thread(target=persist)
+    thread.start()
+    assert entered.wait(5)
+    record.cancellation_token.cancel(InterruptionCause.LEASE_LOST)
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(caught) == 1
+    assert isinstance(caught[0], ActivationLeaseLost)
+    assert drain_calls == []
 
 
 def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:

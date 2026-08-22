@@ -21,6 +21,7 @@ class TokenClaimsPort(Protocol):
 class CancellationTokenPort(Protocol):
     requested: bool
     cause: InterruptionCause | None
+    lease_lost: bool
 
 
 class MessageQueuePort(Protocol):

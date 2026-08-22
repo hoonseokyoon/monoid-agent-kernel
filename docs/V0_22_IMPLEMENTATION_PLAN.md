@@ -1181,6 +1181,11 @@ evidence를 다음 step 뒤에 남기지 않는다.
   output validator, tool handler, child agent await 뒤에는 run boundary를 다시 확인하고,
   model/usage/settle/tool projection gateway는 write authority를 자체 확인한다. outer pump는
   모든 exception과 반환된 park보다 sticky lease loss를 먼저 처리한다.
+  세 checkpoint surface(`FencedRunSink`, host callback, `CheckpointStore`)는 snapshot/blob 수집
+  뒤와 외부 commit 반환 직후 authority를 다시 확인한다. Reference host의 queue/inbox
+  augmentation도 store 반환 뒤 outbox로 넘어가기 전에 같은 fence를 적용한다. outbox send와
+  receipt projection 사이에 lease를 잃으면 request는 idempotency identity를 유지한 pending
+  상태로 남아 replacement owner가 reconcile/redrive한다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는
   dispatch-start를 막고, dispatch-start 뒤 loss는 provider 진입을 막는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.
@@ -1193,6 +1198,8 @@ evidence를 다음 step 뒤에 남기지 않는다.
   event projection에서 지운다.
 - cause가 없는 legacy `turn.interrupted`도 현재 cause-less park로 읽어 이전 typed cause를
   status와 offline projection에서 지운다.
+- unknown non-empty cause도 shared portable-cause parser에서 거부하며 live status, offline,
+  backend projection이 모두 현재 cause 없음으로 읽는다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
 
 종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal
