@@ -2861,11 +2861,14 @@ is absent. The core defines the atomic mutation flag. The host owns the outbox s
 backoff, dead-letter handling, and destination credentials.
 
 An invocation settlement remains authoritative when a later required evidence commit fails.
-The first reservation persists `DurableModelInvocation.requires_evidence=true`, and every
-invocation revision and retry preserves that stable field. Settlement and the obligation therefore
-share the authoritative invocation journal transaction. A crash after settlement commit and before
-evidence delivery or checkpoint publication leaves enough durable state for a replacement
-activation to finish required delivery, even when that activation uses the passive default.
+The first reservation persists `DurableModelInvocation.evidence_policy`, and every invocation
+revision and retry preserves the same `passive | required | outbox` value. Settlement and the
+delivery obligation therefore share the authoritative invocation journal transaction. A crash after
+settlement commit and before evidence delivery or checkpoint publication leaves enough durable state
+for a replacement activation to finish required delivery, even when that activation uses the
+passive default. An outbox reservation also survives replacement: the lifecycle verifies
+transactional outbox capability before provider redispatch and stages evidence in the later
+settlement transaction. Explicit non-passive policy drift fails before provider entry.
 Recovery commits the journal-required evidence before comparing the settled request digest with a
 request rebuilt from replacement runtime config or dynamic context. Request drift may still stop
 result application, and it cannot strand the required sink delivery.
@@ -2885,11 +2888,12 @@ parks on `evidence_uncommitted`; the projection failure preserves the paid strea
 A settled provider refusal retains the failed stream classification. The checkpoint marker sets
 `ModelDispatchRecoveryQuery.require_evidence=True` as a second recovery path for an already
 published evidence park.
-The configured `required` policy cannot upgrade an existing invocation whose journal field is
-`false`. Recovery returns `durable_invocation_evidence_policy_conflict` before evidence mutation;
-reservation recovery returns the same conflict before provider entry. Start a new logical call to
-adopt a stronger policy. A durable checkpoint marker may complete a requirement established before
-the journal field existed because the marker survives every later recovery attempt.
+An explicitly configured non-passive policy cannot change an existing invocation's stored policy.
+Recovery returns `durable_invocation_evidence_policy_conflict` before evidence mutation; reservation
+recovery returns the same conflict before provider entry. The passive replacement-host default
+defers to a stored `required` or `outbox` policy. Start a new logical call to adopt a different
+policy. A durable checkpoint marker may complete a requirement established by the prerelease
+boolean record because the marker survives every later recovery attempt.
 `run_once()` releases this durable park and surfaces `TurnNotSettled` instead of closing it into a
 terminal checkpoint. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected

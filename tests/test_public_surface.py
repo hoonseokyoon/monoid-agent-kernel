@@ -26,6 +26,7 @@ EXPECTED_CONTRACTS_ALL = [
     "InterruptionCause",
     "RetryEligibility",
     "DurableModelInvocation",
+    "ModelEvidencePolicy",
     "RunCheckpoint",
     "CheckpointStore",
     "CheckedCheckpointStore",

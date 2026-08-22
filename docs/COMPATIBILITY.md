@@ -101,10 +101,11 @@ unknown fields are private by default. Receipt key spellings are canonicalized. 
 taxonomy, timestamp, numeric, boolean, and usage values each have bounded typed validation; a
 receipt request digest must equal the invocation request digest. Settled success points to a private
 result blob through a bounded `scheme:locator` address, and ambiguous dispatch has no automatic
-retry evidence. The additive `requires_evidence` boolean records a required-delivery obligation
-from the first reservation through every later revision and retry. Records written before this
-v0.22 prerelease field read as `false`; deploy the current checked reader before a writer that
-emits the field because the earlier prerelease reader used a closed top-level vocabulary.
+retry evidence. The `evidence_policy` enum records `passive`, `required`, or `outbox` delivery from
+the first reservation through every later revision and retry. The checked reader accepts the earlier
+v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `true` to `required`;
+the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
+writer because the earlier prerelease reader used a closed top-level vocabulary.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
 `pending_finish`, and `pending_tool_loads` fields. A

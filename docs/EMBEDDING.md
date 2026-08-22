@@ -209,16 +209,18 @@ Hosted products that configure `AgentLoop(run_sink=..., writer_token=...)` also 
 Keep invocation settlement and evidence delivery in separate tables or record families for
 `required`. Make `commit_model_evidence()` fence-first, idempotent on
 `(run_id, logical_call_id, revision)`, and valid only for the current authoritative settled
-revision. Persist the invocation's `requires_evidence` flag in the same transaction as every
+revision. Persist the invocation's `evidence_policy` enum in the same transaction as every
 invocation revision and preserve it across retries. A replacement worker must honor the journal
-flag even when its configured policy is `passive`; this covers a crash before an
+policy even when its configured policy is `passive`; this covers a crash before an
 `evidence_uncommitted` checkpoint exists. Reject a `passive` to `required` policy change for an
 existing logical call before provider or evidence mutation. Apply the stronger policy to a new
 logical call. On recovery, deliver a journal-required settlement before validating a request digest
 rebuilt from replacement config or dynamic context. For `outbox`, reject the complete transaction
 when either
 the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
-violates the declared capability.
+violates the declared capability. A recovered outbox reservation remains outbox-owned, checks
+`transactional_outbox` before provider entry, and stages evidence at settlement even when the
+replacement activation uses the passive default.
 
 Treat a durable checkpoint whose `last_suspension` is null and whose model-step counter is positive
 as an in-progress internal checkpoint. Resume that allocated step once before advancing counters.

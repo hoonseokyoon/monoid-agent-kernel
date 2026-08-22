@@ -34,7 +34,7 @@ from monoid_agent_kernel.core.outcome import (
     RetryEligibility,
     TerminalOutcome,
 )
-from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.model_invocation import DurableModelInvocation, ModelEvidencePolicy
 from monoid_agent_kernel.core.checkpoint import (
     CheckedCheckpointStore,
     CheckpointRecord,
@@ -311,6 +311,7 @@ __all__ = [
     "InterruptionCause",
     "RetryEligibility",
     "DurableModelInvocation",
+    "ModelEvidencePolicy",
     "RunCheckpoint",
     "CheckpointStore",
     "CheckedCheckpointStore",

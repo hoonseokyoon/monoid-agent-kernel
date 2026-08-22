@@ -116,13 +116,18 @@ out in commit messages and here.
   through `commit_invocation(..., stage_evidence=True)` and requires the sink's
   `transactional_outbox` capability.
 - Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
-  The first durable reservation records a stable `requires_evidence` obligation in every invocation
-  revision. Settlement recovery honors that journal field independently of the replacement host's
-  configured policy, closing the crash window before an evidence-failure checkpoint is published.
+  The first durable reservation records its stable `passive | required | outbox` evidence policy in
+  every invocation revision. Settlement recovery honors that journal field independently of a
+  replacement host's passive default, closing the crash windows before either an evidence-failure
+  checkpoint or an outbox-staged settlement is published. The checked reader maps the earlier
+  prerelease `requires_evidence` boolean to `passive` or `required`; canonical writers emit the enum.
   Journal-required recovery completes the fenced evidence mutation before checking a request digest
   rebuilt from replacement config or dynamic context.
   An activation cannot upgrade an existing passive invocation to required delivery; it fails before
   provider or evidence mutation and applies the stronger policy to a new logical call.
+  An outbox reservation remains outbox-owned across worker replacement, validates transactional
+  outbox capability before redispatch, and stages evidence atomically at settlement even when the
+  replacement activation uses the passive default.
   Recovery commits evidence from the stored logical-call ID and request digest before rebuilding
   any runtime-dependent provider request. It applies the stored success or final refusal to loop
   state before consulting current runtime config, context providers, tool surfaces, or media;

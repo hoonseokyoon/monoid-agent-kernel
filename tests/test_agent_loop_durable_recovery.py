@@ -473,7 +473,7 @@ def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
     )
     evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled.invocation.revision)
 
-    assert settled.invocation.requires_evidence is True
+    assert settled.invocation.evidence_policy == "required"
     assert evidence_key not in harness.sink._model_evidence
 
     suspension, checkpoint = _restore(
@@ -537,7 +537,7 @@ def test_required_policy_cannot_upgrade_a_passive_settled_invocation(
         model_evidence_policy="required",
     )
 
-    assert settled.invocation.requires_evidence is False
+    assert settled.invocation.evidence_policy == "passive"
     assert suspension.reason == "terminal"
     assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
     assert len(adapter.requests) == 1
@@ -559,7 +559,7 @@ def test_required_policy_cannot_upgrade_a_passive_reservation_before_provider_en
         model_evidence_policy="required",
     )
 
-    assert reserved.invocation.requires_evidence is False
+    assert reserved.invocation.evidence_policy == "passive"
     assert suspension.reason == "terminal"
     assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
     assert adapter.requests == []
@@ -1005,7 +1005,7 @@ def test_internal_safety_checkpoint_reuses_step_and_delivers_required_evidence(
     assert settled_load.ok and settled_load.value is not None
     settled_invocation = settled_load.value.invocation
     evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled_invocation.revision)
-    assert settled_invocation.requires_evidence is True
+    assert settled_invocation.evidence_policy == "required"
     assert evidence_key not in harness.sink._model_evidence
 
     current = harness.claim_writer(RUN_ID, "worker-2")
@@ -2092,6 +2092,77 @@ def test_outbox_policy_stages_evidence_with_the_settled_invocation(tmp_path: Pat
     assert settled.reason == "settled"
     assert len(adapter.requests) == 1
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence_outbox
+
+
+def test_outbox_reservation_survives_replacement_passive_activation(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="done", stop_reason="stop"))
+    baseline, reserved = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "reserved",
+        model_evidence_policy="outbox",
+    )
+
+    assert reserved.invocation.evidence_policy == "outbox"
+    assert adapter.requests == []
+
+    settled, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert len(adapter.requests) == 1
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.evidence_policy == "outbox"
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, loaded.value.invocation.revision)
+    assert evidence_key in harness.sink._model_evidence_outbox
+
+
+def test_recovered_outbox_reservation_checks_capability_before_dispatch(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not dispatch", stop_reason="stop"))
+    baseline, reserved = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "reserved",
+        model_evidence_policy="outbox",
+    )
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=False,
+    )
+
+    failed, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert failed.reason == "terminal"
+    assert failed.error_code == "durable_invocation_evidence_policy_conflict"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation == reserved.invocation
+    assert harness.sink._model_evidence_outbox == {}
 
 
 def test_outbox_atomic_failure_publishes_neither_settlement_nor_evidence(tmp_path: Path) -> None:

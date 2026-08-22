@@ -460,7 +460,7 @@ class DeterministicFencedRunSink:
                 "idempotency_key",
                 "request_digest",
                 "digest_generation",
-                "requires_evidence",
+                "evidence_policy",
             )
         ):
             return previous_digest

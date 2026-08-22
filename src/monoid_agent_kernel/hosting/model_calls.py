@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal, NoReturn
+from typing import NoReturn
 
-from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.model_invocation import (
+    DurableModelInvocation,
+    ModelEvidencePolicy,
+)
 from monoid_agent_kernel.errors import DurableModelCallError, ModelEvidenceUncommitted
 from monoid_agent_kernel.hosting.contracts import (
     CommitResult,
@@ -31,7 +34,7 @@ class FencedModelCallLifecycle:
 
     sink: FencedRunSink
     writer_token: WriterToken
-    evidence_policy: Literal["passive", "required", "outbox"] = "passive"
+    evidence_policy: ModelEvidencePolicy = "passive"
     last_invocation: DurableModelInvocation | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -135,18 +138,66 @@ class FencedModelCallLifecycle:
             mark_recovered_model_usage(failed, invocation.receipt or {})
             raise failed from exc
 
-    def _reject_required_policy_upgrade(
+    def _reject_evidence_policy_change(
         self,
         invocation: DurableModelInvocation,
         blobs: Mapping[str, bytes] | None = None,
+        *,
+        prove_ownership: bool = True,
     ) -> NoReturn:
-        """Prove current ownership, preserve the invocation, then reject a policy upgrade."""
+        """Prove current ownership, preserve the invocation, then reject policy drift."""
 
-        self._commit(invocation, blobs)
+        if prove_ownership:
+            self._commit(invocation, blobs)
         raise DurableModelCallError(
-            "an existing durable model invocation cannot acquire required evidence delivery",
+            "an existing durable model invocation cannot change evidence delivery policy",
             error_code="durable_invocation_evidence_policy_conflict",
         )
+
+    def _require_outbox_capability(
+        self,
+        invocation: DurableModelInvocation | None = None,
+    ) -> None:
+        try:
+            supported = self.sink.capabilities.transactional_outbox is True
+        except Exception:
+            supported = False
+        if supported:
+            return
+        if invocation is not None:
+            # Preserve fence-first rejection for a recovered logical call.
+            self._commit(invocation)
+        raise DurableModelCallError(
+            "durable outbox evidence policy requires transactional outbox capability",
+            error_code="durable_invocation_evidence_policy_conflict",
+        )
+
+    def _effective_evidence_policy(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        require_evidence: bool = False,
+        blobs: Mapping[str, bytes] | None = None,
+        prove_ownership: bool = True,
+    ) -> ModelEvidencePolicy:
+        stored = invocation.evidence_policy
+        if require_evidence and stored != "required":
+            self._reject_evidence_policy_change(
+                invocation,
+                blobs,
+                prove_ownership=prove_ownership,
+            )
+        # Passive is the replacement-host default and defers to an existing durable obligation.
+        # Any explicit non-passive mode must equal the policy captured by the first reservation.
+        if self.evidence_policy != "passive" and self.evidence_policy != stored:
+            self._reject_evidence_policy_change(
+                invocation,
+                blobs,
+                prove_ownership=prove_ownership,
+            )
+        if stored == "outbox":
+            self._require_outbox_capability(invocation if prove_ownership else None)
+        return stored
 
     def _commit_settled(
         self,
@@ -155,13 +206,14 @@ class FencedModelCallLifecycle:
         *,
         require_evidence: bool = False,
         evidence_committed: bool = False,
+        authoritative: bool = False,
     ) -> None:
-        if require_evidence or invocation.requires_evidence:
-            evidence_policy = "required"
-        elif self.evidence_policy == "required":
-            self._reject_required_policy_upgrade(invocation, blobs)
-        else:
-            evidence_policy = self.evidence_policy
+        evidence_policy = self._effective_evidence_policy(
+            invocation,
+            require_evidence=require_evidence,
+            blobs=blobs,
+            prove_ownership=authoritative,
+        )
         self._commit(
             invocation,
             blobs,
@@ -218,7 +270,7 @@ class FencedModelCallLifecycle:
             return None
         invocation = record.invocation
         evidence_committed = False
-        if invocation.dispatch_state == "settled" and invocation.requires_evidence:
+        if invocation.dispatch_state == "settled" and invocation.evidence_policy == "required":
             # The journal obligation is authoritative without a checkpoint marker or a rebuilt
             # request. Finish its fenced sink delivery before comparing the query digest that
             # replacement config or dynamic context produced with the settled call.
@@ -262,6 +314,7 @@ class FencedModelCallLifecycle:
                 invocation,
                 require_evidence=query.require_evidence,
                 evidence_committed=evidence_committed,
+                authoritative=True,
             )
             return RecoveredModelDispatch(
                 reservation=reservation,
@@ -293,6 +346,7 @@ class FencedModelCallLifecycle:
             {sha256: result_blob},
             require_evidence=query.require_evidence,
             evidence_committed=evidence_committed,
+            authoritative=True,
         )
         return RecoveredModelDispatch(
             reservation=reservation,
@@ -305,12 +359,13 @@ class FencedModelCallLifecycle:
         if record is None:
             effective = proposed
             revision = 1
-            requires_evidence = self.evidence_policy == "required"
+            evidence_policy = self.evidence_policy
+            if evidence_policy == "outbox":
+                self._require_outbox_capability()
         else:
             invocation = record.invocation
             if invocation.dispatch_state == "reserved":
-                if self.evidence_policy == "required" and not invocation.requires_evidence:
-                    self._reject_required_policy_upgrade(invocation)
+                evidence_policy = self._effective_evidence_policy(invocation)
                 effective = replace(proposed, idempotency_key=invocation.idempotency_key)
                 if not self._same_dispatch(invocation, effective):
                     raise DurableModelCallError(
@@ -325,8 +380,7 @@ class FencedModelCallLifecycle:
                     "durable model invocation remains unknown",
                     error_code="dispatch_unknown",
                 )
-            if self.evidence_policy == "required" and not invocation.requires_evidence:
-                self._reject_required_policy_upgrade(invocation)
+            evidence_policy = self._effective_evidence_policy(invocation)
             retryable_failure = (
                 bool(invocation.failure_code)
                 and invocation.receipt is not None
@@ -348,7 +402,6 @@ class FencedModelCallLifecycle:
                     error_code="durable_invocation_request_conflict",
                 )
             revision = invocation.revision + 1
-            requires_evidence = invocation.requires_evidence
         self._commit(
             DurableModelInvocation(
                 run_id=self.writer_token.run_id,
@@ -360,7 +413,7 @@ class FencedModelCallLifecycle:
                 dispatch_state="reserved",
                 request_digest=effective.request_digest,
                 digest_generation=effective.digest_generation,
-                requires_evidence=requires_evidence,
+                evidence_policy=evidence_policy,
             )
         )
         return effective

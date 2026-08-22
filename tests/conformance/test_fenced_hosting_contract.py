@@ -59,6 +59,7 @@ _INVOCATION_IDENTITY_FIELDS = (
     "idempotency_key",
     "dispatch_state",
     "request_digest",
+    "evidence_policy",
     "receipt",
     "result_ref",
     "failure_code",
@@ -2376,7 +2377,7 @@ def _invocation_identity_drift_factory(field_name: str):
         "request_digest",
         "dispatch_id",
         "dispatch_attempt",
-        "requires_evidence",
+        "evidence_policy",
     ],
 )
 def test_reusable_contract_checks_each_stable_invocation_identity(field_name: str) -> None:
@@ -2448,7 +2449,7 @@ def _terminal_invocation_identity_drift_factory(
         "request_digest",
         "dispatch_id",
         "dispatch_attempt",
-        "requires_evidence",
+        "evidence_policy",
     ],
 )
 def test_reusable_contract_checks_identity_on_terminal_invocation_edges(
@@ -3344,7 +3345,7 @@ def _retry_invocation_identity_drift_factory(field_name: str):
     return factory
 
 
-@pytest.mark.parametrize("field_name", ["idempotency_key", "request_digest", "requires_evidence"])
+@pytest.mark.parametrize("field_name", ["idempotency_key", "request_digest", "evidence_policy"])
 def test_reusable_contract_checks_stable_identity_when_reserving_retry(
     field_name: str,
 ) -> None:
