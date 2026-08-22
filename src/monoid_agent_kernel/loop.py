@@ -2258,6 +2258,10 @@ class AgentLoop:
         state.status = "limited"
         state.error = f"run closed while its turn was {session.midturn_park}; the turn never settled"
         state.error_code = "closed_unsettled"
+        # The terminal verdict supersedes the resumable park. Keeping USER_CANCEL from a
+        # turn-level Stop would make the cause-aware outcome mapper report a cancelled run even
+        # though close deliberately chose the distinct closed_unsettled limit.
+        state.interruption_cause = None
         session.terminal = True
         self._persist_checkpoint(
             session,
@@ -2915,6 +2919,8 @@ class AgentLoop:
         state.status = "failed"
         state.error = str(exc)
         state.error_code = error_code_for_exception(exc)
+        # A terminal failure owns a new verdict. Any cause on a prior resumable park has ended.
+        state.interruption_cause = None
         if inherit_provider_detail and isinstance(exc, ModelAdapterError):
             # Promotion of a recoverable turn.failed (fail_recoverable): keep the provider detail
             # that turn recorded, adopting the synthetic wrapper's fields only if it carries them.

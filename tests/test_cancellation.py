@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -309,9 +310,20 @@ def test_close_of_a_paused_midturn_run_promotes_limited_and_keeps_checkpoints(
     result = loop.close()
 
     assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    assert result.interruption_cause is None
+    assert "interruption_cause" not in result.metrics
     stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert stored is not None
     assert stored.checkpoint.terminal is True
+    assert stored.checkpoint.interruption_cause == ""
+    last = stored.checkpoint.last_suspension
+    assert last is not None and not last.get("interruption_cause")
+    events = [
+        json.loads(line)
+        for line in result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    finished = [event for event in events if event["type"] == "run.finished"]
+    assert finished[-1]["data"]["interruption_cause"] == ""
     # This is not a provider failure: the minted terminal park carries no classification.
     last = stored.checkpoint.last_suspension
     assert last is not None and last.get("error_code") == "closed_unsettled"

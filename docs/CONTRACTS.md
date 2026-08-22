@@ -161,7 +161,7 @@ The run lifecycle is:
   (`paused`/`interrupted` — a turn that never settled) must not finalize a clean
   success either: it promotes to `status="limited"`,
   `error_code="closed_unsettled"` (one code for both variants), with an empty
-  failure classification (nothing here is a provider failure) and its checkpoints
+  failure classification and no interruption cause (the resumable park has ended), with its checkpoints
   kept, so the frozen turn's only restore point survives the close. A settled
   `awaiting_input` park is not this — its turn completed and close finalizes the
   success it was; an acknowledged cancel is the operator's stronger verdict and
