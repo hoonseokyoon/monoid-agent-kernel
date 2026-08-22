@@ -61,6 +61,7 @@ _MODEL_INVOCATION_FIELDS = frozenset(
 # spelling-specific deny rule. Keys are matched without case or separators and emitted canonically.
 _RECEIPT_FIELDS = {
     "attempts": "attempts",
+    "configrecoverable": "config_recoverable",
     "durationms": "duration_ms",
     "finishreason": "finish_reason",
     "httpstatus": "http_status",
@@ -101,7 +102,9 @@ _RECEIPT_TIMESTAMP_FIELDS = frozenset(
         "started_at",
     }
 )
-_RECEIPT_BOOLEAN_FIELDS = frozenset({"provider_retried", "retryable"})
+_RECEIPT_BOOLEAN_FIELDS = frozenset(
+    {"config_recoverable", "provider_retried", "retryable"}
+)
 _RECEIPT_DURATION_FIELDS = frozenset({"duration_ms", "latency_ms"})
 _USAGE_FIELDS = {
     "audioinputtokens": "audio_input_tokens",
@@ -176,6 +179,7 @@ def model_invocation_receipt(receipt: Any) -> dict[str, Any]:
 
     projected: dict[str, Any] = {
         "attempts": getattr(receipt, "attempts", 0),
+        "config_recoverable": getattr(receipt, "config_recoverable", False),
         "latency_ms": getattr(receipt, "latency_ms", 0),
         "provider_retried": getattr(receipt, "provider_retried", False),
         "retryable": getattr(receipt, "retryable", False),

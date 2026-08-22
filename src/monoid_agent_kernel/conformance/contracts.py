@@ -1552,6 +1552,7 @@ def _contract_receipt_field_identity_evidence(
 ) -> tuple[str, tuple[str, str | None, str, str | None]]:
     receipt_values: dict[str, tuple[Any, Any]] = {
         "attempts": (1, 2),
+        "config_recoverable": (False, True),
         "duration_ms": (1.0, 2.0),
         "finish_reason": ("stop", "length"),
         "http_status": (200, 503),

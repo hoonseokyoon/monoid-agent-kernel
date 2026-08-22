@@ -70,6 +70,7 @@ def test_runner_receipt_projection_keeps_only_public_safe_invocation_evidence() 
         error_code="model_error",
         provider_error_code="rate_limited",
         retryable=True,
+        config_recoverable=True,
         http_status=429,
         destination_status="resolved",
         destination_digest="c" * 64,
@@ -80,6 +81,7 @@ def test_runner_receipt_projection_keeps_only_public_safe_invocation_evidence() 
 
     assert projected == {
         "attempts": 2,
+        "config_recoverable": True,
         "latency_ms": 12,
         "provider_retried": True,
         "retryable": True,

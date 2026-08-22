@@ -4032,6 +4032,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
     )
     assert callers == [
         "monoid_agent_kernel/model_call.py",
+        "monoid_agent_kernel/model_lifecycle.py",
         "monoid_agent_kernel/reference/llm_gateway/service.py",
     ], {"callers": callers}
 

@@ -74,15 +74,19 @@ from monoid_agent_kernel.errors import (
     DurableModelCallError,
     ModelAdapterError,
     ModelCallAborted,
+    ModelDispatchRefused,
     RunCancelled,
     RunTimeout,
 )
 from monoid_agent_kernel.model_lifecycle import (
     ModelCallLifecycleHook,
     ModelDispatchReservation,
+    RecoveredModelDispatch,
     dispatch_evidence,
     durable_model_result_blob,
+    durable_model_turn,
     raise_model_dispatch_unknown,
+    recover_model_dispatch,
     reserve_model_dispatch,
     safe_failure_code,
     settle_model_dispatch,
@@ -233,6 +237,52 @@ def _merged_usage(spent: Mapping[str, int], usage: Mapping[str, int]) -> dict[st
     for key, value in spent.items():
         merged[key] = merged.get(key, 0) + value
     return merged
+
+
+def _recovered_receipt(
+    base: ModelCallReceipt,
+    recovered: RecoveredModelDispatch,
+) -> ModelCallReceipt:
+    """Combine current private routing context with authoritative public settlement evidence."""
+
+    try:
+        evidence = recovered.receipt
+        reservation = recovered.reservation
+        return replace(
+            base,
+            request_digest=reservation.request_digest,
+            digest_generation=reservation.digest_generation,
+            digest_status="ok",
+            idempotency_key=reservation.idempotency_key,
+            stop_reason=evidence.get("stop_reason", ""),
+            usage=dict(evidence.get("usage", {})),
+            latency_ms=evidence.get("latency_ms", 0),
+            attempts=evidence["attempts"],
+            provider_retried=evidence.get("provider_retried", False),
+            error_code=recovered.failure_code,
+            provider_error_code=evidence.get("provider_error_code", ""),
+            retryable=evidence.get("retryable", False),
+            config_recoverable=evidence.get("config_recoverable", False),
+            http_status=evidence.get("http_status"),
+            attempt_log=(),
+        )
+    except Exception as exc:
+        raise DurableModelCallError(
+            "durable model invocation receipt is corrupt",
+            error_code="durable_invocation_receipt_corrupt",
+        ) from exc
+
+
+def _recovered_result_matches_receipt(
+    turn: ModelTurn,
+    receipt: ModelCallReceipt,
+) -> bool:
+    stop_reason = turn.stop_reason or ""
+    return (
+        dict(turn.usage) == dict(receipt.usage)
+        and stop_reason == receipt.stop_reason
+        and turn.provider_retried is receipt.provider_retried
+    )
 
 
 def _safe_repr(value: Any) -> str:
@@ -643,6 +693,8 @@ class ModelCallRunner:
             # runs, then re-measured after each one. Threaded into every entry-construction
             # site so the wait lands on the entry it delayed, not the one that caused it.
             pending_backoff_ms = 0
+            recovered_failure_receipt: ModelCallReceipt | None = None
+            durable_outcome_receipt: ModelCallReceipt | None = None
             try:
                 if lifecycle_hook is not None and not is_safe_opaque_id(logical_call_id):
                     raise DurableModelCallError(
@@ -751,6 +803,44 @@ class ModelCallRunner:
                         "durable model call request could not be keyed",
                         error_code="durable_invocation_unkeyable",
                     )
+                if lifecycle_hook is not None:
+                    recovered = recover_model_dispatch(
+                        lifecycle_hook,
+                        logical_call_id=logical_call_id,
+                        request_digest=receipt.request_digest,
+                    )
+                    if recovered is not None:
+                        object.__setattr__(
+                            request,
+                            "idempotency_key",
+                            recovered.reservation.idempotency_key,
+                        )
+                        receipt = _recovered_receipt(receipt, recovered)
+                        if recovered.failure_code:
+                            recovered_failure_receipt = receipt
+                            raise ModelDispatchRefused(
+                                "durable model dispatch restored a settled refusal",
+                                error_code=recovered.failure_code,
+                                provider_error_code=receipt.provider_error_code,
+                                retryable=receipt.retryable,
+                                config_recoverable=receipt.config_recoverable,
+                                http_status=receipt.http_status,
+                                provider_retried=receipt.provider_retried,
+                            )
+                        turn = durable_model_turn(recovered.result_blob)
+                        if not _recovered_result_matches_receipt(turn, receipt):
+                            raise DurableModelCallError(
+                                "durable model result conflicts with its receipt",
+                                error_code="durable_invocation_result_corrupt",
+                            )
+                        settled = self._publish(
+                            request,
+                            turn,
+                            receipt,
+                            elapsed_ms=receipt.latency_ms,
+                            request_preimage=request_preimage,
+                        )
+                        return turn, settled
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is
@@ -865,6 +955,7 @@ class ModelCallRunner:
                                     else current_failure.usage
                                 ),
                             )
+                            durable_outcome_receipt = durable_failure
                             settle_model_dispatch(
                                 lifecycle_hook,
                                 reservation,
@@ -917,6 +1008,52 @@ class ModelCallRunner:
                 if lifecycle_hook is None:
                     turn = normalize_model_turn(turn)
             except BaseException as exc:
+                # Process-control exceptions preserve already-observed accounting but never become
+                # model outcomes or lifecycle compensation. Prefer a complete receipt prepared
+                # immediately before durable settle. If the stop arrived earlier, carry the usage
+                # of completed attempts without constructing an attempt log whose terminal entry
+                # would falsely describe the stop as a provider result. Every diagnostic action is
+                # contained so the original KeyboardInterrupt/SystemExit-shaped signal survives.
+                if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                    crash_receipt = durable_outcome_receipt
+                    if crash_receipt is None:
+                        crash_usage = dict(spent_usage)
+                        if (
+                            last_attempt_entry is not None
+                            and last_attempt_entry.index == attempts_made
+                        ):
+                            crash_usage = _merged_usage(crash_usage, last_attempt_entry.usage)
+                        with contextlib.suppress(Exception):
+                            crash_receipt = replace(
+                                receipt.with_error(exc),
+                                attempts=attempts_made,
+                                attempt_log=(),
+                                usage=crash_usage,
+                            )
+                    if crash_receipt is not None:
+                        with contextlib.suppress(Exception):
+                            self._publish(
+                                request,
+                                None,
+                                crash_receipt,
+                                elapsed_ms=self._ms_since(started),
+                                request_preimage=request_preimage,
+                            )
+                        if crash_receipt.usage:
+                            mark_provider_usage(exc, crash_receipt.usage)
+                    raise
+                if recovered_failure_receipt is not None:
+                    with contextlib.suppress(Exception):
+                        self._publish(
+                            request,
+                            None,
+                            recovered_failure_receipt,
+                            elapsed_ms=recovered_failure_receipt.latency_ms,
+                            request_preimage=request_preimage,
+                        )
+                    if recovered_failure_receipt.usage:
+                        mark_provider_usage(exc, recovered_failure_receipt.usage)
+                    raise
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
                 # abandoned worker's eventual exception is never read, so for a call the run gave
@@ -1036,6 +1173,7 @@ class ModelCallRunner:
                     completed,
                     latency_ms=self._ms_since(started),
                 )
+                durable_outcome_receipt = durable_completed
                 try:
                     result_blob = durable_model_result_blob(turn)
                 except DurableModelCallError as result_error:
