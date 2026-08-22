@@ -951,7 +951,10 @@ class TaskManager:
     workspace: Workspace
     recorder: AgentRecorder
     permission_policy: PermissionPolicy
-    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
+    write_authority: ActivationWriteAuthority = field(
+        default_factory=ActivationWriteAuthority,
+        kw_only=True,
+    )
     jobs: dict[str, Task] = field(default_factory=dict)
     executors: dict[str, TaskExecutor] = field(default_factory=dict, init=False, repr=False)
     injectors: dict[str, ResultInjector] = field(default_factory=dict, init=False, repr=False)

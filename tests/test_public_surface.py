@@ -725,6 +725,22 @@ def test_the_relayed_provider_fields_are_keyword_only() -> None:
         assert fld.kw_only, f"{cls.__name__}.{name} must be keyword-only to preserve positional order"
 
 
+def test_v022_injected_constructor_dependencies_are_keyword_only() -> None:
+    """New authority and lifecycle seams preserve every pre-v0.22 positional binding."""
+    import dataclasses
+
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.tasks import TaskManager
+
+    for cls, name in (
+        (ModelCallRunner, "current_write_authority"),
+        (ModelCallRunner, "lifecycle_hook"),
+        (TaskManager, "write_authority"),
+    ):
+        (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"
+
+
 def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
     """The behavioral half: the old positional shapes still mean what they meant.
 
@@ -753,6 +769,25 @@ def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
     assert studio.llm_gateway_provider is None
 
 
+def test_v022_positional_construction_keeps_its_pre_v022_meaning() -> None:
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.tasks import TaskManager
+
+    adapter = object()
+    runner = ModelCallRunner(adapter, None, None, 0.05)
+
+    assert runner.adapter is adapter
+    assert runner.cancel_grace_s == 0.05
+    assert runner.current_write_authority is None
+    assert runner.lifecycle_hook is None
+
+    restored_jobs = {}
+    manager = TaskManager("run", object(), object(), object(), restored_jobs)
+
+    assert manager.jobs is restored_jobs
+    assert manager.write_authority.revoked is False
+
+
 def test_stable_constructor_positional_order_is_append_only() -> None:
     """The positional signature of the shipped constructors is a compatibility surface.
 
@@ -764,9 +799,11 @@ def test_stable_constructor_positional_order_is_append_only() -> None:
     import dataclasses
 
     from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+    from monoid_agent_kernel.model_call import ModelCallRunner
     from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
     from monoid_agent_kernel.reference.backend.service import RunnerBackend
     from monoid_agent_kernel.reference.studio.server import StudioConfig
+    from monoid_agent_kernel.tasks import TaskManager
 
     def positional(cls: type) -> tuple[str, ...]:
         return tuple(f.name for f in dataclasses.fields(cls) if f.init and not f.kw_only)
@@ -774,6 +811,14 @@ def test_stable_constructor_positional_order_is_append_only() -> None:
     assert positional(GatewayModelAdapter) == (
         "config", "gateway_url", "token", "token_env", "token_file", "token_provider",
         "provider_name",
+    )
+    assert positional(ModelCallRunner) == (
+        "adapter", "current_adapter", "current_cancellation_token", "cancel_grace_s",
+        "current_cancel_grace_s", "thread_name", "subscriptions", "settled_sink",
+        "capture_request_preimage",
+    )
+    assert positional(TaskManager) == (
+        "run_id", "workspace", "recorder", "permission_policy", "jobs",
     )
     assert positional(StudioConfig) == (
         "workspace", "host", "port", "provider", "run_root", "skills_directory", "mcp",

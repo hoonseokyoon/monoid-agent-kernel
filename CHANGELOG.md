@@ -187,6 +187,9 @@ out in commit messages and here.
 - Added deterministic abandoned-activation races covering retained synchronous handlers, workspace
   writes, artifact allocation, callback fan-out, model streams, task cleanup, checkpoint commits,
   outbox commits, recovery, and terminal settlement.
+- Kept the pre-v0.22 positional constructor ABI for `ModelCallRunner` and `TaskManager`. New writer
+  authority and durable lifecycle injection fields are keyword-only and pinned by structural and
+  behavioral public-surface tests.
 
 ## [0.21.0] - 2026-08-12
 

@@ -43,7 +43,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
@@ -519,7 +519,10 @@ class ModelCallRunner:
     runner holding a snapshot would watch a token nobody cancels and silently lose cancellation on
     the streaming path."""
 
-    current_write_authority: Callable[[], ActivationWriteAuthority | None] | None = None
+    current_write_authority: Callable[[], ActivationWriteAuthority | None] | None = field(
+        default=None,
+        kw_only=True,
+    )
     """Returns the activation's independent process-local mutation capability, when present."""
 
     cancel_grace_s: float = 1.0
@@ -582,7 +585,7 @@ class ModelCallRunner:
     the payload corpus) should not pay for bytes it never reads. The wiring that enables the
     payload recorder sets this; the digests themselves are computed either way."""
 
-    lifecycle_hook: ModelCallLifecycleHook | None = None
+    lifecycle_hook: ModelCallLifecycleHook | None = field(default=None, kw_only=True)
     """Optional authoritative lifecycle writer for durable paid-call execution.
 
     The hook is synchronous because the hosting contracts it adapts are synchronous fenced
