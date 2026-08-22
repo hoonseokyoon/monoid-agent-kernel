@@ -310,6 +310,8 @@ class StatusJsonSink:
             self.state["terminal"] = False
             self.state["waiting_for_background_jobs"] = True
             self.state["waiting_jobs"] = data.get("jobs", [])
+            # The current cause-less park supersedes a cause left by an interrupted turn.
+            self.state.pop("interruption_cause", None)
         elif event.type == "run.resumed":
             self.state["state"] = session_state_value(SessionState.RUNNING)
             self.state["terminal"] = False
@@ -323,6 +325,7 @@ class StatusJsonSink:
                 "task_ids": data.get("task_ids", []),
                 "prompt": data.get("prompt"),
             }
+            self.state.pop("interruption_cause", None)
         elif event.type == "agent.config.updated":
             self.state["agent_config"] = {
                 "definition_id": data.get("definition_id"),

@@ -290,6 +290,9 @@ def _apply_event_projection(
             projection["state"] = session_state_value(SessionState.AWAITING_TASKS)
             projection["terminal"] = False
             projection["waiting_for_background_jobs"] = True
+            # A run park is the current suspension. These events carry no interruption cause,
+            # so a cause seeded from status.json/metrics or an older interrupted turn is stale.
+            projection["interruption_cause"] = None
         elif event_type == "run.awaiting_input":
             # The other park on this same stream. Handling only ``run.waiting`` here left a run
             # parked for a hosted task or for user input reading as *running* to `monoid status`,
@@ -297,6 +300,7 @@ def _apply_event_projection(
             # handled both. Both parks now, on both readers.
             projection["state"] = session_state_value(SessionState.AWAITING_INPUT)
             projection["terminal"] = False
+            projection["interruption_cause"] = None
         elif event_type == "run.resumed":
             projection["state"] = session_state_value(SessionState.RUNNING)
             projection["terminal"] = False
