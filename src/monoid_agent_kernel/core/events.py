@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -141,6 +142,7 @@ class EventBus:
     run_id: str
     sinks: tuple[EventSink, ...]
     _seq: int = 0
+    check_authority: Callable[[], None] | None = None
     _closed: bool = field(default=False, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -170,8 +172,18 @@ class EventBus:
             # emit/close serialize on the same lock, so this check is race-free.
             if self._closed:
                 return event
+            if self.check_authority is not None:
+                self.check_authority()
             for sink in self.sinks:
-                sink.emit(event)
+                if self.check_authority is not None:
+                    self.check_authority()
+                try:
+                    sink.emit(event)
+                finally:
+                    # A sink may block while activation ownership moves. Re-read the sticky
+                    # authority fact before the next sink can publish the same event.
+                    if self.check_authority is not None:
+                        self.check_authority()
             return event
 
     def close(self) -> None:

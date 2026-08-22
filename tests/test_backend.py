@@ -699,6 +699,37 @@ def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     assert set(backend.run_root.iterdir()) == existing_run_dirs
 
 
+def test_backend_drain_does_not_stamp_a_run_that_terminalizes_during_cancel(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    prepared = backend._prepare_run_record(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="complete while drain takes ownership",
+            runtime_config=_default_config(),
+        )
+    )
+    record = backend._record(prepared.run_id)
+
+    def complete_during_cancel() -> None:
+        record.state = SessionState.COMPLETED
+        record.terminal = True
+
+    record.cancellation_token.add_cancel_callback(complete_during_cancel)
+
+    pending = backend.drain(timeout_s=0)
+
+    assert pending == []
+    assert record.state is SessionState.COMPLETED
+    assert record.error == ""
+    assert record.error_code == ""
+    assert record.interruption_cause is None
+
+
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
     manager = _token_manager()
     token = manager.issue(

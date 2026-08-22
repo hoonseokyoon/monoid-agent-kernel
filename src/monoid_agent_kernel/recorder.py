@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -430,6 +430,9 @@ class AgentRecorder:
     # Private replay corpus (request preimages + settled response bodies), opt-in like its two
     # sidecar siblings and appended after them so no positional caller is rebound.
     model_payload_file: bool = False
+    # Optional host writer-authority fence. EventBus applies it around every sink callback so a
+    # slow extension cannot let later projections publish after this activation loses its lease.
+    check_authority: Callable[[], None] | None = None
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
@@ -479,7 +482,12 @@ class AgentRecorder:
         if self.status_file:
             sinks.append(StatusJsonSink(self.run_dir / "status.json"))
         sinks.extend(self.extra_event_sinks)
-        self.event_bus = EventBus(self.run_id, tuple(sinks), _seq=initial_seq)
+        self.event_bus = EventBus(
+            self.run_id,
+            tuple(sinks),
+            _seq=initial_seq,
+            check_authority=self.check_authority,
+        )
 
     def emit(
         self,

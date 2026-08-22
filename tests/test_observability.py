@@ -90,6 +90,37 @@ def test_event_bus_normalizes_python_values_before_any_sink_sees_them() -> None:
     assert memory.events == [event]
 
 
+def test_event_bus_rechecks_authority_between_sink_callbacks() -> None:
+    authority_lost = False
+    first_events: list[AgentEvent] = []
+    second = MemoryEventSink()
+
+    class LosingSink:
+        def emit(self, event: AgentEvent) -> None:
+            nonlocal authority_lost
+            first_events.append(event)
+            authority_lost = True
+
+        def close(self) -> None:
+            return None
+
+    def check_authority() -> None:
+        if authority_lost:
+            raise RuntimeError("writer authority lost")
+
+    bus = EventBus(
+        "run_fenced",
+        (LosingSink(), second),
+        check_authority=check_authority,
+    )
+
+    with pytest.raises(RuntimeError, match="writer authority lost"):
+        bus.emit("run.started", data={"mode": "propose"})
+
+    assert len(first_events) == 1
+    assert second.events == []
+
+
 def test_jsonl_sink_rejects_non_finite_values_if_an_ingress_is_bypassed(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     sink = JsonlEventSink(path)

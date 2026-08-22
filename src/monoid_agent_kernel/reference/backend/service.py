@@ -1168,10 +1168,16 @@ class RunnerBackend:
         counterpart to issuing a typed graceful-drain interruption per run and sleeping."""
         with self._lock:
             self._admission_quiesced = True
-            records = [record for record in self._records.values() if not _record_terminal(record)]
-        for record in records:
-            with self._lock:
+            records: list[BackendRunRecord] = []
+            for record in self._records.values():
+                if _record_terminal(record):
+                    continue
                 record.cancellation_token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+                # Cancellation callbacks may complete a run synchronously. Keep admission,
+                # terminal observation, and interruption stamping in one critical section, and
+                # re-read after cancellation before projecting a drain cause onto the record.
+                if _record_terminal(record):
+                    continue
                 cause = (
                     record.cancellation_token.cause
                     or InterruptionCause.GRACEFUL_DRAIN
@@ -1188,6 +1194,8 @@ class RunnerBackend:
                         else cause.value
                     )
                 record.interruption_cause = cause
+                records.append(record)
+        for record in records:
             # Wake a session parked on its message queue (put runs on the shared loop).
             self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
         deadline = time.time() + timeout_s

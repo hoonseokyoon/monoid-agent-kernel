@@ -521,6 +521,89 @@ def test_lease_loss_after_a_terminal_verdict_blocks_finalization(tmp_path: Path)
     assert "run.finished" not in event_types
 
 
+@pytest.mark.parametrize("boundary", ["turn", "run"])
+def test_lease_loss_after_first_finalization_write_blocks_every_later_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    session = loop._session
+    assert session is not None
+    recorder = session.res.recorder
+    original = recorder.write_proposal_revision
+
+    def lose_after_proposal(workspace: Any) -> Any:
+        result = original(workspace)
+        token.cancel(InterruptionCause.LEASE_LOST)
+        return result
+
+    monkeypatch.setattr(recorder, "write_proposal_revision", lose_after_proposal)
+
+    try:
+        with pytest.raises(RunCancelled) as caught:
+            if boundary == "turn":
+                loop._checkpoint_on_settle(session.state, session.res)
+            else:
+                loop.close()
+        assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+        assert not recorder.run_dir.joinpath("metrics.json").exists()
+        event_types = {
+            json.loads(line)["type"]
+            for line in recorder.run_dir.joinpath("events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        }
+        assert "workspace.proposal.updated" not in event_types
+        assert "turn.settled" not in event_types
+        assert "run.finished" not in event_types
+    finally:
+        if boundary == "turn":
+            loop.discard_uncommitted()
+
+
+def test_public_pump_stops_finalization_event_fanout_after_lease_loss(tmp_path: Path) -> None:
+    token = CancellationToken()
+    first_types: list[str] = []
+    second_types: list[str] = []
+
+    class LosingSink:
+        def emit(self, event: Any) -> None:
+            first_types.append(event.type)
+            if event.type == "workspace.proposal.updated":
+                token.cancel(InterruptionCause.LEASE_LOST)
+
+        def close(self) -> None:
+            return None
+
+    class RecordingSink:
+        def emit(self, event: Any) -> None:
+            second_types.append(event.type)
+
+        def close(self) -> None:
+            return None
+
+    loop = _restorable_loop(tmp_path)
+    loop.cancellation_token = token
+    loop.event_sinks = (LosingSink(), RecordingSink())
+    loop.open()
+
+    suspension = loop.run_until_suspended("go")
+
+    assert suspension.reason == "interrupted"
+    assert suspension.turn is None
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert "workspace.proposal.updated" in first_types
+    assert "workspace.proposal.updated" not in second_types
+    assert "turn.settled" not in first_types
+    assert "turn.settled" not in second_types
+    loop.discard_uncommitted()
+
+
 def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
     """A cancel that lands while the run sits at a quiescent park has no pump to raise in.
 

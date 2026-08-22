@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -119,6 +120,7 @@ class LoopBootstrapper:
             # envelope, and this is the same proven-lineage root the model-stream context uses.
             root_run_id=loop._validated_root_run_id(),
             reopen=loop._restoring,
+            check_authority=loop._check_lease_authority,
         )
         model_stream_observers = loop._materialize_model_stream_observers()
         job_manager = TaskManager(
@@ -554,6 +556,39 @@ class LoopFinalizer:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
+    def _fenced_write(self, operation: Callable[[], Any]) -> Any:
+        """Run one finalization mutation under a two-sided sticky-authority fence."""
+
+        self._loop._check_lease_authority()
+        try:
+            return operation()
+        finally:
+            # Sticky authority loss takes precedence over an extension or filesystem failure that
+            # overlapped it, and prevents the next finalization mutation from starting.
+            self._loop._check_lease_authority()
+
+    def _write_common_projection(
+        self,
+        state: Any,
+        res: _RunResources,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        """Write the proposal, metrics, and shared workspace event for one settle boundary."""
+
+        loop = self._loop
+        recorder = res.recorder
+        _diff_text, diff_path, proposal_payload = self._fenced_write(
+            lambda: recorder.write_proposal_revision(res.workspace)
+        )
+        metrics = self.build_metrics(state, res)
+        self._fenced_write(lambda: recorder.write_metrics(metrics))
+        self._fenced_write(
+            lambda: recorder.emit(
+                "workspace.proposal.updated",
+                data=public_proposal_payload(proposal_payload, loop.permission_policy),
+            )
+        )
+        return diff_path, proposal_payload, metrics
+
     def build_metrics(self, state: Any, res: _RunResources) -> dict[str, Any]:
         loop = self._loop
         context = res.context
@@ -633,47 +668,45 @@ class LoopFinalizer:
         loop = self._loop
         context = res.context
         recorder = res.recorder
-        workspace = res.workspace
-        context.job_manager.cancel_all()
-        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
-        metrics = self.build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, loop.permission_policy),
-        )
-        recorder.emit(
-            "proposal.ready",
-            data={
-                "proposal_hash": proposal_payload.get("proposal_hash"),
-                "diff_sha256": proposal_payload.get("diff_sha256"),
-                "changed_paths": [
-                    public_path(str(path), loop.permission_policy)
-                    for path in proposal_payload.get("changed_paths", [])
-                ],
-            },
+        self._fenced_write(context.job_manager.cancel_all)
+        diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
+        self._fenced_write(
+            lambda: recorder.emit(
+                "proposal.ready",
+                data={
+                    "proposal_hash": proposal_payload.get("proposal_hash"),
+                    "diff_sha256": proposal_payload.get("diff_sha256"),
+                    "changed_paths": [
+                        public_path(str(path), loop.permission_policy)
+                        for path in proposal_payload.get("changed_paths", [])
+                    ],
+                },
+            )
         )
         # The record is written as a side effect of building these fields, so it lands before the
         # emit rather than by a caller remembering to call it first. A restored run is recorded too:
         # provenance is not checkpointed, so ``_rehydrate`` fails closed and treats any restored
         # non-empty text as model-authored. Over-recording is the safe direction; see the field on
         # ``RunState``.
-        recorder.emit(
-            "run.finished",
-            data={
-                "status": state.status,
-                "error": public_error_message(state.error),
-                "error_code": state.error_code,
-                "interruption_cause": (
-                    "" if state.interruption_cause is None else state.interruption_cause.value
-                ),
-                **_settled_text_fields(recorder, state),
-                "duration_s": metrics["duration_s"],
-                "diff_path": str(diff_path.relative_to(recorder.run_dir)),
-                "proposal_path": "proposal.json",
-                "metrics_path": "metrics.json",
-            },
-            level="error" if state.status == "failed" else "info",
+        settled_text_fields = self._fenced_write(lambda: _settled_text_fields(recorder, state))
+        self._fenced_write(
+            lambda: recorder.emit(
+                "run.finished",
+                data={
+                    "status": state.status,
+                    "error": public_error_message(state.error),
+                    "error_code": state.error_code,
+                    "interruption_cause": (
+                        "" if state.interruption_cause is None else state.interruption_cause.value
+                    ),
+                    **settled_text_fields,
+                    "duration_s": metrics["duration_s"],
+                    "diff_path": str(diff_path.relative_to(recorder.run_dir)),
+                    "proposal_path": "proposal.json",
+                    "metrics_path": "metrics.json",
+                },
+                level="error" if state.status == "failed" else "info",
+            )
         )
         artifacts = tuple(recorder.artifacts)
         run_dir = recorder.run_dir
@@ -702,13 +735,7 @@ class LoopFinalizer:
         recorder = res.recorder
         workspace = res.workspace
         session = loop._session
-        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
-        metrics = self.build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, loop.permission_policy),
-        )
+        _diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
         public_changed = [
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
@@ -717,23 +744,26 @@ class LoopFinalizer:
         # what they publish. Both normally carry the same value, and ``settled_text`` is
         # content-keyed, so the second record is a no-op by construction rather than by a caller
         # remembering not to repeat itself.
-        recorder.emit(
-            "turn.settled",
-            turn_id=session.active_turn_id if session is not None else None,
-            parent_id=session.active_turn_parent_id if session is not None else None,
-            data={
-                "status": state.status,
-                **_settled_text_fields(recorder, state),
-                "error_code": state.error_code,
-                "interruption_cause": (
-                    "" if state.interruption_cause is None else state.interruption_cause.value
-                ),
-                "changed_paths": public_changed,
-                "output_validators": len(
-                    loop._active_output_validators(state.previous_runtime_config)
-                ),
-                "output_retries": state.output_retries,
-            },
+        settled_text_fields = self._fenced_write(lambda: _settled_text_fields(recorder, state))
+        self._fenced_write(
+            lambda: recorder.emit(
+                "turn.settled",
+                turn_id=session.active_turn_id if session is not None else None,
+                parent_id=session.active_turn_parent_id if session is not None else None,
+                data={
+                    "status": state.status,
+                    **settled_text_fields,
+                    "error_code": state.error_code,
+                    "interruption_cause": (
+                        "" if state.interruption_cause is None else state.interruption_cause.value
+                    ),
+                    "changed_paths": public_changed,
+                    "output_validators": len(
+                        loop._active_output_validators(state.previous_runtime_config)
+                    ),
+                    "output_retries": state.output_retries,
+                },
+            )
         )
         return AgentTurnResult(
             status=state.status,

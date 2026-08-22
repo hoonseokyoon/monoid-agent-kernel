@@ -2932,6 +2932,13 @@ may finish its own in-flight operation; no later subscriber, sidecar, delta writ
 runs under the stale activation. Best-effort diagnostic publication contains extension failures
 while always re-raising lease-loss control flow.
 
+Settle finalization applies the same rule to durable projection writes. One common projection writer
+serves turn settle and run finalization, fencing job cancellation, proposal revision, metrics,
+settled-text persistence, and every event before and after the operation. `EventBus` also fences each
+sink callback, so a sink that overlaps lease loss may finish while every later sink and finalization
+write stays untouched. Recorder close remains activation cleanup and runs through the existing
+best-effort teardown path.
+
 Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
 `FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop
 checks authority after snapshot/blob collection, immediately after the external commit returns,

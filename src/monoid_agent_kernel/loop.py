@@ -5382,6 +5382,7 @@ class AgentLoop:
         return self._finalizer.finalize(state, res)
 
     def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
+        self._check_lease_authority()
         return self._finalizer.checkpoint_on_settle(state, res)
 
     def _pop_background_observations(
