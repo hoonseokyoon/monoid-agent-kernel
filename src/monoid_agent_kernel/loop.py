@@ -1910,6 +1910,11 @@ class AgentLoop:
             # this into a terminal agent failure could commit past the failed barrier.
             raise
         except RunCancelled as exc:
+            # The exception carries the cause observed when it was raised. Lease authority can
+            # be lost while that exception unwinds, so the sticky authority fact is read again
+            # before this handler projects any event, metric, checkpoint, or terminal state.
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             cause = (
                 exc.interruption_cause
                 if isinstance(exc.interruption_cause, InterruptionCause)
@@ -2780,6 +2785,8 @@ class AgentLoop:
                 if isinstance(exc.interruption_cause, InterruptionCause)
                 else InterruptionCause.USER_CANCEL
             )
+            if self._lease_authority_lost():
+                cause = InterruptionCause.LEASE_LOST
             outcome_status, outcome_error_code = _cancelled_model_stream_outcome(cause)
             outcome_final_text = "".join(output_fragments) or None
             lease_lost = cause is InterruptionCause.LEASE_LOST

@@ -404,6 +404,32 @@ def test_recovered_record_registration_is_an_atomic_first_writer_claim(
         backend._unregister_recovered_record(first)
 
 
+def test_stale_record_unregistration_preserves_a_replacement_owner(
+    tmp_path: Path,
+    backend_factory: ManagedBackendFactory,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    request = BackendRunRequest(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        workspace_root=workspace,
+        instruction="replace owner",
+        runtime_config=runtime_config(),
+    )
+    prepared: Any = backend._run_preparation.prepare(request)
+    stale = prepared.record
+    replacement = replace(stale)
+    backend._unregister_recovered_record(stale)
+    assert backend._register_recovered_record(replacement) is True
+
+    try:
+        backend._unregister_recovered_record(stale)
+        assert backend._record(stale.run_id) is replacement
+    finally:
+        backend._unregister_recovered_record(replacement)
+
+
 def test_watchdog_cas_loser_keeps_lease_for_locally_tracked_winner(
     tmp_path: Path,
     backend_factory: ManagedBackendFactory,

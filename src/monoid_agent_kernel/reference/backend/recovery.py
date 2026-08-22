@@ -308,6 +308,7 @@ class RecoveryService:
         acquired = False
         released = False
         discarded = False
+        record: MutableRunRecordPort | None = None
         try:
             await self._context.acquire_run_slot()
             acquired = True
@@ -334,6 +335,11 @@ class RecoveryService:
             released = True
             self._context.record_run_result(run_id, result)
         except Exception as exc:
+            lease_lost = is_activation_lease_loss(exc)
+            if lease_lost and record is not None:
+                # The local host record is an activation claim. Drop it before cleanup so a stale
+                # worker cannot keep advertising or heartbeating ownership while discard runs.
+                self._context.unregister_record(record)
             try:
                 await asyncio.to_thread(loop.discard_uncommitted)
                 discarded = True
@@ -341,7 +347,7 @@ class RecoveryService:
                 # Preserve the recovered execution failure. AgentLoop has already attempted every
                 # owned activation resource before surfacing a cleanup error.
                 pass
-            if not is_activation_lease_loss(exc):
+            if not lease_lost:
                 self._context.record_run_failure(run_id, exc)
         finally:
             # Task cancellation bypasses ``except Exception`` but still owns the recovered loop.

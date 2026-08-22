@@ -45,6 +45,7 @@ def _execution_service(
     failures: list[Exception],
     results: list[Any],
     released: list[bool],
+    unregistered: list[Any],
 ) -> RunExecutionService:
     async def acquire() -> None:
         return None
@@ -53,6 +54,7 @@ def _execution_service(
         RunExecutionContext(
             build_loop=lambda *args: SimpleNamespace(loop=loop),
             attach_loop=lambda *args: None,
+            unregister_record=unregistered.append,
             record=lambda run_id: SimpleNamespace(run_id=run_id),
             drive_open_session=lambda *args, **kwargs: None,  # type: ignore[arg-type]
             record_run_result=lambda run_id, result: results.append((run_id, result)),
@@ -90,11 +92,13 @@ def test_autonomous_execution_discards_lease_loss_without_recording_failure(
     failures: list[Exception] = []
     results: list[Any] = []
     released: list[bool] = []
+    unregistered: list[Any] = []
     service = _execution_service(
         loop,
         failures=failures,
         results=results,
         released=released,
+        unregistered=unregistered,
     )
 
     async def stale_drive(*args: Any, **kwargs: Any) -> None:
@@ -102,13 +106,15 @@ def test_autonomous_execution_discards_lease_loss_without_recording_failure(
 
     service.drive_session = stale_drive  # type: ignore[method-assign]
 
-    asyncio.run(service.run_prepared(_prepared(tmp_path), SimpleNamespace()))
+    prepared = _prepared(tmp_path)
+    asyncio.run(service.run_prepared(prepared, SimpleNamespace()))
 
     assert loop.discard_calls == 1
     assert loop.close_calls == 0
     assert failures == []
     assert results == []
     assert released == [True]
+    assert unregistered == [prepared.record]
 
 
 def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
@@ -118,11 +124,13 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
     failures: list[Exception] = []
     results: list[Any] = []
     released: list[bool] = []
+    unregistered: list[Any] = []
     service = _execution_service(
         loop,
         failures=failures,
         results=results,
         released=released,
+        unregistered=unregistered,
     )
 
     class _LeaseLostStream:
@@ -147,11 +155,13 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
 
     loop.astream = lambda user_input: _LeaseLostStream()  # type: ignore[attr-defined]
 
+    prepared = _prepared(tmp_path)
+
     async def collect() -> list[dict[str, Any]]:
         return [
             frame
             async for frame in service.stream_prepared(
-                _prepared(tmp_path),
+                prepared,
                 SimpleNamespace(input_parts=(), instruction="go"),
             )
         ]
@@ -164,6 +174,7 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
     assert failures == []
     assert results == []
     assert released == [True]
+    assert unregistered == [prepared.record]
 
 
 def test_recovered_execution_discards_lease_loss_without_recording_failure(
@@ -173,6 +184,8 @@ def test_recovered_execution_discards_lease_loss_without_recording_failure(
     failures: list[Exception] = []
     results: list[Any] = []
     released: list[bool] = []
+    unregistered: list[Any] = []
+    recovered_record = SimpleNamespace(run_id="run_stale")
 
     async def acquire() -> None:
         return None
@@ -189,14 +202,14 @@ def test_recovered_execution_discards_lease_loss_without_recording_failure(
             worker_id_provider=lambda: "worker-1",
             lease_ttl_s_provider=lambda: 30.0,
             is_record_tracked=lambda run_id: False,
-            record=lambda run_id: SimpleNamespace(run_id=run_id),
+            record=lambda run_id: recovered_record,
             make_request=lambda *args: SimpleNamespace(),
             make_record=lambda *args: SimpleNamespace(),
             issue_llm_gateway_token=lambda *args: "llm",
             issue_web_gateway_token=lambda *args: "web",
             build_loop=lambda *args: SimpleNamespace(loop=loop),
             register_record=lambda record: True,
-            unregister_record=lambda record: None,
+            unregister_record=unregistered.append,
             attach_loop=lambda *args: None,
             call_soon=lambda *args: None,
             spawn=lambda awaitable: None,
@@ -223,3 +236,4 @@ def test_recovered_execution_discards_lease_loss_without_recording_failure(
     assert failures == []
     assert results == []
     assert released == [True]
+    assert unregistered == [recovered_record]

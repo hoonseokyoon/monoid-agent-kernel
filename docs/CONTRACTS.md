@@ -2903,7 +2903,15 @@ The Reference host treats this observation as an activation disposition. Session
 for `lease_lost` before copying any suspension field onto the backend record. Autonomous,
 streaming, and recovered execution paths then call `discard_uncommitted()` and omit
 `record_run_result`, `record_run_failure`, stream result frames, and `aclose`. This preserves the
-replacement owner's sole projection authority.
+replacement owner's sole projection authority. Each path also removes its identity-matched local
+run record. The stale record therefore cannot serve status, block recovery, consume commands, or
+heartbeat a lease now owned by another worker. Identity matching protects a replacement record
+that registered concurrently.
+
+The loop rechecks sticky lease authority when a `RunCancelled` reaches its handler. This closes the
+unwind race where the exception carried an earlier user-cancel or drain cause and lease loss arrived
+before event, metric, checkpoint, or terminal projection. The model-call attempt handler and model
+stream finalizer apply the same rule before dispatch compensation or stream closure.
 
 The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
 the authoritative reservation and blocks `dispatch_started`. Lease loss observed by

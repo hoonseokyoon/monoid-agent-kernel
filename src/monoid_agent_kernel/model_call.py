@@ -1077,6 +1077,10 @@ class ModelCallRunner:
                             stream_committed=delivered,
                             backoff_ms=pending_backoff_ms,
                         )
+                        # The provider exception records the interruption cause that existed when
+                        # it was raised. Lease loss can become sticky while that exception unwinds;
+                        # re-read authority before any dispatch-unknown or failure transition.
+                        self._check_lease_authority()
                         if (
                             lifecycle_hook is not None
                             and reservation is not None

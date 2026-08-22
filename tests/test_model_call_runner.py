@@ -5505,6 +5505,51 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
     assert sidecar == []
 
 
+def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensation() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    lifecycle = _JournalLifecycle(harness)
+
+    class RacingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+            stale_exception = RunCancelled(
+                "run cancelled",
+                interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+            )
+            token.cancel(InterruptionCause.LEASE_LOST)
+            raise stale_exception
+
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=RacingAdapter(),
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert token.lease_lost is True
+    assert lifecycle.states == ["reserved", "dispatch_started"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "dispatch_started"
+    assert observer.captures == []
+    assert sidecar == []
+
+
 @pytest.mark.parametrize(
     ("failpoint", "expected_state", "calls"),
     (

@@ -789,6 +789,7 @@ class RunnerBackend:
             RunExecutionContext(
                 build_loop=self._build_loop_build,
                 attach_loop=self._attach_loop_build,
+                unregister_record=self._unregister_recovered_record,
                 record=self._record,
                 drive_open_session=self._drive_open_session,
                 record_run_result=self._record_run_result,

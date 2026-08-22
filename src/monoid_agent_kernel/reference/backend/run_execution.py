@@ -68,6 +68,7 @@ def failure_frame(exc: Exception) -> dict[str, Any]:
 class RunExecutionContext:
     build_loop: Callable[[str, RunRequestPort, Path, str, str], LoopBuildPort]
     attach_loop: Callable[[MutableRunRecordPort, LoopBuildPort], None]
+    unregister_record: Callable[[MutableRunRecordPort], None]
     record: Callable[[str], MutableRunRecordPort]
     drive_open_session: DriveOpenSessionPort
     record_run_result: Callable[[str, AgentRunResult], None]
@@ -103,6 +104,11 @@ class RunExecutionService:
                 released = True
                 self._context.record_run_result(prepared.run_id, result)
             except Exception as exc:
+                lease_lost = is_activation_lease_loss(exc)
+                if lease_lost:
+                    # Retire host ownership before cleanup so status, commands, recovery, and the
+                    # watchdog stop seeing this activation as live while discard is in progress.
+                    self._context.unregister_record(prepared.record)
                 if loop is not None and not released:
                     try:
                         await asyncio.to_thread(loop.discard_uncommitted)
@@ -111,7 +117,7 @@ class RunExecutionService:
                         # The original execution failure remains the actionable cause. AgentLoop
                         # already attempts every owned resource before surfacing cleanup failure.
                         pass
-                if is_activation_lease_loss(exc):
+                if lease_lost:
                     return
                 self._context.record_run_failure(prepared.run_id, exc)
         finally:
@@ -222,6 +228,8 @@ class RunExecutionService:
             if not lease_lost:
                 self._context.record_run_failure(prepared.run_id, exc)
                 yield failure_frame(exc)
+            else:
+                self._context.unregister_record(prepared.record)
         finally:
             if loop is not None and not closed:
                 try:

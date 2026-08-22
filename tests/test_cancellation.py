@@ -11,7 +11,7 @@ from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec
-from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.errors import NativeAgentError, RunCancelled
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -266,6 +266,46 @@ def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(
         loop.close()
     assert exc_info.value.error_code == "lease_lost"
     assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
+
+
+def test_sticky_lease_loss_wins_while_an_older_cancellation_unwinds(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    durable_before_loss: dict[str, object] = {}
+
+    async def raise_after_lease_loss(*args, **kwargs):  # noqa: ANN202, ANN002, ANN003
+        del args, kwargs
+        events_path = next(loop.spec.run_root.rglob("events.jsonl"))
+        durable_before_loss["events"] = events_path.read_bytes()
+        stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+        durable_before_loss["checkpoint"] = (
+            None if stored is None else stored.checkpoint.to_json()
+        )
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        stale_exception = RunCancelled(
+            "run cancelled",
+            interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+        )
+        token.cancel(InterruptionCause.LEASE_LOST)
+        raise stale_exception
+
+    loop._apump_turn = raise_after_lease_loss  # type: ignore[method-assign]
+
+    suspension = loop.run_until_suspended("go")
+
+    events_path = next(loop.spec.run_root.rglob("events.jsonl"))
+    stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert events_path.read_bytes() == durable_before_loss["events"]
+    assert (
+        None if stored is None else stored.checkpoint.to_json()
+    ) == durable_before_loss["checkpoint"]
+    loop.discard_uncommitted()
 
 
 def test_token_deadline_uses_the_canonical_timeout_terminal(tmp_path: Path) -> None:
