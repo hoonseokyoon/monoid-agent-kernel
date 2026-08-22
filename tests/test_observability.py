@@ -226,6 +226,37 @@ def test_event_bus_closes_each_sink_once_even_when_one_close_fails() -> None:
     assert [sink.close_count for sink in sinks] == [1, 1, 1]
 
 
+def test_event_bus_rechecks_authority_between_sink_close_callbacks() -> None:
+    authority_lost = False
+
+    class ClosingSink:
+        def __init__(self, *, lose_authority: bool = False) -> None:
+            self.lose_authority = lose_authority
+            self.close_count = 0
+
+        def emit(self, event: AgentEvent) -> None:
+            del event
+
+        def close(self) -> None:
+            nonlocal authority_lost
+            self.close_count += 1
+            if self.lose_authority:
+                authority_lost = True
+
+    def check_authority() -> None:
+        if authority_lost:
+            raise RuntimeError("writer authority lost")
+
+    sinks = (ClosingSink(lose_authority=True), ClosingSink())
+    bus = EventBus("run-close-fenced", sinks, check_authority=check_authority)
+
+    with pytest.raises(RuntimeError, match="writer authority lost"):
+        bus.close()
+    bus.close()
+
+    assert [sink.close_count for sink in sinks] == [1, 0]
+
+
 def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

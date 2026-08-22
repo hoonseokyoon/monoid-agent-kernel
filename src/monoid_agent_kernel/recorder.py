@@ -1238,8 +1238,8 @@ class AgentRecorder:
         finally:
             try:
                 # Event-sink failure must not retain the private transcript handle. TextIO close is
-                # idempotent, while EventBus separately guarantees each configured sink is called
-                # once.
+                # idempotent, while EventBus separately owns close idempotence and stops its
+                # callback fan-out when writer authority moves.
                 self._transcript_file.close()
             finally:
                 try:

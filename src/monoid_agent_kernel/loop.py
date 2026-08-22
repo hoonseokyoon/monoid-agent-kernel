@@ -2454,6 +2454,16 @@ class AgentLoop:
                 cleanup_errors.append(exc)
             try:
                 resources.recorder.close()
+            except RunCancelled as exc:
+                # Event-sink close is authority-fenced because a callback may flush buffered
+                # projections. During an explicit stale-activation discard, that expected fence
+                # stops the callback fan-out while AgentRecorder's finally blocks still release
+                # private handles; it is the cleanup outcome, not a cleanup failure.
+                if not (
+                    self._lease_authority_lost()
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                ):
+                    cleanup_errors.append(exc)
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
         self._close_model_io_subscriptions(resources)

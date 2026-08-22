@@ -668,7 +668,9 @@ class LoopFinalizer:
         loop = self._loop
         context = res.context
         recorder = res.recorder
-        self._fenced_write(context.job_manager.cancel_all)
+        self._fenced_write(
+            lambda: context.job_manager.cancel_all(check_authority=loop._check_lease_authority)
+        )
         diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
         self._fenced_write(
             lambda: recorder.emit(

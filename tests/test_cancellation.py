@@ -604,6 +604,38 @@ def test_public_pump_stops_finalization_event_fanout_after_lease_loss(tmp_path: 
     loop.discard_uncommitted()
 
 
+def test_run_close_stops_event_sink_close_fanout_after_lease_loss(tmp_path: Path) -> None:
+    token = CancellationToken()
+    close_counts = [0, 0]
+
+    class LosingCloseSink:
+        def emit(self, event: Any) -> None:
+            del event
+
+        def close(self) -> None:
+            close_counts[0] += 1
+            token.cancel(InterruptionCause.LEASE_LOST)
+
+    class RecordingCloseSink:
+        def emit(self, event: Any) -> None:
+            del event
+
+        def close(self) -> None:
+            close_counts[1] += 1
+
+    loop = _restorable_loop(tmp_path)
+    loop.cancellation_token = token
+    loop.event_sinks = (LosingCloseSink(), RecordingCloseSink())
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "settled"
+
+    with pytest.raises(RunCancelled) as caught:
+        loop.close()
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert close_counts == [1, 0]
+
+
 def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
     """A cancel that lands while the run sits at a quiescent park has no pump to raise in.
 

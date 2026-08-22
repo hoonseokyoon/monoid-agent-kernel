@@ -80,6 +80,36 @@ def _start(
     )
 
 
+def test_cancel_all_rechecks_authority_between_jobs(tmp_path: Path, monkeypatch: Any) -> None:
+    manager, recorder, _sink = _manager(tmp_path)
+    authority_lost = False
+    cancelled: list[str] = []
+
+    class RunningJob:
+        status = "running"
+
+    manager.jobs = {"job-1": RunningJob(), "job-2": RunningJob()}  # type: ignore[dict-item]
+
+    def cancel(job_id: str) -> dict[str, Any]:
+        nonlocal authority_lost
+        cancelled.append(job_id)
+        authority_lost = True
+        return {"job_id": job_id}
+
+    def check_authority() -> None:
+        if authority_lost:
+            raise RuntimeError("writer authority lost")
+
+    monkeypatch.setattr(manager, "cancel", cancel)
+    try:
+        with pytest.raises(RuntimeError, match="writer authority lost"):
+            manager.cancel_all(check_authority=check_authority)
+    finally:
+        recorder.close()
+
+    assert cancelled == ["job-1"]
+
+
 _RESULT_OBSERVATION_KEYS = {
     "type",
     "job_id",

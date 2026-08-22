@@ -2936,8 +2936,13 @@ Settle finalization applies the same rule to durable projection writes. One comm
 serves turn settle and run finalization, fencing job cancellation, proposal revision, metrics,
 settled-text persistence, and every event before and after the operation. `EventBus` also fences each
 sink callback, so a sink that overlaps lease loss may finish while every later sink and finalization
-write stays untouched. Recorder close remains activation cleanup and runs through the existing
-best-effort teardown path.
+write stays untouched. The same fence applies to each event-sink close callback because close may
+flush buffered projection data. `AgentRecorder` still releases its private transcript and sidecar
+handles through unconditional local teardown after event-sink close stops.
+
+Task shutdown applies authority per running job. `TaskManager.cancel_all` checks before and after
+each individual cancellation, so one blocking executor cannot let the stale activation write cancel
+markers or terminate executors for later jobs.
 
 Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
 `FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop

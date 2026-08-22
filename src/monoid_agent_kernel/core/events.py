@@ -195,10 +195,24 @@ class EventBus:
             self._closed = True
             errors: list[BaseException] = []
             for sink in self.sinks:
+                if self.check_authority is not None:
+                    try:
+                        self.check_authority()
+                    except BaseException as exc:
+                        errors.insert(0, exc)
+                        break
                 try:
                     sink.close()
                 except BaseException as exc:
                     errors.append(exc)
+                if self.check_authority is not None:
+                    try:
+                        self.check_authority()
+                    except BaseException as exc:
+                        # Authority loss is the controlling failure and stops every later sink;
+                        # a close callback may flush buffered projection data.
+                        errors.insert(0, exc)
+                        break
             if errors:
                 raise errors[0]
 

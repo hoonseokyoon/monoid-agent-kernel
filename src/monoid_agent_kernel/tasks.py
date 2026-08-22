@@ -1340,13 +1340,19 @@ class TaskManager:
             self._condition.wait(timeout=max(0.0, timeout_s))
             return bool(self._reentry_queue)
 
-    def cancel_all(self) -> None:
+    def cancel_all(self, *, check_authority: Callable[[], None] | None = None) -> None:
         with self._condition:
             job_ids = list(self.jobs)
         for job_id in job_ids:
+            if check_authority is not None:
+                check_authority()
             job = self.get_job(job_id)
             if job.status == "running":
                 self.cancel(job_id)
+                if check_authority is not None:
+                    # One cancellation can block in a task executor while ownership moves. Stop
+                    # before touching the next job's durable cancel marker or executor.
+                    check_authority()
         # cancel() above synchronously terminates each subprocess, so the children are
         # already dying. The wait below only lets the monitor coroutines observe the deaths
         # and settle status. If we are ON the job loop thread (run_once's close() runs there),
