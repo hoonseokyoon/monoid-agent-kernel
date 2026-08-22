@@ -33,6 +33,8 @@ hosting stays dependency-light.
 - Install smoke: minimal and all-extras installations import root, hosting, conformance, provider,
   observability, MCP, and Reference DBOS modules. Minimal installation also runs retained-evidence
   conformance and Studio acceptance.
+- Publish: the release workflow audits the exact wheel built with the source distribution before
+  uploading that artifact to PyPI.
 - CI: lint, Python 3.11/3.12 fast and contract shards, Python 3.11/3.12 serial integration,
   coverage floor, Windows/macOS smoke, DBOS recovery, Studio assets, and install smoke must pass.
 
