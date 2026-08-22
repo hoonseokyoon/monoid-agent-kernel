@@ -323,6 +323,7 @@ class DurableModelInvocation:
     dispatch_state: Literal["reserved", "dispatch_started", "settled", "unknown"]
     request_digest: str
     digest_generation: str
+    requires_evidence: bool = False
     receipt: Mapping[str, Any] | None = None
     result_ref: str = ""
     failure_code: str = ""
@@ -335,6 +336,7 @@ class DurableModelInvocation:
 - 실패한 `settled`에는 receipt와 failure code가 있고 result가 없다.
 - `unknown`은 자동 retry를 금지한다.
 - `logical_call_id`, request digest, idempotency key는 lifecycle 중 바뀌지 않는다.
+- `requires_evidence`는 첫 reservation에서 결정하고 모든 revision과 retry에서 유지한다.
 - 같은 dispatch attempt 안에서 `dispatch_id`와 `dispatch_attempt`도 바뀌지 않는다.
 - 다음 dispatch attempt만 `dispatch_id`와 `dispatch_attempt`를 변경한다.
 - `revision`은 logical call 안에서 1부터 연속 증가하며 load의 권위 순서를 정한다.
@@ -846,8 +848,11 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   적용한 뒤 현재 runtime config, context provider, tool surface, media를 조회한다. 최종 응답은 이
   지점에서 정산하고, tool call turn은 message log에 반영한 뒤 현재 tool 실행 환경을 구성한다.
   현재 runtime config, context provider, tool surface, media wire payload는 evidence commit의 입력이 아니다.
-  Recovery query의 `require_evidence` marker가 새 activation의 `passive` 또는 다른 설정을 덮어쓰고
-  원래 required delivery 의무를 유지한다.
+  첫 reservation은 invocation journal에 `requires_evidence=true`를 저장한다. Settlement와 이 의무는
+  같은 journal transaction에서 확정된다. Settlement commit 뒤 evidence commit 또는 checkpoint
+  publication 전에 process가 종료되어도 새 activation은 journal field를 읽고 delivery를 완료한다.
+  Recovery query의 `require_evidence` marker는 이미 저장된 evidence park에서 같은 의무를 보강한다.
+  두 표식 모두 새 activation의 `passive` 설정보다 우선한다.
 - 복구된 assistant tool-call turn을 message log에 반영한 뒤 interrupt가 발생하면 suspension에
   `model_tool_calls_pending=true`를 저장한다. 같은 batch에서 완료된 tool observation은
   `pending_observations`에 누적한다. `None` resume은 같은 settled result를 다시 읽고 이미 완료된 call

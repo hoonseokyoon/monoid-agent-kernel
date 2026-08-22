@@ -158,6 +158,27 @@ def test_model_invocation_round_trips_every_state_shape(
     assert DurableModelInvocation.from_json(invocation.to_json()) == invocation
 
 
+def test_model_invocation_round_trips_required_evidence_obligation() -> None:
+    invocation = _invocation(requires_evidence=True)
+
+    checked = decode_model_invocation(invocation.to_json())
+
+    assert checked.status == "loaded"
+    assert checked.value == invocation
+
+
+def test_model_invocation_reads_missing_required_evidence_as_legacy_passive() -> None:
+    payload = _invocation().to_json()
+    del payload["requires_evidence"]
+
+    checked = decode_model_invocation(payload)
+
+    assert checked.status == "loaded"
+    assert checked.value is not None
+    assert checked.value.requires_evidence is False
+    assert checked.value.to_json()["requires_evidence"] is False
+
+
 def test_model_invocation_reads_legacy_namespace_and_writes_canonical_namespace() -> None:
     payload = _invocation().to_json()
     payload["schema_version"] = "native-agent-runner.model-invocation.v1"
@@ -228,6 +249,8 @@ def test_model_invocation_checked_reader_rejects_unknown_top_level_fields(
         {"request_digest": "private prompt"},
         {"digest_generation": ""},
         {"digest_generation": "request-v1"},
+        {"requires_evidence": 1},
+        {"requires_evidence": "true"},
         {"result_ref": 1},
         {"result_ref": "secret"},
         {"result_ref": "private result text"},

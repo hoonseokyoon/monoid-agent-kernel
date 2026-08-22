@@ -452,6 +452,39 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     assert checkpoint.total_usage == turn.usage
 
 
+def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        model_evidence_policy="required",
+    )
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled.invocation.revision)
+
+    assert settled.invocation.requires_evidence is True
+    assert evidence_key not in harness.sink._model_evidence
+
+    suspension, checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None
+    assert suspension.turn.final_text == "durable answer"
+    assert checkpoint is not None
+    assert len(adapter.requests) == 1
+    assert evidence_key in harness.sink._model_evidence
+
+
 def test_recovery_identity_ignores_changed_caller_provenance(tmp_path: Path) -> None:
     harness = DeterministicFencedRunHarness()
     adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))

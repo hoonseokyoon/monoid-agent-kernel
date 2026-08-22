@@ -209,8 +209,12 @@ Hosted products that configure `AgentLoop(run_sink=..., writer_token=...)` also 
 Keep invocation settlement and evidence delivery in separate tables or record families for
 `required`. Make `commit_model_evidence()` fence-first, idempotent on
 `(run_id, logical_call_id, revision)`, and valid only for the current authoritative settled
-revision. For `outbox`, reject the complete transaction when either the invocation revision or the
-outbox entry cannot commit. A partial invocation-only commit violates the declared capability.
+revision. Persist the invocation's `requires_evidence` flag in the same transaction as every
+invocation revision and preserve it across retries. A replacement worker must honor the journal
+flag even when its configured policy is `passive`; this covers a crash before an
+`evidence_uncommitted` checkpoint exists. For `outbox`, reject the complete transaction when either
+the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
+violates the declared capability.
 
 On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
 with the same run ID and a current writer token. The loop commits evidence from the stored logical
@@ -220,8 +224,9 @@ tool-call turn enters the message log before the current tool surface is resolve
 Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
 model-call sidecars receive the authoritative call at the original settlement even when required
 evidence parks afterward; recovery does not duplicate that passive publication. The checkpoint
-marker forces required delivery on the replacement activation even when its configured policy is
-`passive`. One-shot `run_once()` releases this committed park and raises `TurnNotSettled`; restore
+marker and the authoritative invocation flag each force required delivery on the replacement
+activation even when its configured policy is `passive`. One-shot `run_once()` releases this
+committed park and raises `TurnNotSettled`; restore
 the checkpoint and resume with `None`. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.

@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.safe_evidence import (
     is_safe_utc_timestamp,
 )
 from monoid_agent_kernel.core.wire_validation import (
+    parse_bool,
     parse_int,
     parse_literal,
     parse_str,
@@ -50,6 +51,7 @@ _MODEL_INVOCATION_FIELDS = frozenset(
         "dispatch_state",
         "request_digest",
         "digest_generation",
+        "requires_evidence",
         "receipt",
         "result_ref",
         "failure_code",
@@ -333,6 +335,7 @@ class DurableModelInvocation:
     dispatch_state: DispatchState
     request_digest: str
     digest_generation: str
+    requires_evidence: bool = False
     receipt: Mapping[str, Any] | None = None
     result_ref: str = ""
     failure_code: str = ""
@@ -358,6 +361,8 @@ class DurableModelInvocation:
             or self.digest_generation not in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
         ):
             raise ValueError("unsupported model invocation digest_generation")
+        if type(self.requires_evidence) is not bool:
+            raise ValueError("model invocation requires_evidence must be a boolean")
         _require_positive_int(self.revision, "revision")
         _require_positive_int(self.dispatch_attempt, "dispatch_attempt")
         if type(self.dispatch_state) is not str or self.dispatch_state not in get_args(
@@ -413,6 +418,7 @@ class DurableModelInvocation:
             "dispatch_state": self.dispatch_state,
             "request_digest": self.request_digest,
             "digest_generation": MODEL_REQUEST_DIGEST_GENERATION,
+            "requires_evidence": self.requires_evidence,
             "receipt": _normalized_receipt(self.receipt),
             "result_ref": self.result_ref,
             "failure_code": self.failure_code,
@@ -443,6 +449,7 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
         ),
         request_digest=parse_str(payload, "request_digest"),
         digest_generation=parse_str(payload, "digest_generation"),
+        requires_evidence=parse_bool(payload, "requires_evidence", default=False),
         receipt=raw_receipt,
         result_ref=parse_str(payload, "result_ref"),
         failure_code=parse_str(payload, "failure_code"),

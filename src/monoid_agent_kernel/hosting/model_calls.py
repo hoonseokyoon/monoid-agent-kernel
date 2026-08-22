@@ -142,7 +142,9 @@ class FencedModelCallLifecycle:
         *,
         require_evidence: bool = False,
     ) -> None:
-        evidence_policy = "required" if require_evidence else self.evidence_policy
+        evidence_policy = (
+            "required" if require_evidence or invocation.requires_evidence else self.evidence_policy
+        )
         self._commit(
             invocation,
             blobs,
@@ -277,6 +279,7 @@ class FencedModelCallLifecycle:
         if record is None:
             effective = proposed
             revision = 1
+            requires_evidence = self.evidence_policy == "required"
         else:
             invocation = record.invocation
             if invocation.dispatch_state == "reserved":
@@ -315,6 +318,7 @@ class FencedModelCallLifecycle:
                     error_code="durable_invocation_request_conflict",
                 )
             revision = invocation.revision + 1
+            requires_evidence = invocation.requires_evidence
         self._commit(
             DurableModelInvocation(
                 run_id=self.writer_token.run_id,
@@ -326,6 +330,7 @@ class FencedModelCallLifecycle:
                 dispatch_state="reserved",
                 request_digest=effective.request_digest,
                 digest_generation=effective.digest_generation,
+                requires_evidence=requires_evidence,
             )
         )
         return effective

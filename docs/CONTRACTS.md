@@ -2852,17 +2852,24 @@ is absent. The core defines the atomic mutation flag. The host owns the outbox s
 backoff, dead-letter handling, and destination credentials.
 
 An invocation settlement remains authoritative when a later required evidence commit fails.
-Recovery uses the checkpointed logical-call ID and request digest to re-commit the exact invocation
-revision and required evidence before it reads current runtime config, context providers, tool
-surface, or media. It then applies a stored success or final refusal to loop state before those
-current request-building dependencies run. A recovered final settles from the stored outcome; a
-recovered tool-call turn enters the canonical message log before current tool resolution and
-execution setup. Runtime-config drift cannot block evidence delivery or application of the stored
-outcome. The provider call count does not increase. Passive model-I/O observers and requested
-model-call sidecars receive the authoritative call during its original settlement, including when
-required evidence fails afterward. Evidence recovery does not publish the passive call a second
-time. Its marker sets `ModelDispatchRecoveryQuery.require_evidence=True`, so the host performs
-required delivery even when the replacement activation uses the passive default or another policy.
+The first reservation persists `DurableModelInvocation.requires_evidence=true`, and every
+invocation revision and retry preserves that stable field. Settlement and the obligation therefore
+share the authoritative invocation journal transaction. A crash after settlement commit and before
+evidence delivery or checkpoint publication leaves enough durable state for a replacement
+activation to finish required delivery, even when that activation uses the passive default.
+
+Recovery uses the journal obligation or the checkpointed logical-call ID and request digest to
+re-commit the exact invocation revision and required evidence before it reads current runtime
+config, context providers, tool surface, or media. It then applies a stored success or final refusal
+to loop state before those current request-building dependencies run. A recovered final settles
+from the stored outcome; a recovered tool-call turn enters the canonical message log before current
+tool resolution and execution setup. Runtime-config drift cannot block evidence delivery or
+application of the stored outcome. The provider call count does not increase. Passive model-I/O
+observers and requested model-call sidecars receive the authoritative call during its original
+settlement, including when required evidence fails afterward. Evidence recovery does not publish
+the passive call a second time. The checkpoint marker sets
+`ModelDispatchRecoveryQuery.require_evidence=True` as a second recovery path for an already
+published evidence park.
 `run_once()` releases this durable park and surfaces `TurnNotSettled` instead of closing it into a
 terminal checkpoint. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected
