@@ -92,8 +92,21 @@ class LoopBootstrapper:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
+    def _fenced_call(self, operation: Callable[[], Any]) -> Any:
+        """Run one bootstrap operation under a two-sided sticky-authority fence."""
+
+        self._loop._check_lease_authority()
+        try:
+            return operation()
+        finally:
+            # Bootstrap invokes filesystem owners and extension callbacks before a session exists.
+            # A post-check is therefore what stops a callback that overlapped lease movement from
+            # handing control to the next artifact write or extension.
+            self._loop._check_lease_authority()
+
     def bootstrap(self) -> _RunResources:
         loop = self._loop
+        loop._check_lease_authority()
         # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
         # class-exact, so a deployment's extension subclass with both pattern tuples empty read
         # as "the caller configured this" and the operator's spec policy was silently not
@@ -106,21 +119,23 @@ class LoopBootstrapper:
         if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
-        workspace = workspace_factory(loop.spec)
+        workspace = self._fenced_call(lambda: workspace_factory(loop.spec))
         loop._stream_sink = QueueEventSink()
-        recorder = AgentRecorder(
-            loop.spec.run_root,
-            loop.spec.run_id,
-            extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
-            status_file=loop.status_file,
-            model_content_file=loop.model_content_file,
-            model_calls_file=loop.model_calls_file,
-            model_payload_file=loop.model_payload_file,
-            # Resolved once here rather than per record: the recorder owns the whole ledger
-            # envelope, and this is the same proven-lineage root the model-stream context uses.
-            root_run_id=loop._validated_root_run_id(),
-            reopen=loop._restoring,
-            check_authority=loop._check_lease_authority,
+        recorder = self._fenced_call(
+            lambda: AgentRecorder(
+                loop.spec.run_root,
+                loop.spec.run_id,
+                extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
+                status_file=loop.status_file,
+                model_content_file=loop.model_content_file,
+                model_calls_file=loop.model_calls_file,
+                model_payload_file=loop.model_payload_file,
+                # Resolved once here rather than per record: the recorder owns the whole ledger
+                # envelope, and this is the same proven-lineage root the model-stream context uses.
+                root_run_id=loop._validated_root_run_id(),
+                reopen=loop._restoring,
+                check_authority=loop._check_lease_authority,
+            )
         )
         model_stream_observers = loop._materialize_model_stream_observers()
         job_manager = TaskManager(
@@ -222,7 +237,7 @@ class LoopBootstrapper:
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:
-            base_registry.register_many(provider.get_tools(context))
+            self._fenced_call(lambda: base_registry.register_many(provider.get_tools(context)))
         if loop.subagent_definitions:
             loop._install_subagent_capability(base_registry, context, job_manager)
 
@@ -237,7 +252,9 @@ class LoopBootstrapper:
             model_runner=model_runner,
             model_stream_observers=model_stream_observers,
         )
-        initial_runtime_config = loop._current_runtime_config(base_registry)
+        initial_runtime_config = self._fenced_call(
+            lambda: loop._current_runtime_config(base_registry)
+        )
         initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
         initial_turn = TurnContext(
             step=1,
@@ -248,26 +265,35 @@ class LoopBootstrapper:
             pending_observation_count=0,
         )
         initial_surface = validate_tool_surface_snapshot(
-            loop.tool_surface_resolver.resolve(
-                bound_catalog=initial_bound_catalog,
-                turn=initial_turn,
+            self._fenced_call(
+                lambda: loop.tool_surface_resolver.resolve(
+                    bound_catalog=initial_bound_catalog,
+                    turn=initial_turn,
+                )
             )
         )
         initial_visible_tool_specs = list(initial_surface.immediate_tools)
-        workspace_index = build_workspace_index(workspace, run_id=loop.spec.run_id)
-        workspace_index_path = recorder.write_workspace_index(workspace_index)
+        workspace_index = self._fenced_call(
+            lambda: build_workspace_index(workspace, run_id=loop.spec.run_id)
+        )
+        workspace_index_path = self._fenced_call(
+            lambda: recorder.write_workspace_index(workspace_index)
+        )
         static_segments: list[str] = []
         if loop.inject_workspace_index:
             index_segment = render_workspace_index_segment(workspace_index)
             if index_segment:
                 static_segments.append(index_segment)
         for provider in loop.context_providers:
-            segment = provider.static_segment()
+            segment = self._fenced_call(provider.static_segment)
             if segment and segment.strip():
                 static_segments.append(segment)
         if not loop._restoring:
-            workspace_base_path = recorder.write_workspace_base(
-                workspace.workspace_base_payload(loop.spec.run_id)
+            workspace_base_payload = self._fenced_call(
+                lambda: workspace.workspace_base_payload(loop.spec.run_id)
+            )
+            workspace_base_path = self._fenced_call(
+                lambda: recorder.write_workspace_base(workspace_base_payload)
             )
             manifest = build_run_manifest(
                 loop.spec,
@@ -292,43 +318,48 @@ class LoopBootstrapper:
                     workspace_base_path.relative_to(recorder.run_dir).as_posix()
                 ),
             )
-            recorder.write_manifest(manifest)
-            recorder.emit(
-                "run.started",
-                data={
-                    "workspace": str(loop.spec.workspace_root),
-                    "run_dir": str(recorder.run_dir),
-                    "manifest_path": "manifest.json",
-                    "mode": loop.spec.mode,
-                    "workspace_backend": loop.spec.workspace_backend,
-                    "workspace_base_path": "workspace.base.json",
-                    # The provider that will SERVE this run, not the transport it travels over.
-                    # A forwarding adapter (the gateway) declares its upstream, and this event
-                    # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
-                    # so filling it from the raw config made that span disagree with the
-                    # receipt-derived span beside it about the same call. The transport is not
-                    # lost: ``manifest.json`` (written three lines up) records the configured
-                    # ``model_provider`` verbatim, and it is the run's configuration record.
-                    #
-                    # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
-                    # reaches the config itself, on the tolerance path too, and its docstring
-                    # says so. What is left is this event's schema obligation: ``model_provider``
-                    # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
-                    # (outside the declared Literal, but constructible) would resolve to ``None``
-                    # and emit null. Kept as that guarantee, not as a second resolution rule.
-                    "model_provider": resolved_provider_name(
-                        loop.model_adapter, initial_runtime_config.model or ModelConfig()
-                    )
-                    or (initial_runtime_config.model or ModelConfig()).provider,
-                    "model": (initial_runtime_config.model or ModelConfig()).model,
-                    "reasoning_effort": (
-                        initial_runtime_config.model or ModelConfig()
-                    ).reasoning.effort,
-                    "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
-                    "agent_config_hash": initial_runtime_config.config_hash,
-                },
+            self._fenced_call(lambda: recorder.write_manifest(manifest))
+            self._fenced_call(
+                lambda: recorder.emit(
+                    "run.started",
+                    data={
+                        "workspace": str(loop.spec.workspace_root),
+                        "run_dir": str(recorder.run_dir),
+                        "manifest_path": "manifest.json",
+                        "mode": loop.spec.mode,
+                        "workspace_backend": loop.spec.workspace_backend,
+                        "workspace_base_path": "workspace.base.json",
+                        # The provider that will SERVE this run, not the transport it travels over.
+                        # A forwarding adapter (the gateway) declares its upstream, and this event
+                        # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
+                        # so filling it from the raw config made that span disagree with the
+                        # receipt-derived span beside it about the same call. The transport is not
+                        # lost: ``manifest.json`` (written three lines up) records the configured
+                        # ``model_provider`` verbatim, and it is the run's configuration record.
+                        #
+                        # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
+                        # reaches the config itself, on the tolerance path too, and its docstring
+                        # says so. What is left is this event's schema obligation: ``model_provider``
+                        # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
+                        # (outside the declared Literal, but constructible) would resolve to ``None``
+                        # and emit null. Kept as that guarantee, not as a second resolution rule.
+                        "model_provider": resolved_provider_name(
+                            loop.model_adapter, initial_runtime_config.model or ModelConfig()
+                        )
+                        or (initial_runtime_config.model or ModelConfig()).provider,
+                        "model": (initial_runtime_config.model or ModelConfig()).model,
+                        "reasoning_effort": (
+                            initial_runtime_config.model or ModelConfig()
+                        ).reasoning.effort,
+                        "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
+                        "agent_config_hash": initial_runtime_config.config_hash,
+                    },
+                )
             )
-        loop._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
+        self._fenced_call(
+            lambda: loop._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
+        )
+        loop._check_lease_authority()
         return _RunResources(
             workspace=workspace,
             recorder=recorder,

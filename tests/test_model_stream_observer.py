@@ -169,6 +169,61 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
     assert settled.parent_id == started.event_id
 
 
+@pytest.mark.parametrize("losing_open", ("private", "observer"))
+def test_lease_loss_during_each_stream_writer_open_fences_later_opens_and_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    losing_open: str,
+) -> None:
+    token = CancellationToken()
+    first = _RecordingObserver()
+    second = _RecordingObserver()
+    adapter = _ScriptedStreamAdapter([TextDelta("unreachable"), TurnComplete(response_id="r1")])
+    loop = _loop(
+        tmp_path,
+        adapter,
+        observer_factories=(lambda: first, lambda: second),
+        model_content_file=losing_open == "private",
+    )
+    loop.cancellation_token = token
+    loop.open()
+    assert loop._session is not None
+
+    if losing_open == "private":
+        recorder = loop._session.res.recorder
+        original_open = recorder.open_model_stream
+
+        def lose_after_private_open(context: ModelStreamContext):  # noqa: ANN202
+            writer = original_open(context)
+            token.cancel(InterruptionCause.LEASE_LOST)
+            return writer
+
+        monkeypatch.setattr(recorder, "open_model_stream", lose_after_private_open)
+    else:
+        original_open = first.open
+
+        def lose_after_observer_open(context: ModelStreamContext):  # noqa: ANN202
+            writer = original_open(context)
+            token.cancel(InterruptionCause.LEASE_LOST)
+            return writer
+
+        monkeypatch.setattr(first, "open", lose_after_observer_open)
+
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.discard_uncommitted()
+
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert adapter.stream_calls == 0
+    assert second.contexts == []
+    if losing_open == "private":
+        assert first.contexts == []
+    else:
+        assert len(first.contexts) == 1
+
+
 def test_one_shot_adapter_still_closes_observer_with_settled_output(tmp_path: Path) -> None:
     class OneShotAdapter:
         supports_multimodal = False

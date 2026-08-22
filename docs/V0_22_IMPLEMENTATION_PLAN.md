@@ -1189,6 +1189,12 @@ evidence를 다음 step 뒤에 남기지 않는다.
   receipt policy/subscriber/sidecar와 stream delta/outcome writer fan-out은 각 callback 전·후에
   authority를 다시 확인한다. 첫 callback과 겹친 lease loss는 이후 callback을 모두 중단하며,
   best-effort observer containment은 lease-loss control flow를 삼키지 않는다.
+  Bootstrap은 workspace/recorder 생성 전에 authority를 확인하고, extension callback과
+  workspace index/base/manifest/run.started 작업을 각각 전·후 fencing한다. AgentRecorder 생성도
+  내부 파일 작업 사이를 확인하며, 생성 중 실패하면 extension sink를 호출하지 않고 recorder 소유
+  handle만 해제한다.
+  Private model-content writer와 각 custom stream observer writer도 open callback마다 전·후
+  authority를 확인한다. Open 중 lease를 잃으면 뒤 writer open과 provider dispatch를 시작하지 않는다.
   turn settle과 run finalization은 하나의 common projection writer를 사용한다. proposal, metrics,
   settled text, event write를 각각 전·후 fencing하며 EventBus도 emit/close sink별로 authority를
   확인한다. TaskManager는 cancel_all 내부의 각 job cancellation 전·후에 같은 fence를 적용한다.

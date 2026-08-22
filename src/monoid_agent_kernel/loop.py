@@ -1405,11 +1405,13 @@ class AgentLoop:
 
         observers: list[ModelStreamObserver] = []
         for factory in tuple(self.model_stream_observer_factories):
+            self._check_lease_authority()
             try:
                 observer = factory()
             except Exception:  # noqa: BLE001 - content observers cannot fail an agent activation
                 _LOGGER.debug("model stream observer factory failed", exc_info=True)
-                continue
+                observer = None
+            self._check_lease_authority()
             if observer is not None:
                 observers.append(observer)
         return tuple(observers)
@@ -2747,13 +2749,17 @@ class AgentLoop:
                 if self.model_content_file and recorder is not None:
                     # AgentRecorder owns and shields the private sidecar writer. This direct method
                     # keeps the recorder from pretending to implement the external observer API.
+                    self._check_lease_authority()
                     try:
                         writers.append(recorder.open_model_stream(stream_context))
                     except Exception:  # transitional/third-party recorder safety boundary
                         _LOGGER.debug("private model stream open failed", exc_info=True)
-                writers.extend(
-                    safe_open_model_stream(observer, stream_context) for observer in observers
-                )
+                    self._check_lease_authority()
+                for observer in observers:
+                    self._check_lease_authority()
+                    writer = safe_open_model_stream(observer, stream_context)
+                    self._check_lease_authority()
+                    writers.append(writer)
                 observer_writers = tuple(writers)
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811

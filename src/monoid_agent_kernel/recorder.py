@@ -466,28 +466,62 @@ class AgentRecorder:
     _payload_request_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.run_dir = self.run_root / self.run_id
-        self.artifacts_dir = self.run_dir / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
-        events_path = self.run_dir / "events.jsonl"
-        advertised_last_seq = _read_status_last_event_seq(self.run_dir)
-        tail = repair_event_log_tail_for_append(
-            events_path,
-            advertised_last_seq=advertised_last_seq,
-        )
-        initial_seq = _verified_event_sequence_seed(events_path, tail)
-        self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
-        self._terminate_torn_transcript_tail()
-        sinks: list[EventSink] = [JsonlEventSink(events_path)]
-        if self.status_file:
-            sinks.append(StatusJsonSink(self.run_dir / "status.json"))
-        sinks.extend(self.extra_event_sinks)
-        self.event_bus = EventBus(
-            self.run_id,
-            tuple(sinks),
-            _seq=initial_seq,
-            check_authority=self.check_authority,
-        )
+        transcript_file: TextIO | None = None
+        event_file_sink: JsonlEventSink | None = None
+        self._check_writer_authority()
+        try:
+            self.run_dir = self.run_root / self.run_id
+            self.artifacts_dir = self.run_dir / "artifacts"
+            self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
+            self._check_writer_authority()
+            events_path = self.run_dir / "events.jsonl"
+            advertised_last_seq = _read_status_last_event_seq(self.run_dir)
+            self._check_writer_authority()
+            tail = repair_event_log_tail_for_append(
+                events_path,
+                advertised_last_seq=advertised_last_seq,
+            )
+            self._check_writer_authority()
+            initial_seq = _verified_event_sequence_seed(events_path, tail)
+            self._check_writer_authority()
+            transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
+            self._transcript_file = transcript_file
+            self._check_writer_authority()
+            self._terminate_torn_transcript_tail()
+            self._check_writer_authority()
+            event_file_sink = JsonlEventSink(events_path)
+            self._check_writer_authority()
+            sinks: list[EventSink] = [event_file_sink]
+            if self.status_file:
+                sinks.append(StatusJsonSink(self.run_dir / "status.json"))
+            sinks.extend(self.extra_event_sinks)
+            self.event_bus = EventBus(
+                self.run_id,
+                tuple(sinks),
+                _seq=initial_seq,
+                check_authority=self.check_authority,
+            )
+            self._check_writer_authority()
+        except BaseException:
+            # Construction can lose authority after opening local files but before bootstrap can
+            # publish this recorder for ordinary cleanup. Release only recorder-owned handles:
+            # extension sinks may flush durable projections and therefore cannot be called by the
+            # stale activation.
+            if event_file_sink is not None:
+                try:
+                    event_file_sink.close()
+                except Exception:  # pragma: no cover - best-effort constructor cleanup
+                    _LOGGER.debug(
+                        "event log close after recorder bootstrap failure failed", exc_info=True
+                    )
+            if transcript_file is not None:
+                try:
+                    transcript_file.close()
+                except Exception:  # pragma: no cover - best-effort constructor cleanup
+                    _LOGGER.debug(
+                        "transcript close after recorder bootstrap failure failed", exc_info=True
+                    )
+            raise
 
     def emit(
         self,
@@ -1186,18 +1220,24 @@ class AgentRecorder:
         return diff_text, diff_path, proposal_payload
 
     def write_manifest(self, manifest: RunManifest) -> Path:
+        self._check_writer_authority()
         manifest_path = self.run_dir / "manifest.json"
         write_json_atomic(manifest_path, manifest.to_json())
+        self._check_writer_authority()
         return manifest_path
 
     def write_workspace_index(self, payload: dict[str, Any]) -> Path:
+        self._check_writer_authority()
         path = self.run_dir / "workspace.index.json"
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
     def write_workspace_base(self, payload: dict[str, Any]) -> Path:
+        self._check_writer_authority()
         path = self.run_dir / "workspace.base.json"
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
     def write_proposal_snapshot(self, workspace: Workspace, diff_path: Path) -> dict[str, Any]:

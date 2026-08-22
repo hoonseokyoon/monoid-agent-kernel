@@ -2932,6 +2932,17 @@ may finish its own in-flight operation; no later subscriber, sidecar, delta writ
 runs under the stale activation. Best-effort diagnostic publication contains extension failures
 while always re-raising lease-loss control flow.
 
+Bootstrap applies the same operation boundary before a session exists. It checks authority before
+workspace and recorder creation, around each extension callback, and around workspace-index,
+workspace-base, manifest, and `run.started` publication. `AgentRecorder` checks between its own
+directory repair and file-open operations. Constructor failure releases recorder-owned handles
+without invoking extension sinks. An already stale activation creates no run artifacts; a lease loss
+overlapping one bootstrap operation stops every later artifact and callback.
+
+Model-stream writer creation is fenced independently from stream delivery. The private content
+writer and each custom observer writer receive a before/after authority check around `open`. Lease
+loss during one open prevents every later writer open and prevents provider dispatch.
+
 Settle finalization applies the same rule to durable projection writes. One common projection writer
 serves turn settle and run finalization, fencing job cancellation, proposal revision, metrics,
 settled-text persistence, and every event before and after the operation. `EventBus` also fences each

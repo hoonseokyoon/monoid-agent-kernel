@@ -153,6 +153,93 @@ def _restorable_loop(tmp_path: Path) -> AgentLoop:
     )
 
 
+def test_already_lost_lease_stops_before_bootstrap_creates_run_artifacts(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    token.cancel(InterruptionCause.LEASE_LOST)
+    loop.cancellation_token = token
+
+    with pytest.raises(RunCancelled) as caught:
+        loop.open()
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert not loop.spec.run_root.exists()
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+
+
+def test_lease_loss_after_bootstrap_index_write_stops_later_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    original = recorder_module.AgentRecorder.write_workspace_index
+
+    def lose_after_index(
+        recorder: recorder_module.AgentRecorder,
+        payload: dict[str, Any],
+    ) -> Path:
+        path = original(recorder, payload)
+        token.cancel(InterruptionCause.LEASE_LOST)
+        return path
+
+    monkeypatch.setattr(recorder_module.AgentRecorder, "write_workspace_index", lose_after_index)
+
+    with pytest.raises(RunCancelled) as caught:
+        loop.open()
+
+    run_dir = loop.spec.run_root / loop.spec.run_id
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert run_dir.joinpath("workspace.index.json").exists()
+    assert not run_dir.joinpath("workspace.base.json").exists()
+    assert not run_dir.joinpath("manifest.json").exists()
+    assert not run_dir.joinpath("status.json").exists()
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+
+
+def test_recorder_constructor_releases_owned_handles_when_lease_is_lost_mid_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    event_sinks: list[recorder_module.JsonlEventSink] = []
+    transcript_handles: list[Any] = []
+    original_sink_init = recorder_module.JsonlEventSink.__post_init__
+    original_transcript_repair = recorder_module.AgentRecorder._terminate_torn_transcript_tail
+
+    def capture_transcript(recorder: recorder_module.AgentRecorder) -> None:
+        transcript_handles.append(recorder._transcript_file)
+        original_transcript_repair(recorder)
+
+    def lose_after_event_log_open(sink: recorder_module.JsonlEventSink) -> None:
+        original_sink_init(sink)
+        event_sinks.append(sink)
+        token.cancel(InterruptionCause.LEASE_LOST)
+
+    monkeypatch.setattr(
+        recorder_module.AgentRecorder,
+        "_terminate_torn_transcript_tail",
+        capture_transcript,
+    )
+    monkeypatch.setattr(recorder_module.JsonlEventSink, "__post_init__", lose_after_event_log_open)
+
+    with pytest.raises(RunCancelled) as caught:
+        recorder_module.AgentRecorder(
+            loop.spec.run_root,
+            loop.spec.run_id,
+            check_authority=loop._check_lease_authority,
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(event_sinks) == 1 and event_sinks[0]._handle.closed is True
+    assert len(transcript_handles) == 1 and transcript_handles[0].closed is True
+
+
 def test_a_restored_loop_honors_a_durable_cancellation_without_a_token(tmp_path: Path) -> None:
     """``snapshot()`` wrote the flag unconditionally; the restore applied it conditionally.
 
