@@ -262,7 +262,9 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     # them by name is reading two different questions. See docs/CONTRACTS.md, event reads.
     "turn.interrupted": _data_schema(
         {"reason": _STR, "interruption_cause": _STR},
-        required=("reason", "interruption_cause"),
+        # Both fields stay optional in the unchanged v1 reader. Retained events can predate the
+        # typed cause, and the earliest v1 schema also accepted an absent reason.
+        required=(),
     ),
     # The interrupt's park twin, with its own cause vocabulary ("user_pause"). The pause park used to
     # emit no event of its own — only a ``session.state.changed`` — so two sibling parks were not

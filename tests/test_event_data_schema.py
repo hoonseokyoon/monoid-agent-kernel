@@ -48,6 +48,18 @@ def test_studio_retry_resume_marker_uses_existing_v1_data_shape() -> None:
     ) == []
 
 
+def test_turn_interrupted_accepts_legacy_and_typed_v1_payloads() -> None:
+    validator = _validator("turn.interrupted")
+
+    assert list(validator.iter_errors({"reason": "user_stop"})) == []
+    assert list(
+        validator.iter_errors(
+            {"reason": "graceful_drain", "interruption_cause": "graceful_drain"}
+        )
+    ) == []
+    assert EVENT_DATA_SCHEMAS["turn.interrupted"]["required"] == []
+
+
 def test_missing_required_key_fails() -> None:
     # `step` is required for model.turn.started.
     errors = list(_validator("model.turn.started").iter_errors({"previous_turn_handle": "h"}))
