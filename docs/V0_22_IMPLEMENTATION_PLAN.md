@@ -707,6 +707,11 @@ Validation 규칙:
   설정 오류로 거부한다.
 - 기존 `checkpoint_store` 경로는 구성 변화 없이 동작한다.
 
+`run_sink` mode의 checkpoint write는 `commit_checkpoint(..., writer_token=...)`를 사용한다.
+`committed | already_committed`만 성공이다. `conflict | fenced`, 잘못된 반환형, sink exception은
+checkpoint persistence failure로 처리하며 local checkpoint store로 우회하지 않는다. Restore의
+checkpoint 선택과 writer token 발급은 host가 소유한다.
+
 Runtime import 순환을 막기 위해 `loop.py`는 hosting type을 `TYPE_CHECKING`에서만 import한다.
 실행 시 protocol method를 직접 호출한다.
 
@@ -760,6 +765,12 @@ Process crash를 표현하는 `BaseException`은 보상 전이를 실행하지 �
 settle 실패 보상과 unknown 전이를 수행한다. 따라서 named failpoint가 reserve/start/adapter-return
 직후의 실제 journal head를 관찰할 수 있다.
 
+Hook은 optional recovery query를 구현할 수 있다. AgentLoop는 안정적인 logical-call ID를 만들고,
+Runner는 request normalize와 digest 계산 직후 query를 호출한다. Digest의 단일 소유자는 Runner다.
+Hook은 `missing | reserved`에서 새 dispatch를 계속하고, `dispatch_started`를 unknown으로 닫으며,
+`unknown`을 다시 표면화하고, `settled` evidence를 반환한다. PR3 hook 구현은 recovery method 없이
+계속 동작한다.
+
 ### 7.3 Result 재사용
 
 `settled` success를 복구하면 private result blob을 `ModelTurn`으로 복원한다. 복원기는 다음을
@@ -775,6 +786,16 @@ settle 실패 보상과 unknown 전이를 수행한다. 따라서 named failpoin
 
 복원된 turn은 live adapter가 반환한 turn과 같은 normalize path를 거친다. 이후 usage 누적,
 assistant message append, tool call 실행은 기존 loop 경로를 사용한다.
+
+복구 query의 request digest와 저장된 digest가 다르면 provider 진입 전에
+`durable_invocation_request_conflict`로 끝낸다. Settled failure는 저장된 failure code, provider code,
+retryability, config-recoverability, HTTP status, usage를 재생성해 같은 loop failure path로 보낸다.
+Process crash 뒤 남은 kernel retry history를 추측해 자동 재개하지 않는다. 복구된 failure를 먼저
+표면화하고 checkpoint한 뒤 다음 loop drive가 새 logical call로 정책을 다시 적용한다.
+
+Host hook은 result blob의 content digest, canonical body shape, receipt와 turn의 usage/stop/retry
+evidence 일치를 검증한다. 불일치, missing blob, corrupt/unsupported load는 provider를 호출하지 않고
+typed durable error로 끝낸다.
 
 ## 8. Sink delivery policy
 
