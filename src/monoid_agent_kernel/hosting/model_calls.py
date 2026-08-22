@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Literal, NoReturn
 
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.errors import DurableModelCallError, ModelEvidenceUncommitted
@@ -135,6 +135,19 @@ class FencedModelCallLifecycle:
             mark_recovered_model_usage(failed, invocation.receipt or {})
             raise failed from exc
 
+    def _reject_required_policy_upgrade(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes] | None = None,
+    ) -> NoReturn:
+        """Prove current ownership, preserve the invocation, then reject a policy upgrade."""
+
+        self._commit(invocation, blobs)
+        raise DurableModelCallError(
+            "an existing durable model invocation cannot acquire required evidence delivery",
+            error_code="durable_invocation_evidence_policy_conflict",
+        )
+
     def _commit_settled(
         self,
         invocation: DurableModelInvocation,
@@ -142,9 +155,12 @@ class FencedModelCallLifecycle:
         *,
         require_evidence: bool = False,
     ) -> None:
-        evidence_policy = (
-            "required" if require_evidence or invocation.requires_evidence else self.evidence_policy
-        )
+        if require_evidence or invocation.requires_evidence:
+            evidence_policy = "required"
+        elif self.evidence_policy == "required":
+            self._reject_required_policy_upgrade(invocation, blobs)
+        else:
+            evidence_policy = self.evidence_policy
         self._commit(
             invocation,
             blobs,
@@ -283,6 +299,8 @@ class FencedModelCallLifecycle:
         else:
             invocation = record.invocation
             if invocation.dispatch_state == "reserved":
+                if self.evidence_policy == "required" and not invocation.requires_evidence:
+                    self._reject_required_policy_upgrade(invocation)
                 effective = replace(proposed, idempotency_key=invocation.idempotency_key)
                 if not self._same_dispatch(invocation, effective):
                     raise DurableModelCallError(
@@ -297,6 +315,8 @@ class FencedModelCallLifecycle:
                     "durable model invocation remains unknown",
                     error_code="dispatch_unknown",
                 )
+            if self.evidence_policy == "required" and not invocation.requires_evidence:
+                self._reject_required_policy_upgrade(invocation)
             retryable_failure = (
                 bool(invocation.failure_code)
                 and invocation.receipt is not None

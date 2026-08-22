@@ -212,7 +212,9 @@ Keep invocation settlement and evidence delivery in separate tables or record fa
 revision. Persist the invocation's `requires_evidence` flag in the same transaction as every
 invocation revision and preserve it across retries. A replacement worker must honor the journal
 flag even when its configured policy is `passive`; this covers a crash before an
-`evidence_uncommitted` checkpoint exists. For `outbox`, reject the complete transaction when either
+`evidence_uncommitted` checkpoint exists. Reject a `passive` to `required` policy change for an
+existing logical call before provider or evidence mutation. Apply the stronger policy to a new
+logical call. For `outbox`, reject the complete transaction when either
 the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
 violates the declared capability.
 

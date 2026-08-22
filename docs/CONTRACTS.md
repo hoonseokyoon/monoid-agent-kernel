@@ -2870,6 +2870,11 @@ settlement, including when required evidence fails afterward. Evidence recovery 
 the passive call a second time. The checkpoint marker sets
 `ModelDispatchRecoveryQuery.require_evidence=True` as a second recovery path for an already
 published evidence park.
+The configured `required` policy cannot upgrade an existing invocation whose journal field is
+`false`. Recovery returns `durable_invocation_evidence_policy_conflict` before evidence mutation;
+reservation recovery returns the same conflict before provider entry. Start a new logical call to
+adopt a stronger policy. A durable checkpoint marker may complete a requirement established before
+the journal field existed because the marker survives every later recovery attempt.
 `run_once()` releases this durable park and surfaces `TurnNotSettled` instead of closing it into a
 terminal checkpoint. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected

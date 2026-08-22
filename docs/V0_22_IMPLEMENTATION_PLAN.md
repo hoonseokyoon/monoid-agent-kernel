@@ -853,6 +853,9 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   publication 전에 process가 종료되어도 새 activation은 journal field를 읽고 delivery를 완료한다.
   Recovery query의 `require_evidence` marker는 이미 저장된 evidence park에서 같은 의무를 보강한다.
   두 표식 모두 새 activation의 `passive` 설정보다 우선한다.
+  기존 invocation의 journal field가 `false`이면 현재 activation 설정만으로 `required`로 승격하지
+  않는다. Reservation 복구는 provider 진입 전에, settled 복구는 evidence mutation 전에
+  `durable_invocation_evidence_policy_conflict`로 거부한다. 강화된 정책은 새 logical call부터 적용한다.
 - 복구된 assistant tool-call turn을 message log에 반영한 뒤 interrupt가 발생하면 suspension에
   `model_tool_calls_pending=true`를 저장한다. 같은 batch에서 완료된 tool observation은
   `pending_observations`에 누적한다. `None` resume은 같은 settled result를 다시 읽고 이미 완료된 call

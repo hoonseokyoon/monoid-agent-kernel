@@ -485,6 +485,75 @@ def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
     assert evidence_key in harness.sink._model_evidence
 
 
+def test_required_policy_cannot_upgrade_a_passive_settled_invocation(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(tmp_path, harness, adapter, "settled")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert settled.invocation.requires_evidence is False
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
+    assert len(adapter.requests) == 1
+    assert harness.sink._model_evidence == {}
+
+
+def test_required_policy_cannot_upgrade_a_passive_reservation_before_provider_entry(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    baseline, reserved = _crash_at(tmp_path, harness, adapter, "reserved")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert reserved.invocation.requires_evidence is False
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation == reserved.invocation
+
+
+def test_required_policy_change_still_closes_a_started_passive_dispatch_as_unknown(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    baseline, _started = _crash_at(tmp_path, harness, adapter, "dispatch_started")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "dispatch_unknown"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.dispatch_state == "unknown"
+
+
 def test_recovery_identity_ignores_changed_caller_provenance(tmp_path: Path) -> None:
     harness = DeterministicFencedRunHarness()
     adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
