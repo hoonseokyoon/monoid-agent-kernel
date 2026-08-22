@@ -14,6 +14,7 @@ import pytest
 from support.fenced_hosting import DeterministicFencedRunHarness
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.content import ImagePart, TextPart
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
@@ -140,9 +141,9 @@ class _CrashAfterInvocationCommit:
 
 
 @dataclass
-class _CancelAfterInvocationCommit:
+class _RevokeAfterInvocationCommit:
     inner: Any
-    cancellation_token: CancellationToken
+    write_authority: ActivationWriteAuthority
     target_state: str = "settled"
     armed: bool = True
 
@@ -170,7 +171,7 @@ class _CancelAfterInvocationCommit:
             and result.status in {"committed", "already_committed"}
         ):
             self.armed = False
-            self.cancellation_token.cancel(InterruptionCause.LEASE_LOST)
+            self.write_authority.revoke()
         return result
 
     def __getattr__(self, name: str) -> Any:
@@ -335,6 +336,7 @@ def _loop(
     model_stream_observer_factories: tuple[Any, ...] = (),
     tool_ids: tuple[str, ...] = (),
     cancellation_token: CancellationToken | None = None,
+    write_authority: ActivationWriteAuthority | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         spec=_spec(tmp_path, limits=limits),
@@ -350,6 +352,7 @@ def _loop(
         model_content_file=model_content_file,
         model_stream_observer_factories=model_stream_observer_factories,
         cancellation_token=cancellation_token,
+        write_authority=write_authority or ActivationWriteAuthority(),
     )
 
 
@@ -1915,7 +1918,7 @@ def test_lease_loss_precedes_required_evidence_recovery_mutation(tmp_path: Path)
     )
     restored_loop.restore(checkpoint)
     cancellation_token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-    cancellation_token.cancel(InterruptionCause.LEASE_LOST)
+    restored_loop.lose_writer_authority()
     try:
         suspension = restored_loop.run_until_suspended(None)
     finally:
@@ -1925,7 +1928,7 @@ def test_lease_loss_precedes_required_evidence_recovery_mutation(tmp_path: Path)
     assert suspension.reason == "interrupted"
     assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
     assert cancellation_token.cause is InterruptionCause.GRACEFUL_DRAIN
-    assert cancellation_token.lease_lost is True
+    assert restored_loop.write_authority.revoked is True
     assert sink.calls == 1
     assert (RUN_ID, LOGICAL_CALL_ID, 3) not in harness.sink._model_evidence
     assert harness.sink.latest_checked(RUN_ID) == previous_checkpoint
@@ -1954,7 +1957,8 @@ def test_lease_loss_after_invocation_settle_blocks_all_stale_publication(
 
     harness = DeterministicFencedRunHarness()
     cancellation_token = CancellationToken()
-    sink = _CancelAfterInvocationCommit(harness.sink, cancellation_token)
+    write_authority = ActivationWriteAuthority()
+    sink = _RevokeAfterInvocationCommit(harness.sink, write_authority)
     usage = {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
     adapter = _ScriptedAdapter(
         ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
@@ -1967,6 +1971,7 @@ def test_lease_loss_after_invocation_settle_blocks_all_stale_publication(
         sink=sink,
         writer_token=writer_token,
         cancellation_token=cancellation_token,
+        write_authority=write_authority,
         model_calls_file=True,
         model_stream_observer_factories=(lambda: _Observer(writer),),
     )
@@ -2469,8 +2474,9 @@ def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> No
     )
     loop.restore(baseline)
     try:
-        with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
-            loop.run_until_suspended("hello")
+        suspension = loop.run_until_suspended("hello")
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert loop.write_authority.revoked is True
         assert len(adapter.requests) == 1
         assert loop._session is not None
         assert not any(
@@ -2594,8 +2600,9 @@ def test_fenced_checkpoint_commit_escapes_without_local_fallback(tmp_path: Path)
     )
     loop.open()
     try:
-        with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
-            loop.run_until_suspended("hello")
+        suspension = loop.run_until_suspended("hello")
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert loop.write_authority.revoked is True
         assert not (tmp_path / "runs" / RUN_ID / "checkpoint.json").exists()
     finally:
         with suppress(BaseException):
@@ -2615,8 +2622,9 @@ def test_stale_writer_cannot_reserve_or_fall_back_to_a_local_checkpoint(tmp_path
     loop.open()
     harness.claim_writer(RUN_ID, "worker-2")
     try:
-        with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
-            loop.run_until_suspended("hello")
+        suspension = loop.run_until_suspended("hello")
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert loop.write_authority.revoked is True
         assert adapter.requests == []
         assert harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID).status == "missing"
         assert not (tmp_path / "runs" / RUN_ID / "checkpoint.json").exists()

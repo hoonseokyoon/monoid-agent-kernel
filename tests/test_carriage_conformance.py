@@ -6177,9 +6177,9 @@ def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_writ
         if key is None
     }
     assert {
-        "context.shell_service.metrics()",
-        "context.jobs_service.background_metrics()",
-        "context.web_service.metrics()",
+        "context._shell_service.metrics()",
+        "context._jobs_service.background_metrics()",
+        "context._web_service.metrics()",
     } <= splatted, {
         "metrics_blocks_splatted": sorted(splatted),
         "hint": "the narrowed entry names these three service blocks",

@@ -5,13 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.errors import NativeAgentError
-from monoid_agent_kernel.reference.backend.activation import (
-    ActivationLeaseLost,
-    is_activation_lease_loss,
-)
+from monoid_agent_kernel.reference.backend.activation import is_activation_lease_loss
 from monoid_agent_kernel.reference.backend.run_execution import (
     RunExecutionContext,
     RunExecutionService,
@@ -55,7 +56,10 @@ def _execution_service(
             build_loop=lambda *args: SimpleNamespace(loop=loop),
             attach_loop=lambda *args: None,
             unregister_record=unregistered.append,
-            record=lambda run_id: SimpleNamespace(run_id=run_id),
+            record=lambda run_id: SimpleNamespace(
+                run_id=run_id,
+                write_authority=ActivationWriteAuthority(),
+            ),
             drive_open_session=lambda *args, **kwargs: None,  # type: ignore[arg-type]
             record_run_result=lambda run_id, result: results.append((run_id, result)),
             record_run_failure=lambda run_id, exc: failures.append(exc),
@@ -69,7 +73,10 @@ def _execution_service(
 def _prepared(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
         run_id="run_stale",
-        record=SimpleNamespace(run_id="run_stale"),
+        record=SimpleNamespace(
+            run_id="run_stale",
+            write_authority=ActivationWriteAuthority(),
+        ),
         workspace_root=tmp_path,
         llm_gateway_token="llm",
         web_gateway_token="web",
@@ -78,7 +85,7 @@ def _prepared(tmp_path: Path) -> SimpleNamespace:
 
 def test_core_lease_fence_errors_share_the_host_activation_disposition() -> None:
     assert is_activation_lease_loss(
-        NativeAgentError("stale writer", error_code="lease_lost")
+        WriteAuthorityRevoked()
     )
     assert not is_activation_lease_loss(
         NativeAgentError("ordinary failure", error_code="internal_error")
@@ -102,7 +109,7 @@ def test_autonomous_execution_discards_lease_loss_without_recording_failure(
     )
 
     async def stale_drive(*args: Any, **kwargs: Any) -> None:
-        raise ActivationLeaseLost("lost")
+        raise WriteAuthorityRevoked()
 
     service.drive_session = stale_drive  # type: ignore[method-assign]
 
@@ -156,6 +163,7 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
     loop.astream = lambda user_input: _LeaseLostStream()  # type: ignore[attr-defined]
 
     prepared = _prepared(tmp_path)
+    prepared.record.write_authority.revoke()
 
     async def collect() -> list[dict[str, Any]]:
         return [
@@ -185,13 +193,16 @@ def test_recovered_execution_discards_lease_loss_without_recording_failure(
     results: list[Any] = []
     released: list[bool] = []
     unregistered: list[Any] = []
-    recovered_record = SimpleNamespace(run_id="run_stale")
+    recovered_record = SimpleNamespace(
+        run_id="run_stale",
+        write_authority=ActivationWriteAuthority(),
+    )
 
     async def acquire() -> None:
         return None
 
     async def stale_session(*args: Any, **kwargs: Any) -> None:
-        raise ActivationLeaseLost("lost")
+        raise WriteAuthorityRevoked()
 
     service = RecoveryService(
         RecoveryContext(

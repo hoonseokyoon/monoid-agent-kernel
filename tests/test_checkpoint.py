@@ -144,7 +144,7 @@ def test_release_parked_closes_process_resources_without_finalizing_or_deleting(
     assert '"type": "run.finished"' not in events
 
 
-def test_release_parked_rejects_uncommitted_state_and_discard_cleans_resources(
+def test_release_parked_rejects_uncommitted_state_and_leaves_hosted_cleanup_to_host(
     tmp_path: Path,
 ) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
@@ -159,7 +159,7 @@ def test_release_parked_rejects_uncommitted_state_and_discard_cleans_resources(
     assert committed is not None and committed.hosted_tasks == []
 
     uncommitted_task_id = loop.create_task("hitl", {"prompt": "uncommitted"})
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     uncommitted_task = manager.get_job(uncommitted_task_id)
     recorder = loop._session.res.recorder  # type: ignore[union-attr]
     with pytest.raises(NativeAgentError) as raised:
@@ -168,8 +168,8 @@ def test_release_parked_rejects_uncommitted_state_and_discard_cleans_resources(
     assert raised.value.error_code == "run_not_durably_parked"
     assert _latest_checkpoint(spec).hosted_tasks == []  # type: ignore[union-attr]
     loop.discard_uncommitted()
-    assert uncommitted_task.status == "cancelled"
-    assert uncommitted_task.cancel_path.exists()  # type: ignore[union-attr]
+    assert uncommitted_task.status == "running"
+    assert not uncommitted_task.cancel_path.exists()  # type: ignore[union-attr]
     assert recorder._transcript_file.closed is True
     assert loop._session is None
     assert loop._owned_loop is None
@@ -178,7 +178,7 @@ def test_release_parked_rejects_uncommitted_state_and_discard_cleans_resources(
 def test_discard_preserves_hosted_task_from_last_committed_checkpoint(tmp_path: Path) -> None:
     spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
     loop, task_id, _, _ = _hitl_parked_loop(spec)
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     committed_task = manager.get_job(task_id)
     committed = _latest_checkpoint(spec)
 
@@ -338,25 +338,25 @@ def test_restore_failure_releases_partially_bootstrapped_resources(tmp_path: Pat
     assert loop._owned_loop is None
 
 
-def test_restore_bootstrap_failure_closes_published_resources(
+def test_restore_bootstrap_failure_discards_published_resources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from monoid_agent_kernel.recorder import AgentRecorder
 
-    closed_recorders: list[AgentRecorder] = []
-    original_close = AgentRecorder.close
+    discarded_recorders: list[AgentRecorder] = []
+    original_discard = AgentRecorder.discard_uncommitted
 
-    def record_close(recorder: AgentRecorder) -> None:
-        original_close(recorder)
-        closed_recorders.append(recorder)
+    def record_discard(recorder: AgentRecorder) -> None:
+        original_discard(recorder)
+        discarded_recorders.append(recorder)
 
     class _FailingRuntimeConfigProvider:
         def current_config(self, run_id: str):  # noqa: ANN201
             del run_id
             raise RuntimeError("runtime config bootstrap failed")
 
-    monkeypatch.setattr(AgentRecorder, "close", record_close)
+    monkeypatch.setattr(AgentRecorder, "discard_uncommitted", record_discard)
     spec = AgentRunSpec(
         run_id="run_bootstrap_failure",
         workspace_root=_mk(tmp_path / "ws"),
@@ -371,8 +371,8 @@ def test_restore_bootstrap_failure_closes_published_resources(
     with pytest.raises(RuntimeError, match="runtime config bootstrap failed"):
         loop.restore(RunCheckpoint(run_id=spec.run_id, seq=1))
 
-    assert len(closed_recorders) == 1
-    assert closed_recorders[0]._transcript_file.closed is True
+    assert len(discarded_recorders) == 1
+    assert discarded_recorders[0]._transcript_file.closed is True
     assert loop._session is None
     assert loop._bootstrap_resources is None
     assert loop._owned_loop is None
@@ -391,10 +391,9 @@ def test_discard_attempts_all_cleanup_after_task_cleanup_failure(
     loop.open()
     loop.run_until_suspended("hold here")
     recorder = loop._session.res.recorder  # type: ignore[union-attr]
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
 
-    def fail_task_cleanup(*, preserve_hosted_task_ids: set[str]) -> None:
-        del preserve_hosted_task_ids
+    def fail_task_cleanup() -> None:
         raise RuntimeError("task cleanup failed")
 
     monkeypatch.setattr(manager, "discard_uncommitted", fail_task_cleanup)
@@ -976,7 +975,7 @@ def test_snapshot_refuses_while_in_process_shell_job_runs(tmp_path: Path) -> Non
         runtime_config_provider=provider,
     )
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     # startup_wait_s=0 returns immediately with the job still running (no race against a
     # job that finishes during the startup wait); the long sleep outlives the snapshot check.
     job = manager.start_shell_job(

@@ -352,7 +352,7 @@ def test_backend_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_p
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 
@@ -451,7 +451,7 @@ def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_mess
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 
@@ -1215,7 +1215,7 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 

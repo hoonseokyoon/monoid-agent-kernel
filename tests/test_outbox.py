@@ -16,9 +16,11 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.capability import AutoGrantBroker
-from monoid_agent_kernel.core.cancellation import CancellationToken
-from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
@@ -34,7 +36,6 @@ from monoid_agent_kernel.reference.backend.outbox_dispatch import (
     OutboxDispatchService,
     OutboxRetryPolicy,
 )
-from monoid_agent_kernel.reference.backend.activation import ActivationLeaseLost
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference.outbox import (
     FailingOutboxSender,
@@ -132,12 +133,15 @@ def test_outbox_receipt_direct_construction_normalizes_and_validates() -> None:
 
 def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
+    authority = ActivationWriteAuthority()
     context = SimpleNamespace(
-        outbox=Outbox(),
+        _outbox=Outbox(),
+        _write_authority=authority,
+        _check_writer_authority=authority.assert_active,
         _current_call=CallContext("call-1", "turn-1", "event-1"),
         capability_token=lambda capability: f"token:{capability}",
         run_id="run-1",
-        recorder=SimpleNamespace(
+        _recorder=SimpleNamespace(
             emit=lambda event_type, **kwargs: events.append((event_type, kwargs))
         ),
     )
@@ -152,7 +156,7 @@ def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() 
         reply_to="reply\ud800",
     )
 
-    [request] = context.outbox.pending()
+    [request] = context._outbox.pending()
     assert request.destination == "peer\ufffd"
     assert request.capability == "send\ufffd"
     assert request.token_ref == "token:send\ufffd"
@@ -168,13 +172,14 @@ def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() 
             {},
             expect_ack=1,  # type: ignore[arg-type]
         )
-    assert len(context.outbox.pending()) == 1
+    assert len(context._outbox.pending()) == 1
 
 
 def test_record_outbox_result_normalizes_forged_receipt_before_state_change() -> None:
     loop = object.__new__(AgentLoop)
     loop._outbox = Outbox()
     loop._session = None
+    loop.write_authority = ActivationWriteAuthority()
     request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
     receipt = object.__new__(OutboxReceipt)
     object.__setattr__(receipt, "ok", True)
@@ -190,6 +195,7 @@ def test_record_outbox_result_rejects_malformed_forged_receipt_without_mutation(
     loop = object.__new__(AgentLoop)
     loop._outbox = Outbox()
     loop._session = None
+    loop.write_authority = ActivationWriteAuthority()
     request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
     receipt = object.__new__(OutboxReceipt)
     object.__setattr__(receipt, "ok", "false")
@@ -693,7 +699,13 @@ def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -
             record_terminal=lambda _record: False,
         )
     )
-    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+    service.drain_outbox(
+        SimpleNamespace(
+            outbox_sender=_Sender(),
+            write_authority=ActivationWriteAuthority(),
+        ),
+        _Loop(),
+    )
 
     assert sent == ["o1"]
     [(request_id, ok, next_attempt_at)] = recorded
@@ -705,14 +717,14 @@ def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -
 
 
 def test_outbox_send_overlap_with_lease_loss_keeps_request_unprojected() -> None:
-    token = CancellationToken()
+    authority = ActivationWriteAuthority()
     request = OutboxRequest(destination="email", id="o-lease", idempotency_key="idem-lease")
     recorded: list[str] = []
 
     class _Sender:
         def send(self, req: OutboxRequest) -> OutboxReceipt:
             assert req.idempotency_key == "idem-lease"
-            token.cancel(InterruptionCause.LEASE_LOST)
+            authority.revoke()
             return OutboxReceipt(ok=True, reference="possibly-delivered")
 
     class _Loop:
@@ -747,9 +759,9 @@ def test_outbox_send_overlap_with_lease_loss_keeps_request_unprojected() -> None
             record_terminal=lambda _record: False,
         )
     )
-    record = SimpleNamespace(outbox_sender=_Sender(), cancellation_token=token)
+    record = SimpleNamespace(outbox_sender=_Sender(), write_authority=authority)
 
-    with pytest.raises(ActivationLeaseLost):
+    with pytest.raises(WriteAuthorityRevoked):
         service.drain_outbox(record, _Loop())
 
     assert recorded == []
@@ -808,7 +820,13 @@ def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_ha
         )
     )
     before = time.time()
-    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+    service.drain_outbox(
+        SimpleNamespace(
+            outbox_sender=_Sender(),
+            write_authority=ActivationWriteAuthority(),
+        ),
+        _Loop(),
+    )
 
     assert sent == ["o1"]
     [(request_id, ok, next_attempt_at)] = recorded

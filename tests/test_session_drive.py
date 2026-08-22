@@ -10,6 +10,10 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
@@ -21,7 +25,6 @@ from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
 )
-from monoid_agent_kernel.reference.backend.activation import ActivationLeaseLost
 from monoid_agent_kernel.reference.backend import session_drive
 from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.reference.backend.session_drive import (
@@ -79,6 +82,7 @@ class _Record:
         self.seen_inbox_ids: set[str] = set()
         self.loop: Any = None
         self.cancellation_token = CancellationToken()
+        self.write_authority = ActivationWriteAuthority()
 
 
 def test_session_drive_wait_ignores_stray_resume_without_backend(tmp_path: Path) -> None:
@@ -155,13 +159,13 @@ def test_session_drive_stops_before_outbox_when_lease_is_lost_during_store(
     thread = Thread(target=persist)
     thread.start()
     assert entered.wait(5)
-    record.cancellation_token.cancel(InterruptionCause.LEASE_LOST)
+    record.write_authority.revoke()
     release.set()
     thread.join(5)
 
     assert not thread.is_alive()
     assert len(caught) == 1
-    assert isinstance(caught[0], ActivationLeaseLost)
+    assert isinstance(caught[0], WriteAuthorityRevoked)
     assert drain_calls == []
 
 
@@ -200,8 +204,9 @@ def test_session_drive_rejects_lease_loss_before_projecting_or_closing(
             raise AssertionError("a stale activation must not close")
 
     loop = _Loop()
+    record.write_authority.revoke()
 
-    with pytest.raises(ActivationLeaseLost):
+    with pytest.raises(WriteAuthorityRevoked):
         asyncio.run(
             service.drive_open_session(
                 record,
