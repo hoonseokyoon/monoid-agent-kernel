@@ -361,14 +361,35 @@ def _accounted_evidence_usage(
     }
 
 
-def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
-    """Capture a settled call whose durable model step has not reached application."""
+def _unapplied_settled_invocation(
+    session: Any,
+    run_id: str,
+) -> tuple[int, DurableModelInvocation] | None:
+    """Return the current settled model turn when its assistant message is still absent."""
 
     step = getattr(session, "session_step", 0)
     invocation = getattr(session, "last_model_invocation", None)
-    suspension = getattr(session, "last_suspension", None)
     state = getattr(session, "state", None)
     messages = getattr(state, "messages", None)
+    if (
+        type(step) is not int
+        or step < 1
+        or not isinstance(invocation, DurableModelInvocation)
+        or invocation.dispatch_state != "settled"
+        or not isinstance(messages, list)
+        or (messages and messages[-1].get("role") == "assistant")
+    ):
+        return None
+    turn_id = f"turn_{step:04d}"
+    if invocation.logical_call_id != logical_model_call_id(run_id, turn_id):
+        return None
+    return (step, invocation)
+
+
+def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
+    """Capture a settled call whose durable model step has not reached application."""
+
+    suspension = getattr(session, "last_suspension", None)
     evidence_uncommitted = (
         isinstance(suspension, Mapping)
         and suspension.get("error_code") == "evidence_uncommitted"
@@ -379,21 +400,13 @@ def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
     interrupted_before_application = (
         isinstance(suspension, Mapping)
         and suspension.get("reason") == "interrupted"
-        and isinstance(messages, list)
-        and (not messages or messages[-1].get("role") != "assistant")
     )
-    if (
-        type(step) is not int
-        or step < 1
-        or not isinstance(suspension, Mapping)
-        or not (evidence_uncommitted or interrupted_before_application)
-        or not isinstance(invocation, DurableModelInvocation)
-        or invocation.dispatch_state != "settled"
-    ):
+    if not (evidence_uncommitted or interrupted_before_application):
         return None
-    turn_id = f"turn_{step:04d}"
-    if invocation.logical_call_id != logical_model_call_id(run_id, turn_id):
+    unapplied = _unapplied_settled_invocation(session, run_id)
+    if unapplied is None:
         return None
+    step, invocation = unapplied
     return _EvidenceRecovery(
         step=step,
         invocation=invocation,
@@ -1735,6 +1748,7 @@ class AgentLoop:
                 )
             # A new user turn intentionally abandons a prior interrupted result. Required evidence
             # is already committed; only an explicit None resume applies the stored model turn.
+            session.state.pending_observations = ()
             evidence_recovery = None
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
@@ -1895,7 +1909,12 @@ class AgentLoop:
                 data={"reason": "user_stop"},
                 level="info",
             )
-            state.pending_observations = ()
+            # A settled durable result interrupted before assistant-message application must replay
+            # the exact request on a None resume. Tool-follow-up observations are part of that
+            # request digest, so retain them until recovery applies the stored result. A fresh user
+            # turn clears them when it intentionally abandons that result above.
+            if _unapplied_settled_invocation(session, self.spec.run_id) is None:
+                state.pending_observations = ()
             # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
             # no later settle refuses to finalize this abandoned turn as a clean success.
             session.midturn_park = "interrupted"

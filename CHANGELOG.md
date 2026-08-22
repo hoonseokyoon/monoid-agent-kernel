@@ -121,7 +121,7 @@ out in commit messages and here.
   previously charged receipt usage, preventing both provider replay and usage duplication. Model
   step limits and cooperative pause cannot preempt this commit barrier. Cancellation and deadline
   apply after the fenced evidence mutation; an interrupt before result application retains the
-  same logical call for a `None` resume.
+  same logical call and its tool-follow-up observations for a `None` resume.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal, remaining kernel attempts, multimodal

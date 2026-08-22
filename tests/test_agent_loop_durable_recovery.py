@@ -870,6 +870,63 @@ def test_required_evidence_recovery_survives_interrupt_before_result_application
     assert len(adapter.requests) == 1
 
 
+def test_interrupted_evidence_recovery_preserves_tool_follow_up_request(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectNthModelEvidence(harness.sink, reject_on=2)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(ToolCall(id="missing-1", name="missing.tool", arguments={}),),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after observation", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.pending_observations
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.interrupt_turn()
+    try:
+        interrupted = restored_loop.run_until_suspended(None)
+        interrupted_checkpoint = restored_loop.snapshot()
+        settled = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.pending_observations == checkpoint.pending_observations
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "done after observation"
+    assert len(adapter.requests) == 2
+
+
 def test_new_input_can_abandon_a_recovered_result_after_interrupt(tmp_path: Path) -> None:
     harness = DeterministicFencedRunHarness()
     sink = _RejectModelEvidence(harness.sink)
