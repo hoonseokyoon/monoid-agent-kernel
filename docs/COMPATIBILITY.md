@@ -89,6 +89,9 @@ retry, and interruption vocabularies plus opaque output/evidence addresses in bo
 or raw provider exception. Its strict reader rejects fields outside the versioned top-level schema.
 A `dispatch_unknown` outcome permits only `after_reconciliation` or `forbidden` retry eligibility,
 so an ambiguous paid call cannot be classified for automatic retry.
+The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
+limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
+contract window, so deploy the current strict reader before a writer that can emit it.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The
@@ -98,12 +101,17 @@ unknown fields are private by default. Receipt key spellings are canonicalized. 
 taxonomy, timestamp, numeric, boolean, and usage values each have bounded typed validation; a
 receipt request digest must equal the invocation request digest. Settled success points to a private
 result blob through a bounded `scheme:locator` address, and ambiguous dispatch has no automatic
-retry evidence.
+retry evidence. The `evidence_policy` enum records `passive`, `required`, or `outbox` delivery from
+the first reservation through every later revision and retry. The checked reader accepts the earlier
+v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `true` to `required`;
+the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
+writer because the earlier prerelease reader used a closed top-level vocabulary.
 
-`monoid.checkpoint.v1` adds optional `last_model_invocation` and `interruption_cause` fields. A
-v0.21 checkpoint omits both and restores with `None` and the empty cause. The writer keeps the
-checkpoint version and emits an explicit field projection copied through the iterative portable
-JSON normalizer.
+`monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
+`pending_finish`, and `pending_tool_loads` fields. A
+v0.21 checkpoint omits them and restores with empty/default values. The writer keeps the checkpoint
+version and emits an explicit field projection copied through the iterative portable JSON
+normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed

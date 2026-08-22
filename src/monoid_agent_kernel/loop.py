@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
@@ -23,7 +23,18 @@ from monoid_agent_kernel.core._sync_bridge import (
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_timestamp
-from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_call import (
+    ModelCallRunner,
+    _recovered_receipt,
+    _recovered_result_matches_evidence,
+    _settled_model_stream_outcome,
+)
+from monoid_agent_kernel.model_lifecycle import (
+    RecoveredModelDispatch,
+    durable_model_turn,
+    mark_recovered_model_usage,
+    recover_model_dispatch,
+)
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
@@ -154,8 +165,11 @@ from monoid_agent_kernel.core.side_effect_policy import (
 )
 from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.errors import (
+    DurableModelCallError,
     ModelAdapterError,
     ModelCallAborted,
+    ModelDispatchRefused,
+    ModelEvidenceUncommitted,
     AgentConfigError,
     NativeAgentError,
     PermissionDenied,
@@ -329,6 +343,169 @@ def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[boo
     return (
         bool(last_suspension.get("retryable", False)),
         bool(last_suspension.get("config_recoverable", False)),
+    )
+
+
+@dataclass(frozen=True)
+class _EvidenceRecovery:
+    step: int
+    invocation: DurableModelInvocation
+    blocks_new_input: bool = True
+    recovered_dispatch: RecoveredModelDispatch | None = None
+    recovered_turn: ModelTurn | None = None
+    recovered_receipt: ModelCallReceipt | None = None
+    turn_parent_id: str | None = None
+    outcome_projected: bool = False
+
+
+def _replace_provider_usage_projection(
+    error: BaseException,
+    usage: Mapping[str, int],
+) -> None:
+    """Replace an existing aggregate usage stamp with this projection's billable delta.
+
+    ``mark_provider_usage`` intentionally treats an empty mapping as "no report" and leaves an
+    existing stamp untouched. Evidence replay needs a different operation: the recovered receipt
+    remains aggregate authority while transcript/event projections must explicitly carry zero.
+    """
+
+    try:
+        error.provider_usage = dict(usage)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _recover_evidence_dispatch(
+    runner: ModelCallRunner,
+    recovery: _EvidenceRecovery,
+) -> _EvidenceRecovery:
+    """Commit required evidence from stored identity before rebuilding a model request."""
+
+    hook = runner.lifecycle_hook
+    if hook is None:
+        raise DurableModelCallError(
+            "required model evidence recovery has no durable lifecycle hook",
+            error_code="durable_invocation_recovery_unavailable",
+        )
+    invocation = recovery.invocation
+    try:
+        recovered = recover_model_dispatch(
+            hook,
+            logical_call_id=invocation.logical_call_id,
+            request_digest=invocation.request_digest,
+            # The checkpoint marker is authoritative. A new activation's default/passive
+            # configuration cannot lower the required-delivery obligation that created it.
+            require_evidence=recovery.blocks_new_input,
+        )
+    except ModelEvidenceUncommitted as exc:
+        # The provider bill was recorded on the first failed evidence delivery. A later
+        # projection-only attempt has no provider spend of its own.
+        _replace_provider_usage_projection(exc, {})
+        raise
+    if recovered is None:
+        raise DurableModelCallError(
+            "settled model evidence recovery returned no stored outcome",
+            error_code="durable_invocation_recovery_missing",
+        )
+    reservation = recovered.reservation
+    if (
+        reservation.dispatch_attempt != invocation.dispatch_attempt
+        or reservation.dispatch_id != invocation.dispatch_id
+        or reservation.idempotency_key != invocation.idempotency_key
+    ):
+        raise DurableModelCallError(
+            "settled model evidence recovery changed dispatch identity",
+            error_code="durable_invocation_recovery_conflict",
+        )
+    return replace(recovery, recovered_dispatch=recovered)
+
+
+def _accounted_evidence_usage(
+    recovery: _EvidenceRecovery | None,
+    logical_call_id: str,
+) -> dict[str, int]:
+    """Usage already charged at the preceding evidence-uncommitted park for this call."""
+
+    if (
+        recovery is None
+        or (invocation := recovery.invocation).logical_call_id != logical_call_id
+        or not isinstance(invocation.receipt, Mapping)
+    ):
+        return {}
+    raw_usage = invocation.receipt.get("usage")
+    if not isinstance(raw_usage, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in raw_usage.items()
+        if type(key) is str and portable_usage_value(value)
+    }
+
+
+def _unapplied_settled_invocation(
+    session: Any,
+    run_id: str,
+) -> tuple[int, DurableModelInvocation] | None:
+    """Return the current settled model turn when its assistant message is still absent."""
+
+    step = getattr(session, "session_step", 0)
+    invocation = getattr(session, "last_model_invocation", None)
+    state = getattr(session, "state", None)
+    messages = getattr(state, "messages", None)
+    projected_tool_turn = False
+    if isinstance(messages, list) and messages:
+        last_message = messages[-1]
+        tool_calls = last_message.get("tool_calls")
+        projected_tool_turn = (
+            getattr(session, "model_tool_calls_pending", False) is True
+            and last_message.get("role") == "assistant"
+            and isinstance(tool_calls, list)
+            and bool(tool_calls)
+        )
+    if (
+        type(step) is not int
+        or step < 1
+        or not isinstance(invocation, DurableModelInvocation)
+        or invocation.dispatch_state != "settled"
+        or not isinstance(messages, list)
+        or (messages and messages[-1].get("role") == "assistant" and not projected_tool_turn)
+    ):
+        return None
+    turn_id = f"turn_{step:04d}"
+    if invocation.logical_call_id != logical_model_call_id(run_id, turn_id):
+        return None
+    return (step, invocation)
+
+
+def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
+    """Capture a settled call whose durable model step has not reached application."""
+
+    suspension = getattr(session, "last_suspension", None)
+    evidence_uncommitted = (
+        isinstance(suspension, Mapping)
+        and suspension.get("error_code") == "evidence_uncommitted"
+    )
+    # An interrupt immediately after durable recovery committed can preempt application of the
+    # stored turn. The current invocation identity plus the absent assistant message is the durable
+    # proof: once the assistant message exists, replaying the turn could duplicate tool effects.
+    interrupted_before_application = (
+        isinstance(suspension, Mapping)
+        and suspension.get("reason") == "interrupted"
+    )
+    if not (evidence_uncommitted or interrupted_before_application):
+        return None
+    unapplied = _unapplied_settled_invocation(session, run_id)
+    if unapplied is None:
+        return None
+    step, invocation = unapplied
+    return _EvidenceRecovery(
+        step=step,
+        invocation=invocation,
+        blocks_new_input=evidence_uncommitted,
+        outcome_projected=bool(
+            isinstance(suspension, Mapping)
+            and suspension.get("model_tool_calls_pending") is True
+        ),
     )
 
 
@@ -994,6 +1171,14 @@ class _Session:
     # Latest invocation evidence observed by this activation. The sink remains authoritative;
     # this is the compact summary carried by the next checkpoint.
     last_model_invocation: DurableModelInvocation | None = None
+    # A durable assistant tool-call turn is already projected while one or more calls still need
+    # execution. The interruption suspension carries this bit across activations.
+    model_tool_calls_pending: bool = False
+    # A durable internal safety checkpoint was committed after this model-step coordinate was
+    # allocated and before its provider outcome reached a park. ``last_suspension is None`` is the
+    # durable in-flight marker; restore turns it into this one-shot activation-local instruction so
+    # the pump probes the same journal coordinate instead of advancing to a fresh paid call.
+    resume_checkpointed_model_step: bool = False
 
 
 @dataclass
@@ -1081,6 +1266,9 @@ class AgentLoop:
     # scoped to this exact run; hosts issue a fresh generation when ownership moves.
     run_sink: FencedRunSink | None = None
     writer_token: WriterToken | None = None
+    # Delivery of public-safe settled invocation evidence. Passive preserves the historical
+    # recorder/observer containment. Required and outbox are fenced host mutations.
+    model_evidence_policy: Literal["passive", "required", "outbox"] = "passive"
     # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
@@ -1167,7 +1355,17 @@ class AgentLoop:
         self._finalizer = LoopFinalizer(self)
 
     def _validate_durable_hosting(self) -> None:
+        if type(self.model_evidence_policy) is not str or self.model_evidence_policy not in {
+            "passive",
+            "required",
+            "outbox",
+        }:
+            raise AgentConfigError("model_evidence_policy must be passive, required, or outbox")
         if self.run_sink is None and self.writer_token is None:
+            if self.model_evidence_policy != "passive":
+                raise AgentConfigError(
+                    "required and outbox model evidence policies need run_sink and writer_token"
+                )
             return
         if self.run_sink is None or self.writer_token is None:
             raise AgentConfigError("run_sink and writer_token must be configured together")
@@ -1194,6 +1392,10 @@ class AgentLoop:
         if missing:
             raise AgentConfigError(
                 "run_sink is missing required capabilities: " + ", ".join(missing)
+            )
+        if self.model_evidence_policy == "outbox" and capabilities.transactional_outbox is not True:
+            raise AgentConfigError(
+                "outbox model evidence policy requires transactional_outbox capability"
             )
 
     def _materialize_model_stream_observers(self) -> tuple[ModelStreamObserver, ...]:
@@ -1611,6 +1813,18 @@ class AgentLoop:
                 "run reached a terminal state and cannot accept more input",
                 error_code="run_terminal",
             )
+        evidence_recovery = _evidence_recovery(session, self.spec.run_id)
+        if evidence_recovery is not None and user_input is not None:
+            if evidence_recovery.blocks_new_input or evidence_recovery.outcome_projected:
+                raise NativeAgentError(
+                    "durable model recovery must complete before accepting new input",
+                    error_code="evidence_recovery_requires_resume",
+                )
+            # A new user turn intentionally abandons a prior interrupted result. Required evidence
+            # is already committed; only an explicit None resume applies the stored model turn.
+            session.state.pending_observations = ()
+            session.model_tool_calls_pending = False
+            evidence_recovery = None
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
@@ -1648,7 +1862,36 @@ class AgentLoop:
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
         try:
-            suspension = await self._apump_turn(state, res, session)
+            if evidence_recovery is None:
+                # Preserve the historical three-argument seam for embedders/tests that wrap the
+                # private pump to inject a safety checkpoint. Evidence recovery alone needs the
+                # activation snapshot captured above.
+                suspension = await self._apump_turn(state, res, session)
+            else:
+                # Required evidence belongs to the stored dispatch, not to a request rebuilt from
+                # today's runtime config, context providers, tool surface, or media resolver. Use
+                # the durable logical id + digest first. The returned private result/refusal can
+                # then be applied without asking the provider or re-keying the original call.
+                evidence_recovery = _recover_evidence_dispatch(
+                    res.model_runner,
+                    evidence_recovery,
+                )
+                evidence_recovery, suspension = await self._aapply_recovered_model_outcome(
+                    state,
+                    res,
+                    session,
+                    evidence_recovery,
+                )
+                if suspension is None:
+                    if evidence_recovery is None:
+                        suspension = await self._apump_turn(state, res, session)
+                    else:
+                        suspension = await self._apump_turn(
+                            state,
+                            res,
+                            session,
+                            evidence_recovery=evidence_recovery,
+                        )
         except _CheckpointPersistError:
             # A failed safety checkpoint leaves activation ownership uncertain. Preserve the
             # last durable snapshot and let the lifecycle owner decide retry/recovery; converting
@@ -1704,6 +1947,8 @@ class AgentLoop:
             # state.messages (appended before the model call); the assistant reply was never
             # appended (success-only). The ONLY leftover to clear for an idempotent re-attempt
             # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
+            # Required-evidence recovery keeps them because it must reconstruct the exact settled
+            # request; its replay path suppresses their second append into the durable message log.
             state.provider_error_code = exc.provider_error_code
             state.provider_http_status = exc.http_status
             state.retryable = exc.retryable
@@ -1727,7 +1972,8 @@ class AgentLoop:
                 },
                 level="warning",
             )
-            state.pending_observations = ()
+            if exc.error_code != "evidence_uncommitted":
+                state.pending_observations = ()
             result = replace(
                 Suspension(reason="turn_failed", status="failed"),
                 error=public_error_message(str(exc)),
@@ -1756,11 +2002,20 @@ class AgentLoop:
                 data={"reason": "user_stop"},
                 level="info",
             )
-            state.pending_observations = ()
+            # A settled durable result interrupted before assistant-message application must replay
+            # the exact request on a None resume. Tool-follow-up observations are part of that
+            # request digest, so retain them until recovery applies the stored result. A fresh user
+            # turn clears them when it intentionally abandons that result above.
+            if _unapplied_settled_invocation(session, self.spec.run_id) is None:
+                state.pending_observations = ()
             # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
             # no later settle refuses to finalize this abandoned turn as a clean success.
             session.midturn_park = "interrupted"
-            result = Suspension(reason="interrupted", status="completed")
+            result = Suspension(
+                reason="interrupted",
+                status="completed",
+                model_tool_calls_pending=session.model_tool_calls_pending,
+            )
             self._persist_checkpoint(session, result)
             return result
         except TurnPaused:
@@ -2157,10 +2412,23 @@ class AgentLoop:
                     # stop that it had succeeded, and letting the completed-run cleanup
                     # delete the checkpoints the park preserved. They surface typed instead,
                     # after the same close() the absorbed case gets.
-                    if parked.reason != "turn_failed":
+                    if (
+                        parked.reason != "turn_failed"
+                        or parked.suspension.error_code == "evidence_uncommitted"
+                    ):
                         raise
         finally:
-            result = self.close()
+            # Required evidence is an unfinished durable commit barrier. One-shot convenience
+            # releases that committed park for another activation and lets TurnNotSettled escape;
+            # closing would promote it to a terminal failure that recovery rejects at entry.
+            session = self._session
+            evidence_recovery = (
+                _evidence_recovery(session, self.spec.run_id) if session is not None else None
+            )
+            if evidence_recovery is not None and evidence_recovery.blocks_new_input:
+                self.release_parked()
+            else:
+                result = self.close()
         return result
 
     async def aopen(self) -> None:
@@ -2289,6 +2557,7 @@ class AgentLoop:
         invocation_context: InvocationContext,
         step: int,
         turn_id: str,
+        abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
@@ -2416,6 +2685,7 @@ class AgentLoop:
                     if runner.lifecycle_hook is not None
                     else ""
                 ),
+                abort_after_recovery_probe=abort_after_recovery_probe,
             )
         except ModelCallAborted as exc:
             outcome_status = "interrupted"
@@ -2441,6 +2711,25 @@ class AgentLoop:
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "cancelled"
+            raise
+        except ModelEvidenceUncommitted as exc:
+            settled_stream = _settled_model_stream_outcome(exc)
+            if settled_stream is None:
+                # A durable provider refusal can also park on required evidence. It has no
+                # successful stream outcome to preserve, so it keeps the ordinary failure
+                # classification used before the projection lane was separated.
+                outcome_status = "failed"
+                outcome_final_text = "".join(output_fragments) or None
+                outcome_error_code = exc.error_code
+                outcome_retryable = exc.retryable is True
+                outcome_config_recoverable = exc.config_recoverable is True
+            else:
+                # Provider execution completed and only its required evidence projection failed.
+                # Close every presentation/private-content writer from the settled provider fact;
+                # the same exception still parks the run for sink-only recovery below this layer.
+                outcome_status = settled_stream.status
+                outcome_final_text = settled_stream.final_text
+                outcome_usage = settled_stream.usage
             raise
         except BaseException as exc:
             outcome_status = "failed"
@@ -2791,6 +3080,17 @@ class AgentLoop:
                 if session.last_model_invocation is not None
                 else None
             ),
+            plan=[dict(item) for item in res.context.plan],
+            pending_finish=(
+                {
+                    "summary": res.context.pending_finish.summary,
+                    "outputs": list(res.context.pending_finish.outputs),
+                    "notes": res.context.pending_finish.notes,
+                }
+                if res.context.pending_finish is not None
+                else None
+            ),
+            pending_tool_loads=list(res.context._requested_tool_loads),
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -3012,6 +3312,14 @@ class AgentLoop:
         res.context.subagent_usage = dict(cp.subagent_usage)
         res.context.skill_activation_count = cp.skill_activation_count
         res.context.skills_activated = list(cp.skills_activated)
+        res.context.plan = [dict(item) for item in cp.plan]
+        if cp.pending_finish is not None:
+            res.context.pending_finish = FinishResult(
+                summary=cp.pending_finish["summary"],
+                outputs=tuple(cp.pending_finish["outputs"]),
+                notes=cp.pending_finish["notes"],
+            )
+        res.context._requested_tool_loads = list(cp.pending_tool_loads)
         # Reinstall durable (approved) capability leases so a human-approved capability is not
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:
@@ -3088,6 +3396,15 @@ class AgentLoop:
                 if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
             },
             last_model_invocation=restored_invocation,
+            model_tool_calls_pending=bool(
+                isinstance(cp.last_suspension, Mapping)
+                and cp.last_suspension.get("model_tool_calls_pending") is True
+            ),
+            resume_checkpointed_model_step=bool(
+                res.model_runner.lifecycle_hook is not None
+                and cp.session_step > 0
+                and cp.last_suspension is None
+            ),
         )
         manager.restore_state(
             [
@@ -3647,6 +3964,335 @@ class AgentLoop:
         )
         state.previous_runtime_config = config
 
+    def _project_successful_model_turn(
+        self,
+        state: RunState,
+        res: _RunResources,
+        turn: ModelTurn,
+        runtime_config: AgentRuntimeConfig,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+        replayed_without_provider: bool,
+    ) -> None:
+        """Project one already-accounted successful provider outcome into run state."""
+
+        state.previous_turn_handle = turn.response_id or state.previous_turn_handle
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": turn.final_text or "",
+            "tool_calls": [call.__dict__ for call in turn.tool_calls],
+        }
+        # A recovered private result does not retain the original provider/model coordinates.
+        # Omitting its replay-only reasoning tag is safer than attributing encrypted artifacts to
+        # today's adapter after configuration drift. The canonical durable result still retains
+        # those private items for audit and integrity verification.
+        if turn.reasoning and not replayed_without_provider:
+            provider_name = getattr(self.model_adapter, "provider_name", None)
+            if provider_name:
+                assistant_message["reasoning"] = {
+                    "provider": provider_name,
+                    "model": (runtime_config.model or ModelConfig()).model,
+                    "items": [dict(item) for item in turn.reasoning],
+                }
+        state.messages.append(normalize_json_ingress(assistant_message))
+        projected_usage = {} if replayed_without_provider else turn.usage
+        res.recorder.transcript(
+            {
+                "kind": "model_turn",
+                "step": step,
+                "response_id": turn.response_id,
+                "final_text": turn.final_text,
+                "tool_calls": [call.__dict__ for call in turn.tool_calls],
+                "usage": projected_usage,
+                "provider_retried": turn.provider_retried,
+            }
+        )
+        res.recorder.emit(
+            "model.turn.finished",
+            turn_id=turn_id,
+            parent_id=parent_id,
+            data={
+                "step": step,
+                "response_id": (
+                    public_identifier(turn.response_id)
+                    if turn.response_id
+                    else turn.response_id
+                ),
+                "tool_calls": len(turn.tool_calls),
+                "has_final": bool(turn.final_text),
+                "usage": projected_usage,
+            },
+        )
+
+    def _record_failed_model_turn(
+        self,
+        res: _RunResources,
+        *,
+        step: int,
+        exc: ModelAdapterError,
+        usage: Mapping[str, int],
+    ) -> None:
+        """Write the single canonical transcript shape for a failed model turn."""
+
+        res.recorder.transcript(
+            {
+                "kind": "model_turn",
+                "step": step,
+                "response_id": None,
+                "final_text": None,
+                "tool_calls": [],
+                "usage": usage,
+                "error": str(exc),
+                "error_code": exc.error_code,
+                "provider_error_code": exc.provider_error_code,
+                "retryable": exc.retryable,
+                "http_status": exc.http_status,
+                "config_recoverable": exc.config_recoverable,
+                "provider_retried": exc.provider_retried,
+            }
+        )
+
+    @staticmethod
+    def _apply_model_final_text(state: RunState, turn: ModelTurn) -> None:
+        """Apply model-authored terminal text and its provenance in one place."""
+
+        state.final_text = turn.final_text or ""
+        state.final_text_is_model_output = True
+        state.pending_observations = ()
+
+    async def _aapply_recovered_model_outcome(
+        self,
+        state: RunState,
+        res: _RunResources,
+        session: _Session,
+        recovery: _EvidenceRecovery,
+    ) -> tuple[_EvidenceRecovery | None, Suspension | None]:
+        """Apply stored model evidence before any current request-building dependency runs."""
+
+        recovered = recovery.recovered_dispatch
+        if recovered is None:
+            raise DurableModelCallError(
+                "stored model outcome recovery state is incomplete",
+                error_code="durable_invocation_recovery_missing",
+            )
+        step = recovery.step
+        turn_id = f"turn_{step:04d}"
+        if recovery.outcome_projected:
+            parent_id = None
+        else:
+            turn_started = res.recorder.emit(
+                "model.turn.started",
+                turn_id=turn_id,
+                data={
+                    "step": step,
+                    "previous_turn_handle": (
+                        public_identifier(state.previous_turn_handle)
+                        if state.previous_turn_handle
+                        else state.previous_turn_handle
+                    ),
+                },
+            )
+            parent_id = turn_started.event_id
+        session.active_turn_id = turn_id
+        session.active_turn_parent_id = parent_id
+
+        try:
+            call_receipt = _recovered_receipt(ModelCallReceipt(), recovered)
+        except DurableModelCallError as exc:
+            mark_recovered_model_usage(exc, recovered.receipt)
+            raise
+        already_accounted_usage = _accounted_evidence_usage(
+            recovery,
+            recovery.invocation.logical_call_id,
+        )
+        # Settlement owns billing before content projection owns the assistant turn. A stop that
+        # wins at the boundary below therefore persists the paid call in total_usage, and replay
+        # sees the same receipt as already accounted instead of dropping it. Required-evidence
+        # parks already charged this receipt, so their delta is empty and remains idempotent.
+        self._account_model_usage(
+            call_receipt.usage,
+            res.recorder,
+            state,
+            res.context,
+            step=step,
+            turn_id=turn_id,
+            parent_id=parent_id,
+            already_accounted_usage=already_accounted_usage,
+        )
+        # Evidence is fenced and billing is owned before terminal stop/deadline can preempt result
+        # application. No runtime config, context provider, tool provider, surface resolver,
+        # prompt builder, or media resolver runs in between.
+        self._check_run_boundary(res.deadline)
+        if recovery.outcome_projected and recovered.failure_code:
+            raise DurableModelCallError(
+                "projected model outcome recovery restored a failure",
+                error_code="durable_invocation_recovery_conflict",
+            )
+        if recovered.failure_code:
+            recovered_error = ModelDispatchRefused(
+                "durable model dispatch restored a settled refusal",
+                error_code=recovered.failure_code,
+                provider_error_code=call_receipt.provider_error_code,
+                retryable=call_receipt.retryable,
+                config_recoverable=call_receipt.config_recoverable,
+                http_status=call_receipt.http_status,
+                provider_retried=call_receipt.provider_retried,
+            )
+            mark_provider_usage(recovered_error, call_receipt.usage)
+            usage_delta = _usage_delta(call_receipt.usage, already_accounted_usage)
+            self._record_failed_model_turn(
+                res,
+                step=step,
+                exc=recovered_error,
+                usage=usage_delta,
+            )
+            self._account_billed_model_call(
+                recovered_error,
+                res.recorder,
+                state,
+                res.context,
+                step=step,
+                turn_id=turn_id,
+                parent_id=parent_id,
+                already_accounted_usage=already_accounted_usage,
+            )
+            _replace_provider_usage_projection(recovered_error, usage_delta)
+            raise recovered_error
+
+        try:
+            turn = durable_model_turn(recovered.result_blob)  # type: ignore[arg-type]
+        except DurableModelCallError as exc:
+            mark_recovered_model_usage(exc, recovered.receipt)
+            raise
+        if not _recovered_result_matches_evidence(turn, recovered.receipt):
+            recovery_error = DurableModelCallError(
+                "durable model result conflicts with its receipt",
+                error_code="durable_invocation_result_corrupt",
+            )
+            mark_recovered_model_usage(recovery_error, recovered.receipt)
+            raise recovery_error
+        original_config = state.previous_runtime_config or AgentRuntimeConfig(
+            definition_id="recovered-model-outcome"
+        )
+        if not recovery.outcome_projected:
+            self._project_successful_model_turn(
+                state,
+                res,
+                turn,
+                original_config,
+                step=step,
+                turn_id=turn_id,
+                parent_id=parent_id,
+                replayed_without_provider=True,
+            )
+        elif not turn.tool_calls:
+            raise DurableModelCallError(
+                "projected model outcome recovery has no pending tool calls",
+                error_code="durable_invocation_recovery_conflict",
+            )
+
+        if turn.tool_calls:
+            if recovery.outcome_projected:
+                durable_calls = {call.id: call.name for call in turn.tool_calls}
+                completed_call_ids = [
+                    observation.call_id for observation in state.pending_observations
+                ]
+                if (
+                    len(durable_calls) != len(turn.tool_calls)
+                    or len(set(completed_call_ids)) != len(completed_call_ids)
+                    or any(
+                        durable_calls.get(observation.call_id) != observation.tool_name
+                        for observation in state.pending_observations
+                    )
+                ):
+                    raise DurableModelCallError(
+                        "projected model tool progress conflicts with its stored result",
+                        error_code="durable_invocation_recovery_conflict",
+                    )
+            if not recovery.outcome_projected:
+                # The recovered model turn consumed these inputs. From this point the durable
+                # pending observations are only completed outputs of its tool calls.
+                state.pending_observations = ()
+            session.model_tool_calls_pending = True
+            return (
+                replace(
+                    recovery,
+                    recovered_turn=turn,
+                    recovered_receipt=call_receipt,
+                    turn_parent_id=parent_id,
+                    outcome_projected=True,
+                ),
+                None,
+            )
+        if res.context.job_manager.has_resume_jobs():
+            state.pending_observations = ()
+            external = res.context.job_manager.external_pending_task_ids()
+            return (
+                None,
+                Suspension(
+                    reason="awaiting_tasks",
+                    status=state.status,  # type: ignore[arg-type]
+                    awaiting_task_ids=tuple(external),
+                    has_external=bool(external),
+                ),
+            )
+        if turn.final_text or turn.stop_reason in ("refusal", "length"):
+            self._apply_model_final_text(state, turn)
+            decision = await self._decide_settle(
+                state,
+                res,
+                res.context,
+                turn,
+                original_config,
+            )
+            settled = self._apply_settle(
+                decision,
+                state,
+                res,
+                res.context,
+                from_finish=False,
+            )
+            return (None, settled)
+        raise ModelAdapterError("model returned neither final text nor tool calls")
+
+    def _account_model_usage(
+        self,
+        aggregate_usage: Mapping[str, int],
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+        already_accounted_usage: Mapping[str, int] | None = None,
+    ) -> dict[str, int]:
+        """The one route a settled or failed model call's spend takes into run totals.
+
+        Successful settlement and exceptional exit used to account in separate places. That made
+        assistant projection own successful billing, so a post-settlement interrupt could persist
+        a replayable invocation before its usage reached the checkpoint. Billing now commits to
+        RunState directly from the authoritative aggregate receipt before any result-application
+        boundary. Failure wrappers feed the same function from their exception-carried receipt.
+
+        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
+        the totals moved, so the cumulative meter moves at the same ownership point.
+        """
+
+        billed = _usage_delta(
+            aggregate_usage,
+            already_accounted_usage or {},
+        )
+        if not billed:
+            return {}
+        _accumulate_usage_mapping(state.total_usage, billed)
+        self._emit_metrics_updated(
+            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
+        )
+        return billed
+
     def _account_billed_model_call(
         self,
         exc: BaseException,
@@ -3657,30 +4303,20 @@ class AgentLoop:
         step: int,
         turn_id: str,
         parent_id: str | None,
+        already_accounted_usage: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
-        """The one route a failed model call's already-billed spend takes into the run's totals.
+        """Account the aggregate provider usage carried by an escaping call exception."""
 
-        Two arms end a model call by re-raising, and the accounting was written into one of them.
-        A rule living inside a handler is a rule bound to the exception types that handler
-        catches: ``except ModelAdapterError`` covers a provider's refusal and nothing else, so a
-        run boundary -- which is a ``NativeAgentError`` and takes the next arm -- carried its
-        absorbed attempts' bill out of the loop with no one reading it. Written once here so the
-        arms cannot answer the question differently; each arm still decides whether it has a
-        transcript row to write, which is the part that genuinely differs between them.
-
-        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
-        the totals moved, and a meter that publishes only when a turn *settles* leaves a run whose
-        model calls all failed billed reporting a cost of zero.
-        """
-
-        billed = _billed_usage(exc)
-        if not billed:
-            return {}
-        _accumulate_usage_mapping(state.total_usage, billed)
-        self._emit_metrics_updated(
-            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
+        return self._account_model_usage(
+            _billed_usage(exc),
+            recorder,
+            state,
+            context,
+            step=step,
+            turn_id=turn_id,
+            parent_id=parent_id,
+            already_accounted_usage=already_accounted_usage,
         )
-        return billed
 
     def _emit_metrics_updated(
         self,
@@ -3734,7 +4370,12 @@ class AgentLoop:
         )
 
     async def _apump_turn(
-        self, state: RunState, res: _RunResources, session: _Session
+        self,
+        state: RunState,
+        res: _RunResources,
+        session: _Session,
+        *,
+        evidence_recovery: _EvidenceRecovery | None = None,
     ) -> Suspension:
         context = res.context
         recorder = res.recorder
@@ -3746,39 +4387,81 @@ class AgentLoop:
         # The per-submit step budget continues across task-wait suspensions within one
         # submit; session_step is the global, monotonic turn counter for turn ids.
         max_steps = self.spec.limits.max_steps
-        while session.submit_local_step < max_steps:
-            self._check_run_boundary(deadline)
+        evidence_recovery_step = (
+            evidence_recovery.step if evidence_recovery is not None else None
+        )
+        while (
+            evidence_recovery_step is not None
+            or session.resume_checkpointed_model_step
+            or session.submit_local_step < max_steps
+        ):
+            recovering_evidence = evidence_recovery_step is not None
+            resuming_checkpointed_step = (
+                not recovering_evidence and session.resume_checkpointed_model_step
+            )
+            outcome_already_projected = (
+                recovering_evidence
+                and evidence_recovery is not None
+                and evidence_recovery.outcome_projected
+            )
             # Cooperative pause is checked ONLY here, at the start of a step — never inside
             # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
             # tool results sit in state.pending_observations not-yet-sent, so a paused park is
             # clean and a None re-pump resumes the same turn without losing or double-sending them.
-            if self._pause_requested:
-                raise TurnPaused("turn paused")
-            session.submit_local_step += 1
-            local_step = session.submit_local_step
-            session.session_step += 1
-            step = session.session_step
-            background_observations = self._pop_background_observations(
-                context, recorder, step, state
+            # Required-evidence recovery completes the model step that already dispatched and
+            # settled. A cooperative pause therefore lands at the next ordinary step boundary,
+            # exactly as it would when requested after an in-flight model call had started.
+            # Preempting here would replace the durable evidence-recovery marker with a generic
+            # paused suspension and strand the stored result.
+            if not recovering_evidence and not resuming_checkpointed_step:
+                self._check_run_boundary(deadline)
+                if self._pause_requested:
+                    raise TurnPaused("turn paused")
+            else:
+                if recovering_evidence:
+                    step = evidence_recovery_step
+                    evidence_recovery_step = None
+                else:
+                    # ``last_suspension=None`` on the restored durable checkpoint proves that
+                    # this coordinate was allocated inside an unfinished pump. Reuse it once.
+                    # ModelCallRunner probes the authoritative journal before honoring terminal
+                    # boundaries; when no journal head exists, its pre-dispatch abort gate still
+                    # prevents a cooperative stop from starting a new provider call.
+                    step = session.session_step
+                    session.resume_checkpointed_model_step = False
+                local_step = session.submit_local_step
+            if not recovering_evidence and not resuming_checkpointed_step:
+                session.submit_local_step += 1
+                local_step = session.submit_local_step
+                session.session_step += 1
+                step = session.session_step
+            background_observations = (
+                ()
+                if recovering_evidence
+                else self._pop_background_observations(context, recorder, step, state)
             )
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
             turn_id = f"turn_{step:04d}"
-            turn_started = recorder.emit(
-                "model.turn.started",
-                turn_id=turn_id,
-                data={
-                    "step": step,
-                    # Same provenance as `response_id`: this *is* a previous one, echoed back.
-                    "previous_turn_handle": (
-                        public_identifier(state.previous_turn_handle)
-                        if state.previous_turn_handle
-                        else state.previous_turn_handle
-                    ),
-                },
-            )
+            if recovering_evidence and evidence_recovery is not None:
+                turn_parent_id = evidence_recovery.turn_parent_id
+            else:
+                turn_started = recorder.emit(
+                    "model.turn.started",
+                    turn_id=turn_id,
+                    data={
+                        "step": step,
+                        # Same provenance as `response_id`: this *is* a previous one, echoed back.
+                        "previous_turn_handle": (
+                            public_identifier(state.previous_turn_handle)
+                            if state.previous_turn_handle
+                            else state.previous_turn_handle
+                        ),
+                    },
+                )
+                turn_parent_id = turn_started.event_id
             session.active_turn_id = turn_id
-            session.active_turn_parent_id = turn_started.event_id
+            session.active_turn_parent_id = turn_parent_id
             turn_context = self._turn_context(state, res, step, max(0, max_steps - local_step))
             turn_registry = self._registry_for_turn(context, turn_context, res)
             runtime_config = self._current_runtime_config(turn_registry)
@@ -3797,7 +4480,7 @@ class AgentLoop:
                 config=runtime_config,
                 step=step,
                 turn_id=turn_id,
-                parent_id=turn_started.event_id,
+                parent_id=turn_parent_id,
             )
             pending_binding_loads = state.pending_binding_loads
             surface_snapshot = validate_tool_surface_snapshot(
@@ -3825,7 +4508,7 @@ class AgentLoop:
                 recorder.emit(
                     "tool.surface.updated",
                     turn_id=turn_id,
-                    parent_id=turn_started.event_id,
+                    parent_id=turn_parent_id,
                     data=surface_snapshot.to_public_json(),
                 )
             state.previous_surface_snapshot = surface_snapshot
@@ -3914,7 +4597,7 @@ class AgentLoop:
                     recorder.emit(
                         "tool.surface.updated",
                         turn_id=turn_id,
-                        parent_id=turn_started.event_id,
+                        parent_id=turn_parent_id,
                         data=refreshed_surface_snapshot.to_public_json(),
                     )
                     state.previous_surface_snapshot = refreshed_surface_snapshot
@@ -3967,13 +4650,19 @@ class AgentLoop:
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
                 state.messages.append(normalize_json_ingress(user_message))
-            for observation in state.pending_observations:
-                state.messages.append(_observation_message(observation, state.media_blobs))
+            if not recovering_evidence:
+                for observation in state.pending_observations:
+                    state.messages.append(_observation_message(observation, state.media_blobs))
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
             # log is never sent or re-persisted.
-            log_limit_code = self._message_log_limit_exceeded(state)
+            # Evidence-only replay invokes no provider and consumes no new run budget. Finish
+            # projecting the already-paid, settled invocation even when that invocation pushed
+            # the run past a limit; the limit applies again at the next ordinary model step.
+            log_limit_code = (
+                None if recovering_evidence else self._message_log_limit_exceeded(state)
+            )
             if log_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the conversation size limit."
@@ -3989,7 +4678,7 @@ class AgentLoop:
             # Token budget: checked before the turn against the accumulated API-reported
             # usage of prior turns, so once a cap is crossed the run settles rather than
             # starting (and paying for) another turn.
-            token_limit_code = self._token_budget_exceeded(state)
+            token_limit_code = None if recovering_evidence else self._token_budget_exceeded(state)
             if token_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the token budget."
@@ -4002,7 +4691,11 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=token_limit_code,
                 )
-            delta_limit_code = self._workspace_delta_limit_exceeded(res.workspace)
+            delta_limit_code = (
+                None
+                if recovering_evidence
+                else self._workspace_delta_limit_exceeded(res.workspace)
+            )
             if delta_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the workspace change size limit."
@@ -4028,8 +4721,12 @@ class AgentLoop:
             # seam every request is built through, so the prune binds all of them: the sync
             # facade runs this same coroutine, and the streaming path builds its request from
             # this same ``wire_messages``.
-            wire_messages = prune_dead_reasoning(state.messages)
-            if getattr(self.model_adapter, "supports_multimodal", False):
+            request: ModelRequest | None = None
+            if not outcome_already_projected:
+                wire_messages = prune_dead_reasoning(state.messages)
+            if not outcome_already_projected and getattr(
+                self.model_adapter, "supports_multimodal", False
+            ):
                 # Tool-result image eviction runs on the by-reference copy BEFORE resolution,
                 # so dropped images are never read/encoded. Off unless a keep-N is configured.
                 evicted = 0
@@ -4056,7 +4753,9 @@ class AgentLoop:
                 # The resolved payload (inline base64) is the real size risk — the durable
                 # by-reference log stays tiny. Guard it separately so an oversized media turn
                 # settles ``limited`` instead of being sent.
-                wire_limit_code = self._wire_bytes_exceeded(wire_messages)
+                wire_limit_code = (
+                    None if recovering_evidence else self._wire_bytes_exceeded(wire_messages)
+                )
                 if wire_limit_code is not None:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching the model request size limit."
@@ -4069,33 +4768,64 @@ class AgentLoop:
                         final_text=state.final_text,
                         error_code=wire_limit_code,
                     )
-            request = ModelRequest(
-                instruction=instruction,
-                system_prompt=turn_system_prompt,
-                tools=surface_snapshot.immediate_tools,
-                previous_turn_handle=state.previous_turn_handle,
-                observations=state.pending_observations,
-                model=runtime_config.model or ModelConfig(),
-                messages=wire_messages,
-            )
-            recorder.transcript(
-                {
-                    "kind": "model_request",
-                    "step": step,
-                    "previous_turn_handle": state.previous_turn_handle,
-                    "observations": [obs.__dict__ for obs in state.pending_observations],
-                    "tool_surface_hash": surface_snapshot.surface_hash,
-                }
-            )
-            try:
-                turn, call_receipt = await self._acall_model(
-                    request,
-                    deadline,
-                    res.model_runner,
-                    invocation_context=self._model_invocation_context(turn_id),
-                    step=step,
-                    turn_id=turn_id,
+            if not outcome_already_projected:
+                request = ModelRequest(
+                    instruction=instruction,
+                    system_prompt=turn_system_prompt,
+                    tools=surface_snapshot.immediate_tools,
+                    previous_turn_handle=state.previous_turn_handle,
+                    observations=state.pending_observations,
+                    model=runtime_config.model or ModelConfig(),
+                    messages=wire_messages,
                 )
+            logical_call_id = (
+                logical_model_call_id(self.spec.run_id, turn_id)
+                if res.model_runner.lifecycle_hook is not None
+                else ""
+            )
+            already_accounted_usage = (
+                _accounted_evidence_usage(evidence_recovery, logical_call_id)
+                if logical_call_id
+                else {}
+            )
+            if request is not None:
+                recorder.transcript(
+                    {
+                        "kind": "model_request",
+                        "step": step,
+                        "previous_turn_handle": state.previous_turn_handle,
+                        "observations": [obs.__dict__ for obs in state.pending_observations],
+                        "tool_surface_hash": surface_snapshot.surface_hash,
+                    }
+                )
+            try:
+                if outcome_already_projected:
+                    if (
+                        evidence_recovery is None
+                        or evidence_recovery.recovered_turn is None
+                        or evidence_recovery.recovered_receipt is None
+                    ):
+                        raise DurableModelCallError(
+                            "stored model outcome recovery state is incomplete",
+                            error_code="durable_invocation_recovery_missing",
+                        )
+                    turn = evidence_recovery.recovered_turn
+                    call_receipt = evidence_recovery.recovered_receipt
+                else:
+                    if request is None:
+                        raise DurableModelCallError(
+                            "model request was not built for provider dispatch",
+                            error_code="durable_invocation_recovery_missing",
+                        )
+                    turn, call_receipt = await self._acall_model(
+                        request,
+                        deadline,
+                        res.model_runner,
+                        invocation_context=self._model_invocation_context(turn_id),
+                        step=step,
+                        turn_id=turn_id,
+                        abort_after_recovery_probe=resuming_checkpointed_step,
+                    )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -4105,22 +4835,14 @@ class AgentLoop:
                 # never reaches the accumulation below. Counted here, or the cumulative token
                 # budget silently under-counts every refused call and the metrics report a run
                 # cheaper than it was.
-                recorder.transcript(
-                    {
-                        "kind": "model_turn",
-                        "step": step,
-                        "response_id": None,
-                        "final_text": None,
-                        "tool_calls": [],
-                        "usage": dict(_billed_usage(exc)),
-                        "error": str(exc),
-                        "error_code": exc.error_code,
-                        "provider_error_code": exc.provider_error_code,
-                        "retryable": exc.retryable,
-                        "http_status": exc.http_status,
-                        "config_recoverable": exc.config_recoverable,
-                        "provider_retried": exc.provider_retried,
-                    }
+                self._record_failed_model_turn(
+                    res,
+                    step=step,
+                    exc=exc,
+                    usage=_usage_delta(
+                        _billed_usage(exc),
+                        already_accounted_usage,
+                    ),
                 )
                 self._account_billed_model_call(
                     exc,
@@ -4129,7 +4851,15 @@ class AgentLoop:
                     context,
                     step=step,
                     turn_id=turn_id,
-                    parent_id=turn_started.event_id,
+                    parent_id=turn_parent_id,
+                    already_accounted_usage=already_accounted_usage,
+                )
+                # The outer turn-failure event is a second projection of this attempt. Stamp the
+                # delta back onto the exception so it cannot publish the aggregate provider bill
+                # a second time during evidence-only recovery.
+                _replace_provider_usage_projection(
+                    exc,
+                    _usage_delta(_billed_usage(exc), already_accounted_usage),
                 )
                 raise
             except NativeAgentError as exc:
@@ -4148,7 +4878,8 @@ class AgentLoop:
                     context,
                     step=step,
                     turn_id=turn_id,
-                    parent_id=turn_started.event_id,
+                    parent_id=turn_parent_id,
+                    already_accounted_usage=already_accounted_usage,
                 )
                 raise
             except Exception as exc:
@@ -4182,7 +4913,8 @@ class AgentLoop:
                         context,
                         step=step,
                         turn_id=turn_id,
-                        parent_id=turn_started.event_id,
+                        parent_id=turn_parent_id,
+                        already_accounted_usage=already_accounted_usage,
                     )
                 raise
             except BaseException:
@@ -4195,77 +4927,40 @@ class AgentLoop:
                 # to an absent arm: an arm that does not exist records no decision, which is how
                 # the cancellation above went four rounds without one.
                 raise
+            if not outcome_already_projected:
+                # Provider settlement owns its bill before the stop/deadline boundary can persist
+                # an unapplied durable result. Content projection below owns the assistant message
+                # and call-specific transcript, not the cumulative spend.
+                self._account_model_usage(
+                    call_receipt.usage,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_parent_id,
+                    already_accounted_usage=already_accounted_usage,
+                )
             self._check_run_boundary(deadline)
-            # The receipt, not the turn: the two agree everywhere except under a retry layer,
-            # where the receipt's usage carries absorbed attempts' spend the turn cannot know
-            # about. The transcript row below keeps ``turn.usage`` -- the model's statement --
-            # so the reconciliation rule is: totals == transcript rows + absorbed spend, and
-            # the ledger's receipt is the per-call authority for both.
-            _accumulate_usage_mapping(state.total_usage, call_receipt.usage)
-            state.previous_turn_handle = turn.response_id or state.previous_turn_handle
-            # Append the assistant reply to the by-value log (text + any tool calls).
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": turn.final_text or "",
-                "tool_calls": [call.__dict__ for call in turn.tool_calls],
-            }
-            # Carry provider-native reasoning artifacts so they round-trip on the next turn
-            # (DX-13a). Tagged with provider+model so replay only happens against a matching
-            # adapter/model; non-reasoning adapters leave ``turn.reasoning`` empty (neutral seam).
-            if turn.reasoning:
-                provider_name = getattr(self.model_adapter, "provider_name", None)
-                if provider_name:
-                    assistant_message["reasoning"] = {
-                        "provider": provider_name,
-                        "model": (runtime_config.model or ModelConfig()).model,
-                        "items": [dict(item) for item in turn.reasoning],
-                    }
-            state.messages.append(normalize_json_ingress(assistant_message))
-            recorder.transcript(
-                {
-                    "kind": "model_turn",
-                    "step": step,
-                    # Raw. This is `transcript.jsonl`, the private full-payload replay artifact --
-                    # its neighbour `final_text` on the next line is the whole model answer. The
-                    # bound belongs on the *event* copy below, and putting it here also left
-                    # `model_request`'s `previous_turn_handle` unbounded sixty lines up, so the
-                    # private artifact was half-bounded and inconsistent with itself.
-                    "response_id": turn.response_id,
-                    "final_text": turn.final_text,
-                    "tool_calls": [call.__dict__ for call in turn.tool_calls],
-                    "usage": turn.usage,
-                    # Carried by ``ModelTurn`` and by the call receipt, and dropped here: the
-                    # replay artifact of a retried-then-successful call read as a clean single
-                    # attempt. Its failure twin above records the same fact.
-                    "provider_retried": turn.provider_retried,
-                }
-            )
-            recorder.emit(
-                "model.turn.finished",
-                turn_id=turn_id,
-                parent_id=turn_started.event_id,
-                data={
-                    "step": step,
-                    # Bounded: this arrives from the gateway, i.e. from outside the kernel's
-                    # trust boundary, and real ids are short. A compromised or buggy proxy
-                    # echoing an unbounded string onto the public stream is a channel no
-                    # review of *tool* arguments would ever look at.
-                    "response_id": public_identifier(turn.response_id)
-                    if turn.response_id
-                    else turn.response_id,
-                    "tool_calls": len(turn.tool_calls),
-                    "has_final": bool(turn.final_text),
-                    "usage": turn.usage,
-                },
-            )
-            self._emit_metrics_updated(
-                recorder,
-                state,
-                context,
-                step=step,
-                turn_id=turn_id,
-                parent_id=turn_started.event_id,
-            )
+            if not outcome_already_projected:
+                self._project_successful_model_turn(
+                    state,
+                    res,
+                    turn,
+                    runtime_config,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_parent_id,
+                    replayed_without_provider=False,
+                )
+
+            if turn.tool_calls:
+                if not outcome_already_projected:
+                    # The model already consumed the prior observations. Reuse this durable field
+                    # as an incremental journal of completed calls until the whole tool batch ends.
+                    state.pending_observations = ()
+                if res.model_runner.lifecycle_hook is not None or outcome_already_projected:
+                    session.model_tool_calls_pending = True
 
             if not turn.tool_calls:
                 if context.job_manager.has_resume_jobs():
@@ -4286,14 +4981,7 @@ class AgentLoop:
                 # refusal/truncation branch (output_refused / output_truncated), not the
                 # "neither text nor tool calls" error below.
                 if turn.final_text or turn.stop_reason in ("refusal", "length"):
-                    state.final_text = turn.final_text or ""
-                    # The model wrote this (or refused/was truncated, which is still its turn
-                    # speaking). Flagged even when the text is empty: provenance describes who
-                    # produced the value, not whether the value has anything in it.
-                    state.final_text_is_model_output = True
-                    # The model has consumed the pending observations and settled;
-                    # the next submit must not resend them alongside a new message.
-                    state.pending_observations = ()
+                    self._apply_model_final_text(state, turn)
                     decision = await self._decide_settle(state, res, context, turn, runtime_config)
                     settled = self._apply_settle(decision, state, res, context, from_finish=False)
                     if settled is None:
@@ -4301,8 +4989,11 @@ class AgentLoop:
                     return settled
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
-            observations: list[ToolObservation] = []
+            observations = list(state.pending_observations)
+            completed_call_ids = {observation.call_id for observation in observations}
             for call in turn.tool_calls:
+                if call.id in completed_call_ids:
+                    continue
                 self._check_run_boundary(deadline)
                 state.total_tool_calls += 1
                 if state.total_tool_calls > self.spec.limits.max_tool_calls:
@@ -4327,17 +5018,19 @@ class AgentLoop:
                     context=context,
                     recorder=recorder,
                     turn_id=turn_id,
-                    parent_id=turn_started.event_id,
+                    parent_id=turn_parent_id,
                     step=step,
                     side_effect_policy=side_effect_policy,
                     deadline=deadline,
                 )
                 observations.append(observation)
+                state.pending_observations = tuple(observations)
                 self._check_run_boundary(deadline)
             state.pending_binding_loads = _dedupe(
                 (*state.pending_binding_loads, *context.consume_tool_load_requests())
             )
             state.pending_observations = tuple(observations)
+            session.model_tool_calls_pending = False
 
             if context.pending_finish is not None:
                 # ``summary`` is an argument the model passed to the ``run.finish`` tool, so this is
@@ -5926,6 +6619,35 @@ def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, i
                 retryable=False,
             )
         total_usage[key] = total_usage.get(key, 0) + value
+
+
+def _usage_delta(
+    aggregate: Mapping[str, int],
+    already_accounted: Mapping[str, int],
+) -> dict[str, int]:
+    """Return the non-negative remainder of one recovered logical call's aggregate bill."""
+
+    delta: dict[str, int] = {}
+    for key in set(aggregate) | set(already_accounted):
+        current = aggregate.get(key, 0)
+        previous = already_accounted.get(key, 0)
+        if not portable_usage_value(current) or not portable_usage_value(previous):
+            raise NativeAgentError(
+                "durable model usage accounting evidence is malformed",
+                error_code="durable_invocation_usage_corrupt",
+            )
+        if current < previous:
+            raise NativeAgentError(
+                "durable model usage regressed across evidence recovery",
+                error_code="durable_invocation_usage_regressed",
+            )
+        # The first projection preserves provider-reported zero counters. On replay, a key
+        # already projected at zero has no delta and disappears with every other unchanged key.
+        if key in aggregate and key not in already_accounted:
+            delta[key] = current
+        elif current > previous:
+            delta[key] = current - previous
+    return delta
 
 
 def _dedupe(items: tuple[str, ...]) -> tuple[str, ...]:

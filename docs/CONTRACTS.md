@@ -166,11 +166,12 @@ The run lifecycle is:
   success it was; an acknowledged cancel is the operator's stronger verdict and
   wins over the unsettled promotion.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
-  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
-  park does not raise here: the closing `finally` promotes an unrecovered
-  `turn_failed` park to the terminal failure record, and that failed
-  `AgentRunResult` is the return value — for `turn_failed` only, the one park
-  absorbed; an `interrupted` or `paused` park still surfaces as
+  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, an ordinary recoverable
+  provider/config `turn_failed` park does not raise here: the closing `finally` promotes it
+  to the terminal failure record and returns that failed `AgentRunResult`.
+  `evidence_uncommitted` surfaces as `TurnNotSettled` after releasing the committed park
+  without terminalizing it, so another activation can complete sink-only recovery. An
+  `interrupted` or `paused` park also surfaces as
   `TurnNotSettled` after the same close, and that close records the honest
   outcome underneath the raise: `run.finished` carries `status="limited"`,
   `error_code="closed_unsettled"` (the turn never settled — a user stop is not
@@ -2348,6 +2349,15 @@ already represented in it. A crash inside an activation can redeliver effects th
 before a later checkpoint commit.
 `OR-12-DURABLE-SIDE-EFFECT` requires a stable idempotency key or durable outbox for those effects.
 
+A durable internal safety checkpoint with `last_suspension=null` records an activation in progress.
+When its model-step counter is already allocated, restore reuses that coordinate once before normal
+step advancement. The model-call lifecycle probes the authoritative invocation journal at the same
+logical-call ID. A settled head completes required evidence before request-digest validation or a
+terminal boundary; a missing head may proceed to a new dispatch under the ordinary boundary rules.
+This prevents recovery from querying step `N+1` while a settled step-`N` evidence obligation remains
+hidden. A streamed cooperative Stop can bar the new dispatch after the probe. One-shot calls keep
+their existing rule: an in-flight call completes before Stop reaches the next step boundary.
+
 **Division of responsibility:** the core defines *what* a checkpoint contains
 (`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
 stored by implementing `CheckpointStore`. Checkpoint I/O crosses the explicit store seam.
@@ -2834,6 +2844,85 @@ The concrete adapter is `monoid_agent_kernel.hosting.model_calls.FencedModelCall
 module path is explicit while stable hosting import expansion remains an M2 decision. It performs
 checked loads, monotonic revision writes, content-addressed result settlement, and writer-token
 fencing through the host-owned sink. It contains no database, queue, or Temporal runtime.
+
+### Model evidence delivery policy
+
+`AgentLoop.model_evidence_policy` selects one of three opt-in host delivery contracts:
+
+| Policy | Durable mutation | Failure result |
+|---|---|---|
+| `passive` | No additional host mutation. Existing `settled_sink` observers remain failure-contained. | The model result keeps its original classification. |
+| `required` | Commit the invocation first, then call `FencedRunSink.commit_model_evidence()` for that exact settled revision. | `Suspension(reason="turn_failed", error_code="evidence_uncommitted")` |
+| `outbox` | Call `commit_invocation(..., stage_evidence=True)` so the settled revision and host-owned evidence outbox entry share one transaction. | A rejected settlement follows the existing `dispatch_unknown` path. |
+
+`required` and `outbox` need `run_sink` plus `writer_token`. `outbox` also needs the sink to
+declare `transactional_outbox=True`; configuration fails before the run opens when that guarantee
+is absent. The core defines the atomic mutation flag. The host owns the outbox schema, poller,
+backoff, dead-letter handling, and destination credentials.
+
+An invocation settlement remains authoritative when a later required evidence commit fails.
+The first reservation persists `DurableModelInvocation.evidence_policy`, and every invocation
+revision and retry preserves the same `passive | required | outbox` value. Settlement and the
+delivery obligation therefore share the authoritative invocation journal transaction. A crash after
+settlement commit and before evidence delivery or checkpoint publication leaves enough durable state
+for a replacement activation to finish required delivery, even when that activation uses the
+passive default. An outbox reservation also survives replacement: the lifecycle verifies
+transactional outbox capability before provider redispatch and stages evidence in the later
+settlement transaction. Explicit non-passive policy drift fails before provider entry.
+Recovery commits the journal-required evidence before comparing the settled request digest with a
+request rebuilt from replacement runtime config or dynamic context. Request drift may still stop
+result application, and it cannot strand the required sink delivery.
+
+Recovery uses the journal obligation or the checkpointed logical-call ID and request digest to
+re-commit the exact invocation revision and required evidence before it reads current runtime
+config, context providers, tool surface, or media. It then applies a stored success or final refusal
+to loop state before those current request-building dependencies run. A recovered final settles
+from the stored outcome; a recovered tool-call turn enters the canonical message log before current
+tool resolution and execution setup. Runtime-config drift cannot block evidence delivery or
+application of the stored outcome. The provider call count does not increase. Passive model-I/O
+observers and requested model-call sidecars receive the authoritative call during its original
+settlement, including when required evidence fails afterward. Evidence recovery does not publish
+the passive call a second time. A successful provider result closes live model-stream observers
+and `model-content.jsonl` as `completed` with its normalized final text and usage before the run
+parks on `evidence_uncommitted`; the projection failure preserves the paid stream's settled state.
+A settled provider refusal retains the failed stream classification. The checkpoint marker sets
+`ModelDispatchRecoveryQuery.require_evidence=True` as a second recovery path for an already
+published evidence park.
+An explicitly configured non-passive policy cannot change an existing invocation's stored policy.
+Recovery returns `durable_invocation_evidence_policy_conflict` before evidence mutation; reservation
+recovery returns the same conflict before provider entry. The passive replacement-host default
+defers to a stored `required` or `outbox` policy. Start a new logical call to adopt a different
+policy. A durable checkpoint marker may complete a requirement established by the prerelease
+boolean record because the marker survives every later recovery attempt.
+`run_once()` releases this durable park and surfaces `TurnNotSettled` instead of closing it into a
+terminal checkpoint. Repeated evidence parks, transcript
+rows, and public events carry only the non-negative usage delta beyond the amount already projected
+by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
+no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.
+Every authoritative settled receipt enters `RunState.total_usage` and the cumulative metrics lane
+before stop or deadline can preempt assistant-result application. An interruption checkpoint can
+therefore carry an unapplied settled invocation, and it already carries that invocation's bill.
+Resume applies the stored result with a zero usage delta and does not call the provider again.
+
+An interrupt may arrive after a recovered assistant tool-call turn enters the canonical message
+log and before all of its tools finish. The interruption suspension persists
+`model_tool_calls_pending=true`. `pending_observations` then carries the completed calls in that
+batch. A `None` resume reloads the same settled model result, recognizes the already-projected
+assistant turn, skips tool call IDs with completed observations, and executes the remaining calls.
+The assistant turn is never appended twice. New user input is rejected with
+`evidence_recovery_requires_resume` until a `None` resume completes the pending tool exchange.
+The same checkpoint carries the context-owned plan, pending `run.finish` value, and unconsumed
+`tool.search` binding loads. A process-level restore therefore reconstructs these kernel effects
+before it skips calls with completed observations. Tool handlers still need stable external
+idempotency for process loss before a call returns an observation.
+
+`core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
+`TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects
+`dispatch_unknown` to `after_reconciliation`. The projection copies safe taxonomy fields and
+opaque references; it has no raw prompt, model output, reasoning, replay body, or exception-text
+field.
+Run-limit exhaustion projects to `TerminalOutcome(kind="limited",
+retry_eligibility="forbidden")`. Cooperative pause and task-wait boundaries project to `paused`.
 
 ## Run Artifacts
 

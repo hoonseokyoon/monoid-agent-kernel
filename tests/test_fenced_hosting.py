@@ -152,6 +152,7 @@ def test_fake_has_the_composite_protocol_shape_without_legacy_mutations() -> Non
     assert checkpoint_store.capabilities.lease_fencing is True
     assert callable(checkpoint_store.commit_checkpoint)
     assert callable(sink.commit_invocation)
+    assert callable(sink.commit_model_evidence)
     assert callable(sink.append_event)
     assert callable(sink.settle_terminal)
     assert not hasattr(sink, "put")
@@ -161,11 +162,14 @@ def test_fake_has_the_composite_protocol_shape_without_legacy_mutations() -> Non
 def test_public_protocol_annotations_resolve_at_runtime() -> None:
     checkpoint_hints = get_type_hints(FencedCheckpointStore.commit_checkpoint)
     invocation_hints = get_type_hints(FencedRunSink.commit_invocation)
+    evidence_hints = get_type_hints(FencedRunSink.commit_model_evidence)
 
     assert checkpoint_hints["writer_token"] is WriterToken
     assert checkpoint_hints["return"] is CommitResult
     assert invocation_hints["writer_token"] is WriterToken
     assert invocation_hints["return"] is CommitResult
+    assert evidence_hints["writer_token"] is WriterToken
+    assert evidence_hints["return"] is CommitResult
 
 
 def test_local_fs_capability_annotation_resolves_at_runtime() -> None:
@@ -325,6 +329,57 @@ def test_stale_invocation_retry_is_fenced_before_content_comparison() -> None:
     assert first.status == "committed"
     assert fenced == CommitResult(status="fenced")
     assert current_repeat.status == "already_committed"
+
+
+def test_model_evidence_is_idempotent_and_fenced_against_the_authoritative_settlement() -> None:
+    harness = DeterministicFencedRunHarness()
+    run_id = "run-model-evidence"
+    stale = _commit_through_settled(harness, run_id, retryable=False, succeeded=True)
+    loaded = harness.sink.load_invocation(run_id, "call-1")
+    assert loaded.ok and loaded.value is not None
+    settled = loaded.value.invocation
+
+    first = harness.sink.commit_model_evidence(settled, writer_token=stale)
+    repeated = harness.sink.commit_model_evidence(settled, writer_token=stale)
+    current = harness.claim_writer(run_id, "owner-b")
+    fenced = harness.sink.commit_model_evidence(settled, writer_token=stale)
+    current_repeat = harness.sink.commit_model_evidence(settled, writer_token=current)
+    conflict = harness.sink.commit_model_evidence(
+        replace(settled, receipt={**(settled.receipt or {}), "retryable": True}),
+        writer_token=current,
+    )
+
+    assert first.status == "committed"
+    assert repeated.status == "already_committed"
+    assert fenced.status == "fenced"
+    assert current_repeat.status == "already_committed"
+    assert conflict.status == "conflict"
+
+
+def test_transactional_outbox_stage_commits_with_the_settled_invocation() -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    run_id = "run-evidence-outbox"
+    token = harness.claim_writer(run_id, "owner-a")
+    reserved = _invocation(run_id, revision=1, state="reserved")
+    started = _invocation(run_id, revision=2, state="dispatch_started")
+    settled = _invocation(run_id, revision=3, state="settled", succeeded=True)
+    assert harness.sink.commit_invocation(reserved, {}, writer_token=token).status == "committed"
+    assert harness.sink.commit_invocation(started, {}, writer_token=token).status == "committed"
+
+    result = harness.sink.commit_invocation(
+        settled,
+        {_RESULT_BLOB_SHA256: _RESULT_BLOB},
+        writer_token=token,
+        stage_evidence=True,
+    )
+
+    assert result.status == "committed"
+    assert harness.sink.load_invocation(run_id, "call-1").value is not None
+    assert (run_id, "call-1", 3) in harness.sink._model_evidence_outbox
 
 
 def test_writer_token_cannot_cross_run_boundary() -> None:

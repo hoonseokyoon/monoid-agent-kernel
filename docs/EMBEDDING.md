@@ -192,6 +192,79 @@ The Reference inbox assembly realizes the activation and input rows with leases,
 command store, a recovery service, and a watchdog. A product-owned scheduler can realize the same
 obligations through different storage and recovery mechanisms.
 
+### Choose the model evidence delivery policy
+
+Hosted products that configure `AgentLoop(run_sink=..., writer_token=...)` also choose
+`model_evidence_policy`:
+
+- `passive` preserves the existing observer and sidecar behavior. Export failure does not alter the
+  model result.
+- `required` makes the public-safe evidence projection a checked post-settlement mutation. An
+  evidence failure parks as `evidence_uncommitted`; resume the same checkpoint without a new user
+  input. The loop reloads the settled invocation and retries the sink without calling the provider.
+- `outbox` asks the sink to stage evidence in the invocation-settlement transaction. Enable it only
+  on a sink that declares `transactional_outbox=True`. The host runs the sender and its retry or
+  dead-letter policy.
+
+Keep invocation settlement and evidence delivery in separate tables or record families for
+`required`. Make `commit_model_evidence()` fence-first, idempotent on
+`(run_id, logical_call_id, revision)`, and valid only for the current authoritative settled
+revision. Persist the invocation's `evidence_policy` enum in the same transaction as every
+invocation revision and preserve it across retries. A replacement worker must honor the journal
+policy even when its configured policy is `passive`; this covers a crash before an
+`evidence_uncommitted` checkpoint exists. Reject a `passive` to `required` policy change for an
+existing logical call before provider or evidence mutation. Apply the stronger policy to a new
+logical call. On recovery, deliver a journal-required settlement before validating a request digest
+rebuilt from replacement config or dynamic context. For `outbox`, reject the complete transaction
+when either
+the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
+violates the declared capability. A recovered outbox reservation remains outbox-owned, checks
+`transactional_outbox` before provider entry, and stages evidence at settlement even when the
+replacement activation uses the passive default.
+
+Treat a durable checkpoint whose `last_suspension` is null and whose model-step counter is positive
+as an in-progress internal checkpoint. Resume that allocated step once before advancing counters.
+The lifecycle then probes the same logical-call journal address, delivers any required evidence,
+and only enters a new provider dispatch when the head is missing. This rule covers a crash after an
+approval-replay safety checkpoint and after provider settlement but before an evidence-failure park.
+
+On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
+with the same run ID and a current writer token. The loop commits evidence from the stored logical
+call ID and request digest, then applies the stored success or final refusal before consulting the
+current request-building configuration. A recovered final settles immediately. A recovered
+tool-call turn enters the message log before the current tool surface is resolved for execution.
+Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
+model-call sidecars receive the authoritative call at the original settlement even when required
+evidence parks afterward; recovery does not duplicate that passive publication. Live model-stream
+observers and the private content sidecar close a settled provider success as `completed` with its
+final text and usage while the run separately parks for evidence recovery. The checkpoint
+marker and the authoritative invocation flag each force required delivery on the replacement
+activation even when its configured policy is `passive`. One-shot `run_once()` releases this
+committed park and raises `TurnNotSettled`; restore
+the checkpoint and resume with `None`. Treat
+`dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+The kernel accounts an authoritative settled receipt before a stop or deadline can park its result
+as unapplied. Persisted interruption checkpoints therefore include the paid usage even when the
+assistant turn remains absent; resume projects the stored result without adding that usage again.
+Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
+Let the driver decide whether to start a later model step.
+Evidence recovery is a commit barrier for a model step that already settled. The runner completes
+the fenced settlement/evidence mutation before applying a pending cancellation or expired deadline.
+An internal safety checkpoint taken after allocating step `N` and before a park restores step `N`
+once. Recovery queries that journal coordinate before incrementing either the run step or the
+submit-local step, so a crash before evidence delivery cannot strand the settled invocation behind
+step `N+1` or start a second paid call.
+An interrupt can still park before the recovered result is applied; a `None` resume reloads that
+same logical call with its checkpointed tool observations, while a new user input intentionally
+abandons the interrupted result. An interrupt after a recovered assistant tool-call turn is added
+to the message log persists `model_tool_calls_pending=true` and every completed observation. Resume
+with `None`: the loop reloads the settled result, skips completed call IDs, and executes the rest
+without adding a second assistant turn. The loop rejects new user input with
+`evidence_recovery_requires_resume` until this tool exchange completes. Give effectful tool handlers
+stable idempotency keys because a process can still disappear after an external effect and before
+its observation is returned. The interruption checkpoint restores the kernel-owned plan, pending
+`run.finish` value, and pending `tool.search` loads before completed call IDs are skipped.
+
 ## Model and tool wiring
 
 The offline examples inject a fake adapter, so no gateway is contacted. A hosted deployment places
@@ -372,6 +445,8 @@ state as operational diagnostics.
 | Lost task-secret response | Keep the secret absent from durable state and require explicit replacement. | Hosted golden path scans durable files for callback bearers. |
 | Gateway credential expiry | Mint a new scoped gateway token and keep provider keys at the gateway. | Gateway contract and token tests cover expiry and scope. |
 | Telemetry exporter failure | Drop, buffer, or retry telemetry without changing run semantics. | Event sink boundaries isolate exporter failure. |
+| Required model-evidence delivery failure | Commit the settled invocation, publish passive call records once, park as `evidence_uncommitted`, and redrive the same checkpoint. | Fenced recovery retries only `commit_model_evidence`; it applies the stored outcome before current request-building state and keeps provider and passive-record counts fixed. |
+| Transactional evidence outbox failure | Publish neither the settlement nor the outbox entry; close paid-call ambiguity through `dispatch_unknown`. | `transactional_outbox` capability gate and atomic-stage recovery tests cover the boundary. |
 
 ## Conformance and release gate
 

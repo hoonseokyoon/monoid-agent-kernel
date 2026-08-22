@@ -158,6 +158,40 @@ def test_model_invocation_round_trips_every_state_shape(
     assert DurableModelInvocation.from_json(invocation.to_json()) == invocation
 
 
+@pytest.mark.parametrize("evidence_policy", ["passive", "required", "outbox"])
+def test_model_invocation_round_trips_evidence_delivery_policy(evidence_policy: str) -> None:
+    invocation = _invocation(evidence_policy=evidence_policy)
+
+    checked = decode_model_invocation(invocation.to_json())
+
+    assert checked.status == "loaded"
+    assert checked.value == invocation
+    assert invocation.requires_evidence is (evidence_policy == "required")
+
+
+@pytest.mark.parametrize("legacy_required", [False, True])
+def test_model_invocation_reads_legacy_required_flag_as_policy(legacy_required: bool) -> None:
+    payload = _invocation().to_json()
+    del payload["evidence_policy"]
+    payload["requires_evidence"] = legacy_required
+
+    checked = decode_model_invocation(payload)
+
+    assert checked.status == "loaded"
+    assert checked.value is not None
+    assert checked.value.requires_evidence is legacy_required
+    assert checked.value.evidence_policy == ("required" if legacy_required else "passive")
+    assert checked.value.to_json()["evidence_policy"] == checked.value.evidence_policy
+    assert "requires_evidence" not in checked.value.to_json()
+
+
+def test_model_invocation_rejects_conflicting_legacy_evidence_alias() -> None:
+    payload = _invocation(evidence_policy="outbox").to_json()
+    payload["requires_evidence"] = True
+
+    assert decode_model_invocation(payload).status == "corrupt"
+
+
 def test_model_invocation_reads_legacy_namespace_and_writes_canonical_namespace() -> None:
     payload = _invocation().to_json()
     payload["schema_version"] = "native-agent-runner.model-invocation.v1"
@@ -228,6 +262,8 @@ def test_model_invocation_checked_reader_rejects_unknown_top_level_fields(
         {"request_digest": "private prompt"},
         {"digest_generation": ""},
         {"digest_generation": "request-v1"},
+        {"evidence_policy": 1},
+        {"evidence_policy": "transactional"},
         {"result_ref": 1},
         {"result_ref": "secret"},
         {"result_ref": "private result text"},
@@ -240,6 +276,17 @@ def test_model_invocation_rejects_invalid_identity_and_scalar_fields(
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
         _invocation(**changes)
+
+
+@pytest.mark.parametrize("legacy_required", [1, "true"])
+def test_model_invocation_reader_rejects_invalid_legacy_evidence_flag(
+    legacy_required: object,
+) -> None:
+    payload = _invocation().to_json()
+    del payload["evidence_policy"]
+    payload["requires_evidence"] = legacy_required
+
+    assert decode_model_invocation(payload).status == "corrupt"
 
 
 def test_model_invocation_rejects_unserializable_counter_magnitudes() -> None:

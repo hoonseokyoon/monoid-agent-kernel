@@ -108,6 +108,66 @@ out in commit messages and here.
   checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call
   counts at every recovery boundary.
 
+### Added — model evidence delivery policy
+
+- Added opt-in `passive`, `required`, and `outbox` model-evidence policies. Passive delivery keeps
+  the existing failure-contained `settled_sink`. Required delivery commits public-safe evidence
+  after the authoritative invocation settlement. Outbox delivery stages evidence with settlement
+  through `commit_invocation(..., stage_evidence=True)` and requires the sink's
+  `transactional_outbox` capability.
+- Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
+  The first durable reservation records its stable `passive | required | outbox` evidence policy in
+  every invocation revision. Settlement recovery honors that journal field independently of a
+  replacement host's passive default, closing the crash windows before either an evidence-failure
+  checkpoint or an outbox-staged settlement is published. The checked reader maps the earlier
+  prerelease `requires_evidence` boolean to `passive` or `required`; canonical writers emit the enum.
+  Journal-required recovery completes the fenced evidence mutation before checking a request digest
+  rebuilt from replacement config or dynamic context.
+  An activation cannot upgrade an existing passive invocation to required delivery; it fails before
+  provider or evidence mutation and applies the stronger policy to a new logical call.
+  An outbox reservation remains outbox-owned across worker replacement, validates transactional
+  outbox capability before redispatch, and stages evidence atomically at settlement even when the
+  replacement activation uses the passive default.
+  Recovery commits evidence from the stored logical-call ID and request digest before rebuilding
+  any runtime-dependent provider request. It applies the stored success or final refusal to loop
+  state before consulting current runtime config, context providers, tool surfaces, or media;
+  recovered tool calls enter the transcript before current tool execution setup. Stored outcomes
+  therefore survive config drift. Stored refusals are surfaced without an automatic paid retry.
+  Passive observers and requested model-call sidecars receive the original settled call once even
+  when required evidence parks the run; recovery does not republish it. Successful provider
+  streams close live observers and the private model-content sidecar as completed with settled
+  final text and usage while the run independently parks for evidence recovery. Settled provider
+  refusals retain their failed stream classification. Repeated evidence parks,
+  transcript rows, and public events carry only newly billable usage, preventing provider replay
+  and usage duplication. The durable recovery marker forces required delivery even when a new
+  activation is configured as passive. `run_once()` releases this park and raises
+  `TurnNotSettled` instead of promoting it to an unrecoverable terminal checkpoint. Model step
+  limits and cooperative pause cannot preempt this commit
+  barrier. Cancellation and deadline apply after the fenced evidence mutation; an interrupt before
+  result application retains the same logical call and its tool-follow-up observations for a
+  `None` resume. If the recovered assistant tool-call turn was already projected when an interrupt
+  lands, the interruption checkpoint marks that turn as pending and carries each completed tool
+  observation. A later `None` resume reloads the same settled result, skips completed stable call
+  IDs, executes the remaining calls, and appends no duplicate assistant turn. New user input is
+  rejected until this already-projected tool exchange completes. Checkpoints also carry the
+  context-owned plan, pending `run.finish` result, and pending `tool.search` loads, so skipping a
+  completed call after process restore preserves its kernel-owned effects.
+- Model-call usage now has one accounting owner for successful receipts and exception-carried
+  bills. A settled receipt updates cumulative usage and metrics before stop or deadline can persist
+  an unapplied result. Resume projects that stored result with a zero delta, preserving billing and
+  token-limit enforcement without a duplicate provider call.
+- A durable internal safety checkpoint now restores its already-allocated model-step coordinate
+  once before the pump advances. Recovery probes that same invocation journal head, completes any
+  required evidence obligation, and prevents a settled call from being hidden under the next
+  logical-call ID. Streamed cooperative Stop is polled after the recovery probe and before any new
+  provider dispatch; ordinary one-shot Stop semantics remain unchanged.
+- Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
+  to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
+  repeated required failure, settled provider refusal without paid continuation, multimodal stored
+  result replay, transactional outbox staging, atomic-stage rejection, and capability gates.
+  Run-limit exhaustion projects to the terminal `limited` kind with retry forbidden, preserving
+  its meaning separately from cooperative pause and task-wait boundaries.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path

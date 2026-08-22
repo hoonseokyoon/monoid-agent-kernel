@@ -68,6 +68,7 @@ from monoid_agent_kernel.core.model_io import (
     destination_digest,
     dispatch_model_call,
 )
+from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
@@ -75,6 +76,7 @@ from monoid_agent_kernel.errors import (
     ModelAdapterError,
     ModelCallAborted,
     ModelDispatchRefused,
+    ModelEvidenceUncommitted,
     RunCancelled,
     RunTimeout,
 )
@@ -160,6 +162,41 @@ class SettledModelCall:
     receipt: ModelCallReceipt
     request_preimage: bytes | None = None
     turn: Any | None = None
+
+
+_SETTLED_MODEL_STREAM_OUTCOME = "_monoid_settled_model_stream_outcome"
+
+
+def _carry_settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+    turn: ModelTurn,
+) -> None:
+    """Carry a successful provider stream across a required-evidence projection failure.
+
+    The exception still parks durable evidence recovery. This private in-process fact lets the
+    owning loop close live observers and the private content writer with the provider outcome
+    that already settled, instead of relabelling a paid success as a failed stream. The normalized
+    turn is the same source used by the ordinary successful return path.
+    """
+
+    setattr(
+        error,
+        _SETTLED_MODEL_STREAM_OUTCOME,
+        ModelStreamOutcome(
+            status="completed",
+            final_text=turn.final_text,
+            usage=turn.usage,
+        ),
+    )
+
+
+def _settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+) -> ModelStreamOutcome | None:
+    """Read only the private, typed success marker produced by this runner."""
+
+    outcome = getattr(error, _SETTLED_MODEL_STREAM_OUTCOME, None)
+    return outcome if isinstance(outcome, ModelStreamOutcome) else None
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
@@ -639,6 +676,7 @@ class ModelCallRunner:
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
         logical_call_id: str = "",
+        abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one call and return the turn with the receipt that describes it.
 
@@ -658,6 +696,11 @@ class ModelCallRunner:
         ``logical_call_id`` is required only when ``lifecycle_hook`` is configured. It is the
         caller-owned durable address of this call; standalone anonymous calls cannot invent a
         stable address across process restore.
+
+        ``abort_after_recovery_probe`` is the durable-resume seam for an already-started streamed
+        step. It polls ``should_abort`` once after authoritative recovery proves there is no
+        reusable outcome and before a new dispatch. The default preserves the ordinary contract:
+        one-shot calls never poll the streamed-call abort predicate before provider entry.
         """
 
         started = time.monotonic()
@@ -727,20 +770,12 @@ class ModelCallRunner:
                         "durable model calls require an explicit bounded logical_call_id",
                         error_code="durable_invocation_identity_required",
                     )
-                # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
-                # already been crossed, but by then the adapter has been invoked and the provider has
-                # been paid for work the run had already decided not to do. Checking here also covers
-                # the interval the caller cannot: building the receipt digests above happens between
-                # the caller's own boundary check and this line, so a deadline can expire in between.
-                #
-                # Durable mode performs synchronous reserve/start commits between this check and
-                # adapter entry. A boundary crossed during those commits is caught by the race once
-                # provider work starts; the host must keep those mutations bounded.
-                #
-                # Lifted out of `_adrive` so that refusing the call and dispatching it are
-                # distinguishable here; `_adrive` is called from nowhere else, so the check still
-                # exists once.
-                self._check_cancel_or_deadline(deadline)
+                # An ordinary call keeps the historical boundary precedence: cancellation or an
+                # expired deadline refuses it before ingress normalization, keying, or adapter
+                # entry. Durable calls defer this check only long enough to probe and complete an
+                # existing authoritative settlement/evidence barrier below.
+                if lifecycle_hook is None:
+                    self._check_cancel_or_deadline(deadline)
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -836,6 +871,11 @@ class ModelCallRunner:
                         request_digest=receipt.request_digest,
                     )
                     if recovered is not None:
+                        # The recovery hook performs the fenced, idempotent settlement/evidence
+                        # commit and invokes no provider. Let that commit barrier finish before a
+                        # terminal boundary wins; otherwise cancel or expiry can permanently strand
+                        # required evidence for a provider call that already settled.
+                        self._check_cancel_or_deadline(deadline)
                         object.__setattr__(
                             request,
                             "idempotency_key",
@@ -915,6 +955,22 @@ class ModelCallRunner:
                                 request_preimage=request_preimage,
                             )
                             return turn, settled
+                # Check immediately before any path can reserve or enter the adapter. Digesting and
+                # probing durable recovery above are local/idempotent work; every new provider
+                # dispatch remains barred once cancellation or the deadline has won.
+                self._check_cancel_or_deadline(deadline)
+                # Durable recovery above must run first so an already-settled required-evidence
+                # obligation cannot be stranded by a stop. Once that probe and every terminal
+                # boundary prove there is no reusable outcome, a cooperative turn stop bars
+                # reservation/provider entry too. The ordinary AgentLoop path checks this at its
+                # step boundary; this second gate covers a restored internal safety checkpoint
+                # that must reuse and probe its in-progress coordinate before honoring that signal.
+                if (
+                    abort_after_recovery_probe
+                    and should_abort is not None
+                    and should_abort()
+                ):
+                    raise ModelCallAborted("model call aborted before provider dispatch")
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is
@@ -1126,6 +1182,22 @@ class ModelCallRunner:
                         if crash_receipt.usage:
                             mark_provider_usage(exc, crash_receipt.usage)
                     raise
+                if isinstance(exc, ModelEvidenceUncommitted):
+                    # The paid dispatch and its canonical result/refusal are already settled.
+                    # Required evidence is a separate recovery lane. Passive subscribers and
+                    # sidecars still receive the authoritative provider outcome now, while the
+                    # original request/preimage is in hand; the projection failure itself never
+                    # becomes a fabricated model-call failure and never enters the retry loop.
+                    if durable_outcome_receipt is not None:
+                        with contextlib.suppress(Exception):
+                            self._publish(
+                                request,
+                                None,
+                                durable_outcome_receipt,
+                                elapsed_ms=durable_outcome_receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
+                    raise
                 if recovered_failure_receipt is not None:
                     with contextlib.suppress(Exception):
                         self._publish(
@@ -1270,13 +1342,28 @@ class ModelCallRunner:
                         failure_code=result_error.error_code,
                         usage=durable_completed.usage,
                     )
-                settle_model_dispatch(
-                    lifecycle_hook,
-                    reservation,
-                    durable_completed,
-                    result_blob=result_blob,
-                    stream_committed=delivered,
-                )
+                try:
+                    settle_model_dispatch(
+                        lifecycle_hook,
+                        reservation,
+                        durable_completed,
+                        result_blob=result_blob,
+                        stream_committed=delivered,
+                    )
+                except ModelEvidenceUncommitted as evidence_error:
+                    # The success settlement is finalized after the provider try/except above.
+                    # Publish it here so passive observers and sidecars see the paid call even
+                    # though required evidence parks the loop before the ordinary publish below.
+                    _carry_settled_model_stream_outcome(evidence_error, turn)
+                    with contextlib.suppress(Exception):
+                        self._publish(
+                            request,
+                            turn,
+                            durable_completed,
+                            elapsed_ms=durable_completed.latency_ms,
+                            request_preimage=request_preimage,
+                        )
+                    raise
             settled = self._publish(
                 request,
                 turn,

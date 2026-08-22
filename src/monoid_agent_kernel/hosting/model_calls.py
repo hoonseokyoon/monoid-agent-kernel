@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from typing import NoReturn
 
-from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
-from monoid_agent_kernel.errors import DurableModelCallError
+from monoid_agent_kernel.core.model_invocation import (
+    DurableModelInvocation,
+    ModelEvidencePolicy,
+)
+from monoid_agent_kernel.errors import DurableModelCallError, ModelEvidenceUncommitted
 from monoid_agent_kernel.hosting.contracts import (
     CommitResult,
     FencedRunSink,
@@ -30,7 +34,12 @@ class FencedModelCallLifecycle:
 
     sink: FencedRunSink
     writer_token: WriterToken
+    evidence_policy: ModelEvidencePolicy = "passive"
     last_invocation: DurableModelInvocation | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.evidence_policy not in {"passive", "required", "outbox"}:
+            raise ValueError("model evidence policy is outside the portable vocabulary")
 
     def _load(self, logical_call_id: str) -> ModelInvocationRecord | None:
         try:
@@ -69,13 +78,23 @@ class FencedModelCallLifecycle:
         self,
         invocation: DurableModelInvocation,
         blobs: Mapping[str, bytes] | None = None,
+        *,
+        stage_evidence: bool = False,
     ) -> None:
         try:
-            result = self.sink.commit_invocation(
-                invocation,
-                blobs or {},
-                writer_token=self.writer_token,
-            )
+            if stage_evidence:
+                result = self.sink.commit_invocation(
+                    invocation,
+                    blobs or {},
+                    writer_token=self.writer_token,
+                    stage_evidence=True,
+                )
+            else:
+                result = self.sink.commit_invocation(
+                    invocation,
+                    blobs or {},
+                    writer_token=self.writer_token,
+                )
         except Exception as exc:
             raise DurableModelCallError(
                 "durable model invocation commit failed",
@@ -102,6 +121,106 @@ class FencedModelCallLifecycle:
                 error_code="durable_invocation_commit_failed",
             )
         self.last_invocation = invocation
+
+    def _commit_evidence(self, invocation: DurableModelInvocation) -> None:
+        try:
+            result = self.sink.commit_model_evidence(
+                invocation,
+                writer_token=self.writer_token,
+            )
+            if not isinstance(result, CommitResult) or result.status not in {
+                "committed",
+                "already_committed",
+            }:
+                raise RuntimeError("required evidence commit was not accepted")
+        except Exception as exc:
+            failed = ModelEvidenceUncommitted()
+            mark_recovered_model_usage(failed, invocation.receipt or {})
+            raise failed from exc
+
+    def _reject_evidence_policy_change(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes] | None = None,
+        *,
+        prove_ownership: bool = True,
+    ) -> NoReturn:
+        """Prove current ownership, preserve the invocation, then reject policy drift."""
+
+        if prove_ownership:
+            self._commit(invocation, blobs)
+        raise DurableModelCallError(
+            "an existing durable model invocation cannot change evidence delivery policy",
+            error_code="durable_invocation_evidence_policy_conflict",
+        )
+
+    def _require_outbox_capability(
+        self,
+        invocation: DurableModelInvocation | None = None,
+    ) -> None:
+        try:
+            supported = self.sink.capabilities.transactional_outbox is True
+        except Exception:
+            supported = False
+        if supported:
+            return
+        if invocation is not None:
+            # Preserve fence-first rejection for a recovered logical call.
+            self._commit(invocation)
+        raise DurableModelCallError(
+            "durable outbox evidence policy requires transactional outbox capability",
+            error_code="durable_invocation_evidence_policy_conflict",
+        )
+
+    def _effective_evidence_policy(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        require_evidence: bool = False,
+        blobs: Mapping[str, bytes] | None = None,
+        prove_ownership: bool = True,
+    ) -> ModelEvidencePolicy:
+        stored = invocation.evidence_policy
+        if require_evidence and stored != "required":
+            self._reject_evidence_policy_change(
+                invocation,
+                blobs,
+                prove_ownership=prove_ownership,
+            )
+        # Passive is the replacement-host default and defers to an existing durable obligation.
+        # Any explicit non-passive mode must equal the policy captured by the first reservation.
+        if self.evidence_policy != "passive" and self.evidence_policy != stored:
+            self._reject_evidence_policy_change(
+                invocation,
+                blobs,
+                prove_ownership=prove_ownership,
+            )
+        if stored == "outbox":
+            self._require_outbox_capability(invocation if prove_ownership else None)
+        return stored
+
+    def _commit_settled(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes] | None = None,
+        *,
+        require_evidence: bool = False,
+        evidence_committed: bool = False,
+        authoritative: bool = False,
+    ) -> None:
+        evidence_policy = self._effective_evidence_policy(
+            invocation,
+            require_evidence=require_evidence,
+            blobs=blobs,
+            prove_ownership=authoritative,
+        )
+        self._commit(
+            invocation,
+            blobs,
+            stage_evidence=evidence_policy == "outbox",
+        )
+        if evidence_policy == "required" and not evidence_committed:
+            self._commit_evidence(invocation)
 
     @staticmethod
     def _same_dispatch(
@@ -150,6 +269,13 @@ class FencedModelCallLifecycle:
         if record is None:
             return None
         invocation = record.invocation
+        evidence_committed = False
+        if invocation.dispatch_state == "settled" and invocation.evidence_policy == "required":
+            # The journal obligation is authoritative without a checkpoint marker or a rebuilt
+            # request. Finish its fenced sink delivery before comparing the query digest that
+            # replacement config or dynamic context produced with the settled call.
+            self._commit_evidence(invocation)
+            evidence_committed = True
         if (
             invocation.request_digest != query.request_digest
             or invocation.digest_generation != query.digest_generation
@@ -184,7 +310,12 @@ class FencedModelCallLifecycle:
             # An exact idempotent mutation is the host contract's authenticated ownership check.
             # Fencing precedes idempotency, so a stale activation cannot expose a recovered
             # settlement even though the preceding checked load is intentionally token-free.
-            self._commit(invocation)
+            self._commit_settled(
+                invocation,
+                require_evidence=query.require_evidence,
+                evidence_committed=evidence_committed,
+                authoritative=True,
+            )
             return RecoveredModelDispatch(
                 reservation=reservation,
                 receipt=invocation.receipt,
@@ -210,7 +341,13 @@ class FencedModelCallLifecycle:
             )
         # Replay the exact settlement through the fenced mutation path before returning any
         # private result. Supplying the original blob preserves full content identity.
-        self._commit(invocation, {sha256: result_blob})
+        self._commit_settled(
+            invocation,
+            {sha256: result_blob},
+            require_evidence=query.require_evidence,
+            evidence_committed=evidence_committed,
+            authoritative=True,
+        )
         return RecoveredModelDispatch(
             reservation=reservation,
             receipt=invocation.receipt,
@@ -222,9 +359,13 @@ class FencedModelCallLifecycle:
         if record is None:
             effective = proposed
             revision = 1
+            evidence_policy = self.evidence_policy
+            if evidence_policy == "outbox":
+                self._require_outbox_capability()
         else:
             invocation = record.invocation
             if invocation.dispatch_state == "reserved":
+                evidence_policy = self._effective_evidence_policy(invocation)
                 effective = replace(proposed, idempotency_key=invocation.idempotency_key)
                 if not self._same_dispatch(invocation, effective):
                     raise DurableModelCallError(
@@ -239,6 +380,7 @@ class FencedModelCallLifecycle:
                     "durable model invocation remains unknown",
                     error_code="dispatch_unknown",
                 )
+            evidence_policy = self._effective_evidence_policy(invocation)
             retryable_failure = (
                 bool(invocation.failure_code)
                 and invocation.receipt is not None
@@ -271,6 +413,7 @@ class FencedModelCallLifecycle:
                 dispatch_state="reserved",
                 request_digest=effective.request_digest,
                 digest_generation=effective.digest_generation,
+                evidence_policy=evidence_policy,
             )
         )
         return effective
@@ -316,7 +459,7 @@ class FencedModelCallLifecycle:
             sha256 = hashlib.sha256(settlement.result_blob).hexdigest()
             blobs[sha256] = settlement.result_blob
             result_ref = f"blob:{sha256}"
-        self._commit(
+        self._commit_settled(
             replace(
                 invocation,
                 revision=invocation.revision + 1,

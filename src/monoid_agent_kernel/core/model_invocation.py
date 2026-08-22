@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.safe_evidence import (
     is_safe_utc_timestamp,
 )
 from monoid_agent_kernel.core.wire_validation import (
+    parse_bool,
     parse_int,
     parse_literal,
     parse_str,
@@ -37,6 +38,7 @@ LOGICAL_MODEL_CALL_GENERATION = namespaced_id("logical-model-call.v1")
 MODEL_DISPATCH_GENERATION = namespaced_id("model-dispatch.v1")
 
 DispatchState = Literal["reserved", "dispatch_started", "settled", "unknown"]
+ModelEvidencePolicy = Literal["passive", "required", "outbox"]
 
 _MODEL_INVOCATION_FIELDS = frozenset(
     {
@@ -50,6 +52,9 @@ _MODEL_INVOCATION_FIELDS = frozenset(
         "dispatch_state",
         "request_digest",
         "digest_generation",
+        "evidence_policy",
+        # Accepted legacy v0.22 prerelease spelling. Canonical writers emit the policy enum.
+        "requires_evidence",
         "receipt",
         "result_ref",
         "failure_code",
@@ -333,6 +338,7 @@ class DurableModelInvocation:
     dispatch_state: DispatchState
     request_digest: str
     digest_generation: str
+    evidence_policy: ModelEvidencePolicy = "passive"
     receipt: Mapping[str, Any] | None = None
     result_ref: str = ""
     failure_code: str = ""
@@ -358,6 +364,10 @@ class DurableModelInvocation:
             or self.digest_generation not in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
         ):
             raise ValueError("unsupported model invocation digest_generation")
+        if type(self.evidence_policy) is not str or self.evidence_policy not in get_args(
+            ModelEvidencePolicy
+        ):
+            raise ValueError("model invocation evidence_policy is outside the durable vocabulary")
         _require_positive_int(self.revision, "revision")
         _require_positive_int(self.dispatch_attempt, "dispatch_attempt")
         if type(self.dispatch_state) is not str or self.dispatch_state not in get_args(
@@ -413,6 +423,7 @@ class DurableModelInvocation:
             "dispatch_state": self.dispatch_state,
             "request_digest": self.request_digest,
             "digest_generation": MODEL_REQUEST_DIGEST_GENERATION,
+            "evidence_policy": self.evidence_policy,
             "receipt": _normalized_receipt(self.receipt),
             "result_ref": self.result_ref,
             "failure_code": self.failure_code,
@@ -423,6 +434,25 @@ class DurableModelInvocation:
         """Compatibility wrapper over :func:`decode_model_invocation`."""
 
         return decode_model_invocation(payload).value
+
+    @property
+    def requires_evidence(self) -> bool:
+        """Compatibility projection for the prerelease required-delivery boolean."""
+
+        return self.evidence_policy == "required"
+
+
+def _model_evidence_policy_from_payload(payload: Mapping[str, Any]) -> ModelEvidencePolicy:
+    if "evidence_policy" in payload:
+        policy = parse_literal(payload, "evidence_policy", get_args(ModelEvidencePolicy))
+        if "requires_evidence" in payload:
+            legacy_required = parse_bool(payload, "requires_evidence")
+            if legacy_required is not (policy == "required"):
+                raise ValueError(
+                    "model invocation legacy evidence flag conflicts with evidence_policy"
+                )
+        return policy  # type: ignore[return-value]
+    return "required" if parse_bool(payload, "requires_evidence", default=False) else "passive"
 
 
 def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvocation:
@@ -443,6 +473,7 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
         ),
         request_digest=parse_str(payload, "request_digest"),
         digest_generation=parse_str(payload, "digest_generation"),
+        evidence_policy=_model_evidence_policy_from_payload(payload),
         receipt=raw_receipt,
         result_ref=parse_str(payload, "result_ref"),
         failure_code=parse_str(payload, "failure_code"),
@@ -477,6 +508,7 @@ __all__ = [
     "LOGICAL_MODEL_CALL_GENERATION",
     "MODEL_DISPATCH_GENERATION",
     "DispatchState",
+    "ModelEvidencePolicy",
     "DurableModelInvocation",
     "MODEL_INVOCATION_CODEC",
     "decode_model_invocation",

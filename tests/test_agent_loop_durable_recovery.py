@@ -14,17 +14,22 @@ import pytest
 from support.fenced_hosting import DeterministicFencedRunHarness
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.content import ImagePart, TextPart
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
     logical_model_call_id,
     model_dispatch_id,
 )
-from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig
+from monoid_agent_kernel.core.model_content import read_model_content
+from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig, RunLimits
 from monoid_agent_kernel.errors import (
     AgentConfigError,
     DurableModelCallError,
     ModelDispatchRefused,
+    NativeAgentError,
+    TurnNotSettled,
 )
 from monoid_agent_kernel.hosting import CommitResult, ModelInvocationRecord, WriterToken
 from monoid_agent_kernel.loop import AgentLoop
@@ -38,6 +43,8 @@ from monoid_agent_kernel.model_lifecycle import (
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
+    ToolCall,
+    ToolObservation,
     mark_provider_usage,
     provider_usage_of,
 )
@@ -66,6 +73,28 @@ class _ScriptedAdapter:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class _RaisingDynamicContextProvider:
+    def static_segment(self) -> None:
+        return None
+
+    def dynamic_segment(self, turn: Any) -> None:
+        del turn
+        raise AssertionError("dynamic context must not run before stored outcome application")
+
+
+class _InterruptingDynamicContextProvider:
+    loop: AgentLoop | None = None
+
+    def static_segment(self) -> None:
+        return None
+
+    def dynamic_segment(self, turn: Any) -> None:
+        del turn
+        assert self.loop is not None
+        self.loop.interrupt_turn()
+        return None
 
 
 @dataclass
@@ -124,6 +153,73 @@ class _RejectCheckpointCommit:
 
 
 @dataclass
+class _RejectModelEvidence:
+    inner: Any
+    failures: int = 1
+
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
+    def commit_model_evidence(self, *args: Any, **kwargs: Any) -> CommitResult:
+        if self.failures > 0:
+            self.failures -= 1
+            return CommitResult(status="conflict")
+        return self.inner.commit_model_evidence(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@dataclass
+class _RejectNthModelEvidence:
+    inner: Any
+    reject_on: int
+    calls: int = 0
+
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
+    def commit_model_evidence(self, *args: Any, **kwargs: Any) -> CommitResult:
+        self.calls += 1
+        if self.calls == self.reject_on:
+            return CommitResult(status="conflict")
+        return self.inner.commit_model_evidence(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@dataclass
+class _RejectAtomicEvidenceStage:
+    inner: Any
+
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+        stage_evidence: bool = False,
+    ) -> CommitResult:
+        if stage_evidence:
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        return self.inner.commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@dataclass
 class _TamperInvocationResultLoad:
     inner: Any
 
@@ -169,13 +265,14 @@ class _RecoveredResultHook:
         )
 
 
-def _spec(tmp_path: Path) -> AgentRunSpec:
+def _spec(tmp_path: Path, *, limits: RunLimits | None = None) -> AgentRunSpec:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     return AgentRunSpec(
         workspace_root=workspace,
         run_root=tmp_path / "runs",
         run_id=RUN_ID,
+        limits=limits or RunLimits(),
     )
 
 
@@ -188,15 +285,27 @@ def _loop(
     checkpoint_persist_callback: Any = None,
     invocation_context: InvocationContext | None = None,
     model: ModelConfig | None = None,
+    model_evidence_policy: str = "passive",
+    limits: RunLimits | None = None,
+    context_providers: tuple[Any, ...] = (),
+    model_calls_file: bool = False,
+    model_content_file: bool = False,
+    model_stream_observer_factories: tuple[Any, ...] = (),
+    tool_ids: tuple[str, ...] = (),
 ) -> AgentLoop:
     return AgentLoop(
-        spec=_spec(tmp_path),
+        spec=_spec(tmp_path, limits=limits),
         model_adapter=adapter,
-        runtime_config_provider=runtime_provider(runtime_config(model=model)),
+        runtime_config_provider=runtime_provider(runtime_config(*tool_ids, model=model)),
         run_sink=sink,
         writer_token=writer_token,
         checkpoint_persist_callback=checkpoint_persist_callback,
         invocation_context=invocation_context,
+        model_evidence_policy=model_evidence_policy,  # type: ignore[arg-type]
+        context_providers=context_providers,
+        model_calls_file=model_calls_file,
+        model_content_file=model_content_file,
+        model_stream_observer_factories=model_stream_observer_factories,
     )
 
 
@@ -206,10 +315,12 @@ def _crash_at(
     adapter: _ScriptedAdapter,
     state: str,
     *,
-    user_input: str = "hello",
+    user_input: str | None = "hello",
     invocation_context: InvocationContext | None = None,
     target_failure_code: str | None = None,
     model: ModelConfig | None = None,
+    model_evidence_policy: str = "passive",
+    limits: RunLimits | None = None,
 ):
     token = harness.claim_writer(RUN_ID, "worker-1")
     loop = _loop(
@@ -223,6 +334,8 @@ def _crash_at(
         writer_token=token,
         invocation_context=invocation_context,
         model=model,
+        model_evidence_policy=model_evidence_policy,
+        limits=limits,
     )
     loop.open()
     baseline = loop.snapshot()
@@ -245,10 +358,15 @@ def _restore(
     adapter: _ScriptedAdapter,
     baseline,
     *,
-    user_input: str = "hello",
+    user_input: str | None = "hello",
     sink: Any = None,
     invocation_context: InvocationContext | None = None,
     model: ModelConfig | None = None,
+    model_evidence_policy: str = "passive",
+    limits: RunLimits | None = None,
+    context_providers: tuple[Any, ...] = (),
+    model_calls_file: bool = False,
+    tool_ids: tuple[str, ...] = (),
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -258,6 +376,11 @@ def _restore(
         writer_token=token,
         invocation_context=invocation_context,
         model=model,
+        model_evidence_policy=model_evidence_policy,
+        limits=limits,
+        context_providers=context_providers,
+        model_calls_file=model_calls_file,
+        tool_ids=tool_ids,
     )
     loop.restore(baseline)
     try:
@@ -334,6 +457,138 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     assert settled.invocation.receipt["usage"] == turn.usage
     assert checkpoint is not None
     assert checkpoint.total_usage == turn.usage
+
+
+def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        model_evidence_policy="required",
+    )
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled.invocation.revision)
+
+    assert settled.invocation.evidence_policy == "required"
+    assert evidence_key not in harness.sink._model_evidence
+
+    suspension, checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None
+    assert suspension.turn.final_text == "durable answer"
+    assert checkpoint is not None
+    assert len(adapter.requests) == 1
+    assert evidence_key in harness.sink._model_evidence
+
+
+def test_pre_checkpoint_required_evidence_commits_before_rebuilt_request_drift(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        model=ModelConfig(model="original-model"),
+        model_evidence_policy="required",
+    )
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled.invocation.revision)
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model=ModelConfig(model="replacement-model"),
+        model_evidence_policy="passive",
+    )
+
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_request_conflict"
+    assert evidence_key in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+
+
+def test_required_policy_cannot_upgrade_a_passive_settled_invocation(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(tmp_path, harness, adapter, "settled")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert settled.invocation.evidence_policy == "passive"
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
+    assert len(adapter.requests) == 1
+    assert harness.sink._model_evidence == {}
+
+
+def test_required_policy_cannot_upgrade_a_passive_reservation_before_provider_entry(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    baseline, reserved = _crash_at(tmp_path, harness, adapter, "reserved")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert reserved.invocation.evidence_policy == "passive"
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_evidence_policy_conflict"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation == reserved.invocation
+
+
+def test_required_policy_change_still_closes_a_started_passive_dispatch_as_unknown(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    baseline, _started = _crash_at(tmp_path, harness, adapter, "dispatch_started")
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="required",
+    )
+
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "dispatch_unknown"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.dispatch_state == "unknown"
 
 
 def test_recovery_identity_ignores_changed_caller_provenance(tmp_path: Path) -> None:
@@ -490,6 +745,1455 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: 
     assert loaded.value.invocation.receipt is not None
     assert loaded.value.invocation.receipt["attempts"] == 2
     assert loaded.value.invocation.receipt["usage"] == expected_usage
+
+
+def test_required_evidence_retries_only_projection_and_deduplicates_usage(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink, failures=2)
+    usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+        model_calls_file=True,
+    )
+    loop.open()
+    try:
+        first = loop.run_until_suspended("hello")
+        first_checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert first.reason == "turn_failed"
+    assert first.error_code == "evidence_uncommitted"
+    assert first.retryable is True
+    assert first_checkpoint is not None and first_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+    second, second_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        first_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        model_calls_file=True,
+    )
+    assert second.reason == "turn_failed", second
+    assert second.error_code == "evidence_uncommitted"
+    assert second_checkpoint is not None and second_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        second_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        model_calls_file=True,
+    )
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    transcript_path = next((tmp_path / "runs").rglob("transcript.jsonl"))
+    model_turns = [
+        record
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+        if (record := json.loads(line)).get("kind") == "model_turn"
+    ]
+    assert [record["usage"] for record in model_turns] == [usage, {}]
+    assert sum(record["usage"].get("total_tokens", 0) for record in model_turns) == 6
+    model_calls_path = next((tmp_path / "runs").rglob("model_calls.jsonl"))
+    model_calls = [
+        json.loads(line)
+        for line in model_calls_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(model_calls) == 1
+    assert model_calls[0]["stop_reason"] == "stop"
+    assert model_calls[0]["usage"] == usage
+    events_path = next((tmp_path / "runs").rglob("events.jsonl"))
+    failed_turns = [
+        event
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line)).get("type") == "turn.failed"
+    ]
+    assert [event["data"]["provider_usage"] for event in failed_turns] == [usage, {}]
+
+
+def test_required_evidence_projection_failure_preserves_completed_model_stream(
+    tmp_path: Path,
+) -> None:
+    class _Writer:
+        def __init__(self) -> None:
+            self.outcomes: list[ModelStreamOutcome] = []
+
+        def push(self, _delta: Any) -> None:
+            return None
+
+        def close(self, outcome: ModelStreamOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    class _Observer:
+        def __init__(self, writer: _Writer) -> None:
+            self.writer = writer
+
+        def open(self, _context: Any) -> _Writer:
+            return self.writer
+
+    harness = DeterministicFencedRunHarness()
+    usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    writer = _Writer()
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=_RejectModelEvidence(harness.sink),
+        writer_token=token,
+        model_evidence_policy="required",
+        model_content_file=True,
+        model_stream_observer_factories=(lambda: _Observer(writer),),
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    expected = ModelStreamOutcome(
+        status="completed",
+        final_text="durable answer",
+        usage=usage,
+    )
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert len(adapter.requests) == 1
+    assert writer.outcomes == [expected]
+    content_path = next((tmp_path / "runs").rglob("model-content.jsonl"))
+    snapshots = read_model_content(content_path).snapshots
+    assert len(snapshots) == 1
+    assert snapshots[0].status == "completed"
+    assert snapshots[0].final_text == "durable answer"
+    assert snapshots[0].usage == usage
+
+
+def test_post_settlement_interrupt_accounts_usage_before_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    usage = {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="settled answer", usage=usage, stop_reason="stop")
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(tmp_path, adapter, sink=harness.sink, writer_token=token)
+    original_acall_model = loop._acall_model
+
+    async def interrupt_after_settlement(*args: Any, **kwargs: Any):
+        outcome = await original_acall_model(*args, **kwargs)
+        loop.interrupt_turn()
+        return outcome
+
+    monkeypatch.setattr(loop, "_acall_model", interrupt_after_settlement)
+    loop.open()
+    try:
+        interrupted = loop.run_until_suspended("hello")
+        interrupted_checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.total_usage == usage
+    assert not any(
+        message.get("role") == "assistant" for message in interrupted_checkpoint.messages
+    )
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "settled answer"
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+
+def test_internal_safety_checkpoint_reuses_step_and_delivers_required_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    crash_after_settle = _CrashAfterInvocationCommit(
+        harness.sink,
+        target_state="settled",
+    )
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="settled after replay", stop_reason="stop"),
+        ModelTurn(final_text="must not dispatch", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=crash_after_settle,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    session = loop._require_open()
+    session.state.pending_tool_approval_replays = (
+        {
+            "call_name": "demo_approval",
+            "call_id": "approved-1",
+            "arguments": {"value": "approved"},
+            "binding_id": "demo.approval",
+            "tool_id": "demo.approval",
+            "task_id": "task-1",
+            "approval_key": "unused-by-injected-replay",
+        },
+    )
+
+    async def replay_approved_call(*_args: Any, **_kwargs: Any) -> ToolObservation:
+        return ToolObservation(
+            call_id="tool_approval_replay:approved-1",
+            tool_name="demo_approval",
+            output={"type": "tool_approval_replay_result", "value": "approved"},
+            is_background=True,
+        )
+
+    monkeypatch.setattr(loop, "_aexecute_tool_approval_replay", replay_approved_call)
+    try:
+        with pytest.raises(_HardCrash, match="^settled$"):
+            loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    checkpoint_load = harness.sink.latest_checked(RUN_ID)
+    assert checkpoint_load.ok and checkpoint_load.value is not None
+    safety_checkpoint = checkpoint_load.value.checkpoint
+    assert safety_checkpoint.session_step == 1
+    assert safety_checkpoint.submit_local_step == 1
+    assert safety_checkpoint.last_suspension is None
+    assert safety_checkpoint.pending_tool_approval_replays == []
+
+    settled_load = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert settled_load.ok and settled_load.value is not None
+    settled_invocation = settled_load.value.invocation
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled_invocation.revision)
+    assert settled_invocation.evidence_policy == "required"
+    assert evidence_key not in harness.sink._model_evidence
+
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=harness.sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(safety_checkpoint)
+    try:
+        recovered = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert recovered.reason == "terminal"
+    assert recovered.error_code == "durable_invocation_request_conflict"
+    assert evidence_key in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+    next_call_id = logical_model_call_id(RUN_ID, "turn_0002")
+    next_load = harness.sink.load_invocation(RUN_ID, next_call_id)
+    assert next_load.status == "missing"
+
+
+def test_required_evidence_recovery_preserves_policy_and_identity_across_config_changes(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model=ModelConfig(model="original-model"),
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model=ModelConfig(model="changed-model"),
+        model_evidence_policy="passive",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None
+    assert len(adapter.requests) == 1
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+
+
+def test_run_once_releases_required_evidence_park_for_sink_only_recovery(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+
+    with pytest.raises(TurnNotSettled) as raised:
+        loop.run_once("hello")
+
+    assert raised.value.reason == "turn_failed"
+    assert raised.value.suspension.error_code == "evidence_uncommitted"
+    assert RUN_ID not in harness.sink._terminals
+    loaded = harness.sink.latest_checked(RUN_ID)
+    assert loaded.ok and loaded.value is not None
+    checkpoint = loaded.value.checkpoint
+    assert checkpoint.terminal is False
+    assert checkpoint.last_suspension is not None
+    assert checkpoint.last_suspension["error_code"] == "evidence_uncommitted"
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.terminal is False
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_applies_stored_final_before_dynamic_context(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        context_providers=(_RaisingDynamicContextProvider(),),
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None
+    assert final_checkpoint.messages[-1]["content"] == "durable answer"
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_replays_multimodal_result_without_rebuilding_request(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended(
+            (
+                TextPart("describe this"),
+                ImagePart(source_ref="asset:image-1", mime_type="image/png"),
+            )
+        )
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    assert adapter.requests[0].instruction == "describe this"
+    assert isinstance(adapter.requests[0].messages[0]["content"], list)
+
+    restored, _final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_does_not_consume_an_extra_step(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    limits = RunLimits(max_steps=1)
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.submit_local_step == 1
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.session_step == 1
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_bypasses_budget_exhausted_by_settled_call(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    limits = RunLimits(max_total_tokens=1)
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.total_usage == usage
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_completes_before_a_requested_pause(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.pause_turn()
+    try:
+        settled = restored_loop.run_until_suspended(None)
+        final_checkpoint = restored_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.last_suspension is not None
+    assert final_checkpoint.last_suspension["reason"] == "settled"
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_survives_interrupt_before_result_application(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.interrupt_turn()
+    try:
+        interrupted = restored_loop.run_until_suspended(None)
+        interrupted_checkpoint = restored_loop.snapshot()
+        settled = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.last_suspension is not None
+    assert interrupted_checkpoint.last_suspension["reason"] == "interrupted"
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "durable answer"
+    assert len(adapter.requests) == 1
+
+
+def test_projected_recovered_tool_calls_resume_after_context_interrupt(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(ToolCall(id="missing-1", name="missing.tool", arguments={}),),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after resumed tool", stop_reason="stop"),
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("hello")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    interrupting_provider = _InterruptingDynamicContextProvider()
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+        context_providers=(interrupting_provider,),
+    )
+    interrupting_provider.loop = interrupted_loop
+    interrupted_loop.restore(evidence_checkpoint)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+        with pytest.raises(NativeAgentError) as raised:
+            interrupted_loop.run_until_suspended("replace the unfinished tool turn")
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert raised.value.error_code == "evidence_recovery_requires_resume"
+    assert interrupted.model_tool_calls_pending is True
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.last_suspension is not None
+    assert interrupted_checkpoint.last_suspension["model_tool_calls_pending"] is True
+    projected_tool_turns = [
+        message
+        for message in interrupted_checkpoint.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert len(projected_tool_turns) == 1
+    assert len(adapter.requests) == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "done after resumed tool"
+    assert final_checkpoint is not None
+    assert final_checkpoint.last_suspension is not None
+    assert final_checkpoint.last_suspension["model_tool_calls_pending"] is False
+    final_tool_turns = [
+        message
+        for message in final_checkpoint.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert len(final_tool_turns) == 1
+    assert len(adapter.requests) == 2
+    assert {observation.call_id for observation in adapter.requests[1].observations} == {
+        "missing-1"
+    }
+
+
+def test_projected_recovered_tool_calls_skip_checkpointed_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(
+                ToolCall(id="missing-1", name="missing.tool", arguments={}),
+                ToolCall(id="missing-2", name="missing.tool", arguments={}),
+            ),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after both tools", stop_reason="stop"),
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("hello")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+    )
+    interrupted_loop.restore(evidence_checkpoint)
+    execute_tool_call = interrupted_loop._aexecute_tool_call
+
+    async def interrupt_after_first_tool(**kwargs: Any):
+        observation = await execute_tool_call(**kwargs)
+        if kwargs["call_id"] == "missing-1":
+            interrupted_loop.interrupt_turn()
+        return observation
+
+    monkeypatch.setattr(interrupted_loop, "_aexecute_tool_call", interrupt_after_first_tool)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert [
+        observation["call_id"] for observation in interrupted_checkpoint.pending_observations
+    ] == ["missing-1"]
+    assert interrupted_checkpoint.total_tool_calls == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert final_checkpoint is not None
+    assert final_checkpoint.total_tool_calls == 2
+    assert len(adapter.requests) == 2
+    assert [
+        observation.call_id for observation in adapter.requests[1].observations
+    ] == ["missing-1", "missing-2"]
+
+
+def test_checkpointed_recovered_finish_restores_kernel_tool_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(
+                ToolCall(
+                    id="finish-1",
+                    name="run_finish",
+                    arguments={
+                        "summary": "durable finish",
+                        "outputs": ["result.md"],
+                        "notes": "kept across restore",
+                    },
+                ),
+            ),
+            stop_reason="tool_calls",
+        )
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+        tool_ids=("run.finish",),
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("finish the run")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+        tool_ids=("run.finish",),
+    )
+    interrupted_loop.restore(evidence_checkpoint)
+    execute_tool_call = interrupted_loop._aexecute_tool_call
+
+    async def interrupt_after_finish(**kwargs: Any):
+        observation = await execute_tool_call(**kwargs)
+        interrupted_loop.interrupt_turn()
+        return observation
+
+    monkeypatch.setattr(interrupted_loop, "_aexecute_tool_call", interrupt_after_finish)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.pending_finish == {
+        "summary": "durable finish",
+        "outputs": ["result.md"],
+        "notes": "kept across restore",
+    }
+    assert len(adapter.requests) == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+        tool_ids=("run.finish",),
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "durable finish"
+    assert final_checkpoint is not None
+    assert final_checkpoint.pending_finish is not None
+    assert final_checkpoint.pending_finish["outputs"] == ["result.md"]
+    assert final_checkpoint.total_tool_calls == 1
+    assert len(adapter.requests) == 1
+
+
+def test_interrupted_evidence_recovery_preserves_tool_follow_up_request(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectNthModelEvidence(harness.sink, reject_on=2)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(ToolCall(id="missing-1", name="missing.tool", arguments={}),),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after observation", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.pending_observations
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.interrupt_turn()
+    try:
+        interrupted = restored_loop.run_until_suspended(None)
+        interrupted_checkpoint = restored_loop.snapshot()
+        settled = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.pending_observations == checkpoint.pending_observations
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "done after observation"
+    assert len(adapter.requests) == 2
+
+
+def test_new_input_can_abandon_a_recovered_result_after_interrupt(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="interrupted answer", stop_reason="stop"),
+        ModelTurn(final_text="replacement answer", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.interrupt_turn()
+    try:
+        interrupted = restored_loop.run_until_suspended(None)
+        replacement = restored_loop.run_until_suspended("replace it")
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert replacement.reason == "settled"
+    assert replacement.turn is not None
+    assert replacement.turn.final_text == "replacement answer"
+    assert len(adapter.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_change", "expected_error_code"),
+    [
+        ({"remaining_duration_s": 0.0}, "run_timeout"),
+        ({"cancellation_requested": True}, "cancelled"),
+    ],
+)
+def test_required_evidence_commits_before_terminal_run_boundary(
+    tmp_path: Path,
+    checkpoint_change: dict[str, Any],
+    expected_error_code: str,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    checkpoint = replace(checkpoint, **checkpoint_change)
+
+    terminal, _terminal_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+    )
+
+    assert terminal.reason == "terminal"
+    assert terminal.error_code == expected_error_code
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_preserves_tool_observations_without_replaying_provider(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectNthModelEvidence(harness.sink, reject_on=2)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(ToolCall(id="missing-1", name="missing.tool", arguments={}),),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after observation", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.pending_observations
+    assert len(adapter.requests) == 2
+
+    restored, _final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "done after observation"
+    assert len(adapter.requests) == 2
+
+
+def test_required_evidence_park_rejects_new_input_without_mutating_recovery_state(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    try:
+        with pytest.raises(NativeAgentError, match="before accepting new input") as raised:
+            restored_loop.run_until_suspended("new input")
+        unchanged = restored_loop.snapshot()
+        settled = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert raised.value.error_code == "evidence_recovery_requires_resume"
+    assert unchanged is not None and unchanged.messages == checkpoint.messages
+    assert settled.reason == "settled"
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_restores_provider_refusal_without_double_billing(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    refusal = ModelDispatchRefused(
+        "provider refused",
+        error_code="rate_limited",
+        provider_error_code="rate_limit",
+        retryable=True,
+        http_status=429,
+        config_recoverable=True,
+    )
+    usage = {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5}
+    mark_provider_usage(refusal, usage)
+    adapter = _ScriptedAdapter(refusal)
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+        model_calls_file=True,
+        model_content_file=True,
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.total_usage == usage
+    refusal_content_path = next((tmp_path / "runs").rglob("model-content.jsonl"))
+    refusal_streams = read_model_content(refusal_content_path).snapshots
+    assert len(refusal_streams) == 1
+    assert refusal_streams[0].status == "failed"
+    assert refusal_streams[0].error_code == "evidence_uncommitted"
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        model_calls_file=True,
+    )
+    assert restored.reason == "turn_failed"
+    assert restored.error_code == "rate_limited"
+    assert restored.provider_error_code == "rate_limit"
+    assert restored.http_status == 429
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+    model_calls_path = next((tmp_path / "runs").rglob("model_calls.jsonl"))
+    model_calls = [
+        json.loads(line)
+        for line in model_calls_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(model_calls) == 1
+    assert model_calls[0]["error_code"] == "rate_limited"
+    assert model_calls[0]["usage"] == usage
+
+
+def test_required_evidence_recovery_surfaces_retryable_refusal_without_paid_retry(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    refusal = ModelDispatchRefused("transient overload", retryable=True)
+    mark_provider_usage(
+        refusal,
+        {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+    )
+    adapter = _ScriptedAdapter(
+        refusal,
+        ModelTurn(
+            final_text="second attempt",
+            usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            stop_reason="stop",
+        ),
+    )
+    model = ModelConfig(
+        retry=ModelRetryConfig(
+            layer="kernel",
+            max_attempts=2,
+            initial_delay_s=0.0,
+            jitter_s=0.0,
+        )
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model=model,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    assert checkpoint.total_usage == {
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 3,
+    }
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model=model,
+        model_evidence_policy="required",
+    )
+    assert restored.reason == "turn_failed"
+    assert restored.error_code == "model_error"
+    assert restored.retryable is True
+    assert final_checkpoint is not None
+    assert final_checkpoint.total_usage == {
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 3,
+    }
+    assert len(adapter.requests) == 1
+
+
+def test_outbox_policy_stages_evidence_with_the_settled_invocation(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="done", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=harness.sink,
+        writer_token=token,
+        model_evidence_policy="outbox",
+    )
+    loop.open()
+    try:
+        settled = loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert settled.reason == "settled"
+    assert len(adapter.requests) == 1
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence_outbox
+
+
+def test_outbox_reservation_survives_replacement_passive_activation(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="done", stop_reason="stop"))
+    baseline, reserved = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "reserved",
+        model_evidence_policy="outbox",
+    )
+
+    assert reserved.invocation.evidence_policy == "outbox"
+    assert adapter.requests == []
+
+    settled, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert len(adapter.requests) == 1
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.evidence_policy == "outbox"
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, loaded.value.invocation.revision)
+    assert evidence_key in harness.sink._model_evidence_outbox
+
+
+def test_recovered_outbox_reservation_checks_capability_before_dispatch(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not dispatch", stop_reason="stop"))
+    baseline, reserved = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "reserved",
+        model_evidence_policy="outbox",
+    )
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=False,
+    )
+
+    failed, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model_evidence_policy="passive",
+    )
+
+    assert failed.reason == "terminal"
+    assert failed.error_code == "durable_invocation_evidence_policy_conflict"
+    assert adapter.requests == []
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation == reserved.invocation
+    assert harness.sink._model_evidence_outbox == {}
+
+
+def test_outbox_atomic_failure_publishes_neither_settlement_nor_evidence(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(
+        harness.sink.capabilities,
+        transactional_outbox=True,
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="done", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=_RejectAtomicEvidenceStage(harness.sink),
+        writer_token=token,
+        model_evidence_policy="outbox",
+    )
+    loop.open()
+    try:
+        failed = loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert failed.reason == "terminal"
+    assert failed.error_code == "dispatch_unknown"
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.dispatch_state == "unknown"
+    assert harness.sink._model_evidence_outbox == {}
+    assert len(adapter.requests) == 1
 
 
 def test_settled_failure_replays_classification_without_provider_call(tmp_path: Path) -> None:
@@ -772,6 +2476,28 @@ def test_durable_hosting_configuration_is_all_or_nothing(tmp_path: Path) -> None
             adapter,
             sink=harness.sink,
             writer_token=WriterToken(run_id="another-run", owner_id="worker-1", generation=1),
+        )
+    with pytest.raises(AgentConfigError, match="need run_sink and writer_token"):
+        AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config()),
+            model_evidence_policy="required",
+        )
+    with pytest.raises(AgentConfigError, match="passive, required, or outbox"):
+        AgentLoop(
+            spec=_spec(tmp_path),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config()),
+            model_evidence_policy="unknown",  # type: ignore[arg-type]
+        )
+    with pytest.raises(AgentConfigError, match="transactional_outbox"):
+        _loop(
+            tmp_path,
+            adapter,
+            sink=harness.sink,
+            writer_token=token,
+            model_evidence_policy="outbox",
         )
     harness.sink.capabilities = replace(
         harness.sink.capabilities,

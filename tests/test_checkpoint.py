@@ -417,6 +417,9 @@ def test_additive_checkpoint_fields_preserve_existing_positional_order() -> None
     assert checkpoint.applied_input_ids == []
     assert checkpoint.last_model_invocation is None
     assert checkpoint.interruption_cause == ""
+    assert checkpoint.plan == []
+    assert checkpoint.pending_finish is None
+    assert checkpoint.pending_tool_loads == []
 
 
 def test_checkpoint_explicit_projection_covers_every_dataclass_field() -> None:
@@ -620,6 +623,13 @@ def test_v022_additive_checkpoint_fields_round_trip_under_v1_schema(tmp_path: Pa
         seq=2,
         last_model_invocation=invocation.to_json(),
         interruption_cause="lease_lost",
+        plan=[{"step": "finish", "status": "in_progress"}],
+        pending_finish={
+            "summary": "durable finish",
+            "outputs": ["result.md"],
+            "notes": "resume settlement",
+        },
+        pending_tool_loads=["workspace.read"],
     )
 
     write_checkpoint(tmp_path, checkpoint)
@@ -650,6 +660,9 @@ def test_checkpoint_writer_rejects_overflowing_float_fields(tmp_path: Path, fiel
         ("terminal", "no"),
         ("pending_observations", {}),
         ("pending_binding_loads", [1]),
+        ("pending_tool_loads", [1]),
+        ("plan", [1]),
+        ("pending_finish", {"summary": "done", "outputs": "result.md", "notes": None}),
         ("tool_call_counts", {"fs.read": True}),
         ("queued_messages", [1]),
         ("active_input", {"input_id": "input", "phase": "running", "source_seq": True}),
@@ -706,6 +719,43 @@ def test_checkpoint_decoder_allows_unknown_additive_fields() -> None:
 
     assert checked.status == "loaded"
     assert checked.value is not None and checked.value.run_id == "run_1"
+
+
+def test_restore_preserves_checkpointed_agent_tool_context_state(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    checkpoint = RunCheckpoint(
+        run_id=spec.run_id,
+        seq=1,
+        plan=[{"step": "finish", "status": "in_progress"}],
+        pending_finish={
+            "summary": "durable finish",
+            "outputs": ["result.md"],
+            "notes": "resume settlement",
+        },
+        pending_tool_loads=["workspace.read"],
+    )
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("run.finish")),
+    )
+
+    loop.restore(checkpoint)
+    try:
+        context = loop._session.res.context  # type: ignore[union-attr]
+        assert context.plan == checkpoint.plan
+        assert context.pending_finish is not None
+        assert context.pending_finish.summary == "durable finish"
+        assert context.pending_finish.outputs == ("result.md",)
+        assert context.pending_finish.notes == "resume settlement"
+        assert context._requested_tool_loads == ["workspace.read"]
+        snapshot = loop.snapshot()
+        assert snapshot is not None
+        assert snapshot.plan == checkpoint.plan
+        assert snapshot.pending_finish == checkpoint.pending_finish
+        assert snapshot.pending_tool_loads == checkpoint.pending_tool_loads
+    finally:
+        loop.discard_uncommitted()
 
 
 def test_checkpoint_writer_canonicalizes_accepted_legacy_namespace(tmp_path: Path) -> None:

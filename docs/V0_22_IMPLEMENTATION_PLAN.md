@@ -269,7 +269,7 @@ class TerminalOutcome:
     schema_version: str
     run_id: str
     kind: Literal[
-        "completed", "paused", "cancelled", "interrupted",
+        "completed", "paused", "limited", "cancelled", "interrupted",
         "failed_retryable", "failed_config", "failed_terminal",
         "dispatch_unknown", "evidence_uncommitted",
     ]
@@ -286,6 +286,8 @@ class TerminalOutcome:
 
 Outcome은 content를 inline으로 운반하지 않는다. Opaque address와 안전한 taxonomy를 운반한다.
 기존 `AgentRunResult`, `AgentTurnResult`, `Suspension`에서 outcome을 만드는 helper를 제공한다.
+`Suspension(reason="limited")`는 terminal `kind="limited"`와 `retry_eligibility="forbidden"`으로
+투영한다. Cooperative pause와 task wait만 `kind="paused"`로 투영한다.
 
 `RetryEligibility` 값은 다음으로 고정한다.
 
@@ -323,6 +325,7 @@ class DurableModelInvocation:
     dispatch_state: Literal["reserved", "dispatch_started", "settled", "unknown"]
     request_digest: str
     digest_generation: str
+    evidence_policy: Literal["passive", "required", "outbox"] = "passive"
     receipt: Mapping[str, Any] | None = None
     result_ref: str = ""
     failure_code: str = ""
@@ -335,6 +338,7 @@ class DurableModelInvocation:
 - 실패한 `settled`에는 receipt와 failure code가 있고 result가 없다.
 - `unknown`은 자동 retry를 금지한다.
 - `logical_call_id`, request digest, idempotency key는 lifecycle 중 바뀌지 않는다.
+- `evidence_policy`는 첫 reservation에서 결정하고 모든 revision과 retry에서 유지한다.
 - 같은 dispatch attempt 안에서 `dispatch_id`와 `dispatch_attempt`도 바뀌지 않는다.
 - 다음 dispatch attempt만 `dispatch_id`와 `dispatch_attempt`를 변경한다.
 - `revision`은 logical call 안에서 1부터 연속 증가하며 load의 권위 순서를 정한다.
@@ -351,13 +355,16 @@ Schema identifier는 `monoid.model-invocation.v1`로 둔다. Checked reader와 c
 ```python
 last_model_invocation: dict[str, Any] | None = None
 interruption_cause: str = ""
+plan: list[dict[str, Any]] = field(default_factory=list)
+pending_finish: dict[str, Any] | None = None
+pending_tool_loads: list[str] = field(default_factory=list)
 ```
 
-Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 두 필드는 additive/defaulted다.
-v0.21 fixture는 두 값의 기본값으로 복원한다.
+Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 필드는 additive/defaulted다.
+v0.21 fixture는 기본값으로 복원한다.
 
 `to_json()`은 hand-written field projection으로 교체한다. Reflection 기반 encoder를 새로 만들지
-않는다. Checkpoint decoder의 field validators에도 두 필드를 추가한다.
+않는다. Checkpoint decoder의 field validators에도 필드를 추가한다.
 
 ## 6. Hosting contract
 
@@ -809,6 +816,24 @@ receipt usage를 오류에 보존한다.
 
 현재 `settled_sink`의 의미는 `passive`다. 기존 callable과 failure containment를 유지한다.
 
+`required`와 `outbox`는 기존 callable을 강화하지 않는다. `FencedRunSink`가 다음 두 mutation을
+제공한다.
+
+```python
+commit_model_evidence(invocation, *, writer_token) -> CommitResult
+commit_invocation(
+    invocation,
+    blobs,
+    *,
+    writer_token,
+    stage_evidence: bool = False,
+) -> CommitResult
+```
+
+`commit_model_evidence`는 이미 authoritative한 settled invocation의 public-safe projection을
+idempotently 확정한다. `stage_evidence=True`는 invocation revision과 evidence outbox entry를 같은
+transaction에서 확정한다. Outbox schema, poller, retry worker는 host adapter가 소유한다.
+
 | Policy | 동작 | Provider 재호출 |
 |---|---|---|
 | `passive` | observer/sidecar 실패를 log하고 model outcome을 유지 | 없음 |
@@ -820,8 +845,64 @@ Authoritative invocation settle과 evidence projection을 구분한다.
 - Invocation settle 실패: paid call의 durable 상태를 확정하지 못했으므로 crash-safe path는
   `dispatch_unknown`이다.
 - Invocation settle 성공 + required evidence 실패: `evidence_uncommitted`다.
-- `evidence_uncommitted` 복구: settled invocation result를 재사용하고 evidence delivery만 다시 한다.
+- `evidence_uncommitted` 복구: checkpoint의 logical call ID와 request digest로 evidence delivery를
+  먼저 확정하고 settled invocation result를 재사용한다. 저장된 성공 또는 최종 거절을 loop state에
+  적용한 뒤 현재 runtime config, context provider, tool surface, media를 조회한다. 최종 응답은 이
+  지점에서 정산하고, tool call turn은 message log에 반영한 뒤 현재 tool 실행 환경을 구성한다.
+  현재 runtime config, context provider, tool surface, media wire payload는 evidence commit의 입력이 아니다.
+  첫 reservation은 invocation journal에 `evidence_policy="required"`를 저장한다. Settlement와 이 의무는
+  같은 journal transaction에서 확정된다. Settlement commit 뒤 evidence commit 또는 checkpoint
+  publication 전에 process가 종료되어도 새 activation은 journal field를 읽고 delivery를 완료한다.
+  Journal field가 required이면 replacement config와 dynamic context로 다시 계산한 request digest를
+  검증하기 전에 sink delivery를 먼저 완료한다. 이후 request drift는 result 적용을 중단할 수 있지만
+  required evidence를 남겨두지 않는다.
+  Recovery query의 `require_evidence` marker는 이미 저장된 evidence park에서 같은 의무를 보강한다.
+  두 표식 모두 새 activation의 `passive` 설정보다 우선한다.
+  기존 invocation의 journal policy가 `passive`이면 현재 activation 설정만으로 `required` 또는
+  `outbox`로 승격하지 않는다. `outbox` reservation은 replacement activation의 passive 기본값보다
+  우선하며 provider 재진입 전에 transactional outbox capability를 확인한다. Reservation 복구는
+  provider 진입 전에, settled 복구는 evidence mutation 전에
+  `durable_invocation_evidence_policy_conflict`로 거부한다. 강화된 정책은 새 logical call부터 적용한다.
+- 복구된 assistant tool-call turn을 message log에 반영한 뒤 interrupt가 발생하면 suspension에
+  `model_tool_calls_pending=true`를 저장한다. 같은 batch에서 완료된 tool observation은
+  `pending_observations`에 누적한다. `None` resume은 같은 settled result를 다시 읽고 이미 완료된 call
+  ID를 건너뛴 뒤 남은 call만 실행한다. Assistant turn은 중복 추가하지 않는다. 이 tool exchange가
+  완료될 때까지 새 user input은 `evidence_recovery_requires_resume`으로 거부한다.
+  Checkpoint는 context-owned `plan`, pending `run.finish`, pending `tool.search` load도 저장한다.
+  Process restore는 이 상태를 먼저 복원한 뒤 완료된 call ID를 건너뛴다.
+- `last_suspension=null`인 durable 내부 safety checkpoint는 이미 할당된 model step을 한 번 재사용한다.
+  복구는 counter를 증가시키기 전에 같은 logical call journal을 조회한다. Step N settlement와 required
+  evidence 의무가 있으면 먼저 delivery를 완료하고, missing head일 때만 새 dispatch를 진행한다.
+  Approval replay consumption checkpoint 뒤 provider settlement와 evidence park 사이에서 process가
+  종료되어도 step N invocation이 step N+1 뒤에 숨지 않는다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
+
+Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
+Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
+`evidence_uncommitted`로 분리한다. Recovery는 현재 writer fence를 같은 invocation으로 다시 검증한
+뒤 evidence mutation만 재시도한다. Passive `settled_sink`는 required/outbox mutation과 독립이며
+기존처럼 결과 분류를 바꾸지 않는다. 최초 invocation settlement에서 passive observer와 활성화된
+model-call sidecar에 authoritative call을 한 번 전달한다. Required evidence 실패 뒤 복구는 이 passive
+전달을 반복하지 않는다. 성공한 provider stream은 live observer와 `model-content.jsonl`에서
+`completed`로 닫고 normalized final text와 usage를 보존한다. Evidence projection 실패 중에도
+성공한 provider stream은 settled 상태를 유지한다. Settled provider refusal은 failed stream 분류를
+유지한다.
+
+`run_once()`는 `evidence_uncommitted`를 일반 recoverable provider failure처럼 terminal로 승격하지
+않는다. Committed checkpoint boundary를 release하고 `TurnNotSettled`를 표면화한다. 새 activation은
+그 checkpoint를 restore한 뒤 `None`으로 resume해 sink-only recovery를 완료한다.
+
+첫 `evidence_uncommitted` park는 저장된 receipt usage를 run total에 반영한다. 같은 logical call의
+복구는 마지막 evidence-uncommitted checkpoint가 이미 반영한 usage를 읽고 이후 aggregate receipt와의
+non-negative delta만 더한다. 같은 evidence 재시도, settled failure 재표면화, 남은 kernel attempt
+자동 재개는 수행하지 않는다. Transcript와 public event도 같은 delta를 기록한다. 저장된 결과를
+provider 호출 없이 적용한 행의 usage는 빈 mapping이다. Retryable settled failure는 그대로
+표면화하고 다음 paid model step의 시작 여부를 driver가 결정한다.
+
+모든 authoritative settled receipt는 assistant turn projection보다 먼저 `total_usage`와 cumulative
+metrics에 반영한다. 그 다음 stop/deadline boundary를 검사한다. Settlement 직후 interrupt가 발생한
+checkpoint도 paid usage를 포함하며 assistant message는 아직 포함하지 않는다. Resume은 저장된 결과를
+적용하고 usage delta 0을 사용한다.
 
 기존 반환형을 유지하기 위해 AgentLoop는 `evidence_uncommitted`를 non-terminal
 `Suspension(reason="turn_failed", error_code="evidence_uncommitted")`로 표면화한다.
@@ -1065,8 +1146,10 @@ local store로 우회하지 않으며, 손상된 invocation/result가 provider �
 - required delivery 결과
 - outbox capability gate
 - `evidence_uncommitted` mapping과 sink-only recovery
+- 내부 safety checkpoint의 in-progress model step 재사용과 동일 journal coordinate 복구
 
-종료 조건: evidence failure가 provider 호출을 반복하지 않는다.
+종료 조건: evidence failure가 provider 호출을 반복하지 않고, park 전 crash도 settled step의 required
+evidence를 다음 step 뒤에 남기지 않는다.
 
 ### PR 6 — Typed interruption
 

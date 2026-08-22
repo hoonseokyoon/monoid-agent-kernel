@@ -30,7 +30,11 @@ from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_id,
     is_safe_taxonomy_code,
 )
-from monoid_agent_kernel.errors import DurableModelCallError, ModelDispatchRefused
+from monoid_agent_kernel.errors import (
+    DurableModelCallError,
+    ModelDispatchRefused,
+    ModelEvidenceUncommitted,
+)
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ToolCall,
@@ -77,6 +81,7 @@ class ModelDispatchRecoveryQuery:
     logical_call_id: str
     request_digest: str
     digest_generation: str
+    require_evidence: bool = False
 
     def __post_init__(self) -> None:
         if not is_safe_opaque_id(self.logical_call_id):
@@ -85,6 +90,8 @@ class ModelDispatchRecoveryQuery:
             raise ValueError("model recovery request_digest must be a lowercase SHA-256 digest")
         if self.digest_generation != MODEL_REQUEST_DIGEST_GENERATION:
             raise ValueError("model recovery digest_generation is unsupported")
+        if type(self.require_evidence) is not bool:
+            raise ValueError("model recovery require_evidence must be a boolean")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -231,6 +238,7 @@ def recover_model_dispatch(
     *,
     logical_call_id: str,
     request_digest: str,
+    require_evidence: bool = False,
 ) -> RecoveredModelDispatch | None:
     """Ask an optional recovery hook for settled evidence and validate its identity."""
 
@@ -241,6 +249,7 @@ def recover_model_dispatch(
         logical_call_id=logical_call_id,
         request_digest=request_digest,
         digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+        require_evidence=require_evidence,
     )
     recovered = recover(query)
     if recovered is None:
@@ -319,6 +328,10 @@ def settle_model_dispatch(
                 failure_code=safe_failure,
             )
         )
+    except ModelEvidenceUncommitted:
+        # The invocation is already authoritative. Reclassifying a projection failure as an
+        # ambiguous paid dispatch would both lose that fact and invite the wrong recovery path.
+        raise
     except Exception as persistence_error:
         raise_model_dispatch_unknown(
             hook,

@@ -109,13 +109,16 @@ _CONTRACT_INVOCATION_IDENTITY_FIELDS = frozenset(
         "idempotency_key",
         "dispatch_state",
         "request_digest",
+        "evidence_policy",
         "receipt",
         "result_ref",
         "failure_code",
     }
 )
 _CONTRACT_INVOCATION_FIXED_CANONICAL_FIELDS = frozenset({"schema_version", "digest_generation"})
-_CONTRACT_RETRY_STABLE_IDENTITY_FIELDS = frozenset({"idempotency_key", "request_digest"})
+_CONTRACT_RETRY_STABLE_IDENTITY_FIELDS = frozenset(
+    {"idempotency_key", "request_digest", "evidence_policy"}
+)
 _CONTRACT_QUEUED_MEDIA_CARRIERS = ("content_list", "envelope")
 _CONTRACT_RECEIPT_RETRYABILITY_STATES = ("true", "false", "omitted")
 _CONTRACT_CHECKPOINT_CANONICAL_ALIAS_FIELDS = frozenset(
@@ -516,6 +519,7 @@ def _contract_checkpoint_identity_variants(
         "inbox_seen_ids",
         "applied_input_ids",
         "skills_activated",
+        "pending_tool_loads",
     }
     special_values: dict[str, Any] = {
         "provider_http_status": 200,
@@ -538,6 +542,11 @@ def _contract_checkpoint_identity_variants(
             dispatch_state="reserved",
         ).to_json(),
         "interruption_cause": InterruptionCause.USER_CANCEL.value,
+        "pending_finish": {
+            "summary": "contract alternate finish",
+            "outputs": ["contract-alternate.md"],
+            "notes": "contract alternate notes",
+        },
     }
     variants: dict[str, RunCheckpoint] = {}
     for field_name in sorted(identity_fields):
@@ -682,6 +691,7 @@ def _contract_invocation(
     idempotency_key: str | None = None,
     request_digest: str = "a" * 64,
     digest_generation: str = MODEL_REQUEST_DIGEST_GENERATION,
+    evidence_policy: str = "passive",
     retryable: bool | None = False,
     succeeded: bool = False,
 ) -> DurableModelInvocation:
@@ -708,6 +718,7 @@ def _contract_invocation(
         dispatch_state=dispatch_state,  # type: ignore[arg-type]
         request_digest=request_digest,
         digest_generation=digest_generation,
+        evidence_policy=evidence_policy,  # type: ignore[arg-type]
         receipt=receipt,
         result_ref=result_ref,
         failure_code=failure_code,
@@ -1300,6 +1311,7 @@ def _contract_retry_identity_drift_status(
             idempotency_key="contract-retry-idempotency-drift",
         ),
         "request_digest": replace(baseline, request_digest="b" * 64),
+        "evidence_policy": replace(baseline, evidence_policy="required"),
     }
     if set(variants) != _CONTRACT_RETRY_STABLE_IDENTITY_FIELDS:
         raise AssertionError("retry stable identity matrix is incomplete")
@@ -1477,6 +1489,7 @@ def _contract_invocation_identity_status(
             ),
             "dispatch_state": replace(baseline, dispatch_state="dispatch_started"),
             "request_digest": replace(baseline, request_digest="b" * 64),
+            "evidence_policy": replace(baseline, evidence_policy="required"),
         }
         variant = variants[field_name]
     first = harness.sink.commit_invocation(
@@ -4933,12 +4946,19 @@ def _run_fenced_run_sink_contract(
                 "dispatch_attempt",
                 2,
             ),
+            "evidence_policy": _contract_invocation_drift_status(
+                factory,
+                _contract_run_id(namespace, "invocation-drift-evidence-policy"),
+                "evidence_policy",
+                "required",
+            ),
         }
         terminal_identity_drift_values = {
             "idempotency_key": "contract-terminal-idempotency-drift",
             "request_digest": "b" * 64,
             "dispatch_id": "dispatch-terminal-drift",
             "dispatch_attempt": 2,
+            "evidence_policy": "required",
         }
         terminal_identity_drift_statuses = {
             (terminal_state, field_name): _contract_terminal_invocation_drift_status(

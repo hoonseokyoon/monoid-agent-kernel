@@ -147,7 +147,28 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
         blobs: Mapping[str, bytes],
         *,
         writer_token: WriterToken,
-    ) -> CommitResult: ...
+        stage_evidence: bool = False,
+    ) -> CommitResult:
+        """Commit one authoritative invocation revision.
+
+        ``stage_evidence=True`` requires ``capabilities.transactional_outbox`` and commits the
+        revision plus a public-safe evidence outbox entry atomically.  A rejected transaction
+        publishes neither mutation.
+        """
+        ...
+
+    def commit_model_evidence(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        """Commit the public-safe projection of an authoritative settled invocation.
+
+        The writer fence is checked before idempotency.  The invocation must equal the current
+        settled authoritative revision; this mutation never changes that invocation head.
+        """
+        ...
 
     def append_event(
         self,
