@@ -2726,6 +2726,57 @@ coroutine that swallows a cancellation is a broken coroutine. `SystemExit` and `
 deliberately do **not** account — teardown is where a recorder's sinks are closing, and a meter
 nobody will read is not worth touching a closing file for.
 
+### Durable `ModelCallRunner` lifecycle
+
+`ModelCallRunner.lifecycle_hook` activates authoritative paid-call journaling. The default value is
+`None`, so existing in-process calls keep their per-call key issuance, adapter dispatch, retry,
+receipt, observer, and passive `settled_sink` behavior.
+
+An activated lifecycle requires `acall(logical_call_id=...)`. The ID is a stable execution address,
+not a request hash. `core.model_invocation.logical_model_call_id(run_id, step_id)` derives the
+AgentLoop form without exposing the raw run or step string. Each kernel dispatch uses
+`model_dispatch_id(logical_call_id, attempt)`. A standalone durable caller supplies its own stable
+logical ID.
+
+The synchronous lifecycle sequence is:
+
+```text
+normalize + request digest
+  -> reserve effective key
+  -> commit dispatch_started
+  -> enter adapter
+  -> commit settled success/refusal OR commit unknown
+  -> deliver passive observer/sidecar evidence
+```
+
+`reserve()` may substitute the idempotency key from an existing reservation. The runner rejects any
+change to logical ID, dispatch ID/attempt, request digest, or digest generation before adapter
+entry. The first committed key remains fixed across restore and kernel retry. Durable mode accepts
+only `digest_status="ok"`; an absent or oversized request digest raises
+`durable_invocation_unkeyable` before reserve and provider dispatch.
+
+Failure evidence is explicit and fail-closed. An ordinary `ModelAdapterError` is ambiguous.
+`ModelDispatchRefused` is the typed proof of a definite terminal refusal. A typed refusal commits a
+settled failure and may enter the existing kernel retry policy when its receipt is retryable.
+Connection loss, timeout, malformed terminal data, and every other exception type commit `unknown`,
+raise `dispatch_unknown`, and forbid an automatic paid-call retry. Provider-specific refusal proof
+remains opt-in; HTTP status and `retryable=True` do not infer it.
+
+Successful settlement stores the canonical `core.model_payloads.response_record_body()` bytes as a
+private result blob. The body preserves final text, tool calls, reasoning, usage, stop reason, and
+provider retry evidence. It excludes `ModelTurn.raw`. An unencodable or oversized result becomes an
+unknown dispatch because provider work has already happened.
+
+Lifecycle writes control execution and their exceptions are not observer failures. Reserve/start
+failure prevents adapter entry. Settle failure attempts an unknown transition and surfaces
+`dispatch_unknown` even when that transition also fails. The next recovery pass interprets a
+remaining `dispatch_started` head as unknown. Python `BaseException` represents a process-stop
+failpoint and bypasses in-process compensation, leaving the last committed head for recovery.
+
+The lifecycle value types live in `monoid_agent_kernel.model_lifecycle`. They stay outside the
+stable package root and contain no storage, queue, lease, database, or Temporal dependency. A host
+adapter binds them to `FencedRunSink` and `WriterToken`; the runner imports neither hosting type.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:

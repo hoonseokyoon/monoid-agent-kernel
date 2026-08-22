@@ -60,6 +60,23 @@ out in commit messages and here.
   `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
   retaining the legacy unfenced store API.
 
+### Added — durable model-call lifecycle
+
+- Added the opt-in `ModelCallRunner` lifecycle boundary for durable paid calls. A durable call now
+  reserves its logical dispatch and commits `dispatch_started` before adapter entry, then commits a
+  proven success/refusal or closes ambiguous transport and settlement failures as `unknown`.
+  Restore and kernel retry reuse the first committed idempotency key. Logical-call and dispatch IDs
+  are deterministic content-free addresses derived from execution coordinates.
+- Durable failure evidence is fail-closed. An ordinary `ModelAdapterError` is ambiguous;
+  `ModelDispatchRefused` is the typed proof that permits a settled failure and the existing kernel
+  retry policy. Retryability alone never proves that a paid dispatch finished. Successful durable
+  settlements store the existing canonical replay-turn projection as a private content-addressed
+  result blob, excluding `ModelTurn.raw`.
+- Added standalone fenced-journal crash tests for every PR3 boundary: before/after reserve,
+  after start and before adapter entry, after adapter return and before settle, ambiguous transport,
+  explicit retryable refusal, result settlement, and settlement-write failure. Hard-crash
+  failpoints retain the last committed head without running in-process compensation.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path
