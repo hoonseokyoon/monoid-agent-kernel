@@ -16,6 +16,12 @@ _OPERATIONAL_CANCELLATION_CAUSES = frozenset(
 )
 
 
+def is_operational_cancellation_cause(cause: InterruptionCause) -> bool:
+    """Whether ``cause`` belongs to the public execution-cancellation capability."""
+
+    return cause in _OPERATIONAL_CANCELLATION_CAUSES
+
+
 @dataclass
 class CancellationToken:
     _event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
@@ -32,7 +38,7 @@ class CancellationToken:
             cause = InterruptionCause(cause)
         except (TypeError, ValueError) as exc:
             raise ValueError("cancellation cause is outside the portable vocabulary") from exc
-        if cause not in _OPERATIONAL_CANCELLATION_CAUSES:
+        if not is_operational_cancellation_cause(cause):
             allowed = ", ".join(sorted(item.value for item in _OPERATIONAL_CANCELLATION_CAUSES))
             raise ValueError(f"cancellation cause must be operational: {allowed}")
         self._request(cause)

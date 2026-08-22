@@ -618,6 +618,10 @@ Checkpoints produced before v0.22 may encode `lease_lost` as a cancellation requ
 reader detects that value before bootstrap and revokes the activation's
 `ActivationWriteAuthority`, leaving recorder, workspace replay, task restore, and extension
 callbacks unopened. The public `CancellationToken.cancel()` API receives only operational causes.
+Checkpoint validation rejects `cancellation_requested=true` when its cause is
+`provider_failure`, `validation_failure`, or `unknown`; those values describe outcomes and cannot
+drive execution cancellation. Direct `AgentLoop.restore()` applies the same check before
+bootstrap.
 The Reference recovery service also resolves the registered activation record before its first
 authority-sensitive loop call, so a concurrent revocation still unregisters and discards the
 stale activation.

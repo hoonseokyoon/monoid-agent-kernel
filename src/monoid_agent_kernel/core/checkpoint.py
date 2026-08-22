@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.core.cancellation import is_operational_cancellation_cause
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
@@ -532,17 +533,27 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             raise ValueError("checkpoint last_model_invocation is invalid")
         if invocation.value is None or invocation.value.run_id != payload.get("run_id"):
             raise ValueError("checkpoint last_model_invocation run_id must match checkpoint run_id")
+    parsed_interruption_cause: InterruptionCause | None = None
     if "interruption_cause" in payload:
         interruption_cause = payload["interruption_cause"]
         if not isinstance(interruption_cause, str):
             raise ValueError("checkpoint interruption_cause is outside the portable vocabulary")
         if interruption_cause:
             try:
-                InterruptionCause(interruption_cause)
+                parsed_interruption_cause = InterruptionCause(interruption_cause)
             except ValueError as exc:
                 raise ValueError(
                     "checkpoint interruption_cause is outside the portable vocabulary"
                 ) from exc
+    if (
+        payload.get("cancellation_requested") is True
+        and parsed_interruption_cause is not None
+        and parsed_interruption_cause is not InterruptionCause.LEASE_LOST
+        and not is_operational_cancellation_cause(parsed_interruption_cause)
+    ):
+        raise ValueError(
+            "checkpoint cancellation_requested requires an operational interruption cause"
+        )
     for field_name in ("tool_call_counts", "total_usage", "subagent_usage"):
         if field_name in payload:
             _validate_counter_mapping(payload[field_name], field_name)

@@ -368,6 +368,38 @@ def test_a_legacy_lease_loss_checkpoint_restores_as_revoked_writer_authority(
     loop.discard_uncommitted()
 
 
+@pytest.mark.parametrize(
+    "cause",
+    (
+        InterruptionCause.PROVIDER_FAILURE,
+        InterruptionCause.VALIDATION_FAILURE,
+        InterruptionCause.UNKNOWN,
+    ),
+)
+def test_restore_rejects_a_failure_cause_before_bootstrap(
+    tmp_path: Path,
+    cause: InterruptionCause,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="cancellation_requested requires an operational interruption cause",
+    ):
+        loop.restore(
+            RunCheckpoint(
+                run_id=loop.spec.run_id,
+                cancellation_requested=True,
+                interruption_cause=cause.value,
+            )
+        )
+
+    assert loop.write_authority.revoked is False
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+    assert not loop.spec.run_root.exists()
+
+
 def test_a_quiescent_snapshot_persists_the_pending_token_cause_atomically(
     tmp_path: Path,
 ) -> None:

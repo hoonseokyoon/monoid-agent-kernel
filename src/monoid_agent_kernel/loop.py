@@ -39,7 +39,10 @@ from monoid_agent_kernel.model_lifecycle import (
     mark_recovered_model_usage,
     recover_model_dispatch,
 )
-from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.cancellation import (
+    CancellationToken,
+    is_operational_cancellation_cause,
+)
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
     LocalFsCheckpointStore,
@@ -3627,15 +3630,22 @@ class AgentLoop:
                 "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
                 error_code="model_io_subscriptions_closed",
             )
-        if (
-            checkpoint.cancellation_requested
-            and checkpoint.interruption_cause == InterruptionCause.LEASE_LOST.value
-        ):
-            # Compatibility migration for checkpoints written before execution cancellation and
-            # writer authority became separate capabilities. Detect it before bootstrap creates,
-            # reopens, replays, or publishes any activation-owned resource.
-            self.lose_writer_authority()
-            return
+        if checkpoint.cancellation_requested:
+            restored_cause = (
+                InterruptionCause(checkpoint.interruption_cause)
+                if checkpoint.interruption_cause
+                else InterruptionCause.USER_CANCEL
+            )
+            if restored_cause is InterruptionCause.LEASE_LOST:
+                # Compatibility migration for checkpoints written before execution cancellation
+                # and writer authority became separate capabilities. Detect it before bootstrap
+                # creates, reopens, replays, or publishes any activation-owned resource.
+                self.lose_writer_authority()
+                return
+            if not is_operational_cancellation_cause(restored_cause):
+                raise ValueError(
+                    "checkpoint cancellation_requested requires an operational interruption cause"
+                )
         self._restoring = True
         try:
             res = self._bootstrap()

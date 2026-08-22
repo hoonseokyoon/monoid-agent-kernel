@@ -23,6 +23,7 @@ from monoid_agent_kernel.core.checkpoint import (
     read_checkpoint_checked,
     write_checkpoint,
 )
+from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.result import (
     Suspension,
     suspension_checkpoint_payload,
@@ -1398,6 +1399,31 @@ def test_a_malformed_park_payload_is_refused_at_the_recovery_boundary(tmp_path: 
         "reason": "settled",
         "status": "completed",
     }
+
+
+@pytest.mark.parametrize(
+    "cause",
+    (
+        InterruptionCause.PROVIDER_FAILURE,
+        InterruptionCause.VALIDATION_FAILURE,
+        InterruptionCause.UNKNOWN,
+    ),
+)
+def test_checkpoint_rejects_a_failure_cause_used_as_cancellation(
+    cause: InterruptionCause,
+) -> None:
+    payload = RunCheckpoint(
+        run_id="run_1",
+        cancellation_requested=True,
+        interruption_cause=cause.value,
+    ).to_json()
+
+    with pytest.raises(
+        ValueError,
+        match="cancellation_requested requires an operational interruption cause",
+    ):
+        _validate_checkpoint_payload(payload)
+    assert decode_checkpoint(payload).status == "corrupt"
 
 
 def test_metrics_after_a_restore_report_one_epoch_not_two(tmp_path: Path) -> None:
