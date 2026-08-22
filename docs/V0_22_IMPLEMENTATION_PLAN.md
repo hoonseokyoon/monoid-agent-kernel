@@ -809,6 +809,24 @@ receipt usage를 오류에 보존한다.
 
 현재 `settled_sink`의 의미는 `passive`다. 기존 callable과 failure containment를 유지한다.
 
+`required`와 `outbox`는 기존 callable을 강화하지 않는다. `FencedRunSink`가 다음 두 mutation을
+제공한다.
+
+```python
+commit_model_evidence(invocation, *, writer_token) -> CommitResult
+commit_invocation(
+    invocation,
+    blobs,
+    *,
+    writer_token,
+    stage_evidence: bool = False,
+) -> CommitResult
+```
+
+`commit_model_evidence`는 이미 authoritative한 settled invocation의 public-safe projection을
+idempotently 확정한다. `stage_evidence=True`는 invocation revision과 evidence outbox entry를 같은
+transaction에서 확정한다. Outbox schema, poller, retry worker는 host adapter가 소유한다.
+
 | Policy | 동작 | Provider 재호출 |
 |---|---|---|
 | `passive` | observer/sidecar 실패를 log하고 model outcome을 유지 | 없음 |
@@ -822,6 +840,17 @@ Authoritative invocation settle과 evidence projection을 구분한다.
 - Invocation settle 성공 + required evidence 실패: `evidence_uncommitted`다.
 - `evidence_uncommitted` 복구: settled invocation result를 재사용하고 evidence delivery만 다시 한다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
+
+Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
+Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
+`evidence_uncommitted`로 분리한다. Recovery는 현재 writer fence를 같은 invocation으로 다시 검증한
+뒤 evidence mutation만 재시도한다. Passive `settled_sink`는 required/outbox mutation과 독립이며
+기존처럼 결과 분류를 바꾸지 않는다.
+
+첫 `evidence_uncommitted` park는 저장된 receipt usage를 run total에 반영한다. 같은 logical call의
+복구는 마지막 evidence-uncommitted checkpoint가 이미 반영한 usage를 읽고 이후 aggregate receipt와의
+non-negative delta만 더한다. 같은 evidence 재시도, settled failure 재표면화, 남은 kernel attempt
+재개가 usage를 중복 계상하지 않는다.
 
 기존 반환형을 유지하기 위해 AgentLoop는 `evidence_uncommitted`를 non-terminal
 `Suspension(reason="turn_failed", error_code="evidence_uncommitted")`로 표면화한다.
