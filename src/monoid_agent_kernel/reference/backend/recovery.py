@@ -312,6 +312,10 @@ class RecoveryService:
         try:
             await self._context.acquire_run_slot()
             acquired = True
+            # Recovery already registered this activation before scheduling this coroutine. Fetch
+            # its record before the first loop call: that call may observe a concurrent authority
+            # revocation, and the lease-loss disposition must still unregister the stale claim.
+            record = self._context.record(run_id)
             if loop.has_pending_tasks():
                 # ``status="completed"``, not ``"running"``. The durable status vocabulary is
                 # completed/failed/limited (core/result.py), and this synthetic park used to be
@@ -323,7 +327,6 @@ class RecoveryService:
                 suspension = Suspension(
                     reason="awaiting_tasks", status="completed", has_external=True
                 )
-            record = self._context.record(run_id)
             result = await self._context.drive_open_session(
                 record,
                 request,

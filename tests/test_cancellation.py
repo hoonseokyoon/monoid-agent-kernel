@@ -342,6 +342,32 @@ def test_a_restored_loop_reinstalls_the_durable_interruption_cause(tmp_path: Pat
     assert stored.checkpoint.interruption_cause == InterruptionCause.GRACEFUL_DRAIN.value
 
 
+def test_a_legacy_lease_loss_checkpoint_restores_as_revoked_writer_authority(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+
+    loop.restore(
+        RunCheckpoint(
+            run_id=loop.spec.run_id,
+            seq=1,
+            cancellation_requested=True,
+            interruption_cause=InterruptionCause.LEASE_LOST.value,
+        )
+    )
+
+    assert loop.write_authority.revoked is True
+    assert loop.cancellation_token is not None
+    assert loop.cancellation_token.cause is InterruptionCause.LEASE_LOST
+    suspension = loop.run_until_suspended("must not execute")
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert loop._session is not None
+    assert loop._session.checkpoint_seq == 1
+    assert loop._session.state.status == "completed"
+    loop.discard_uncommitted()
+
+
 def test_a_quiescent_snapshot_persists_the_pending_token_cause_atomically(
     tmp_path: Path,
 ) -> None:

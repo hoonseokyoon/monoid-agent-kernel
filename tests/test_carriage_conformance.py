@@ -6189,10 +6189,10 @@ def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_writ
 def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
     """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
 
-    The flag is the request; the token is only the channel a boundary check reads it through. So
-    the restore mints one when the loop has none, exactly as ``astream`` and ``LoopSession.cancel``
-    do — pinned as "the guard is the flag alone, and a token is minted", because re-introducing a
-    token precondition anywhere in that branch restores the defect.
+    The flag is the request. Operational causes use the shared token-creation seam; legacy lease
+    loss revokes writer authority and uses that token only as its private wake channel. Pinned as
+    "the guard is the flag alone, and both cause families have an explicit disposition", because a
+    token precondition or routing lease loss through public ``cancel`` restores one of the defects.
     """
 
     assert "cancellation_requested" in _snapshot_written_keys()
@@ -6206,16 +6206,16 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
         "restore_guards": guards,
         "hint": "a second condition on this branch is the asymmetry that was closed",
     }
-    minting = [
+    token_ensures = [
         ast.unparse(node)
         for node in ast.walk(restore)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "CancellationToken"
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_ensure_cancellation_token"
     ]
-    assert minting == ["CancellationToken()"], {
-        "tokens_minted_during_restore": minting,
-        "hint": "without minting, a loop rebuilt with no token silently un-cancels the run",
+    assert token_ensures == ["self._ensure_cancellation_token()"], {
+        "token_ensure_calls": token_ensures,
+        "hint": "without the shared ensure seam, a fresh loop silently un-cancels the run",
     }
     cancels = [
         ast.unparse(node)
@@ -6224,10 +6224,19 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "cancel"
     ]
-    assert cancels == [
-        "self.cancellation_token.cancel(InterruptionCause(cp.interruption_cause) if "
-        "cp.interruption_cause else InterruptionCause.USER_CANCEL)"
-    ], {"cancel_calls": cancels}
+    assert cancels == ["self._ensure_cancellation_token().cancel(cause)"], {
+        "cancel_calls": cancels
+    }
+    authority_losses = [
+        ast.unparse(node)
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "lose_writer_authority"
+    ]
+    assert authority_losses == ["self.lose_writer_authority()"], {
+        "authority_loss_calls": authority_losses
+    }
 
 
 def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:

@@ -3820,13 +3820,18 @@ class AgentLoop:
             # ``LoopSession.cancel``: the flag is the request, the token is only the channel a
             # boundary check reads it through. An embedder deliberately re-running a cancelled
             # checkpoint clears ``cancellation_requested`` before restoring.
-            if self.cancellation_token is None:
-                self.cancellation_token = CancellationToken()
-            self.cancellation_token.cancel(
+            cause = (
                 InterruptionCause(cp.interruption_cause)
                 if cp.interruption_cause
                 else InterruptionCause.USER_CANCEL
             )
+            if cause is InterruptionCause.LEASE_LOST:
+                # Compatibility migration for checkpoints written before execution cancellation
+                # and writer authority became separate capabilities. Lease loss revokes this
+                # activation and uses the token only as its private wake channel.
+                self.lose_writer_authority()
+            else:
+                self._ensure_cancellation_token().cancel(cause)
 
     @staticmethod
     def _apply_workspace_delta(

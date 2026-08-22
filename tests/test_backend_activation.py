@@ -185,66 +185,75 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
     assert unregistered == [prepared.record]
 
 
-def test_recovered_execution_discards_lease_loss_without_recording_failure(
+def test_recovered_execution_unregisters_lease_loss_before_or_during_drive(
     tmp_path: Path,
 ) -> None:
-    loop = _DiscardableLoop(tmp_path)
-    failures: list[Exception] = []
-    results: list[Any] = []
-    released: list[bool] = []
-    unregistered: list[Any] = []
-    recovered_record = SimpleNamespace(
-        run_id="run_stale",
-        write_authority=ActivationWriteAuthority(),
-    )
-
-    async def acquire() -> None:
-        return None
-
-    async def stale_session(*args: Any, **kwargs: Any) -> None:
-        raise WriteAuthorityRevoked()
-
-    service = RecoveryService(
-        RecoveryContext(
-            run_root_provider=lambda: tmp_path,
-            checkpoint_store_provider=lambda: None,
-            lease_store_provider=lambda: None,
-            max_recover_attempts_provider=lambda: 3,
-            worker_id_provider=lambda: "worker-1",
-            lease_ttl_s_provider=lambda: 30.0,
-            is_record_tracked=lambda run_id: False,
-            record=lambda run_id: recovered_record,
-            make_request=lambda *args: SimpleNamespace(),
-            make_record=lambda *args: SimpleNamespace(),
-            issue_llm_gateway_token=lambda *args: "llm",
-            issue_web_gateway_token=lambda *args: "web",
-            build_loop=lambda *args: SimpleNamespace(loop=loop),
-            register_record=lambda record: True,
-            unregister_record=unregistered.append,
-            attach_loop=lambda *args: None,
-            call_soon=lambda *args: None,
-            spawn=lambda awaitable: None,
-            drive_open_session=stale_session,  # type: ignore[arg-type]
-            record_run_result=lambda run_id, result: results.append((run_id, result)),
-            record_run_failure=lambda run_id, exc: failures.append(exc),
-            meter_abandoned_run=lambda run_id, tenant_id: None,
-            acquire_run_slot=acquire,
-            release_run_slot=lambda: released.append(True),
+    for failure_boundary in ("pending_tasks", "drive"):
+        loop = _DiscardableLoop(tmp_path)
+        failures: list[Exception] = []
+        results: list[Any] = []
+        released: list[bool] = []
+        unregistered: list[Any] = []
+        recovered_record = SimpleNamespace(
+            run_id="run_stale",
+            write_authority=ActivationWriteAuthority(),
         )
-    )
 
-    asyncio.run(
-        service.run_recovered(
-            "run_stale",
-            SimpleNamespace(),
-            loop,  # type: ignore[arg-type]
-            Suspension(reason="settled", status="completed"),
+        async def acquire() -> None:
+            return None
+
+        def pending_tasks() -> bool:
+            if failure_boundary == "pending_tasks":
+                raise WriteAuthorityRevoked()
+            return False
+
+        async def stale_session(*args: Any, **kwargs: Any) -> None:
+            if failure_boundary == "drive":
+                raise WriteAuthorityRevoked()
+            raise AssertionError("drive must not start after authority loss")
+
+        loop.has_pending_tasks = pending_tasks  # type: ignore[method-assign]
+        service = RecoveryService(
+            RecoveryContext(
+                run_root_provider=lambda: tmp_path,
+                checkpoint_store_provider=lambda: None,
+                lease_store_provider=lambda: None,
+                max_recover_attempts_provider=lambda: 3,
+                worker_id_provider=lambda: "worker-1",
+                lease_ttl_s_provider=lambda: 30.0,
+                is_record_tracked=lambda run_id: False,
+                record=lambda run_id: recovered_record,
+                make_request=lambda *args: SimpleNamespace(),
+                make_record=lambda *args: SimpleNamespace(),
+                issue_llm_gateway_token=lambda *args: "llm",
+                issue_web_gateway_token=lambda *args: "web",
+                build_loop=lambda *args: SimpleNamespace(loop=loop),
+                register_record=lambda record: True,
+                unregister_record=unregistered.append,
+                attach_loop=lambda *args: None,
+                call_soon=lambda *args: None,
+                spawn=lambda awaitable: None,
+                drive_open_session=stale_session,  # type: ignore[arg-type]
+                record_run_result=lambda run_id, result: results.append((run_id, result)),
+                record_run_failure=lambda run_id, exc: failures.append(exc),
+                meter_abandoned_run=lambda run_id, tenant_id: None,
+                acquire_run_slot=acquire,
+                release_run_slot=lambda: released.append(True),
+            )
         )
-    )
 
-    assert loop.discard_calls == 1
-    assert loop.close_calls == 0
-    assert failures == []
-    assert results == []
-    assert released == [True]
-    assert unregistered == [recovered_record]
+        asyncio.run(
+            service.run_recovered(
+                "run_stale",
+                SimpleNamespace(),
+                loop,  # type: ignore[arg-type]
+                Suspension(reason="settled", status="completed"),
+            )
+        )
+
+        assert loop.discard_calls == 1, failure_boundary
+        assert loop.close_calls == 0, failure_boundary
+        assert failures == [], failure_boundary
+        assert results == [], failure_boundary
+        assert released == [True], failure_boundary
+        assert unregistered == [recovered_record], failure_boundary

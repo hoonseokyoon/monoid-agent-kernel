@@ -613,3 +613,9 @@ identity or receipt ledger can redrive an applied input or return the wrong boun
 experimental DBOS adapter, keep `application_version` stable while same-slot recovery of pending
 workflow history is required. That operational version never replaces checkpoint schema/version
 compatibility or the checkpoint receipt as semantic authority.
+
+Checkpoints produced before v0.22 may encode `lease_lost` as a cancellation request. A v0.22
+reader migrates that value by revoking the activation's `ActivationWriteAuthority`; it does not
+route lease loss through the public `CancellationToken.cancel()` API. The Reference recovery
+service also resolves the registered activation record before its first authority-sensitive loop
+call, so a concurrent revocation still unregisters and discards the stale activation.
