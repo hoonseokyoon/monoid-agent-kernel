@@ -52,7 +52,7 @@ from monoid_agent_kernel.shell import (
     ShellExecutionOptions,
     ResolvedShellExecutionWorkspace,
 )
-from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.workspace import Workspace, _workspace_root_path
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
 
 import monoid_agent_kernel.shell as shell_runtime
@@ -368,8 +368,9 @@ class ShellTaskExecutor:
         execution_workspace: ResolvedShellExecutionWorkspace,
     ) -> tuple[Path, Path | None, Any]:
         if execution_workspace == "direct":
-            cwd_abs = (manager.workspace.root / cwd_rel).resolve()
-            if not is_within(manager.workspace.root, cwd_abs):
+            workspace_root = _workspace_root_path(manager.workspace)
+            cwd_abs = (workspace_root / cwd_rel).resolve()
+            if not is_within(workspace_root, cwd_abs):
                 raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
             if not cwd_abs.exists() or not cwd_abs.is_dir():
                 raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")

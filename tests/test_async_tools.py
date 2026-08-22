@@ -486,7 +486,7 @@ def test_lease_loss_fences_late_artifact_from_abandoned_sync_tool(tmp_path: Path
         loop.discard_uncommitted()
 
 
-@pytest.mark.parametrize("mutation", ("plan", "finish", "workspace"))
+@pytest.mark.parametrize("mutation", ("plan", "finish"))
 def test_lease_loss_fences_context_mutation_from_abandoned_sync_tool(
     tmp_path: Path,
     mutation: str,
@@ -508,10 +508,8 @@ def test_lease_loss_fences_context_mutation_from_abandoned_sync_tool(
                 try:
                     if mutation == "plan":
                         ctx.update_plan([{"step": "late", "status": "pending"}])
-                    elif mutation == "finish":
-                        ctx.finish("late", [], None)
                     else:
-                        ctx.workspace.write_bytes("late.txt", b"stale")
+                        ctx.finish("late", [], None)
                 except BaseException as exc:
                     late_errors.append(exc)
                 finally:
@@ -565,6 +563,98 @@ def test_lease_loss_fences_context_mutation_from_abandoned_sync_tool(
         assert isinstance(late_errors[0], RunCancelled)
         assert context.plan == []
         assert context.pending_finish is None
+        assert not loop.spec.workspace_root.joinpath("late.txt").exists()
+    finally:
+        loop.discard_uncommitted()
+
+
+def test_extension_context_exposes_methods_without_mutable_engine_capabilities(
+    tmp_path: Path,
+) -> None:
+    forbidden = {
+        "workspace",
+        "recorder",
+        "job_manager",
+        "outbox",
+        "plan",
+        "pending_finish",
+        "subagent_usage",
+        "skills_activated",
+    }
+    provider_leaks: list[str] = []
+    handler_leaks: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            provider_leaks.extend(name for name in forbidden if hasattr(context, name))
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                handler_leaks.extend(name for name in forbidden if hasattr(ctx, name))
+                ctx.update_plan([{"step": "safe façade", "status": "completed"}])
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="context.inspect",
+                    description="inspect the extension context boundary",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("context_inspect", {}, "c1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("context.inspect"),))
+        ),
+        tool_providers=(Provider(),),
+    )
+    loop.open()
+    assert loop._session is not None
+    workspace = loop._session.res.workspace
+
+    try:
+        assert not hasattr(workspace, "root")
+        assert not hasattr(workspace, "resolve_existing_or_parent")
+        assert loop.run_until_suspended("go").reason == "settled"
+        loop.close()
+    finally:
+        if loop._session is not None:
+            loop.discard_uncommitted()
+
+    assert provider_leaks == []
+    assert handler_leaks == []
+
+
+def test_retained_builtin_workspace_handler_is_fenced_without_exporting_a_path(
+    tmp_path: Path,
+) -> None:
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(turns=[]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    assert loop._session is not None
+    resources = loop._session.res
+    write_tool = next(spec for spec in resources.base_tool_specs if spec.id == "fs.write")
+    loop.lose_writer_authority()
+
+    try:
+        with pytest.raises(RunCancelled):
+            write_tool.handler(
+                resources.context._extension_context,
+                {"path": "late.txt", "content": "stale"},
+            )
         assert not loop.spec.workspace_root.joinpath("late.txt").exists()
     finally:
         loop.discard_uncommitted()
@@ -761,7 +851,7 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     all, so the abandoned worker would widen to the run-level permission policy.
     """
     workers: list[threading.Thread] = []
-    late_tool_id: list[str] = []
+    late_scope_results: list[tuple[bool, bool]] = []
 
     class Provider:
         def get_tools(self, context: ToolContext) -> list[ToolSpec]:
@@ -770,9 +860,14 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
             def handler(ctx: ToolContext, args: dict) -> ToolResult:
                 del args
                 workers.append(threading.current_thread())
-                # Outlive the deadline and the grace window, then read the call back.
+                # Outlive the deadline and the grace window, then exercise the retained scope.
                 threading.Event().wait(timeout=1.5)
-                late_tool_id.append(ctx._current_call.tool_id)  # type: ignore[attr-defined]
+                late_scope_results.append(
+                    (
+                        ctx.path_allowed("notes/kept.txt", "read"),
+                        ctx.path_allowed("secrets/key.txt", "read"),
+                    )
+                )
                 return ToolResult(ok=True, content={})
 
             return [
@@ -793,7 +888,13 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
                 turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_scope", {}, "c1"),))]
             ),
             runtime_config_provider=runtime_provider(
-                runtime_config(bindings=(tool_binding("sync.late_scope"),))
+                runtime_config(
+                    bindings=(
+                        tool_binding(
+                            "sync.late_scope", scope=ToolScope(allowed_paths=("notes/*",))
+                        ),
+                    )
+                )
             ),
             tool_providers=(Provider(),),
             async_tool_cancel_grace_s=0.05,
@@ -803,7 +904,7 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
     workers[0].join(timeout=10)
-    assert late_tool_id == ["sync.late_scope"]
+    assert late_scope_results == [(True, False)]
 
 
 def test_failed_tool_outcome_is_consumed_when_a_run_boundary_wins_the_turn(tmp_path: Path) -> None:

@@ -235,7 +235,11 @@ class LoopBootstrapper:
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:
-            self._guard_external(lambda: base_registry.register_many(provider.get_tools(context)))
+            self._guard_external(
+                lambda: base_registry.register_many(
+                    provider.get_tools(context._extension_context)
+                )
+            )
         if loop.subagent_definitions:
             loop._install_subagent_capability(base_registry, context, job_manager)
 

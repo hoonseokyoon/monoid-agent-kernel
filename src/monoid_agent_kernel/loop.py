@@ -572,10 +572,107 @@ class FinishResult:
     notes: str | None = None
 
 
+class _ExtensionToolContext(ToolContext):
+    """Capability-minimal view passed across the Python extension boundary.
+
+    The engine keeps lifecycle state and mutable dependencies on ``AgentToolContext``. Tool
+    providers and handlers receive this explicit method-only façade, so a retained context cannot
+    obtain the workspace backend, a reusable filesystem path, the recorder, task manager, outbox,
+    or mutable counters through public attributes. Underscore access remains the trusted Python
+    extension boundary; arbitrary Python code is not sandboxed.
+    """
+
+    __slots__ = ("_delegate",)
+
+    def __init__(self, delegate: AgentToolContext) -> None:
+        self._delegate = delegate
+
+    def emit_artifact(
+        self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._delegate.emit_artifact(path, kind, label, metadata)
+
+    def list_artifacts(self) -> list[dict[str, Any]]:
+        return self._delegate.list_artifacts()
+
+    def update_plan(self, items: list[dict[str, Any]]) -> None:
+        self._delegate.update_plan(items)
+
+    def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
+        self._delegate.finish(summary, outputs, notes)
+
+    def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.execute_shell(args)
+
+    def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.run_script(args)
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        return self._delegate.list_jobs()
+
+    def job_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.job_status(args)
+
+    def job_logs(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.job_logs(args)
+
+    def job_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.job_cancel(args)
+
+    def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.job_wait(args)
+
+    def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.request_human_input(args)
+
+    def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.spawn_subagent(args)
+
+    def record_skill_activation(self, name: str, *, resource_count: int = 0) -> None:
+        self._delegate.record_skill_activation(name, resource_count=resource_count)
+
+    def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.execute_web_search(args)
+
+    def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.execute_web_fetch(args)
+
+    def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.execute_web_context(args)
+
+    def path_allowed(self, path: str, operation: str = "read") -> bool:
+        return self._delegate.path_allowed(path, operation)
+
+    def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._delegate.search_tools(args)
+
+    def capability_token(self, capability: str) -> str | None:
+        return self._delegate.capability_token(capability)
+
+    def emit_outbox(
+        self,
+        destination: str,
+        payload: dict[str, Any],
+        *,
+        capability: str = "",
+        idempotency_key: str = "",
+        expect_ack: bool = False,
+        reply_to: str = "",
+    ) -> dict[str, Any]:
+        return self._delegate.emit_outbox(
+            destination,
+            payload,
+            capability=capability,
+            idempotency_key=idempotency_key,
+            expect_ack=expect_ack,
+            reply_to=reply_to,
+        )
+
+
 @dataclass
 class AgentToolContext(ToolContext):
     run_id: str
-    workspace: Workspace
+    _workspace: Workspace
     _recorder: AgentRecorder
     _job_manager: TaskManager
     _shell_service: ShellService
@@ -644,6 +741,10 @@ class AgentToolContext(ToolContext):
     # moved on to another call. ``None`` means no call is in flight *on this thread's tier*, which is
     # a refusal for authorization-bearing operations rather than an unrestricted scope.
     _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
+    _extension_context: ToolContext = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._extension_context = _ExtensionToolContext(self)
 
     def _check_writer_authority(self) -> None:
         self._write_authority.assert_active()
@@ -712,10 +813,10 @@ class AgentToolContext(ToolContext):
                 f"artifact metadata is not portable JSON: {exc}",
                 error_code="artifact_metadata_unportable",
             ) from exc
-        data, _digest = self.workspace.read_bytes(path)
+        data, _digest = self._workspace.read_bytes(path)
         self._check_writer_authority()
         artifact = self._recorder.emit_artifact_bytes(
-            workspace_path=self.workspace.normalize(path),
+            workspace_path=self._workspace.normalize(path),
             content=data,
             kind=kind,
             label=label,
@@ -775,7 +876,7 @@ class AgentToolContext(ToolContext):
 
     def path_allowed(self, path: str, operation: str = "read") -> bool:
         try:
-            rel = self.workspace.normalize(path)
+            rel = self._workspace.normalize(path)
             permission_operation = (
                 operation if operation in {"read", "write", "artifact", "run"} else "read"
             )
@@ -4202,7 +4303,12 @@ class AgentLoop:
         registry = ToolRegistry()
         registry.register_many(res.base_tool_specs)
         for provider in self._dynamic_providers():
-            registry.register_many(provider.get_tools_for_turn(context, turn))
+            specs = self.write_authority.guard_external_call(
+                lambda provider=provider: provider.get_tools_for_turn(
+                    context._extension_context, turn
+                )
+            )
+            registry.register_many(specs)
         return registry
 
     def _dynamic_providers(self) -> tuple[DynamicToolProvider, ...]:
@@ -5836,7 +5942,7 @@ class AgentLoop:
                     "stdout_bytes": payload.get("stdout_bytes"),
                     "stderr_bytes": payload.get("stderr_bytes"),
                 },
-                "mode": context.workspace.mode,
+                "mode": context._workspace.mode,
             },
         )
         self._emit_workspace_proposal(context, recorder)
@@ -5849,7 +5955,9 @@ class AgentLoop:
         turn_id: str | None = None,
         parent_id: str | None = None,
     ) -> None:
-        diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(context.workspace)
+        diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(
+            context._workspace
+        )
         recorder.emit(
             "workspace.diff.updated",
             turn_id=turn_id,
@@ -5859,7 +5967,7 @@ class AgentLoop:
                 "bytes": len(diff_text.encode("utf-8")),
                 "changed_paths": [
                     public_path(path, self.permission_policy)
-                    for path in context.workspace.changed_paths()
+                    for path in context._workspace.changed_paths()
                 ],
             },
         )
@@ -6005,13 +6113,13 @@ class AgentLoop:
             handler = spec.handler
             async_call = is_async_callable(handler)
             if async_call:
-                pending = handler(context, arguments)
+                pending = handler(context._extension_context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)
             else:
                 result = await self._await_native_tool_handler(
                     start_abandonable_sync_call(
                         lambda: self.write_authority.guard_external_call(
-                            lambda: handler(context, arguments)
+                            lambda: handler(context._extension_context, arguments)
                         ),
                         thread_name=f"nar-tool-{self.spec.run_id}",
                     ),
@@ -6903,7 +7011,7 @@ class AgentLoop:
                     "tool": spec.id,
                     "paths": paths,
                     "result": result_payload,
-                    "mode": context.workspace.mode,
+                    "mode": context._workspace.mode,
                 },
             )
             self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)
@@ -6916,7 +7024,7 @@ class AgentLoop:
                     "tool": spec.id,
                     "paths": _public_paths_from_args(spec, arguments, self.permission_policy),
                     "result": public_result_content(result.content, self.permission_policy),
-                    "mode": context.workspace.mode,
+                    "mode": context._workspace.mode,
                 },
             )
             self._emit_workspace_proposal(context, recorder, turn_id=turn_id, parent_id=parent_id)

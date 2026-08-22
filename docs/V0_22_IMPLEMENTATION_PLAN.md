@@ -1217,9 +1217,10 @@ evidence를 다음 step 뒤에 남기지 않는다.
   sidecar 사이를 추가로 fencing한다. Final recorder close와 completed checkpoint delete도 전·후에
   authority를 재검사한다.
   Abandon된 synchronous tool handler가 뒤늦게 재개될 수 있으므로 AgentToolContext의 상태 변경과
-  kernel-managed side effect 진입점은 shared authority를 자체 검사한다. Raw recorder, TaskManager,
-  service, outbox dependency는 private field이며 공식 ToolContext method만 extension에 제공한다.
-  `AuthorityBoundWorkspace`가 read와 모든 write API를 검사한다. Artifact, plan, finish, shell/web,
+  kernel-managed side effect 진입점은 shared authority를 자체 검사한다. Workspace, raw recorder,
+  TaskManager, service, outbox, lifecycle state, counter는 private field다. Tool provider와 handler는
+  공식 method만 가진 slotted ToolContext façade를 받는다. `AuthorityBoundWorkspace`는 native root와
+  absolute path resolver를 공개하지 않으며 read와 모든 write API를 검사한다. Artifact, plan, finish, shell/web,
   task/job, skill activation, tool-search load request, outbox staging을 포함한다.
   AgentRecorder의 artifact writer는 같은 fence를 반복하고 artifact directory를 원자적으로 선점해
   recovered owner와 late prior owner의 동일 path overwrite를 막는다.

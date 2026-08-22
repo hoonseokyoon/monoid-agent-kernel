@@ -171,11 +171,6 @@ class AuthorityBoundWorkspace:
     _write_authority: ActivationWriteAuthority
 
     @property
-    def root(self) -> Path:
-        self._write_authority.assert_active()
-        return self._backend.root
-
-    @property
     def mode(self) -> RunMode:
         self._write_authority.assert_active()
         return self._backend.mode
@@ -193,12 +188,6 @@ class AuthorityBoundWorkspace:
     def normalize(self, path: str | None) -> str:
         self._write_authority.assert_active()
         return self._backend.normalize(path)
-
-    def resolve_existing_or_parent(
-        self, path: str | None, *, for_write: bool = False
-    ) -> tuple[str, Path]:
-        self._write_authority.assert_active()
-        return self._backend.resolve_existing_or_parent(path, for_write=for_write)
 
     def path_kind(self, path: str | None) -> str | None:
         self._write_authority.assert_active()
@@ -347,6 +336,20 @@ class AuthorityBoundWorkspace:
     def workspace_base_payload(self, run_id: str) -> dict[str, Any]:
         self._write_authority.assert_active()
         return self._backend.workspace_base_payload(run_id)
+
+
+def _workspace_root_path(workspace: Workspace) -> Path:
+    """Return a native root only to trusted kernel adapters.
+
+    The authority-bound proxy has no public ``root`` or path-resolving API because a retained
+    ``Path`` would remain writable after revocation. Direct shell and workspace-index adapters use
+    this private boundary and still receive an authority check before the path leaves the proxy.
+    """
+
+    if isinstance(workspace, AuthorityBoundWorkspace):
+        workspace._write_authority.assert_active()
+        return workspace._backend.root
+    return workspace.root
 
 
 WorkspaceFactory = Callable[[AgentRunSpec], Workspace]

@@ -2946,10 +2946,13 @@ an earlier fence passed.
 
 A synchronous tool handler may remain alive in its dedicated daemon thread after the loop abandons
 its await. `AgentToolContext`, `AuthorityBoundWorkspace`, `AgentRecorder`, `EventBus`, and
-`TaskManager` share one `ActivationWriteAuthority`. Raw recorder, task manager, service, and outbox
-dependencies are private implementation fields. The `ToolContext` protocol exposes the supported
-mutation surface to extensions. Reads assert active authority. Short memory and filesystem
-mutations use `guard_local_mutation`; callbacks and I/O edges use `guard_external_call`.
+`TaskManager` share one `ActivationWriteAuthority`. Tool providers and handlers receive a slotted,
+method-only `ToolContext` façade. Workspace, recorder, task manager, service, outbox, lifecycle
+state, and counters remain behind private implementation fields. The façade exposes the supported
+extension operations and no reusable native workspace `Path`; the authority-bound workspace itself
+has no public `root` or absolute-path resolver. Reads assert active authority. Short memory and
+filesystem mutations use `guard_local_mutation`; callbacks and I/O edges use
+`guard_external_call`.
 
 This boundary covers artifact emission, plan and finish state, workspace mutation, shell and web
 execution, job cancellation and task creation, skill activation, tool-search load requests, and

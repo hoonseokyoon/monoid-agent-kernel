@@ -416,6 +416,8 @@ Apply these boundaries:
 - validate token kind, audience, run ID, tenant, user, task metadata, and expiry;
 - keep provider keys and capability secrets in a gateway, broker, or secret manager;
 - persist hashes or opaque handles in checkpoints, events, commands, receipts, and logs;
+- give Python tool extensions only the method-only `ToolContext` façade; keep workspace roots,
+  native paths, recorder/task handles, lifecycle state, and counters behind the trusted kernel edge;
 - restrict workspace roots and resolve paths through the `Workspace` contract;
 - isolate run artifacts, projections, quotas, and retention by tenant;
 - run the production checklist and relevant conformance profiles before external traffic.
