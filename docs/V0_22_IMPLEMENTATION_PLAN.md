@@ -928,7 +928,7 @@ def cancel(self, cause: InterruptionCause = InterruptionCause.USER_CANCEL) -> No
 | `user_cancel` | terminal cancelled | 현재 writer token으로 terminal settle 시도 |
 | `graceful_drain` | partial state를 safe park로 만들고 interrupted 반환 | checkpoint 허용, terminal 정책은 host 결정 |
 | `host_shutdown` | graceful drain과 같은 handoff 기본값 | checkpoint 허용 |
-| `lease_lost` | 즉시 실행 중단, in-memory interrupted outcome 반환 | checkpoint/event/terminal 금지 |
+| `lease_lost` | 즉시 실행 중단, in-memory interrupted outcome 반환 | usage/metric/observer/sidecar/checkpoint/event/projection/terminal 금지 |
 | `deadline` | timed-out terminal outcome | 현재 writer token이 유효할 때만 settle |
 
 `Suspension`, `AgentTurnResult`, `AgentRunResult`, `RunState`, checkpoint의 additive tail field로 cause를
@@ -1166,9 +1166,12 @@ evidence를 다음 step 뒤에 남기지 않는다.
   Reference backend는 admission barrier를 먼저 닫고, 이 park를 terminal close로 정리한다.
 - `lease_lost` activation은 in-memory park만 반환하며 checkpoint, event, projection, terminal을
   쓰지 않는다. 신호 전에 commit된 model invocation settlement는 권위 evidence로 남는다.
+  Settlement 반환 직후 lease authority를 다시 검사하고 stale activation의 usage accounting,
+  receipt observer, model-call sidecar, model-stream close를 차단한다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
 
-종료 조건: lease-lost worker가 checkpoint/event/terminal mutation을 만들지 않는다.
+종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal
+mutation을 만들지 않는다.
 
 ### PR 7 — Conformance와 release closure
 

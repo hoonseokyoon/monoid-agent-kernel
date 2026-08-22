@@ -1882,6 +1882,7 @@ class AgentLoop:
                     res.model_runner,
                     evidence_recovery,
                 )
+                self._check_lease_authority()
                 evidence_recovery, suspension = await self._aapply_recovered_model_outcome(
                     state,
                     res,
@@ -2751,6 +2752,7 @@ class AgentLoop:
         outcome_error_code: str | None = None
         outcome_retryable = False
         outcome_config_recoverable = False
+        lease_lost = False
         try:
             turn, receipt = await runner.acall(
                 request,
@@ -2775,10 +2777,11 @@ class AgentLoop:
             # retry absorbed before the turn was stopped. Those attempts completed and were charged
             # for; the interrupt did not un-spend them.
             raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
-        except RunCancelled:
+        except RunCancelled as exc:
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "cancelled"
+            lease_lost = exc.interruption_cause is InterruptionCause.LEASE_LOST
             raise
         except RunTimeout:
             outcome_status = "timed_out"
@@ -2846,7 +2849,7 @@ class AgentLoop:
                 latest_invocation = getattr(lifecycle, "last_invocation", None)
                 if isinstance(latest_invocation, DurableModelInvocation):
                     session.last_model_invocation = latest_invocation
-            if outcome_status is not None and observer_writers:
+            if outcome_status is not None and observer_writers and not lease_lost:
                 try:
                     outcome = ModelStreamOutcome(
                         status=outcome_status,
@@ -4191,6 +4194,7 @@ class AgentLoop:
     ) -> tuple[_EvidenceRecovery | None, Suspension | None]:
         """Apply stored model evidence before any current request-building dependency runs."""
 
+        self._check_lease_authority()
         recovered = recovery.recovered_dispatch
         if recovered is None:
             raise DurableModelCallError(
@@ -4946,6 +4950,7 @@ class AgentLoop:
                         turn_id=turn_id,
                         abort_after_recovery_probe=resuming_checkpointed_step,
                     )
+                self._check_lease_authority()
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -6568,6 +6573,7 @@ class AgentLoop:
         )
 
     def _check_run_boundary(self, deadline: float | None) -> None:
+        self._check_lease_authority()
         if self.cancellation_token is not None and self.cancellation_token.requested:
             raise RunCancelled(
                 "run cancelled",
@@ -6580,6 +6586,18 @@ class AgentLoop:
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
+
+    def _check_lease_authority(self) -> None:
+        token = self.cancellation_token
+        if (
+            token is not None
+            and token.requested
+            and token.cause is InterruptionCause.LEASE_LOST
+        ):
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=InterruptionCause.LEASE_LOST,
+            )
 
     @staticmethod
     def _emit_turn_interrupted(

@@ -246,6 +246,10 @@ the checkpoint and resume with `None`. Treat
 The kernel accounts an authoritative settled receipt before a stop or deadline can park its result
 as unapplied. Persisted interruption checkpoints therefore include the paid usage even when the
 assistant turn remains absent; resume projects the stored result without adding that usage again.
+Lease loss uses the stricter ownership boundary. The runner rechecks authority immediately after
+durable settlement and suppresses stale usage accounting, metrics, passive model-I/O delivery,
+model-call sidecars, and model-stream completion. The replacement owner recovers the stored receipt
+and publishes it without another provider dispatch.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes

@@ -1876,13 +1876,34 @@ def test_required_evidence_commits_before_terminal_run_boundary(
     assert len(adapter.requests) == 1
 
 
-def test_lease_loss_after_invocation_settle_does_not_commit_a_checkpoint_or_terminal(
+def test_lease_loss_after_invocation_settle_blocks_all_stale_publication(
     tmp_path: Path,
 ) -> None:
+    class _Writer:
+        def __init__(self) -> None:
+            self.outcomes: list[ModelStreamOutcome] = []
+
+        def push(self, _delta: Any) -> None:
+            return None
+
+        def close(self, outcome: ModelStreamOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    class _Observer:
+        def __init__(self, writer: _Writer) -> None:
+            self.writer = writer
+
+        def open(self, _context: Any) -> _Writer:
+            return self.writer
+
     harness = DeterministicFencedRunHarness()
     cancellation_token = CancellationToken()
     sink = _CancelAfterInvocationCommit(harness.sink, cancellation_token)
-    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    usage = {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    writer = _Writer()
     writer_token = harness.claim_writer(RUN_ID, "worker-1")
     loop = _loop(
         tmp_path,
@@ -1890,10 +1911,14 @@ def test_lease_loss_after_invocation_settle_does_not_commit_a_checkpoint_or_term
         sink=sink,
         writer_token=writer_token,
         cancellation_token=cancellation_token,
+        model_calls_file=True,
+        model_stream_observer_factories=(lambda: _Observer(writer),),
     )
     loop.open()
     try:
         suspension = loop.run_until_suspended("hello")
+        assert loop._session is not None
+        stale_total_usage = dict(loop._session.state.total_usage)
     finally:
         with suppress(BaseException):
             loop.discard_uncommitted()
@@ -1903,6 +1928,23 @@ def test_lease_loss_after_invocation_settle_does_not_commit_a_checkpoint_or_term
     invocation = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
     assert invocation.ok and invocation.value is not None
     assert invocation.value.invocation.dispatch_state == "settled"
+    assert invocation.value.invocation.receipt is not None
+    assert invocation.value.invocation.receipt["usage"] == usage
+    assert stale_total_usage == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    events_path = next((tmp_path / "runs").rglob("events.jsonl"))
+    event_types = {
+        json.loads(line)["type"]
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert "metrics.updated" not in event_types
+    assert "model.turn.completed" not in event_types
+    assert list((tmp_path / "runs").rglob("model_calls.jsonl")) == []
+    assert writer.outcomes == []
     assert harness.sink.latest_checked(RUN_ID).status == "missing"
     assert harness.read_terminal(RUN_ID) is None
 

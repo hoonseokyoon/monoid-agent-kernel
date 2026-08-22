@@ -2770,6 +2770,7 @@ normalize + request digest
   -> commit dispatch_started
   -> enter adapter
   -> commit settled success/refusal OR commit unknown
+  -> recheck lease authority
   -> deliver passive observer/sidecar evidence
 ```
 
@@ -2881,9 +2882,13 @@ projection, and the Reference backend record/result surfaces. An absent cause re
 with older checkpoints and events.
 
 Lease loss can race with a model settlement. A `settled` invocation committed before the lease-loss
-signal remains authoritative paid-call evidence. The stale activation returns the in-memory
-`lease_lost` park and performs no later checkpoint or terminal mutation. A replacement owner loads
-the committed invocation and continues recovery without redispatching the provider call.
+signal remains authoritative paid-call evidence. The runner rechecks lease authority immediately
+after that commit and before it publishes the receipt. The stale activation leaves run usage
+unchanged and emits no metric, event, passive model-I/O observation, model-call sidecar record, or
+model-stream completion. It returns the in-memory `lease_lost` park without a checkpoint,
+projection, or terminal mutation. A replacement owner loads the committed invocation, accounts and
+publishes it under current authority, and continues recovery without redispatching the provider
+call.
 
 ### Model evidence delivery policy
 
@@ -2919,10 +2924,11 @@ config, context providers, tool surface, or media. It then applies a stored succ
 to loop state before those current request-building dependencies run. A recovered final settles
 from the stored outcome; a recovered tool-call turn enters the canonical message log before current
 tool resolution and execution setup. Runtime-config drift cannot block evidence delivery or
-application of the stored outcome. The provider call count does not increase. Passive model-I/O
-observers and requested model-call sidecars receive the authoritative call during its original
-settlement, including when required evidence fails afterward. Evidence recovery does not publish
-the passive call a second time. A successful provider result closes live model-stream observers
+application of the stored outcome. The provider call count does not increase. While the activation
+retains lease authority, passive model-I/O observers and requested model-call sidecars receive the
+authoritative call during its original settlement, including when required evidence fails
+afterward. Evidence recovery does not publish the passive call a second time. A successful provider
+result closes live model-stream observers
 and `model-content.jsonl` as `completed` with its normalized final text and usage before the run
 parks on `evidence_uncommitted`; the projection failure preserves the paid stream's settled state.
 A settled provider refusal retains the failed stream classification. The checkpoint marker sets

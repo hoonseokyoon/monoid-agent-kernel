@@ -671,6 +671,25 @@ class ModelCallRunner:
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
 
+    def _check_lease_authority(self) -> None:
+        """Fence publication immediately after a durable host mutation returns.
+
+        A lifecycle commit can be the operation that discovers or concurrently observes lease
+        loss. Its durable settlement remains authoritative, while every receipt observer and
+        sidecar after that commit belongs to the stale activation and must stay untouched.
+        """
+
+        token = self._token()
+        if (
+            token is not None
+            and token.requested
+            and token.cause is InterruptionCause.LEASE_LOST
+        ):
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=InterruptionCause.LEASE_LOST,
+            )
+
     async def acall(
         self,
         request: ModelRequest,
@@ -784,13 +803,7 @@ class ModelCallRunner:
                     # Lease loss is an authority boundary, not a recoverable cancellation.
                     # Other terminal requests intentionally wait for an already-settled required
                     # evidence barrier below; a stale owner may not attempt that mutation.
-                    token = self._token()
-                    if (
-                        token is not None
-                        and token.requested
-                        and token.cause is InterruptionCause.LEASE_LOST
-                    ):
-                        self._check_cancel_or_deadline(deadline)
+                    self._check_lease_authority()
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -1118,6 +1131,7 @@ class ModelCallRunner:
                                 failure_code=durable_failure.error_code,
                                 stream_committed=delivered,
                             )
+                            self._check_lease_authority()
                         if (
                             retry_plan is None
                             or attempts_made >= retry_plan.max_attempts
@@ -1165,6 +1179,13 @@ class ModelCallRunner:
                 if lifecycle_hook is None:
                     turn = normalize_model_turn(turn)
             except BaseException as exc:
+                if (
+                    isinstance(exc, RunCancelled)
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                ):
+                    # A durable settlement may have won immediately before lease loss. Preserve
+                    # that journal fact and skip every stale observer/sidecar publication below.
+                    raise
                 # Process-control exceptions preserve already-observed accounting but never become
                 # model outcomes or lifecycle compensation. Prefer a complete receipt prepared
                 # immediately before durable settle. If the stop arrived earlier, carry the usage
@@ -1369,10 +1390,12 @@ class ModelCallRunner:
                         result_blob=result_blob,
                         stream_committed=delivered,
                     )
+                    self._check_lease_authority()
                 except ModelEvidenceUncommitted as evidence_error:
                     # The success settlement is finalized after the provider try/except above.
                     # Publish it here so passive observers and sidecars see the paid call even
                     # though required evidence parks the loop before the ordinary publish below.
+                    self._check_lease_authority()
                     _carry_settled_model_stream_outcome(evidence_error, turn)
                     with contextlib.suppress(Exception):
                         self._publish(

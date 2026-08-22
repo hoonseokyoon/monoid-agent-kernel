@@ -24,6 +24,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
@@ -5375,6 +5376,44 @@ def test_durable_success_commits_the_canonical_private_result_before_passive_del
     assert body["reasoning"] == [{"type": "encrypted_reasoning", "id": "reasoning-1"}]
     assert "raw" not in body
     assert adapter.keys == [invocation.idempotency_key]
+
+
+def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def settled(self, settlement: ModelDispatchSettlement) -> None:
+            super().settled(settlement)
+            token.cancel(InterruptionCause.LEASE_LOST)
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "settled"
+    assert observer.captures == []
+    assert sidecar == []
 
 
 @pytest.mark.parametrize(
